@@ -1,0 +1,167 @@
+         * risk, since he's not inserted his commit record yet; and one that's  
+         * already cleared it is not at risk either, since he's done fixing clog  
+         * and we will correctly flush the update below.  So we cannot miss any  
+         * xacts we need to wait for.  
+         */  
+        vxids = GetVirtualXIDsDelayingChkpt(&nvxids);  
+        if (nvxids > 0)  
+        {  
+                do  
+                {  
+                        pg_usleep(10000L);      /* wait for 10 msec */  
+                } while (HaveVirtualXIDsDelayingChkpt(vxids, nvxids));  
+        }  
+        pfree(vxids);  
+执行检查点最重要也是最拖累性能的任务，fsync：  
+        CheckPointGuts(checkPoint.redo, flags);  
+CheckPointGuts函数内容后面叙述。  
+Fsync完成后，写入一段XLOG，表示检查点完成  
+        /*  
+         * Now insert the checkpoint record into XLOG.  
+         */  
+        rdata.data = (char *) (&checkPoint);  
+        rdata.len = sizeof(checkPoint);  
+        rdata.buffer = InvalidBuffer;  
+        rdata.next = NULL;  
+        recptr = XLogInsert(RM_XLOG_ID,  
+                                                shutdown ? XLOG_CHECKPOINT_SHUTDOWN :  
+                                                XLOG_CHECKPOINT_ONLINE,  
+                                                &rdata);  
+        XLogFlush(recptr);  
+更新控制文件，控制文件中写入检查点的XLOG逻辑位置，物理位置等信息。  
+        /*  
+         * Select point at which we can truncate the log, which we base on the  
+         * prior checkpoint's earliest info.  
+         */  
+        XLByteToSeg(ControlFile->checkPointCopy.redo, _logSegNo);  
+        /*  
+         * Update the control file.  
+         */  
+        LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);  
+        if (shutdown)  
+                ControlFile->state = DB_SHUTDOWNED;  
+        ControlFile->prevCheckPoint = ControlFile->checkPoint;  
+        ControlFile->checkPoint = ProcLastRecPtr;    //  包含检查点的 xlog 结束位置,  ProcLastRecPtr是XLogInsert中更新的一个全局变量,表示XLOG位置。  
+        ControlFile->checkPointCopy = checkPoint;    // 包含检查点的 xlog 逻辑位置，在前面记录了，请看前面的代码  
+        ControlFile->time = (pg_time_t) time(NULL);  
+        /* crash recovery should always recover to the end of WAL */  
+        ControlFile->minRecoveryPoint = InvalidXLogRecPtr;  
+        ControlFile->minRecoveryPointTLI = 0;  
+        /*  
+         * Persist unloggedLSN value. It's reset on crash recovery, so this goes  
+         * unused on non-shutdown checkpoints, but seems useful to store it always  
+         * for debugging purposes.  
+         */  
+        SpinLockAcquire(&XLogCtl->ulsn_lck);  
+        ControlFile->unloggedLSN = XLogCtl->unloggedLSN;  
+        SpinLockRelease(&XLogCtl->ulsn_lck);  
+        UpdateControlFile();  
+        LWLockRelease(ControlFileLock);  
+释放检查点排他锁  
+        LWLockRelease(CheckpointLock);  
+Fsync涉及的函数CheckPointGuts如下：  
+/*  
+ * Flush all data in shared memory to disk, and fsync  
+ *  
+ * This is the common code shared between regular checkpoints and  
+ * recovery restartpoints.  
+ */  
+static void  
+CheckPointGuts(XLogRecPtr checkPointRedo, int flags)  
+{  
+        CheckPointCLOG();   // src/backend/access/transam/clog.c  
+        CheckPointSUBTRANS();  // src/backend/access/transam/subtrans.c  
+        CheckPointMultiXact();  // src/backend/access/transam/multixact.c  
+        CheckPointPredicate();  // src/backend/storage/lmgr/predicate.c  
+        CheckPointRelationMap();  // src/backend/utils/cache/relmapper.c  
+        CheckPointReplicationSlots();  //  src/backend/replication/slot.c  
+        CheckPointSnapBuild();  // src/backend/replication/logical/snapbuild.c  
+        CheckPointLogicalRewriteHeap();  // src/backend/access/heap/rewriteheap.c  
+        CheckPointBuffers(flags);       /* performs all required fsyncs */  // src/backend/storage/buffer/bufmgr.c  
+        /* We deliberately delay 2PC checkpointing as long as possible */    
+        CheckPointTwoPhase(checkPointRedo);  //  src/backend/access/transam/twophase.c  
+}  
+```
+最后，回答一个问题，为什么检查点会带来巨大的性能损耗呢？  
+需要分析CheckPointGuts函数内调用的这些函数来回答这个问题，整个检查点的过程只有这里是重量级任务，而且涉及到大量的排他锁。  
+例如BufferSync里面需要将所有检查点逻辑位置前所有已提交事务的buffer脏数据刷入数据文件(这个说法并不严谨，也可能包含检查点开始后某一个时间差内产生的脏数据，见BufferSync@src/backend/storage/buffer/bufmgr.c)。  
+内容太多，放到下一篇文章进行讲解。  
+如果你要跟踪这里面的开销，在linux下面可以使用systemtap跟踪这些函数，或者探针。  
+方法参考：  
+http://blog.163.com/digoal@126/blog/static/1638770402015380712956/  
+http://blog.163.com/digoal@126/blog/#m=0&t=1&c=fks_084068084086080075085082085095085080082075083081086071084  
+## 其他 
+根据XLOG切换个数触发检查点，  
+判断经过N个XLOG后是否要做检查点。  
+```
+/*  
+ * Check whether we've consumed enough xlog space that a checkpoint is needed.  
+ *  
+ * new_segno indicates a log file that has just been filled up (or read  
+ * during recovery). We measure the distance from RedoRecPtr to new_segno  
+ * and see if that exceeds CheckPointSegments.  
+ *  
+ * Note: it is caller's responsibility that RedoRecPtr is up-to-date.  
+ */  
+static bool  
+XLogCheckpointNeeded(XLogSegNo new_segno)  
+{  
+        XLogSegNo       old_segno;  
+        XLByteToSeg(RedoRecPtr, old_segno);  
+        if (new_segno >= old_segno + (uint64) (CheckPointSegments - 1))    
+           // CheckPointSegments取决于参数checkpoint_segments  
+                return true;  
+        return false;  
+}  
+```
+在写XLOG(XLogWrite@src/backend/access/transam/xlog.c)和读XLOG(XLogPageRead@src/backend/access/transam/xlog.c)时会触发这个检查。  
+```
+/*  
+ * Write and/or fsync the log at least as far as WriteRqst indicates.  
+ *  
+ * If flexible == TRUE, we don't have to write as far as WriteRqst, but  
+ * may stop at any convenient boundary (such as a cache or logfile boundary).  
+ * This option allows us to avoid uselessly issuing multiple writes when a  
+ * single one would do.  
+ *  
+ * Must be called with WALWriteLock held. WaitXLogInsertionsToFinish(WriteRqst)  
+ * must be called before grabbing the lock, to make sure the data is ready to  
+ * write.  
+ */  
+static void  
+XLogWrite(XLogwrtRqst WriteRqst, bool flexible)  
+{  
+......  
+                                /*  
+                                 * Request a checkpoint if we've consumed too much xlog since  
+                                 * the last one.  For speed, we first check using the local  
+                                 * copy of RedoRecPtr, which might be out of date; if it looks  
+                                 * like a checkpoint is needed, forcibly update RedoRecPtr and  
+                                 * recheck.  
+                                 */  
+                                if (IsUnderPostmaster && XLogCheckpointNeeded(openLogSegNo))  
+                                {  
+                                        (void) GetRedoRecPtr();  
+                                        if (XLogCheckpointNeeded(openLogSegNo))  
+                                                RequestCheckpoint(CHECKPOINT_CAUSE_XLOG);  
+                                }  
+......  
+```
+## 参考 
+1\. src/backend/postmaster/checkpointer.c  
+2\. src/backend/access/transam/xlog.c  
+3\. src/backend/storage/buffer/bufmgr.c  
+4\. src/backend/storage/buffer  
+5\. src/include/storage/buf_internals.h  
+6\. src/backend/storage/smgr/smgr.c  
+7\. http://blog.163.com/digoal@126/blog/static/1638770402015380712956/  
+8\. http://blog.163.com/digoal@126/blog/#m=0&t=1&c=fks_084068084086080075085082085095085080082075083081086071084  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

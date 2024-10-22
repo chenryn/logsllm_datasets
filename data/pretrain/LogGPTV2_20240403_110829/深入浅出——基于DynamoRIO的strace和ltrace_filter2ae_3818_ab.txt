@@ -1,0 +1,134 @@
+        else
+            OUTPUT(&buf, "    failed (error="IF_WINDOWS_ELSE(PIFX, "%d")") =>n", errno);
+        res = drsys_iterate_args(drcontext, drsys_iter_arg_cb, &buf);//获取系统调用参数信息
+        if (res != DRMF_SUCCESS && res != DRMF_ERROR_DETAILS_UNKNOWN)
+            ASSERT(false, "drsys_iterate_args failed post-syscall");
+        FLUSH_BUFFER(outf, buf.buf, buf.sofar);
+    }
+drstrace的主干代码流程如上所述，除此之外，在源码中还包括`print_arg`,`print_structure`,`safe_read_field`等与参数打印相关的自定义函数，主要思想是根据参数的类型在程序动态运行时读取系统内存数据，此处不再赘述，感兴趣的同学可以到源码中学习阅读。
+**注：** 默认情况下，drstrace跟踪所有子进程，可以通过参数`-no_follow_children`来修改
+## 0x03 drltrace的实现与源码剖析
+###  drltrace简介
+drltrace是DynamoRIO实现的针对库函数调用的跟踪工具，在官方资料中同样能够找到其源码`drltrace.c`以及二进制文件。
+###  测试分析
+直接执行如下图命令，对测试程序 **WriteFileEx1.exe** 进行分析。
+其中参数`only_from_app`表示只记录应用程序本身所调用的库函数信息，而不记录函数库彼此之间所调用的信息。（此参数具有实际的工作意义，因为在日常的逆向分析工作中，我们确实更多的关心应用程序本身调用了哪些库函数，从而根据API序列分析其行为，而并不关心一个库函数内部又调用的其他库函数信息，这种冗余信息会增添无谓的工作量）
+参数`print_ret_addr`表示打印出函数在应用程序中的返回地址。
+在结果文件中，成功监测到对 **kernel32.dll**
+的`CreateFileA->WriteFile->CloseHandle`的库函数调用序列，并提取了对应的函数参数信息和函数返回地址。
+###  源码剖析
+drltrace源码的主干部分同样是先完成初始化和事件回调函数注册工作，其中通过`dr_get_main_module()`函数获取主程序
+**WriteFileEx1.exe** 的模块信息，保存其起始地址 **exe_start**
+。然后进行回调函数的注册，这里最重要的一部分是通过`drmgr_register_module_load_event`函数注册的`event_module_load`回调函数，在每一个模块加载的时候都会执行此函数。
+    DR_EXPORT void
+    dr_client_main(client_id_t id, int argc, const char *argv[])
+    {
+        //相关初始化工作
+        module_data_t *exe;
+        ...
+        drmgr_init();
+        drwrap_init();
+        drx_init();
+        ...
+        //获取主应用程序的信息
+        exe = dr_get_main_module();
+        if (exe != NULL)
+            exe_start = exe->start;
+        dr_free_module_data(exe);
+        dr_register_exit_event(event_exit);//注册程序退出事件的回调函数
+        drmgr_register_module_load_event(event_module_load);//注册模块加载事件的回调函数
+        drmgr_register_module_unload_event(event_module_unload);//注册模块卸载事件的回调函数
+        open_log_file();//打开日志文件进行记录
+    }
+`event_module_load`回调函数的原型如下，其主要功能就是对每一个需要分析的模块执行`iterate_exports`函数；而`iterate_exports`的原型如下，其主要功能是通过`dr_symbol_export_iterator_start`、`dr_symbol_export_iterator_hasnext`和`dr_symbol_export_iterator_next`函数的配合，遍历模块内的每一个导出函数，对满足条件的导出函数执行`drwrap_wrap_ex`。
+    static void
+    event_module_load(void *drcontext, const module_data_t *info, bool loaded)
+    {
+        if (info->start != exe_start && library_matches_filter(info))
+            iterate_exports(info, true/*add*/);
+    }
+    static void
+    iterate_exports(const module_data_t *info, bool add)
+    {
+        dr_symbol_export_iterator_t *exp_iter =
+            dr_symbol_export_iterator_start(info->handle);
+        while (dr_symbol_export_iterator_hasnext(exp_iter)) {
+            dr_symbol_export_t *sym = dr_symbol_export_iterator_next(exp_iter);
+            app_pc func = NULL;
+            if (sym->is_code)
+                func = sym->addr;
+            if (op_ignore_underscore.get_value() && strstr(sym->name, "_") == sym->name)
+                func = NULL;
+            if (func != NULL) {
+                if (add) {
+                    ...                
+                        drwrap_wrap_ex(func, lib_entry, NULL, (void *) sym->name, 0);
+                    ...
+                } 
+                ...
+            }
+        }
+        dr_symbol_export_iterator_stop(exp_iter);
+    }
+函数`drwrap_wrap_ex`的功能是对每一个满足条件的函数 **func** ，在其函数调用的入口处调用开发者自定义的分析函数
+**lib_entry** ，这里dltrace的 **lib_entry** 分析函数如下，其整体流程如下：
+  1. 完成相关变量的初始化工作
+  2. 通过`drwrap_get_drcontext`函数来获取，此次函数调用的上下文状态信息
+  3. 在仅监控主应用程序的条件下：首先获取函数的返回地址 **retaddr** ，然后判断返回地址是否位于主应用程序 **WriteFileEx1.exe** 的地址空间
+  4. 最后打印出参数信息和返回地址的信息。
+    static void
+    lib_entry(void *wrapcxt, INOUT void **user_data)
+    {
+        //初始化相关变量
+        const char *name = (const char *) *user_data;
+        const char *modname = NULL;
+        app_pc func = drwrap_get_func(wrapcxt);
+        module_data_t *mod;
+        thread_id_t tid;
+        uint mod_id;
+        app_pc mod_start, ret_addr;
+        drcovlib_status_t res;
+        //获取当前上下文信息
+        void *drcontext = drwrap_get_drcontext(wrapcxt);
+        if (op_only_from_app.get_value()) {//仅记录主应用程序的库函数调用信息
+            app_pc retaddr =  NULL;
+            DR_TRY_EXCEPT(drcontext, {
+                retaddr = drwrap_get_retaddr(wrapcxt);//获取函数返回地址
+            }, { /* EXCEPT */
+                retaddr = NULL;
+            });
+            if (retaddr != NULL) {
+                mod = dr_lookup_module(retaddr);
+                if (mod != NULL) {//通过函数的返回地址判断函数的调用是否来自主应用程序
+                    bool from_exe = (mod->start == exe_start);
+                    dr_free_module_data(mod);
+                    if (!from_exe)
+                        return;
+                }
+            } else { return; }
+        }
+        ...
+        print_symbolic_args(name, wrapcxt, func); //打印参数信息
+        //打印函数返回地址信息
+        if (op_print_ret_addr.get_value()) {
+            ret_addr = drwrap_get_retaddr(wrapcxt);
+            res = drmodtrack_lookup(drcontext, ret_addr, &mod_id, &mod_start);
+            if (res == DRCOVLIB_SUCCESS) {
+                dr_fprintf(outf,
+                           op_print_ret_addr.get_value() ?
+                           " and return to module id:%d, offset:" PIFX : "",
+                           mod_id, ret_addr - mod_start);
+            }
+        }
+        ...
+    }
+这里需要注意的是打印参数的`print_symbolic_args`函数，在此处其采用三种参数打印方式：
+  1. 通过`drsyscall`函数来获取已知库函数的参数类型，并以此为依据提取运行时参数信息
+  2. 在自定义的参数配置文件中找寻由用户定义的参数类型，然后据此提取运行时参数信息
+  3. 如果上述两步都无法找到参数类型信息，则在动态监控时，此参数标记为`type=*`
+这里提到参数配置文件是指在drltrace工具包中的 **drltrace.config**
+文件，其内部包含了常见的函数参数信息，用于指导动态运行时的参数提取，其文件内容如下，后续开发者可以通过这个配置文件来补充函数和参数类型，从而丰富动态记录的内容。
+## 结束语
+以上介绍了drstrace和drltrace的工具使用和源码实现，而DynamoRIO还有更丰富的功能等待大家去挖掘。
+除了DynamoRIO外，Pin是另外一种流行的动态二进制插桩工具，两者相比各有优势。从应用的角度而言，本人的总体感觉是DynamoRIO效率更高，而Pin的稳定性更好，而且编程接口更容易掌握，感兴趣的同学可以尝试学习运用一下。
+盼与大家共同学习提高。

@@ -1,0 +1,213 @@
++ *  
++ * Heap-only tuple handling within IndexBuildHeapScan() works in a way that  
++ * helps us to detect index tuples that contain the wrong values (values that  
++ * don't match the latest tuple in the HOT chain).  This can happen when there  
++ * is no superseding index tuple due to a faulty assessment of HOT safety,  
++ * perhaps during the original CREATE INDEX.  Because the latest tuple's  
++ * contents are used with the root TID, an error will be raised when a tuple  
++ * with the same TID but non-matching attribute values is passed back to us.  
++ * Faulty assessment of HOT-safety was behind at least two distinct CREATE  
++ * INDEX CONCURRENTLY bugs that made it into stable releases, one of which was  
++ * undetected for many years.  In short, the same principle that allows a  
++ * REINDEX to repair corruption when there was an (undetected) broken HOT chain  
++ * also allows us to detect the corruption in many cases.  
++ */  
++static void  
++bt_tuple_present_callback(Relation index, HeapTuple htup, Datum *values,  
++                         bool *isnull, bool tupleIsAlive, void *checkstate)  
++{  
++   BtreeCheckState *state = (BtreeCheckState *) checkstate;  
++   IndexTuple  itup;  
++  
++   Assert(state->heapallindexed);  
++  
++   /*  
++    * Generate an index tuple for fingerprinting.  
++    *  
++    * Index tuple formation is assumed to be deterministic, and IndexTuples  
++    * are assumed immutable.  While the LP_DEAD bit is mutable in leaf pages,  
++    * that's ItemId metadata, which was not fingerprinted.  (There will often  
++    * be some dead-to-everyone IndexTuples fingerprinted by the Bloom filter,  
++    * but we only try to detect the absence of needed tuples, so that's okay.)  
++    *  
++    * Note that we rely on deterministic index_form_tuple() TOAST compression.  
++    * If index_form_tuple() was ever enhanced to compress datums out-of-line,  
++    * or otherwise varied when or how compression was applied, our assumption  
++    * would break, leading to false positive reports of corruption.  For now,  
++    * we don't decompress/normalize toasted values as part of fingerprinting.  
++    */  
++   itup = index_form_tuple(RelationGetDescr(index), values, isnull);  
++   itup->t_tid = htup->t_self;  
++  
++   /* Probe Bloom filter -- tuple should be present */  
++   if (bloom_lacks_element(state->filter, (unsigned char *) itup,  
++                           IndexTupleSize(itup)))  
++       ereport(ERROR,  
++               (errcode(ERRCODE_DATA_CORRUPTED),  
++                errmsg("heap tuple (%u,%u) from table \"%s\" lacks matching index tuple within index \"%s\"",  
++                       ItemPointerGetBlockNumber(&(itup->t_tid)),  
++                       ItemPointerGetOffsetNumber(&(itup->t_tid)),  
++                       RelationGetRelationName(state->heaprel),  
++                       RelationGetRelationName(state->rel)),  
++                !state->readonly  
++                ? errhint("Retrying verification using the function bt_index_parent_check() might provide a more specific error.")  
++                : 0));  
++  
++   state->heaptuplespresent++;  
++   pfree(itup);  
++}  
++  
+```  
+```  
++   /*  
++    * * Check whether heap contains unindexed/malformed tuples *  
++    */  
++   if (state->heapallindexed)  
++   {  
++       IndexInfo  *indexinfo = BuildIndexInfo(state->rel);  
++       HeapScanDesc scan;  
++  
++       /*  
++        * Create our own scan for IndexBuildHeapScan(), rather than getting it  
++        * to do so for us.  This is required so that we can actually use the  
++        * MVCC snapshot registered earlier in !readonly case.  
++        *  
++        * Note that IndexBuildHeapScan() calls heap_endscan() for us.  
++        */  
++       scan = heap_beginscan_strat(state->heaprel, /* relation */  
++                                   snapshot,   /* snapshot */  
++                                   0,  /* number of keys */  
++                                   NULL,   /* scan key */  
++                                   true,   /* buffer access strategy OK */  
++                                   true);  /* syncscan OK? */  
++  
++       /*  
++        * Scan will behave as the first scan of a CREATE INDEX CONCURRENTLY  
++        * behaves in !readonly case.  
++        *  
++        * It's okay that we don't actually use the same lock strength for the  
++        * heap relation as any other ii_Concurrent caller would in !readonly  
++        * case.  We have no reason to care about a concurrent VACUUM  
++        * operation, since there isn't going to be a second scan of the heap  
++        * that needs to be sure that there was no concurrent recycling of  
++        * TIDs.  
++        */  
++       indexinfo->ii_Concurrent = !state->readonly;  
++  
++       /*  
++        * Don't wait for uncommitted tuple xact commit/abort when index is a  
++        * unique index on a catalog (or an index used by an exclusion  
++        * constraint).  This could otherwise happen in the readonly case.  
++        */  
++       indexinfo->ii_Unique = false;  
++       indexinfo->ii_ExclusionOps = NULL;  
++       indexinfo->ii_ExclusionProcs = NULL;  
++       indexinfo->ii_ExclusionStrats = NULL;  
++  
++       elog(DEBUG1, "verifying that tuples from index \"%s\" are present in \"%s\"",  
++            RelationGetRelationName(state->rel),  
++            RelationGetRelationName(state->heaprel));  
++  
++       IndexBuildHeapScan(state->heaprel, state->rel, indexinfo, true,  
++                          bt_tuple_present_callback, (void *) state, scan);  
++  
++       ereport(DEBUG1,  
++               (errmsg_internal("finished verifying presence of " INT64_FORMAT " tuples from table \"%s\" with bitset %.2f%% set",  
++                                state->heaptuplespresent, RelationGetRelationName(heaprel),  
++                                100.0 * bloom_prop_bits_set(state->filter))));  
++  
++       if (snapshot != SnapshotAny)  
++           UnregisterSnapshot(snapshot);  
++  
++       bloom_free(state->filter);  
++   }  
+```  
+## test_bloomfilter使用例子  
+```  
+cd postgresql-11devel/src/test/modules/test_bloomfilter/  
+USE_PGXS=1 make   
+USE_PGXS=1 make install  
+```  
+```  
+postgres=# create extension test_bloomfilter ;  
+CREATE EXTENSION  
+postgres=# \df test_bloomfilter   
+                                                                 List of functions  
+ Schema |       Name       | Result data type |                                     Argument data types                                      | Type   
+--------+------------------+------------------+----------------------------------------------------------------------------------------------+------  
+ public | test_bloomfilter | void             | power integer, nelements bigint, seed integer DEFAULT '-1'::integer, tests integer DEFAULT 1 | func  
+(1 row)  
+```  
+```  
+Testing strategy  
+----------------  
+Our approach to regression testing is to test that a Bloom filter has only a 1%  
+false positive rate for a single bitset size (2 ^ 23, or 1MB).  We test a  
+dataset with 838,861 elements, which works out at 10 bits of memory per  
+element.  We round up from 9.6 bits to 10 bits to make sure that we reliably  
+get under 1% for regression testing.  Note that a random seed is used in the  
+regression tests because the exact false positive rate is inconsistent across  
+platforms.  Inconsistent hash function behavior is something that the  
+regression tests need to be tolerant of anyway.  
+```  
+```  
+postgres=# set client_min_messages ='debug';  
+SET  
+postgres=# select test_bloomfilter(23,8388610);  
+DEBUG:  beginning test #1...  
+DEBUG:  bloom_work_mem (KB): 1024  
+WARNING:  seed: 1883349013 false positives: 5303072 (0.632175%) bitset 63.21% set  
+ test_bloomfilter   
+------------------  
+(1 row)  
+postgres=# select test_bloomfilter(24,8388610);  
+DEBUG:  beginning test #1...  
+DEBUG:  bloom_work_mem (KB): 2048  
+WARNING:  seed: 1590179470 false positives: 3299662 (0.393350%) bitset 39.34% set  
+ test_bloomfilter   
+------------------  
+(1 row)  
+postgres=# select test_bloomfilter(25,8388610);  
+DEBUG:  beginning test #1...  
+DEBUG:  bloom_work_mem (KB): 4096  
+WARNING:  seed: 1790559261 false positives: 1233267 (0.147017%) bitset 52.77% set  
+ test_bloomfilter   
+------------------  
+(1 row)  
+```  
+这里的```false positives: 1233267 (0.147017%)```就是误差率。  
+```  
+postgres=# select 1233267/8388610.0;  
+        ?column?          
+------------------------  
+ 0.14701684784487537268  
+(1 row)  
+```  
+```bitset 52.77% set```，表示4MB的bits中，有52.77%的bit位被设置了。  
+## amcheck使用例子  
+```  
+postgres=# create unlogged table test_b (c1 int, c2 int, c3 int, c4 int, c5 timestamp);  
+CREATE TABLE  
+postgres=# insert into test_b select random()*10000000, random()*10000000,random()*10000000,random()*10000000,clock_timestamp() from generate_series(1,50000000);  
+INSERT 0 50000000  
+postgres=# create index idx_test_b on test_b using btree(c2,c3,c1,c5);  
+CREATE INDEX  
+postgres=# create index idx_test_b_1 on test_b using btree(mod(c2+c3,512),c4);  
+CREATE INDEX  
+```  
+需要多大的maintenance_work_mem，可以控制在2%左右的误差。maintenance_work_mem越低，越容易掩盖问题。所以至少要设置这么大：  
+```  
+postgres=# select pg_size_pretty(50000000*2::numeric);  
+ pg_size_pretty   
+----------------  
+ 95 MB  
+(1 row)  
+```  
+测试  
+```  
+postgres=# set client_min_messages ='debug';  
+SET  
+postgres=# create extension amcheck;  
+CREATE EXTENSION  
+postgres=# \timing  
+Timing is on.  

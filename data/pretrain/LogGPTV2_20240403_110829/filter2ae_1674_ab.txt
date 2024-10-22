@@ -1,0 +1,216 @@
+                       sizeof(struct user_i387_struct))) {
+                ret = -EIO;
+                break;
+            }
+            ret = 0;
+            if ( !child->used_math ) {
+                /* Simulate an empty FPU. */
+                set_fpu_cwd(child, 0x037f);
+                set_fpu_swd(child, 0x0000);
+                set_fpu_twd(child, 0xffff);
+            }
+            get_fpregs((struct user_i387_struct *)data, child);
+            break;
+        }
+        /*设置浮点寄存器值*/
+        case PTRACE_SETFPREGS: { /* Set the child FPU state. */
+            if (!access_ok(VERIFY_READ, (unsigned *)data,
+                       sizeof(struct user_i387_struct))) {
+                ret = -EIO;
+                break;
+            }
+            child->used_math = 1;
+            set_fpregs(child, (struct user_i387_struct *)data);
+            ret = 0;
+            break;
+        }
+        case PTRACE_GETFPXREGS: { /* Get the child extended FPU state. */
+            ...
+        }
+        case PTRACE_SETFPXREGS: { /* Set the child extended FPU state. */
+            ...
+        }
+        case PTRACE_SETOPTIONS: {
+            if (data & PTRACE_O_TRACESYSGOOD)
+                child->ptrace |= PT_TRACESYSGOOD;
+            else
+                child->ptrace &= ~PT_TRACESYSGOOD;
+            ret = 0;
+            break;
+        }
+        default:
+            ret = -EIO;
+            break;
+        }
+    out_tsk:
+        free_task_struct(child);
+    out:
+        unlock_kernel();
+        return ret;
+    }
+注意这个函数`get_stack_long(proccess, offset)`：
+    /*
+     * this routine will get a word off of the processes privileged stack. 
+     * the offset is how far from the base addr as stored in the TSS.  
+     * this routine assumes that all the privileged stacks are in our
+     * data space.
+     */   
+    static inline int get_stack_long(struct task_struct *task, int offset)
+    {
+        unsigned char *stack;
+        stack = (unsigned char *)task->thread.esp0;
+        stack += offset;
+        return (*((int *)stack));
+    }
+其中task->thread.esp0是堆栈指针，通用的寄存器在堆栈中按顺序排放，通过偏移量0ffset便可以依次读取
+### PTRACE_TRACEME
+当要调试一个进程时需要其进入被追踪状态(traced)，有两种方法进入该状态：
+  * 被调试进程 **主动** 调用`ptrace(PTRACE_TRACEME, ...)`进入traced状态
+  * 调试进程调用`ptrace(PTRACE_ATTACH, pid, ...)`来使指定进程进入
+总之被调试进程必须进入traced状态才能进行调试，因为Linux会对处于traced状态的进程进行特殊操作。以第一种方式来说明：
+    if (request == PTRACE_TRACEME) {
+            /* are we already being traced? */
+            if (current->ptrace & PT_PTRACED)
+                goto out;
+            /* set the ptrace bit in the process flags. */
+            current->ptrace |= PT_PTRACED;
+            ret = 0;
+            goto out;
+        }
+只是将当前进程标记为 **PT_PTRACED** 状态，但是如果该进程接下来进行 **execve** 系统调用去执行一个外部程序时会
+**暂停当前进程** ，并且发送 **SIGCHLD** 信号给 **父进程** ，父进程接收到该信号时就可以对被调试进程进行调试。
+**sys_execve() - > do_execve() -> load_elf_binary()：**
+    static int load_elf_binary(struct linux_binprm * bprm, struct pt_regs * regs)
+    {
+        ...
+        if (current->ptrace & PT_PTRACED)
+            send_sig(SIGTRAP, current, 0);
+        ...
+    }
+对于处于traced状态的进程执行 **execve** 系统调用时会发送一个 **SIGTRAP给当前进程**
+。这个信号将在`do_signal`函数处理：
+    int do_signal(struct pt_regs *regs, sigset_t *oldset) 
+    {
+        for (;;) {
+            unsigned long signr;
+            spin_lock_irq(&current->sigmask_lock);
+            signr = dequeue_signal(&current->blocked, &info);
+            spin_unlock_irq(&current->sigmask_lock);
+            // 如果进程被标记为 PTRACE 状态
+            if ((current->ptrace & PT_PTRACED) && signr != SIGKILL) {   //除了SIGKILL信号，都将让tracee停止并通知tracer
+                /* 让调试器运行  */
+                current->exit_code = signr;
+                current->state = TASK_STOPPED;   // 让自己进入停止运行状态
+                notify_parent(current, SIGCHLD); // 发送 SIGCHLD 信号给父进程表示子进程"死亡(被替换)"
+                schedule();                      // 让出CPU的执行权限
+                ...
+            }
+        }
+    }
+所以调试器使用这种方式调试某个程序时大致例程为：
+当父进程（调试进程）接收到 `SIGCHLD` 信号后，表示被调试进程已经标记为 **被追踪状态并且停止运行** ，那么调试进程就可以开始进行调试了。
+### PTRACE_SINGLESTEP
+单步运行是最为常用的，当把tracee设置为单步运行模式时，tracee每执行一条指令CPU都会停止然后向父进程发送一个 **SIGCHLD**
+信号，在ptrace中实现是将eflags设置trap_flag标志位：
+    case PTRACE_SINGLESTEP: {  /* set the trap flag. */
+            long tmp;
+            ret = -EIO;
+            if ((unsigned long) data > _NSIG)
+                break;
+            child->ptrace &= ~PT_TRACESYS;
+            if ((child->ptrace & PT_DTRACE) == 0) {
+                /* Spurious delayed TF traps may occur */
+                child->ptrace |= PT_DTRACE;
+            }
+            tmp = get_stack_long(child, EFL_OFFSET) | TRAP_FLAG;
+            put_stack_long(child, EFL_OFFSET, tmp);
+            child->exit_code = data;
+            /* give it a chance to run. */
+            wake_up_process(child);
+            ret = 0;
+            break;
+        }
+能够这样做是基于X86 intel CPU提供一个硬件机制，就是当eflags的`Trap
+Flag`置为1时，CPU每执行一条指令都会产生一个异常然后Linux异常处理机制进程处理，由此会发送一个 **SIGTRAP** 信号给
+**tracee** ；核心是：
+    tmp = get_stack_long(child, EFL_OFFSET) | TRAP_FLAG;
+    put_stack_long(child, EFL_OFFSET, tmp);
+  1. 获取进程的 `eflags` 寄存器的值，并且设置 `Trap Flag` 标志。
+  2. 把新的值设置到进程的 `eflags` 寄存器中。
+设置完寄存器后唤醒(wake_up_process)进程，让其进入运行状态：
+同样的当tracee执行完一条指令获取 **SIGTRAP** 信号，在 **do_signal** 函数处理信号时，由于`current->ptrace
+& PT_PTRACED`将停止执行并发送 **SIGCHLD**
+信号给父进程tracer。父进程接收到SIGCHLD信号后就知道tracee停止，可以发送命令来读取或者修改tracee的内存数据或寄存器，或者通过调用
+`ptrace(PTRACE_CONT, child,...)` 来让被调试进程进行运行等
+## Debugger 基本功能实现
+实现一个简单的debugger，大致模型如下：主程序fork一个子程序去执行待调试程序；然后主程序循环等待用户输入命令，停止主程序停止并等待输入命令的条件就是子程序停止，这会在
+**首次execute一个程序** 发生，以及 **单步(PTRACE_SINGLESTEP)** 或者 **断点**
+发生。子程序很简单只需要调用execute系统调用启动一个新程序即可
+待实现的debugger有三个基本功能：单步，读写寄存器，读写内存。基于这三个功能再添加其他类似于gdb的功能。初始框架如下：
+    int main(int argc, char *argv[]){
+        if(argc  0){
+            //parent process
+            //execute tracer
+        }else{
+            perror("fork.");
+            return -1;
+        }
+        return 0;
+    }
+子程序部分很简单调用exec族函数即可。
+### Parent
+首先考虑使用一个结构体记录子进程的信息，然后父进程进入一个读取用户命令的循环，这里使用[linenoise](https://github.com/antirez/linenoise)开源项目实现命令补全，命令记录等功能当然还需要处理命令：
+    /**
+     * debugger uitls
+    */
+    typedef struct Debugger{
+        const char *d_name;
+        int d_pid;
+        Breakpoint *d_brks;         //记录断点
+    }Debugger;
+    void dbg_run(Debugger *dbg){
+        int wait_status;
+        char *cmd;
+        waitpid(dbg->d_pid, &wait_status, 0);
+        /*UI for start up*/
+        while((cmd = linenoise("minidbg$ ")) != NULL){
+            dbg_handle_command(dbg, cmd);
+            linenoiseHistoryAdd(cmd);
+            linenoiseFree(cmd);
+        }
+    }
+使用Debugger结构体记录程序状态，主要是子程序pid和之后的断点信息；`linenoise("minidbg$
+")`会打印`minidbg$`并等待输入，使用`dbg_handle_command`处理命令包括读写内存，寄存器，下断点等。`linenoiseHistoryAdd(cmd)`将命令添加到历史记录中
+在`dbg_handle_command`函数中大致结构为：很方便添加新功能， **is_prefix** 辅助函数用于判断缩写指令
+    void dbg_handle_command(Debugger *dbg, char *cmd){
+        char *lcmd = strdup(cmd);
+        char *argv[8] = { 0 };    
+        char *command;
+        argv[0] = strtok(lcmd, " ");
+        for(int i = 1; i  strlen(ss)) return false;
+        return !strncmp(s, ss, strlen(s));
+    }
+### 读写寄存器
+一个非常基础的功能，基于`ptrace(PTRACE_GETREGS, ...)`和`ptrace(PTRACE_SETREGS,
+...)`读写寄存器，为了保留寄存器信息在`****`头文件中定义了如下结构体：
+    struct user_regs_struct
+    {
+      __extension__ unsigned long long int r15;
+      __extension__ unsigned long long int r14;
+      __extension__ unsigned long long int r13;
+      __extension__ unsigned long long int r12;
+      __extension__ unsigned long long int rbp;
+      __extension__ unsigned long long int rbx;
+      __extension__ unsigned long long int r11;
+      __extension__ unsigned long long int r10;
+      __extension__ unsigned long long int r9;
+      __extension__ unsigned long long int r8;
+      __extension__ unsigned long long int rax;
+      __extension__ unsigned long long int rcx;
+      __extension__ unsigned long long int rdx;
+      __extension__ unsigned long long int rsi;
+      __extension__ unsigned long long int rdi;
+      __extension__ unsigned long long int orig_rax;
+      __extension__ unsigned long long int rip;
+      __extension__ unsigned long long int cs;
+      __extension__ unsigned long long int eflags;

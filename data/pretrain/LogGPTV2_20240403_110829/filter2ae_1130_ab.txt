@@ -1,0 +1,100 @@
+#### UAF to Read/Write
+在这里，我们希望实现两个目标：通过读取内存以查找all_buckets的地址；编辑SHM，以更改bucket索引，并添加自定义的mutex结构
+幸运的是，在内存中PHP的堆位于两者之前。
+PHP的堆、ap_scoreboard_image->*和all_buckets的内存地址
+    root@apaubuntu:~# cat /proc/6318/maps | grep libphp | grep rw-p
+    7f4a8f9f3000-7f4a8fa0a000 rw-p 00471000 08:02 542265 /usr/lib/apache2/modules/libphp7.2.so
+    (gdb) p *ap_scoreboard_image 
+    $14 = {
+      global = 0x7f4a9323e008, 
+      parent = 0x7f4a9323e020, 
+      servers = 0x55835eddea78
+    }
+    (gdb) p all_buckets 
+    $15 = (prefork_child_bucket *) 0x7f4a9336b3f0
+因为我们触发的是针对PHP对象的UAF，所以，该对象的任何属性也可以在释放后使用；我们可以将这个zend_object UAF转换为zend_string
+UAF。这一点非常有用，因为zend_string的结构如下所示：
+(gdb) ptype zend_string
+    type = struct _zend_string {
+        zend_refcounted_h gc;
+        zend_ulong h;
+        size_t len;
+        char val[1];
+    }
+属性len存放的是字符串的长度。通过递增这个值，我们可以进一步读写其他内存空间，从而访问我们感兴趣的两个内存区域：SHM和Apache的all_buckets。
+#### Locating bucket indexes and all_buckets
+我们希望修改特定worker_id的ap_scoreboard_image->parent[worker_id]->bucket。
+幸运的是，该结构总是从共享内存块的开头部分开始的，因此很容易进行定位。
+共享内存的位置与目标process_score结构
+    root@apaubuntu:~# cat /proc/6318/maps | grep rw-s
+    7f4a9323e000-7f4a93252000 rw-s 00000000 00:05 57052                      /dev/zero (deleted)
+    (gdb) p &ap_scoreboard_image->parent[0]
+    $18 = (process_score *) 0x7f4a9323e020
+    (gdb) p &ap_scoreboard_image->parent[1]
+    $19 = (process_score *) 0x7f4a9323e044
+我们可以利用我们对prefork_child_bucket结构的了解，来定位all_buckets：
+bucket项的重要结构
+    prefork_child_bucket {
+        ap_pod_t *pod;
+        ap_listen_rec *listeners;
+        apr_proc_mutex_t *mutex; mutex与all_buckets[0]位于相同的内存区域中。由于meth是一个静态结构，因此，它将位于libapr的.data内存中。同时，由于meth指向在libapr中定义的函数，因此，所有的函数指针都将位于libapr.text中。
+因为我们可以通过/proc/self/map获悉这些区域的地址，所以，我们可以遍历Apache内存中的每一个指针，找到一个与该结构匹配的指针。它通常是all_buckets[0]。
+正如前面所提到的，all_buckets的地址在每次正常重新启动时都会发生变化。这意味着，当我们的漏洞利用代码触发时，all_buckets的地址将与我们所找到的地址不同。我们必须考虑到这一点；详情将在后文中加以介绍。
+### 2.在SHM中编写一个伪prefork_child_bucket结构
+#### Reaching the function call
+任意函数调用的代码路径如下所示：
+    bucket_id = ap_scoreboard_image->parent[id]->bucket
+    my_bucket = all_buckets[bucket_id]
+    mutex = &my_bucket->mutex
+    apr_proc_mutex_child_init(mutex)
+    (*mutex)->meth->child_init(mutex, pool, fname)
+#### Calling something proper
+为了利用这个漏洞，我们要让( _mutex)- >meth->child_init指向zend_object_std_dtor(zend_object
+_object)，具体如下所示：
+    mutex = &my_bucket->mutex
+    [object = mutex]
+    zend_object_std_dtor(object)
+    ht = object->properties
+    zend_array_destroy(ht)
+    zend_hash_destroy(ht)
+    val = &ht->arData[0]->val
+    ht->pDestructor(val)
+其中，pDestructor被设置为system， &ht->arData[0]->val则是一个字符串。
+### 3\. 让all_buckets[bucket]指向该结构
+#### Problem and solution
+现在，如果all_buckets的地址在两次重新启动之间保持不变，我们的漏洞利用代码则能够：
+  * 能够读写PHP堆后面的所有内存空间 
+  * 通过匹配其结构查找all_buckets 
+  * 把我们的结构放入SHM 
+  * 更改shm中的某个process_score.bucket，以便让all_bucket[bucket]->mutex指向我们的payload代码 
+随着all_buckets的地址发生变化，我们可以通过两件事来提高可靠性：对SHM进行喷射处理，并使用所有process_score结构——每个PID一个。
+#### Spraying the shared memory
+如果all_buckets的新地址离旧地址不远的好，my_bucket将指向我们的结构。因此，我们可以将其全部喷射到SHM的未使用部分上，而不是将我们的prefork_child_bucket结构放到SHM的某个地址中问题是该结构也用作zend_object，因此，它的大小为
+(5 * 8 =)
+40个字节，用来保存zend_object.properties。实际上，在这么小的内存空间上喷射一个大的结构对我们来说没什么帮助。为了解决这个问题，我们叠加了两个中心结构apr_proc_mutex_t和zend_array，并将它们的地址喷射到共享内存的其余部分。这样的话，就会导致prefork_child_bucket.mutex和zend_object.properties指向同一地址。现在，如果all_bucket重分配到离其原始地址不远的地方，则my_bucket将位于喷射区域中。
+#### Using every process_score
+Apache的每个worker都有一个对应的process_score结构，以及一个bucket索引。我们可以修改每个processscore.bucket的值，而不是更改某个processscore.bucket的值，这样，它们就可以覆盖内存的其他部分，例如：
+    ap_scoreboard_image->parent[0]->bucket = -10000 -> 0x7faabbcc00 parent[1]->bucket = -20000 -> 0x7faabbdd00 parent[2]->bucket = -30000 -> 0x7faabbff00 <= all_buckets <= 0x7faabc0000
+这使我们的成功率需要乘以apache的worker的数量。在重新生成（respawn）时，只有一个worker获得有效的bucket号，但这不是问题，因为其他worker会崩溃，并立即重新生成（respawn）。
+#### Success rate
+不同的Apache服务器具有不同数量的worker。拥有更多的worker意味着我们可以在更少的内存上喷射mutex的地址，但这也意味着我们可以为all_buckets指定更多的索引。换句话说，拥有更多worker可以提高我们的成功率。在具有4个worker（默认数量）的测试Apache服务器上进行多次实验后，我发现成功率大约为80％左右。如果添加更多worker，成功率随之提高，最后成功率提升至100％左右。
+同样，如果漏洞利用失败，它可以在第二天重新启动，因为Apache仍将正常重启。然而，Apache的error.log将保存关于其worker的segfaulting的通知。
+### 4.待到早上6:25，漏洞触发
+## Vulnerability timeline
+  * 2019-02-22 首次发现，将相关情况通过电子邮件发送至Security[at]Apache[dot]org，包括相关说明和PoC 
+  * 2019-02-25 确认漏洞的，开始修复 
+  * 2019-03-07 Apache的安全小组发送了一个补丁程序供我审查，并分配相应的CVE编号 
+  * 2019-03-10 确认补丁程序有效 
+  * 2019-04-01 发布Apache HTTP2.4.39版本 
+感谢Apache团队给予及时响应和补丁，行动力太赞了。这是一次非常好的漏洞提交经历。不过，PHP从未就UAF安全漏洞给予响应。
+## Questions
+为何取这个名字？
+CARPE：代表CVE-2019-0211 Apache Root权限提升  
+DIEM：每天触发一次漏洞
+不取这样的名字，说不过去啊。
+这种利用方法是否可以进一步改进？
+当然。例如，bucket索引的计算方法并不稳定。这是PoC和正确利用漏洞之间的权衡问题。顺便说一下，我添加了大量的注释，这是为了帮助大家理解。
+该漏洞是否是针对PHP的？
+不，它的目标是Apache HTTP服务器。
+## Exploit
+漏洞利用代码很快就会公之于众。

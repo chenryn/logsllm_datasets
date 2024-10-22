@@ -1,0 +1,203 @@
+# Apache httpd Server CVE-2021-40438 漏洞分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x01 漏洞简介
+2021年9月16日，Apache官方发布了Apache httpd mod_proxy
+SSRF漏洞CVE-2021-40438，影响v2.4.48及以下版本。该漏洞影响范围较广，危害较大，利用简单，不得不引起重视。本文可配合之前的《Apache安全—挂钩分析》一起学习，笔者在本文重点介绍proxy钩子的漏洞细节，以及介绍如何分析Apache钩子的调试方式。
+## 0x02 漏洞搭建
+docker部署详见
+开启mod_proxy模块
+启用vhost配置文件
+/etc/httpd/extra/httpd-vhosts.conf 配置文件内容如下
+        ServerAdmin PI:EMAIL
+        DocumentRoot "/usr/local/httpd//docs/dummy-host.example.com"
+        ServerName dummy-host.example.com
+        ServerAlias www.dummy-host.example.com
+        ErrorLog "logs/dummy-host.example.com-error_log"
+        CustomLog "logs/dummy-host.example.com-access_log" common
+            ProxyPass http://127.0.0.1:8888
+使用gdb挂在httpd进程即可进行源码调试，如下图所示
+## 0x03 漏洞分析
+###  0x1 问题梳理
+老方法，在漏洞分析之前首先问自己几个问题，带着这些问题去调试思考，最终通过努力将会解答自己的疑惑。面对这个漏洞以及利用poc，笔者有如下几个问题
+1.apache代理关键逻辑是哪块函数处理的，从漏洞挖掘角度该怎么思考  
+2.为什么可以通过HTTP数据包覆盖配置文件里的代理路径  
+3.为什么需要这么多字符才能覆盖为http代理
+    GET /proxy?unix:A*6409|http://127.0.0.1:9999/vv HTTP/1.1
+    Host: 127.0.0.1:8787
+    User-Agent: curl/7.64.1
+    Accept: */*
+###  0x2 如何分析Apache代理模块
+Apache 配置的代理模式，其实是一个Apache
+Proxy组件。该组件也是通过挂钩函数注册在Apache程序中，其中处理函数为proxy_handler，钩子的注册函数为ap_hook_handler，钩子的执行函数为ap_run_handler。可以在/modules/proxy/mod_proxy.c函数中找到apache
+proxy注册的身影
+​
+那么何时调用呢？这个其实在分析CVE-2021-41773
+Apache路径穿越漏洞的时候就已经分析了，简单总结为在/modules/http/http_request.c中的ap_process_async_request函数处理解析请求数据包
+    void ap_process_async_request(request_rec *r)
+    {
+        conn_rec *c = r->connection;
+        int access_status;
+        ......
+        if (access_status == DECLINED) {
+            access_status = ap_process_request_internal(r);
+            if (access_status == OK) {
+                access_status = ap_invoke_handler(r);
+            }
+        }
+        ......
+    }
+在/server/config.c代码中存在如下处理逻辑
+    AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r)
+    {
+        ......
+        result = ap_run_handler(r);
+        ......
+    }
+然而通过之前总结的《Apache安全—挂钩分析》文章得知，ap_run_handler在源码中并没有实际实现，而是通过宏定义的方式去实现，有兴趣的小伙伴可以去学习下。笔者的分析如下利用ida打开httpd程序，我们可以看到ap_run_handler的实具体现逻辑。
+如上图所示v1为一个类似于虚表的结构，每40字节一个结构类型，处理函数的地址就存放在该结构的第一个4字节地址空间中。把断点下在第15行，通过下面的gdb脚本进行遍历打印
+    define FindHookList
+      set $ptr = $arg0
+      set $temp =  *(unsigned long long *)$ptr
+      while($temp != 0)
+         xinfo $temp
+         set $ptr = $ptr + 40
+         set $temp = *(unsigned long long *)$ptr
+      end
+    end
+脚本执行结果如下
+梳理一下大概有这几个钩子处理函数，然而这次漏洞就出现在了proxy_handler函数中
+    core_upgrade_handler
+    proxy_handler
+    status_handler
+    handle_autoindex
+    default_handler
+笔者通过查看汇编指令的方式查看地址对应的函数名
+找到proxy_handler的调用过程后，主要分析Apache代理模块是如何进行代理的
+###  0x3 Apache代理功能分析
+在/modules/proxy/mod_proxy.c中的proxy_handler函数入口r->filename的值为下图所示
+笔者发送的数据包为
+    GET /proxy/xxxx HTTP/1.1
+    Host: 127.0.0.1:8787
+    User-Agent: curl/7.64.1
+    Accept: */*
+显而易见，r->filename采用了proxy路径之后的内容与 proxy:http://127.0.0.1:8888/进行拼接，继续往下分析。  
+接下来一大段代码是首部字段 Max-Forwards的处理逻辑，这里就不再讲解了。再之后的代码如下
+    char *url = uri;
+    /* Try to obtain the most suitable worker */
+    access_status = ap_proxy_pre_request(&worker, &balancer, r, conf, &url);
+此处的uri为http://127.0.0.1:8888/xxxx
+，跟进ap_proxy_pre_request函数，最终来到了本次漏洞的主要函数fix_uds_filename
+fix_uds_filename函数开头部分判断了几个条件，是否为proxy:开头，其中是否包含了unix和| ，如果进入if判断这几个条件缺一不可。
+笔者采用的配置方式如下所示，因此不会进入fix_uds_filename函数主逻辑进行处理。
+    ProxyPass http://127.0.0.1:8888
+同样的如下配置也是不能够进入到主处理逻辑的，因为不包含|
+    ProxyPass unix:///tmp/xxxx
+其实细心的同学们已经发现fix_uds_filename的第二个参数为引用参数，当函数执行完之后会将结果会传给实参。再往上追溯ap_proxy_pre_request函数也是采用引用参数的形式获取url的值，worker和balancer参数同理
+那么究竟如何给这个url赋值呢？他到底有什么作用？即使配置成这样也是不能进入处理逻辑
+    ProxyPass "unix:/tmp/xxxx|http://127.0.0.1:8888/"
+经过前面函数的处理只保留了http部分内容，接下来就是漏洞payload构造环节了
+###  0x4 为什么可以替换代理内容
+那么可以猜想xxxx部分内容是否可控，比如发送如下数据包
+    GET /proxy/xxxx?unix:///tmp/xxxx|http://127.0.0.1:8888/ HTTP/1.1
+    Host: 127.0.0.1:8787
+    User-Agent: curl/7.64.1
+    Accept: */*
+在后端查看log日志显示内容如下，attempt to connect to Unix domain socket
+/tmp/xxxx，这说明已经把之前配置文件里代理到http://127.0.0.1:8888/链接的配置修改为了访问Unix domain
+socket套接字。
+接着上一小节继续分析，这中间到底发生了什么导致从GET
+url传递的path路径最后经过apache的解析覆盖了配置里的路径。具体细节在fix_uds_filename写的很清楚
+    static void fix_uds_filename(request_rec *r, char **url) 
+    {
+        char *ptr, *ptr2;
+        if (!r || !r->filename) return;
+        if (!strncmp(r->filename, "proxy:", 6) &&
+                (ptr2 = ap_strcasestr(r->filename, "unix:")) &&
+                (ptr = ap_strchr(ptr2, '|'))) {//判断r->filename中是否包含proxy:、unix:以及|
+            apr_uri_t urisock;
+            apr_status_t rv;
+            *ptr = '\0';//用来分割unix domain socket 和 http协议
+            rv = apr_uri_parse(r->pool, ptr2, &urisock);
+            if (rv == APR_SUCCESS) {
+                char *rurl = ptr+1;//获取代理的http路径
+                char *sockpath = ap_runtime_dir_relative(r->pool, urisock.path);
+                apr_table_setn(r->notes, "uds_path", sockpath);
+                *url = apr_pstrdup(r->pool, rurl); /* so we get the scheme for the uds */
+                /* r->filename starts w/ "proxy:", so add after that */
+                memmove(r->filename+6, rurl, strlen(rurl)+1);//覆盖原有代理路径为新的http路径
+                ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                        "*: rewrite of url due to UDS(%s): %s (%s)",
+                        sockpath, *url, r->filename);
+            }
+            else {
+                *ptr = '|';
+            }
+        }
+    }
+最后通过fix_uds_filename的一波操作后r->filename 变为了新的代理url。调试分析如下
+函数入口处的r->filename为带有|分割的两个代理路径，最后通过以下两条语句获取uds_path和rurl
+    rv = apr_uri_parse(r->pool, ptr2, &urisock); // 从ptr2获取uds path
+    char *rurl = ptr+1;// 取|后的内容
+可以看到代码的最后使用memmove函数替换r->filename 6字节之后的内容，如下图所示
+细心读者可能会注意到一个为9999端口一个为/tmp/xxxx uds
+文件，为什么最后代理的是uds文件而不是9999端口呢？这要看proxy_handler之后的代码。
+###  0x5 如何将代理替换为http协议
+在mod_proxy模块中也有钩子的使用，在proxy_handler代码中有一处如下函数调用。
+    access_status = proxy_run_scheme_handler(r, worker,
+                                             conf, url,
+                                             ents[i].hostname,
+                                             ents[i].port);
+在 **P神**
+的分析文章中直接把代码定位到了下面的部分，但是如果不了解apache函数调用机制的话，不知道是如何调用过来的，如果跟踪调用栈的话，只知道从proxy_run_scheme_handler到proxy_http_handler，虽然中间发生了很多事，但对调试者来说是透明的。和之前的钩子分析类似，scheme_handler也是一种挂钩，笔者找到了声明和注册的相关代码。
+注册挂钩函数内容
+p神在分析文章中提到的关键代码
+    uds_path = (*worker->s->uds_path ? worker->s->uds_path : apr_table_get(r->notes, "uds_path"));
+    if (uds_path) {//如果是null 则会使用http协议
+        if (conn->uds_path == NULL) {
+            /* use (*conn)->pool instead of worker->cp->pool to match lifetime */
+            conn->uds_path = apr_pstrdup(conn->pool, uds_path);
+        }
+        // ...
+        conn->hostname = "httpd-UDS";
+        conn->port = 0;
+    }
+    else {
+        // ...
+        conn->hostname = apr_pstrdup(conn->pool, uri->hostname);
+        conn->port = uri->port;
+        // ...
+    }
+那么如何让uds_path为空就是这个漏洞将要解决的问题，把目光继续转向生成uds_path的关键代码。
+    char *sockpath = ap_runtime_dir_relative(r->pool, urisock.path);
+    apr_table_setn(r->notes, "uds_path", sockpath);
+影响返回值的关键函数是apr_filepath_merge，代码将会根据该函数返回值，返回相应的内容。
+    AP_DECLARE(char *) ap_runtime_dir_relative(apr_pool_t *p, const char *file)
+    {
+        char *newpath = NULL;
+        apr_status_t rv;
+        const char *runtime_dir = ap_runtime_dir ? ap_runtime_dir : ap_server_root_relative(p, DEFAULT_REL_RUNTIMEDIR);
+        rv = apr_filepath_merge(&newpath, runtime_dir, file,
+                                APR_FILEPATH_TRUENAME, p);
+        if (newpath && (rv == APR_SUCCESS || APR_STATUS_IS_EPATHWILD(rv)
+                                          || APR_STATUS_IS_ENOENT(rv)
+                                          || APR_STATUS_IS_ENOTDIR(rv))) {
+            return newpath;
+        }
+        else {
+            return NULL;
+        }
+    }
+但是apr函数不在apache源代码里，通过查看apr-1.6.3源码可以分析其中的逻辑，该函数在apr-1.6.3/file_io/unix/filepath.c
+通过调试分析，该部分绕过就显而易见了，只需控制maxlen>APR_PATH_MAX
+即可，addpath为uninx://和|之间的字符串，所以在构造payload的时候只需将长度控制在一定大小就能让Apache转发给指定的http端口。到此该漏洞的大部分内容已经分析完了，该漏洞涉及到了大量的httpd
+调试技术，笔者在之前的分析文章中也有介绍。
+###  0x6 如何修复
+在2.4.49版本代码中使用了ap_cstr_casecmpn，该函数不区分大小写的比较两个字符串的前5个字符。
+这也就意味着只能是 proxy:unix:
+开头的字符串才能进入该分支，然而这并不属于用户控制的范围。但是如果在原用配置中使用了uds配置，则会进入该分支，至于会不会产生漏洞，笔者没有进一步测试。
+## 0x04 总结
+该ssrf代理访问漏洞适用于apache的绝大多是版本，相对来说漏洞原理比较简单，隐藏了多年也是很不容易了，至于危害的话，笔者认为危害还是挺大的，可以访问到服务器内部一些不对外开放的http端口及uds文件。整个分析流程已经完整呈现在大家面前，很多借鉴了p神和Firzen文章里的分析步骤，如有问题多多指正。
+## 参考文献

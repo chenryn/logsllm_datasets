@@ -1,0 +1,64 @@
+Runtime，唯一的不同点是有个额外的参数用来指定MachO文件头的地址。
+初始化完成后调用`call
+__ZN13dyldbootstrap5startEPK12macho_headeriPPKclS2_Pm`，demangle之后为下面的函数:
+    // //  This is code to bootstrap dyld.  This work in normally done for a program by dyld and crt. //  In dyld we have to do this manually. // uintptr_t start(const struct macho_header* appsMachHeader, int argc, const char* argv[],              intptr_t slide, const struct macho_header* dyldsMachHeader,             uintptr_t* startGlue) {     // if kernel had to slide dyld, we need to fix up load sensitive locations // we have to do this before using any global variables if ( slide != 0 ) {  rebaseDyld(dyldsMachHeader, slide); }   // allow dyld to use mach messaging mach_init();    // kernel sets up env pointer to be just past end of agv array const char** envp = &argv[argc+1];  // kernel sets up apple pointer to be just past end of envp array const char** apple = envp; while(*apple != NULL) { ++apple; } ++apple;     // set up random value for stack canary __guard_setup(apple); #if DYLD_INITIALIZER_SUPPORT // run all C++ initializers inside dyld runDyldInitializers(dyldsMachHeader, slide, argc, argv, envp, apple); #endif     // now that we are done bootstrapping dyld, call dyld's main uintptr_t appsSlide = slideOfMainExecutable(appsMachHeader); return dyld::_main(appsMachHeader, appsSlide, argc, argv, envp, apple, startGlue); } 
+所以dyld真正的入口地址是`dyld::_main`，该函数的功能主要有:
+  1. 初始化上下文(setContext)
+  2. 将可执行文件的路径转为绝对路径
+  3. 处理环境变量
+  4. 判断是否需要加载共享缓存库，如果需要加载则直接映射到内存中(mapSharedCache)
+  5. 加载注入的动态库(sEnv.DYLD_INSERT_LIBRARIES)
+  6. 链接主程序(dyld::link)，实际上用的是虚函数`ImageLoader::link`
+  7. initializeMainExecutable: 运行初始化函数(`__mod_init_funcs`)
+  8. 执行最终的目标程序(LC_MAIN/LC_UNIXTHREAD)
+最终目标程序正常执行，就像自己直接启动一样。下面挑几个比较关键的点进行深入分析。
+### linking
+链接是dyld的主要功能，执行实际动态链接功能的是link函数，除了链接待执行的目标程序，还链接所有插入的其他动态库:
+            // link main executable     gLinkContext.linkingMainExecutable = true;  link(sMainExecutable, sEnv.DYLD_BIND_AT_LAUNCH, true, ImageLoader::RPathChain(NULL, NULL));     // link any inserted libraries  // do this after linking main executable so that any dylibs pulled in by inserted   // dylibs (e.g. libSystem) will not be in front of dylibs the program uses  if ( sInsertedDylibCount > 0 ) {        for(unsigned int i=0; i setNeverUnloadRecursive();       }       // only INSERTED libraries can interpose        // register interposing info after all inserted libraries are bound so chaining works       for(unsigned int i=0; i registerInterposing();       }   } 
+而`dyld:link`使用的是具体ImageLoader的link多态实现:
+    void link(ImageLoader* image, bool forceLazysBound, bool neverUnload, const ImageLoader::RPathChain& loaderRPaths) { // add to list of known images.  This did not happen at creation time for bundles if ( image->isBundle() && !image->isLinked() )   addImage(image);    // we detect root images as those not linked in yet  if ( !image->isLinked() )  addRootImage(image);  // process images try {   image->link(gLinkContext, forceLazysBound, false, neverUnload, loaderRPaths); } catch (const char* msg) {   garbageCollectImages();     throw; } } 
+sMainExecutable的实现在开源代码中并没有给出，不过参考基类的默认实现如下:
+    void ImageLoader::link(const LinkContext& context, bool forceLazysBound, bool preflightOnly, bool neverUnload, const RPathChain& loaderRPaths) { //dyld::log("ImageLoader::link(%s) refCount=%d, neverUnload=%d\n", this->getPath(), fDlopenReferenceCount, fNeverUnload);  // clear error strings (*context.setErrorStrings)(dyld_error_kind_none, NULL, NULL, NULL);  uint64_t t0 = mach_absolute_time(); this->recursiveLoadLibraries(context, preflightOnly, loaderRPaths); context.notifyBatch(dyld_image_state_dependents_mapped);  // we only do the loading step for preflights if ( preflightOnly )    return;      uint64_t t1 = mach_absolute_time(); context.clearAllDepths(); this->recursiveUpdateDepth(context.imageCount());    uint64_t t2 = mach_absolute_time();     this->recursiveRebase(context); context.notifyBatch(dyld_image_state_rebased);  uint64_t t3 = mach_absolute_time();     this->recursiveBind(context, forceLazysBound, neverUnload);     uint64_t t4 = mach_absolute_time(); if ( !context.linkingMainExecutable )   this->weakBind(context); uint64_t t5 = mach_absolute_time();        context.notifyBatch(dyld_image_state_bound); uint64_t t6 = mach_absolute_time();        std::vector dofs; this->recursiveGetDOFSections(context, dofs); context.registerDOFs(dofs); uint64_t t7 = mach_absolute_time();        // interpose any dynamically loaded images if ( !context.linkingMainExecutable && (fgInterposingTuples.size() != 0) ) {     this->recursiveApplyInterposing(context); }  // clear error strings  // ... } 
+主要做的就是这几步:
+  1. recursiveLoadLibraries
+  2. recursiveUpdateDepth
+  3. recursiveRebase
+  4. recursiveBind
+  5. weakBind
+  6. recursiveGetDOFSections
+根据名字不难看出其作用，其中大部分函数名称带recursive，这是因为动态库本身也可能会依赖其他的动态库，因此需要递归进行处理(当然循环依赖会有对应的处理)。其中`recursiveUpdateDepth`不太直观，其实作用只是为了对镜像进行排序，被依赖的库会出现在依赖者之前。
+### dyld_cache
+在上面第4步中说到要加载共享缓存库，这是个什么东西呢？这一步的目的其实是为了加速动态库的加载过程。对于我们自己编译的macOS命令行程序可能还好，但是对于图形界面应用来说，每个应用启动时需要加载的动态库可能有上百个，而其中很大一部分是系统库，比如UIKit、Foundation等。因此苹果就事先把这些常用的库打包成缓存，程序启动时候直接映射到内存中，而无需逐个执行繁琐的处理和解析。
+映射共享缓存库的函数为`mapSharedCache`，首先检查共享缓存库是否已经映射过:
+    static int __attribute__((noinline)) _shared_region_check_np(uint64_t* start_address) { if ( gLinkContext.sharedRegionMode == ImageLoader::kUseSharedRegion )   return syscall(294, start_address); return -1; } 
+294号系统调用定义在内核中(bsd/kern/syscalls.master):
+    294 AUE_NULL    ALL { int shared_region_check_np(uint64_t *start_address) NO_SYSCALL_STUB; } 295    AUE_NULL    ALL { int shared_region_map_np(int fd, uint32_t count, const struct shared_file_mapping_np *mappings) NO_SYSCALL_STUB; } 
+内核中的实现也比较简单，忽略错误检查，关键的代码如下:
+    int shared_region_check_np( __unused struct proc            *p, struct shared_region_check_np_args  *uap, __unused int              *retvalp) {  // ...  shared_region = vm_shared_region_get(current_task()); if (shared_region != NULL) {         /* retrieve address of its first mapping... */  kr = vm_shared_region_start_address(shared_region,                      &start_address);            /* ... and give it to the caller */     error = copyout(&start_address,                 (user_addr_t) uap->start_address,               sizeof (start_address));    // ...  vm_shared_region_deallocate(shared_region);  } } 
+其内部实现姑且不管，继续回到用户空间，所返回的地址可以强制转换为`dyld_cache_header`格式:
+    struct dyld_cache_header { char     magic[16];              // e.g. "dyld_v0    i386" uint32_t  mappingOffset;          // file offset to first dyld_cache_mapping_info uint32_t    mappingCount;           // number of dyld_cache_mapping_info entries uint32_t   imagesOffset;           // file offset to first dyld_cache_image_info uint32_t  imagesCount;            // number of dyld_cache_image_info entries uint64_t dyldBaseAddress;        // base address of dyld when cache was built uint64_t   codeSignatureOffset;    // file offset of code signature blob uint64_t  codeSignatureSize;      // size of code signature blob (zero means to end of file) uint64_t slideInfoOffset;        // file offset of kernel slid info uint64_t slideInfoSize;          // size of kernel slid info uint64_t    localSymbolsOffset;     // file offset of where local symbols are stored uint64_t   localSymbolsSize;       // size of local symbols information uint8_t        uuid[16];               // unique value for each shared cache file uint64_t cacheType;              // 1 for development, 0 for optimized }; 
+检查共享缓存空间存在则直接复制其UUID到进程的`sharedCacheUUID`中，然后直接使用该缓存。
+如果不存在，就需要进行创建，创建的过程如下:
+  1. 如果是x86环境，需要判断当前是否为安全启动模式，则会删除之前余留的cache文件，路径为`/var/db/dyld/dyld_shared_cache_$arch`
+  2. 打开sharedCache文件，对于IPhone路径为`/System/Library/Caches/com.apple.dyld/dyld_shared_cache_$arch`
+  3. 读取文件的前8192字节转换为`struct dyld_cache_header`，并做一些合法性检查
+  4. 处理cache文件，主要是将mapping信息提取出来，保存为一个数组`mappings[]`
+  5. 调用`_shared_region_map_and_slide_np`映射每个mapping
+mapping信息如下:
+    struct dyld_cache_mapping_info { uint64_t   address; uint64_t   size; uint64_t  fileOffset; uint32_t    maxProt; uint32_t   initProt; }; 
+和之前提到的segment信息类似，没有feilsize，因为不存在padding。
+`_shared_region_map_and_slide_np`函数分别处理每个mapping，并最终使用`mmap`来完成cache到内存的映射操作。
+> 每个mapping info对应一个`struct
+> shared_file_mapping_np`，但是这个结构体的定义在开源代码中没找到，并且在苹果文档中也进行了隐藏，见:
+> 
+# 后记
+本文通过对MachO文件的文件格式研究，介绍了MacOS和iOS中可执行文件的加载过程，从内核中的处理一直到动态连接器dyld的代码分析。可以看出MachO与ELF相比实现方式各有千秋，但是在内核中原生增加了对代码的签名和加密，其实ELF也很容易实现类似的功能，但开放系统需要更多考虑兼容性的问题，不像苹果可以大刀阔斧的随便改。
+对于MachO的深入理解其实也有助于日常的相关研究，比如Apple
+Store的加密实现以及代码签名的大致原理，还有针对dyld_cache的处理等，其中每一项都值得去深入挖掘。而且本文也没有介绍到全部的MachO特性，比如Objective-C相关的段，具体的实战部分后面有时间会再去整理一下。
+# 参考资料
+  * [Overview of the Mach-O Executable Format](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/CodeFootprint/Articles/MachOOverview.html)
+  * [Mach Object Files](http://www.cilinder.be/docs/next/NeXTStep/3.3/nd/DevTools/14_MachO/MachO.htmld/index.html)
+  * [apple/darwin-xnu](https://github.com/apple/darwin-xnu)
+  * [opensource-apple/dyld](https://github.com/opensource-apple/dyld)
+  * RTFSC
+* * *

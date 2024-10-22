@@ -1,0 +1,163 @@
+作者：Leeqwind  
+作者博客：
+本文将对 CVE-2016-0165 (MS16-039)
+漏洞进行一次简单的分析，并尝试构造其漏洞利用和内核提权验证代码，以及实现对应利用样本的检测逻辑。分析环境为 Windows 7 x86 SP1
+基础环境的虚拟机，配置 1.5GB 的内存。
+本文分为三篇：
+从 CVE-2016-0165 说起：分析、利用和检测（上）
+[从 CVE-2016-0165 说起：分析、利用和检测（中）](https://paper.seebug.org/580/ "从
+CVE-2016-0165 说起：分析、利用和检测（中）")
+[从 CVE-2016-0165 说起：分析、利用和检测（下）](https://paper.seebug.org/581/ "从
+CVE-2016-0165 说起：分析、利用和检测（下）")
+#### 0x0 前言
+CVE-2016-0165 是一个典型的整数上溢漏洞，由于在 `win32k!RGNMEMOBJ::vCreate`
+函数中分配内核池内存块前没有对计算的内存块大小参数进行溢出校验，导致函数有分配到远小于所期望大小的内存块的可能性。而函数本身并未对分配的内存块大小进行必要的校验，在后续通过该内存块作为缓冲区存储数据时，将会触发缓冲区溢出访问的
+OOB 问题，严重情况将导致系统 BSOD 的发生。
+本分析中利用该特性，通过内核内存布局的设计以及内核对象的构造，使 `win32k!RGNMEMOBJ::vCreate`
+函数分配的固定大小的内存块被安置在某一内存页的末尾位置，其下一内存页由我们之前分配的垫片对象和位图对象填充。在
+`win32k!RGNMEMOBJ::vCreate` 函数接下来调用 `vConstructGET`
+函数期间，溢出访问发生在可控的内存区域和范围，下一内存页中我们所分配的垫片和位图对象将被溢出覆盖，其中的数据被破坏。根据精心布局的内存结构，位图对象的
+`sizlBitmap.cy` 成员正好被覆盖成了 `0xFFFFFFFF` 数值，这将使该位图对象拥有完整内存空间访问的能力。
+然而由于该位图对象的 `pvScan0`
+成员值未被覆盖，所以该对象读写内存数据时，只能从自身所关联的位图数据区域首地址作为访问的起始地址。而由于提前精心布局的内存结构，该位图对象下一内存页中对应的位置仍旧存储由我们分配的位图对象，通过当前位图对象作为管理对象，以整内存页读写的方式，对其下一内存页中的位图对象的
+`pvScan0`
+成员的值进行修改，使其指向我们想要读写访问的内存地址，将下一位图对象作为扩展对象，然后操作扩展对象对指定的内存区域进行读写访问，以指哪、打哪两步走操作的方式，实现任意内核内存地址读写的能力。
+利用实现的任意内核内存地址读写的能力，通过定位 `System` 进程的 `EPROCESS` 对象地址和当前进程的 `EPROCESS` 对象地址，以
+`Token` 指针替换的方式实现内核提权的目的。
+在本分析中，将对该漏洞的逻辑、触发机理、利用对策等进行由浅入深的探索，并将探究本分析中所涉及到的系统函数在内核中是如何关联在一起的。为减小文章数据占用空间，因此将大部分
+IDA 和 WinDBG 分析调试的代码数据截图以代码清单的方式呈现。
+本次分析涉及或间接涉及到的类或结构体可在[《图形设备接口子系统的对象解释》](https://xiaodaozhi.com/win32k-gdi-object.html "《图形设备接口子系统的对象解释》")文档中找到解释说明。
+#### 0x1 原理
+CVE-2016-0165 是 `win32k` 内核模块中 GDI
+子系统的一个典型的整数向上溢出漏洞。整数向上溢出漏洞通常的特征是：当某个特定的整数变量的数值接近其整数类型的上限、而代码逻辑致使未进行适当的溢出校验就对该变量的值继续增加时，将导致发生整数溢出，使该变量数值的高位丢失，变成远小于其本应成为的数值；如果该变量将作为缓冲区大小或数组的元素个数，继而将使依赖该缓冲区大小或数组元素个数变量的后续代码发生诸如缓冲区溢出、越界访问等问题。
+* * *
+**漏洞位置**
+漏洞发生在 `win32k!RGNMEMOBJ::vCreate` 函数中，该函数是 `RGNMEMOBJ` 内存对象类的成员函数，用于依据路径
+`PATH` 对象对当前 `RGNMEMOBJ` 对象所关联的区域 `REGION` 对象进行初始化。通过补丁比对，发现以下主要不同的地方：
+      if ( 0x28 * (v6 + 1) )
+      {
+        v12 = ExAllocatePoolWithTag((POOL_TYPE)0x21, 0x28 * (v6 + 1), 'ngrG');
+        v7 = a4;
+        P = v12;
+      }
+      else
+      {
+        P = 0;
+      }
+清单 1-1 补丁前
+      if ( ULongAdd(NumberOfBytes, 1u, &NumberOfBytes) >= 0
+        && ULongLongToULong(0x28 * NumberOfBytes, 0x28 * NumberOfBytes >> 32, &NumberOfBytes) >= 0 )
+      {
+        P = NumberOfBytes ? ExAllocatePoolWithTag((POOL_TYPE)0x21, NumberOfBytes, 'gdeG') : 0;
+        if ( P )
+        {
+          v6 = a4;
+          NumberOfBytes = 1;
+          ...
+        }
+        ...
+      }
+清单 1-2 补丁后
+函数中有一处 `ExAllocatePoolWithTag` 调用，用来分配在构造 `REGION` 时容纳中间数据的临时缓冲区，并在函数返回之前调用
+`ExFreePoolWithTag` 释放前面分配的缓冲区内存。
+补丁在 `RGNMEMOBJ::vCreate` 函数中调用 `ExAllocatePoolWithTag` 分配内存之前，增加了 `ULongAdd` 和
+`ULongLongToULong` 两个函数调用。函数 `ULongAdd` 用来将参数 1 和参数 2 相加并将值放置于参数 3 指针指向的
+`ULONG` 类型变量中；函数 `ULongLongToULong` 用于将 `ULONGLONG` 类型的参数 1 转换为 `ULONG`
+类型数值并放置在参数 2 指针指向的变量中。这两个函数在调用时如果发现运算的数值超出 `ULONG` 整数的范围，将会返回
+`ERROR_ARITHMETIC_OVERFLOW` (`0x80070216`)
+的错误码，所以通常被调用来防止发生整数溢出的问题。在该漏洞所在函数中，补丁增加这两个调用则用来防止 `ExAllocatePoolWithTag` 的参数
+`SIZE_T NumberOfBytes` 发生整数溢出。
+除去防止整数溢出的作用外，上面的“补丁后”代码片段增加的两个函数调用计算结果等同于：
+    NumberOfBytes = 0x28 * (NumberOfBytes + 1);
+对比补丁前后的代码片段可知两者含义基本相同，均是用来指示 `ExAllocatePoolWithTag` 函数调用分配用以存储“特定数量”+1 个
+`0x28` 单位大小元素的内存缓冲区。这个“特定数量”的数值来自于参数 `a2` 指向的 `EPATHOBJ+4` 字节偏移的域：
+      v6 = *((_DWORD *)a2 + 1);
+      v38 = v6;
+      if ( v6 < 2 )
+        return;
+清单 1-3 函数 RGNMEMOBJ::vCreate 对 v6 进行赋值
+位于 `EPATHOBJ+4` 字节偏移的域是定义为 `ULONG cCurves` 的成员变量，用于定义当前 `EPATHOBJ` 用户对象的曲线数目。
+调用 `ExAllocatePoolWithTag` 函数分配内存缓冲区后，在随后的代码逻辑中，缓冲区地址的指针将被作为第 3 个参数传入
+`vConstructGET` 函数调用。
+      v24 = (struct EDGE *)P;
+      *(_DWORD *)(*(_DWORD *)v5 + 0x30) = 0x48;
+      *(_DWORD *)(*(_DWORD *)v5 + 0x18) = 0;
+      *(_DWORD *)(*(_DWORD *)v5 + 0x14) = 0;
+      *(_DWORD *)(*(_DWORD *)v5 + 0x34) = 0;
+      *(_DWORD *)(*(_DWORD *)v5 + 0x1C) = *(_DWORD *)v5 + 0x48;
+      v25 = *(_DWORD *)v5 + 0x20;
+      *(_DWORD *)(v25 + 4) = v25;
+      *(_DWORD *)v25 = v25;
+      vConstructGET(a2, (struct EDGE *)&v30, v24, a4);
+清单 1-4 内存地址的指针作为第 3 个参数传入 vConstructGET 函数
+* * *
+**vConstructGET**
+函数 `vConstructGET` 用于根据路径建立全局边表，全局边表以 Y-X 坐标序列构成。调用 `vConstructGET`
+时将前面分配的内存指针是作为 `struct EDGE *` 类型的指针参数传入的。由此可见，该内存缓冲区将作为“特定数量”个单位大小为 `0x28` 的
+`struct EDGE` 类型元素的数组发挥作用。查阅相关资料，在 WinNT4 源码 (`fillpath.c`) 中发现 `EDGE`
+数据结构的相关定义：
+    // Describe a single non-horizontal edge of a path to fill.
+    typedef struct _EDGE {
+        PVOID pNext;            //<[00,04]
+        INT iScansLeft;         //<[04,04]
+        INT X;                  //<[08,04]
+        INT Y;                  //<[0C,04]
+        INT iErrorTerm;         //<[10,04]
+        INT iErrorAdjustUp;     //<[14,04]
+        INT iErrorAdjustDown;   //<[18,04]
+        INT iXWhole;            //<[1C,04]
+        INT iXDirection;        //<[20,04]
+        INT iWindingDirection;  //<[24,04]
+    } EDGE, *PEDGE;
+清单 1-5 结构体 EDGE 的定义
+结构体 `EDGE` 用于描述将要填充的路径中的单个非水平（不与 Y 轴平行的）边。在 32 位环境下，该结构体的大小是 `0x28` 字节。
+在函数 `vConstructGET` 中循环调用 `AddEdgeToGET` 函数，将路径中通过两点描述的边依次添加到全局边表中。
+      for ( pptfxStart = 0; ppr; ppr = *(struct PATHRECORD **)ppr )
+      {
+        pptfx = (struct PATHRECORD *)((char *)ppr + 0x10);
+        if ( *((_BYTE *)ppr + 8) & 1 )
+        {
+          pptfxStart = (struct PATHRECORD *)((char *)ppr + 0x10);
+          pptfxPrev = (struct PATHRECORD *)((char *)ppr + 0x10);
+          pptfx = (struct PATHRECORD *)((char *)ppr + 0x18);
+        }
+        for ( pptfxEnd = (struct PATHRECORD *)((char *)ppr + 8 * *((_DWORD *)ppr + 3) + 0x10);
+              pptfx < pptfxEnd;
+              pptfx = (struct _POINTFIX *)((char *)pptfx + 8) )
+        {
+          pFreeEdges = AddEdgeToGET(pGETHead, pFreeEdges, pptfxPrev, pptfx, pBound);
+          pptfxPrev = pptfx;
+        }
+        if ( *((_BYTE *)ppr + 8) & 2 )
+        {
+          pFreeEdges = AddEdgeToGET(pGETHead, pFreeEdges, pptfxPrev, pptfxStart, pBound);
+          pptfxPrev = 0;
+        }
+      }
+清单 1-6 函数 vConstructGET 代码片段
+其中，函数 `vConstructGET` 的第 3 个参数 `struct EDGE *pFreeEdges` 即前面分配的内存缓冲区指针，调用
+`AddEdgeToGET` 时 `pFreeEdges` 作为参数 `a2` 传入。在依次调用的 `AddEdgeToGET`
+函数中，将通过两点描述的边添加到全局边表中，并将相关数据写入当前 `a2` 参数指向的 `EDGE` 结构体元素，最后将下一个 `EDGE`
+元素地址作为返回值返回：
+      *(_DWORD *)pFreeEdge = v24;
+      *(_DWORD *)v23 = pFreeEdge;
+      return (struct EDGE *)((char *)pFreeEdge + 0x28);
+清单 1-7 函数 AddEdgeToGET 将 pFreeEdges 数组下一个元素地址作为返回值
+如果前面分配内存时分配大小满足了溢出条件，那么将会分配远小于所期望长度的内存缓冲区，但存储于数据结构中的数组元素个数仍是原来期望的数值，在循环调用
+`AddEdgeToGET` 函数逐个操作 `pFreeEdges`
+数组元素时，由于进行了大量的写入操作，将会造成缓冲区访问越界覆盖其他数据，发生不可预料的问题，从而导致系统 `BSOD` 的触发。
+#### 0x2 追踪
+为了复现漏洞，需要找一条通往 `RGNMEMOBJ::vCreate` 中漏洞关键位置的调用路径。在 `win32k` 中有很多函数都会调用
+`RGNMEMOBJ::vCreate` 函数。
+图 2-1 RGNMEMOBJ::vCreate 的引用列表
+在前面的章节已知，漏洞触发关键变量 `v6` 来源于 `RGNMEMOBJ::vCreate` 函数的 `EPATHOBJ *a2`
+参数。通过在引用列表中逐项比对之后决定选取 `NtGdiPathToRegion` 函数作为调用接口。
+* * *
+**NtGdiPathToRegion**
+函数 `NtGdiPathToRegion` 用于根据被选择在 `DC` 对象中的路径 `PATH` 对象创建区域 `REGION`
+对象，生成的区域将使用设备坐标，唯一的参数 `HDC a1` 是指向某个设备上下文 `DC`
+对象的句柄。由于区域的转换需要闭合的图形，所以在函数中执行转换之前，函数会将 `PATH`
+中所有未闭合的图形闭合。在成功执行从路径到区域的转换操作之后，系统将释放目标 `DC` 对象中的闭合路径。另外该函数可在用户态进程中通过
+`gdi32.dll` 中的导出函数在用户进程中进行直接调用，这给路径追踪带来便利。
+      DCOBJ::DCOBJ(&v9, a1);
+      ...

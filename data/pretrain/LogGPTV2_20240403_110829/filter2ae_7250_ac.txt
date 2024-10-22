@@ -1,0 +1,151 @@
+`hdev->tx_work` 来完成控制流劫持了。实际上，相关的 `work_struct` 中确实存在可口的函数指针。
+    typedef void (*work_func_t)(struct work_struct *work);
+    struct work_struct {
+        atomic_long_t data;
+        struct list_head entry;
+        work_func_t func;
+    #ifdef CONFIG_LOCKDEP
+        struct lockdep_map lockdep_map;
+    #endif
+    };
+即成员 `work_func_t func`。由于我们可以覆盖完整的整个 `hdev` 对象，去把这几个 `work_struct`
+改掉看起来也只是小菜一碟哈。
+只不过，我又错了。
+仅仅去覆盖掉 `work_struct` 是没有用的，因为 `queue_work()`
+必须要求一个合法的工作队列来承载这个要被调度的工作。即我们需要一个合法的 `hdev->workqueue` 才能完成上述的攻击。
+这有可能可以做到么？`workqueue`是`hdev`下的一个指针对象，如果我们能将其改写成一个已知的而且指向合法的工作队列的指针的话，事情就可以顺利进行。
+虽然听起来合理，但这个方案难度是很大的。因为 `workqueue_struct` 并非是全局的数据结构，而是在 `hdev`
+对象注册时候被动态创建的，位于内核的SLUB堆上。即使在前文我们已经完成了对于KASLR的泄露绕过，但我们并没有任意读能力，因此想泄露出一个合法工作队列所在的堆地址这一方案实在是黄粱美梦。
+当然，安全研究者永不言败，如果没法覆盖一个新的工作队列指针上去，那我们就想办法用旧的吧！`hdev`对象在堆喷覆盖之前，其`workqueue`成员指向的是已经在`hci_unregister_dev()`中被释放掉的一个工作队列，换言之，其指向的是一个被释放了的，`kmalloc-512`的堆对象。我们可以再次使用堆喷的方式，想办法在该位置上喷射上去一个合法的工作队列。
+针对`workqueue_struct`的喷洒已经是利用中的第二次堆喷了，有趣的是，这一次堆喷并不是要喷我们自己的数据，而是想喷上去一个合法的工作队列结构体。所以堆喷的路径并非大家知道的`msg`,
+`setxattr`。我的做法就是想办法再多创建一些虚拟的蓝牙设备，毕竟每个设备初始化的时候都会创建`hdev`中的工作队列的。
+>
+> 值得一提，对于`workqueue_struct`的喷射比之前对于`hdev`的喷射要困难了许多，这是因为`kmalloc-512`的对象好像非常“热门”，总是有地方冒出来。在我的利用中，我通过调整设备初始化的顺序来增加喷射的成功率，细节可以见代码。
+当这一次喷射成功时，`workqueue`指针就指向了一个合法的工作队列，而 `queue_work` 就可以成功将需要被调度的 `work_struct`
+压入工作队列。不过呢，因为在 `hdev` 中 `workqueue` 在 `cmd_work` 和 `tx_work`
+的前面，所以我们没法在这一步就去覆盖掉 `work_struct` 的 `fn` 成员。
+不过这其实还好，因为将要被调度的 `hci_cmd_work` 或者 `hci_tx_work` 都会跑到一个会使用到 `hdev` 内函数指针的
+`hci_send_frame` 代码内，我们可以在那个时候再搞定控制流。
+只不过呢，我又又错了。
+因为，这个利用思路非常不稳定：我们没法很好地预测工作队列调度目标 `work_struct` 的时间，这个时延可能非常短，以至于我根本没有机会让
+`setxattr`
+喷上我想要的数据而函数指针就已经被用过了。这些该死的函数指针偏偏放在结构体的末尾，我又偏偏需要`hdev`中保留的`workqueue`的值，如下逻辑。
+    ====> overwrite the hdev
+    +--+-----------+-----+---------+----------+---------+-----+---------------+
+       | workqueue | ... | rx_work | cmd_work | tx_work | ... | code pointers |
+    +--+-----------+-----+---------+----------+---------+-----+---------------+
+真是伤脑筋，难道就没有一个比较好的，可以预测的访问函数指针的位置么？
+当然，或者说碰巧，是有的。正如老话所言，当上帝把门关上时，他一定会打开一扇窗。我在已有的调用路径上发现了又一个财宝，那就是延时工作:
+`delayed_work`
+    static void hci_cmd_work(struct work_struct *work)
+    {
+        struct hci_dev *hdev = container_of(work, struct hci_dev, cmd_work);
+    ...
+            hdev->sent_cmd = skb_clone(skb, GFP_KERNEL);
+            if (hdev->sent_cmd) {
+                ...
+                if (test_bit(HCI_RESET, &hdev->flags))
+                    cancel_delayed_work(&hdev->cmd_timer);
+                else
+                    schedule_delayed_work(&hdev->cmd_timer,
+                                  HCI_CMD_TIMEOUT); // {6}
+            } else {
+                skb_queue_head(&hdev->cmd_q, skb);
+                queue_work(hdev->workqueue, &hdev->cmd_work);
+            }
+由`{6}`标记的代码会为发出去的命令注册一个延迟工作，以处理该命令的回复超时的情况。`delayed_work`的逻辑其实很`work_struct`非常想，只不过呢，我们有一段非常可预测的时间窗了
+    #define HCI_CMD_TIMEOUT     msecs_to_jiffies(2000)  /* 2 seconds */
+2秒，看起来非常合适。现在，我们可以让堆喷的`setxattr`先一直卡着，直到接近2秒的时候再覆盖上我们的恶意数据，这样子就可以保证前文所计划的攻击都能完成，并且我们获得了一个劫持RIP的原语。
+#### ROP
+ROP的故事并没有控RIP的故事那样精彩，不过在做栈迁移的时候还是有一些小技巧的。
+    /* HCI command timer function */
+    static void hci_cmd_timeout(struct work_struct *work)
+    {
+        struct hci_dev *hdev = container_of(work, struct hci_dev,
+                            cmd_timer.work);
+    ...
+        if (hdev->cmd_timeout)
+            hdev->cmd_timeout(hdev);
+在正常的情况下，`cmd_timer`会唤醒函数`hci_cmd_timeout`去完成超时处理，我们看到函数内有基于`hdev->cmd_timeout`的函数指针使用。在该位置劫持控制流后，第一个跳向的gadget一定得想办法将栈迁移到可控的堆上去（最好就是我们覆盖的
+`hdev` 成员）。在内核中找了几遍后，我们却没有找到非常合适的gadget。
+比如说，我们经常使用的一个类型的gadget便是直接通过`mov`去写`rsp`的
+For example, the popular one
+    0xffffffff81e0103f: mov rsp, rax; push r12; ret;
+但是，此时我们劫持控制流的代码`hdev->cmd_timeout(hdev)`其底层实现是`__x86_indirect_thunk_rax`，也就是说，此时的rax寄存器是刚好指向要跳往的gadget的，一心不可二用，rax此时又怎么能指向堆地址呢？
+> 还有一些经典的通过 xchg 去迁移栈的，只不过那往往是用于 SMAP 保护关闭的情况。我们的目标环境是保护全开的，这类 gadget 也不好用。
+迁栈的问题确实困扰了我许久，感谢队内大佬[Nop](n0nop.com "Nop")帮助，我们最好找到了一个非常合适的迁栈方法。
+首先，我们使用的gadget是
+       0xffffffff81060a41 :   mov    rsp,QWORD PTR [rsp+0x18]
+       0xffffffff81060a46 :   pop    rbx
+       0xffffffff81060a47 :   pop    rbp
+       0xffffffff81060a48 :   ret
+其会将栈上 rsp + 0x18 位置的值给 RSP 寄存器，那么，接着就是一个关键点，它既能满足控制流劫持，又可以刚好让 [rsp + 0x18]
+指向合适的堆地址。
+我最后选定的目标是 `hci_error_reset`，其内部又一个 `hdev->hw_error`
+的调用。而且通过调试，我们发现调用点的栈满足所需，[rsp + 0x18]刚好是指向 `hdev` 内部的，Perfect！
+    static void hci_error_reset(struct work_struct *work)
+    {
+        struct hci_dev *hdev = container_of(work, struct hci_dev, error_reset);
+        BT_DBG("%s", hdev->name);
+        if (hdev->hw_error)
+            hdev->hw_error(hdev, hdev->hw_error_code);
+        else
+            bt_dev_err(hdev, "hardware error 0x%2.2x", hdev->hw_error_code);
+    ...
+    }
+剩下的工作就是大家都熟悉的ROP了，出于只是展示的需要，我实现的ROP其仅仅完成的是对于`modprobe_path`的修改。代码以及demo开源在github上
+感兴趣的读者可以试着写一下更完善的ROP
+## 修复的故事
+如果是你，你会怎样修复在这样一个条件竞争的漏洞呢？
+当我提交该漏洞时候，我向内核社区提供了一份如下的补丁作为参考。
+    ---     net/bluetooth/hci_sock.c | 4 ++--     1 file changed, 2 insertions(+), 2 deletions(-)
+    diff --git a/net/bluetooth/hci_sock.c b/net/bluetooth/hci_sock.c
+    index 251b9128f530..eed0dd066e12 100644
+    --- a/net/bluetooth/hci_sock.c
+    +++ b/net/bluetooth/hci_sock.c
+    @@ -762,7 +762,7 @@ void hci_sock_dev_event(struct hci_dev *hdev, int event)
+            /* Detach sockets from device */
+            read_lock(&hci_sk_list.lock);
+            sk_for_each(sk, &hci_sk_list.head) {
+    -           bh_lock_sock_nested(sk);
+    +           lock_sock(sk);
+                if (hci_pi(sk)->hdev == hdev) {
+                    hci_pi(sk)->hdev = NULL;
+                    sk->sk_err = EPIPE;
+    @@ -771,7 +771,7 @@ void hci_sock_dev_event(struct hci_dev *hdev, int event)
+                    hci_dev_put(hdev);
+                }
+    -           bh_unlock_sock(sk);
+    +           release_sock(sk);
+            }
+            read_unlock(&hci_sk_list.lock);
+        }
+    --    2.30.2
+从漏洞发现者的角度来看，这个漏洞的根本成因在于有一个特殊的 FREEING 线程，其可能可以在别的 USING
+线程（如`hci_sock_bound_ioctl` and `hci_sock_sendmsg`）还在使用 `hdev` 对象时候便将该目标给释放掉。
+所以呢，我的补丁通过替换锁来完成对于该 FREEING 线程的堵塞。在打上这个补丁之后，KASAN并不会再有任何的报告，感觉是没啥问题的。
+悲哀的是，我又又又错了。
+因为我本人并不是非常清楚内核中的同步机制，这里对于锁的替换仅仅是参考相关的 USING
+线程，以直觉方式完成的。我并没有去仔细进行锁的分析，以至于我提供的补丁是有可能造成死锁的（我真的不是故意的呜呜呜）
+**更糟糕的是，内核并没有经过任何犹豫便打上了我提供的补丁。**
+灾难大概在补丁进入内核主线的一周之后开始初见端倪：我开始收到各种各样的邮件来控诉这个荒唐的补丁。其中最早来的是谷歌的 [Anand K.
+Mistry](https://github.com/akmistry)，他向我展示了在开启 `CONFIG_LOCK_DEBUG`
+后生成的错误报告以及死锁的可能性分析。在他之后，也有越来越多的内核开发者注意到了这条有问题的补丁。其中很大的促进因素是谷歌的模糊测试机器人 syzbot
+> Also, this regression is currently 7th top crashers for syzbot
+这个机器人将触发这个锁错误的测试报告不断发送给蓝牙的维护者（因为实在太好触发了，设备一旦卸载这个错误就会被捕获）。
+我实在是羞愧的想挖个洞把自己给埋了。可能你会很好奇，再提交一份正确的修复不就好了么？但悲哀的事实是，这个条件竞争并不好修复，社区中也开展了充足的讨论，读者可以阅读下面的链接去了解该情况。
+[https://marc.info/?l=linux-bluetooth&m=162441276805113&w=2](https://marc.info/?l=linux-bluetooth&m=162441276805113&w=2) [https://marc.info/?l=linux-bluetooth&m=162653675414330&w=2](https://marc.info/?l=linux-bluetooth&m=162653675414330&w=2)
+让人欣慰的是，内核大佬 Tetsuo Handa 与蓝牙维护者 [Luiz](https://github.com/Vudentz)
+对这个问题是十分上心的，我相信一份正确的补丁会很快成埃落定的。
+**== 7月28日更新 ==**
+Yeah，一份看起来不错的补丁已经发布在了`bluetooth-next`分支上：[戳](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=73333364afebb5e45807139bc79e6a6574c1874b)
+这次连着几天的讨论甚至让我接触到了[Linus](https://en.wikipedia.org/wiki/Linus_Torvalds)，心情实在难以平复
+:)
+## 结论
+这是我的首个Linux内核0 day利用，说真的，这个过程中我真的学到了很多：写漏洞利用真的就是一门艺术。
+当然，需要承认的是这个漏洞虽然可以稳定触发，但品相也还是有缺点的：其要求 `CAP_NET_ADMIN` 权限，所以在野场景下的 fullchain
+利用要求攻击者先攻破具有该权限的 daemon 才行。
+这是挖掘本地蓝牙栈漏洞的一个固有缺点，因为我们需要在用户态模拟一个假的蓝牙控制器，而这件事情显然不会是零权限的。更好品质的漏洞自然应该像
+[BleedingTooth](https://github.com/google/security-research/tree/master/pocs/linux/bleedingtooth) 那样在不要求任何点击的情况下，在 **远程** 完成代码执行。
+我相信这种理想类型的漏洞会是我们的终极目标。
+* * *

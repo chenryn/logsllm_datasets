@@ -1,0 +1,97 @@
+事情的起因是帮班级开发了一个管理平台，其中的权限校验部分使用了shiro。上线后有一个同学发现了一个漏洞，可以造成任意用户登录，绕过Api的身份验证。
+我们在使用shiro进行身份认证时，需要根据自己的需求实现Realm，实现doGetAuthentication（用户身份认证信息）以及doGetAuthorizationInfo（用于权限校验信息）。
+## 问题代码
+重写的doGetAuthenticationInfo方法，在使用userMapper查询到用户信息之后，将user存到了shiro的session之后。
+    @Override
+        protected AuthenticationInfo doGetAuthenticationInfo(AuthenticationToken token) throws AuthenticationException,NumberFormatException {
+            if (token.getPrincipal()==null){
+                throw new UnknownAccountException();
+            }
+            Integer studentId = Integer.valueOf((String) token.getPrincipal());
+            //取出数据库中的指定User
+            User user= Optional.ofNullable(userMapper.selectByStudentId(studentId)).orElseThrow(UnknownAccountException::new);
+            SimpleAuthenticationInfo info=new SimpleAuthenticationInfo(user,user.getPassword(),getName());
+            Session session= SecurityUtils.getSubject().getSession();
+            //存到shiro的session中（对于Web来说本质是HttpSession）
+            session.setAttribute("USER_SESSION",user);
+            return info;
+        }
+登录处：
+    Subject subject=SecurityUtils.getSubject();
+            UsernamePasswordToken token=new UsernamePasswordToken(studentId,password);
+            try {
+                subject.login(token);
+            }
+之后的API处的身份验证：
+    if(!SecurityUtils.getSubject().isAuthenticated()) {
+                return resultJson.error(401,"未授权");
+            }
+    User user = CommonUtil.getUserFromShiroSession();
+    //其中的getUserFromShiroSession():
+    public static User getUserFromShiroSession(){
+            return (User)SecurityUtils.getSubject().getSession().getAttribute("USER_SESSION");
+        }
+> 身份认证的逻辑就是：
+身份验证时，先验证当前的Subject是否已经授权，如果已经授权的话，获取当前用户采用了从shiro的session中获取的方法
+这会导致什么问题呢？先了解一下shiro身份认证的过程
+## Shiro进行身份认证的过程
+我们先Debug跟一下，理一下shiro的身份验证的逻辑。
+断点下在login处，我们跟进login方法。
+login默认调用的是DelegatingSubject的login方法。
+可以看到，其中的逻辑为：调用securityManger的login方法。而其中的改变Subject的成员变量authenticated的值在login的下面。
+跟进securityManger的login方法:
+跟进authenticate(token)；我们进入authenticate方法，单步往下跟最后可以跟到AuthenticatingRealm的`getAuthenticationInfo`方法。可以看到此处调用了我们重写的`doGetAuthenticationInfo`方法，也就是在这里，依照我们的校验逻辑，shiro中的session就被赋值完成了。
+接着我们回到`getAuthenticationInfo`方法,其中调用了`assertCredentialsMatch(token,info)`，将用户输入token，与查出的用户info信息比对，不匹配就抛出异常，异常延调用栈一直抛到我们的subject.login()方法。
+这里就可以看出，即使登录失败，我们在`doGetAuthenticationInfo`中设置的session属性依然可以生效。而且由于异常栈抛出的过程中并没有创建subject,也不会重新设置authenticated的状态。
+## 问题根源
+**当用户重复登录的时候，会改变session中的USER_SESSION的值，但是并不会改变用户isAuthenticated的状态**
+当A用户使用自己的账号登录成功之后（这时Subject.isAuthenticated()已经变成了true），带着登录成功的Session，尝试登录另一个用户B的账号，Shiro在`Subject.login()`的时候调用了我们重写的`doGetAuthenticationInfo(AuthenticationToken
+token)`方法。
+这时候，Session中的USER_SESSION的值已经变成了用户B的信息，而且shiro这时并不会更新isAuthenticated的状态，这样一来用户A就可以绕开了身份验证，能够以用户B的身份访问其他的API。
+## 拓展
+其实当时的写法参考了这篇文章：
+[一起来学SpringBoot | 第二十六篇：轻松搞定安全框架（Shiro）](www.spring4all.com/article/1315)，
+这篇文章的写法也出了问题，出问题的地方在权限校验处。
+Realm：
+    @Configuration
+    public class AuthRealm extends AuthorizingRealm {
+        @Override
+        protected AuthenticationInfo doGetAuthenticationInfo(AuthenticationToken token)
+                throws AuthenticationException {
+            String principal = (String) token.getPrincipal();
+            User user = Optional.ofNullable(DBCache.USERS_CACHE.get(principal)).orElseThrow(UnknownAccountException::new);
+            if (!user.isLocked()) {
+                throw new LockedAccountException();
+            }
+            SimpleAuthenticationInfo authenticationInfo = new SimpleAuthenticationInfo(principal, user.getPassword(), getName());
+            Session session = SecurityUtils.getSubject().getSession();
+            //在进行权限校验的时候，直接从session中取对应的值
+            session.setAttribute("USER_SESSION", user);
+            return authenticationInfo;
+        }
+        @Override
+        protected AuthorizationInfo doGetAuthorizationInfo(PrincipalCollection principal) {
+            Session session = SecurityUtils.getSubject().getSession();
+            //这里将user存到了USER_SESSION中
+            User user = (User) session.getAttribute("USER_SESSION");
+            SimpleAuthorizationInfo info = new SimpleAuthorizationInfo();
+            Set roles = new HashSet<>();
+            roles.add(user.getRoleName());
+            info.setRoles(roles);
+            final Map> permissionsCache = DBCache.PERMISSIONS_CACHE;
+            final Collection permissions = permissionsCache.get(user.getRoleName());
+            info.addStringPermissions(permissions);
+            return info;
+        }
+    }
+我们就用这篇文章的代码做一个demo测试一下，Realm与文章中的相同：
+我们创建两个用户：
+我们编写以下Controller
+假设我们现在是user2,角色是guest,hello接口只有admin角色的用户可以访问，我们访问不了hello接口。
+接着我们登录user1，由于我们不知道user1的密码，所以登录失败。
+但是此时我们的USER_SESSION已经更新成user1的，所以我们的角色也变成了admin。当调用
+`doGetAuthorizationInfo`获取info 的时候，获取到的info中的role就为admin。此时我们再次访问/hello
+## 正确使用shiro
+从前面的分析可知，在shiro中获取当前用户信息，不要使用自定义的Realm中将信息存到session里。
+shiro中正确获取当前用户的方法应该为`(User)
+SecurityUtils.getSubject().getPrincipal()`来获取，这里是因为Subject中的principal只有在用户成功登录之后才进行更新。

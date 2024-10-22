@@ -1,0 +1,119 @@
+## 前言
+用于后开发的.NET仍然存在。它已与大多数C2框架捆绑在一起，移植了通用工具，添加（然后绕过了）AMSI，并且使用很多妙招来启动非托管代码。但是，加载.NET程序集的过程似乎非常一致。
+众所周知，像Cobalt Strike中`execute-assembly`这样的工具极大地提高了从内存中加载.NET程序集的可访问性，很多攻击者在Github上发布代码时都以或这或那的方式使用它。基于这种趋势，蓝队自然而然善于寻找遗留在内存中的文件。但是，作为红队，我们仍然发现，不管目标是托管还是非托管进程，在进程内启动.NET代码的方法似乎一成不变。例如，如果我们希望将代码注入到进程中，那么，即使目标已经是加载了CLR的.NET进程，我们通常采用的路径也是相同的：
+这已经困扰了我好多年，所以我花了几个晚上研究可以更改签名的潜在方法。我的目标很简单，就是尝试找到一种在.NET进程中直接调用.NET方法的方法，不必费尽心思将Shellcode或rDLL注入非托管空间，而是另辟蹊径，通过CLR接口来加载.
+NET程序集。（作者写的这个rdll是个什么东东，老夫查了半天没查出来，见笑了……）
+这篇文章将探讨实现此目标的一种潜在性，通过利用Windows公开的调试框架，我们可以看到使用调试API在目标进程中调用任意.NET代码所需要的内容。
+## ICorDebug简介
+正如我们大多数人在Visual Studio中所见，.NET公开了强大的调试功能，使人们能够在附加的进程中执行代码：
+在我脑海中已初步构建一种在.NET进程中执行特定函数的简单方法，但是，有那么一种方法可以模拟此功能，使得.NET进程中的代码可以执行而不必加载shellcode和全部.NET程序集吗？我所希望的是某种类似`DebuggerEvaluateCSharpInThisProcess`的方法，但是，并不存在。。。又但是，我们可以利用一个文档齐全（尽管非常复杂）的API，然后以编程方式来利用.NET调试的功能。
+`ICorDebug`是.NET调试的切入点，并提供了很多函数，使我们可以控制.NET进程。让我们从设计一个简单的调试器开始，将其附加到我们选择的进程中，从而开始探索此API。
+## 创建一个调试器
+我们要做的第一件事是新建一个ICorDebug实例。使用与当前.NET注入方法完全相同的调用，我们首先选择.NET框架的安装版本：
+    if ((hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID *)&metaHost)) != S_OK)
+    {
+      return hr;
+    }
+    if ((hr = metaHost->EnumerateInstalledRuntimes(&runtime)) != S_OK)
+    {
+      return hr;
+    }
+    frameworkName = (LPWSTR)LocalAlloc(LPTR, 2048);
+    if (frameworkName == NULL)
+    {
+      return E_OUTOFMEMORY;
+    }
+    while (runtime->Next(1, &enumRuntime, 0) == S_OK)
+    {
+      if (enumRuntime->QueryInterface(&runtimeInfo) == S_OK)
+      {
+        if (runtimeInfo != NULL)
+        {
+          runtimeInfo->GetVersionString(frameworkName, &bytes);
+          wprintf(L"[*] Supported Framework: %s\\n", frameworkName);
+        }
+      }
+    }
+不同之处在于，一旦我们确定了要使用的运行时间后，就会初始化该`ICorDebug`接口实例；而不是像通常那样，从注入的DLL直接运行.NET代码，然后再请求一个`ICLRRuntimeHost`实例。此处的主要区别在于，我们把要执行的shellcode附加到另一个.NET进程，而不需要将之注入非托管空间再加载CLR那么麻烦。
+我们使用以下内容来创建一个`ICorDebug`实例：
+    // Create our debugging interface
+    ICorDebug *debug;
+    ICorDebugProcess *process;
+    if ((hr = runtimeInfo->GetInterface(CLSID_CLRDebuggingLegacy, IID_ICorDebug, (LPVOID *)&debug)) != S_OK)
+    {
+      return hr;
+    }
+    // Initialise the debugger
+    debug->Initialize();
+    // Attach to an existing process by PID
+    debug->DebugActiveProcess(1234, false, &process);
+现在我们已经初始化了接口，这里暂停一下喝杯茶，然后解释一下此调试框架实际上如何与我们的目标流程交互的。首先看看对所公开的各个组件进行高层次概述：
+这乍看之下可能有点抽象（我第一次使用API时，阅读了无数遍文档才看懂），但是值得一提的是，调试器API将首先响应从目标进程触发的调试事件。例如，如果引发异常，例如将新程序集加载到目标中或创建了新线程，我们将收到一个事件。并且，每次触发事件时，我们都有机会与进入“stopped”状态的目标进行交互，然后才最终恢复执行并等待其他事件。
+通常，当我们与调试的.NET进程进行交互时，该进程需要处于stopped状态。如果与正在运行的进程进行交互的话，就会报错如下：
+要在事件之外手动停止和恢复进程，我们可以调用`ICorDebugController`方法实现：
+    // Stop execution of our target
+    debug->Stop(0);
+    // Resume execution of our target
+    debug->Continue(0);
+既然我们对所要干的事有了进一步了解，下一步就需要处理那些在连接到目标的整个过程中将发生的异步事件。为此，我们设计一个可以同时实现`ICorDebugManagedCallback`和`ICorDebugManagedCallback2`接口的类，如下所示：
+    class ManagedCallback : public ICorDebugManagedCallback, public ICorDebugManagedCallback2
+    {
+      ...
+    }
+[所有回调事件的说明文档](https://docs.microsoft.com/en-us/dotnet/framework/unmanaged-api/debugging/icordebugmanagedcallback-interface)。
+本文不会每一个都详细介绍，因为我们只需要关心其中的少数几个，即可实现将代码注入.NET进程的目的。为了清楚起见，让我们快速看一下如何处理诸如触发断点之类的事件：
+    HRESULT ManagedCallback::Breakpoint(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread, ICorDebugBreakpoint *pBreakpoint)
+    {
+      // Execution of the target is stopped when we enter this event handler
+      // Here we can do whatever we want (within reason ;)
+      //
+        DoSomethingInteresting();
+      //
+      // And we then resume execution before returning from our event handler
+      pAppDomain->Continue(false);
+      return S_OK;
+    }
+如上所述，每次调用托管回调方法时，目标都会停止执行，但我们可以使用Continue(...)函数来恢复执行。如果不做这一步的话，目标基本上啥也干不了。
+构建托管回调类之后，需要使用以下命令将其与我们的ICorDebug对象相关联：
+    ManagedCallback* handler = new ManagedCallback();
+    return debug->SetManagedHandler(handler);
+至此，调试器已准备就绪。现在，我们只需要构造一些东西，以便在目标中执行任意代码。
+## 注入什么？
+从简单开始，首先调用.NET方法，该方法将将程序集从磁盘加载到目标进程中。为此，我们将尝试远程调用`Assembly.LoadFile`方法，该方法具有以下签名：
+    public static System.Reflection.Assembly LoadFile (string path);
+要在.NET进程中调用任何代码，我们需要一个`ICorDebugEval`接口的实例，顾名思义，它公开了在目标.NET运行时内评估代码所需的几种方法。
+方法之一是`ICorDebugEval::CallFunction`，该方法允许我们直接调用一个.NET方法，在本例中就是直接调用`Assembly.LoadFile`方法。当然，我们还需要创建一个新`System.String`对象作为参数传递，可通过调用`ICorDebugEval::NewString`函数来完成。
+但是，实际上在什么时候调用这些方法？事实证明，使用该`ICorDebugEval`接口的方式比较复杂，因为目标需要处于一种我们可以实际评估代码的状态。
+如果我们尝试在错误的位置评估代码，则会收到如下错误：
+图中`0x80131c23错误`或`GC unsafe
+point`到底是什么意思？不幸的是，关于这个文档中并没有过多描述，但是经过一番百度之后，找到了一片文章，是这样解释的：
+>
+> 当JIT编译器编译方法时，它可以插入一个检查GC是否挂起的特殊函数的调用。如果是这样，线程将被挂起，GC将运行至结束，然后继续执行该线程。编译器插入这些方法调用的位置称为GC安全点。
+因此，从本质上讲，我们需要以一种类似于进行垃圾回收的方式来安全地评估代码。
+事实证明，盲目地寻找能够满足这一要求的时机可能很棘手（目标没有可用的源代码或PDB），但是我发现实现这一目标的较简单方法之一就是：使用`ICorDebugStepper`实例来逐步跟踪我们的附加进程。该接口使我们能够以与使用标准调试器时相同的方式逐步浏览托管代码。如果重复执行此操作，则最终可以找到一个评估所需.NET代码的安全点。
+在实践中这种方法很有成效，但是当我们试图到达目标CLR正在将JIL设置为某个IL的点时，这意味着挂起的应用程序（或处于停滞状态的应用程序）不太可能使我们能够注入我们的代码。值得庆幸的是，有许多备用手段（以及我们稍后将讨论的一些COMPlus变量）使这一过程变得更加容易，我们将在下文介绍。
+现在，在继续创建步进器之前，有必要重点介绍.NET应用程序的组件如何映射到调试器API，这将有助于我们稍后理解一些POC代码。它看起来像酱紫：
+要创建步进器，我们需要找到一个与其关联的活动线程，可以通过使用`ICorDebugProcess::EnumerateThreads`或`ICorDebugAppDomain::EnumerateThreads`函数来枚举现有线程，从而允许我们检索`ICorDebugThread`实例数组。
+**注意：尽管我们在这里讨论线程，但必须指出，它们是“托管线程”的表示形式，与我们通常处理的传统OS线程不同。不幸的是，这些术语在文档中通常没有区别，但是对于调试器API而言，这很重要。**
+通过收集活动线程列表，我们可以使用该`ICorDebugThread::CreateStepper`方法创建并关联步进器。
+确保成功连接后，还要向目标进程可能产生的任何新线程添加步进器。当发生一些有趣的事件时，由于已经有了通过托管回调处理程序调用的方法，因此我们可以根据需要使用`CreateThread`事件添加其他步进器：
+    HRESULT ManagedCallback::CreateThread(ICorDebugAppDomain *pAppDomain, ICorDebugThread *thread)
+    {
+      // Create a stepper
+      ICorDebugStepper *stepper;
+      thread->CreateStepper(&stepper);
+      // Step through code
+      stepper->Step(0);
+    // Continue execution of our assembly
+      pAppDomain->Continue(false);
+      return S_OK;
+    }
+创建步进器后，在继续执行目标之前,将使用`ICorDebugStepper::Step`方法触发执行代码的步骤。一旦z这个触发点成功执行，就会通过事件再次提醒`ManagedCallback::StepComplete`处理程序。此时，我们尝试评估线程中的一些代码。
+确定是否处于GC安全点的一个很好的起点是：尝试在目标进程中创建一个新的字符串对象，稍后将其用作`Assembly.LoadFile`调用的参数：
+    HRESULT ManagedCallback::StepComplete(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread, ICorDebugStepper *pStepper, CorDebugStepReason reason)
+    {
+      ICorDebugEval *eval;
+      bool stepAgain = false;
+    // Create our eval instance
+      if (pThread->CreateEval(&eval) != S_OK)
+      {

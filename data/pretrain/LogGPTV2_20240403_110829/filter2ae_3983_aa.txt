@@ -1,0 +1,92 @@
+**作者：evilpan  
+原文链接：**
+本文主要介绍Buddy System、Slab
+Allocator的实现机制以及现实中的一些漏洞利用方法，从攻击者角度加深对Linux内核内存管理机制的理解。
+# 前言
+网上已经有很多关于Linux内核内存管理的分析和介绍了，但是不影响我再写一篇:)
+一方面是作为其他文章的补充，另一方面则自己学习的记录、总结和沉淀。所谓条条大路通罗马，本文只作为其中一条路，强烈建议想去罗马的朋友看完文末所列举的参考文章。
+# 伙伴系统
+伙伴系统即Buddy
+System，是一种简单高效的内存分配策略。其主要思想是将大块内存按照一定策略去不断拆分（在到达最小的块之前），直至存在满足指定请求大小的最小块。其中块的大小由其相对根块的位置指定，通常称为order(阶)。一个最简单的拆分方式就是以2为指数进行拆分，例如定义最小块的大小为64K，order上限为4，则最大块的大小为：
+    64K * 2^4 = 1024K
+最大块的order为4，最小块的order为0。对于请求大小为k的块，最小块为N，则其order值为align(k)/N。为什么叫buddy
+system呢？假设一个大块A所分解成的两个小块B和C，其中B和C就相互为彼此的 ~~天使~~ buddy。只有彼此的buddy才能够进行合并。
+使用Buddy算法的的应用有很多，其中Linux内核就是一个，此外jemalloc也是使用Buddy技术的一个现代内存分配器。
+维基百科中有一个很直观的例子：[Buddy memory
+allocation](https://en.wikipedia.org/wiki/Buddy_memory_allocation)。Linux内核中的伙伴系统块大小为一页，通常是4096字节。最大的order一般是10，即MAX_ORDER为11。
+      /* Free memory management - zoned buddy allocator.  */
+      #ifndef CONFIG_FORCE_MAX_ZONEORDER
+      #define MAX_ORDER 11
+      #else
+      #define MAX_ORDER CONFIG_FORCE_MAX_ZONEORDER
+      #endif
+      #define MAX_ORDER_NR_PAGES (1 
+> from：https://events.static.linuxfound.org/sites/events/files/slides/slaballocators.pdf
+说句题外话，SLOB (Simple List Of Blocks)
+可以看做是针对嵌入式设备优化的分配器，通常只需要几MB的内存。其采用了非常简单的`first-fit`算法来寻找合适的内存block。这种实现虽然去除了几乎所有的额外开销，但也因此会产生额外的内存碎片，因此一般只用于内存极度受限的场景。
+## 数据结构
+在本文中，我会尽量少粘贴大段的代码进行分析，但Slub分配器是比较依赖于实现而不是设计的，因此数据结构的介绍是难免的。
+### page
+描述一个页的数据结构就是`struct page`。为了节约空间，page使用了大量的union结构，针对不同用处的页使用不同的字段。
+Slab是一个或者多个连续页组成的内存空间，那么本质上指向一个Slab的数据结构不是别的，就是`struct page
+*`，对应Slab中的信息可以通过第一个page的某些字段描述。记住这点对后面的理解很重要。
+### kmem_cache
+kmem_cache是Slab的主要管理结构，申请和释放对象都需要经过该结构操作，部分重要字段如下：
+      /*
+       * Slab cache management.
+       */
+      struct kmem_cache {
+          struct kmem_cache_cpu __percpu *cpu_slab;
+          /* Used for retriving partial slabs etc */
+          unsigned long flags;
+          unsigned long min_partial;
+          int size;       /* The size of an object including meta data */
+          int object_size;    /* The size of an object without meta data */
+          int offset;     /* Free pointer offset. */
+      #ifdef CONFIG_SLUB_CPU_PARTIAL
+          int cpu_partial;    /* Number of per cpu partial objects to keep around */
+      #endif
+          ...
+          struct kmem_cache_node *node[MAX_NUMNODES];
+    }
+重点关注`cpu_slab`和`node`。
+`cpu_slab`包含当前CPU的Slab。这是个`__percpu`的对象，什么意思呢？我的理解是内核为了加速当前CPU的访问，会对每个CPU保存一个变量，这样在当前CPU访问该变量时候就可以免去加锁的开销。在调试中发现该变量的值是个类似`0x18940`这样比较小的数，这个地址是没有映射的，访问percpu变量需要通过`raw_cpu_ptr`宏去获取实际的地址。
+`node`数组中包括其他CPU的Slab。为什么叫做node？其实这是NUMA系统中的node概念。NUMA是为了多核优化而产生的架构，可以令某个CPU访问某段内存的速度更快。node的定义是“一段内存，其中每个字节到CPU的距离相等”，更加通俗的解释是：“在同一物理总线上的内存+CPUs+IO+……”，更多细节可以参考[NUMA
+FAQ](http://lse.sourceforge.net/numa/faq/index.html#what_is_a_node)。
+### kmem_cache_cpu
+cpu_slab是`kmem_cache_cpu`结构，如下：
+      struct kmem_cache_cpu {
+          void **freelist;    /* Pointer to next available object */
+          unsigned long tid;  /* Globally unique transaction id */
+          struct page *page;  /* The slab from which we are allocating */
+      #ifdef CONFIG_SLUB_CPU_PARTIAL
+          struct page *partial;   /* Partially allocated frozen slabs */
+      #endif
+      #ifdef CONFIG_SLUB_STATS
+          unsigned stat[NR_SLUB_STAT_ITEMS];
+      #endif
+      };
+freelist指向第一个空闲的对象(假设为x)，page指向x所在slab(的第一页)。这里的page有以下特点： \- objects =
+slab的对象数 \- inuse = objects \- frozen = 1 \- **freelist = NULL**
+partial主要包含本地部分分配的slab。partial指向的page有以下特点： \- **next指向下一个slab(page)** \-freelist指向slab中第一个空闲object \- inuse = slab中已使用的object个数 \- frozen = 1
+其中第一个page的`pbojects`记录了partial objects数。
+### kmem_cache_node
+    struct kmem_cache_node {
+        spinlock_t list_lock;
+        ...
+    #ifdef CONFIG_SLUB
+        unsigned long nr_partial;
+        struct list_head partial;
+        ..
+    #endif
+    };
+这个数据结构根据配置的`SL[OAU]B`分配器而异，对于SLUB而言，使用的字段就只有两个，nr_partial和partial。其中partial是Linux内核中可插拔式通用双链表结构，使用内核中双链表的接口进行操作。nr_partial表示partial双链表中的元素个数，即slab的个数。
+partial->next指向的page结构，用于该结构的page有如下特点：
+  * frozon = 0
+  * freelist指向slab中第一个空闲object
+  * inuse表示对应slab使用中的object个数
+  * **通过lru字段索引链表中的下一个/前一个page**
+前三点没什么好说的，大家都差不多。需要关注的是第四点，这里不像cpu partial那样通过next指针连接页表，而是通过lru字段：
+    struct page {
+    ...
+          /*

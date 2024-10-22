@@ -1,0 +1,284 @@
+## PostgreSQL merge join 评估成本时可能会查询索引 - 硬解析务必引起注意 - 批量删除数据后, 未释放empty索引页导致mergejoin执行计划变慢 case  
+### 作者                                             
+digoal                                              
+### 日期                                              
+2017-02-21                                                                         
+### 标签                                                                                                                                                              
+PostgreSQL , merge join , min , max , 优化器 , 索引倾斜 , 垃圾回收   
+----                                              
+## 背景      
+PostgreSQL支持三种JOIN的方法，nestloop, merge, hash。  
+这三种JOIN方法的差别和原理可以参考  
+https://www.postgresql.org/docs/devel/static/planner-optimizer.html  
+[《PostgreSQL nestloop/hash/merge join讲解》](../201205/20120521_02.md)  
+nested loop join:   
+```  
+The right relation is scanned once for every row found in the left relation.   
+This strategy is easy to implement but can be very time consuming.   
+(However, if the right relation can be scanned with an index scan, this can be a good strategy.   
+It is possible to use values from the current row of the left relation as keys for the index scan of the right.)  
+```  
+merge join:   
+```  
+Each relation is sorted on the join attributes before the join starts.   
+Then the two relations are scanned in parallel, and matching rows are combined to form join rows.   
+This kind of join is more attractive because each relation has to be scanned only once.   
+The required sorting might be achieved either by an explicit sort step,   
+or by scanning the relation in the proper order using an index on the join key.  
+```  
+hash join:   
+```  
+the right relation is first scanned and loaded into a hash table, using its join attributes as hash keys.   
+Next the left relation is scanned and the appropriate values of every row found are used as hash keys to locate the matching rows in the table.  
+```  
+对于merge join，在估算成本时，如果JOIN列有索引，那么会扫描索引，获取该列的最大值和最小值。  
+(注意，数据库的统计信息中并没有最大值和最小值)  
+```  
+          View "pg_catalog.pg_stats"  
+         Column         |   Type   | Modifiers   
+------------------------+----------+-----------  
+ schemaname             | name     |   
+ tablename              | name     |   
+ attname                | name     |   
+ inherited              | boolean  |   
+ null_frac              | real     |   
+ avg_width              | integer  |   
+ n_distinct             | real     |   
+ most_common_vals       | anyarray |   
+ most_common_freqs      | real[]   |   
+ histogram_bounds       | anyarray |   
+ correlation            | real     |   
+ most_common_elems      | anyarray |   
+ most_common_elem_freqs | real[]   |   
+ elem_count_histogram   | real[]   |   
+```  
+那么问题来了，如果索引出现了剧烈倾斜（或者没有及时释放空页），那么在评估merge join的执行计划时，可能导致执行计划时间过长。  
+下面看一个例子。  
+## merge join 评估成本  
+创建两张测试表，关闭表级autovacuum，以免影响结果  
+```  
+postgres=# create  unlogged table tbl1(id int, info text) with (autovacuum_enabled=off);  
+CREATE TABLE  
+postgres=# create  unlogged table tbl2(id int, info text) with (autovacuum_enabled=off);  
+CREATE TABLE  
+```  
+往两张表分别插入1000万记录  
+```  
+postgres=# insert into tbl1 select generate_series(1,10000000);  
+INSERT 0 10000000  
+postgres=# insert into tbl2 select generate_series(1,10000000);  
+INSERT 0 10000000  
+```  
+检查mergejoin已打开  
+```  
+postgres=# show enable_mergejoin ;  
+ enable_mergejoin   
+------------------  
+ on  
+(1 row)  
+```  
+打开时间记录  
+```  
+postgres=# \timing  
+Timing is on.  
+```  
+查看执行计划，目前生成执行计划的耗时很正常  
+```  
+postgres=# explain select * from tbl1,tbl2 where tbl1.id=tbl2.id;  
+                                    QUERY PLAN                                      
+----------------------------------------------------------------------------------  
+ Merge Join  (cost=1838455.64..2370285748.91 rows=157893676470 width=72)  
+   Merge Cond: (tbl1.id = tbl2.id)  
+   ->  Sort  (cost=919227.82..933276.56 rows=5619496 width=36)  
+         Sort Key: tbl1.id  
+         ->  Seq Scan on tbl1  (cost=0.00..100442.96 rows=5619496 width=36)  
+   ->  Materialize  (cost=919227.82..947325.30 rows=5619496 width=36)  
+         ->  Sort  (cost=919227.82..933276.56 rows=5619496 width=36)  
+               Sort Key: tbl2.id  
+               ->  Seq Scan on tbl2  (cost=0.00..100442.96 rows=5619496 width=36)  
+(9 rows)  
+Time: 1.134 ms  
+```  
+收集统计信息，生成表对应的vm, fsm文件。  
+```  
+postgres=# vacuum analyze tbl1;  
+VACUUM  
+Time: 834.366 ms  
+postgres=# vacuum analyze tbl2;  
+VACUUM  
+Time: 835.022 ms  
+```  
+再次生成执行计划，强制使用merge join，执行计划的时间依旧正常  
+当没有索引时，评估merge join的成本不需要获取最大值和最小值  
+```  
+postgres=# explain select * from tbl1,tbl2 where tbl1.id=tbl2.id;  
+                                 QUERY PLAN                                   
+----------------------------------------------------------------------------  
+ Hash Join  (cost=347372.66..975995.14 rows=9999985 width=72)  
+   Hash Cond: (tbl1.id = tbl2.id)  
+   ->  Seq Scan on tbl1  (cost=0.00..144247.85 rows=9999985 width=36)  
+   ->  Hash  (cost=144247.85..144247.85 rows=9999985 width=36)  
+         ->  Seq Scan on tbl2  (cost=0.00..144247.85 rows=9999985 width=36)  
+(5 rows)  
+Time: 0.633 ms  
+postgres=# set enable_hashjoin=off;  
+SET  
+Time: 0.246 ms  
+postgres=# explain select * from tbl1,tbl2 where tbl1.id=tbl2.id;  
+                                    QUERY PLAN                                      
+----------------------------------------------------------------------------------  
+ Merge Join  (cost=3285716.66..3510716.32 rows=9999985 width=72)  
+   Merge Cond: (tbl1.id = tbl2.id)  
+   ->  Sort  (cost=1642858.33..1667858.29 rows=9999985 width=36)  
+         Sort Key: tbl1.id  
+         ->  Seq Scan on tbl1  (cost=0.00..144247.85 rows=9999985 width=36)  
+   ->  Materialize  (cost=1642858.33..1692858.26 rows=9999985 width=36)  
+         ->  Sort  (cost=1642858.33..1667858.29 rows=9999985 width=36)  
+               Sort Key: tbl2.id  
+               ->  Seq Scan on tbl2  (cost=0.00..144247.85 rows=9999985 width=36)  
+(9 rows)  
+Time: 0.469 ms  
+postgres=# set enable_material =off;  
+SET  
+Time: 0.205 ms  
+postgres=# explain select * from tbl1,tbl2 where tbl1.id=tbl2.id;  
+                                 QUERY PLAN                                   
+----------------------------------------------------------------------------  
+ Merge Join  (cost=3285716.66..3485716.36 rows=9999985 width=72)  
+   Merge Cond: (tbl1.id = tbl2.id)  
+   ->  Sort  (cost=1642858.33..1667858.29 rows=9999985 width=36)  
+         Sort Key: tbl1.id  
+         ->  Seq Scan on tbl1  (cost=0.00..144247.85 rows=9999985 width=36)  
+   ->  Sort  (cost=1642858.33..1667858.29 rows=9999985 width=36)  
+         Sort Key: tbl2.id  
+         ->  Seq Scan on tbl2  (cost=0.00..144247.85 rows=9999985 width=36)  
+(8 rows)  
+Time: 0.436 ms  
+```  
+创建tbl1的JOIN字段ID的索引  
+```  
+postgres=# create index idx_tbl1_id on tbl1(id);  
+CREATE INDEX  
+Time: 2813.772 ms  
+```  
+当前索引大小214 MB  
+```  
+postgres=# \di+ idx_tbl1_id   
+                           List of relations  
+ Schema |    Name     | Type  |  Owner   | Table |  Size  | Description   
+--------+-------------+-------+----------+-------+--------+-------------  
+ public | idx_tbl1_id | index | postgres | tbl1  | 214 MB |   
+(1 row)  
+```  
+删除tbl1表的前9999999条记录  
+```  
+postgres=# delete from tbl1 where id  Index Scan using idx_tbl1_id on tbl1  (cost=0.43..229897.34 rows=10000000 width=36)  
+   ->  Sort  (cost=1642858.33..1667858.29 rows=9999985 width=36)  
+         Sort Key: tbl2.id  
+         ->  Seq Scan on tbl2  (cost=0.00..144247.85 rows=9999985 width=36)  
+(6 rows)  
+Time: 1317.079 ms  
+```  
+再一次生成执行计划，耗时还是不正常，但是略有好转，可能因为索引页的数据已经在内存中了。  
+```  
+postgres=# explain select * from tbl1,tbl2 where tbl1.id=tbl2.id;  
+                                        QUERY PLAN                                           
+-------------------------------------------------------------------------------------------  
+ Merge Join  (cost=1642863.77..2047750.44 rows=9999985 width=72)  
+   Merge Cond: (tbl1.id = tbl2.id)  
+   ->  Index Scan using idx_tbl1_id on tbl1  (cost=0.43..229897.34 rows=10000000 width=36)  
+   ->  Sort  (cost=1642858.33..1667858.29 rows=9999985 width=36)  
+         Sort Key: tbl2.id  
+         ->  Seq Scan on tbl2  (cost=0.00..144247.85 rows=9999985 width=36)  
+(6 rows)  
+Time: 81.410 ms  
+```  
+执行计划的时间与通过索引查询JOIN列的最大最小值的时间基本一致  
+```  
+postgres=# select min(id),max(id) from tbl1;  
+   min    |   max      
+----------+----------  
+ 10000000 | 10000000  
+(1 row)  
+Time: 81.591 ms  
+```  
+没有评估到merge join的时候，执行计划是正常的  
+```  
+postgres=# explain select min(id),max(id) from tbl1;  
+                                                      QUERY PLAN                                                         
+-----------------------------------------------------------------------------------------------------------------------  
+ Result  (cost=0.91..0.92 rows=1 width=8)  
+   InitPlan 1 (returns $0)  
+     ->  Limit  (cost=0.43..0.46 rows=1 width=4)  
+           ->  Index Only Scan using idx_tbl1_id on tbl1  (cost=0.43..210649.04 rows=10000000 width=4)  
+                 Index Cond: (id IS NOT NULL)  
+   InitPlan 2 (returns $1)  
+     ->  Limit  (cost=0.43..0.46 rows=1 width=4)  
+           ->  Index Only Scan Backward using idx_tbl1_id on tbl1 tbl1_1  (cost=0.43..210649.04 rows=10000000 width=4)  
+                 Index Cond: (id IS NOT NULL)  
+(9 rows)  
+Time: 0.679 ms  
+```  
+将优化器的enable_mergejoin关闭，执行计划的耗时恢复正常，所以问题的根源是merge join执行计划本身的问题，后面会有更细致的分析  
+```  
+postgres=# set enable_mergejoin =off;  
+SET  
+postgres=# explain select * from tbl1,tbl2 where tbl1.id=tbl2.id;  
+                                     QUERY PLAN                                        
+-------------------------------------------------------------------------------------  
+ Nested Loop  (cost=0.43..13754566787.32 rows=10000000 width=72)  
+   ->  Seq Scan on tbl2  (cost=0.00..144247.85 rows=9999985 width=36)  
+   ->  Index Scan using idx_tbl1_id on tbl1  (cost=0.43..875.44 rows=50000 width=36)  
+         Index Cond: (id = tbl2.id)  
+(4 rows)  
+Time: 0.602 ms  
+```  
+目前索引大小依旧是214 MB  
+```  
+postgres=# \di+ idx_tbl1_id   
+                           List of relations  
+ Schema |    Name     | Type  |  Owner   | Table |  Size  | Description   
+--------+-------------+-------+----------+-------+--------+-------------  
+ public | idx_tbl1_id | index | postgres | tbl1  | 214 MB |   
+(1 row)  
+```  
+使用pageinspect插件，检查一下当前索引  
+```  
+postgres=# create extension pageinspect ;  
+CREATE EXTENSION  
+```  
+首先，从metapage，查到索引的root page id  
+```  
+postgres=# select * from bt_metap('idx_tbl1_id');  
+ magic  | version | root | level | fastroot | fastlevel   
+--------+---------+------+-------+----------+-----------  
+ 340322 |       2 |  290 |     2 |      290 |         2  
+(1 row)  
+```  
+查询root page有多少条目，可以看到虽然数据都删了，但是索引还没有清理，这些条目依旧存在索引页中。  
+这也是为什么使用这个索引查找min, max会很慢的原因，因为它不知道这些数据已经被删除了，必须通过索引条目访问到HEAP PAGE对应的tuple后，才知道。  
+```  
+postgres=# select * from bt_page_stats('idx_tbl1_id',290);  
+ blkno | type | live_items | dead_items | avg_item_size | page_size | free_size | btpo_prev | btpo_next | btpo | btpo_flags   
+-------+------+------------+------------+---------------+-----------+-----------+-----------+-----------+------+------------  
+   290 | r    |         97 |          0 |            15 |      8192 |      6216 |         0 |         0 |    2 |          2  
+(1 row)  
+```  
+查找root page索引条目的明细  
+```  
+postgres=# select * from bt_page_items('idx_tbl1_id',290);  
+ itemoffset |   ctid    | itemlen | nulls | vars |          data             
+------------+-----------+---------+-------+------+-------------------------  
+          1 | (3,1)     |       8 | f     | f    |   
+          2 | (289,1)   |      16 | f     | f    | 09 96 01 00 00 00 00 00  
+          3 | (575,1)   |      16 | f     | f    | 11 2c 03 00 00 00 00 00  
+          4 | (860,1)   |      16 | f     | f    | 19 c2 04 00 00 00 00 00  
+          5 | (1145,1)  |      16 | f     | f    | 21 58 06 00 00 00 00 00  
+ ......  
+         96 | (27080,1) |      16 | f     | f    | f9 ac 96 00 00 00 00 00  
+         97 | (27365,1) |      16 | f     | f    | 01 43 98 00 00 00 00 00  
+(97 rows)  
+```  
+接下来使用vacuum tbl1 回收垃圾页，这个动作同样会回收tbl1的索引垃圾页，对于全部dead的索引也，会置为empty page。  
+```  
+postgres=# vacuum tbl1;  

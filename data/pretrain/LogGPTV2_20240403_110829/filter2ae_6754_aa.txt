@@ -1,0 +1,169 @@
+# 前言
+在2015年的GopherCon大会上 ,来自俄罗斯的google工程师Dmitry Vyukov 在其名为“[Go Dynamic
+Tools]”的presentation中就介绍了[go-fuzz](https://github.com/dvyukov/go-fuzz/blob/master/slides/go-fuzz.slide)，上篇文章中，介绍了go-fuzz的安装和使用方法。go-fuzz在go的标准库中找到了200+的bug，在一些go项目的更是发现了上千的bug，可以说是go语言模糊测试的一个成功的第三方解决方案。但是，Dmitry
+Vyukov发现虽然通过第三方的fuzzing工具可以解决Go开发者关于Fuzzing的部分需求，但有很多功能特性是通过第三方工具无法实现的。
+2016年，Dmitry Vyukov在Go官方issue列表中创建[“cmd/compile: coverage instrumentation for
+fuzzing”](https://github.com/golang/go/issues/14565)的issue归纳说明了这些问题，也是从那时开始，Dmitry
+Vyukov极力推进Fuzzing进入Go原生工具链的。 目前go-fuzz还存在以下几个问题：
+    1. 可能会由于go语言内部的相互依赖的包的改变而导致崩溃
+    2. 不在编译器的帮助下做覆盖率的插装，这会导致极端案例代码的破坏；表现不佳; 覆盖检测质量欠佳（缺失边缘） 
+    3. 与go语言原生的单元测试比太过复杂
+    4. 由于它使用源预处理，因此很难将其集成到其他构建系统和非标准上下文中
+3月16日， Go 团队终于发布 Go 1.18 ， Go 1.18 是一个包含大量新功能的版本，同时不仅改善了性能，也对语言本身做了有史以来最大的改变。
+Go 1.18将fuzz testing纳入了go
+test工具链，与单元测试、[性能基准测试](https://www.imooc.com/read/87/article/2439)等一起成为了Go原生测试工具链中的重要成员
+，Go也是第一个将模糊测试完全集成到其标准工具链中的主流语言 。本文从源码和实践的角度对go原生的fuzzing做一个简单的介绍。
+# go native fuzzing
+下面是官方给出使用go test -fuzz 进行的一个[模糊测试](https://go.dev/doc/fuzz/#glos-fuzz-test)的例子，突出了它的主要组成部分。
+以下是模糊测试必须遵循的规则。
+  * 模糊测试必须是以 `FuzzXxx` 命名的函数 ，它只接受 `*testing.F`参数并且没有返回值。
+  * 模糊测试必须在 *_test.go 文件中才能运行。
+  * [模糊测试的目标](https://go.dev/doc/fuzz/#glos-fuzz-target)必须是对`(*testing.F).Fuzz`的一个方法调用，且将 `*testing.T`作为第一个参数，然后是模糊测试的参数，没有返回值。
+  * 每个模糊测试必须只有一个测试目标。
+  * 所有[种子语料库](https://go.dev/doc/fuzz/#glos-seed-corpus)条目的类型必须与[模糊测试参数](https://go.dev/doc/fuzz/#fuzzing-arguments)相同，顺序相同。这适用于 `(*testing.F).Add`对模糊测试的 `testdata/fuzz` 目录中的任何语料库文件的调用。
+  * 模糊测试参数只能是以下类型：
+    * `string`, `[]byte`
+    * `int`, `int8`, `int16`, `int32`/`rune`, `int64`
+    * `uint`, `uint8`/`byte`, `uint16`, `uint32`, `uint64`
+    * `float32`, `float64`
+    * `bool`
+# go test -fuzz 相关技术
+## 架构
+gofuzz 是一个多进程的fuzzer，其组件可分为协调进程、工作进程和RPC。
+### Coordinator
+​ Coordinator的职责是运行和唤醒工作进程、命令工作进行去fuzz下一个输入、如果发生crash则将interesting data
+写入语料库等，该部分源码在[go](https://github.com/golang/go/tree/4d2da99498ff55700eeddf09d603fa0618c8b55c)/[src](https://github.com/golang/go/tree/4d2da99498ff55700eeddf09d603fa0618c8b55c/src)/[internal](https://github.com/golang/go/tree/4d2da99498ff55700eeddf09d603fa0618c8b55c/src/internal)/[fuzz](https://github.com/golang/go/tree/4d2da99498ff55700eeddf09d603fa0618c8b55c/src/internal/fuzz)/
+**fuzz.go** 中可以找到。
+  * **CoordinateFuzzingOpts { }**
+​ 结构体 `CoordinateFuzzingOpts` 定义了 `CoordinateFuzzing` 的一系类参数，包括语料库加载后的挂钟时间、
+生成和测试的随机值的数量、发现崩溃后的最小化时间、并行运行的worker进程数量、种子列表、语料库文件夹、
+构成语料库条目的类型列表等，其中部分字段被设置为0值表示没有限制，其结构体源码如下：
+    // go/src/internal/fuzz/fuzz.go
+    // CoordinateFuzzingOpts is a set of arguments for CoordinateFuzzing.
+    // The zero value is valid for each field unless specified otherwise.
+    type CoordinateFuzzingOpts struct {
+        Log io.Writer
+        Timeout time.Duration
+        Limit int64
+        MinimizeTimeout time.Duration
+        MinimizeLimit int64
+        Parallel int
+        Seed []CorpusEntry
+        Types []reflect.Type
+        CorpusDir string
+        CacheDir string
+    }
+  * **CoordinateFuzzing（）**
+`CoordinateFuzzing`函数用来创建多个`worker`进程，并管理`worker`进程对可能触发崩溃的随机输入进行测试。如果发生崩溃，该函数将返回一个err，其中包含有关崩溃的信息。
+该函数时定义了包括主时间循环在内的诸如管理`worker`进程的多个行为：如
+创建worker进程、开始worker进程、结束worker进程、确保发现的crash写入语料库、根据覆盖率信息协调工作进程等。
+  * **Coordinator {}**
+结构体 coordinator
+定义了多个Coordinator与worker之间的channel，如coordinator传递fuzz数据到worker的channel
+`inputC`、传递最小化数据的channel `minimizeC`，worker传递fuzzing结果到coordinator的channel
+`resultC`等，此外还包括加载语料库后workers启动的时间 `startTime` 、发现的感兴趣的输入数量 `interestingCount`
+等等，该结构体定义如下：
+    // coordinator holds channels that workers can use to communicate with
+    // the coordinator.
+    type coordinator struct {
+        opts CoordinateFuzzingOpts
+        // startTime is the time we started the workers after loading the corpus.
+        // Used for logging.
+        startTime time.Time
+        // inputC is sent values to fuzz by the coordinator. Any worker may receive
+        // values from this channel. Workers send results to resultC.
+        inputC chan fuzzInput
+        // minimizeC is sent values to minimize by the coordinator. Any worker may
+        // receive values from this channel. Workers send results to resultC.
+        minimizeC chan fuzzMinimizeInput
+        // resultC is sent results of fuzzing by workers. The coordinator
+        // receives these. Multiple types of messages are allowed.
+        resultC chan fuzzResult
+        // count is the number of values fuzzed so far.
+        count int64
+        // countLastLog is the number of values fuzzed when the output was last
+        // logged.
+        countLastLog int64
+        // timeLastLog is the time at which the output was last logged.
+        timeLastLog time.Time
+        // interestingCount is the number of unique interesting values which have
+        // been found this execution.
+        interestingCount int
+        // warmupInputCount is the count of all entries in the corpus which will
+        // need to be received from workers to run once during warmup, but not fuzz.
+        // This could be for coverage data, or only for the purposes of verifying
+        // that the seed corpus doesn't have any crashers. See warmupRun.
+        warmupInputCount int
+        // warmupInputLeft is the number of entries in the corpus which still need
+        // to be received from workers to run once during warmup, but not fuzz.
+        // See warmupInputLeft.
+        warmupInputLeft int
+        // duration is the time spent fuzzing inside workers, not counting time
+        // starting up or tearing down.
+        duration time.Duration
+        // countWaiting is the number of fuzzing executions the coordinator is
+        // waiting on workers to complete.
+        countWaiting int64
+        // corpus is a set of interesting values, including the seed corpus and
+        // generated values that workers reported as interesting.
+        corpus corpus
+        // minimizationAllowed is true if one or more of the types of fuzz
+        // function's parameters can be minimized.
+        minimizationAllowed bool
+        // inputQueue is a queue of inputs that workers should try fuzzing. This is
+        // initially populated from the seed corpus and cached inputs. More inputs
+        // may be added as new coverage is discovered.
+        inputQueue queue
+        // minimizeQueue is a queue of inputs that caused errors or exposed new
+        // coverage. Workers should attempt to find smaller inputs that do the
+        // same thing.
+        minimizeQueue queue
+        // crashMinimizing is the crash that is currently being minimized.
+        crashMinimizing *fuzzResult
+        // coverageMask aggregates coverage that was found for all inputs in the
+        // corpus. Each byte represents a single basic execution block. Each set bit
+        // within the byte indicates that an input has triggered that block at least
+        // 1 << n times, where n is the position of the bit in the byte. For example, a
+        // value of 12 indicates that separate inputs have triggered this block
+        // between 4-7 times and 8-15 times.
+        coverageMask []byte
+    }
+### Worker
+worker的功能主要包括种子变异、最小化、运行fuzz函数、收集覆盖率、返回Crash或新的边、等。
+worker 管理运行测试二进制文件的工作进程 ，当且仅当进程被`go -test -fuzz`
+唤醒时，worker对象才会存在与coordinator中。 coordinator从种子语料库和缓存语料库选择输入来进行模糊测试 ，使用
+`workerClient` 向工作进程发送 RPC ， `workerServer` 来处理这些RPC ，下面是worker定义的结构体。
+    type worker struct {
+        dir     string   // working directory, same as package directory
+        binPath string   // path to test executable
+        args    []string // arguments for test executable
+        env     []string // environment for test executable
+        coordinator *coordinator
+        memMu chan *sharedMem // mutex guarding shared memory with worker; persists across processes.
+        cmd         *exec.Cmd     // current worker process
+        client      *workerClient // used to communicate with worker process
+        waitErr     error         // last error returned by wait, set before termC is closed.
+        interrupted bool          // true after stop interrupts a running worker.
+        termC       chan struct{} // closed by wait when worker process terminates
+    }
+  * **workerComm**
+​ `workerComm`支持用于`workerClint`进程与`workerServer`进程之间通信的管道和共享内存 ， 对共享内存的访问通过
+RPC 协议隐式同步实现，`workComm`定义的结构体如下：
+    type workerComm struct {
+        fuzzIn, fuzzOut *os.File
+        memMu           chan *sharedMem // mutex guarding shared memory
+    }
+  * **workerServer**
+​ `workerServe`r 是一个由worker进程运行的极简的 RPC
+服务器，该系统允许coordinator并行运行多个worker进程，并在工作进程意外终止后从共享内存中收集导致崩溃的输入。其定义的结构体如下：
+    type workerServer struct {
+        workerComm
+        m *mutator
+        coverageMask []byte
+        fuzzFn func(CorpusEntry) (time.Duration, error)
+    }
+​
+其中`coverageMask`定义了worker的本地覆盖数据，当新的路径被发现它会定期的更新以供coordinator参考。fuzzFn运行worker指定的fuzz目标，当发现一个crash便会返回一个error和其运行该输入花费的时间。
+`workerserver`有以下几个方法：
+​ `server()`在 `fuzzIn` 上读取序列化的 RPC 消息 , 当serve收到消息时 , 它调用相应的方法 ,
+然后将序列化的结果返回给fuzzout； `fuzz()` 在共享内存中根据随机输入在有限的持续时间或迭代次数内来运行测试函数

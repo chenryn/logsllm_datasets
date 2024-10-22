@@ -1,0 +1,306 @@
+# 从强网杯 2021 线上赛题目 notebook 中浅析 userfaultfd 在 kernel pwn 中的利用
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00.一切开始之前
+条件竞争漏洞算是日常生活中较为常见的一个漏洞，也是当前 CTF 中 Linux kernel pwn 中较为热门的方向之一
+但多个线程之间的竞争总归是命中率较低，从而无法让攻击者很好地完成利用，为了能够成功、稳定地达成 race，`userfaultfd`
+这一冷门系统调用逐渐走入大众视野
+笔者今天就借助强网杯2021线上赛的 notebook 一题简单讲讲 userfaultfd 在 kernel pwn 中的利用手法
+## 0x01.userfaultfd 系统调用
+严格意义而言 userfaultfd 并非是一种利用手法， **而是 Linux 的一个系统调用** ，简单来说，通过 userfaultfd 这种机制，
+**用户可以通过自定义的 page fault handler 在用户态处理缺页异常**
+下面的这张图很好地体现了 userfaultfd 的整个流程：
+要使用 userfaultfd 系统调用，我们首先要注册一个 userfaultfd，通过 ioctl
+监视一块内存区域，同时还需要专门启动一个用以进行轮询的线程 `uffd monitor`，该线程会通过 `poll()` 函数不断轮询
+**直到出现缺页异常**
+  * 当有一个线程在这块内存区域内触发缺页异常时（比如说第一次访问一个匿名页），该线程（称之为 faulting 线程）进入到内核中处理缺页异常
+  * 内核会调用 `handle_userfault()` 交由 userfaultfd 处理
+  * 随后 faulting 线程进入堵塞状态，同时将一个 `uffd_msg` 发送给 monitor 线程，等待其处理结束
+  * monitor 线程调用通过 ioctl 处理缺页异常，有如下选项： 
+    * `UFFDIO_COPY`：将用户自定义数据拷贝到 faulting page 上
+    * `UFFDIO_ZEROPAGE` ：将 faulting page 置0
+    * `UFFDIO_WAKE`：用于配合上面两项中 `UFFDIO_COPY_MODE_DONTWAKE` 和 `UFFDIO_ZEROPAGE_MODE_DONTWAKE` 模式实现批量填充
+  * 在处理结束后 monitor 线程发送信号唤醒 faulting 线程继续工作
+以上便是 userfaultfd 这个机制的整个流程，该机制最初被设计来用以进行虚拟机/进程的迁移等用途
+###  userfaultfd 与条件竞争
+看起来 userfaultfd 只是一个常规的与处理缺页异常相关的系统调用，但是
+**通过这个机制我们可以控制进程执行流程的先后顺序，从而使得对条件竞争的利用成功率大幅提高**
+考虑在内核模块当中有一个菜单堆的情况，其中的操作都没有加锁，存在条件竞争的可能，考虑如下竞争情况：
+  * 线程1不断地分配与编辑堆块
+  * 线程2不断地释放堆块
+此时线程1便 **有可能编辑到被释放的堆块** ，若是此时恰好我们又将这个堆块申请到了合适的位置（比如说
+tty_operations），那么我们便可以控制程序执行流（也可以是编辑释放后堆块的 fd，然后实现任意地址写）
+但是毫无疑问的是，若是直接开两个线程进行竞争，命中的几率是比较低的，我们也很难判断是否命中
+但假如线程1使用注诸如 `copy_from_user` 等方法从用户空间向内核空间拷贝数据，那么我们便可以先用 mmap 分一块匿名内存，为其注册
+userfaultfd，之后 **线程1在内核中触发缺页异常时便会陷入阻塞，此时我们便可以开另一个线程将这块内存释放掉，然后再分配到我们想要的地方**
+（比如说 tty_operations），此时再让线程1继续执行，便能向我们想要读写的目标读写特定数据了， **这使得条件竞争的命中率大幅提高**
+###  userfaultfd 的具体用法
+> 以下代码参考自 Linux man page，略有改动
+首先定义接下来需要用到的一些数据结构
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    void errExit(char * msg)
+    {
+        puts(msg);
+        exit(-1);
+    }
+    //...
+    long uffd;          /* userfaultfd file descriptor */
+    char *addr;         /* Start of region handled by userfaultfd */
+    unsigned long len;  /* Length of region handled by userfaultfd */
+    pthread_t thr;      /* ID of thread that handles page faults */
+    struct uffdio_api uffdio_api;
+    struct uffdio_register uffdio_register;
+首先通过 userfaultfd 系统调用注册一个 userfaultfd，其中 `O_CLOEXEC` 和 `O_NONBLOCK` 和 open 的
+flags 相同，笔者个人认为这里可以理解为我们创建了一个虚拟设备 `userfault`
+这里用 mmap 分一个匿名页用作后续被监视的区域
+    /* Create and enable userfaultfd object */
+    uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (uffd == -1)
+        errExit("userfaultfd");
+    uffdio_api.api = UFFD_API;
+    uffdio_api.features = 0;
+    if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+        errExit("ioctl-UFFDIO_API");
+    /* Create a private anonymous mapping. The memory will be
+        demand-zero paged--that is, not yet allocated. When we
+        actually touch the memory, it will be allocated via
+        the userfaultfd. */
+    len = 0x1000;
+    addr = (char*) mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED)
+        errExit("mmap");
+为这块内存区域注册 userfaultfd
+    /* Register the memory range of the mapping we just created for
+        handling by the userfaultfd object. In mode, we request to track
+        missing pages (i.e., pages that have not yet been faulted in). */
+    uffdio_register.range.start = (unsigned long) addr;
+    uffdio_register.range.len = len;
+    uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+        errExit("ioctl-UFFDIO_REGISTER");
+启动 monitor 轮询线程，整个 userfaultfd 的启动流程就结束了，接下来便是等待缺页异常的过程
+    /* Create a thread that will process the userfaultfd events */
+    int s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+    if (s != 0) {
+        errExit("pthread_create");
+    }
+monitor 轮询线程应当定义如下形式，这里给出的是 UFFD_COPY，即将自定义数据拷贝到 faulting page 上：
+    static int page_size;
+    static void *
+    fault_handler_thread(void *arg)
+    {
+        static struct uffd_msg msg;   /* Data read from userfaultfd */
+        static int fault_cnt = 0;     /* Number of faults so far handled */
+        long uffd;                    /* userfaultfd file descriptor */
+        static char *page = NULL;
+        struct uffdio_copy uffdio_copy;
+        ssize_t nread;
+        page_size = sysconf(_SC_PAGE_SIZE);
+        uffd = (long) arg;
+        /* Create a page that will be copied into the faulting region */
+        if (page == NULL) 
+        {
+            page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (page == MAP_FAILED)
+                errExit("mmap");
+        }
+        /* Loop, handling incoming events on the userfaultfd
+            file descriptor */
+        for (;;) 
+        {
+            /* See what poll() tells us about the userfaultfd */
+            struct pollfd pollfd;
+            int nready;
+            pollfd.fd = uffd;
+            pollfd.events = POLLIN;
+            nready = poll(&pollfd, 1, -1);
+            if (nready == -1)
+                errExit("poll");
+            printf("\nfault_handler_thread():\n");
+            printf("    poll() returns: nready = %d; "
+                    "POLLIN = %d; POLLERR = %d\n", nready,
+                    (pollfd.revents & POLLIN) != 0,
+                    (pollfd.revents & POLLERR) != 0);
+            /* Read an event from the userfaultfd */
+            nread = read(uffd, &msg, sizeof(msg));
+            if (nread == 0)
+            {
+                printf("EOF on userfaultfd!\n");
+                exit(EXIT_FAILURE);
+            }
+            if (nread == -1)
+                errExit("read");
+            /* We expect only one kind of event; verify that assumption */
+            if (msg.event != UFFD_EVENT_PAGEFAULT)
+            {
+                fprintf(stderr, "Unexpected event on userfaultfd\n");
+                exit(EXIT_FAILURE);
+            }
+            /* Display info about the page-fault event */
+            printf("    UFFD_EVENT_PAGEFAULT event: ");
+            printf("flags = %llx; ", msg.arg.pagefault.flags);
+            printf("address = %llx\n", msg.arg.pagefault.address);
+            /* Copy the page pointed to by 'page' into the faulting
+                region. Vary the contents that are copied in, so that it
+                is more obvious that each fault is handled separately. */
+            memset(page, 'A' + fault_cnt % 20, page_size);
+            fault_cnt++;
+            uffdio_copy.src = (unsigned long) page;
+            /* We need to handle page faults in units of pages(!).
+            So, round faulting address down to page boundary */
+            uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+                                                  ~(page_size - 1);
+            uffdio_copy.len = page_size;
+            uffdio_copy.mode = 0;
+            uffdio_copy.copy = 0;
+            if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+                errExit("ioctl-UFFDIO_COPY");
+            printf("        (uffdio_copy.copy returned %lld)\n",
+                   uffdio_copy.copy);
+        }
+    }
+有人可能注意到了 `uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+~(page_size - 1);` 这个奇怪的句子，在这里作用是将触发缺页异常的地址 **按页对齐** 作为后续拷贝的起始地址
+> 比如说触发的地址可能是 0xdeadbeef，直接从这里开始拷贝一整页的数据就拷歪了，应当从 0xdeadb000 开始拷贝（假设页大小 0x1000）
+**例程**
+测试例程如下：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    static int page_size;
+    void errExit(char * msg)
+    {
+        printf("[x] Error at: %s\n", msg);
+        exit(-1);
+    }
+    static void *
+    fault_handler_thread(void *arg)
+    {
+        static struct uffd_msg msg;   /* Data read from userfaultfd */
+        static int fault_cnt = 0;     /* Number of faults so far handled */
+        long uffd;                    /* userfaultfd file descriptor */
+        static char *page = NULL;
+        struct uffdio_copy uffdio_copy;
+        ssize_t nread;
+        uffd = (long) arg;
+        /* Create a page that will be copied into the faulting region */
+        if (page == NULL) 
+        {
+            page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (page == MAP_FAILED)
+                errExit("mmap");
+        }
+        /* Loop, handling incoming events on the userfaultfd
+            file descriptor */
+        for (;;) 
+        {
+            /* See what poll() tells us about the userfaultfd */
+            struct pollfd pollfd;
+            int nready;
+            pollfd.fd = uffd;
+            pollfd.events = POLLIN;
+            nready = poll(&pollfd, 1, -1);
+            if (nready == -1)
+                errExit("poll");
+            printf("\nfault_handler_thread():\n");
+            printf("    poll() returns: nready = %d; "
+                    "POLLIN = %d; POLLERR = %d\n", nready,
+                    (pollfd.revents & POLLIN) != 0,
+                    (pollfd.revents & POLLERR) != 0);
+            /* Read an event from the userfaultfd */
+            nread = read(uffd, &msg, sizeof(msg));
+            if (nread == 0)
+            {
+                printf("EOF on userfaultfd!\n");
+                exit(EXIT_FAILURE);
+            }
+            if (nread == -1)
+                errExit("read");
+            /* We expect only one kind of event; verify that assumption */
+            if (msg.event != UFFD_EVENT_PAGEFAULT)
+            {
+                fprintf(stderr, "Unexpected event on userfaultfd\n");
+                exit(EXIT_FAILURE);
+            }
+            /* Display info about the page-fault event */
+            printf("    UFFD_EVENT_PAGEFAULT event: ");
+            printf("flags = %llx; ", msg.arg.pagefault.flags);
+            printf("address = %llx\n", msg.arg.pagefault.address);
+            /* Copy the page pointed to by 'page' into the faulting
+                region. Vary the contents that are copied in, so that it
+                is more obvious that each fault is handled separately. */
+            memset(page, 'A' + fault_cnt % 20, page_size);
+            fault_cnt++;
+            uffdio_copy.src = (unsigned long) page;
+            /* We need to handle page faults in units of pages(!).
+            So, round faulting address down to page boundary */
+            uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+                                                  ~(page_size - 1);
+            uffdio_copy.len = page_size;
+            uffdio_copy.mode = 0;
+            uffdio_copy.copy = 0;
+            if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+                errExit("ioctl-UFFDIO_COPY");
+            printf("        (uffdio_copy.copy returned %lld)\n",
+                   uffdio_copy.copy);
+        }
+    }
+    int main(int argc, char ** argv, char ** envp)
+    {
+        long uffd;          /* userfaultfd file descriptor */
+        char *addr;         /* Start of region handled by userfaultfd */
+        unsigned long len;  /* Length of region handled by userfaultfd */
+        pthread_t thr;      /* ID of thread that handles page faults */
+        struct uffdio_api uffdio_api;
+        struct uffdio_register uffdio_register;
+        page_size = sysconf(_SC_PAGE_SIZE);
+        /* Create and enable userfaultfd object */
+        uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+        if (uffd == -1)
+            errExit("userfaultfd");
+        uffdio_api.api = UFFD_API;
+        uffdio_api.features = 0;
+        if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+            errExit("ioctl-UFFDIO_API");
+        /* Create a private anonymous mapping. The memory will be
+            demand-zero paged--that is, not yet allocated. When we
+            actually touch the memory, it will be allocated via
+            the userfaultfd. */
+        len = 0x1000;
+        addr = (char*) mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (addr == MAP_FAILED)
+            errExit("mmap");
+        /* Register the memory range of the mapping we just created for
+        handling by the userfaultfd object. In mode, we request to track
+        missing pages (i.e., pages that have not yet been faulted in). */
+        uffdio_register.range.start = (unsigned long) addr;
+        uffdio_register.range.len = len;

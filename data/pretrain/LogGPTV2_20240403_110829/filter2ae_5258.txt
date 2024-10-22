@@ -1,0 +1,185 @@
+**作者：wzt  
+原文链接：**
+## **1 简介**
+Freebsd的jail模型是一个纯粹的沙箱模型，用来限制进程的一些行为，是一种安全机制。它是一种简单的“虚拟化”设计，更精确的说它只是简单的namespace机制实现。Linux的容器机制技术包括pid
+namespace、ipc namespace、uts namespace、mount namespace、netstack
+namespace、cgroup等。Freebsd的jail只包含了uts、netstack的namespace完整实现，剩下的namespace不具备功能完整性，只做了一些简单的隔离限制，在后面的源码分析中，将会看到详细的阐述。
+## **2 架构**
+### **2.1 Jail模型**
+Jail模型在内核里是以prison为单位进行管理， 一个prison有其父prison，有兄弟prison，有子prison，很类似进程的关系链。
+prison用结构体struct prison表示， 内核使用宏FOREACH_PRISON_DESCENDANT遍历prison：
+    sys/jail.h：
+    #define FOREACH_PRISON_DESCENDANT(ppr, cpr, descend)                    \
+            for ((cpr) = (ppr), (descend) = 1;                              \
+                ((cpr) = (((descend) && !LIST_EMPTY(&(cpr)->pr_children))   \
+                  ? LIST_FIRST(&(cpr)->pr_children)                         \
+                  : ((cpr) == (ppr)                                         \
+                     ? NULL                                                 \
+                     : (((descend) = LIST_NEXT(cpr, pr_sibling) != NULL)    \
+                        ? LIST_NEXT(cpr, pr_sibling)                        \
+                        : (cpr)->pr_parent))));)                            \
+                    if (!(descend))                                         \
+                            ;                                               \
+                    else
+这个宏读起来比较绕，首先对prison的子节点进行深度遍历，然后在对其兄弟prison进行遍历。descend只起到一个标识作用，在从children向上回溯时不需要在做检查。
+Freebsd增加了sys_jail、sys_jail_set、jail_remove三个系统调用，来支持jail的建立和销毁。Jail在内核中的结构如下：
+    struct jail {
+            uint32_t        version;// jail版本号
+            char            *path;// chroot路径
+            char            *hostname;// 主机名
+            char            *jailname;// jail名
+            uint32_t        ip4s;// ipv4地址数目
+            uint32_t        ip6s;// ipv6地址数目
+            struct in_addr  *ip4;// ipv4地址数组
+            struct in6_addr *ip6;// ipv6地址数组
+    };
+kern_jail_set函数用于将struct jail结构转化为struct prison结构，后者挂接于每个线程的struct ucred结构体里。
+    struct prison {
+    ...
+            char             pr_hostname[MAXHOSTNAMELEN];   /* (p) jail hostname */
+            char             pr_domainname[MAXHOSTNAMELEN]; /* (p) jail domainname */
+            char             pr_hostuuid[HOSTUUIDLEN];      /* (p) jail hostuuid */
+            char             pr_osrelease[OSRELEASELEN];    /* (c) kern.osrelease value */
+    };
+以后内核对于取主机名等操作就从此结构体里取出，这样就实现了类似linux uts namespace的机制。
+系统的init进程处于prison0之中，类似于linux的init进程处于init_namespace之中。
+### **2.2 进程隔离**
+linux提供了pid namespace机制，不同的pid namespace之间不能进行信号发送，同一个pid namespace组里，只有父pid
+namespace可以给子pid namespace发送信号，反过来则不行。比如父进程可以发送kill
+-9杀死子进程，子进程却不能杀死父进程，这是进程间隔离的基本要素。Freebsd的实现也是如此。
+sys_kill->p_cansignal->cr_cansignal->prison_check->prison_ischild
+    int
+    prison_ischild(struct prison *pr1, struct prison *pr2)
+    {
+            for (pr2 = pr2->pr_parent; pr2 != NULL; pr2 = pr2->pr_parent)
+                    if (pr1 == pr2)
+                            return (1);
+            return (0);
+    }
+当发送信号操作时，会调用prison_ischild函数检查目标进程是否处于当前进程的子prison里，如果是则继续发送信号，如果不是则失败返回。这个算法与linux的pid
+namespace机制如出一辙，只不过linux的每个pid namespace都有自己的进程号管理体系，它通过层次来实现进程的pid
+namespace区分，假如一个进程处于三层namespace中，
+那么在它的一层、二层namespace中都占有一个独立的进程号，而Freebsd并没有采取上述机制。
+### **2.3 ipc隔离**
+在ipc相关的通讯中，也有类似进程隔离的检查机制。
+    kern/sysv_msg.c
+    sys_msgctl->kern_msgctl->msq_prison_cansee
+    static int
+    msq_prison_cansee(struct prison *rpr, struct msqid_kernel *msqkptr)
+    {
+            if (msqkptr->cred == NULL ||
+                !(rpr == msqkptr->cred->cr_prison ||
+                  prison_ischild(rpr, msqkptr->cred->cr_prison)))
+                    return (EINVAL);
+            return (0);
+    }
+msq_prison_cansee仍然调用prison_ischild函数来判断目标进程是否处于当前进程的子prison中。
+    kern/sysv_shm.c：
+    sys_shmat->kern_shmat->kern_shmctl_locked->shm_find_segment->shm_prison_cansee
+    static int
+    shm_prison_cansee(struct prison *rpr, struct shmid_kernel *shmseg)
+    {
+            if (shmseg->cred == NULL ||
+                !(rpr == shmseg->cred->cr_prison ||
+                  prison_ischild(rpr, shmseg->cred->cr_prison)))
+                    return (EINVAL);
+            return (0);
+    }
+    kern/sysv_sem.c:
+    sys___semctl->kern_semctl->sem_prison_cansee
+    static int
+    sem_prison_cansee(struct prison *rpr, struct semid_kernel *semakptr)
+    {
+            if (semakptr->cred == NULL ||
+                !(rpr == semakptr->cred->cr_prison ||
+                  prison_ischild(rpr, semakptr->cred->cr_prison)))
+                    return (EINVAL);
+            return (0);
+    }
+### **2.4 文件系统隔离**
+#### **2.4.1 mount隔离**
+freebsd没有实现linux的mount namespace机制，而是在mount的操作中，判断是否处于prison的进程可以执行mount操作。
+    kern/vfs_subr.c：
+    int
+    vfs_suser(struct mount *mp, struct thread *td)
+    {
+            int error;
+            if (jailed(td->td_ucred)) {
+                    if (prison_check(td->td_ucred, mp->mnt_cred) != 0)
+                            return (EPERM);
+            }
+    }
+当进程处于jail中，就调用prison_check对当前进程的cred和要挂接的目录cred进行比对，后者又调用prison_ischild来判断要挂接的目录是否在当前prison之外，如果是的话就不允许此操作。
+#### **2.4.2 文件系统属性修改**
+    ufs/ufs/ufs_vnops.c：
+    static int
+    ufs_setattr(ap)
+            struct vop_setattr_args /* {
+                    struct vnode *a_vp;
+                    struct vattr *a_vap;
+                    struct ucred *a_cred;
+            } */ *ap;
+    {
+                   if (!priv_check_cred(cred, PRIV_VFS_SYSFLAGS)) {
+    }
+判断当前处在prison中的进程是否有PRIV_VFS_SYSFLAGS修改文件系统属性的权限。
+    priv_check_cred->prison_priv_check
+    int
+    prison_priv_check(struct ucred *cred, int priv)
+    {
+            case PRIV_VFS_SYSFLAGS:
+                    if (cred->cr_prison->pr_allow & PR_ALLOW_CHFLAGS)
+                            return (0);
+    }
+#### **2.5 网络隔离**
+freebsd的net stack
+namespace是通过vnet模型来实现的，jail模型只做简单的隔离操作，比如是否允许prison的进程绑定地址等等。
+    sys_bind->kern_bindat->sobind
+    int
+    sobind(struct socket *so, struct sockaddr *nam, struct thread *td)
+    {
+            error = (*so->so_proto->pr_usrreqs->pru_bind)(so, nam, td);
+    }
+so->so_proto->pr_usrreqs->pru_bind指向某个具体的地址族中的某个协议地址绑定操作指针，我们以INET地址族TCP协议的端口绑定操作来看下：
+in_pcbbind->in_pcbbind_setup
+    int
+    in_pcbbind_setup(struct inpcb *inp, struct sockaddr *nam, in_addr_t *laddrp,
+        u_short *lportp, struct ucred *cred)
+    {
+    if ((error = prison_local_ip4(cred, &laddr)) != 0)
+    }
+Tcp bind的初始化操作中调用prison_local_ip4来判断是否允许此次bind操作。
+    int
+    prison_local_ip4(struct ucred *cred, struct in_addr *ia)
+    {
+            pr = cred->cr_prison;
+            if (!(pr->pr_flags & PR_IP4))                [1]
+                    return (0);
+            mtx_lock(&pr->pr_mtx);
+            if (!(pr->pr_flags & PR_IP4)) {
+                    mtx_unlock(&pr->pr_mtx);
+                    return (0);
+            }
+            if (pr->pr_ip4 == NULL) {                    [2]
+                    mtx_unlock(&pr->pr_mtx);
+                    return (EAFNOSUPPORT);
+            }
+            ia0.s_addr = ntohl(ia->s_addr);
+            if (ia0.s_addr == INADDR_ANY) {              [3]
+                    if (pr->pr_ip4s == 1)
+                            ia->s_addr = pr->pr_ip4[0].s_addr;
+                    mtx_unlock(&pr->pr_mtx);
+                    return (0);
+            }
+            error = prison_check_ip4_locked(pr, ia);     [4]
+            if (error == EADDRNOTAVAIL && ia0.s_addr == INADDR_LOOPBACK) {
+                    ia->s_addr = pr->pr_ip4[0].s_addr;
+                    error = 0;
+            }
+            mtx_unlock(&pr->pr_mtx);
+            return (error);
+    }
+[1] 如果prison没有设置PR_IP4标志则放行通过,
+如果设置了但pr->pr_ip4保存的ipv4地址数组为空，则失败返回。在[3]处，如果地址类型为INADDR_ANY，则放行通过。然后调用[4]处的prison_check_ip4_locked判断要绑定的地址是否在prison
+ipv4地址数组中，它通过二分法来做匹配。如果绑定的地址不在其中，则返回失败，也就是说prison中进程使用socket绑定的ipv4地址必须是在通过sys_jail设置好的地址范围。
+* * *

@@ -1,0 +1,187 @@
+# ptmalloc malloc部分源码分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+ptmalloc是glibc的默认管理器，我们常用的malloc和free就是由ptmalloc提供的内存分配函数，对malloc部分的代码进行分析。在分配器中，为了解决多线程锁的争夺问题，分为了主分配区和非主分配区，每个进程有一个主分配区，还可以有多个非主分配区。主分配区用brk和mmap来分配，但是非主分配区使用mmap来映射内存。接下来我们对院代码进行分析。调用malloc函数的时候，又调用了__libc_malloc函数，接下来看下该函数的源码
+    void *
+    __libc_malloc( size_t bytes )
+    {
+        mstate    ar_ptr;
+        void    *victim;
+        void( hook ) ( size_t, const void )
+            = atomic_forced_read( malloc_hook );
+        if ( builtin_expect( hook != NULL, 0 ) )
+            return( (hook) (bytes, RETURN_ADDRESS( 0 ) ) );
+        arena_lookup( ar_ptr );
+        arena_lock( ar_ptr, bytes );
+        if ( !ar_ptr )
+            return(0);
+        victim = _int_malloc( ar_ptr, bytes );
+        if ( !victim )
+        {
+            LIBC_PROBE( memory_malloc_retry, 1, bytes );
+            ar_ptr = arena_get_retry( ar_ptr, bytes );
+            if ( __builtin_expect( ar_ptr != NULL, 1 ) )
+            {
+                victim = _int_malloc( ar_ptr, bytes );
+                (void) mutex_unlock( &ar_ptr->mutex );
+            }
+        }else
+            (void) mutex_unlock( &ar_ptr->mutex );
+        assert( !victim || chunk_is_mmapped( mem2chunk( victim ) ) ||
+            ar_ptr == arena_for_chunk( mem2chunk( victim ) ) );
+        return(victim);
+    }
+其次，再看这个之前，需要先补充一点概念，先看下面这结构体
+        struct malloc_state
+    {
+      /* Serialize access.  */
+      mutex_t mutex;
+      /* Flags (formerly in max_fast).  */
+      int flags;
+      /* Fastbins */
+      mfastbinptr fastbinsY[NFASTBINS];
+      /* Base of the topmost chunk -- not otherwise kept in a bin */
+      mchunkptr top;
+      /* The remainder from the most recent split of a small request */
+      mchunkptr last_remainder;
+      /* Normal bins packed as described above */
+      mchunkptr bins[NBINS * 2 - 2];
+      /* Bitmap of bins */
+      unsigned int binmap[BINMAPSIZE];
+      /* Linked list */
+      struct malloc_state *next;
+      /* Linked list for free arenas.  */
+      struct malloc_state *next_free;
+      /* Memory allocated from the system in this arena.  */
+      INTERNAL_SIZE_T system_mem;
+      INTERNAL_SIZE_T max_system_mem;
+    };
+在这个里面，我们需要先知道是如何对这些东西进行管理的，这里需要知道的是arena，heap，chunk三个。
+  1. arena在开始说过，该结构主要存储的是一些较高层次的信息。arena的数量是有限的，满了以后就不再创建而是与其他的进行共享。如果该arena没有线程使用，就上锁，防止冲突，可以用来保证多线程堆空间的分配的高效。
+  2. heap的话就是存储着堆的相关信息。
+  3. chunk的话则是分配的内存单位，当我们进行申请的时候，就会得到一个chunk。
+有了这个概念以后，再看上面的结构体，加上注释就可能好理解一点上面的结构体成员作如下理解。  
+mutex是互斥锁，前面说到的arena为了解决多线程冲突的问题，所以如果使用了该arena，会进行上锁。  
+后面的flags是标志位标志着一些特征，这里不做深入只需要有个概念。fastbins是一个链表后面再做解释，top指的是top
+chunk，bins也是一个chunk的链表数组，next指针指向的是下一个malloc_state的位置。而后面那个*next_free指针是指向下一个未使用的malloc_state的位置。最后两个结构体成员则是和系统目前分配的内存总量有关。回到__libc_malloc的源码,声明了一个结构体一个指针。然后
+    void *(*hook) (size_t, const void *)
+    = atomic_forced_read (__malloc_hook);
+这个地方我们可以看一下宏定义
+    #define atomic_forced_read( x )    \
+    ({ typeof(x)x; asm ("" : "=r" (x) : "0" (x) ); __x; })
+typeof是返回类型，后面的是一段汇编代码，此处看内联汇编。该宏定义操作就是原子读，源代码处就是把malloc_hook函数地址放入任意寄存器再取出。而__malloc_hook函数的定义如下
+    void *weak_variable (*__malloc_hook)(size_t __size, const void *) = malloc_hook_ini;
+__malloc_hook_ini的定义如下
+    static void * malloc_hook_ini (size_t sz, const void *caller){
+    __malloc_hook = NULL;
+    ptmalloc_init ();
+    return __libc_malloc (sz);
+    }
+在ptmalloc中定义了一个hook，如果我们需要自定义堆分配函数，就可以把malloc_hook设置成我们自定义的函数，申请完成直接返回。如果我们没有自定义分配函数，那就会进入ptmalloc_init函数，该函数进行初始化，然后调用libc_malloc函数。  
+回到_libc_malloc的代码，关于arena_get函数，其作用就是获取当前的arena。然后调用int_malloc函数，后面如果我们ini_malloc函数分配失败，并且我们可以找到一个可用的arena，那就用尝试另一个arena。接下来分析int_malloc函数  
+函数开头声明了变量，根据注释可以理解。后面会慢慢解释
+    INTERNAL_SIZE_T nb;              normalized request size * /
+    unsigned int idx;                       /* associated bin index /
+                                             * mbinptr bin;                      / associated bin */
+    mchunkptr victim;                       /* inspected/selected chunk /
+                                             * INTERNAL_SIZE_T size;             / its size /
+                                             * int victim_index;                 / its bin index */
+    mchunkptr remainder;                    /* remainder from a split /
+                                             * unsigned long remainder_size;     / its size */
+    unsigned int block;                     /* bit map traverser /
+                                             * unsigned int bit;                 / bit map traverser /
+                                             * unsigned int map;                 / current word of binmap */
+    mchunkptr fwd;                          /* misc temp for linking /
+                                             * mchunkptr bck;                    / misc temp for linking */
+    const char *errstr = NULL;
+接下来，有一个宏，这个宏定义如下
+    #define request2size( req )                        \
+    ( ( (req) + SIZE_SZ + MALLOC_ALIGN_MASK  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Size of previous chunk                            |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    `head:' |             Size of chunk, in bytes                         |P|
+      mem-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Forward pointer to next chunk in list             |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Back pointer to previous chunk in list            |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Unused space (may be 0 bytes long)                .
+        .                                                               .
+        .                                                               |
+    nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    `foot:' |             Size of chunk, in bytes                           |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+当一个chunk在被使用的时候结构如下。所以这时候至少需要req+SIZE_SZ大小的内存，MALLOC_ALIGN_MASK用于对齐。
+        chunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Size of previous chunk, if allocated            | |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Size of chunk, in bytes                       |M|P|
+      mem-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             User data starts here...                          .
+        .                                                               .
+        .             (malloc_usable_size() bytes)                      .
+        .                                                               |
+    nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |             Size of chunk                                     |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+到这里，这个宏定义的作用就是将请求的size转换成对应chunk的大小。
+      if ((unsigned long) (nb) fd, victim))
+             != victim);
+      if (victim != 0)
+        {
+          if (__builtin_expect (fastbin_index (chunksize (victim)) != idx, 0))
+            {
+              errstr = "malloc(): memory corruption (fast)";
+            errout:
+              malloc_printerr (check_action, errstr, chunk2mem (victim));
+              return NULL;
+            }
+          check_remalloced_chunk (av, victim, nb);
+          void *p = chunk2mem (victim);
+          alloc_perturb (p, bytes);
+          return p;
+        }
+    }
+进入了一个if判断，后面的get_max_fast返回的是fastbin里面存储的最大值，经过request2size转换后的nb小于fastbin存储的最大值，那就先调用fastbin_index获取对应的索引，然后通过fastbin宏获得链表指针。这里的两个宏定义如下
+    #define fastbin_index( sz ) \
+    ( ( ( (unsigned int) (sz) ) >> (SIZE_SZ == 8 ? 4 : 3) ) - 2)
+    #define fastbin( ar_ptr, idx ) ( (ar_ptr)->fastbinsY[idx])
+下面进入了一个 do while 循环。此处是通过单链表的fd指针，指向下一个空闲chunk（victim -> fd），直到fd指针指向的地方为 NULL
+，再下面的代码进行了检查，用 fastbin_index 宏对该 chunk 的 size 进行检查，判断是否属于该 idx 对应的索引。获得空闲的
+chunk 后，就用 chunk2mem 得到内存指针，然后调用 alloc_perturb 进行初始化，返回该内存指针。假设 fastbin
+中寻找失败，就进入下一步，这时候从 smallbin 中尝试。
+      if (in_smallbin_range (nb))
+    {
+      idx = smallbin_index (nb);
+      bin = bin_at (av, idx);
+      if ((victim = last (bin)) != bin)
+        {
+          if (victim == 0) /* initialization check */
+            malloc_consolidate (av);
+          else
+            {
+              bck = victim->bk;
+    if (__glibc_unlikely (bck->fd != victim))
+                {
+                  errstr = "malloc(): smallbin double linked list corrupted";
+                  goto errout;
+                }
+              set_inuse_bit_at_offset (victim, nb);
+              bin->bk = bck;
+              bck->fd = bin;
+              if (av != &main_arena)
+                victim->size |= NON_MAIN_ARENA;
+              check_malloced_chunk (av, victim, nb);
+              void *p = chunk2mem (victim);
+              alloc_perturb (p, bytes);
+              return p;
+            }
+        }
+    }
+首先，if里面的判断，该宏定义如下
+    #define in_smallbin_range( sz )     \
+    ( (unsigned long) (sz) bins[( (i) - 1) * 2]) )             \
+            - offsetof( struct malloc_chunk, fd ) )
+根据smallbin_index获取索引，通过bin_at获得链表指针。

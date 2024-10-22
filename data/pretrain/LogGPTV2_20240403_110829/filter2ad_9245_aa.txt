@@ -1,0 +1,95 @@
+## 环境搭建
+（1）下载调试镜像：
+    sudo apt-get install debootstrap
+    wget https://raw.githubusercontent.com/google/syzkaller/master/tools/create-image.sh -O create-image.sh
+    chmod +x create-image.sh
+    ./create-image.sh
+（2）编译内核
+具体见：[https://de4dcr0w.github.io/%E5%BF%AB%E9%80%9F%E6%90%AD%E5%BB%BA%E4%B8%80%E4%B8%AALinux%E5%86%85%E6%A0%B8%E8%B0%83%E8%AF%95%E7%8E%AF%E5%A2%83.html](https://de4dcr0w.github.io/快速搭建一个Linux内核调试环境.html)
+（3）编译poc
+    wget https://raw.githubusercontent.com/cgwalters/cve-2020-14386/master/cve-cap-net-raw.c
+    gcc cve-cap-net-raw.c -o poc -static
+（4）赋予poc CAP_NET_RAW 权限，CAP_NET_RAW权限，可以通过网络命名空间来实现，编译内核时需要开启CONFIG_USER_NS=y
+    # 设置 cap_net_raw 权限
+    setcap cap_net_raw+ep ./poc
+    # 查看程序的 cap 权限
+    getcap ./poc
+    # 删除 cap_net_raw 权限
+    setcap cap_net_raw-ep ./poc
+仅做调试使用可以直接运行：
+    sudo ./poc skip-unshare
+（5）传入qemu镜像中就可以调试
+设置断点：
+    b tpacket_rcv
+## 基础知识
+### linux 内核的内存布局
+    0xffffffffffffffff  ---+-----------+-----------------------------------------------+-------------+
+                           |           |                                               |+++++++++++++|
+        8M                 |           | unused hole                                   |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+    0xffffffffff7ff000  ---|-----------+------------| FIXADDR_TOP |--------------------|+++++++++++++|
+        1M                 |           |                                               |+++++++++++++|
+    0xffffffffff600000  ---+-----------+------------| VSYSCALL_ADDR |------------------|+++++++++++++|
+        548K               |           | vsyscalls                                     |+++++++++++++|
+    0xffffffffff577000  ---+-----------+------------| FIXADDR_START |------------------|+++++++++++++|
+        5M                 |           | hole                                          |+++++++++++++|
+    0xffffffffff000000  ---+-----------+------------| MODULES_END |--------------------|+++++++++++++|
+                           |           |                                               |+++++++++++++|
+        1520M              |           | module mapping space (MODULES_LEN)            |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+    0xffffffffa0000000  ---+-----------+------------| MODULES_VADDR |------------------|+++++++++++++|
+                           |           |                                               |+++++++++++++|
+        512M               |           | kernel text mapping, from phys 0              |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+    0xffffffff80000000  ---+-----------+------------| __START_KERNEL_map |-------------|+++++++++++++|
+        2G                 |           | hole                                          |+++++++++++++|
+    0xffffffff00000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        64G                |           | EFI region mapping space                      |+++++++++++++|
+    0xffffffef00000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        444G               |           | hole                                          |+++++++++++++|
+    0xffffff8000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        16T                |           | %esp fixup stacks                             |+++++++++++++|
+    0xffffff0000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        3T                 |           | hole                                          |+++++++++++++|
+    0xfffffc0000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        16T                |           | kasan shadow memory (16TB)                    |+++++++++++++|
+    0xffffec0000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        1T                 |           | hole                                          |+++++++++++++|
+    0xffffeb0000000000  ---+-----------+-----------------------------------------------| kernel space|
+        1T                 |           | virtual memory map for all of struct pages    |+++++++++++++|
+    0xffffea0000000000  ---+-----------+------------| VMEMMAP_START |------------------|+++++++++++++|
+        1T                 |           | hole                                          |+++++++++++++|
+    0xffffe90000000000  ---+-----------+------------| VMALLOC_END   |------------------|+++++++++++++|
+        32T                |           | vmalloc/ioremap (1 tpacket_rcv：
+漏洞代码：
+    static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+                   struct packet_type *pt, struct net_device *orig_dev)
+    {
+    // ...
+        if (sk->sk_type == SOCK_DGRAM) {
+            macoff = netoff = TPACKET_ALIGN(po->tp_hdrlen) + 16 +
+                      po->tp_reserve;
+        } else {
+            unsigned int maclen = skb_network_offset(skb);
+            // tp_reserve is unsigned int, netoff is unsigned short. Addition can overflow netoff
+            netoff = TPACKET_ALIGN(po->tp_hdrlen +
+                           (maclen tp_reserve; // [1]
+            if (po->has_vnet_hdr) {
+                netoff += sizeof(struct virtio_net_hdr);
+                do_vnet = true;
+            }
+            // Attacker controls netoff and can make macoff be smaller than sizeof(struct virtio_net_hdr)
+            macoff = netoff - maclen; // [2]
+        }
+    // ...
+        // "macoff - sizeof(struct virtio_net_hdr)" can be negative, resulting in a pointer before h.raw
+        if (do_vnet &&
+            virtio_net_hdr_from_skb(skb, h.raw + macoff -                        sizeof(struct virtio_net_hdr),
+                        vio_le(), true, 0)) {  // [3]
+    // ...
+漏洞在于[1]处，netoff是 unsigned short 类型，范围为[0, 0xffff]，而tp_reserve为unsigned int
+类型，范围为[0,
+0xffffffff]，在赋值过程进行类型转化，导致高两个字节截断。所以[2]处控制netoff，使得到的macoff小于sizeof(struct
+virtio_net_hdr)，[3]处macoff - sizeof(struct virtio_net_hdr) 为负，相当于往&h.raw
+地址前面写入数据，造成向上越界写漏洞。
+调试过程：

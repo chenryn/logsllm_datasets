@@ -1,0 +1,124 @@
+        JSObject* obj = JS::NewMappedArrayBufferWithContents(aCx, mLength, mMapPtr);
+        if (!obj) {
+          JS::ReleaseMappedArrayBufferContents(mMapPtr, mLength);
+        }
+        mMapPtr = nullptr;
+        // The memory-mapped contents will be released when the ArrayBuffer
+        // becomes detached or is GC'd.
+        return obj;
+    }
+在上面的代码中，如果我们在函数开始之前修改`mMapPtr`，我们将得到一个`ArrayBuffer`对象，并指向我们放入`mMapPtr`而不是预期返回数据的任何地址。
+访问返回的`ArrayBuffer`对象将允许我们从`mMapPtr`指向的内存中读取和写入。
+要将XHR对象填充到这种方便的被破坏的堆栈中，需要将其置于已发送实际请求并正在等待响应的状态。
+我们可以将XHR请求的资源设置为URI，以避免网络活动的延迟和开销：
+`xhr.open("GET", "data:text/plain,xxxxxxxxxx", true);`
+在`mMapPtr`包含在`XMLHttpRequestMainThread`类内的子类`ArrayBufferBuilder`中，该类是内部`XMLHttpRequest`对象的实际实现类。
+它的大小是`0x298`：
+大小为0x298的分配进入0x400大小类bin，因此`XMLHttpRequestMainThrea`d对象将始终放在属于以下模式之一的内存地址中：`0xXXXXXXXXX000,0xXXXXXXXX400,0xXXXXXXXXX800或0xXXXXXXXXXc00`。
+这与mHandles分配的模式很好地同步，即`0xXXXXXXXXX000`。
+要使用该bug破坏XHR的`mArrayBufferBuilder.mMapPtr`值，我们必须将0x250字节的偏移量放入释放的mHandles分配中：
+因此，`XMLHttpRequestMainThread`是利用此内存损坏的合适目标，但其大小类与mHandle不同，需要我们依赖于执行“运行回收”技术。
+为了帮助执行“ grooming”堆以这种方式运行所需的堆操作，我们将使用另一种对象类型：
+### 用于堆grooming的FormData
+简单地说，FormData是一种对象类型，它包含提供给它的一组键/值对。
+    var formData = new FormData();
+    formData.append("username", "Groucho");
+    formData.append("accountnum", "123456");
+在内部，它使用数据结构`FormDataTuple`来表示键/值对，以及一个名为`mFormData`的成员变量来存储它所持有的对：  
+`nsTArray mFormData`。
+`mFormData`最初是一个空数组。 调用`append()`和`delete()`方法在其中添加或删除元素。
+`nsTArray`类使用动态内存分配来存储其元素，根据需要扩展或缩小其分配大小。
+这就是`FormData`选择此存储缓冲区的分配大小的方式：
+    nsTArray_base::EnsureCapacity(size_type aCapacity,
+                                               size_type aElemSize) {
+        ...
+        size_t reqSize = sizeof(Header) + aCapacity * aElemSize;
+        ...
+        // Round up to the next power of two.
+        bytesToAlloc = mozilla::RoundUpPow2(reqSize);
+        ...
+        header = static_cast(ActualAlloc::Realloc(mHdr, bytesToAlloc));
+鉴于`sizeof（Header）== sizeof（nsTArrayHeader）== 8和aElemSize ==
+sizeof（FormDataTuple）== 0x30`，这是获取缓冲区分配大小作为数组中元素数量的函数的公式：
+`bytesToAlloc = RoundUpPow2（8 + aCapacity * 0x30）`
+由此我们可以计算出`mFormData`将在附加到它的第11对上执行对0x400字节的`realloc()`调用，在第22对上执行0x800字节`realloc()`，在第43对上执行0x1000字节`realloc()`。缓冲区的地址存储在`mFormData.mHdr`中。
+要产生`mFormData.mHdr`的分配取消操作，我们可以使用`delete()`方法。它将从数组中删除的单个键名作为参数，但不同的对可以使用相同的键名。因此，如果为每个附加对重用相同的键名，则在该键名上调用`delete()`将在一次运行中清除整个数组。一旦`nsTArray_base`对象减少为保存0个元素，mHdr中的内存将被释放。
+总而言之，我们可以使用FormData对象在Firefox堆中任意执行特定大小的内存的分配和解除分配。
+知道这一点，这些是我们可以采取的步骤，用于放置0x400大小类分配来代替0x1000大小类分配：
+1 进行0x1000分配
+创建许多`FormData`对象，并为每个对象追加43对。
+现在堆包含许多块，其中大部分是连续的0x1000运行，其中包含我们的`mFormData.mHdr`缓冲区。
+2 内存中的“Poke holes”
+使用`delete()`取消分配一些`mFormData.mHdr`缓冲区，以便在`mFormData.mHdr`分配块之间有空闲的0x1000大小的空格。
+3 触发`mHandles`的分配
+附加子iframe，并创建HTML解析器，并使用`mHandles`分配的`nsHtml5TreeBuilder`对象。
+由于“LIFO空闲列表”，mHandles应该获得与上一步中取消分配的缓冲区之一相同的地址。
+4 释放mHandles
+5 释放所有0x1000分配  
+在所有剩余的`FormData`上使用`delete()`。
+6 0x400分配  
+创建多个`XMLHttpRequest`对象。
+如果正确完成，在执行这些步骤后触发错误将破坏在步骤6中创建的创建的`XMLHttpRequest`对象，以便其`mArrayBufferBuilder.mMapPtr`变量现在指向HTML元素对象。  
+我们可以继续遍历所有创建的XHR对象并检查它们的响应属性。如果它们中的任何一个包含意外数据，那么它必定已成功被攻击，因为该错误，我们现在有一个能够读取的`ArrayBuffer`对象和写入新创建的HTML元素对象的内存。
+仅此一点就足以让我们通过读取对象的成员变量来绕过`ASLR`，其中一些变量指向`Firefox`的主`DLL
+xul.dll`中的变量。还可以通过修改对象的虚拟表指针来控制程序执行。但是，如前所述，这个HTML元素对象是孤立的，不能被JavaScript引用并且是为了解除分配，所以必须采取另一种方法。
+如果再次查看上面引用的`ArrayBufferBuilder::getArrayBuffer`函数，我们可以看到即使在损坏状态下，创建的ArrayBuffer对象也设置为与原始响应相同的长度，因为只修改了`mMapPtr`，`mLength`却完好无损。
+由于响应大小将与我们选择所请求的数据URI的大小相同，我们可以任意设置它，并确保格式错误的`ArrayBuffer`的长度足以覆盖它将指向的HTML元素，但是在HTML元素之后将操作范围扩展到相当大的内存量。
+要写入`mMapPtr的HTML`元素对象的特定类型由我们选择使用自定义元素定义扩展的HTML元素的基本类型决定。
+HTML元素对象的大小介于`0x80和0x6d8`之间：
+因此，我们可以在不同的堆大小类之间进行选择，以便通过格式错误的`ArrayBuffer`进行操作。
+例如，选择扩展“br”HTML元素将导致指向写入`mMapPtr`的`HTMLBRElement`（大小为0x80）对象的指针。
+正如堆栈定义中所述，紧跟在HTML元素之后的内存将保存相同大小类的其他分配。  
+要在HTML元素之后立即定位特定对象，我们可以利用“相同大小类分配是连续的”堆属性，并且：
+1 查找与目标对象具有相同大小类的HTML元素，并将自定义元素定义基于该元素。
+2 通过分配相同HTML元素类型的许多实例来得出相关bin的空闲列表。
+这非常适合0x250字节的损坏偏移，因为在自定义元素之前定义许多元素是达到此偏移的必要条件，它有助于我们完成消耗操作。
+3 在分配自定义HTML元素对象后，尽快为放置目标对象分配。 在此之后立即调用自定义元素的构造函数，因此应该首先在构造函数内部创建对象。
+利用此功能的最直接的方法是利用我们已经了解的`XMLHttpRequest`对象并将其用作目标对象。
+以前我们只能使用不可控制的指针来破坏`mMapPtr`，但现在可以完全控制对象的操作，我们可以任意设置`mMapPtr`和`mLength`，以便能够读取和写入内存中的任何地址。
+但是，`XMLHttpRequestMainThread`对象属于0x400大小类，并且没有HTML元素对象属于相同大小的类！
+因此必须使用另一种对象类型。`FileReader`对象有点类似于`XMLHttpRequest`，因为它读取数据并可以将其作为`ArrayBuffer`返回。
+    var arrayBuffer;
+    var blob = new Blob(["data to read"]);
+    var fileReader = new FileReader();
+    fileReader.onload = function(event) {
+        arrayBuffer = event.target.result;
+        if (arrayBuffer) {
+            var byteArray = new Uint8Array(arrayBuffer);
+            for (var i = 0; i 
+    function receiveMessage(event) {
+            console.log("point 2");
+    }
+    addEventListener("message", receiveMessage, false);
+    let f = document.createElement("iframe");
+    f.src = "sync2.html";
+    document.body.append(f);
+sync2.html:
+    var delay_xhr = new XMLHttpRequest();
+    delay_xhr.open('GET', '/delay.xml', false);
+    parent.postMessage("", "*");
+    console.log("point 1");
+    delay_xhr.send(null);
+    console.log("point 3");
+将会输出：
+    point 1 (child iframe)
+    point 2 (main page)
+    point 3 (child iframe)
+通过这种方式，我们可以启用从子`iframe`运行的`JavaScript`代码，以在主页面中发送和调度`JavaScript`函数的执行，并确保它在获得控制权之前完成运行。
+### POC
+PoC构建在上面所写的所有内容上，以生成一个`ArrayBuffer`，可用于从`0x4141414141414141`读取和写入内存。
+    $ python delay_http_server.py 8080 &
+    $ firefox http://127.0.0.1:8080/customelements_poc.html
+我们可以在连接中找到具体使用方法：
+[on the SophosLabs GitHub
+repository.](https://github.com/sophoslabs/CVE-2018-18500)
+### 漏洞修补
+此bug在 [Firefox 65.0](https://www.mozilla.org/en-US/security/advisories/mfsa2019-01/)中修补。  
+`nsHtml5TreeOperation::Perform: nsHtml5TreeOpExecutor::RunFlushLoop and
+nsHtml5TreeOpExecutor::FlushDocumentWrite.`
+    +  RefPtr streamParserGrip;
+    +  if (mParser) {
+    +    streamParserGrip = GetParser()->GetStreamParser();
+    +  }
+    +  mozilla::Unused << streamParserGrip;  // Intentionally not used within function
+    此文为译文，原文来自：[https://news.sophos.com/en-us/2019/04/18/protected-cve-2018-18500-heap-write-after-free-in-firefox-analysis-and-exploitation/](https://news.sophos.com/en-us/2019/04/18/protected-cve-2018-18500-heap-write-after-free-in-firefox-analysis-and-exploitation/)

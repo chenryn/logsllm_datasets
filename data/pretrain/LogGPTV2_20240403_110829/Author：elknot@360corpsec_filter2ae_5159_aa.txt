@@ -1,0 +1,191 @@
+## Author：elknot@360corpsec
+## Support: 二惑@360corpsec
+广告位招租
+* * *
+安全部门确实是消防队的，但至少有一部分应该是检查灭火器位置放没放对且是否失效，报警装置能不能用。如果一个消防队全是外勤，那么可能就真的跟《全境封锁》里面的消防队一样了。——题记
+这两天摊上了个头痛的问题，如何去做基于主机端的入侵检测，结果我在翻github的时候遇到一个OSSIM下面的一个OSSIC
+HIDS平台，是趋势科技开出来的，于是便研究了一下。但是由于本人C++很弱（确切来说是编程能力很弱，曾经被某面试官喷不懂for循环），所以我决定自己研究下这个东西到底是啥。
+p.s. 这个也是我去年去滴滴面试的时候面试官问我的问题，当时因为自己比较菜，所以没回答全，但是今年由于自己有了对这些东西的理解，算是可以写出点东西来。
+## 0x00 HIDS有用么
+答曰：有用，用处在于更好地监控服务器的状态。
+HIDS平台建设其实分为三大部分：终端Agent监控组件，Dashboard控制面板和与SIEM、运维数据等其他平台对接的接口集合。
+终端Agent组件：可以简单理解为就是一个后门（他真的是一个后门），主要作用包括：监控文件变更、监控服务器状态、下发一些操作指令等。
+DashBoard：用来执行一些策略推送、资源管理方面的操作
+MQ && Servers：用来做负载均衡并吞吐数据到数据库
+Database：数据库
+SIEM APIs：用来将HIDS的数据和SIEM做整合
+具体的话就上个图吧：  
+粗略的画了个架构，如下图：  
+先来说一下想法：终端Agent通过对业务IT资产文件的监控可以发现一些潜在威胁的文件或者是被人中的webshell后门，也可以记录和发现文件改动。同时终端Agent肩负着把日志摆渡到数据库的工作，方便运维人员对日志进行检索，进行终端日志的统一化收集管理。这个时候Agent的工作已经结束了，Agent需要的操作通过消息队列（这里技术选型可以考虑memcached/redis/kafka等组件，需根据自身需求做决定，图片中选择kafka）和负载均衡把数据传到Agent
+Server
+Cluster中，之后Server中的数据写入MongoDB的数据库集群做的储存，到这里完成了数据的保存工作。接下来进行第二阶段的工作也就是数据分析，首先需要从MongoDB集群中读取数据放到Spark中进行分析，但是在入Spark之前需要使用Kafka进行数据清洗，防止畸形数据进入分析，分析完了之后使用ElasticSearch集群进行日志的检索，最后导入DashBoard进行可视化展示，除此之外，在经历过ES集群之后，也可以直接接入TensorFlow分析一些看似正常的行为是不是攻击（这里需要大量的模型提交到TensorFlow进行学习训练，才能投入，如果没这个条件可以在前面Spark中做攻击行为的正则），最后提交到DashBoard做威胁可视化展示。第三部分就是Agent命令分发，这里安全运营工程师通过DashBoard直接向Agent批量下发命令，中间需要经过消息队列（也就是Kafka）进行任务的分发，完成批量的策略部署。
+## 0x01 详细模块设计
+### 1\. Agent模块设计
+实际上Agent这边需要一个比较大的权限，而且Agent端其实就是一个权限很大的后门，通过上面的架构，我们大概能看出来Agent主要的作用有五个：文件监控、进程/任务监控、日志摆渡、策略推送和补丁推送，Agent这边的东西其实越轻量化越好，由于性能等诸多因素限制，Agent端不能占用太多的计算资源，在设置时要注意资源红线的设计，所以建议用C/C++开发。
+#### a.文件监控
+文件监控这部分其实相对容易实现，这部分主要监测设备插入和拔出以及业务系统文件监控，这里需要说到一个小东西：inortify。inotify
+是一种文件系统的变化通知机制，如文件增加、删除等事件可以立刻让用户态得知，该机制是著名的桌面搜索引擎项目 beagle 引入的，并在 Gamin
+等项目中被应用。
+inortify具体的代码原理和实现我就不说了，这里先用一个简单的C代码去实现一个简单的文件监控：
+    #include 
+        #include 
+        #include 
+        _syscall0(int, inotify_init)
+        _syscall3(int, inotify_add_watch, int, fd, const char *, path, __u32, mask)
+        _syscall2(int, inotify_rm_watch, int, fd, __u32, mask)
+        char * monitored_files[] = {
+            "./tmp_file",
+            "./tmp_dir",
+            "/mnt/sda3/windows_file"
+        };
+        struct wd_name {
+            int wd;
+            char * name;
+        };
+        #define WD_NUM 3
+        struct wd_name wd_array[WD_NUM];
+        char * event_array[] = {
+            "File was accessed",
+            "File was modified",
+            "File attributes were changed",
+            "writtable file closed",
+            "Unwrittable file closed",
+            "File was opened",
+            "File was moved from X",
+            "File was moved to Y",
+            "Subfile was created",
+            "Subfile was deleted",
+            "Self was deleted",
+            "Self was moved",
+            "",
+            "Backing fs was unmounted",
+            "Event queued overflowed",
+            "File was ignored"
+        };
+        #define EVENT_NUM 16
+        #define MAX_BUF_SIZE 1024
+        int main(void)
+        {
+            int fd;
+            int wd;
+            char buffer[1024];
+            char * offset = NULL;
+            struct inotify_event * event;
+            int len, tmp_len;
+            char strbuf[16];
+            int i = 0;
+            fd = inotify_init();
+            if (fd mask & IN_ISDIR) {
+                        memcpy(strbuf, "Direcotory", 11);
+                    }
+                    else {
+                        memcpy(strbuf, "File", 5);
+                    }
+                    printf("Object type: %s\n", strbuf);
+                    for (i=0; iwd != wd_array[i].wd) continue;
+                        printf("Object name: %s\n", wd_array[i].name);
+                        break;
+                    }
+                    printf("Event mask: %08X\n", event->mask);
+                    for (i=0; imask & (1
+        long int ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data)
+这里面有四个参数，其中，request决定ptrace做什么，pid是被跟踪进程的ID，data存储从进程空间偏移量为addr的地方开始将被读取/写入的数据。
+我们还是写一段代码来当注释看吧：
+    #include 
+        #include 
+        #include 
+        #include 
+        #include 
+        #include 
+        #include 
+        #include 
+        int main(void)
+        {
+            long long counter = 0;
+            int wait_val;
+            int pid;
+            put("elknot@360corpsec says: Wait a Moment");
+            switch(pid=fork())
+            {
+              case -1: perror("fork");break;
+              case 0: {
+                ptrace(PTRACE_TRACEME, 0, 0, 0);
+                excel("/bin/ls", "ls", NULL);
+                break;
+              }
+              default: {
+                wait(&wait_val);
+                while(wait_val == 1047)
+                {
+                  counter++
+                    if(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) != 0)
+                      perror("ptrace");
+                  wait(&wait_val);
+                }
+              }
+                printf("Number of Machine instructions: %lld\n", counter);
+                return 0;
+            }
+        }
+这个例子的意思是：开始的时候子进程开始运行，调用exec后移花栽木，这时子进程的原进程(也就是未调用exec之前的进程)因为要被杀死了，会向父进程发送一个SIGTRAP信号。父进程此刻一直阻塞等待(也就是第一条wait(&wait_val);语句)。当父进程捕获到SIGTRAP信号，这个时候知道子进程已经结束了。此时，父进程通过request值为PTRACE_SINGLESTEP的ptrace调用来告诉操作系统重新唤醒子进程，但是在每条机器指令运行之后暂停。紧接着，父进程阻塞等待子进程暂停(wait_val
+== 1407等价于WIFSTOPPED(wait_val))并计数。子进程结束(这里不是暂停，对应的是WIFEXITED)后，父进程跳出loop循环。
+进程监控大概就是这么个思路，这里可以参考：
+#### c.日志摆渡
+所谓日志摆渡指的是通过Agent在终端将终端里面的日志导出至Agent服务端，然后由控制台进行检索。
+这里我们先来以Linux操作系统为例，说一下需要摆渡的日志：
+    系统日志：
+        /var/log/boot.log：录了系统在引导过程中发生的事件，就是Linux系统开机自检过程显示的信息
+        /var/log/lastlog ：记录最后一次用户成功登陆的时间、登陆IP等信息
+        /var/log/messages ：记录Linux操作系统常见的系统和服务错误信息
+        /var/log/secure ：Linux系统安全日志，记录用户和工作组变坏情况、用户登陆认证情况
+        /var/log/btmp ：记录Linux登陆失败的用户、时间以及远程IP地址
+        /var/log/syslog：只记录警告信息，常常是系统出问题的信息，使用lastlog查看
+        /var/log/wtmp：该日志文件永久记录每个用户登录、注销及系统的启动、停机的事件，使用last命令查看
+        /var/run/utmp：该日志文件记录有关当前登录的每个用户的信息。如 who、w、users、finger等就需要访问这个文件
+        连接时间日志：
+        /var/log/wtmp
+        /var/run/utmp
+        注：这里的日志不能直接用cat命令查看，可以通过w/who/finger/id/last/lastlog/ac进行查看
+        web服务器日志：
+        /var/log/nginx：Nginx日志默认位置
+        $TOMCAT_HOME\logs：Tomcat日志位置
+        /usr/local/apache/logs/access_log：Apache日志位置
+        /usr/local/apache2/logs：Apache2日志位置
+通过将这些日志通过摆渡的方式放至Agent服务器，即可实现对终端关键日志的检索，例如我们可以使用fliebeat的方式通过Logstash收集日志，然后通过ES做检索，但是Logstash是不太适合Agent操作的，原因你懂的。读取日志的时候，可以用下面的函数去读取，以OSSEC下读取syslog为例：
+    void *read_syslog(int pos, int *rc, int drop_it)
+        {
+            int __ms = 0;
+            char *p;
+            char str[OS_MAXSTR + 1];
+            fpos_t fp_pos;
+            str[OS_MAXSTR] = '\0';
+            *rc = 0;
+            /* Get initial file location */
+            fgetpos(logff[pos].fp, &fp_pos);
+            while (fgets(str, OS_MAXSTR - OS_LOG_HEADER, logff[pos].fp) != NULL) {
+                /* Get the last occurrence of \n */
+                if ((p = strrchr(str, '\n')) != NULL) {
+                    *p = '\0';
+                }
+                /* If we didn't get the new line, because the
+                 * size is large, send what we got so far.
+                 */
+                else if (strlen(str) >= (OS_MAXSTR - OS_LOG_HEADER - 2)) {
+                    /* Message size > maximum allowed */
+                    __ms = 1;
+                } else {
+                    /* Message not complete. Return. */
+                    debug1("%s: Message not complete. Trying again: '%s'", ARGV0, str);
+                    fsetpos(logff[pos].fp, &fp_pos);
+                    break;
+                }
+        #ifdef WIN32
+                if ((p = strrchr(str, '\r')) != NULL) {
+                    *p = '\0';
+                }
+                /* Look for empty string (only on Windows) */
+                if (strlen(str) <= 2) {
+                    fgetpos(logff[pos].fp, &fp_pos);
+                    continue;
+                }
+                /* Windows can have comment on their logs */

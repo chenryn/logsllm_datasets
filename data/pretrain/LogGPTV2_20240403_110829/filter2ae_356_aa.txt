@@ -1,0 +1,248 @@
+## 前言
+前段时间`Confluence`发布了`CVE-2021-26085`补丁，刚好之前分析过`Confluence`的漏洞，免去了搭建漏洞分析环境的麻烦，因此分析下这个漏洞。
+## 分析过程
+### 漏洞点定位
+这个漏洞爆出来已经有一段时间了，所以已经有公开的POC了
+    /s/123cfx/_/;/WEB-INF/web.xml
+首先大致测了一下，除了`123cfx`部分可以修改为其他内容，其他的部分修改或者删除后都会导致无法读取,`/s/`这部分比较特殊，所以猜测可能是由于以`/s/`开始会被当作静态文件处理。在`web.xml`中找`/s/`部分的`Filter`或者`Servlet`。
+在`/WEB-INF/web.xml`中对`/s/`对应的`servlet`做了配置,所以理论上来讲可以在`ConfluenceNoOpServlet#service`方法打断点查看执行流程。
+            noop
+            com.atlassian.confluence.servlet.ConfluenceNoOpServlet
+            0
+            noop
+            /s/*
+但是当执行`payload`后并没断下来，将url改为`/s/12xxxx`则执行到了`ConfluenceNoOpServlet`,所以在Tomcat程序`Filter`到`Servlet`的必经之路`ApplicationFilterChain#internalDoFilter`方法`this.servlet.service(request,
+response);`打断点，发现当我们执行`payload`时最后是由`DefaultServlet`来处理的，而`DefaultServlet`按理说是只处理根目录的请求，为什么我们的`payload`会被`DefaultServlet`处理。
+            default
+            org.apache.catalina.servlets.DefaultServlet
+        ...
+            default
+            /
+设置`servlet`的代码在`ApplicationFilterChain#setServlet`中，再次运行测试，发现程序会两次进入`setServlet`方法，第一次是`ConfluenceNoOpServlet`，第二次是`DefaultServlet`。所以猜测是当程序在`Filter`中对请求做了转发，查看调用链，果然在`UrlRewriteFilter`中做了处理。
+            UrlRewriteFilter
+            org.tuckey.web.filters.urlrewrite.UrlRewriteFilter
+            UrlRewriteFilter
+            /s/*
+### UrlRewriteFilter入门
+这里使用了`UrlRewriteFilter`组件，所以我们有必要先对这个组件简单了解。
+> UrlRewriteFilter是一个改写URL的Java Web过滤器，可见将动态URL静态化。适用于任何Java  
+>  Web服务器（Resin，Jetty，JBoss,Tomcat，Orion等）。与其功能类似的还有Apache的mod_rewrite。
+将动态URL转化为伪静态URL的好处主要有三个：
+  * 便于搜索引擎收录。
+  * 屏蔽url结构和参数信息，更安全。
+  * 可以将冗杂的URL改写得简而美。
+一般在`web.xml`中配置后还需要配置一个`urlrewriter.xml`,在`Confluence`中，配置如下：
+            /images/icons/attachments/file.gif
+            %{context-path}/images/icons/contenttypes/attachment_16.png
+这个标签中的内容比较好理解，大概是当访问呢`images/icons/attachments/file.gif`会被重定向到`%{context-path}/images/icons/contenttypes/attachment_16.png`中，但``中配置的类是如何工作的？
+查了官网的文档，当我们要扩展基本规则时，可以继承`RewriteRule`类并实现`matches`方法。
+### UrlRewriteFilter解析流程分析
+#### 初始化
+初始化`init`主要完成`urlrewriter.xml`的解析，这里会从`FilterConfig`中保存的配置中首先解析一些属性，这里需要注意，当没有配置`modRewriteConf`属性时，则会判断`modRewriteStyleConf`的值，这个值默认为False，所以会将`confPath`属性设置为`/WEB-INF/urlrewrite.xml`，再往下会判断`modRewriteConfText`属性是否在`FilterConfig`中配置，如果没有则通过`loadUrlRewriter`方法。
+    private boolean modRewriteStyleConf = false;
+    public void init(FilterConfig filterConfig) throws ServletException {
+           ...
+            String confPathStr = filterConfig.getInitParameter("confPath");
+            ...
+            //判断是否在Filter中配置了modRewriteConf,如果没有则modRewriteStyleConf的值为默认值false。
+                    String modRewriteConf = filterConfig.getInitParameter("modRewriteConf");
+                    if (!StringUtils.isBlank(modRewriteConf)) {
+                        this.modRewriteStyleConf = "true".equals(StringUtils.trim(modRewriteConf).toLowerCase());
+                    }
+            //由于modRewriteStyleConf为False，默认加载/WEB-INF/urlrewrite.xml
+                    if (!StringUtils.isBlank(confPathStr)) {
+                        this.confPath = StringUtils.trim(confPathStr);
+                    } else {
+                        this.confPath = this.modRewriteStyleConf ? "/WEB-INF/.htaccess" : "/WEB-INF/urlrewrite.xml";
+                    }
+    ...
+        //没有在Filter中配置modRewriteConfText，则通过loadUrlRewriter加载配置。
+                    String modRewriteConfText = filterConfig.getInitParameter("modRewriteConfText");
+                    if (!StringUtils.isBlank(modRewriteConfText)) {
+                        ModRewriteConfLoader loader = new ModRewriteConfLoader();
+                        Conf conf = new Conf();
+                        loader.process(modRewriteConfText, conf);
+                        conf.initialise();
+                        this.checkConf(conf);
+                        this.confLoadedFromFile = false;
+                    } else {
+                        this.loadUrlRewriter(filterConfig);
+                    }
+                }
+            }
+        }
+`loadUrlRewriter`中主要通过调用`loadUrlRewriterLocal`完成实际的加载逻辑。
+  * 通过`confPath`作为路径加载内容到`inputStream`
+  * 将资源路径转换为`URL`并保存到`confUrlStr`中
+  * 通过文件内容，URL,`modRewriteStyleConf`等属性构建Conf对象
+  * `checkConf`检查`Conf`对象
+    private void loadUrlRewriterLocal() {
+            InputStream inputStream = this.context.getResourceAsStream(this.confPath);
+            if (inputStream == null) {
+                inputStream = ClassLoader.getSystemResourceAsStream(this.confPath);
+            }
+            URL confUrl = null;
+            try {
+                confUrl = this.context.getResource(this.confPath);
+            } catch (MalformedURLException var5) {
+                log.debug(var5);
+            }
+            String confUrlStr = null;
+            if (confUrl != null) {
+                confUrlStr = confUrl.toString();
+            }
+            if (inputStream == null) {
+                log.error("unable to find urlrewrite conf file at " + this.confPath);
+                if (this.urlRewriter != null) {
+                    log.error("unloading existing conf");
+                    this.urlRewriter = null;
+                }
+            } else {
+                Conf conf = new Conf(this.context, inputStream, this.confPath, confUrlStr, this.modRewriteStyleConf);
+                this.checkConf(conf);
+            }
+        }
+首先看下`Conf`对象创建的过程，前面的是一些属性赋值的操作，在下面的`If`语句中判断`modRewriteStyleConf`的值用不同的解析方式，这个也可以理解`.htaccess`和`urlrewrite.xml`本来就应该用不同的方式解析，由于我们这里是使用`urlrewrite.xml`配置，因此会通过`loadDom`加载XML内容。
+    public Conf(ServletContext context, InputStream inputStream, String fileName, String systemId, boolean modRewriteStyleConf) {
+           ...
+            if (modRewriteStyleConf) {
+                this.loadModRewriteStyle(inputStream);
+            } else {
+                this.loadDom(inputStream);
+            }
+            if (this.docProcessed) {
+                this.initialise();
+            }
+            this.loadedDate = new Date();
+        }
+`loadDom`主要通过`Dom`方式解析XML内容，解析完成后通过`processConfDoc`处理解析后的内容,这里会根据标签的不同做不同的处理，由于我们这里只用了`rule`和`rule-class`标签，所以其他部分的代码先忽略。
+  * 标签为`rule`时则创建`NormalRule`对象 ，并将属性封装到这个对象中。
+  * 标签为`class-rule`创建`ClassRule`对象，并将`class`和`method`属性设置到这个对象中。
+  * 通过标签构造完对象后都会通过`addRule`将创建好的对象放到`Conf.rules`属性中。
+    protected void processConfDoc(Document doc) {
+            Element rootElement = doc.getDocumentElement();
+    ...
+            NodeList rootElementList = rootElement.getChildNodes();
+            for(int i = 0; i < rootElementList.getLength(); ++i) {
+                Node node = rootElementList.item(i);
+                Element ruleElement;
+                Node toNode;
+                if (node.getNodeType() == 1 && ((Element)node).getTagName().equals("rule")) {
+                    ruleElement = (Element)node;
+                    NormalRule rule = new NormalRule();
+                    this.processRuleBasics(ruleElement, rule);
+                    procesConditions(ruleElement, rule);
+                    processRuns(ruleElement, rule);
+                    toNode = ruleElement.getElementsByTagName("to").item(0);
+                    rule.setTo(getNodeValue(toNode));
+                    rule.setToType(getAttrValue(toNode, "type"));
+                    rule.setToContextStr(getAttrValue(toNode, "context"));
+                    rule.setToLast(getAttrValue(toNode, "last"));
+                    rule.setQueryStringAppend(getAttrValue(toNode, "qsappend"));
+                    if ("true".equalsIgnoreCase(getAttrValue(toNode, "encode"))) {
+                        rule.setEncodeToUrl(true);
+                    }
+                    processSetAttributes(ruleElement, rule);
+                    this.addRule(rule);
+                } else if (node.getNodeType() == 1 && ((Element)node).getTagName().equals("class-rule")) {
+                    ruleElement = (Element)node;
+                    ClassRule classRule = new ClassRule();
+                    if ("false".equalsIgnoreCase(getAttrValue(ruleElement, "enabled"))) {
+                        classRule.setEnabled(false);
+                    }
+                    if ("false".equalsIgnoreCase(getAttrValue(ruleElement, "last"))) {
+                        classRule.setLast(false);
+                    }
+                    classRule.setClassStr(getAttrValue(ruleElement, "class"));
+                    classRule.setMethodStr(getAttrValue(ruleElement, "method"));
+                    this.addRule(classRule);
+                } 
+            }
+            this.docProcessed = true;
+        }
+最后我们再看下`checkConf`方法，这个方法通过`checkConfLocal`完成具体的检测,主要是通过`Conf`对象的一些属性检测是否加载成功，如果加载成功则通过Conf构建`UrlRewriter`对象并赋值给`this.urlRewriter`。
+    private void checkConfLocal(Conf conf) {
+          ...
+            this.confLastLoaded = conf;
+            if (conf.isOk() && conf.isEngineEnabled()) {
+                this.urlRewriter = new UrlRewriter(conf);
+                log.info("loaded (conf ok)");
+            } else {
+                if (!conf.isOk()) {
+                    log.error("Conf failed to load");
+                }
+                if (!conf.isEngineEnabled()) {
+                    log.error("Engine explicitly disabled in conf");
+                }
+                if (this.urlRewriter != null) {
+                    log.error("unloading existing conf");
+                    this.urlRewriter = null;
+                }
+            }
+        }
+#### 拦截器处理过程
+拦截器的处理主要在`UrlRewriteFilter#doFilter`中，具体操作如下：
+  * 获取`urlRewriter`对象并封装到`urlRewriteWrappedResponse`中
+  * 判断`servername`是否为`localhost`，一般都不是所以先不看这里的处理逻辑
+  * `urlRewriter`不为Null,执行`processRequest`方法
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+            UrlRewriter urlRewriter = this.getUrlRewriter(request, response, chain);
+            HttpServletRequest hsRequest = (HttpServletRequest)request;
+            HttpServletResponse hsResponse = (HttpServletResponse)response;
+            UrlRewriteWrappedResponse urlRewriteWrappedResponse = new UrlRewriteWrappedResponse(hsResponse, hsRequest, urlRewriter);
+            if (this.statusEnabled && this.statusServerNameMatcher.isMatch(request.getServerName())) {
+                String uri = hsRequest.getRequestURI();
+                if (log.isDebugEnabled()) {
+                    log.debug("checking for status path on " + uri);
+                }
+                String contextPath = hsRequest.getContextPath();
+                if (uri != null && uri.startsWith(contextPath + this.statusPath)) {
+                    this.showStatus(hsRequest, urlRewriteWrappedResponse);
+                    return;
+                }
+            }
+            boolean requestRewritten = false;
+            if (urlRewriter != null) {
+                requestRewritten = urlRewriter.processRequest(hsRequest, urlRewriteWrappedResponse, chain);
+            } else if (log.isDebugEnabled()) {
+                log.debug("urlRewriter engine not loaded ignoring request (could be a conf file problem)");
+            }
+            if (!requestRewritten) {
+                chain.doFilter(hsRequest, urlRewriteWrappedResponse);
+            }
+        }
+`processRequest`首先获取`RuleChain`,并执行`doRules`方法。
+    public boolean processRequest(HttpServletRequest hsRequest, HttpServletResponse hsResponse, FilterChain parentChain) throws IOException, ServletException {
+            //
+            RuleChain chain = this.getNewChain(hsRequest, parentChain);
+            if (chain == null) {
+                return false;
+            } else {
+                chain.doRules(hsRequest, hsResponse);
+                return chain.isResponseHandled();
+            }
+        }
+`getNewChain`主要是从`conf`中获取`rules`，如果不为空，则将`rules`封装到`RuleChain`对象中返回。
+    private RuleChain getNewChain(HttpServletRequest hsRequest, FilterChain parentChain) {
+            String originalUrl = this.getPathWithinApplication(hsRequest);
+      ...
+                if (!this.conf.isOk()) {
+                    log.debug("configuration is not ok.  not rewriting request.");
+                    return null;
+                } else {
+                    List rules = this.conf.getRules();
+                    if (rules.size() == 0) {
+                        log.debug("there are no rules setup.  not rewriting request.");
+                        return null;
+                    } else {
+                        return new RuleChain(this, originalUrl, parentChain);
+                    }
+                }
+            }
+        }
+        public RuleChain(UrlRewriter urlRewriter, String originalUrl, FilterChain parentChain) {
+            this.finalToUrl = originalUrl;
+            this.urlRewriter = urlRewriter;
+            this.rules = urlRewriter.getConf().getRules();
+            this.parentChain = parentChain;
+        }

@@ -1,0 +1,83 @@
+# CVE-2019-8603：Safari沙盒逃逸&LPE深入分析
+|
+##### 译文声明
+本文是翻译文章，文章原作者 phoenhex，文章来源：phoenhex.re
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 写在前面的话
+在这篇文章中，我们将对漏洞CVE-2019-8603进行分析。简而言之，这是一个存在于Dock以及com.apple.uninstalld服务中的堆越界读取漏洞，该漏洞将导致攻击者调用CFRelease并在macOS上实现Safari浏览器沙盒逃逸，最终获取到目标设备的root权限。
+漏洞CVE-2019-8606将允许攻击者通过kextutil中的竞争条件来以root权限实现内核代码执行，再配合上qwertyoruiopz和bkth提供的WebKit漏洞（远程代码执行漏洞），攻击者就可以彻底破坏掉Safari本身的安全机制，并攻陷目标用户的操作系统。
+不过别担心，刚才提到的这两个漏洞苹果公司的安全技术人员都已经在macOS 10.14.5版本中成功修复了。
+## 漏洞分析
+此前，本人正在开发一款基于代码覆盖导向的模糊测试工具，并且在用这款工具对AXUnserializeCFType进行测试时发现了本文的主角，也就是漏洞CVE-2019-8606。但根据我之前的接触，这个函数本质上其实是一个简单的解析器，而且它曾在去年的Pwn2Own大会上曾出现，但当时没有人发现这个函数竟然存在漏洞。
+翻了一下文档之后，我才发现我搞错了。这个函数是CoreFoundation对象序列化的另一个代码实现函数，它属于HIServices框架中的一个组件，而且代码存储在对应的dylib库中。
+这个函数能够进行序列化处理的其中一种对象类型为CFAttributedString，这种字符串中，每一个字符都跟一个CFDictionary有关联，其中存储了跟对应字符串相关的任意描述信息（属性）。这些属性可以是颜色、字体或其他用户需要标注的信息。对于我们来说，我们要的就是代码执行了。
+为了帮助大家更直观地了解这种特性，我们专门给出了这种特性所对应的数据结构：
+    // from CFAttributedString.c
+    struct __CFAttributedString {
+    CFRuntimeBase base;
+    CFStringRef string;
+    CFRunArrayRef attributeArray; // attributeArray, runRanges[cnt], attrs, runRanges[cnt].length);
+    CFRelease(attrs);
+    }
+而且最终的正式发布版本中也没有针对此项判断的断言。因此，攻击者将能够使用完全可控的range以及newLength值来调用CFRunArrayReplace。
+    void CFRunArrayReplace(CFRunArrayRef array, CFRange range, CFTypeRef newObject, CFIndex newLength) {
+    CFRunArrayGuts *guts = array->guts;
+    CFRange blockRange;
+    CFIndex block, toBeDeleted, firstEmptyBlock, lastEmptyBlock;
+    // [[ 1 ]]
+    // ??? if (range.location + range.length > guts->length) BoundsError;
+    if (range.length == 0) return;
+    if (newLength == 0) newObject = NULL;
+    // [...]
+    /* This call also sets the cache to point to this block */
+    // [[ 2 ]]
+    block = blockForLocation(guts, range.location, &blockRange);
+    guts->length -= range.length;
+    /* Figure out how much to delete from this block */
+    toBeDeleted = blockRange.length - (range.location - blockRange.location);
+    if (toBeDeleted > range.length) toBeDeleted = range.length;
+    /* Delete that count */
+    // [[ 3 ]]
+    if ((guts->list[block].length -= toBeDeleted) == 0) FREE(guts->list[block].obj);
+    …
+首先看代码段[[ 1 ]]部分，很明显，代码开发人员想要尝试对传入的参数有效性进行验证，但实际上它并没有更改函数签名并返回任何错误信息。
+从代码段[[ 2
+]]部分开始，事情就有些“失控”了：如果range.location非常大，超出了长度，那么blockForLocation就会返回一个越界索引。代码段[[
+3
+]]的FREE在调用CFRelease（使用越界索引获取的指针来实现调用）时，就导致了漏洞被触发。接下来，代码将进一步导致objc_release被调用，然后程序会向一个vtable发起查询，尝试为release选择器寻找需要的Objective-C函数。
+    id objc_msgSend(id obj, SEL sel, …)
+    {
+    objc2_class *cls; // r10
+    int128 *v3; // r11
+    __int64 i; // r11
+    if ( !obj )
+    return 0LL;
+    if ( obj & 1 )
+    {
+    // […]
+    }
+    else
+    {
+    cls = (obj & 0x7FFFFFFFFFF8LL);
+    }
+    v3 = &cls->vtab[cls->mask & sel];
+    if ( sel == v3 )
+    return (*(v3 + 1))(); // <- OUCH!!
+需要注意的是，如果我们能够完全控制传递进来的obj值，那我们就可以直接在第一次检测时添加一条else语句，并实现间接调用，这我们可以在已知位置放置一个伪造的对象，而且更重要的是，我们已经知道了release选择器的地址了。幸运的是，在沙盒逃逸场景中，最后这个条件并不是什么大问题，因为所有代码库都会映射到系统范围的相同地址，其中就包括选择器在内。
+## 堆内存
+为了将这个漏洞转换为可控地调用CFRelease，我们需要在CFRunArray后面存放适当的值，并实现越界访问。这里，我们可以使用解析器本身自带的分配和重新分配原语。准确来说，解析器将允许我们创建一个字典，然后重复设置实体并通过输入流传递给处理函数。
+在字典中添加新的实体之后，我们就可以分配一个对象了。之后通过覆盖实体，刚才分配的对象将会被释放。这种原语已经足够创建一个可预知的数据序列了，其中一个CFRunArray将会占用，下一个就是包含了可控数据的CFString对象。
+实际的内存布局需要我们花一些经理，但是想要保证数据结构正确，我们需要多进行一些尝试，这样才能找出合适的堆喷射对象。最后，我们向解析器输入了一个数据对象，并稳定地触发了这个安全漏洞。
+## DockDock
+我们需要利用两次这个漏洞：首先，我们要利用Dock托管的com.apple.dock.server服务，并且可以从Safari的WebContent沙盒环境下访问获取。
+我们要攻击的是消息ID为96508的处理器（handler），这里的关键点在于，它需要通过AXUnserializeCFType来接收并解析某些数据，并将其作为外联内存描述符，这是我们可以提供给它的。MIG还可以将我们所提供的千兆字节数据映射到接收器的地址空间中，这也是很多人都熟知的堆喷射技术，这样我们就可以将任意数据存放到我们想要的位置了。
+接下来，我们要确保堆喷射对象的每一个页面都要有重复相同的数据（约800MiB），这些数据由下面这两个部分组成：
+1、 伪造的对象用来触发间接调用，并输入一个小型JOP stub来支撑栈结构；
+2、 一个ROP链，用来完成所有可自动化的任务；
+## 从root到内核：kextutil
+没错，kextutil可以帮助我们以root权限加载内核扩展，但是它会执行类似代码签名和用户许可之类的检测。很明显，我们需要绕过这种检测，并在不涉及任何用户交互的情况下加载我们未签名的代码。我们绕过文件检查机制所使用的方法基于竞争机制实现，通常需要涉及到符号链接，当然这种方式也适用于本文涉及到的场景。
+完成了所有检测操作之后，kextutil会将所有的函数调用请求加载进IOKit!OSKextLoadWithOptions，并向内核发送一个加载请求。但是，如果提供的kext路径为符号链接，我们就可以直接用它来连接不同的操作了。
+在整个漏洞利用的过程中，还需要满足几个条件，其中一个就是交换符号链接目的地址的时机是否正确。这里，我们可以运行下列命令来输出大量调试信息，并提供一个完整的POSIX管道来作为STDOUT：
+`kextutil -verbose 6 -load /path/to/kext`
+这样一来，我们就可以在代码执行的过程中在指定的地址造成管道溢出，并挂起进程，直到我们替换掉符号链接并清除管道数据为止。最终的结果，就是我们能够成功加载未签名的kext，这样也就成功利用了这个漏洞并实现任意代码执行，最终达到我们Safari沙盒逃逸的目的。

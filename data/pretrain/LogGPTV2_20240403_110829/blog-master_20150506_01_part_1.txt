@@ -1,0 +1,203 @@
+## PostgreSQL 检查点性能影响及源码分析 - 1  
+### 作者                 
+digoal                  
+### 日期                
+2015-05-06                    
+### 标签                
+PostgreSQL , 检查点 , 性能影响 , full page write , FPW , 可靠性                                                
+----                
+## 背景  
+数据库可靠性从何而来？    
+数据库崩溃后如何恢复，从什么位置开始恢复？    
+数据库检查点是什么？    
+检查点要干些什么？    
+为什么脏数据较多时，检查点会对性能有一定的影响？    
+什么是full page write？    
+相信这些问题是搞数据库的同学都想搞明白的。    
+接下里的一系列文章，围绕检查点展开讲解，讲一讲检查点的原理，以及为什么脏数据较多是，它会对数据库产生一定的性能影响。      
+## 正文  
+检查点，通俗的理解就是数据库处于数据一致性，完整性的点。  
+因此在这个点之前提交的事务确保数据已经写入数据文件，事务状态已经写入pg_clog文件。  
+通常创建检查点会需要一个漫长的过程，那么怎么保证数据的一致性和完整性呢？  
+从数据恢复（XLOG）的角度来看，检查点在XLOG文件中分为两个位置，一个是逻辑位置，一个是物理位置。  
+逻辑位置即开始位置，也是一致性位置，在这个位置之前已提交的事务，确保它们的事务状态和脏数据都已经写入持久化存储。  
+物理位置即结束位置，因为做检查点时，需要将逻辑位置之前已提交事务的事务状态和脏数据都写入持久化存储，这个需要一个过程，这些刷脏页面和CLOG的动作同样会产生XLOG，所以这一系列动作完成后，就是检查点结束的位置，即物理位置。  
+从逻辑角度来看，这两个XLOG位置实际是同一个位置，所以在做数据恢复时，先找到检查点的XLOG物理位置，然后根据这里的结束检查点时写入的XLOG信息找到逻辑位置，从逻辑位置开始，读取XLOG并实施xlog replay恢复，至少要恢复到XLOG物理位置才能确保数据库的一致性和完整性。  
+如图：  
+创建检查点示意图：  
+![pic](20150506_01_pic_001.png)     
+数据恢复示意图：    
+![pic](20150506_01_pic_002.png)     
+当然，检查点不仅仅是刷脏数据这么简单，还有其他一些操作，见下面的分析。  
+checkpointer process 介绍，挑选了一些关键步骤进行讲解：  
+CheckpointerMain@src/backend/postmaster/checkpointer.c  
+接收检查点请求：  
+```
+ 365         /*  
+ 366          * Process any requests or signals received recently.  
+ 367          */  
+ 368         AbsorbFsyncRequests();  
+......  
+ 388         if (checkpoint_requested)  
+ 389         {  
+ 390             checkpoint_requested = false;  
+ 391             do_checkpoint = true;  
+ 392             BgWriterStats.m_requested_checkpoints++;  
+ 393         }  
+超时(checkpoint_timeout参数)触发检查点：  
+ 407         /*  
+ 408          * Force a checkpoint if too much time has elapsed since the last one.  
+ 409          * Note that we count a timed checkpoint in stats only when this  
+ 410          * occurs without an external request, but we set the CAUSE_TIME flag  
+ 411          * bit even if there is also an external request.  
+ 412          */  
+ 413         now = (pg_time_t) time(NULL);  
+ 414         elapsed_secs = now - last_checkpoint_time;  
+ 415         if (elapsed_secs >= CheckPointTimeout)  
+ 416         {  
+ 417             if (!do_checkpoint)  
+ 418                 BgWriterStats.m_timed_checkpoints++;  
+ 419             do_checkpoint = true;  
+ 420             flags |= CHECKPOINT_CAUSE_TIME;  
+ 421         }  
+......  
+进入检查点，记录检查点的逻辑位置（即开始位置的XLOG OFFSET），调用CreateCheckPoint创建检查点。  
+ 423         /*  
+ 424          * Do a checkpoint if requested.  
+ 425          */  
+ 426         if (do_checkpoint)  
+ 427         {  
+ 428             bool        ckpt_performed = false;  
+ 429             bool        do_restartpoint;  
+ 430   
+ 431             /* use volatile pointer to prevent code rearrangement */  
+ 432             volatile CheckpointerShmemStruct *cps = CheckpointerShmem;  
+ 433   
+ 434             /*  
+ 435              * Check if we should perform a checkpoint or a restartpoint. As a  
+ 436              * side-effect, RecoveryInProgress() initializes TimeLineID if  
+ 437              * it's not set yet.  
+ 438              */  
+ 439             do_restartpoint = RecoveryInProgress();  
+ 440   
+ 441             /*  
+ 442              * Atomically fetch the request flags to figure out what kind of a  
+ 443              * checkpoint we should perform, and increase the started-counter  
+ 444              * to acknowledge that we've started a new checkpoint.  
+ 445              */  
+ 446             SpinLockAcquire(&cps->ckpt_lck);  
+ 447             flags |= cps->ckpt_flags;  
+ 448             cps->ckpt_flags = 0;  
+ 449             cps->ckpt_started++;  
+ 450             SpinLockRelease(&cps->ckpt_lck);  
+ 451   
+ 452             /*  
+ 453              * The end-of-recovery checkpoint is a real checkpoint that's  
+ 454              * performed while we're still in recovery.  
+ 455              */  
+ 456             if (flags & CHECKPOINT_END_OF_RECOVERY)  
+ 457                 do_restartpoint = false;  
+ 458   
+ 459             /*  
+ 460              * We will warn if (a) too soon since last checkpoint (whatever  
+ 461              * caused it) and (b) somebody set the CHECKPOINT_CAUSE_XLOG flag  
+ 462              * since the last checkpoint start.  Note in particular that this  
+ 463              * implementation will not generate warnings caused by  
+ 464              * CheckPointTimeout ckpt_lck);  
+ 507             cps->ckpt_done = cps->ckpt_started;  
+ 508             SpinLockRelease(&cps->ckpt_lck);  
+ 509   
+ 510             if (ckpt_performed)  
+ 511             {  
+ 512                 /*  
+ 513                  * Note we record the checkpoint start time not end time as  
+ 514                  * last_checkpoint_time.  This is so that time-driven  
+ 515                  * checkpoints happen at a predictable spacing.  
+ 516                  */  
+ 517                 last_checkpoint_time = now;  
+ 518             }  
+ 519             else  
+ 520             {  
+ 521                 /*  
+ 522                  * We were not able to perform the restartpoint (checkpoints  
+ 523                  * throw an ERROR in case of error).  Most likely because we  
+ 524                  * have not received any new checkpoint WAL records since the  
+ 525                  * last restartpoint. Try again in 15 s.  
+ 526                  */  
+ 527                 last_checkpoint_time = now - CheckPointTimeout + 15;  
+ 528             }  
+ 529   
+ 530             ckpt_active = false;  
+ 531         }  
+```
+记录检查点开始前的XLOG位置, 用于检查点调度,和逻辑位置无关。  
+GetInsertRecPtr@src/backend/access/transam/xlog.c  
+```
+/*  
+ * GetInsertRecPtr -- Returns the current insert position.  
+ *  
+ * NOTE: The value *actually* returned is the position of the last full  
+ * xlog page. It lags behind the real insert position by at most 1 page.  
+ * For that, we don't need to scan through WAL insertion locks, and an  
+ * approximation is enough for the current usage of this function.  
+ */  
+XLogRecPtr  
+GetInsertRecPtr(void)  
+{  
+        /* use volatile pointer to prevent code rearrangement */  
+        volatile XLogCtlData *xlogctl = XLogCtl;  
+        XLogRecPtr      recptr;  
+        SpinLockAcquire(&xlogctl->info_lck);  
+        recptr = xlogctl->LogwrtRqst.Write;    //   写入并返回XLOG位置  
+        SpinLockRelease(&xlogctl->info_lck);  
+        return recptr;  
+}  
+```
+检查点调度  
+IsCheckpointOnSchedule@src/backend/postmaster/checkpointer.c  
+```
+/*  
+ * IsCheckpointOnSchedule -- are we on schedule to finish this checkpoint  
+ *               in time?  
+ *  
+ * Compares the current progress against the time/segments elapsed since last  
+ * checkpoint, and returns true if the progress we've made this far is greater  
+ * than the elapsed time/segments.  
+ */  
+static bool  
+IsCheckpointOnSchedule(double progress)  
+{  
+        XLogRecPtr      recptr;  
+        struct timeval now;  
+        double          elapsed_xlogs,  
+                                elapsed_time;  
+        Assert(ckpt_active);  
+        /* Scale progress according to checkpoint_completion_target. */  
+        progress *= CheckPointCompletionTarget;   // checkpoint_completion_target 参数控制系数，所以系数越大，progress越大。  
+        /*  
+         * Check against the cached value first. Only do the more expensive  
+         * calculations once we reach the target previously calculated. Since  
+         * neither time or WAL insert pointer moves backwards, a freshly  
+         * calculated value can only be greater than or equal to the cached value.  
+         */  
+        if (progress < ckpt_cached_elapsed)  
+                return false;  // 返回false，checkpointer不休息  
+        /*  
+         * Check progress against WAL segments written and checkpoint_segments.  
+         *  
+         * We compare the current WAL insert location against the location  
+         * computed before calling CreateCheckPoint. The code in XLogInsert that  
+         * actually triggers a checkpoint when checkpoint_segments is exceeded  
+         * compares against RedoRecptr, so this is not completely accurate.  
+ca  
+         * However, it's good enough for our purposes, we're only calculating an  
+         * estimate anyway.  
+         */  
+        if (!RecoveryInProgress())  
+        {  
+                recptr = GetInsertRecPtr();  
+                elapsed_xlogs = (((double) (recptr - ckpt_start_recptr)) / XLogSegSize) / CheckPointSegments;  
+                //  CheckPointSegments由参数checkpoint_segments控制.  
+                //  checkpoint_completion_target 是0-1的范围  
+                //  checkpoint_segments是触发检查点的XLOG个数，  
+                //  假设checkpoint_completion_target = 0.1, progress传入参数=1, 那么  

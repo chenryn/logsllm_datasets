@@ -1,0 +1,127 @@
+停止备份, 意味着PITR的时间点对应的wal必须在这之后.  
+postgres=# select pg_stop_backup();  
+NOTICE:  WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup  
+ pg_stop_backup  
+----------------  
+ 1/A601F420  
+(1 row)  
+```  
+所以:  
+- PITR只能恢复到全量备份结束后的时刻.  
+思考问题:  
+- 为什么PG不考虑当前正在备份, 延迟删除数据文件呢? 这样的话, 备份开始时刻就可以成为PITR的选择时刻.  
+3、为什么逻辑备份可能和业务产生冲突?  
+https://www.bilibili.com/video/BV1Em4y1y7PV/  
+逻辑备份pg_dump备份集是一致性备份集, 如果一个实例有多个database, 一致性最大范围可包含一个库.  
+1 首先开启RR事务  
+2 然后对需要备份的对象加共享锁, 防止要备份的数据被DROP或TRUNCATE, 或者结构被变更.  
+过程2进行中, 和这些操作冲突, pg_dump getSchemaData() 操作被堵塞: (与DDL、vacuum full、cluser、ALTER 等操作冲突, 包括pg_repack在切换数据文件时也需要短暂的排他锁与之冲突.)  
+过程2结束后, 过程3结束前, 和这些操作冲突, 用户操作被堵塞: (与DDL、vacuum full、cluser、ALTER 等操作冲突, 包括pg_repack在切换数据文件时也需要短暂的排他锁与之冲突.)  
+3 依次备份数据, 直到完成, 释放共享锁.  
+由于2到3的过程取决于备份集的大小, 如果备份集很大, 在这段时间冲突概率就会比较大.  
+例如, 凌晨逻辑备份, 用户正好在凌晨执行vacuum full整理数据, 或者在凌晨有一些数据处理操作用到了DDL处理中间结果|表名等.  
+PS: 多个库不保障一致性, 因为不支持跨库import snapshot.   也许未来的版本会支持.  
+如果是单个库使用多个JOB并行备份时, 怎么保障多个JOB备份数据的全局一致性? 就是用的snapshot export功能.  
+```  
+postgres=# begin transaction isolation level repeatable read ;  
+BEGIN  
+postgres=*# select pg_export_snapshot();  
+ pg_export_snapshot  
+---------------------  
+ 00000004-00000227-1  
+(1 row)  
+.......  
+db1=# begin TRANSACTION ISOLATION LEVEL repeatable read;  
+BEGIN  
+db1=*# SET TRANSACTION SNAPSHOT '00000004-00000227-1';  
+ERROR:  cannot import a snapshot from a different database  
+```  
+pg_dump.c   // 开启RR 事务  
+```  
+        /*  
+         * Start transaction-snapshot mode transaction to dump consistent data.  
+         */  
+        ExecuteSqlStatement(AH, "BEGIN");  
+        if (AH->remoteVersion >= 90100)  
+        {  
+                /*  
+                 * To support the combination of serializable_deferrable with the jobs  
+                 * option we use REPEATABLE READ for the worker connections that are  
+                 * passed a snapshot.  As long as the snapshot is acquired in a  
+                 * SERIALIZABLE, READ ONLY, DEFERRABLE transaction, its use within a  
+                 * REPEATABLE READ transaction provides the appropriate integrity  
+                 * guarantees.  This is a kluge, but safe for back-patching.  
+                 */  
+                if (dopt->serializable_deferrable && AH->sync_snapshot_id == NULL)  
+                        ExecuteSqlStatement(AH,  
+                                                                "SET TRANSACTION ISOLATION LEVEL "  
+                                                                "SERIALIZABLE, READ ONLY, DEFERRABLE");  
+                else  
+                        ExecuteSqlStatement(AH,  
+                                                                "SET TRANSACTION ISOLATION LEVEL "  
+                                                                "REPEATABLE READ, READ ONLY");  
+        }  
+```  
+pg_dump.c     // 对表加共享锁  
+```  
+/*  
+ * getTables  
+ *        read all the tables (no indexes)  
+ * in the system catalogs return them in the TableInfo* structure  
+ *  
+ * numTables is set to the number of tables read in  
+ */  
+TableInfo *  
+getTables(Archive *fout, int *numTables)  
+{  
+.........  
+        for (i = 0; i data);  
+                }  
+                /* Emit notice if join for owner failed */  
+                if (strlen(tblinfo[i].rolname) == 0)  
+                        pg_log_warning("owner of table \"%s\" appears to be invalid",  
+                                                   tblinfo[i].dobj.name);  
+```  
+pg_dump.h    // 判断表的哪些元数据需要加共享锁  
+```  
+/* component types of an object which can be selected for dumping */  
+typedef uint32 DumpComponents;  /* a bitmask of dump object components */  
+#define DUMP_COMPONENT_NONE                     (0)  
+#define DUMP_COMPONENT_DEFINITION       (1 << 0)  
+#define DUMP_COMPONENT_DATA                     (1 << 1)  
+#define DUMP_COMPONENT_COMMENT          (1 << 2)  
+#define DUMP_COMPONENT_SECLABEL         (1 << 3)  
+#define DUMP_COMPONENT_ACL                      (1 << 4)  
+#define DUMP_COMPONENT_POLICY           (1 << 5)  
+#define DUMP_COMPONENT_USERMAP          (1 << 6)  
+#define DUMP_COMPONENT_ALL                      (0xFFFF)  
+/*  
+ * component types which require us to obtain a lock on the table  
+ *  
+ * Note that some components only require looking at the information  
+ * in the pg_catalog tables and, for those components, we do not need  
+ * to lock the table.  Be careful here though- some components use  
+ * server-side functions which pull the latest information from  
+ * SysCache and in those cases we *do* need to lock the table.  
+ *  
+ * We do not need locks for the COMMENT and SECLABEL components as  
+ * those simply query their associated tables without using any  
+ * server-side functions.  We do not need locks for the ACL component  
+ * as we pull that information from pg_class without using any  
+ * server-side functions that use SysCache.  The USERMAP component  
+ * is only relevant for FOREIGN SERVERs and not tables, so no sense  
+ * locking a table for that either (that can happen if we are going  
+ * to dump "ALL" components for a table).  
+ *  
+ * We DO need locks for DEFINITION, due to various server-side  
+ * functions that are used and POLICY due to pg_get_expr().  We set  
+ * this up to grab the lock except in the cases we know to be safe.  
+ */  
+#define DUMP_COMPONENTS_REQUIRING_LOCK (\  
+                DUMP_COMPONENT_DEFINITION |\  
+                DUMP_COMPONENT_DATA |\  
+                DUMP_COMPONENT_POLICY)  
+```  
+4、为什么逻辑备份可能导致实例膨胀?  
+https://www.bilibili.com/video/BV1Z14y1Z7nm/   
+这和垃圾回收的机制有关, 最早的XID之后产生的垃圾tuple, 都不会被回收.  

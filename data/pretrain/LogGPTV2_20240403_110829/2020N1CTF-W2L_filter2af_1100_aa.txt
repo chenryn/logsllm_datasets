@@ -1,0 +1,192 @@
+# 2020N1CTF-W2L
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前言
+本文以2020N1CTF题目环境为例介绍CVE-2017-7038、绕过KASLR的通用方法，以及本题最后的解法。
+## 信息收集
+run.sh qemu 启动脚本如下：
+    #echo "welcome"
+    exec 2>/dev/null
+    exec timeout -k1 120 stdbuf -i0 -o0 -e0 \
+    qemu-system-x86_64 \
+        -m 256M \
+        -cpu qemu64,+smep,+smap \
+        -kernel bzImage \
+        -initrd root.cpio \
+        -nographic \
+        -append "root=/dev/ram rw console=ttyS0 oops=panic loglevel=2 panic=1 kaslr console=ttyS0" \
+        -monitor /dev/null \
+        -s
+可见开启了 SMEP,SMAP,KASLR;
+提取文件系统后查看内核保护：
+    $ checksec vmlinux
+        Arch:     amd64-64-little
+        RELRO:    No RELRO
+        Stack:    No canary found
+        NX:       NX disabled
+        PIE:      No PIE (0xffffffff81000000)
+        RWX:      Has RWX segments
+init系统启动脚本如下：
+    #!/bin/sh
+    mknod -m 0666 /dev/null c 1 3
+    mknod -m 0660 /dev/ttyS0 c 4 64
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    mv flag root
+    chown root:root root/flag
+    chmod 660 root/flag
+    setsid cttyhack setuidgid 1000 /bin/sh
+    umount /proc
+    umount /sys
+    poweroff -f
+查看系统版本：
+    / $ cat /proc/version
+    Linux version 5.9.0 (zip@zip-server) (gcc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0, GNU ld (GNU Binutils for Ubuntu) 2.30) #1 SMP Sat Oct 17 01:49:15 EDT 2020
+## 背景知识介绍
+关于`AF_PACKET sockets`的简要介绍和相关实现，有助于理解漏洞，已经了解的同学可以跳过。
+###  `AF_PACKET` sockets 介绍
+####  概述
+`AF_PACKET`套接字允许用户在设备驱动程序级别上发送或接收数据包。
+例如，可以在物理层的顶部实现自己的协议，或者嗅探包括以太网和更高级别协议标头的数据包。
+要创建`AF_PACKET`套接字，进程必须在控制其网络名称空间的用户名称空间中具有`CAP_NET_RAW`功能。
+要在数据包套接字上发送和接收数据包，进程可以使用send和recv系统调用。
+但是，数据包套接字提供了一种使用环形缓冲区（在内核和用户空间之间共享）来更快地完成此操作的方法。
+可以通过`PACKET_TX_RING`和`PACKET_RX_RING`套接字选项创建环形缓冲区。
+然后，用户可以映射环形缓冲区，然后可以直接向其读取或写入数据包数据。
+内核处理环形缓冲区的方式有几种不同的变体。 用户可以使用`PACKET_VERSION`套接字选项来选择此变量。
+环形缓冲区版本之间的差异可以在内核文档[4]中找到（搜索“ TPACKET version”）。
+tcpdump是`AF_PACKET`套接字的广泛使用的程序之一。 当使用tcpdump嗅探特定接口上的所有数据包时，大致会发生以下情况：
+    # strace tcpdump -i eth0
+    ...
+    socket(PF_PACKET, SOCK_RAW, 768)        = 3
+    ...
+    bind(3, {sa_family=AF_PACKET, proto=0x03, if2, pkttype=PACKET_HOST, addr(0)={0, }, 20) = 0
+    ...
+    setsockopt(3, SOL_PACKET, PACKET_VERSION, [1], 4) = 0
+    ...
+    setsockopt(3, SOL_PACKET, PACKET_RX_RING, {block_size=131072, block_nr=31, frame_size=65616, frame_nr=31}, 16) = 0
+    ...
+    mmap(NULL, 4063232, PROT_READ|PROT_WRITE, MAP_SHARED, 3, 0) = 0x7f73a6817000
+    ...
+此系统调用序列对应于以下操作：
+  1. 创建了一个`socket(AF_PACKET，SOCK_RAW，htons(ETH_P_ALL))`。
+  2. 套接字绑定到eth0。
+  3. 环形缓冲区版本通过`PACKET_VERSION`套接字选项设置为`TPACKET_V2`。
+  4. 通过`PACKET_RX_RING`套接字选项创建一个环形缓冲区。
+  5. 环形缓冲区在用户空间中映射。
+之后，内核将开始将通过eth0到达的所有数据包放入环形缓冲区，而tcpdump将从用户空间中的mmapped区域读取它们。
+####  环形缓冲区
+现有文档主要集中于`TPACKET_V1`和`TPACKET_V2`环形缓冲区版本。
+由于CVE-2017-7038仅影响`TPACKET_V3`版本，因此将重点关注该版本。环形缓冲区是用于存储数据包的存储区域。
+每个数据包都存储在单独的帧中。 帧被分组为块。 在`TPACKET_V3`环形缓冲区中，帧大小不是固定的，只要帧适合块，就可以具有任意值。
+要通过`PACKET_RX_RING`套接字选项创建`TPACKET_V3`环形缓冲区，用户必须提供环形缓冲区的确切参数。
+这些参数通过一个指向名为`tpacket_req3`的请求结构的指针传递给`setsockopt`调用，该请求结构定义为：
+    //v5.9/source/include/uapi/linux/if_packet.h#L277
+    struct tpacket_req3 {
+        unsigned int    tp_block_size;    /* Minimal size of contiguous block */
+        unsigned int    tp_block_nr;    /* Number of blocks */
+        unsigned int    tp_frame_size;    /* Size of frame */
+        unsigned int    tp_frame_nr;    /* Total number of frames */
+        unsigned int    tp_retire_blk_tov; /* timeout in msecs */
+        unsigned int    tp_sizeof_priv; /* offset to private data area. This area can be used by a user to store arbitrary information associated with each block. */
+        unsigned int    tp_feature_req_word; /*a set of flags (actually just one at the moment), which allows to enable some additional functionality.*/
+    };
+每个块都有一个关联的头，该头存储在为该块分配的存储区域的最开始处。
+块头结构称为`tpacket_block_desc`，并具有一个`block_status`字段，该字段指示该块是内核当前正在使用还是用户可用。
+通常的工作流程是，内核将数据包存储到一个块中直到其填满，然后将`block_status`设置为`TP_STATUS_USER`。
+然后，用户通过将`block_status`设置为`TP_STATUS_KERNEL`来从块中读取所需的数据，并将其释放回内核。
+    //v5.9/source/include/uapi/linux/if_packet.h
+    struct tpacket_hdr_v1 {
+        __u32    block_status;
+        __u32    num_pkts;
+        __u32    offset_to_first_pkt;
+    ...
+    };
+    union tpacket_bd_header_u {
+        struct tpacket_hdr_v1 bh1;
+    };
+    struct tpacket_block_desc {
+        __u32 version;
+        __u32 offset_to_priv;
+        union tpacket_bd_header_u hdr;
+    };
+每个帧还具有由结构`tpacket3_hdr`描述的关联标头。 `tp_next_offset`字段指向同一块内的下一帧。
+    //v5.9/source/include/uapi/linux/if_packet.h
+    struct tpacket3_hdr {
+        __u32        tp_next_offset;
+    ...
+    };
+当一个数据块完全填满数据（一个新的数据包无法容纳剩余空间）时，它会被关闭并释放到用户空间或被内核“淘汰”。
+由于用户通常希望尽快看到数据包，因此即使没有完全填充数据，内核也可以释放该数据块。
+这是通过设置一个计时器来完成的，该计时器以`tp_retire_blk_tov`参数控制的超时来退出当前块。
+还有一种方法可以指定每个块的私有区域，内核不会触及该私有区域，用户可以用来存储与块相关的任何信息。
+该区域的大小通过`tp_sizeof_priv`参数传递。
+如果想更好地了解用户空间程序如何使用`TPACKET_V3`环形缓冲区，则可以阅读文档[4]中提供的示例（搜索“ `TPACKET_V3`
+example”）。
+###  AF_PACKET sockets 的实现
+####  结构体定义
+每当创建数据包套接字时，就会在内核中分配一个相关的`packet_sock`结构：
+    //v5.9/source/net/packet/internal.h#L108
+    struct packet_sock {
+        /* struct sock has to be the first member of packet_sock */
+        struct sock        sk;
+        ...
+        struct packet_ring_buffer    rx_ring;
+        struct packet_ring_buffer    tx_ring;
+        ...
+        enum tpacket_versions    tp_version;
+        ...
+        int            (*xmit)(struct sk_buff *skb);
+        ...
+    };
+此结构中的`tp_version`字段保存环形缓冲区版本，通过`PACKET_VERSION`
+`setsockopt`调用将其设置为`TPACKET_V3`。
+`rx_ring`和`tx_ring`字段描述了通过`PACKET_RX_RING`和`PACKET_TX_RING`
+`setsockopt`调用创建的接收和发送环形缓冲区。 这两个字段的类型为`packet_ring_buffer`，定义为
+    //v5.9/source/net/packet/internal.h
+    struct packet_ring_buffer {
+        struct pgv        *pg_vec;
+        ...
+        union {
+            unsigned long            *rx_owner_map;
+            struct tpacket_kbdq_core    prb_bdqc;
+        };
+    };
+    struct pgv {
+        char *buffer;
+    };
+`pg_vec`字段是指向pgv结构数组的指针，每个结构都包含对块的引用。 实际上，块是单独分配的，而不是作为一个连续的存储区域分配。
+`prb_bdqc`字段的类型为`tpacket_kbdq_core`，其字段描述了环形缓冲区的当前状态：
+    //v5.9/source/net/packet/internal.h
+    /* kbdq - kernel block descriptor queue */
+    struct tpacket_kbdq_core {
+        ...
+        unsigned short    blk_sizeof_priv;
+        ...
+        char        *nxt_offset;
+        ...
+        /* timer to retire an outstanding block */
+        struct timer_list retire_blk_timer;
+    };
+`blk_sizeof_priv`字段包含每个块的私有区域的大小。 `nxt_offset`字段指向当前活动块内部，并显示下一个数据包应保存在何处。
+`retire_blk_timer`字段的类型为`timer_list`，描述了在超时时退出当前块的计时器。
+    //v5.9/source/include/linux/timer.h#L11
+    struct timer_list {
+        /*
+         * All fields that change during normal runtime grouped to the
+         * same cacheline
+         */
+        struct hlist_node    entry;
+        unsigned long        expires;
+        void            (*function)(struct timer_list *);
+        u32            flags;
+    ...
+    };
+####  环形缓冲区设置
+内核使用`packet_setsockopt()`函数来处理数据包套接字的套接字设置选项。
+使用`PACKET_VERSION`套接字选项时，内核会将`po-> tp_version`设置为提供的值。
+使用`PACKET_RX_RING`套接字选项，将创建接收环形缓冲区。 在内部，它是由`packet_set_ring()`函数完成的。
+此功能可以完成很多事情，在此仅介绍重要部分。 首先，`packet_set_ring()`对提供的环形缓冲区参数执行大量完整性检查：
+    //v5.9/source/net/packet/af_packet.c

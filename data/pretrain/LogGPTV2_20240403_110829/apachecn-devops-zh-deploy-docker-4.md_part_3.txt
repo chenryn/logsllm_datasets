@@ -1,0 +1,129 @@
+在前一章中，我们构建了一个简单的服务，可以用来添加和列出表单中输入的单词。但是如果你还记得的话，我们大量使用了一些实现细节来将服务连接在一起，如果不是彻底的黑客攻击，也是非常脆弱的。借助我们新发现的服务发现知识和对 Docker Swarm 编排的理解，我们可以尝试让旧代码为真正的集群部署做好准备，并摆脱我们之前脆弱的设置。
+# 应用服务器
+将旧的应用服务器文件夹从[第 3 章](3.html)、*服务分解、*复制到一个新的文件夹中，我们将更改我们的主处理程序代码(`index.js`)，因为我们必须适应这样一个事实，即我们将不再是唯一一个读写数据库的实例。
+As always, all code can also be found at [https://github.com/sgnn7/deploying_with_docker](https://github.com/sgnn7/deploying_with_docker). This particular implementation can be found in `chapter_4/clustered_application`. Warning! As you start thinking about similar containers running in parallel, you have to start being extra careful about data changes that can and will occur outside of the container's realm of control. For this reason, keeping or caching the state in any form in a running container is usually a recipe for disaster and data inconsistencies. To avoid this issue, in general, you should try to make sure that you re-read the information from your upstream sources (that is, the database) before doing any transformation or passing of the data like we do here.
+# index.js
+该文件与上一章中的文件基本相同，但我们将进行一些更改以消除缓存:
+```
+'use strict'
+const bodyParser = require('body-parser')
+const express = require('express');
+const mongo = require('mongodb')
+const DB_NAME = 'word_database';
+const DB_HOST = process.env.DB_HOST || 'localhost:27017';
+const COLLECTION_NAME = 'words';
+const SERVER_PORT = 8000;
+const app = express();
+const client = mongo.MongoClient();
+const dbUri = `mongodb://${DB_HOST}/${DB_NAME}`;
+app.set('view engine', 'pug')
+app.use(bodyParser.urlencoded({ extended: false }))
+function loadWordsFromDatabase() {
+    return client.connect(dbUri).then((db) => {
+        return db.collection(COLLECTION_NAME).find({}).toArray();
+    })
+    .then((docs) => {
+        return docs.map(doc => doc.word);
+    });
+}
+app.get('/', (req, res) => {
+    console.info("Loading data from database...");
+    loadWordsFromDatabase().then(words => {
+        console.info("Data loaded, showing the result...");
+        res.render('index', { words: words });
+    });
+});
+app.post('/new', (req, res) => {
+    const word = req.body.word;
+    console.info(`Got word: ${word}`);
+    if (word) {
+        client.connect(dbUri).then((db) => {
+            db.collection(COLLECTION_NAME).insertOne({ word }, () => {
+                db.close();
+            });
+        });
+    }
+    res.redirect('/');
+});
+app.listen(SERVER_PORT, () => {
+    console.info("Server started on port %d...", SERVER_PORT);
+});
+```
+如果可能已经注意到，许多事情是相似的，但也有根本性的变化:
+*   我们不会预加载 start 上的单词，因为列表可能会在服务初始化和用户请求数据时发生变化。
+*   我们在每个`GET`请求上加载保存的单词，以确保我们总是得到新的数据。
+*   当我们保存这个词时，我们只是把它插入数据库，而不是保存在应用中，因为我们会在`GET`上获得新的数据重新显示。
+使用这种方法，任何应用实例对数据库中的数据所做的任何更改都会立即反映在所有应用实例中。此外，如果数据库管理员更改了任何数据，我们也会在应用中看到这些更改。由于我们的服务还为数据库主机使用了一个环境变量，因此我们不需要将其更改为支持服务发现。
+Caution! Be aware that because we read the database on each `GET` request, our changes to support clustering are not free and come with an increase in database queries, which can become a real bottleneck when the networking, cache invalidation, or disk transfers become overly saturated by these requests. Additionally, since we read the database before we display the data, slowdowns in the backend processing of our database `find()` will be user-visible, possibly causing undesired user experience, so keep these things in mind as you develop container-friendly services.
+# 网络服务器
+由于 NGINX 配置处理的一个怪癖/特性，我们的网络服务器更改会有点棘手，如果您进行基于 Java 的 DNS 解析，这可能也会影响您。本质上，NGINX 缓存 DNS 条目是如此之难，以至于一旦它读取了配置文件，除非指定了一些额外的标志(`resolver`)，否则该配置中的任何新 DNS 解析实际上都不会发生。随着 Docker 服务不断变化和重新定位，这是一个必须解决的严重问题，以便在 Swarm 上正常运行。这里，你有几个选择:
+*   与 NGINX 并行运行一个 DNS 转发器(如`dnsmasq`)，并将其用作解析器。这需要在同一个容器中运行`dnsmasq`和 NGINX。
+*   使用系统中相同的解析器填充 NGINX 配置容器，例如`envsubst`:这要求所有容器都在同一个用户定义的网络中。
+*   对 DNS 解析器 IP 进行硬编码(`127.0.0.11`):这也要求所有容器都在同一个用户定义的网络中。
+为了鲁棒性，我们将使用第二个选项，因此将前一章的 web 服务器复制到一个新文件夹中，并将其重命名为`nginx_main_site.conf.template`。然后，我们将向其中添加一个解析器配置，并为我们的代理主机端点添加一个变量`$APP_NAME`:
+```
+server {
+  listen         8080;
+  server_name    _;  
+  resolver $DNS_RESOLVERS;
+  root /srv/www/html;
+  location ~/\. {
+    deny all;
+  }
+  location / { 
+    auth_basic           "Authentication required";
+    auth_basic_user_file /srv/www/html/.htpasswd;
+    proxy_pass           http://$APP_NAME:8000;
+  }
+}
+```
+由于 NGINX 不处理配置文件中的环境变量替换，我们将围绕它编写一个包装脚本。添加一个名为`start_nginx.sh`的新文件，并在其中包含以下内容，该文件接受主机的解析器并生成新的 main_site 配置:
+```
+#!/bin/bash -e
+export DNS_RESOLVERS=$(cat /etc/resolv.conf | grep 'nameserver' | awk '{ print $2 }' | xargs echo)
+cat /etc/nginx/conf.d/nginx_main_site.conf.template | envsubst '$DNS_RESOLVERS $APP_NAME' > /etc/nginx/conf.d/nginx_main_site.conf
+nginx -g 'daemon off;'
+```
+为了运行这个，我们最终需要确保我们用这个脚本而不是内置的脚本启动 NGINX，所以我们也需要修改我们的`Dockerfile`。
+打开我们的 Dockerfile，并确保它具有以下内容:
+```
+FROM nginx:latest
+RUN apt-get update -q && \
+    apt-get dist-upgrade -y && \
+    apt-get install openssl && \
+    apt-get clean && \
+    apt-get autoclean
+EXPOSE 8080
+ENV SRV_PATH /srv/www/html
+ARG PASSWORD=test
+RUN rm /etc/nginx/conf.d/default.conf
+COPY start_nginx.sh /usr/local/bin/
+RUN mkdir -p $SRV_PATH && \
+    chown nginx:nginx $SRV_PATH && \
+    printf "user:$(openssl passwd -crypt $PASSWORD)\n" >> $SRV_PATH/.htpasswd && \
+    chmod +x /usr/local/bin/start_nginx.sh
+COPY nginx_main_site.conf.template /etc/nginx/conf.d/
+CMD ["/usr/local/bin/start_nginx.sh"]
+```
+这里，主要的变化是启动脚本`CMD`覆盖并将配置转换为模板，剩下的几乎不做任何改变。
+# 数据库ˌ资料库
+与其他两个容器不同，我们将数据库放在一个容器中，这是由于以下因素的组合:
+*   MongoDB 可以通过垂直扩展轻松扩展到高 GB/低 TB 数据集大小。
+*   没有对卷的深入了解，数据库极难扩展(下一章将介绍)。
+*   数据库的分片和副本集通常足够复杂，以至于整本书都只能写这个主题。
+我们可能会在后面的章节中讨论这个主题，但是在这里，它会使我们偏离我们学习如何部署服务的总体目标，因此我们将只拥有我们在前面章节中使用的单个数据库实例。
+# 全部部署
+正如我们对简单的 web 服务器所做的那样，我们将从创建另一个 Swarm 集群开始:
+```
+$ docker swarm init
+Swarm initialized: current node (1y1h7rgpxbsfqryvrxa04rvcp) is now a manager.
+To add a worker to this swarm, run the following command:
+ docker swarm join \
+ --token SWMTKN-1-36flmf9vnika6x5mbxx7vf9kldqaw6bq8lxtkeyaj4r5s461ln-aiqlw49iufv3s6po4z2fytos1 \
+ 192.168.4.128:2377
+```
+然后，我们需要为服务发现主机名解析创建覆盖网络。除了创建一个我们将向其添加所有服务的隔离网络之外，您不需要了解太多:
+```
+$ docker network create --driver overlay service_network
+44cyg4vsitbx81p208vslp0rx
+```

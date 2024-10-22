@@ -1,0 +1,128 @@
+  * net.go:164 声明conn结构体，fd 为 netFD 指针
+  * fd_unix.go:19 声明 netFD 结构体。
+  * fd_unix.go:45 声明 setAddr 函数，对 netFD.raddr进行赋值， 此处即为漏洞传入参数 RemoteAddr，首次声明位置。 找到这里还不够，我们需要知道这个传入的值，究竟从哪来的。
+  * file_unix.go:66 调用 setAddr() :fd.setAddr(laddr, raddr),第二个参数，是我们需找的。
+  * file_unix.go:60 设置raddr：addr := fd.addrFunc()(rsa)
+  * sock_posi.go:92 声明 addrFunc(),可以看到根据套接字族设定进行不同的操作，返回sockaddrToXXX
+      func (fd *netFD) addrFunc() func(syscall.Sockaddr) Addr {
+      switch fd.family {
+      case syscall.AF_INET, syscall.AF_INET6:
+          switch fd.sotype {
+          case syscall.SOCK_STREAM:
+              return sockaddrToTCP
+          case syscall.SOCK_DGRAM:
+              return sockaddrToUDP
+          case syscall.SOCK_RAW:
+              return sockaddrToIP
+          }
+      case syscall.AF_UNIX:
+          switch fd.sotype {
+          case syscall.SOCK_STREAM:
+              return sockaddrToUnix
+          case syscall.SOCK_DGRAM:
+              return sockaddrToUnixgram
+          case syscall.SOCK_SEQPACKET:
+              return sockaddrToUnixpacket
+          }
+      }
+      return func(syscall.Sockaddr) Addr { return nil }
+      }
+  * 查阅[资料](http://man7.org/linux/man-pages/man7/unix.7.html)，原来 AF_UNIX 用于进程间通信，绑定的文件，可以通过 sockaddrToUnix 取得。下面是说明：
+> …….  
+>  Address format  
+>  A UNIX domain socket address is represented in the following  
+>  structure:
+>
+> struct sockaddr_un {  
+>  sa_family_t sun_family; /* AF_UNIX */  
+>  char sun_path[108]; /* pathname */  
+>  };
+>
+> The sun_family field always contains AF_UNIX. On Linux sun_path is  
+>  108 bytes in size; see also NOTES, below.
+>
+> Various systems calls (for example, bind(2), connect(2), and  
+>  sendto(2)) take a sockaddr_un argument as input. Some other system  
+>  calls (for example, getsockname(2), getpeername(2), recvfrom(2), and  
+>  accept(2)) return an argument of this type.
+>
+> Three types of address are distinguished in the sockaddr_un struc‐  
+>  ture:
+>
+> * pathname: a UNIX domain socket can be bound to a null-terminated  
+>  filesystem pathname using bind(2). When the address of a pathname  
+>  socket is returned (by one of the system calls noted above), its  
+>  length is
+>
+> offsetof(struct sockaddr_un, sun_path) + strlen(sun_path) + 1
+>
+> and sun_path contains the null-terminated pathname. (On Linux,  
+>  the above offsetof() expression equates to the same value as  
+>  sizeof(sa_family_t), but some other implementations include other  
+>  fields before sun_path, so the offsetof() expression more portably  
+>  describes the size of the address structure.)
+>
+> For further details of pathname sockets, see below.  
+>  ……
+  * unixsock_posix.go:52 定义了 sockaddrToUnix(),可以看到，是通过 syscall.SockaddrUnix获得的绑定文件名。
+分析到这里，RemoteAddr 怎么来的我们算整明白了：根据不同的套接字族，返回不同的地址。如果是通过 AF_UNIX 创建的套接字，将返回绑定的文件名。
+###  到哪去
+那么，哪里调用了存在漏洞的函数？该漏洞有多大影响呢？
+之前看到，漏洞函数在api.go 中进行调用：
+ucrednetGet 重命名为 postCreateUserUcrednetGet, 在postCreateUser有调用：
+    ......
+    func postCreateUser(c *Command, r *http.Request, user *auth.UserState) Response {
+        _, uid, _, err := postCreateUserUcrednetGet(r.RemoteAddr)
+        if err != nil {
+            return BadRequest("cannot get ucrednet uid: %v", err)
+        }
+        if uid != 0 {
+            return BadRequest("cannot use create-user as non-root")
+        }
+    ......
+而该函数，对应的是创建本地用户的API：
+    ......
+        createUserCmd = &Command{
+            Path: "/v2/create-user",
+            POST: postCreateUser,
+        }
+    ......
+了解下 snap API：
+[API 文档](https://github.com/snapcore/snapd/wiki/REST-API)
+功能是创建本地用户，使用权限是root。结合漏洞会将uid 覆盖为 0（root）的可能，则该漏洞可以通过调用api，创建用户，如果 sudoer
+设置为true，则创建的为特权用户。
+## 0x05 漏洞利用分析
+之上，将漏洞分析的明明白白。此时其实可以自己写出exp：
+  * 创建 AF_UNIX 族套接字
+  * 绑定一个文件，文件名为;uid=0,“;”用于截取字符串，获取覆盖uid的能力。
+  * 调用API，且sudoer 设为true
+  * snapd在鉴权的时候会获取远程地址，如果是 AF_UNIX 类型套接字。将返回绑定的文件，触发漏洞。
+  * 鉴权的到uid=0，认为是root权限调用，执行生成本地用户操作，且调用API，且sudoer=true，则生成的用户具有特权。
+漏洞作者给的
+[exp](https://github.com/initstring/dirty_sock/blob/master/dirty_sockv1.py)，确实是这么写的。
+## 0x06 补丁分析
+漏洞修补的很粗暴，之前：
+    return fmt.Sprintf("pid=%s;uid=%s;socket=%s;%s", wa.pid, wa.uid, wa.socket, wa.Addr)
+现在定义了一个结构体 ucrednet ，并且现在
+    return fmt.Sprintf("pid=%d;uid=%d;socket=%s;", un.pid, un.uid, un.socket)
+不再返回 wa.Addr ，即不再处理远程连接地址。通过 AF_UNIX 套接字向RemoteAddr 注入文本已经行不通。从而修补了漏洞。
+## 0x07 漏洞验证
+漏洞十分的好用，snap < 2.37.1 以下版本均受影响。
+因为在ubuntu 18.04 以后版本，默认安装 snap ，并且测试时发现，一些vps 供应商 Ubuntu 16.04 同样默认安装snap。
+以下vps服务商的 ubuntu 安装镜像均存在问题：
+  * 腾讯云
+  * 谷歌云
+  * 亚马逊云
+  * vultr
+  * 搬瓦工
+  * ……
+除了阿里云外，一打一个准。阿里云ubuntu 镜像中，不带有snap，是我测的主机中，唯一不受漏洞影响的云服务商。
+## 0x08 安全建议
+修补很简单，将 snap 升级到最新版就好了。
+有 ubuntu vps 的同学，建议查看一下自己主机上snap的版本。
+## 0x09 后记
+很多漏洞作者，都会公布漏洞详情。建议做漏洞分析的同学，不要先去看漏洞详情。成长的过程在于对漏洞的摸索。
+拿着分析文章，看一步调一步。没有太大意义，沉淀不了自己的经验。
+本次分析的snap漏洞，唯一卡住的地方，是套接字那里。去看漏洞作者详细分析，才知道原来还有 AF_UNIX
+用于本地进程通信。这个是我知识盲区，卡在这确实没办法。
+ps：其实整篇下来，最难得部分是逆 go 的net标准库。（笑

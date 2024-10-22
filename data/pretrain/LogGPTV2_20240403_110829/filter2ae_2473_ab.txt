@@ -1,0 +1,125 @@
+          rtnValue = v16;
+          *a3 = v6;
+    toend2:
+          if ( v7 != -1 )
+          {
+            CloseHandle(v7);
+            rtnValue = v16;
+          }
+          goto end;
+        }
+    LABEL_9:
+        v6 = 1;
+        goto LABEL_10;
+      }
+漏洞修复后，原本 `GetTempFileNameW` 函数的位置变成了
+`CheckDevicePathIsWritable`，`GetTempFileNameW` 函数的实现位于 kernelbase.dll
+文件中，如果你仔细对比，会发现这两个函数中的大部分代码相同，只有一处差异点需要注意，就是在创建临时文件的时候，两者的代码如下：
+    // GetTempFileNameW
+    v24 = CreateFileW(lpTempFileName, GENERIC_READ, 0, 0i64, 1u, 0x80u, 0i64);
+    // CheckDevicePathIsWritable
+    v22 = CreateFileW(FileName, GENERIC_READ, 0, 0i64, 1u, 0x4000080u, 0i64);
+可以看到在 `CheckDevicePathIsWritable` 函数中，`CreateFileW` 函数的第六个参数
+`dwFlagsAndAttributes` 数值由 `0x80` 变成了 `0x4000080`，即从 `FILE_ATTRIBUTE_NORMAL`
+变成了 `FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE`。
+根据文档说明，`FILE_FLAG_DELETE_ON_CLOSE` 表示文件会在所有句柄关闭时直接删除，并且之后打开该文件的请求必须包含
+`FILE_SHARE_DELETE` 共享模式，否则会失败。
+简单来说，修复后的代码将临时文件的创建和删除操作整合成为了一个元操作。
+### 3.2 漏洞原理分析
+上面补丁对比的结果可以确定这是一个条件竞争漏洞，由于临时文件的创建操作和删除操作接次发生，并且在两个操作之间没有对文件进行限制，这就导致攻击者可以创建另一线程，在临时文件创建之后，删除之前，获取文件句柄并创建机会锁阻止其他线程操作，同时将文件删除，并设置原文件路径指向其他文件，当机会锁释放后，指向的其他文件就会被删除。
+## 4\. 漏洞利用
+### 4.1 文件删除漏洞利用代码流程总结
+  1. 在临时文件夹下，使用 `FULL_SHARING` 模式创建目录 dir ，作为上述临时文件的保存位置;
+  2. 创建线程 FindFile，监控 dir 目录下的文件创建操作：
+  3. 获取创建文件句柄并创建机会锁；
+  4. 将创建的文件移动到其他目录下；
+  5. 创建符号链接，将原文件路径指向要删除的目标文件；
+  6. 释放机会锁；
+  7. 主线程将目录 dir 的路径转换为 unc 格式，并通过 `CoCreateInstance` 的方式调用 sdrsvc 服务的 `CSdCommonImpl::QueryStorageDevice` 接口；
+  8. sdrsvc 服务在 unc 格式目录下创建临时文件，之后删除文件。
+如下图所示：
+### 4.2 提权漏洞利用
+#### 4.2.1 原理分析
+这部分内容基本上看 [ZDI 的文章](https://www.zerodayinitiative.com/blog/2022/3/16/abusing-arbitrary-file-deletes-to-escalate-privilege-and-other-great-tricks)就可以，这里做一下介绍。
+简单来说，从 **任意文件删除** 到本地提权，需要与 MSI installer 文件运行过程进行条件竞争。
+Windows Installer 服务负责应用程序的安装，而 msi
+文件定义了安装过程中会发生的变化，例如创建了哪些文件夹、复制了哪些文件、修改了哪些注册表等等。因为程序安装过程中会对系统进行修改，为了避免安装出错导致系统无法恢复，msi
+会在运行时创建文件夹 `C:/Config.msi`，将安装过程中做的所有更改记录到 .rbs 后缀的文件中，同时将被替换的系统文件存储为 .rbf
+格式放入该文件夹。所以如果可以替换其中的 rbf 文件，就能将系统文件替换为任意恶意文件。正是因为有文件替换的风险，所以 `C:/Config.msi`
+及其中的文件默认具有强 DACL。
+但是如果攻击者能做到 **任意目录删除** ，就可以将 `C:/Config.msi` 删除，重新创建一个弱 DACL 的 `C:/Config.msi`
+目录，并在 msi 程序创建完 rbs 和 rbf 文件之后，对其进行替换，使用恶意 rbf 文件实现提权。
+具体来看，msi 在运行时经历了 **创建- >删除->再创建** 的过程，之后才会开始创建 rbs 文件，因此 **任意目录删除** 需要在
+**再创建** 之后，rbs 文件创建之前删除 `C:/Config.msi` 目录，并监控 rbs 文件的产生，对文件进行替换，条件竞争就发生在这里。
+上面提到的漏洞是 **任意目录删除** ，如果发现的是 **任意文件删除** ，可以删除
+`C:/Config.msi::$INDEX_ALLOCATION` 数据流，同样可以实现目录的删除。
+利用任意文件删除漏洞实现提权的流程如下图所示：
+#### 4.2.2 失败原因分析
+上面介绍的流程把 **Config.msi 的删除** 当作一个元操作，但在 CVE-2023-21752
+这个漏洞中，文件删除同样需要条件竞争才能实现，具有相对繁琐的步骤。也就是说想要利用这个漏洞实现本地提权，需要同时实现赢得两个条件竞争，这也是我一开始复现总是失败的原因。
+为了方便了解利用代码的执行流程，我对代码中的注释进行了添加和修改，得到了如下的执行结果：
+    PS C:\Users\exp\Desktop> C:\Users\exp\Desktop\SDRsvcEop.exe
+    [wmain] Config.msi directory created!
+    [wmain] Directory: C:\users\exp\appdata\local\temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8
+    [wmain] Got handle of uuid directory
+    [wmain] Finish create oplock for config.msi
+    [Trigger] Path: \\127.0.0.1\c$\Users\exp\AppData\Local\Temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8
+    [FindFile] Found added file C:\users\exp\appdata\local\temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8\SDT73B.tmp
+    [FindFile] Got handle of C:\users\exp\appdata\local\temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8\SDT73B.tmp
+    [cb] Oplock!
+    [Move] Finish moving to \??\C:\windows\temp\c5b82788-8133-4971-b351-38f58233ced1
+    [CreateJunction] Junction \\?\C:\Users\exp\AppData\Local\Temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8 -> \RPC Control created!
+    [DosDeviceSymLink] Symlink Global\GLOBALROOT\RPC Control\SDT73B.tmp -> \??\C:\Config.msi::$INDEX_ALLOCATION created!
+    [FindFile] End
+    [Move] Finish moving to \??\C:\windows\temp\0f1161f2-a8c5-4798-a71d-f32ebba87125
+    [install] MSI file: C:\windows\temp\MSI72F.tmp
+    [install] Start ACTION=INSTALL
+    [cb1] Detect first create
+    [cb1] Detect first delete
+    [install] Start REMOVE=ALL
+    [install] Start delete msi file
+    [Fail] Race condtion failed!
+    [DeleteJunction] Junction \\?\C:\Users\exp\AppData\Local\Temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8 deleted!
+    [DelDosDeviceSymLink] Symlink Global\GLOBALROOT\RPC Control\SDT73B.tmp -> \??\C:\Config.msi::$INDEX_ALLOCATION deleted!
+我在不同流程的结果之间添加了回车，方便观察，可以看到在 **删除文件**
+流程中，程序监控到了临时文件的生成，也创建了符号链接，但是由于符号链接将临时文件链接到了
+`C:/Config.msi::$INDEX_ALLOCATION` 上，而 `C:/Config.msi` 的机会锁又掌握在 msi
+线程上，因此删除操作停滞了。
+于此同时 msi 线程上只监测到了 `C:\\Config.msi`
+的第一次创建和删除，并没有监测到第二次创建，因为这里使用了循环对创建行为进行检测，因此该线程也陷入了无限循环。
+与 msi 的条件竞争失败，导致两个线程发生死锁，漏洞利用失败。
+#### 4.2.3 问题解决
+首先，我将利用代码的整个流程画成了如下的流程图：
+红框部分就是条件竞争失败的地点。
+我尝试增加虚拟机的 CPU 数量，对监控 Config.msi 创建的代码进行优化，但是都没有成功。同时我也单独使用 procmon 监控了 msi
+文件的运行过程，确定 Config.msi 目录确实发生了二次创建。
+所以结论只有一个，Config.msi 目录的二次创建发生的太快了。但是既然 Config.msi
+目录的二次创建是确实发生的，同时利用代码已经监测到了第一次删除的行为，那么如果这个时候就释放机会锁 2，又会如何呢？
+如果不对 Config.msi 目录的二次创建进行监控，直接释放机会锁 2，因为 Config.msi 目录的二次创建时间间隔非常短，等待良久的
+sdrsvc 就有机会成功删除 Config.msi。此时漏洞利用流程可以继续进行下去，并成功实现漏洞利用！
+### 3.2 符号链接的问题
+之前我对利用代码中如何链接向待删除文件存在疑问，实际上这种利用手法[来自 James
+Forshaw](https://vimeo.com/showcase/3416096/video/133002251)，参考链接 5 和 6
+对其进行了介绍。
+重分析点/Junction 是一种 NTFS 文件系统中文件夹的属性，NTFS
+驱动在打开文件夹的时候会对它进行读取。可以使用它对目录之间进行链接，假设要建立目录 A 向目录 B 的重分析点，只要普通用户对目录 A
+具有可写权限就能够进行，而对目录 B 的权限没有任何要求。
+在 Windows 系统中，我们常提到的 C 盘目录并不是一个真的文件夹，它实际上是一个指向设备物理地址的符号链接对象，你可以使用 WinObj 在
+`\GLOBAL??` 中看到 `C:` 项是一个 `SymbolicLink`。当我们访问 C
+盘中的某个文件时，系统会对访问路径进行转换，转换成真正的设备物理地址。普通用户也可以在对象管理器中添加或删除符号链接，但是该行为只能在有限的目录下进行，例如
+`\RPC Control`.
+在上面利用代码执行结果中，有下面两行输出：
+    [CreateJunction] Junction \\?\C:\Users\exp\AppData\Local\Temp\3bbbd2cf-7baf-42b7-98ea-242f703b08f8 -> \RPC Control created!
+    [DosDeviceSymLink] Symlink Global\GLOBALROOT\RPC Control\SDT73B.tmp -> \??\C:\Config.msi::$INDEX_ALLOCATION created!
+首先创建了攻击者可控的目录 `3bbbd2cf-7baf-42b7-98ea-242f703b08f8` 指向 `\RPC Control`
+的重分析点，这样访问 `\RPC Control` 就相当于访问这个可控目录；之后在 `\RPC Control` 下面创建了一个由
+`SDT73B.tmp` 指向待删除文件的符号链接，这一步就相当于将可控目录下的 `SDT73B.tmp` 指向了待删除文件，删除 `SDT73B.tmp`
+就相当于删除了目标文件。
+## 6\. 参考资料
+  1. 
+  2. [Windows Exploitation Tricks: Exploiting Arbitrary Object Directory Creation for Local Elevation of Privilege](https://googleprojectzero.blogspot.com/2018/08/windows-exploitation-tricks-exploiting.html)
+  3. [CVE-2023-21752 exp](https://github.com/Wh04m1001/CVE-2023-21752)
+  4. [ABUSING ARBITRARY FILE DELETES TO ESCALATE PRIVILEGE AND OTHER GREAT TRICKS](https://www.zerodayinitiative.com/blog/2022/3/16/abusing-arbitrary-file-deletes-to-escalate-privilege-and-other-great-tricks)
+  5. [Follow the Link: Exploiting Symbolic Links with Ease](https://www.cyberark.com/resources/threat-research-blog/follow-the-link-exploiting-symbolic-links-with-ease)
+  6. [Understanding and Exploiting Symbolic links in Windows - Symlink Attack EOP](https://nixhacker.com/understanding-and-exploiting-symbolic-link-in-windows/)
+* * *

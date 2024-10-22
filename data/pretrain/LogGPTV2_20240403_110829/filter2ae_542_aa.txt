@@ -1,0 +1,32 @@
+作者：zjq@IceSword Lab  
+来源：
+在安卓阵营中，三星手机可以说是最重视安全的了，各种mitigation技术都是早于官方系统应用到自己手机上，并且加入了KNOX技术，在内核层设置了重重校验，提高了手机root难度。17年下半年，研究过一段时间三星手机s8的内核安全问题，发现了一些比较有意思的漏洞。本文中，将介绍一个race
+condition漏洞，利用此漏洞绕过KALSR，PXN，CFI，KNOX2.8等拿到了s8内核root权限。目前这些漏洞都已经被修复。
+#### 0x0 MobiCore驱动的提权漏洞
+在MobiCore驱动中，ioct的MC_IO_GP_REGISTER_SHARED_MEM接口会从slab中分配一块cwsm
+buffer，MC_IO_GP_RELEASE_SHARED_MEM接口用来释放cwsm
+buffer和相关资源。但是在释放过程中，由于没有加锁，存在race condition进而导致double free的可能：
+看此函数的实现，首先从链表中查找获取该内存块，并将引用计数加1以持有该cwsm buffer。然后通过连续两个cwsm_put函数减去引用计数并释放cwsm
+buffer。cwsm_put的实现是引用计数减1，然后检查引用计数是否为0，如果为0，则执行cwsm_release函数释放cwsm，如下所示：
+正常情况下，创建该buffer时引用计数被设为1，cwsm_find查找该buffer时引用计数加1，第一个cwsm_put调用减去cwsm_find持有的引用计数，然后第二个cwsm_put将引用计数减为0，并调用cwsm_release释放资源。
+但在client_gp_release_shared_mem函数中，由于cwsm_find和两个cwsm_put之间并未加锁保护，使获取cwsm和释放cwsm不是原子操作，当race
+condition发生时，多个线程在cwsm被释放前调用cwsm_find获取该buffer后，接下来的多次cwsm_put调用则可以触发对cwsm的double
+free。
+我们再看cwsm_release这个函数，还是比较复杂的：
+其中，cwsm的结构为：
+仔细分析cwsm_release函数，我们会发现，这个函数中当race condition发生时， tee_mmu_delete(cwsm->mmu)
+会造成cwsm->mmu 的double free， client_put(client) 会造成cwsm->client的double
+free，最后kfree(cwsm) 也会造成cwsm的double free。三个大小不一的slab内存块同时double
+free，极易引起内核崩溃，除非我们在cwsm第一次被释放后占住该内存，从而控制内存中内容，改变第二次执行此函数中的流程。而list_del_init(&cwsm->list)这一句：
+如果我们可以控制cwsm的内容，也就是list->next 和list->prev指针的值，则可以做成一个任意地址写。
+#### 0x1 利用方案
+从client_gp_release_shared_mem函数中可以看到，调用cwsm_find获得buffer和调用cwsm_put释放buffer时间间隙极小，如何能提高race
+condition的成功率，有效控制指针，并能尽可能的降低崩溃率呢？通过对slab中内存分配释放机制的分析，主要采用了几下几个方法:
+  1. 如何增加race condition成功率呢？kmalloc在slab中分配内存块会记录下本线程所在核，kfree释放内存时，如果判断当前线程所在核与分配内存时的所在核一致，则将内存释放到快速缓存链表freelist中，这样当其他线程分配相同大小的内存块时能快速取到，这样可以增加释放后马上占位的成功率；如果释放时判断当前线程所在核与分配内存时的所在核不一致，则将内存释放到page->freelist中，当其他线程分配内存时，缓存链表中内存耗尽后，才会从此链表中取用，因为时间间隙很小，这会降低占位成功率。所以分配slab内存，释放内存，占位内存的线程最好在同一个核上。假设有0，1，2三个核，线程A在0核上分配了buffer，线程B在0核上释放buffer，同时为了制造race condition需要线程C在1核上释放buffer，同时线程D在0核上，可以调用add_key系统调用来占用线程B释放掉的内存块，并填上我们需要的内容。当然这实际调试中，因为race condition间隙很小，可能需要几个甚至几十几百个线程同时操作来增加成功率。同时，因为race condition间隙很小，可以在0核上增加大量打酱油线程，使其在race condition间隙中获得调用机会，以增大时间间隙，提高占位的成功率；
+  2. 我们在cwsm double free的第一次释放后将其占住，那么就可以控制其中的内容，填上我们需要的值，因此我们可以将cwsm->list.next设为一个内核地址，利用list_del_init(&cwsm->list)再调用__list_del，可以实现内核地址写，比如将ptmx->check_flags 设置为我们需要的函数指针；
+  3. 当race condition发生时，多个线程调用cwsm_release时，大小不同的slab块cwsm->mmu，cwsm->client和cwsm都会被重复释放，在此情况下，内核大概率会崩。因此，当cwsm第一次释放，我们占住后，需要将cwsm->client和cwsm->mmu填上合适的值，防止内核崩溃。我们先看client_put(client) 函数：
+这个函数首先引用计数client->kref减1，如果为0，则调用client_release释放资源。因此我们可以将client->kref设为大于1的值，防止cwsm->client被二次释放。
+再看tee_mmu_delete(cwsm->mmu)，这一句比较麻烦，它将调用mmu_release函数，看内部实现（片段）：
+可以看到，mmu_release
+不仅要释放mmu，并且要引用mmu中指针。如果我们能控制cwsm->mmu，那么我们必须将cwsm->mmu设为一个合法的slab地址，并且能够控制这个slab中的内容，否则系统将崩溃。幸运的是，我们找到了一个信息泄露漏洞：
+/sys/kernel/debug/ion/event文件将泄露ion中分配的ion_buffer的地址。我们可以利用ion接口分配大量ion_buffer，然后在泄露的地址中查找到连续8k大小（cwsm->mmu的大小）的ion_buffer内存。然后在ion中占住这一块内存不释放，将其地址填到cwsm->mmu中，使mmu_release释放此内存块，但因为我们在ion中此内存占住不释放不使用，所以即使被别人重新获得，也可避免内核崩溃。

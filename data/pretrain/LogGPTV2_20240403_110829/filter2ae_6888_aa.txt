@@ -1,0 +1,95 @@
+**作者：Koalr  
+原文链接：**
+xray 得益于 Go
+语言本身的优势，没有那么多不安全的动态特性，唯一动态是一个表达式引擎（CEL)，用的时候也加了各种类型校验，和静态代码没有什么区别了，因此基本不可能实现
+RCE 之类的反制效果。那么我们换个思路，有没有办法让 xray 直接无法使用呢。
+无法使用有两个表现，一个是让其直接崩溃掉，效果就是如果用 xray 扫描一个恶意 server，xray 直接 panic 退出。xray 0.x.x
+之前的某些版本确实有这种 bug，我当时耗费了很大的精力去这个定位问题然后开心的修掉了，这里就不细说这个点了，因为版本太老说了也没有太大意义。
+另一方面呢，想想之前比较热门的 CobaltStrike 反制，做法是设法取得 CS 的通信密钥然后模拟其上线流量，Server 端会瞬间上线无数机器，使得
+CS 无法正常使用。那么我们能否给 xray
+喂屎，使得它能瞬间扫出无数漏洞来让正常的扫描失效呢，我顺着这个思路做了一些探索，这篇文章就来说下我在编写这样一个”反制“工具的过程中遇到的困难以及我是如何解决的。
+## 入手
+想让扫描器能扫出漏洞，只需要满足扫描器对一个漏洞的规则定义即可。xray 的 poc 部分是开源的，意味着我们可以知道 xray
+在扫描时是怎么发的包，以及什么样的响应会被定义为漏洞存在。那么我们只要能定义一个 server ，让 server 按照 poc
+中定义的的响应去返回数据，就可以欺骗 xray 让其认为漏洞存在！看一个最简单的例子：
+    rules:
+        r0:
+            request:
+                method: GET
+                path: /app/kibana
+            expression: response.status == 200 && response.body.bcontains(b".kibanaWelcomeView")
+    expression: r0()
+在这个例子中，只要让 `/app/kibana` 这个路由返回`.kibanaWelcomeView` 并且状态码是 200，就能扫出 `poc-yaml-kibana-unauth` 这个漏洞。这太简单了，我们只需要批量解析一下所有
+poc，然后基于规则构建一下返回的数据就可以了，事实的确如此，不过过程可能稍显曲折。来看下另一个例子：
+    set:
+        rand1: randomLowercase(10)
+    rules:
+        r0:
+            request:
+                method: GET
+                path: /enc?md5={{rand1}}
+            expression: response.body.bcontains(bytes(md5(rand1)))
+            output:
+                search: 'test_yarx_(?P\w+)".bsubmatch(response.body)'
+          group_id: search["group_id"]
+        r1:
+            request:
+                method: GET
+                path: /groups/{{group_id}}
+            expression: response.headers["Set-Cookie"].contains(group_id, 0, 8)
+    expression: r0() && r1()
+这个例子复杂了亿点，其复杂性主要来自于这几方面：
+  1. 整体存在两条规则 `r0() && r1()` ，且两条规则都满足才行
+  2. path 中存在变量，无法直接将 path 作为路由使用
+  3. 第二条规则的 `group_id`来自于第一条规则的响应进行匹配得到的值，即两条规则存在联系
+  4. 对响应的判断没有使用常量，而是需要将变量经过部分运算后返回给扫描器才有效
+可能有同学会问，实际的 poc 真有这么复杂吗，答案是有过之而无不及。这种逻辑复杂还有层级关系的 poc
+极大的阻碍了我们上面一把梭的想法。我们需要重新整理一下思路，寻找一下破局的方法。
+## 破局
+yaml poc 中的 expression 部分用于漏洞存在性判断，它是一条规则在执行过程最终的终点，从这里出发去寻找解决方案是一个不错的思路。
+expression 部分是由 CEL 标准定义的表达式，下面这些形式都是合法且常见的：
+    reponse.status != 201
+    response.header["token"] == "lwq"
+    reponse.body.bcontains(bytes(md5("yarx")))
+需要反连的漏洞先不谈，宏观来讲一个响应我们可以控制的点只有4个：
+  * 状态码
+  * 响应头
+  * 响应体
+  * 响应时间
+最后一个一般用于盲注检测的指标也暂时不看，其余三个就可以涵盖绝大部分的 yaml poc 的判定规则。因此对于一条
+expression，我们只需要确定下列三点就可以做自动化构建：
+  * 修改的位置（status，body，header)
+  * 修改方式（contains, matches, equals)
+  * 修改的值（body 或 header value 等）
+那么如何对每条 expression 确定这三点呢？也许简单的 case 我们可以直接用正则匹配实现，但正则解决不了诸如
+`reponse.body.bcontains(bytes(md5("yarx")))`的情况，而这样的情况有很多，因此为了降低复杂度。我从 AST
+层面入手解决了这个问题。老生常谈的做法这里就不展开了，经过一坨的遍历和分析之后，可以把表达式解析成下面的形式：
+可以发现前两个的规则其实是静态的，这种静态规则我们可以在分析的时候就计算出正确的数据，然后在响应返回即可。比较棘手的是第三个例子的情况，判断条件种包含了
+r1这样一个变量，这个变量由 xray
+生成，在请求的某个角落被发送过来。换句话说，我们需要先获取到这个变量的值，然后才能代入到表达式中计算获取最终的结果，那么怎么获取这个变量呢？举个栗子
+    set:
+        rand1: randomLowercase(8)
+    rules:
+        ...
+            request:
+                path: /?a=md5({{rand1}})
+            expression: response.body.bcontains(bytes(md5(rand1)))
+当上述 poc 被加载运行时，作为服务端会收到一个类似这样的 path: `/?a=md5(abcdefgh)` 这里的 `abcdefgh`
+就是我们要获取的变量的值。聪明的你不难想到，我们只需要做一个正则转换就可以实现这个目标（别忘了正则需要转义）：
+    Origin: /?a=md5({{rand1}})
+    Regexp: /\?a=md5\((?P\w+)\)
+甚至基于`randomLowercase(8)` 这个上下文，我们可以写出一个更完美的正则:
+    Origin: /?a=md5({{rand1}})
+    Regexp: /\?a=md5\((?P[a-zA-Z]{8})\)
+基于这个思想，我们可以把请求的各个位置都变成正则表达式，这些正则将在收到对应的请求时被执行，并将提取出的变量储存起来供表达式使用。可是，如何使用这些变量？
+## 变量
+变量是 poc 的利器，也是我们的绊脚石。不如就 ”以变制变“
+来解决变量带来的一系列问题。我在解析表达式的时候没有分析到底，而是以下面的这些函数或者运算符作为终止条件，并记下他们的参数。
+  * `=`、`!=`
+  * `contains`、`bcontains`
+  * `matches`、`bmatches`
+这样有什么好处呢，就是可以借助表达式的部分执行 (`PartialEval`) 来简化分析流程。比如 `contains` 的参数可能是这些
+    "SQL Admin"
+    md5("koalr")
+    substr(md5(r1), 0, 8)
+如果我头铁去解析到底，这复杂度和重写一个表达式语言差不多了。我发现这些参数实际都是合法的 CEL 表达式，当相关变量成功获取后，它们也可以被 CEL

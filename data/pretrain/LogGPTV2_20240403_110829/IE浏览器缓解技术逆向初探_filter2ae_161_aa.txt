@@ -1,0 +1,70 @@
+# IE浏览器缓解技术逆向初探
+|
+##### 译文声明
+本文是翻译文章，文章原作者 LSC
+译文仅供参考，具体内容表达以及含义原文为准。
+##
+##
+作者：dwfault@野火研习社
+预估稿费：400RMB
+投稿方式：发送邮件至linwei#360.cn，或登陆网页版在线投稿
+## 前言
+浏览器中的UAF类漏洞触发时，通常用“exploit-friendly”对象占位之前释放的内存空间，通过数组下标索引即可读写此内存区域的对象，控制内存中的对象虚函数调用以执行流程劫持。虚函数调用本质上是通过函数指针进行的，往往形如“call
+register”或“call [register + offset]”，因此也被称为间接调用。
+2014年6月，微软在浏览器产品Internet Explorer中应用堆隔离技术(Isolated Heap)，把漏洞多发的对象与“exploit-friendly”对象分配在不同的堆空间；2014年7月微软在IE浏览器中加入延迟释放技术(Delayed
+Free)，其主要流程如下：对象释放时不立即释放堆块，而是加入等待列表中；当内存分配有压力时，从栈中检查是否存在对内存空间的引用，不存在时将堆块释放；针对劫持间接调用的攻击技术，微软在Windows
+10上实现了粗粒度的控制流保护技术(Control Flow Guard,
+CFG)。堆隔离、延迟释放、控制流保护技术使得传统的基于占位的利用技术发生变化，本文就来对这些缓解技术进行逆向初探，分析环境为Windows 10
+14393 32bit IE 11，主要分析对象涉及mshtml.dll、msvcrt.dll、ntdll.dll等。
+## 一、堆隔离技术
+在mshtml!DllMainStartup函数中，有:
+    call        ds: __imp__GetProcessHeap@0
+    mov      ecx, eax
+    mov      _g_hProcessHeap, ecx
+    call        ?RegisterHeap@MemoryProtection@@YGXPAX@Z ;
+    mov      _g_hIsolatedHeap, ecx
+当mshtml.dll被加载进入浏览器内存时，DllMainStartup函数首先被调用，初始化全局变量_g_hProcessHeap、_g_hIsolatedHeap，全部赋值为GetProcessHeap
+API的返回值，即首先将隔离堆的句柄初始化为进程默认堆。
+mshtml!DllProcessAttach函数中有:
+    push      ebx
+    push      ebx               ; dwInitialSize
+    push      ebx               ; flOptions
+    call        ds:__imp__HeapCreate@12 ;
+    mov      _g_hIsolatedHeap, eax
+这段代码创建了新的堆，随后为全局变量_g_hIsolatedHeap重新赋值。从这里开始隔离堆被创建。之后在隔离堆上分配对象时，设置HeapAlloc的参数为_g_hIsolatedHeap。下面代码已经简化：
+    mov      ecx, _g_hIsolatedHeap
+    …
+    call        ds:__imp__HeapAlloc@12
+按照同样的方法对jscript9.dll中的内存分配进行逆向分析。分析发现，一部分对象分配在系统堆上；大多数对象使用jscript9!HeapAllocator::Alloc分配，该函数实际是对malloc函数的封装，malloc函数位于msvcrt.dll中，跟踪进入该模块，发现这些对象分配在__crtheap中。
+查看全局变量_g_hIsolatedHeap的交叉引用，可得到分配在隔离堆的对象类型，其中包括DOM元素(CElement及其派生类)、DOM树节点(CTreeNode)、DOM树节点标记(CTreePos)、结构化标记(CMarkup)等。堆隔离技术使可用于内存占位的对象种类减少，因此占位难度增加，漏洞利用的难度增加。
+## 二、延迟释放技术
+mshtml.dll模块下的MemoryProtection命名空间实现了多个延迟释放技术相关的类，因此延迟释放技术也被称为MemoryProtection。CMemoryProtector是命名空间中的核心类，浏览器进程的每个线程维护一个该类的实例，该实例的索引存储在线程局部存储TLS中，总大小为0x1020字节，其结构如下：
+    class      CMemoryProtector
+    +00       void * SBlockDescriptorArray
+    +04       DWORD TotalSize
+    +08       DWORD NumberOfUsed
+    +0c       DWORD NumberOfTotal
+    +10       BOOL IsSorted
+    +14       BOOL IsForceMarkAndReclaim
+    +18       DWORD StackHighAddress
+    +1c       DWORD StackMarkerAddress
+    +20       DWORD SAddressFilter[512]
+其中的SAddressFilter是一个bitmap，用来指示SBlockDescriptorArray中的堆块是否存在引用。SBlockDescriptor是SBlockDescriptorArray中的元素，大小为8字节，用以存储堆块的地址和大小。其结构如下：
+    struct    SBlockDescriptor
+    +00       void *pAddress
+    +04       DWORD nSize
+SBlockDescriptorArray表示等待列表，对象释放后堆块添加进该列表，以后再释放堆块。等待列表在初次分配时大小为0x8000字节，可以存放0x1000个SBlockDescriptor，NumberOfTotal表示等待列表的总容量，初始值为0x1000；NumberOfUsed表示已存储的堆块个数，初始值为0。当有新的堆块添加到SBlockDescriptorArray时，NumberOfUsed增加；当NumberOfUsed与NumberOfTotal相等时，说明SBlockDescriptorArray已满，此时调用HeapReAlloc重新分配SBlockDescriptorArray，大小翻倍。
+图1 延迟释放技术相关函数调用关系
+被保护的对象在释放时，不直接调用Windows API
+HeapFree，而是调用MemoryProtection::HeapFree。该函数检查进程保护策略，包括是否启用延迟释放技术的保护等，若保护未开启，调用Windows
+API HeapFree直接释放堆块；否则调用CMemoryProtector::ProtectedFree。
+CMemoryProtector::ProtectedFree函数调用的核心函数是ReclaimMemory，此外调用有SBlockDescriptorArray::AddBlockDescriptor、SAddressFilter::AddBlock、memset。
+ReclaimMemory用于检查等待列表中的堆块。首先检查CMemoryProtector的TotalSize域，该值表示已经添加进等待列表的堆块总大小，当TotalSize小于等于0x186a0(100000)字节时不做处理，否则调用MarkBlock、ReclaimUnmarkedBlocks函数，这两个函数实现了标记清除式垃圾回收算法。算法首先从栈内存中查找堆块的引用，标记存在引用的堆块；然后释放未标记的堆块，为已标记的堆块去除标记以供下次检查。最后调用memset把堆块内容覆写为0。
+SBlockDescriptorArray::AddBlockDescriptor用于在等待列表中增加堆块；SAddressFilter::AddBlock用于进行bitmap的更新。
+图2展示了延迟释放技术相关代码的整体流程图：
+图2 延迟释放技术相关代码流程图
+可将延迟释放技术总结如下：对象释放时不立即释放堆块，而是加入等待列表中，同时将堆块内存覆写为0；当列表标示的堆块总大小达到100000字节时，从栈中检查是否存在堆块的引用，若不存在引用则将堆块释放。
+延迟释放技术对基于占位的UAF漏洞利用具有有效的遏制作用。但由于IE浏览器采用保守垃圾回收算法，延迟释放机制存在严重缺陷：
+保守垃圾回收算法无法区分指针和数据，攻击者可以用Array等数据结构在栈中伪造堆块的指针，使伪造指针所指向的堆块不能被释放；以侧信道攻击配合，攻击者迭代地把指针置零可将MemoryProtection用作Oracle，询问进程内存空间是否可用；用这种方法将动态库模块加载到一个确定的地址，该地址就是本次置零的指针值。如图3所示，研究者利用延迟释放技术将Windows.data.pdff.dll加载到确定的地址：
+图3 利用延迟释放技术绕过ASLR技术示意图
+## 三、控制流保护技术

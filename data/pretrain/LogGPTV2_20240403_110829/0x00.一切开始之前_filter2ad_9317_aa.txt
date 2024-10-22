@@ -1,0 +1,265 @@
+# 0x00.一切开始之前
+CVE-2022-0847 是这两天刚爆出来的一个热乎的内核漏洞，漏洞主要发生在对管道进行数据写入时，由于未对原有的
+`pipe_buffer->flags` 进行清空，从而导致了 **可以越权对文件进行写入**
+；由于这样的漏洞形式类似于“脏牛”（CVE-2016-5195），但更加容易进行利用，因此研究人员将该漏洞称之为“Dirty Pipe”
+据研究者描述，目前 **5.8 版本以上的内核均会收到该漏洞的影响** ，在 **5.16.11** 、 **5.15.25** 、
+**5.10.102** 版本中才被修复，影响范围不可谓不大，因此这个漏洞也得到了高达 7.2 的 CVSS 评分
+这个漏洞的发现源自于一次 CRC
+校验失败，感兴趣的可以看[原作者的博客](https://dirtypipe.cm4all.com/)，是一段十分奇妙的旅程（笑）
+本次选用进行分析的内核源码为 Linux 5.13.19（因为笔者前些天刚好编译了一个这个版本的内核，刚好受到该漏洞影响，就直接拿来用了）
+在开始分析之前，我们先来补充一些前置知识
+## pipe：管道
+稍微接触过 Linux 的同学应该都知道“管道”这一 IPC 神器。而在 Linux 内核中，管道本质上是创建了一个 **虚拟的 inode**
+（即创建了一个虚拟文件节点）来表示的，其中在节点上存放管道信息的是一个 `pipe_inode_info`
+结构体（`inode->i_pipe`），其中包含了一个管道的所有信息
+当我们创建一个管道时，内核会创建一个 VFS inode 、一个 `pipe_inode_info` 结构体、两个文件描述符（代表着管道的两端）、一个
+`pipe_buffer` 结构体数组，下图是一张叙述管道原理的经典图例
+用来表示管道中数据的是一个 `pipe_buffer` 结构体数组，单个 `pipe_buffer` 结构体用来表示 **管道中单张内存页的数据** ：
+    /**
+     *  struct pipe_buffer - a linux kernel pipe buffer
+     *  @page: 管道缓冲区中存放了数据的页框
+     *  @offset: 在 @page 中数据的偏移
+     *  @len: 在 @page 中数据的长度
+     *  @ops: 该 buffer 的函数表， 参见 @pipe_buf_operations.
+     *  @flags: 管道缓冲区的标志位，参见上面
+     *  @private: 函数表的私有数据
+     **/
+    struct pipe_buffer {
+        struct page *page;
+        unsigned int offset, len;
+        const struct pipe_buf_operations *ops;
+        unsigned int flags;
+        unsigned long private;
+    };
+创建管道使用的 pipe 与 pipe2 这两个系统调用最终都会调用到 `do_pipe2()` 这个函数，不同的是后者我们可以指定一个
+flag，而前者默认 flag 为 0
+存在如下调用链：
+    do_pipe2()
+        __do_pipe_flags()
+            create_pipe_files()
+                get_pipe_inode()
+                    alloc_pipe_info()
+最终调用 `kcalloc()` 分配一个 `pipe_buffer` 数组，默认数量为 `PIPE_DEF_BUFFERS`
+（16）个，即一个管道初始默认可以存放 16 张页面的数据
+    struct pipe_inode_info *alloc_pipe_info(void)
+    {
+        struct pipe_inode_info *pipe;
+        unsigned long pipe_bufs = PIPE_DEF_BUFFERS;
+        struct user_struct *user = get_current_user();
+        unsigned long user_bufs;
+        unsigned int max_size = READ_ONCE(pipe_max_size);
+        pipe = kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL_ACCOUNT);
+        //...
+        pipe->bufs = kcalloc(pipe_bufs, sizeof(struct pipe_buffer),
+                     GFP_KERNEL_ACCOUNT);
+管道形成的核心结构如下图所示
+> page 结构体用以 **唯一标识一个物理页框** ，参见
+> 
+管道的本体是一个 `pipe_inode_info` 结构体，其管理 `pipe_buffer` 数组的方式 **本质上是一个循环队列** ，其 head
+成员标识队列头的 idx，tail 成员标识队列尾的 idx， **头进尾出**
+    /**
+     *  struct pipe_inode_info - a linux kernel pipe
+     *  @mutex: 保护一切的互斥锁
+     *  @rd_wait: 空管道中读者的等待点
+     *  @wr_wait: 满管道中写者的等待点
+     *  @head: 缓冲区的生产点
+     *  @tail: 缓冲区的消费点
+     *  @note_loss: 下一次 read() 应当插入一个 data-lost 消息
+     *  @max_usage: 在环中使用的 slots 的最大数量
+     *  @ring_size: 缓冲区的总数 (应当为 2 的幂次)
+     *  @nr_accounted: The amount this pipe accounts for in user->pipe_bufs
+     *  @tmp_page: 缓存的已释放的页面
+     *  @readers: 管道中现有的读者数量
+     *  @writers: 管道中现有的写者数量
+     *  @files: 引用了该管道的 file 结构体数量 (protected by ->i_lock)
+     *  @r_counter: 读者计数器
+     *  @w_counter: 写者计数器
+     *  @fasync_readers: reader side fasync
+     *  @fasync_writers: writer side fasync
+     *  @bufs: 管道缓冲区循环数组
+     *  @user: 创建该管道的用户
+     *  @watch_queue: If this pipe is a watch_queue, this is the stuff for that
+     **/
+    struct pipe_inode_info {
+        struct mutex mutex;
+        wait_queue_head_t rd_wait, wr_wait;
+        unsigned int head;
+        unsigned int tail;
+        unsigned int max_usage;
+        unsigned int ring_size;
+    #ifdef CONFIG_WATCH_QUEUE
+        bool note_loss;
+    #endif
+        unsigned int nr_accounted;
+        unsigned int readers;
+        unsigned int writers;
+        unsigned int files;
+        unsigned int r_counter;
+        unsigned int w_counter;
+        struct page *tmp_page;
+        struct fasync_struct *fasync_readers;
+        struct fasync_struct *fasync_writers;
+        struct pipe_buffer *bufs;
+        struct user_struct *user;
+    #ifdef CONFIG_WATCH_QUEUE
+        struct watch_queue *watch_queue;
+    #endif
+    };
+### 管道函数表：
+阅读 pipe 系统调用源码，注意到如下调用链：
+    do_pipe2()
+        __do_pipe_flags()
+            create_pipe_files()
+                alloc_file_pseudo()
+在创建管道文件的函数 `create_pipe_files()` 中，传入 `alloc_file_pseudo()` 的函数表为
+`pipefifo_fops`，这便是管道相关的操作的函数表
+    int create_pipe_files(struct file **res, int flags)
+    {
+        //...
+        f = alloc_file_pseudo(inode, pipe_mnt, "",
+                    O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT)),
+                    &pipefifo_fops);
+        //...
+该函数表中定义了我们对管道的相关操作会调用到的函数
+    const struct file_operations pipefifo_fops = {
+        .open       = fifo_open,
+        .llseek     = no_llseek,
+        .read_iter  = pipe_read,
+        .write_iter = pipe_write,
+        .poll       = pipe_poll,
+        .unlocked_ioctl = pipe_ioctl,
+        .release    = pipe_release,
+        .fasync     = pipe_fasync,
+        .splice_write   = iter_file_splice_write,
+    };
+### 管道的写入过程
+查表 `pipefifo_fops` 可知当我们向管道内写入数据时，最终会调用到 `pipe_write` 函数，大概流程如下：
+  * 若管道非空且上一个 buf 未满，则先尝试向上一个被写入的 buffer写入数据（若该 buffer 设置了`PIPE_BUF_FLAG_CAN_MERGE` 标志位）
+  * 接下来开始对新的 buffer 进行数据写入，若没有`PIPE_BUF_FLAG_CAN_MERGE` 标志位则分配新页面后写入
+  * 循环第二步直到完成写入，若管道满了则会尝试唤醒读者让管道腾出空间
+这里我们可以看出 `PIPE_BUF_FLAG_CAN_MERGE` **用以标识一个 pipe_buffer 是否已经分配了可以写入的空间**
+，在大循环中若对应 pipe_buffer 没有设置该 flag（刚被初始化），则会 **新分配一个页面供写入，并设置该标志位**
+    static ssize_t
+    pipe_write(struct kiocb *iocb, struct iov_iter *from)
+    {
+        struct file *filp = iocb->ki_filp;
+        struct pipe_inode_info *pipe = filp->private_data;
+        unsigned int head;
+        ssize_t ret = 0;
+        size_t total_len = iov_iter_count(from);
+        ssize_t chars;
+        bool was_empty = false;
+        bool wake_next_writer = false;
+        /* Null write succeeds. */
+        if (unlikely(total_len == 0))
+            return 0;
+        __pipe_lock(pipe);
+        if (!pipe->readers) {   // 管道没有读者，返回
+            send_sig(SIGPIPE, current, 0);
+            ret = -EPIPE;
+            goto out;
+        }
+    #ifdef CONFIG_WATCH_QUEUE
+        if (pipe->watch_queue) {
+            ret = -EXDEV;
+            goto out;
+        }
+    #endif
+        /*
+         * 若管道非空，我们尝试将新数据合并到最后一个buffer 中
+         *
+         * 这自然会合并小的写操作，但其也会对
+         * 跨越多个页框的大的写操作的剩余写入操作
+         * 进行页面对齐
+         * （译注：大概就是先尝试把数据写到管道的最后一个buffer（如果对应 page 没写满的话））
+         */
+        head = pipe->head;  // 获取队列头
+        was_empty = pipe_empty(head, pipe->tail); // head == tail
+        chars = total_len & (PAGE_SIZE-1);
+        if (chars && !was_empty) {  // 管道非空，且上一个 buf 没写满
+            unsigned int mask = pipe->ring_size - 1;
+            struct pipe_buffer *buf = &pipe->bufs[(head - 1) & mask]; // 找到上一个 buf
+            int offset = buf->offset + buf->len;
+            /*
+             * 设置了PIPE_BUF_FLAG_CAN_MERGE标志位，
+             * 说明该 buffer 可用于直接写入，
+             * 直接把数据拷贝进去后就返回
+             */
+            // 注：这是漏洞利用的写入点
+            if ((buf->flags & PIPE_BUF_FLAG_CAN_MERGE) &&   
+                offset + chars page, offset, chars, from);
+                if (unlikely(ret len += ret;
+                if (!iov_iter_count(from))
+                    goto out;
+            }
+        }
+        // 写满 last buffer 对应数据后，接下来将剩余数据写到往后的 buffer 中
+        for (;;) {
+            if (!pipe->readers) {   // 没有读者，返回
+                send_sig(SIGPIPE, current, 0);
+                if (!ret)
+                    ret = -EPIPE;
+                break;
+            }
+            head = pipe->head;
+            if (!pipe_full(head, pipe->tail, pipe->max_usage)) { // 管道没满，正常写入
+                unsigned int mask = pipe->ring_size - 1;
+                struct pipe_buffer *buf = &pipe->bufs[head & mask];
+                struct page *page = pipe->tmp_page;
+                int copied;
+                if (!page) {    // 没有预先准备page，分配一个新的
+                    page = alloc_page(GFP_HIGHUSER | __GFP_ACCOUNT);
+                    if (unlikely(!page)) {
+                        ret = ret ? : -ENOMEM;
+                        break;
+                    }
+                    pipe->tmp_page = page;
+                }
+                /* 提前在环中分配一个 slot，并附加一个空 buffer。
+                 * 若我们出错或未能使用它，
+                 * 它会被读者所使用，
+                 * 亦或是保留在这里等待下一次写入。
+                 */
+                spin_lock_irq(&pipe->rd_wait.lock);
+                head = pipe->head;
+                if (pipe_full(head, pipe->tail, pipe->max_usage)) { // 管道满了，开启下一次循环
+                    spin_unlock_irq(&pipe->rd_wait.lock);
+                    continue;
+                }
+                pipe->head = head + 1;
+                spin_unlock_irq(&pipe->rd_wait.lock);
+                /* 将其插入 buffer array 中 */
+                buf = &pipe->bufs[head & mask];
+                buf->page = page;
+                buf->ops = &anon_pipe_buf_ops;
+                buf->offset = 0;
+                buf->len = 0;
+                if (is_packetized(filp))    // 设置 buffer 的 flag，若设置了 O_DIRECT 则为 PACKET
+                    buf->flags = PIPE_BUF_FLAG_PACKET;
+                else
+                    buf->flags = PIPE_BUF_FLAG_CAN_MERGE;
+                pipe->tmp_page = NULL;
+                copied = copy_page_from_iter(page, 0, PAGE_SIZE, from); // 将数据拷贝到 buffer 对应 page 上
+                if (unlikely(copied offset = 0;
+                buf->len = copied;
+                if (!iov_iter_count(from))  // 读完数据了，退出循环
+                    break;
+            }
+            if (!pipe_full(head, pipe->tail, pipe->max_usage))  // 管道没满，继续下一次循环
+                continue;
+            /* 等待缓冲区空间可用. */
+            // 管道满了，等他变空
+            if (filp->f_flags & O_NONBLOCK) {
+                if (!ret)
+                    ret = -EAGAIN;
+                break;
+            }
+            if (signal_pending(current)) {
+                if (!ret)
+                    ret = -ERESTARTSYS;
+                break;
+            }
+            /*
+             * 我们将释放管道的锁，等待（有）更多的空间。
+             * 若有必要我们将唤醒任意读者，在等待后我们需要重新检查
+             * 在我们释放锁后管道是否变空了

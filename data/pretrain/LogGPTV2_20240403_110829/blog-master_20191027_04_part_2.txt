@@ -1,0 +1,201 @@
+CREATE OR REPLACE FUNCTION create_prometheus_table(  
+       metrics_view_name NAME,  
+       metrics_values_table_name NAME = NULL,  
+       metrics_labels_table_name NAME = NULL,  
+       metrics_samples_table_name NAME = NULL,  
+       metrics_copy_table_name NAME = NULL,  
+       normalized_tables BOOL = TRUE,  
+       use_timescaledb BOOL = NULL,  
+       chunk_time_interval INTERVAL = interval '1 day'  
+)  
+    RETURNS VOID LANGUAGE PLPGSQL VOLATILE AS  
+$BODY$  
+DECLARE  
+    timescaledb_ext_relid OID = NULL;  
+BEGIN  
+    SELECT oid FROM pg_extension  
+    WHERE extname = 'timescaledb'  
+    INTO timescaledb_ext_relid;  
+    IF use_timescaledb IS NULL THEN  
+      IF timescaledb_ext_relid IS NULL THEN  
+        use_timescaledb := FALSE;  
+      ELSE  
+        use_timescaledb := TRUE;  
+      END IF;  
+    END IF;  
+    IF use_timescaledb AND  timescaledb_ext_relid IS NULL THEN  
+      RAISE 'TimescaleDB not installed';  
+    END IF;  
+    IF metrics_view_name IS NULL THEN  
+       RAISE EXCEPTION 'Invalid table name';  
+    END IF;  
+    IF metrics_values_table_name IS NULL THEN  
+       metrics_values_table_name := format('%I_values', metrics_view_name);  
+    END IF;  
+    IF metrics_labels_table_name IS NULL THEN  
+       metrics_labels_table_name := format('%I_labels', metrics_view_name);  
+    END IF;  
+    IF metrics_samples_table_name IS NULL THEN  
+       metrics_samples_table_name := format('%I_samples', metrics_view_name);  
+    END IF;  
+    IF metrics_copy_table_name IS NULL THEN  
+       metrics_copy_table_name := format('%I_copy', metrics_view_name);  
+    END IF;  
+    IF normalized_tables THEN  
+        -- Create labels table  
+        EXECUTE format(  
+            $$  
+            CREATE TABLE %I (  
+                  id SERIAL PRIMARY KEY,  
+                  metric_name TEXT NOT NULL,  
+                  labels jsonb,  
+                  UNIQUE(metric_name, labels)  
+            )  
+            $$,  
+            metrics_labels_table_name  
+        );  
+        -- Add a GIN index on labels  
+        EXECUTE format(  
+            $$  
+            CREATE INDEX %I_labels_idx ON %1$I USING GIN (labels)  
+            $$,  
+            metrics_labels_table_name  
+        );  
+         -- Add a index on metric name  
+        EXECUTE format(  
+            $$  
+            CREATE INDEX %I_metric_name_idx ON %1$I USING BTREE (metric_name)  
+            $$,  
+            metrics_labels_table_name  
+        );  
+        EXECUTE format(  
+          $$  
+          CREATE TABLE %I (sample prom_sample NOT NULL)  
+          $$,  
+          metrics_copy_table_name  
+        );  
+        -- Create normalized metrics table  
+        IF use_timescaledb THEN  
+          --does not support foreign  references  
+          EXECUTE format(  
+              $$  
+              CREATE TABLE %I (time TIMESTAMPTZ, value FLOAT8, labels_id INTEGER)  
+              $$,  
+              metrics_values_table_name  
+          );  
+        ELSE  
+          EXECUTE format(  
+              $$  
+              CREATE TABLE %I (time TIMESTAMPTZ, value FLOAT8, labels_id INTEGER REFERENCES %I(id))  
+              $$,  
+              metrics_values_table_name,  
+              metrics_labels_table_name  
+          );  
+        END IF;  
+        -- Make metrics table a hypertable if the TimescaleDB extension is present  
+        IF use_timescaledb THEN  
+           PERFORM create_hypertable(metrics_values_table_name::regclass, 'time',  
+                   chunk_time_interval => _timescaledb_internal.interval_to_usec(chunk_time_interval));  
+        END IF;  
+        -- Create labels ID column index  
+        EXECUTE format(  
+            $$  
+            CREATE INDEX %I_labels_id_idx ON %1$I USING BTREE (labels_id, time desc)  
+            $$,  
+            metrics_values_table_name  
+        );  
+        -- Create a view for the metrics  
+        EXECUTE format(  
+            $$  
+            CREATE VIEW %I AS   
+            SELECT prom_construct(m.time, l.metric_name, m.value, l.labels) AS sample,  
+                   m.time AS time, l.metric_name AS name,  m.value AS value, l.labels AS labels  
+            FROM %I AS m  
+            INNER JOIN %I l ON (m.labels_id = l.id)  
+            $$,  
+            metrics_view_name,  
+            metrics_values_table_name,  
+            metrics_labels_table_name  
+        );  
+        EXECUTE format(  
+            $$  
+            CREATE TRIGGER insert_trigger INSTEAD OF INSERT ON %I  
+            FOR EACH ROW EXECUTE PROCEDURE prometheus.insert_view_normal(%L, %L)  
+            $$,  
+            metrics_view_name,  
+            metrics_values_table_name,  
+            metrics_labels_table_name  
+        );  
+        EXECUTE format(  
+            $$  
+            CREATE TRIGGER insert_trigger BEFORE INSERT ON %I  
+            FOR EACH ROW EXECUTE PROCEDURE prometheus.insert_view_normal(%L, %L)  
+            $$,  
+            metrics_copy_table_name,  
+            metrics_values_table_name,  
+            metrics_labels_table_name  
+        );  
+    ELSE  
+        EXECUTE format(  
+          $$  
+          CREATE TABLE %I (sample prom_sample NOT NULL)  
+          $$,  
+          metrics_samples_table_name  
+        );  
+        -- Create labels index on raw samples table  
+        EXECUTE format(  
+            $$  
+            CREATE INDEX %I_labels_idx ON %1$I USING GIN (prom_labels(sample))  
+            $$,  
+            metrics_samples_table_name  
+        );  
+        -- Create time index on raw samples table  
+        EXECUTE format(  
+            $$  
+            CREATE INDEX %I_time_idx ON %1$I USING BTREE (prom_time(sample))  
+            $$,  
+            metrics_samples_table_name  
+        );  
+        -- Create a view for the metrics  
+        EXECUTE format(  
+            $$  
+            CREATE VIEW %I AS   
+            SELECT sample AS sample, prom_time(sample) AS time, prom_name(sample) AS name, prom_value(sample) AS value, prom_labels(sample) AS labels  
+            FROM %I  
+            $$,  
+            metrics_view_name,  
+            metrics_samples_table_name  
+        );  
+        EXECUTE format(  
+            $$  
+            CREATE TRIGGER insert_trigger INSTEAD OF INSERT ON %I  
+            FOR EACH ROW EXECUTE PROCEDURE prometheus.insert_view_sample(%L)  
+            $$,  
+            metrics_view_name,  
+            metrics_samples_table_name  
+        );  
+    END IF;  
+END  
+$BODY$;  
+```  
+其他功能说明详见readme  
+https://github.com/timescale/pg_prometheus  
+## Prometheus remote storage adapter for PostgreSQL  
+如果你选择了PG作为Prometheus的存储，那么Prometheus端需要安装这个适配器，PG可以是一个远程的数据库，只要安装了pg_prometheus插件即可。  
+https://github.com/timescale/prometheus-postgresql-adapter  
+## 小结  
+PG 12的分区性能有了巨大的进步，PG 12结合pg_prometheus插件可以很好的存储prometheus的时序数据，作为标配的时序数据库使用。  
+prometheus的市场非常大，也是timescale为什么要开放pg_prometheus插件的主要原因。  
+## 参考        
+https://github.com/timescale/pg_prometheus  
+https://github.com/timescale/prometheus-postgresql-adapter  
+https://github.com/timescale/timescaledb  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

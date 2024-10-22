@@ -1,0 +1,99 @@
+# Chakra漏洞调试笔记5——CVE-2019-0861复现
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+在《Chakra漏洞调试笔记》1~4中，笔者从ImplicitCall，OpCode Side Effect，MissingValue和Array
+OOB几个方向分别介绍了Chakra JIT引擎的几个常见攻击面。从近几个月Google Project Zero的bug
+列表中可以看到不再有新的Chakra漏洞PoC更新，猜测可能是因为微软将在新版的Edge浏览器中使用Chromium内核，Google Project
+Zero的挖洞重点不再是Chakra。因此从这篇笔记开始，笔者将尝试对今年Chakra的一些漏洞补丁进行分析，尝试根据补丁复现PoC。这篇笔记选择分析的漏洞是CVE-2019-0861。
+## 0x0 Patch Analysis
+这里的补丁比较简单，只有一行，即在函数JavascriptOperators::CallSetter回调返回前加入了语句：
+threadContext->AddImplicitCallFlags(ImplicitCall_Accessor);
+根据笔记1的介绍，ImplicitCallFlags是用来同步Interpreter和JIT状态的标识符，这里加入ImplicitCallFlags说明存在JIT中存在需要Bailout到Interpreter的情况。
+补丁中给出了修补的注释，大概意思是如果需要将变量存储的值向前传播，就需要Bailout，不能依赖于getter/setter来生成LdFld需要的值。这里理解起来比较晦涩，大概可以猜到的信息是getter/setter操作错误导致JIT里对变量值判断错误。
+## 0x1 From Patch to PoC
+通过Patch复现PoC，笔者的思路是首先寻找可以走到Patch点的js代码。然后根据猜测的漏洞点通过修改js代码构造触发漏洞的PoC。
+首先通过源码查找寻找函数JavascriptOperators::CallSetter可能的调用栈，这里找到一个可能的调用栈如下：
+  * JavascriptOperators::OP_SetProperty
+  * JavascriptOperators::SetProperty
+  * JavascriptOperators::SetProperty_Internal
+  * JavascriptOperators::SetAccessorOrNonWritableProperty
+  * JavascriptOperators::CallSetter
+根据函数JavascriptOperators::OP_SetProperty，猜测这里可以触发漏洞点函数应该是一个对象属性的Set操作。
+根据函数JavascriptOperators::SetAccessorOrNonWritableProperty的实现：
+猜测到对象的属性需要有构造器（Accessor）才可以走到漏洞点。由Project Zero如下case启发：
+这里使用__defineSetter__定义构造器，第一版js代码如下：
+在函数JavascriptOperators::CallSetter回调返回前下断点，当执行obj.x = 1;语句时，可以看到c++代码成功走到了漏洞点：
+由于ImplicitCallFlags是用来处理JIT中回调的bailout问题，因此我们还需要将第一版js代码修改为可以触发JIT的代码，在JIT调用栈中走到漏洞点。修改第二版js代码如下（ch.exe运行参数
+-mic:1 -off:simplejit -bgjit-）：
+这里我们通过接受obj.x的值作为JIT的返回值，检查JIT对obj.x值判断是否正确。
+再次运行PoC代码，函数opt触发JIT，并成功走到漏洞点：
+两次print的输出分别为1和undefined，符合预期。
+有了可以走到漏洞点的js代码，接下来就需要分析如何通过修改js代码构造触发漏洞的PoC了。
+关于JIT中脚本回调的问题，Chakra是通过ImplicitCallFlags机制处理的。一般情况下：
+  1. JIT代码会根据Opcode是否存在脚本回调的情况生成BailOutOnImplicitCallsPreOp或者BailOutOnImplicitCalls指令
+  2. runtime代码通过ExecuteImplicitCall调用回调函数，ExecuteImplicitCall内部首先判断回调函数是否存在Side Effect，如果没有就直接执行回调函数（返回前需检查回调函数的返回值是否在栈上，防止栈上指针泄露，见CVE-2018-0860）；如果DisableImplicitCallFlags=1则不执行回调函数，直接返回Undefined；否则在回调函数前设置ImplicitCallFlags，再调用回调函数。这样在回到JIT代码后就可以通过检查ImplicitCallFlags是否被修改来判断是否发生脚本回调了。（具体原理参见笔记1）
+首先，obj.x = 1对应的操作符StFld会生成BailOutOnImplicitCalls指令，满足1）；
+其次，JavascriptOperators::CallSetter回调点是通过ExecuteImplicitCall调用的，满足2）。
+因此，这里不可以通过obj.__defineSetter__(“x”,
+()=>{});构造一个脚本回调来修改JIT中的数据类型。那么为什么补丁还在JavascriptOperators::CallSetter回调函数返回前加入threadContext->AddImplicitCallFlags(ImplicitCall_Accessor);强制JIT
+bailout呢？是否存在不通过回调就可以触发JIT错误的方法呢？
+我们观察第二版js代码生成的Globopt后的IR：
+这里我们看到StFld确实生成了BailOutOnImplicitCalls，同时发现语句var tmp = obj.x; return tmp;
+被优化成了：
+Ret 0x1000000000001.var
+也就是说JIT认为obj.x是一个常量，常量的赋值传播直接被优化成了返回常量1。
+我们知道obj.__defineSetter__(“x”, ()=>{}); 使得obj.x = undefined，JIT在Ret
+0x1000000000001.var前因为回调函数()=>{} 而bailout到Interpreter，从而返回了undefined的正确值。
+那么根据补丁，应该存在这样一种错误的场景：不触发StFld指令bailout条件的情况下，通过构造器__defineSetter__设置obj.x =
+undefined，回到JIT后因为ImplicitCallFlags没有被ExecuteImplicitCall修改从而不会bailout到Interpreter，最终返回obj.x的错误值1。
+观察ExecuteImplicitCall的实现：
+其中红框中的逻辑是：当回调函数没有Side
+Effect，并且返回值不再栈上，就不会设置ImplicitCallFlags。因此这里把obj.__defineSetter__(“x”,
+()=>{});的回调函数()=>{}修改为没有Side Effect的函数，就可以触发红框中代码流程。由Project Zero如下case启发：
+修改后的第三版js代码如下：
+再次执行PoC，成功绕过了JIT中BailOutOnImplicitCalls的检查，回调返回后继续执行JIT代码。可以看到第二次的print(ret)错误的输出了数值1（正确值为undefined）：
+到这里我们就成功构造出了触发漏洞的PoC了。接下来需要考虑如何利用这个漏洞。
+## 0x2 Exploit
+这里我们可以利用漏洞得到一个JIT判断错误的值，那么如何利用呢？由S0rryMyBad漏洞利用代码启发：
+修改PoC如下，尝试通过漏洞返回错误的值0：
+执行js代码，很遗憾，第二次ret值打印为NaN，我们观察上述js代码生成的Globopt后的部分IR：
+这里看到return tmp – 0;生成IR中变量tmp的符号信息是CanBeTaggedValue_Int，tmp –
+0对应的操作符为Sub_I4，返回的值s0对应的符号信息也是CanBeTaggedValue_Int。因此JIT后函数opt返回值应该是一个整数（FromVar没有Bailout），但是最后输出了非数字NaN，说明没有走到JIT
+return的代码，在前面就Bailout了。观察前面的IR，发现LdFld存在BailOutOnImplicitCallsPreOp指令不允许产生脚本回调，猜测是在这里bailout，通过调试验证猜测：
+可以看到，这里正是在LdFld后，ImplicitCallFlags =
+ImplicitCall_Accessor（0x5）从而发生了bailout。因此我们需要修改js代码，不让LdFld回调产生bailout。
+有了之前StFld构造的经验，LdFld绕过ImplicitCallFlags的方法就很容易想到了。观察到JavascriptOperators::CallGetter的返回值前没有强制增加ImplicitCallFlags：
+因此修改后的PoC如下：
+这里LdFld不再bailout，并且JIT调用Js::JavascriptMath::ToInt32将Object.prototype.valueOf返回的this指针（obj）转换成0，从而得到错误的obj.x
+= 0。
+最后尝试利用错误的obj.x= 0构造一个存在Missing
+Value并且有HasNoMissingValues标志的错误状态的NativeIntArray：
+运行PoC，Debug版的ch.exe成功触发ASSERTION：
+后面的利用就可以参考S0rryMyBad利用代码，将NativeIntArray转换为NativeFloatArray最终触发Array的类型混淆。
+## 0x3 Thinking
+理解补丁原理后接着要思考的就是这个补丁是否完全修复了问题，是否有方法可以绕过补丁或者寻找到类似的攻击点。通过JavascriptOperators::CallSetter的补丁很容易联想到JavascriptOperators::CallGetter是否会存在类似的问题。可以看到CVE-2019-0861的补丁并没有修复JavascriptOperators::CallGetter函数，跟踪ChakraCore的commit可以看到两个月后的CVE-2019-0993补丁正是用来修复JavascriptOperators::CallGetter函数：
+因此可以尝试复现JavascriptOperators::CallGetter触发漏洞的PoC。
+我们选择在前面构造的CVE-2019-0861
+PoC基础上做修改，首先需要注释JavascriptOperators::CallSetter的调用，因为JIT现在走到JavascriptOperators::CallSetter一定会bailout，同时在obj初始化的时候创建属性x值为1：
+运行js代码，发现第二个print(ret)为NaN，说明JIT bailout了，观察Globopt阶段生成的部分IR：
+发现函数opt返回前，tmp的符号信息变成了LikelyCanBeTaggedValue_Int，而不是之前的CanBeTaggedValue_Int，同时增加了一个BailOutIntOnly的检查，通过调试证明JIT正是在这里bailout的，因此需要修改PoC，让这里的tmp的符号信息变为CanBeTaggedValue_Int。观察CVE-2019-0993补丁的注释：
+根据注释，这里我们尝试增加一个比较运算，修改PoC如下：
+观察Globopt阶段生成的部分IR：
+可以看到，返回的tmp-0没有了bailout，但是现在需要考虑绕过if(obj.x > 0)的bailout。
+这里需要构造的执行流程是：
+  1. if(obj.x > 0)中obj.x触发__defineGetter__回调，返回>0的数值进入if分支，比如1
+  2. var tmp = obj.x; obj.x触发__defineGetter__回调，返回Undefined，触发漏洞
+两次__defineGetter__的相同回调函数返回值不一样，由Project Zero如下case启发：
+这里我们需要寻找一个调用链：Runtime里没有Side
+Effect的函数回调一个用户自定义函数。这里笔者选择的是Array.prototype.toString,
+Array.prototype.toString 会调用对象属性Join：
+通过设置属性Join使得第一次的obj.x返回1绕过if分支的检查，再delete
+obj的属性Join，使得obj.x调用Array.prototype.toString返回Undefined从而触发漏洞。具体构造PoC的过程感兴趣的读者可以自行尝试。
+## 0x4 References
+  1. 
+  2. 
+  3. 
+  4. 
+  5. 
+  6. 

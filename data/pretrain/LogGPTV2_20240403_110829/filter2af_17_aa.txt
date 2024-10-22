@@ -1,0 +1,106 @@
+**作者：360漏洞研究院 刘永 王晓东 姚俊  
+原文链接：**
+## 概述
+众所周知，ROP是一种主流的Linux内核利用方式，它需要攻击者基于漏洞来寻找可用的gadgets，然而这是一件十分耗费时间和精力的事情，并且有时候很有可能找不到合适的gadget。此外由于CFI（控制流完整性校验）利用缓解措施已经被合并到了Linux内核主线中了，所以随着后续主流发行版的跟进，ROP会变得不再可用。
+这篇博客主要介绍一种叫做USMA（User-Space-Mapping-Attack），跨平台通用的利用方法。它允许普通用户进程可以映射内核态内存并且修改内核代码段，通过这个方法，我们可以绕过Linux内核中的CFI缓解措施，在内核态中执行任意代码。下面此文会介绍一个漏洞，然后分别使用ROP和USMA两种方法完成对这个漏洞的利用，最后总结一下USMA的优势。
+## 漏洞
+漏洞出现在Linux内核中的packet socket模块，这个模块可以让用户在设备驱动层接受和发送raw
+packets，并且为了加速数据报文的拷贝，它允许用户创建一块与内核态共享的环形缓冲区，具体的创建操作是在packet_set_ring()这个函数中实现的。
+    /net/packet/af_packet.c
+    4292 static int packet_set_ring(sk, req_u, closing, tx_ring)
+    4294 {
+    4317    if (req->tp_block_nr) {
+    4362        order = get_order(req->tp_block_size);
+    4363         pg_vec = alloc_pg_vec(req, order);
+    4366        switch (po->tp_version) {
+    4367        case TPACKET_V3:
+    4369            if (!tx_ring) {
+    4370                init_prb_bdqc(po, rb, pg_vec, req_u);
+    4371            }
+    4390        }
+    4391    }
+    4414        if (closing || atomic_read(&po->mapped) == 0) {
+    4417            swap(rb->pg_vec, pg_vec);
+    4418            if (po->tp_version rx_owner_map, rx_owner_map);
+    4435        }
+    4450 out_free_pg_vec:
+    4451    bitmap_free(rx_owner_map);
+    4452    if (pg_vec)
+    4453        free_pg_vec(pg_vec, order, req->tp_block_nr);
+    4456 }
+packet_set_ring()通过用户传递的tp_block_nr（行4317）和tp_block_size（行4362）来决定分配的环形缓冲区的大小，如果packet
+socket的版本为TPACKET_V3，那么在init_prb_bdqc()的调用中（行4370），packet_ring_buffer.prb_bdqc.pkbdq就会持有一份pg_vec的引用（行584）。
+    /net/packet/af_packet.c
+    573 static void init_prb_bdqc(po, rb, pg_vec, req_u)
+    577 {
+    578     struct tpacket_kbdq_core *p1 = GET_PBDQC_FROM_RB(rb);
+    579     struct tpacket_block_desc *pbd;
+    583     p1->knxt_seq_num = 1;
+    584     p1->pkbdq = pg_vec;
+    603     prb_init_ft_ops(p1, req_u);
+    604     prb_setup_retire_blk_timer(po);
+    605     prb_open_block(p1, pbd);
+    606 }
+如果用户传递的tpacket_req.tp_block_nr等于0，那么就没有新的pg_vec会被分配，并且旧的pg_vec会被释放（行4453），但是packet_ring_buffer.prb_bdqc.pkbdq仍然保留着被释放的pg_vec的引用。如果我们此时将packet
+socket的版本切换为TPACKET_V2并且再次设置缓冲区，那么保存在pkbdq，被释放的pg_vec会被当做rx_owner_map再次被释放（行4451），因为packet_ring_buffer是一个联合体，pkbdq（行18）和rx_owner_map（行74）的内存偏移是一样的。
+    /net/packet/internal.h
+    59 struct packet_ring_buffer {
+    60    struct pgv *pg_vec;
+    73    union {
+    74        unsigned long *rx_owner_map;
+    75        struct tpacket_kbdq_core prb_bdqc;
+    76    };
+    77 };
+    17 struct tpacket_kbdq_core {
+    18     struct pgv *pkbdq;
+    19     unsigned int feature_req_word;
+    20     unsigned int hdrlen;
+    21     unsigned char reset_pending_on_curr_blk;
+    22     unsigned char delete_blk_timer;
+    52     struct timer_list retire_blk_timer;
+    53 };
+## ROP
+ROP的利用分为两个步骤：
+  1. 泄露内核地址，绕过KASLR。
+  2. 劫持PC，通过gadget修改进程的cred。
+这两个步骤要各自触发一次漏洞，通过选择不同的目标结构体，分别达到上述的目的。
+### 信息泄露
+    /include/linux/msg.h 
+    9 struct msg_msg {          
+    10     struct list_head m_list;                                                         
+    11     long m_type;                                                                     
+    12     size_t m_ts;        /* message text size */                                     
+    13     struct msg_msgseg *next;        
+    14     void *security;                                                                   
+    15     /* the actual message follows immediately */                                     
+    16 };                                               
+这里选择msg_msg结构体作为目标结构体，原因有以下两点：
+  1. 它含有m_ts成员(行12)，这个成员用来描述结构体下面跟着的缓冲区长度。
+  2. 普通用户可以读取缓冲区的内容。
+通过pg_vec double
+free的漏洞，在第一次释放pg_vec之后，使用msg_msg进行堆喷，之后再次释放pg_vec，使用msg_msgseg进行堆喷来修改msg_msg的m_ts成员，这样在copy_msg函数中就可以有一次越界读的机会（行128）。
+    /ipc/msgutil.c
+    118 struct msg_msg *copy_msg(src, dst)
+    119 {
+    121         size_t len = src->m_ts;
+    127         alen = min(len, DATALEN_MSG);
+    128         memcpy(dst + 1, src + 1, alen);
+    129 
+    130         for (dst_pseg = dst->next, src_pseg = src->next;
+    131              src_pseg != NULL;
+    132              dst_pseg = dst_pseg->next, src_pseg = src_pseg->next) {
+    133 
+    134                 len -= alen;
+    135                 alen = min(len, DATALEN_SEG);
+    136                 memcpy(dst_pseg + 1, src_pseg + 1, alen);
+    137         }
+    142         return dst;
+    143 }
+如果将timerfd_ctx结构体通过堆风水布局在double
+free的pg_vec后面，如下图所示，那么就可以将timerfd_ctx结构体的内容读取到用户态中。
+通过泄露timerfd_ctx结构体中的function函数指针（行121）以及wqh等待队列头（行38），就可以得到内核代码段的地址以及timerfd_ctx的堆地址。
+    /fs/timerfd.c
+     31 struct timerfd_ctx {         
+     32     union {          
+     33         struct hrtimer tmr;         
+     34         struct alarm alarm;          

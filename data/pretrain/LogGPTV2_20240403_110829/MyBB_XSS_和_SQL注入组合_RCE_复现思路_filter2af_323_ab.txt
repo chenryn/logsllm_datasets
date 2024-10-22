@@ -1,0 +1,210 @@
+    POST /admin/index.php?module=style-themes&action=export
+    ...... tid=1 & custom_theme=1 & include_templates=1
+根据前面看 XSS 时发现的命名规则，全局搜索 `['action'] == "export"`。下断点慢慢看流程。
+大概流程走完一遍后，结合 patch 定位到 _admin/modules/style/themes.php_ 如下代码。发现这是一个可能是一个
+**二次注入**
+    //数据库中查找对应 tid 的数据
+    $query = $db->simple_select("themes", "*", "tid='".$mybb->get_input('tid', MyBB::INPUT_INT)."'");
+    $theme = $db->fetch_array($query);
+    //$properties 为数据库中 properties字段的反序列化
+    $properties = my_unserialize($theme['properties']);
+    //ps:不清楚 properties字段是如何被赋值的，需要去调试下导入主题的接口来确定如何构造 $properties 的值
+    ......
+    if($mybb->input['include_templates'] != 0)
+    {
+    ......
+        // ++ !!! ++
+        //没对 $properties 进行引号消毒，可产生二次注入
+        //注入参数为 $properties['templateset']
+        //结合 SQL 语句可知，templateset 为 sid
+        $query = $db->simple_select("templates", "*", "sid='".$properties['templateset']."'");
+        // -- !!! --    
+        while($template = $db->fetch_array($query))
+        {
+            $template['template'] = str_replace(']]>', ']]]]>', $template['template']);
+            // ++ !!! ++
+            //将 $template 的一些属性值 放入了 $xml 中
+            $xml .= "...{$template['title']}...{$template['version']}...{$template['template']}...";
+            // -- !!! --        }
+    ......
+    }
+由于我们不清楚 `properties`字段 是如何被赋值的，需要去调试下 **导入主题** 的接口来确定如何构造 `$properties` 的值
+导入主题前先瞄瞄题配置文件长啥样：
+        //properties 标签
+            //ps：注意这里的 templateset。值为 1。也许上文代码中 
+            //$properties['templateset'] 就出自这里
+    ......
+再将这个主题导入，抓包得到接口为 `/admin/index.php?module=style-themes&action=import`。对应去源码中查找
+`import` 的 action。搜索 `['action'] == "import"`。下断看看流程。
+    ......
+    //读取上传文件的内容
+    $contents = @file_get_contents($_FILES['local_file']['tmp_name']);    
+    ......
+    //[(call) 调用了 import_theme_xml() 方法，以下为import_theme_xml()的代码 ]
+    function import_theme_xml($xml, $options=array()){
+        //$xml 就是上面的 $contents
+        $parser = new XMLParser($xml);
+        $tree = $parser->get_tree();
+        $theme = $tree['theme'];
+        ......
+        //将 XML中 properties标签 里头的 子标签 抽出来
+        //存入 $properties中
+        foreach($theme['properties'] as $property => $value){
+            ......
+            $properties[$property] = $value['value'];
+        }
+        //往下重点追踪 $properties
+    }
+    ......
+    //[(call) 调用了 build_new_theme() 方法，以下为build_new_theme()的代码 ]
+    function build_new_theme($name, $properties=null, $parent=1){
+        ......
+        //$properties为上面的 $properties
+        //序列化 $properties。
+        $updated_theme['properties'] = $db->escape_string(my_serialize($properties));
+        //更新数据库
+        //数据库为 themes
+        $db->update_query("themes", $updated_theme, "tid='{$tid}'");
+    }
+简单走了一遍导入流程可知， `export` action 中的 `$properties['templateset']` 就是 XML 中
+`properties` 标签里头的 `templateset` 标签
+###  后台SQL注入
+综上所述，SQL注入的触发流程为：
+  1. 导入一个恶意 XML格式的主题，`properties` 标签中的 `templateset` 为 SQL payload
+  2. 导出该恶意主题。使 `templateset` payload 注入
+下载默认 Theme。修改 `templateset` 值为
+ps：由于这个注入查询的是 `mybb_templates` 表，该表数据量贼大，如果直接用 `or sleep(1)#` 会导致卡死
+**导入** 主题之后，直接去翻数据库可以发现， `templateset` 的值已经成功被修改
+再尝试 **导出** 对应 `tid` 的主题，调试如下：
+    ......
+    //$properties['templateset'] 值为 ' and sleep(5)#   
+    $query = $db->simple_select("templates", "*", "sid='".$properties['templateset']."'");
+    //[(call) 调用了 simple_select() 方法，simple_select()的代码 ]
+    function simple_select($table, $fields="*", $conditions="", $options=array()){
+        $query = "SELECT ".$fields." FROM ".$this->table_prefix.$table;
+        if($conditions != "")
+        {
+            $query .= " WHERE ".$conditions;
+        }
+        //此时的 $query值为
+        // SELECT * FROM mybb_templates WHERE sid='0' union select 1,2,3,4,5,6,7#'
+        .......
+        $query = @mysqli_query($this->read_link, $string);
+        ......
+        //执行SQL，return $query  
+    }
+成功注入！
+###  污染 eval 导致 RCE
+做完这些工作，我们把 **_admin/modules/style/themes.php_** （ _Export Theme_ 和 _Duplicate
+Theme_ ，这两流程差不多） 和 **_admin/inc/functions_themes.php_** （ _Import Theme_
+）patch 的位置都走了遍流程。但并没发现能 RCE 的地方。。
+不过 **_inc/class_templates.php_** 这个文件里的 patch 我们还没看，说不定就是这里。
+在 _inc/class_templates.php_ 中 patch的函数为 `get()` 和 `cache()`。
+我们先回溯 `get()`。不搜不知道，一搜吓一跳，`get()` 被调用的地方全是 `eval()`
+粗略看了下调用点，就选前文 XSS 中调用过的 `mycode_parse_img()` 来测试吧。毕竟前面走过一遍 XSS 的调用流程，相对熟悉一点。
+从入口点 到`mycode_parse_img()` 再到 `get()` 的调用流程是这样的（有一大部分是前面 XSS 时的流程）：
+    newreply.php  newreply action   -- 入口点 
+    //下面这三个就是 XSS时调用的解析 [img] 的函数
+    inc/class_parser.php parse_message()
+    inc/class_parser.php parse_mycode()
+    inc/class_parser.php mycode_parse_img_callback1()
+    inc/class_parser.php mycode_parse_img()  -- 执行 eval
+    inc/class_templates.php get()            -- SQL注入点
+仔细观察 SQL注入点 `inc/class_templates.php get()`。将这个函数简单整理如下：
+    //inc/class_parser.php mycode_parse_img() 的 eval()
+    //注意到调用 get() 时，传入的参数都是固定死的
+    eval("\$mycode_img = \"".$templates->get("mycode_img", 1, 0)."\";");
+    //[(call) 调用了 get() 方法，以下为get()的代码 ]
+    function get($title, $eslashes=1, $htmlcomments=1){
+        //全局变量 $theme。为当前管理员设置的主题
+        global $db, $theme, $mybb;
+        //$title 就是eval() 调用时的 "mycode_img"
+        //这里有个前提条件，必须得 $this->cache[$title] 不存在。可是 $this->cache 已经预定义了超多 title。
+        if(!isset($this->cache[$title]))
+        {
+            //注入点 $theme['templateset']
+            //值得注意的是，$theme['templateset'] 被包裹在小括号中需要逃逸
+            $query = $db->simple_select("templates", "template", "title='".$db->escape_string($title)."' AND sid IN ('-2','-1','".$theme['templateset']."')", ......);
+            $gettemplate = $db->fetch_array($query);
+            $this->cache[$title] = $gettemplate['template'];
+        }
+        $template = $this->cache[$title];
+        //这里返回了 $template
+        //如果我们能通过 SQL注入控制 $gettemplate['template']
+        //就能控制返回的 $template
+        //从而污染调用者 eval 的内容
+        return $template;
+    }
+发现了一个眼熟的东西 `$theme['templateset']`。这是不是就是前文 SQL注入的那个参数呢？溯源 `$theme`。发现确实如此：
+    //global.php
+    ......
+    $loadstyle = "tid = '{$mybb->user['style']}'";
+    ......
+    //themes 主题表，前文的SQL注入 payload 就是 写进 了这张表里
+    $query = $db->simple_select('themes', 'name, tid, properties, stylesheets, allowedgroups', $loadstyle, array('limit' => 1));
+    $theme = $db->fetch_array($query);
+在 `get()` 中，只要我们能够执行到 SQL 语句，就可以RCE了。
+可是我们得先进入判断 `if(!isset($this->cache[$title]))` 才行，但 `$this->cache` 是在数据库中
+`mybb_templates` 表中的 `title` 字段，默认多达955行
+这时我们就要去找那些在 `$this->cache` 中不存在的 `title`，这样才能顺利进入判断；或者去寻找 `eval` 调用时，传入的
+`$title` 可控的点。
+**编个正则来查找：**
+    \$templates\-\>get\([\"\'](?!error|error_inline|....)[\w0-9_]*
+搜完一圈，居然没有一处地方是 `title` 不存在的。既然 `title` 都存在，自然无法进入代码中 `if` 判断，也就无法进行 SQL 注入了。
+###  重整思路
+无法进入 `if` 判断，我们找一找 `$this->cache` 是在哪里初始化的，尝试绕过 `$this->cache`
+发现在 `inc/class_templates.php` 的 `cache()` 中进行了 `$this->cache` 的初始化
+    //index.php 入口文件
+    ......
+    require_once './global.php';
+    ......
+    //global.php 中
+    ......
+    $templatelist = "headerinclude......";
+    $templates->cache($db->escape_string($templatelist));
+    //[(call) 调用了 cache() 方法，以下为cache()的代码 ]
+    function cache($templates)
+    {
+        global $db, $theme;
+        ......
+        //意外发现这里使用了 $theme['templateset']
+        //这里也是一个注入点
+        //此时我们可以通过SQL注入来篡改 $this->cache 的值了
+        $query = $db->simple_select("templates", "title,template", "title IN (''$sql) AND sid IN ('-2','-1','".$theme['templateset']."')", array('order_by' => 'sid', 'order_dir' => 'asc'));
+        //上面这段 SQL 语句为：
+        //SELECT title,template FROM mybb_templates WHERE title IN ('...') AND sid IN ('-2','-1','$theme['templateset']')
+        //
+        //将 $query 查出来的赋值给 cache
+          while($template = $db->fetch_array($query))
+         {
+             $this->cache[$template['title']] = $template['template'];
+         }
+    }
+通过上面的代码我们可以篡改 `$this->cache` 的值。既然 `$this->cache` 能够被控制，那自然而然前文中 return 的
+`$template` 也能够被控制了。
+SQL的触发点有了，接下来寻找 `eval` 的触发点。发现前台的入口文件 `index.php` 首先引入了 `global.php`，并且在
+`global.php` 发现一堆的调用点。所以只要我们访问首页就会触发。
+**不过这里需要注意个小问题：**
+在 `cache()` 中，SQL语句是两个字段
+    SELECT title,template ......
+而在 `get()` 中，SQL语句是一个字段
+    SELECT template ......
+而我们注入的 payload 只能输一次。。这就尴尬了。。
+**注意：**
+假设我们控制 `$this->cache` 为不存在的一个 `title` 。会执行 `get()` 的 SQL语句。但此时我们的 payload
+肯定是两个字段的payload。无法在一个字段的 `get()` 的SQL语句中执行。
+所以我们必须找到 **第一个** `eval()` 调用点，将 `$this->cache` 的 `title` 设置为对应的 `title`。这样在
+`get()` 中就不会执行 SQL语句直接返回恶意 `$template` 了。
+`glboa.php` 是 mybb 第一个引入的文件，经过测试发现，下面这段代码是当用户为 **普通用户** 时，第一个被执行的 `eval()` 点
+    if($mybb->usergroup['canusercp'] == 1)
+    {
+        eval('$usercplink = "'.$templates->get('header_welcomeblock_member_user').'";');
+    }
+那么我们只需要设置 `$this->cache` 的 `title` 为 _header_welcomeblock_member_user_ 即可
+**构造 payload**
+整理下现在的信息
+  1. `eval()` 内容部分可控，可控部分取决于 `get()` 的返回值
+  2. `get()` 内部通过 `$this->cache[$title]`，返回 `$template`
+  3. mybb 初始化 `global.php`时调用了 `cache()`，`cache()`是用于初始化 `$this->cache[$title]` 的
+  4. 我们可以通过 SQL 注入控制 `$this->cache`的值，从而污染`$template`，使得恶意代码进入 `eval`
+  5. `get()` 在 `global.php` 的 _header_welcomeblock_member_user_ 这一段中第一次触发

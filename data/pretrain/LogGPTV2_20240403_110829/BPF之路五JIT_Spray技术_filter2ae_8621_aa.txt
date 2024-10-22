@@ -1,0 +1,182 @@
+# BPF之路五JIT Spray技术
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 简介
+JIT喷射通过JIT来绕过ASLR(地址随机化)和DEP(数据不可执行), 举个例子, 有如下JS代码
+    var a = (0x11223344^0x44332211^0x44332211^ ...);
+那么JIT编译后会产生如下x86指令
+    0:  b8 44 33 22 11      mov $0x11223344,%eax    mov eax,0x11223344
+    5:  35 11 22 33 44      xor $0x44332211,%eax    xor eax,0x44332211
+    a:  35 11 22 33 44      xor $0x44332211,%eax    xor eax,0x44332211
+如果我们利用各种漏洞令RIP跳转到mov指令的第二字节, 那么就会被解读为全新的x86指令, 完成任意指令执行
+    1:  44                  inc %esp                inc esp
+    2:  33 22               xor (%edx),%esp         xor esp,DWORD PTR [edx]
+    4:  11 35 11 22 33 44   adc %esi,0x44332211     adc DWORD PTR ds:0x44332211,esi
+    a:  35 11 22 33 44      xor $0x44332211,%eax    xor eax,0x44332211
+缓解措施有二, 我们都在上一篇的`do_jit()`函数中看到过: 1: 对JIT翻译出的指令进行地址随机化 2: 启用立即数致盲, 不出现指定的立即数
+我们本篇先假设不启用立即数致盲
+## 如何嵌入x86指令
+我们要探究的第一个问题就是如何用稳定的方式, 在eBPF指令中插入x86的指令, 一种比较好的方法是在eBPF中ALU指令的imm字段写入x86指令.
+因为ALU指令在JIT时几乎是与x86一一对应的, 并且imm部分是照办过去的, 性质很好.
+这里以`ldw R0, 任意值`指令为例子, 过程如下
+    eBPF:   +------------------------+----------------+----+----+--------+
+            |immediate               |offset          |src |dst |opcode  |
+            +------------------------+----------------+----+----+--------+
+            |       32:任意值         |    16          | 4  |4:0 | 8:0xb4 |
+                                 |    JIT
+                                 V
+    x86:    +------------------------+--------+
+            |immediate               |opcode  |
+            +------------------------+--------+
+            |    32:任意值            |8:0xb8  |
+多个`ldw R0, 任意值`指令一起JIT之后就可以得到如下结构
+        x86:            内存中的表示
+    mov eax, A;        [0, 5):   0xb8 p32(A)
+    mov eax, B;        [5, 10):  0xb8 p32(B)
+    mov eax, C;        [10: 15): 0xb8 p32(C)
+    ...
+跳转时我们要跳转到0xb8后一字节的位置, 也就是从p32(A)开始执行. 下面研究下立即数里面要放什么.
+首先要解决的问题就是A与B中间间隔了一个0xb8, 怎么跳过这个0xb8. 思路有两种:
+  * 用别的指令前缀吃掉0xb8
+  * jmp 1指令直接跳到B中
+对于第一种思路我用脚本遍历了`任意一字节+0xb8+p32(B)`的情况, 有下列可用前缀, 其中`3c`和`a8`性质最好, 不会改变ax
+    04 b8                   add    al, 0xb8
+    0c b8                   or     al, 0xb8
+    14 b8                   adc    al, 0xb8
+    1c b8                   sbb    al, 0xb8
+    24 b8                   and    al, 0xb8
+    2c b8                   sub    al, 0xb8
+    34 b8                   xor    al, 0xb8
+    3c b8                   cmp    al, 0xb8    *
+    a8 b8                   test   al, 0xb8    *
+    b0 b8                   mov    al, 0xb8  
+    b1 b8                   mov    cl, 0xb8
+    b2 b8                   mov    dl, 0xb8
+    b3 b8                   mov    bl, 0xb8
+    b4 b8                   mov    ah, 0xb8
+    b5 b8                   mov    ch, 0xb8
+    b6 b8                   mov    dh, 0xb8
+    b7 b8                   mov    bh, 0xb8
+以`cmp al, 0xb8`为例子, 前缀是0x3c, 要放到0xb8前面, 也就是A的最高字节, 我们可以如下编码
+        eBPF:                    x86                        内存
+    ldw R0, 0x3c9012b0        mov eax, 0x3c9012b0        0xb8 0xb0 0x12 0x90 0x3c
+    ldw R0, 0x3c9034b4        mov eax, 0x3c9034b4        0xb8 0xb4 0x34 0x90 0x3c
+令RIP跳转到0xb8后面一字节就有如下指令, 可完成`ax=0x3412`的工作(本来以ax=0x1234为例子, 结果搞反了ah al, 不过问题不大)
+        内存            x86
+    0xb0 0x12       mov al, 0x12
+    0x90            nop
+    0x3c 0xb8       cmp al, 0xb8    ;用0x3c吃掉一个0xb8
+    0xb4 0x34       mov ah, 0x34
+    0x90            nop
+    0x3c ...        ...            ;继续吃掉下一个0xb8
+对于第二种思路可以使用`jmp $+3`指令, +3包含2字节jmp指令的长度和1字节0xb8, 编译出来也就是`0xeb 0x01`, 我们可以如下编码
+        eBPF:                    x86                        内存
+    ldw R0, 0x01eb12b0        mov eax, 0x01eb12b0        0xb8 0xb0 0x12 0xeb 0x01
+    ldw R0, 0x01eb34b4        mov eax, 0x01eb34b4        0xb8 0xb4 0x34 0xeb 0x01
+令RIP跳转到0xb8后面一字节就有如下指令, 同样是完成`ax=0x3412`的工作
+        内存            x86
+    0xb0 0x12        mov al, 0x12  
+    0xeb 0x01        jmp $+3            ;直接过0xb8, 进入mov ah, 0x34, 效果等价于PC = PC+1
+    0xb8
+    0xb4 0x34        mov ah, 0x34
+    0xeb 0x01        jmp $+3
+    ...
+两种方法比较而言 我更喜欢第一种, 因为可以用3B空间写入任意x86指令, 而第二种只有2B. 足以写入很多指令
+接下来我会以2021 SECCON CTF的kone_gadget为例子, 展示这种手法
+## 例题介绍
+题目十分简洁. 启动脚本如下, 开了smap, smep, 没开kaslr
+    qemu-system-x86_64 \
+            -m 64M \
+            -nographic \
+            -kernel bzImage \
+            -append "console=ttyS0 loglevel=3 oops=panic panic=-1 pti=on nokaslr" \
+            -no-reboot \
+            -cpu kvm64,+smap,+smep \
+            -smp 1 \
+            -monitor /dev/null \
+            -initrd rootfs.cpio \
+            -net nic,model=virtio \
+            -net user \
+            $DEBUG_ARG
+本题没有插入设备, 而是新增了一个系统调用, 可以让我们控制RIP, 但是除此之外的所有寄存器全部清0
+    Added to arch/x86/entry/syscalls/syscall_64.tbl:
+    1337 64 seccon sys_seccon
+    ‍‍‍‍
+    Added to kernel/sys.c:
+    SYSCALL_DEFINE1(seccon, unsigned long, rip)
+    {
+      asm volatile("xor %%edx, %%edx;"
+                   "xor %%ebx, %%ebx;"
+                   "xor %%ecx, %%ecx;"
+                   "xor %%edi, %%edi;"
+                   "xor %%esi, %%esi;"
+                   "xor %%r8d, %%r8d;"
+                   "xor %%r9d, %%r9d;"
+                   "xor %%r10d, %%r10d;"
+                   "xor %%r11d, %%r11d;"
+                   "xor %%r12d, %%r12d;"
+                   "xor %%r13d, %%r13d;"
+                   "xor %%r14d, %%r14d;"
+                   "xor %%r15d, %%r15d;"
+                   "xor %%ebp, %%ebp;"
+                   "xor %%esp, %%esp;"
+                   "jmp %0;"
+                   "ud2;"
+                   : : "rax"(rip));
+      return 0;
+    }
+按照常规思路: 想要进行ROP那么需要先恢复RSP, 不然连call和ret指令都无法完成, 因此要寻找`mov rsp, ...`这种GG,
+内核中这种GG并不多, 只有`mov rsp, gs:0x6004`可以恢复RSP, 但是无法控制接下来的调用. 由此常规思路陷入死胡同, 打出GG退出游戏
+此时就可以引入JIT Spray, 利用BPF的JIT在内核中写入任意指令, 然后通过系统调用运行shellcode, 这也就是题目所指的OneGadget
+## 如何注入eBPF程序
+当我们尝试进行bpf系统调用注入程序时会发现这个内核并不支持bpf系统调用. 那还有没有什么别的方法能够注入eBPF程序呢?
+答案就是seccomp, 其本质上也就是一段BPF指令, 在进程进行系统调用时触发, 从而完成各种系统调用的过滤.
+seccomp通过`prctl()`注入BPF, 我们需要先看下man学习下用法
+    //prctl - 控制一个进程或者线程
+    #include 
+    int prctl(int option, unsigned long arg2, unsigned long arg3,
+                     unsigned long arg4, unsigned long arg5);
+`prctl()`操作调用线程或者进程的各个方面的行为. `prctl()`使用第一个参数来描述要做什么, 值定义在``.
+我们只看`PR_SET_SECCOMP`
+`PR_SET_SECCOMP`用于设置调用线程的安全计算模式, 来限制可用的系统调用.
+最近的seccomp()系统调用提供了`PR_SET_SECCOMP`功能的超集, (换言之, 不管怎么设置, seccomp的限制总会越来越大).
+seccomp的模式通过`arg2`选择, 这些常数都定义在``
+当`arg2`设置为`SECCOMP_MODE_FILTER`时, 允许的系统调用可以通过`arg3`指向的BPF程序定义. `arg3`指向`struct
+sock_fprog`, 可以被设计用于过滤任何系统调用以及系统调用的参数. 这个操作只有内核编译时启用`CONFIG_SECCOMP_FILTER`才可以
+如果`SECCOMP_MODE_FILTER`过滤器允许fork(), 那么seccomp模式会在fork()时被子进程继承.
+如果过滤器允许execve(), 那么seccomp模式也会被保留. 如果过滤器允许prctl()调用, 那么可以添加额外的过滤器, 过滤器会按照顺序执行,
+直到返回一个不允许的结果为止
+为了设置过滤器, 调用线程要么在用户空间中具有`CAP_SYS_ADMIN`的能力(有管理系统相关配置的能力),
+要么必须已经设置了`no_new_privs`标志, 此标志可通过如下调用设置: `prctl(PR_SET_NO_NEW_PRIVS, 1);`
+不然的话`SECCOMP_MODE_FILTER`就会失败, 并把`errno`设置为`EACCES`, 也就是无权访问.
+这一要求保证了一个非特权进程不能执行一个恶意的过滤器, 然后使用execve()调用set-user-ID或者其他特权进程. 举个例子,
+一个过滤器可能会尝试使用setuid()来设置调用者的用户ID为非0值, 而不是真正执行系统调用而返回0.
+因此程序可能会被诱骗保留超级用户权限，因为它实际上并没有放弃权限。
+除了`SYS_prctl`以外还有一个系统调用`SYS_seccomp`也可以用于设置seccomp.
+设置过滤器时`prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER,
+args);`和`seccomp(SECCOMP_SET_MODE_FILTER, 0, args)`是等价的
+设置过滤器时args要指向一个过滤器程序, 该结构体定义如下
+    struct sock_fprog {
+                   unsigned short      len;    /* 有多少条BPF程序 */
+                   struct sock_filter *filter; /* 指向BPF指令数组 */
+               };
+`struct sock_filter`表示一个BPF指令, 定义如下. 注意seccomp只支持最原始的cBPF
+    struct sock_filter {            /* Filter block */
+                   __u16 code;                 /* Actual filter code */
+                   __u8  jt;                   /* Jump true */
+                   __u8  jf;                   /* Jump false */
+                   __u32 k;                    /* Generic multiuse field */
+               };
+对于cBPF其操作码如下, 因此同样是`ldw AX, 任意值`指令, 对于cBPF就编码为: `{0, 0, 0, 任意值}`
+    #define        BPF_LD        0x00                    //将值cp进寄存器
+    #define        BPF_LDX        0x01
+    #define        BPF_ST        0x02
+    #define        BPF_STX        0x03
+    #define        BPF_ALU        0x04
+    #define        BPF_JMP        0x05
+    #define        BPF_RET        0x06
+    #define        BPF_MISC        0x07
+因此我们可以通过如下方式注入BPF
+    void install_seccomp(char *insn, unsigned int len){

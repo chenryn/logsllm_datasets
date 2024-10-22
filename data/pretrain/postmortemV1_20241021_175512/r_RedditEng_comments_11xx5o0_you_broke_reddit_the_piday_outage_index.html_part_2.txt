@@ -1,0 +1,222 @@
+
+4.  Launch new control plane nodes and join them to sync.
+
+Immediately, we noticed a few issues. This procedure had been written
+against a now end-of-life Kubernetes version, and it pre-dated our
+switch to CRI-O, which means all of the instructions were written with
+Docker in mind. This made for several confounding variables where
+command syntax had changed, arguments were no longer valid, and the
+procedure had to be rewritten live to accommodate. We used the procedure
+as much we could; at one point to our detriment, as you'll see in a
+moment.
+
+In our environment, we don't treat all our control plane nodes as equal.
+We number them, and the first one is generally considered somewhat
+special. Practically speaking it's the same, but we use it as the
+baseline for procedures. Also, critically, we don't set the hostname of
+these nodes to reflect their membership in the control plane, instead
+leaving them as the default on AWS of something similar to
+\`ip-10-1-0-42.ec2.internal\`. The restore procedure specified that we
+should terminate all control plane nodes except the first, restore the
+backup to it, bring it up as a single-node control plane, and then bring
+up new nodes to replace the others that had been terminated. Which we
+did.
+
+The restore for the first node was completed successfully, and we were
+back in business. Within moments, nodes began coming online as the
+cluster autoscaler sprung back to life. This was a great sign because it
+indicated that networking was working again. However, we weren't ready
+for that quite yet and shut off the autoscaler to buy ourselves time to
+get things back to a known state. This is a large cluster, so with only
+a single control plane node, it would very likely fail under load. So,
+we wanted to get the other two back online before really starting to
+scale back up. We brought up the next two and ran into our next sticking
+point: AWS capacity was exhausted for our control plane instance type.
+This further delayed our response, as canceling a
+'[terraform](https://www.terraform.io/) apply\` can have strange
+knock-on effects with state and we didn't want to run the risk of making
+things even worse. Eventually, the nodes launched, and we began trying
+to join them.
+
+The next hitch: The new nodes wouldn't join. Every single time, they'd
+get stuck, with no error, due to being unable to connect to etcd on the
+first node. Again, several engineers split off into a separate call to
+look at why the connection was failing, and the remaining group planned
+how to slowly and gracefully bring workloads back online from a cold
+start. The breakout group only took a few minutes to discover the
+problem. Our restore procedure was extremely prescriptive about the
+order of operations and targets for the restore... but the backup
+procedure wasn't. Our backup was written to be executed on *any* control
+plane node, but the restore had to be performed on the **same** one. And
+it wasn't. This meant that the TLS certificates being presented by the
+working node weren't valid for anything else to talk to it, because of
+the hostname mismatch. With a bit of fumbling due to a lack of
+documentation, we were able to generate new certificates that worked.
+New members joined successfully. We had a working, high-availability
+control plane again.
+
+In the meantime, the main group of responders started bringing traffic
+back online. This was the longest down period we'd seen in a long
+time... so we started extremely conservatively, at about 1%. Reddit
+relies on a lot of caches to operate semi-efficiently, so there are
+several points where a ['thundering herd'
+problem](https://en.wikipedia.org/wiki/Thundering_herd_problem) can
+develop when traffic is scaled immediately back to 100%, but downstream
+services aren't prepared for it, and then suffer issues due to the
+sudden influx of load.
+
+This tends to be exacerbated in outage scenarios, because services that
+are idle tend to scale down to save resources. We've got some tooling
+that helps deal with that problem which will be presented in another
+blog entry, but the point is that we didn't want to turn on the firehose
+and wash everything out. From 1%, we took small increments: 5%, 10%,
+20%, 35%, 55%, 80%, 100%. The site was (mostly) live, again. Some
+particularly touchy legacy services had been stopped manually to ensure
+they wouldn't misbehave when traffic returned, and we carefully turned
+those back on.
+
+Success! The outage was over.
+
+But we still didn't know why it happened in the first place.
+
+# A little self-reflection; or, a needle in a 3.9 Billion Log Line Haystack 
+
+Further investigation kicked off. We started looking at everything we
+could think of to try and narrow down the exact moment of failure,
+hoping there'd be a hint in the last moments of the metrics before they
+broke. There wasn't. For once though, a historical decision worked in
+our favor... our logging agent was unaffected. Our metrics are entirely
+k8s native, but our logs are very low-level. So we had the logs
+preserved and were able to dig into them.
+
+We started by trying to find the exact moment of the failure. The API
+server logs for the control plane exploded at 19:04:49 UTC. Log volume
+just for the API server increased by 5x at that instant. But the only
+hint in them was one we'd already seen, our timeouts calling OPA. The
+next point we checked was the OPA logs for the exact time of the
+failure. About 5 seconds before the API server started spamming, the OPA
+logs stopped entirely. Dead end. Or was it?
+
+Calico had started failing at some point. Pivoting to its logs for the
+timeframe, we found the next hint.
+
+[](https://preview.redd.it/you-broke-reddit-the-pi-day-outage-v0-z1xbioce36pa1.png?width=1640&format=png&auto=webp&s=283d0809d859b0a2e919235a9828a3adb8a4577f "Image from r/RedditEng - All Reddit metrics and incident activities are managed in UTC for consistency in comms. Log timestamps here are in US/Central due to our logging system being overly helpful. ")
+
+All Reddit metrics and incident activities are managed in UTC for
+consistency in comms. Log timestamps here are in US/Central due to our
+logging system being overly helpful.
+
+Two seconds before the chaos broke loose, the calico-node daemon across
+the cluster began dropping routes to the first control plane node we
+upgraded. That's normal and expected behavior, due to it going offline
+for the upgrade. What wasn't expected was that **all** routes for
+**all** nodes began dropping as well. And that's when it clicked.
+
+The way Calico works, by default, is that every node in your cluster is
+directly peered with every other node in a mesh. This is great in small
+clusters because it reduces the complexity of management considerably.
+However, in larger clusters, it becomes burdensome; the cost of
+maintaining all those connections with every node propagating routes to
+every other node scales... poorly. Enter route reflectors. The idea with
+route reflectors is that you designate a small number of nodes that peer
+with everything and the rest only peer with the reflectors. This allows
+for far fewer connections and lower CPU and network overhead. These are
+great on paper, and allow you to scale to much larger node counts (\>100
+is where they're recommended, we add zero(s)). However, Calico's
+configuration for them is done in a somewhat obtuse way that's hard to
+track. That's where we get to the cause of our issue.
+
+The route reflectors were set up several years ago by the precursor to
+the current Compute team. Time passed, and with attrition and growth,
+everyone who knew they existed moved on to other roles or other
+companies. Only our largest and most legacy clusters still use them. So
+there was nobody with the knowledge to interact with the route reflector
+configuration to even realize there could be something wrong with it or
+to be able to speak up and investigate the issue. Further, Calico's
+configuration doesn't actually work in a way that can be easily managed
+via code. Part of the route reflector configuration requires fetching
+down Calico-specific data that's expected to only be managed by their
+CLI interface (not the standard Kubernetes API), hand-edited, and
+uploaded back. To make this acceptable means writing custom tooling to
+do so. Unfortunately, we hadn't. The route reflector configuration was
+thus committed nowhere, leaving us with no record of it, and no
+breadcrumbs for engineers to follow. One engineer happened to remember
+that this was a feature we utilized, and did the research during this
+postmortem process, discovering that this was what actually affected us
+and how.
+
+# Get to the Point, Spock, If You Have One 
+
+How did it actually break? That's one of the most unexpected things of
+all. In doing the research, we discovered that the way that the route
+reflectors were configured was to set the control plane nodes as the
+reflectors, and everything else to use them. Fairly straightforward, and
+logical to do in an autoscaled cluster where the control plane nodes are
+the only consistently available ones. However, the way this was
+configured had an insidious flaw. Take a look below and see if you can
+spot it. I'll give you a hint: The upgrade we were performing was to
+Kubernetes 1.24.
+
+[](https://preview.redd.it/you-broke-reddit-the-pi-day-outage-v0-58cy37ii36pa1.png?width=1565&format=png&auto=webp&s=ba1b5ea8b0203790f11ce4fc8059a6080ea434dc "Image from r/RedditEng - A horrifying representation of a Kubernetes object in YAML")
+
+A horrifying representation of a Kubernetes object in YAML
+
+The nodeSelector and peerSelector for the route reflectors target the
+label \`node-role.kubernetes.io/master\`. In the 1.20 series, Kubernetes
+[changed its
+terminology](https://github.com/kubernetes/enhancements/blob/master/keps/sig-cluster-lifecycle/kubeadm/2067-rename-master-label-taint/README.md) from
+"master" to "control-plane." And in 1.24, they removed references to
+"master," even from running clusters. This is the cause of our outage.
+Kubernetes node labels.
+
+But wait, that's not all. Really, that's the proximate cause. The actual
+cause is more systemic, and a big part of what we've been unwinding for
+years: Inconsistency.
+
+Nearly every critical Kubernetes cluster at Reddit is bespoke in one way
+or another. Whether it's unique components that only run on that
+cluster, unique workloads, only running in a single availability zone as
+a development cluster, or any number of other things. This is a natural
+consequence of organic growth, and one which has caused more outages
+than we can easily track over time. A big part of the Compute team's
+charter has specifically been to unwind these choices and make our
+environment more homogeneous, and we're actually getting there.
+
+In the last two years, A great deal of work has been put in to unwind
+that organic pattern and drive infrastructure built with intent and
+sustainability in mind. More components are being standardized and
+shared between environments, instead of bespoke configurations
+everywhere. More pre-production clusters exist that we can test
+confidently with, instead of just a YOLO to production. We're working on
+tooling to manage the lifecycle of whole clusters to make them all look
+as close to the same as possible and be re-creatable or replicable as
+needed. We're moving in the direction of only using unique things when
+we absolutely must, and trying to find ways to make those the new
+standards when it makes sense to. Especially, we're codifying everything
+that we can, both to ensure consistent application and to have a clear
+historical record of the choices that we've made to get where we are.
+Where we can't codify, we're documenting in detail, and (most
+importantly) evaluating how we can replace those exceptions with better
+alternatives. It's a long road, and a difficult one, but it's one we're
+consciously choosing to go down, so we can provide a better experience
+for our engineers and our users.
+
+# Final Curtain 
+
+If you've made it this far, we'd like to take the time to thank you for
+your interest in what we do. Without all of you in the community, Reddit
+wouldn't be what it is. You truly are the reason we continue to
+passionately build this site, even with the ups and downs (fewer downs
+over time, with our focus on reliability!)
+
+Finally, if you found this post interesting, and you'd like to be a part
+of the team, the Compute team is
+[hiring](https://infrastructure.redditinc.com/), and
+we'd love to hear from you if you think you'd be a fit. If you apply,
+mention that you read this postmortem. It'll give us some great insight
+into how you think, just to discuss it. We can't continue to improve
+without great people and new perspectives, and you could be the next
+person to provide them!
+
+
+

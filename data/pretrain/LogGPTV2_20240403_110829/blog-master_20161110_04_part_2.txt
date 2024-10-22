@@ -1,0 +1,202 @@
+57     }  
+58   
+59     if(ep_is_linked(&epi->rdllink))  
+60         goto is_linked;  
+61     //关键是这一句，将该fd加入到epoll监听的就绪链表中  
+62     list_add_tail(&epi->rdllink,&ep->rdllist);  
+63 is_linked:  
+64     if(waitqueue_active(&ep->wq))  
+65         __wake_up_locked(&ep->wq,TASK_UNINTERRUPTIBLE   
+66             | TASK_INTERRUPTIBLE);      
+67     if(waitqueue_active(&ep->poll_wait))  
+68         pwake++;  
+69 out_unlock:  
+70     spin_unlock_irqrestore(&ep->lock,flags);  
+71       
+72     if(pwake)  
+73         ep_poll_safewake(&psw,&ep->poll_wait);  
+74     return 1;  
+75 }  
+```
+这里采用了两级回调方式，流程如下:  
+![pic2](20161110_04_pic_002.png)  
+目前为止，整个数据结构就可以描述如下:  
+![pic3](20161110_04_pic_003.png)  
+epoll_wait系统实现如下:  
+```
+ 1 asmlinkage long sys_epoll_wait(int epfd,struct epoll_event __user *events,  
+ 2             int maxevents,int timeout)  
+ 3 {  
+ 4     int error;  
+ 5     struct file *file;  
+ 6     struct eventpoll *ep;  
+ 7     //#define EP_MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))  
+ 8 //178956970(1.7亿)  
+ 9     if(maxevents  EP_MAX_EVETNS)   
+10         return -EINVAL;  
+11     //判断返回事件数组是否合法  
+12     if(!access_ok(VERIFY_WRITE,events,  
+13             maxevents * sizeof(struct epoll_event)))  
+14     {  
+15         error = -EFAULT;  
+16         goto error_return;  
+17     }  
+18   
+19     error = -EBADF;  
+20     file = fget(epfd);  
+21       
+22     if(!file)  
+23         goto error_return;  
+24     error = -EINVAL;  
+25     if(!is_file_epoll(file))  
+26         goto error_fput;  
+27     //将epoll注册时设置的数据结构取出来，开始进行判断  
+28     ep = file->private_data;  
+29     error = ep_poll(ep,events,maxevents,timeout);  
+30         ….......  
+31 }  
+``` 
+现在又转入了ep_poll函数中:  
+```
+ 1 static int ep_poll(struct eventpoll *ep,struct epoll_event __user *events,  
+ 2                 int maxevents,long timeout)  
+ 3 {  
+ 4     int res,avail;  
+ 5     unsigned long flags;  
+ 6     long jtimeout;  
+ 7     wait_queue_t wait;  
+ 8       
+ 9     //注册的0ms按0.999 Jiffies处理,并非真正的0s,HZ=100,  
+10 //jiffies/HZ 为s  
+11     jtimeout = (timeout= EP_MAX_MSTIMEO)?  
+12         MAX_SCHEDULE_TIMEOUT:(timeout*HZ+999)/1000;  
+13   
+14 retry:  
+15     spin_lock_irqsave(&ep->lock,flags);  
+16       
+17     res = 0;  
+18     //事件就绪队列为空，就监听poll  
+19     if(list_empty(&ep->rdllist))  
+20     {  
+21         //让当前进程挂在等待队列wait上，并将该等待队列加入到ep->wq(epoll_wait的            专属队列中),  
+22         init_waitqueue_entry(&wait,current);  
+23         wait.flags |= WQ_FLAG_EXCLUSIVE;  
+24         __add_wait_queue(&ep->wq,&wait);  
+25   
+26         for(;;){  
+27             //进程设置睡眠状态，等到信息时变唤醒  
+28             set_current_state(TASK_INTERRUPTIBLE);  
+29             if(!list_empty(&ep->rdllist) || !jtimeout)//只要事件到来，就返回  
+30                 break;  
+31             if(signal_pending(current)) {//被信号中断就会返回  
+32                 res = -EINTR;  
+33                 break;  
+34             }  
+35         spin_unlock_irqrestore(&ep->lock,flags);  
+36         //进程进入睡眠状态直到规定的睡眠事件醒来或者注册的fd对应的poll驱动函数唤醒该            进程  
+37         jtimeout = schedule_timeout(jtimeout);  
+38         spin_lock_irqrestore(&ep->lock,flags);  
+39         }  
+40     //poll驱动唤醒了该进程，现在就将对应的poll从等待队列中清除出去,并设置为运行状态  
+41     __remove_wait_queue(&ep->wq,&wait);  
+42     set_current_state(TASK_RUNNING);  
+43     }  
+44     eavail = !list_empty(&ep->rdllist);  
+45     spin_unlock_irqrestore(&ep->lock,flags);  
+46     //没有被中断，有就绪事件，并且向用户空间发送成功，就返回  
+47     if(!res && eavail && !(res = ep_send_events(ep,events,maxevents))  
+48         &&jtimeout)  
+49         goto retry;  
+50   
+51     return res;  
+52 }  
+``` 
+ep_send_events函数向用户空间发送就绪事件:  
+```
+ 1 static int ep_send_events(struct eventpoll *ep,struct epoll_event __user *events,int maxevents)  
+ 2 {  
+ 3     int eventcnt,error = -EFAULT,pwake = 0;  
+ 4     unsigned int revents;  
+ 5     unsigned long flags;  
+ 6     struct epitem *epi,*nepi;  
+ 7     struct list_head txlist;  
+ 8   
+ 9     INIT_LIST_HEAD(&txlist);  
+10     mutex_lock(&ep->mtx);  
+11   
+12     spin_lock_irqsave(&ep->lock,flags);  
+13     //将ep->rdllist链表加入到txlist链表中去,这样的话rdllist链表就为空了  
+14     list_splice(&ep->rdllist,&txlist);  
+15     INIT_LIST_HEAD(&ep->rdllist);  
+16     ep->ovflist = NULL;  
+17     spin_unlock_irqrestore(&ep->lock,flags);  
+18     //将rdllist链表中的每一项都发送至用户空间  
+19     for(eventcnt = 0; !list_empty(&txlist) && eventcnt rdllink);      
+23         //立刻返回当前文件的就绪事件  
+24         revents = epi->ffd.file->f_op->poll(epi->ffd.file,NULL);  
+25         revents &= epi->event.events;  
+26           
+27         if(revents) {  
+28             //将就绪事件的poll_event发送至用户空间  
+29             if(__put_user(revents,&events[eventcnt.].events) ||  
+30              __put_user(epi->event.data,&events[eventcnt].data))  
+31                   
+32                 goto errxit;  
+33             //#define EP_PRIVATE_BITS (EPOLLONESHOT | EPOLLET)  
+34             if(epi->event.events & EPOLLONESHOT)  
+35                 epi->event.events &= EP_PRIVATE_BITS;  
+36             eventcnt++;  
+37         }  
+38      //非边缘触发，且事件就绪时，就将epi->rdllink加入到rdllist链表中,实际上就是将没有标记为ET模式的fd又放回到rdllist中，这样下次就绪时又能将其发送至用户空间了  
+39      if(!(epi->event.events & EPOLLET) && (revents &   
+40                 epi->event.events))  
+41             list_add_tail(&epi->rdllink,&ep->rdllist);  
+42 }  
+43     error = 0;  
+44 errixt:  
+45     spin_lock_irqsave(&ep->lock,flags);  
+46     //在执行上面的代码期间，又有可能有就绪事件，这样的话就进入了ovflist队列，这样有需要再一次确认一次      
+47     for(nepi = ep->ovflist;(epi = nepi)!= NULL;  
+48      nepi = epi->next;epi->next = EP_UNACTIVE_PTR) {  
+49         //链表为空且没有ET事件发生,#define EP_PRIVATE_BITS (EPOLLONESHOT | EPOLLET),这里也和上面的一样  
+50         if(!ep_is_linked(&epi->rdllink) && (epi->event.events &   
+51             ~EP_PRIVATE_BITS))  
+52             //又将rdllink其加入到rdllist中  
+53                 list_add_tail(&epi->rdllink,&ep->rdllist);  
+54     }  
+55     //#define EP_UNACTIVE_PTR    ((void*) -1L)  
+56     ep->ovflist = EP_UNACTIVE_PTR;  
+57     list_spice(&txlist,&ep->rdllist);//现在又将txlist链表加入到rdllist链表中去  
+58     if(!list_empty(&ep->rdllist))  
+59     {  
+60         //等待的队列不为空  
+61         if(waitqueue_active(&ep->wq))  
+62               
+63             __wake_up_locked(&ep->wq,TASK_UNINTERRUPTIBLE |  
+64             TASK_INTERRUPTIBLE);  
+65         //如果poll队列不为空，则唤醒的次数加1  
+66         if(waitqueue_active(&ep->poll_wait))  
+67             pwake++;  
+68     }  
+69     spin_unlock_irqrestore(&ep->lock,flags);  
+70     mutex_unlock(&ep->mtx);  
+71     if(pwake)  
+72         ep_poll_safewake(&psw,&ep->poll_wait);  
+73     return eventcnt == 0?error:eventcnt;  
+74 }  
+``` 
+这样epoll_wait的调用顺序为:  
+![pic4](20161110_04_pic_004.png)  
+参考资料:  
+linux-2.6.24.3源代码  
+http://donghao.org/2009/08/linuxiapolliepollaueouaeaeeio.html  
+http://blog.chinaunix.net/uid-20687780-id-2105154.html  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

@@ -1,0 +1,211 @@
+jndi注入高版本绕过与反序列化
+昨天群里聊到这了，虽然都是炒冷饭，但有些细节可能分析清楚点也有好处。主要分析分三个部分
+1、jndi注入的原理
+2、jndi注入与反序列化的关系
+3、jndi注入与jdk版本的关系
+jndi注入的原理：
+jndi是java用于访问目录和命名服务的 API。使用jndi进行查询本来是一个正常的功能，但由于实现时没
+有考虑安全问题，如果查询恶意对象就会导致被攻击。但攻击的结果并不一定是rce。
+jndi的查询大致可以分两步：
+1、客户端请求一个命名服务并获取一个对象。
+2、客户端解析这个对象。
+那么漏洞出现在哪步呢？实际上是两步都有可能，因为jndi支持RMI、LDAP、CORBA、DNS四种协议，
+每种都对应不同的实现，支持绑定的对象有序列化对象、引用对象、属性对象等。所以攻击路径很多，
+漏洞也很多。
+在攻击中常用的有jndi+rmi和jndi+ldap，实际上corba也可以用于攻击，但基本能用corba打的都能用
+rmi打，并且流程很啰嗦。所以这里就分析这jndi+rmi和jndi+ldap两种实现。
+jndi+rmi
+关键代码在RegistryContext#lookup
+可以看到第一步，远程对象obj是通过原生rmi的lookup获取的，了解rmi的就知道是通过反序列化获取
+的。实际上如果系统里有gadget，这一步反序列化的时候就可以导致代码执行了。
+然后第二步，在decodeObject里面对获取到的对象进行了解析，
+逻辑在RegistryContext#decodeObject里面
+    public Object lookup(Name name) throws NamingException {
+        if (name.isEmpty()) {
+            return (new RegistryContext(this));
+        }
+        Remote obj;
+        try {
+            obj = registry.lookup(name.get(0));
+        } catch (NotBoundException e) {
+            throw (new NameNotFoundException(name.get(0)));
+        } catch (RemoteException e) {
+            throw (NamingException)wrapRemoteException(e).fillInStackTrace();
+        }
+        return (decodeObject(obj, name.getPrefix(1)));
+    private Object decodeObject(Remote r, Name name) throws NamingException {
+        try {
+            Object obj = (r instanceof RemoteReference)
+                        ? ((RemoteReference)r).getReference()
+注释里写的很明白，如果com.sun.jndi.rmi.object.trustURLCodebase为true就可以通过codebase加载
+任意远程类，导致代码执行。这个校验是在jdk8u121开启的，并且是加在RegistryContext里面的，也
+就是只对了jndi的rmi实现作了限制，所以后续才会有ldap的绕过。
+然后调用的是NamingManager.getObjectInstance，这个函数就是前面说的所谓的解析远程对象的函
+数。
+                        : (Object)r;
+            /*
+             * Classes may only be loaded from an arbitrary URL codebase when
+             * the system property com.sun.jndi.rmi.object.trustURLCodebase
+             * has been set to "true".
+             */
+            // Use reference if possible
+            Reference ref = null;
+            if (obj instanceof Reference) {
+                ref = (Reference) obj;
+            } else if (obj instanceof Referenceable) {
+                ref = ((Referenceable)(obj)).getReference();
+            }
+            if (ref != null && ref.getFactoryClassLocation() != null &&
+                !trustURLCodebase) {
+                throw new ConfigurationException(
+                    "The object factory is untrusted. Set the system property" +
+                    " 'com.sun.jndi.rmi.object.trustURLCodebase' to 'true'.");
+            }
+            return NamingManager.getObjectInstance(obj, name, this,
+                                                   environment);
+    public static Object
+        getObjectInstance(Object refInfo, Name name, Context nameCtx,
+                          Hashtable environment)
+        throws Exception
+    {
+        ObjectFactory factory;
+        // Use builder if installed
+        ......
+        // Use reference if possible
+        Reference ref = null;
+        if (refInfo instanceof Reference) {
+            ref = (Reference) refInfo;
+        } else if (refInfo instanceof Referenceable) {
+            ref = ((Referenceable)(refInfo)).getReference();
+        }
+        Object answer;
+        if (ref != null) {
+            String f = ref.getFactoryClassName();
+            if (f != null) {
+                // if reference identifies a factory, use exclusively
+                factory = getObjectFactoryFromReference(ref, f);//这里通过
+URLClassLoader从codebase里加载工厂类
+                if (factory != null) {
+                    return factory.getObjectInstance(ref, name, nameCtx,
+                                                     environment);//这里调用工厂类
+的getObjectInstance方法
+                }
+                // No factory found, so return original refInfo.
+这里的逻辑其实都在处理远程对象是Reference的情况，如果通过rmi获取的远程对象是一个
+Reference，就会调用getObjectFactoryFromReference从Reference里获取工厂类，然后调用工厂类的
+getObjectInstance方法。
+那这里实际上有两种rce的攻击手法：
+1、getObjectFactoryFromReference在开启trustURLCodebase时可以通过URLClassloader加载远程类
+并进行实例化，导致代码执行。
+2、远程对象是一个Reference，同时系统本身有某些工厂类在调用getObjectInstance时导致了任意代
+码执行，这个工厂类其实就是tomcat中的beanFactory，通过反射执行el表达式。
+可以看到，上面这两种执行代码的方式都不是通过反序列化导致的代码执行。也就是说jndi+rmi的攻击
+中，虽然远程对象是反序列化传过来的，但真正导致代码执行的入口并不是反序列化。这也是昨天我和
+三梦师傅的分歧，虽然意思是差不多，但我觉得这不能叫反序列化漏洞，也许可以归类成所谓的后反序
+列化漏洞。
+jndi+ldap
+核心逻辑在ldapCtx#c_lookup
+把无关代码去掉后，这里很明显的两步，第一步通过Obj.decodeObject从ldap获取字符串，解码出一个
+Object对象，第二步通过DirectoryManager.getObjectInstance解析。实际上和rmi一样的逻辑，代码
+都差不多。但这里就没有rmi那个trustURLCodebase的校验，这也是ldap+jndi可以绕过ldap+rmi修复
+的原因。后来的jdk8u191版本里又增加了一个校验，直接加到类加载那了，就不细说了。
+那么第一步是获取远程对象，在Obj#decodeObject 
+                // Will reach this point if factory class is not in
+                // class path and reference does not contain a URL for it
+                return refInfo;
+            } else {
+                ......
+    protected Object c_lookup(Name name, Continuation cont)
+            throws NamingException {
+        cont.setError(this, name);
+        Object obj = null;
+        Attributes attrs;
+        try {
+            ......
+            if (attrs.get(Obj.JAVA_ATTRIBUTES[Obj.CLASSNAME]) != null) {
+                // serialized object or object reference
+                obj = Obj.decodeObject(attrs);
+            }
+            if (obj == null) {
+                obj = new LdapCtx(this, fullyQualifiedName(name));
+            }
+        } catch (LdapReferralException e) {
+            ......
+        try {
+            return DirectoryManager.getObjectInstance(obj, name,
+                this, envprops, attrs);
+        ......
+    }
+    static Object decodeObject(Attributes attrs)
+可以看到有三种获取对象的方式，名字看着都不咋安全，jndi简直是一步一个坑。
+具体代码不跟了，太长了，结论如下，如果有问题欢迎指出：
+deserializeObject就是一个原生反序列化
+decodeRmiObject是新建一个Reference，没有反序列化。
+decodeRefernce，原生反序列化，但是如果com.sun.jndi.ldap.object.trustURLCodebase开启，会调
+一个重写的resolveClass进行远程类加载。
+所以jndi+ldap获取对象的方式可以理解为和rmi差不多，都是通过反序列化获取的。
+然后解析对象调用的是DirectoryManager.getObjectInstance，其实和
+NamingManager.getObjectInstance基本是一样的。jndi+ldap的rce方式有以下两种：
+1、获取对象时调用decodeRefernce触发远程类加载，这个我没具体实现，因为实际上和第二点是相同
+利用条件的，意义不大，也许有坑，感兴趣的可以看下。
+2、解析对象时调用getObjectFactoryFromReference，在开启
+com.sun.jndi.ldap.object.trustURLCodebase时进行远程类加载，注意这个trustURLCodebase和rmi
+的不是一个。
+3、和rmi一样用本地工厂类，但ldap服务端不能像rmi一样直接绑远程对象，需要绑序列化后的数据。
+实际上到目前为止，rmi和ldap这几种rce都是不需要本地有反序列化利用链的，也就是说一般说的jndi
+注入导致命令执行并不是通常说的反序列化漏洞，只是在传递对象时是通过反序列化传递的。
+那么目前为止jndi注入的原理以及jndi注入与反序列化的关系应该就清楚了，接下来说说jdk版本与jndi注
+入的关系，也就是jdk到底修了什么，没修什么。
+        throws NamingException {
+        Attribute attr;
+        // Get codebase, which is used in all 3 cases.
+        String[] codebases = getCodebases(attrs.get(JAVA_ATTRIBUTES[CODEBASE]));
+        try {
+            if ((attr = attrs.get(JAVA_ATTRIBUTES[SERIALIZED_DATA])) != null) {
+                if (!VersionHelper12.isSerialDataAllowed()) {
+                    throw new NamingException("Object deserialization is not 
+allowed");
+                }
+                ClassLoader cl = helper.getURLClassLoader(codebases);
+                return deserializeObject((byte[])attr.get(), cl);//获取普通序列化对
+象
+            } else if ((attr = attrs.get(JAVA_ATTRIBUTES[REMOTE_LOC])) != null) 
+{
+                // For backward compatibility only
+                return decodeRmiObject(//获取rmi对象
+                    (String)attrs.get(JAVA_ATTRIBUTES[CLASSNAME]).get(),
+                    (String)attr.get(), codebases);
+            }
+            attr = attrs.get(JAVA_ATTRIBUTES[OBJECT_CLASS]);
+            if (attr != null &&
+                (attr.contains(JAVA_OBJECT_CLASSES[REF_OBJECT]) ||
+                    attr.contains(JAVA_OBJECT_CLASSES_LOWER[REF_OBJECT]))) {
+                return decodeReference(attrs, codebases);//获取Reference对象
+            }
+            return null;
+        ......
+jndi注入与jdk版本
+实际上针对jndi注入jdk大的修复只修复了两次，分别是8u121对rmi和corba的jndi注入进行了限制，默
+认禁止了这两种命名服务远程加载工厂类。之后在8u191禁止了ldap的远程类加载。除此之外没有有效
+的修复了，最近的版本新增加了一个ldap限制反序列化的参数，但是默认没有开启。所以jndi注入过程
+里的反序列化都是可以利用的。
+那么高版本下jndi注入rce的方式依然可用的还有
+（1）加载本地工厂类(beanFactory)
+（2）打本地反序列化链。
+前者需要tomcat8/9环境，后者需要反序列化链，都不是无条件的，但依然有rce的可能。
+jndi注入与jep290
+顺便提一下jep290是否对jndi注入有影响，答案是几乎没有。因为jep290只是提供了开启反序列化过滤
+的机制，但默认开启过滤的只有rmi服务端的几个类。而jndi注入是针对客户端的攻击，是不受影响的。
+实际上rmi自身的设计也意味着不可能针对客户端进行反序列化过滤，这种问题可能只能通过security 
+manager解决。
+总结
+所以最后总结一下开篇的三个问题：
+1、jndi注入的原理
+一般说的jndi注入原理是远程类加载。其他攻击方法还有本地工厂类代码执行、反序列化。
+2、jndi注入与反序列化的关系
+jndi注入依赖反序列化来传递对象，但常说的jndi注入代码执行并不是由反序列化链导致的。同样jndi注
+入也可以转化成通常说的反序列化攻击。
+3、jndi注入与jdk版本的关系
+jdk升级只能修复jndi远程类加载的攻击方式，高版本依然有加载本地工厂类和反序列化本地利用链的攻
+击方式。
+写的比较仓促，如果有错误欢迎指出。

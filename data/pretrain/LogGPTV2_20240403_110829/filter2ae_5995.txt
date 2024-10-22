@@ -1,0 +1,139 @@
+# IOST公链P2P远程拒绝服务漏洞
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 漏洞分析
+IOST公链使用Go语言开发，Go语言的make函数如果参数控制不当容易产生拒绝服务漏洞。在IOST的公链代码中搜索 **make**
+,找到了一处貌似可以利用的地方。
+    func (sy *SyncImpl) getBlockHashes(start int64, end int64) *msgpb.BlockHashResponse {
+        resp := &msgpb.BlockHashResponse{
+            BlockInfos: make([]*msgpb.BlockInfo, 0, end-start+1),
+        }
+        node := sy.blockCache.Head()
+        if node != nil && end > node.Head.Number {
+            end = node.Head.Number
+        }
+    省略...
+Line3 make的第3个参数为end-start+1, end和start来自handleHashQuery
+    func (sy *SyncImpl) handleHashQuery(rh *msgpb.BlockHashQuery, peerID p2p.PeerID) {
+        if rh.End = pm.neighborCap[direction] {
+            if !pm.isBP(remotePID) {
+                ilog.Infof("neighbor count exceeds, close connection. remoteID=%v, addr=%v", remotePID.Pretty(), s.Conn().RemoteMultiaddr())
+                if direction == inbound {
+                    bytes, _ := pm.getRoutingResponse([]string{remotePID.Pretty()})
+                    if len(bytes) > 0 {
+                        msg := newP2PMessage(pm.config.ChainID, RoutingTableResponse, pm.config.Version, defaultReservedFlag, bytes)
+                        s.Write(msg.content())
+                    }
+                    time.AfterFunc(time.Second, func() { s.Conn().Close() })
+                } else {
+                    s.Conn().Close()
+                }
+                return
+            }
+            pm.kickNormalNeighbors(direction)
+        }
+        pm.AddNeighbor(NewPeer(s, pm, direction))
+        return
+    }
+对于新建立连接的peer，IOST会启动该peer并添加到neighbor list中
+    // AddNeighbor starts a peer and adds it to the neighbor list.
+    func (pm *PeerManager) AddNeighbor(p *Peer) {
+        pm.neighborMutex.Lock()
+        defer pm.neighborMutex.Unlock()
+        if pm.neighbors[p.id] == nil {
+            p.Start()
+            pm.storePeerInfo(p.id, []multiaddr.Multiaddr{p.addr})
+            pm.neighbors[p.id] = p
+            pm.neighborCount[p.direction]++
+        }
+    }
+peer启动之后，IOST会调用peer的readLoop和writeLoop函数对该peer进行读写。
+    // Start starts peer's loop.
+    func (p *Peer) Start() {
+        ilog.Infof("peer is started. id=%s", p.ID())
+        go p.readLoop()
+        go p.writeLoop()
+    }
+我们主要看readLoop，看IOST对我们发送的数据如何处理。
+    func (p *Peer) readLoop() {
+        header := make([]byte, dataBegin)
+        for {
+            _, err := io.ReadFull(p.stream, header)
+            if err != nil {
+                ilog.Warnf("read header failed. err=%v", err)
+                break
+            }
+            chainID := binary.BigEndian.Uint32(header[chainIDBegin:chainIDEnd])
+            if chainID != p.peerManager.config.ChainID {
+                ilog.Warnf("mismatched chainID. chainID=%d", chainID)
+                break
+            }
+            length := binary.BigEndian.Uint32(header[dataLengthBegin:dataLengthEnd])
+            if length > maxDataLength {
+                ilog.Warnf("data length too large: %d", length)
+                break
+            }
+            data := make([]byte, dataBegin+length)
+            _, err = io.ReadFull(p.stream, data[dataBegin:])
+            if err != nil {
+                ilog.Warnf("read message failed. err=%v", err)
+                break
+            }
+            copy(data[0:dataBegin], header)
+            msg, err := parseP2PMessage(data)
+            if err != nil {
+                ilog.Errorf("parse p2pmessage failed. err=%v", err)
+                break
+            }
+            tagkv := map[string]string{"mtype": msg.messageType().String()}
+            byteInCounter.Add(float64(len(msg.content())), tagkv)
+            packetInCounter.Add(1, tagkv)
+            p.handleMessage(msg)
+        }
+        p.peerManager.RemoveNeighbor(p.id)
+    }
+主要是读取一个固定长度的header，然后根据header中的length来读取data，通过header和data创建一个P2PMessage，最后调用handleMessage来处理这个msg。  
+节点发送的数据包结构如下：
+    /*
+    P2PMessage protocol:
+     0               1               2               3              (bytes)
+     0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                         Chain ID                              |
+    +-------------------------------+-------------------------------+
+    |          Message Type         |            Version            |
+    +-------------------------------+-------------------------------+
+    |                         Data Length                           |
+    +---------------------------------------------------------------+
+    |                         Data Checksum                            |
+    +---------------------------------------------------------------+
+    |                         Reserved                              |
+    +---------------------------------------------------------------+
+    |                                                               |
+    .                             Data                                .
+    |                                                               |
+    +---------------------------------------------------------------+
+    */
+handleMessage会根据messageType对message进行处理
+    // HandleMessage handles messages according to its type.
+    func (pm *PeerManager) HandleMessage(msg *p2pMessage, peerID peer.ID) {
+        data, err := msg.data()
+        if err != nil {
+            ilog.Errorf("get message data failed. err=%v", err)
+            return
+        }
+        switch msg.messageType() {
+        case RoutingTableQuery:
+            go pm.handleRoutingTableQuery(msg, peerID)
+        case RoutingTableResponse:
+            go pm.handleRoutingTableResponse(msg)
+        default:
+            inMsg := NewIncomingMessage(peerID, data, msg.messageType())
+            if m, exist := pm.subs.Load(msg.messageType()); exist {
+                m.(*sync.Map).Range(func(k, v interface{}) bool {
+                    select {
+                    case v.(chan IncomingMessage) 
+## 漏洞修复
+官方的修复方式也很简单，限制end-start+1的大小。

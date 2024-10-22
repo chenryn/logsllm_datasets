@@ -1,0 +1,161 @@
+**作者：raycp**  
+**原文来自安全客：**
+CVE-2015-5165及CVE-2015-7504，很经典的一个qemu逃逸漏洞，想通过它来学习qemu的cve。篇幅的原因，先分析CVE-2015-5165。
+## 环境搭建
+首先是编译qemu：
+    git clone git://git.qemu-project.org/qemu.git
+    cd qemu
+    git checkout bd80b59
+    mkdir -p bin/debug/naive
+    cd bin/debug/naive
+    ../../../configure --target-list=x86_64-softmmu --enable-debug --disable-werror
+    make
+qemu的路径在`./qemu/bin/debug/native/x86_64-softmmu/qemu-system-x86_64`，`--enable-debug`保留了调试符号，可以源代码调试，很舒服。
+接着是制作qemu虚拟机，包括两个部分一个是文件系统镜像，一个是内核。
+可以使用`debootstrap`制作debian文件系统镜像。
+安装`debootstrap`
+    sudo apt-get install debootstrap
+参考[create-image.sh](https://github.com/google/syzkaller/blob/master/tools/create-image.sh)制作了一个2GB大小的rootfs.img镜像文件。
+    mkdir rootfs
+    sudo debootstrap --include=openssh-server,curl,tar,gcc,\
+    libc6-dev,time,strace,sudo,less,psmisc,\
+    selinux-utils,policycoreutils,checkpolicy,selinux-policy-default \
+    stretch rootfs
+    set -eux
+    # Set some defaults and enable promtless ssh to the machine for root.
+    sudo sed -i '/^root/ { s/:x:/::/ }' rootfs/etc/passwd
+    echo 'T0:23:respawn:/sbin/getty -L ttyS0 115200 vt100' | sudo tee -a rootfs/etc/inittab
+    #printf '\nauto enp0s3\niface enp0s3 inet dhcp\n' | sudo tee -a qemu/etc/network/interfaces
+    printf '\nallow-hotplug enp0s3\niface enp0s3 inet dhcp\n' | sudo tee -a rootfs/etc/network/interfaces
+    echo 'debugfs /sys/kernel/debug debugfs defaults 0 0' | sudo tee -a rootfs/etc/fstab
+    echo "kernel.printk = 7 4 1 3" | sudo tee -a rootfs/etc/sysctl.conf
+    echo 'debug.exception-trace = 0' | sudo tee -a rootfs/etc/sysctl.conf
+    echo "net.core.bpf_jit_enable = 1" | sudo tee -a rootfs/etc/sysctl.conf
+    echo "net.core.bpf_jit_harden = 2" | sudo tee -a rootfs/etc/sysctl.conf
+    echo "net.ipv4.ping_group_range = 0 65535" | sudo tee -a rootfs/etc/sysctl.conf
+    echo -en "127.0.0.1\tlocalhost\n" | sudo tee rootfs/etc/hosts
+    echo "nameserver 8.8.8.8" | sudo tee -a rootfs/etc/resolve.conf
+    echo "ubuntu" | sudo tee rootfs/etc/hostname
+    sudo mkdir -p rootfs/root/.ssh/
+    rm -rf ssh
+    mkdir -p ssh
+    ssh-keygen -f ssh/id_rsa -t rsa -N ''
+    cat ssh/id_rsa.pub | sudo tee rootfs/root/.ssh/authorized_keys
+    # Build a disk image
+    dd if=/dev/zero of=rootfs.img bs=1M seek=2047 count=1
+    sudo mkfs.ext4 -F rootfs.img
+    sudo mkdir -p /mnt/rootfs
+    sudo mount -o loop rootfs.img /mnt/rootfs
+    sudo cp -a rootfs/. /mnt/rootfs/.
+    sudo umount /mnt/rootfs
+然后是编译内核，对应的内核文件路径为`./linux-5.2.11/arch/x86/boot/bzImage`：
+    wget https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.2.11.tar.xz -O linux-5.2.11.tar.xz
+    tar -xvf linux-5.2.11.tar.xz
+    make defconfig
+    make kvmconfig
+    #编辑 .config 文件， 将 CONFIG_8139CP=y 和 CONFIG_PCNET32=y 打开
+    make -j4
+要确保下面两个配置选项是打开的， 否则系统启动的时候会出现发现启动网卡的错误，因为对应的网卡驱动没有编译进去。
+    CONFIG_8139CP=y  , rtl8139 驱动
+    CONFIG_PCNET32=y , pcnet 驱动
+然后使用下面的`launch.sh`就可以启动虚拟机了，因为将`22`端口转发到了本地的`10021`端口，所以可以通过`ssh -i
+./ssh/id_rsa -p 10021 root@localhost`，登进去虚拟机对虚拟机进行管理，以及通过`scp`传递文件。
+    $ cat launch.sh
+    #!/bin/sh
+    ./qemu/bin/debug/native/x86_64-softmmu/qemu-system-x86_64 \
+        -kernel ./linux-5.2.11/arch/x86/boot/bzImage  \
+        -append "console=ttyS0 root=/dev/sda rw"  \
+        -hda ./rootfs.img  \
+        -enable-kvm -m 2G -nographic \
+        -netdev user,id=t0, -device rtl8139,netdev=t0,id=nic0 \
+        -netdev user,id=t1, -device pcnet,netdev=t1,id=nic1 \
+        -net user,hostfwd=tcp::10021-:22 -net nic
+## 漏洞分析
+在开始漏洞分析之前需要先介绍下`rtl8139`的部分寄存器，与漏洞相关部分如下：
+                +---------------------------+----------------------------+
+        0x00    |           MAC0            |            MAR0            |
+                +---------------------------+----------------------------+
+        0x10    |                       TxStatus0                        |
+                +--------------------------------------------------------+
+        0x20    |                        TxAddr0                         |
+                +-------------------+-------+----------------------------+
+        0x30    |        RxBuf      |ChipCmd|                            |
+                +-------------+------+------+----------------------------+
+        0x40    |   TxConfig  |  RxConfig   |            ...             |
+                +-------------+-------------+----------------------------+
+                |                                                        |
+                |             skipping irrelevant registers              |
+                |                                                        |
+                +---------------------------+--+------+------------------+
+        0xd0    |           ...             |  |TxPoll|      ...         |
+                +-------+------+------------+--+------+--+---------------+
+        0xe0    | CpCmd |  ... |RxRingAddrLO|RxRingAddrHI|    ...        |
+                +-------+------+------------+------------+---------------+
+其在qemu中对应的结构体为`RTL8139State`，其中比较关键的部分如下：
+  * `TxConfig`：开启/关闭Tx的标记，包括TxLoopBack （开启loopback测试模式）以及TxCRC (Tx包是否添加校验码)。
+  * `RxConfig`：开启/关闭Rx的标记，比如AcceptBroadcast（接收广播包）， AcceptMulticast（接收组播包）等。
+  * `CpCmd`：C+指令寄存器用来执行一些函数，比如 CplusRxEnd（允许接收），CplusTxEnd（允许发送）等。
+  * `TxAddr0`：Tx表的物理内存地址。
+  * `RxRingAddrLO`：Rx表的物理内存地址的低32位。
+  * `RxRingAddrHI`：Rx表的物理内存地址的高32位。
+  * `TxPoll`：告诉网卡检查Tx缓冲区。
+经过对代码的学习，知道了Tx缓冲区是网卡的发送数据缓冲区，而Rx缓冲区则是接收数据缓冲区。Tx表以及Rx表为一个16字节结构体大小的数组，该表中的`rtl8139_desc`包含缓冲区的具体位置，定义如下：
+    struct rtl8139_ring {
+            struct rtl8139_desc *desc;
+            void                *buffer;
+    };
+其中Rx/Tx-descriptor定义如下，`dw0`中包含一些标志位，`buf_lo`和`buf_hi`表示Tx/Rx缓冲的物理内存地址的低32位和高32位，这些地址指向存储要发送/接收的包的缓冲区，必须与页面大小对齐：
+    struct rtl8139_desc {
+            uint32_t dw0;
+            uint32_t dw1;
+            uint32_t buf_lo;
+            uint32_t buf_hi;
+    };
+`rtl8139`网卡对应的文件在`/hw/net/rtl8139.c`中，首先是漏洞关键部分代码，在函数`rtl8139_cplus_transmit_one`中，该函数更多的是和tx寄存器相关，发送的数据是Tx缓冲区中的数据（可控），检查的相关标志位为txdw0：
+            uint8_t *saved_buffer  = s->cplus_txbuffer;
+            int      saved_size    = s->cplus_txbuffer_offset;
+            int      saved_buffer_len = s->cplus_txbuffer_len;
+            ...
+            if (txdw0 & (CP_TX_IPCS | CP_TX_UDPCS | CP_TX_TCPCS | CP_TX_LGSEN))
+            {
+                DPRINTF("+++ C+ mode offloaded task checksum\n");
+                /* ip packet header */
+                ip_header *ip = NULL;
+                int hlen = 0;
+                uint8_t  ip_protocol = 0;
+                uint16_t ip_data_len = 0;
+                uint8_t *eth_payload_data = NULL;
+                size_t   eth_payload_len  = 0;
+                int proto = be16_to_cpu(*(uint16_t *)(saved_buffer + 12));
+                if (proto == ETH_P_IP)
+                {
+                    DPRINTF("+++ C+ mode has IP packet\n");
+                    /* not aligned */
+                    eth_payload_data = saved_buffer + ETH_HLEN;
+                    eth_payload_len  = saved_size   - ETH_HLEN;
+                    ip = (ip_header*)eth_payload_data;
+                    if (IP_HEADER_VERSION(ip) != IP_HEADER_VERSION_4) {
+                        DPRINTF("+++ C+ mode packet has bad IP version %d "
+                            "expected %d\n", IP_HEADER_VERSION(ip),
+                            IP_HEADER_VERSION_4);
+                        ip = NULL;
+                    } else {
+                        hlen = IP_HEADER_LENGTH(ip);
+                        ip_protocol = ip->ip_p;
+                        ip_data_len = be16_to_cpu(ip->ip_len) - hlen;
+                          }
+                }
+漏洞的关键代码为`ip_data_len = be16_to_cpu(ip->ip_len) -hlen`，没有对`ip->ip_len`的长度以及`hlen`进行检查，`hlen`为20，当`be16_to_cpu(ip->ip_len)`小于20时，会导致`ip_data_len`为负数。因为`ip_data_len`的变量类型为`uint16_t`，所以会在最后发送ip数据包时将负数当成正数来发送，导致多余的数据泄露出来。
+下面先看当`ip_data_len`为负数时，数据时如何泄露出来的，关键代码如下：
+                        ...
+                        /* pointer to TCP header */
+                        tcp_header *p_tcp_hdr = (tcp_header*)(eth_payload_data + hlen);
+                        /* ETH_MTU = ip header len + tcp header len + payload */
+                        int tcp_data_len = ip_data_len - tcp_hlen;
+                        int tcp_chunk_size = ETH_MTU - hlen - tcp_hlen;
+                        ...
+                        /* note the cycle below overwrites IP header data,
+                           but restores it from saved_ip_header before sending packet */
+                        int is_last_frame = 0;
+                        for (tcp_send_offset = 0; tcp_send_offset < tcp_data_len; tcp_send_offset += tcp_chunk_size)
+                        {

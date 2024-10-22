@@ -1,0 +1,162 @@
+close(12)                               = 0  
+lstat("base/16384/305700", {st_mode=S_IFREG|0600, st_size=8192, ...}) = 0  
+open("base/16384/305700", O_RDONLY)     = 12  
+open("base/24795111/305700", O_RDWR|O_CREAT|O_EXCL, 0600) = 13  
+read(12, "\0\0\0\0\30p\234+\0\0\0\0000\0\360\37\360\37\4 \0\0\0\0b1\5\0\2\0\0\0"..., 65536) = 8192  
+write(13, "\0\0\0\0\30p\234+\0\0\0\0000\0\360\37\360\37\4 \0\0\0\0b1\5\0\2\0\0\0"..., 8192) = 8192  
+sync_file_range(0xd, 0, 0x2000, 0x2)    = 0  
+read(12, "", 65536)                     = 0  
+close(13)                               = 0  
+close(12)                               = 0  
+lstat("base/16384/639437", {st_mode=S_IFREG|0600, st_size=8192, ...}) = 0  
+```  
+7\. 删除单个schema   
+```  
+\c test  
+drop schema s1 cascade;  
+```  
+耗时3秒 。  
+备库XLOG延迟773字节 。    
+备库XLOG延迟平复时间  27秒 。   
+相差9倍的时间。所以你需要注意这一点。  
+8\. 删除刚刚创建的数据库  
+```  
+drop database  test;  
+```  
+耗时1分钟 。  
+备库XLOG延迟176字节 。    
+备库XLOG延迟平复时间  30秒，实际上没有差别，因为drop database结束后，才产生XLOG，然后这笔XLOG还需要在备库apply，所以drop database实际上是没有延迟的 。  
+9\. 多次通过模板创建并删除（非常多小文件的）数据库，依旧会导致备库startup进程慢，延迟   
+```
+create database test1 with template tmp1;
+drop database test1;
+```
+```
+startup perf
+    99.76%  postgres  postgres           [.] remove_from_unowned_list
+            |
+            --- remove_from_unowned_list
+                smgrclose
+                smgrcloseall
+                XLogDropDatabase
+                dbase_redo
+                StartupXLOG
+                StartupProcessMain
+                AuxiliaryProcessMain
+                StartChildProcess
+                PostmasterMain
+                startup_hacks
+                __libc_start_main
+```
+#### 奇怪现象
+有几次startup, checkpoint进程CPU 100%，卡在close()系统调用时，使用pg_ctl stop -m immediate强行关库后，重启，就快了。    
+猜测mark一下，回头看看代码，难道shared buffer中存储了什么fd list？停库后没有了，所以不需要挨个close()快了？   
+src/backend/catalog/storage.c   
+```
+typedef struct PendingRelDelete
+{
+        RelFileNode relnode;            /* relation that may need to be deleted */
+        BackendId       backend;                /* InvalidBackendId if not a temp rel */
+        bool            atCommit;               /* T=delete at commit; F=delete at abort */
+        int                     nestLevel;              /* xact nesting level of request */
+        struct PendingRelDelete *next;          /* linked-list link */
+} PendingRelDelete;
+/*
+ * RelationDropStorage
+ *              Schedule unlinking of physical storage at transaction commit.
+ */
+void
+RelationDropStorage(Relation rel)
+{
+        PendingRelDelete *pending;
+        /* Add the relation to the list of stuff to delete at commit */
+        pending = (PendingRelDelete *)
+                MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+        pending->relnode = rel->rd_node;
+        pending->backend = rel->rd_backend;
+        pending->atCommit = true;       /* delete if commit */
+        pending->nestLevel = GetCurrentTransactionNestLevel();
+        pending->next = pendingDeletes;
+        pendingDeletes = pending;
+        /*
+         * NOTE: if the relation was created in this transaction, it will now be
+         * present in the pending-delete list twice, once with atCommit true and
+         * once with atCommit false.  Hence, it will be physically deleted at end
+         * of xact in either case (and the other entry will be ignored by
+         * smgrDoPendingDeletes, so no error will occur).  We could instead remove
+         * the existing list entry and delete the physical file immediately, but
+         * for now I'll keep the logic simple.
+         */
+        RelationCloseSmgr(rel);
+}
+```
+### 优化  
+1\. 修改操作系统打开文件限制  
+```  
+vi /etc/sysctl.conf  
+fs.nr_open=10240000  
+sysctl -p  
+```  
+```  
+vi /etc/security/limits.conf  
+* soft    nofile  10240000  
+* hard    nofile  10240000  
+```  
+2\. 修改数据库打开文件限制  
+```  
+vi postgresql.conf  
+max_files_per_process = 2048000  
+```  
+3\. 使用新的ulimit值，重启数据库  
+通常退出Linux会话，重新登录即可  
+```  
+pg_ctl restart -m fast  
+```  
+4\. 备库关闭 fsync 将缩短至几乎0延迟  
+在有多个备库的情况下，如果考虑性能，关闭某些备库的fsync也未尝不可。  
+例如内存数据库voltdb，就是类似的。  
+# 补充(20180808)
+## schema实现多租户  
+1、不同租户数据放在不同的schema下面  
+2、通过设置search_path，访问不同schema下面的数据。（如此，不需要每次都引用schema name）  
+3、当租户需要独立计费时，可以将租户整个schema的数据从共享实例中迁移到独立实例。  
+### 好处  
+1、相比DB模式，SCHEMA模式下连接可以复用。(ip:port:user:pwd:db) ，同一个用户连接同一个DB的连接，可以复用。  
+2、多租户隔离后，数据按租户分别存储，IO放大减少，提升性能。  
+3、schema提供了一定的隔离性。权限、存储。  
+4、相比DB节约元数据资源（INODE），DB为单位  
+5、相比租户数据混合存到同样的表里面，使用租户字段的方式隔离。SCHEAM降低了单表大小，同时隔离了数据，查询，写入效率更佳。  
+6、相比使用分区的方式。SCHEAM的方式完全可以模板化，而分区不行，也不利于方便的剥离租客。  
+7、、好迁移，一个租户的数据在同一个schema里面，整个schema迁移。  
+8、好升级扩容，租户的数据分布在不同的schema里面，升级单个租户的数据库时，迁移到新实例即可。  
+### 内核层面增强  
+PostgreSQL增加了一个application_name参数，可以识别会话  
+通过增加对application_name的识别（不同租户使用同一个用户连接，但是使用不同的application_name），提供一些限流功能（权限，连接数，资源限制等）。  
+## 小结
+1\. schema和database在物理结构上的差别  
+database是以目录的形式组织在表空间的目录下的，而schema是以文件的形式在数据库的目录下的，没有再细分独立的目录。   
+所以在drop database时系统调用变得更简单，而drop schema需要挨个文件来。  
+2\. schema和database在元数据上的差别  
+简单来说就是比擦屁股的动作, drop database擦屁股很快，因为元数据很少只影响pg_databases。    
+drop schema擦屁股就很烦了，要挨个清理pg_class, pg_attribute, 等等元表。 ?元表清理完还需要vacuum。   
+3\. create 和 drop schema的文件操作很多，是一个个文件进行的，而且都会记录在REDO中，如果schema中有很对对象并且有很多文件的话，会非常慢。  
+4\. create 和 drop database产生的日志少，系统调用也更少。   
+schema不建议作为daas的模板环境频繁(新增和删除时)使用，如果要频繁的创建和删除模板，建议使用database作为模板。 ?
+database作为模板的一个缺点是连接复用的问题，因为连接复用需要基于user+database，如果有很多DB的话，连接可能会消耗很多。    
+5\. 当数据库中有很多实体对象时，文件数会非常庞大，而对于Linux操作系统来说，单个进程的打开文件数是有限制的。PostgreSQL数据库新增了一层文件句柄管理，使用文件句柄池来管理文件的打开和关闭。  
+但是如果需要打开或关闭的文件数特别多（例如 某个业务一下子创建了几十万张表，然后做检查点），文件句柄池就会不停的切换，成为系统的瓶颈。  
+所以增加进程的打开文件句柄限制，也是优化方法之一。  
+## drop schema的数据库内核优化点
+把schema放到database下，新增一个目录存放。删除的时候可以drop dir，但是清理元数据还是少不了的。    
+schema与其他schema之间的一些依赖关系也需要清理(可能涉及元数据的清理)。    
+## 社区内核已优化解决
+https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=b41669118c00e25376a6c9ac991e0d074990484a  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

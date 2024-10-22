@@ -1,0 +1,151 @@
+**作者： pass、neargle @腾讯安全平台部  
+原文链接：**
+**本次KCon 2021黑客大会中也有关于容器逃逸的议题，详情请查看：  
+**
+## 前言
+容器安全是一个庞大且牵涉极广的话题，而容器的安全隔离往往是一套纵深防御的体系，牵扯到AppArmor、Namespace、Capabilities、Cgroup、Seccomp等多项内核技术和特性，但安全却是一处薄弱则全盘皆输的局面，一个新的内核特性可能就会让看似无懈可击的防线存在突破口。随着云原生技术的快速发展，越来越多的容器运行时组件在新版本中会默认配置AppArmor策略，原本我们在《红蓝对抗中的云原生漏洞挖掘及利用实录》介绍的多种容器逃逸手法会逐渐失效；因此我们希望能碰撞出一些攻击手法，进而突破新版本容器环境的安全能力，并使用更契合容器集群的新方式把“任意文件写”转化为“远程代码执行”，从而提前布防新战场。
+结合腾讯蓝军近几年在云原生安全上的积累以及我们在WHC2021上分享的关于《多租户容器集群权限提升的攻防对抗》的议题，本文将着重探讨内核特性eBPF对容器安全性的挑战和云原生攻防场景下的实践。
+## 使用eBPF的容器逃逸技术
+### eBPF简介
+eBPF作为传统BPF的后继者，自内核3.17版本开始进入Linux内核。它提供了一种无需加载内核模块也能在内核里执行代码的功能，方式是在内核中实现了一个虚拟机，用于执行经过安全检查的字节码。
+eBPF可以应用在安全、跟踪、性能分析、网络数据包处理、观测、监控等不同领域。
+eBPF可以使用c语法的子集来编写，然后使用LLVM编译出eBPF字节码。
+作为一个较新的内核特性，近些年来有许多利用这项新技术来解决一些安全问题的讨论和研究。使用eBPF我们可以使用诸如 `kprobe` 、
+`tracepoint`
+的跟踪技术，因此在防御的角度，可以用于实现HIDS、各种日志的监控等；而站在攻击者的角度，eBPF可以任意修改用户空间的内存，可以挂钩网络数据，这提供了很好的捷径用于编写
+`Rootkit` ，同时作为一个新的内核特性，也给了漏洞挖掘人员一个新攻击面。
+本文不过多描述eBPF的核心概念、eBPF程序如何编写，展开讲会失去文章的重点，下面给出几个文章可以帮助读者快速了解eBPF和入门知识：
+  * What is eBPF[1] 
+  * BPF and XDP Reference Guide[2] 
+  * The art of writing eBPF programs: a primer.[3] 
+### 新的弱点
+Docker使用AppArmor来进一步限制容器，保证隔离的安全，其中有一个让很多逃逸技术失效的限制是禁用了mount(https://github.com/moby/moby/blob/4283e93e6431c5ff6d59aed2104f0942ae40c838/profiles/apparmor/template.go#L44)，换言之，即使攻击者获取了一个
+`CAP_SYS_ADMIN` 权限的容器，他也很难用一些和file
+system有关的逃逸手法。那有没有什么不需要和各种伪文件系统交互的方法呢？有一些，比如如果有 `CAP_DAC_READ_SEARCH`
+权限，那么可以使用系统调用来实现逃逸至宿主机的root file
+system。从内核4.17版本开始，可以通过`perf_event_open`来创建`kprobe`和`uprobe`，并且`tracepoint`子系统新增了一个`raw_tracepoint`类型，该类型也是可以通过简单的系统调用来使用，结合eBPF的使用，这就给了攻击者可乘之机。
+### 容器逃逸分析
+要想使用eBPF，需要一些权限和挂载伪文件系统，下表展示了eBPF kprobe、tracepoint使用的条件：
+特性/功能 | 要求  
+---|---  
+bpf系统调用 | 拥有CAP_SYS_ADMIN; kernel 5.8开始拥有CAP_SYS_ADMIN或者CAP_BPF  
+Unprivileged bpf - "socket filter" like |
+kernel.unprivileged_bpf_disabled为0或拥有上述权限  
+perf_event_open系统调用 | 拥有CAP_SYS_ADMIN; kernel
+5.8开始拥有CAP_SYS_ADMIN或者CAP_PERFMON  
+kprobe | 需要使用tracefs; kernel 4.17后可用perf_event_open创建  
+tracepoint | 需要使用tracefs  
+raw_tracepoint | kernel 4.17后通过bpf调用BPF_RAW_TRACEPOINT_OPEN即可  
+eBPF program作为附加在内核特定hook point的应用，在加载eBPF
+program时，并不会考虑被hook的进程是处于哪个namespace，又处于哪个cgroup，换句话说即使处在容器内，也依旧可以hook容器外的进程。
+Linux kernel为eBPF程序提供了一系列固定的函数，这些函数被称为 `BPF-HELPERS`
+，它们为eBPF程序提供了一定程度上的内核功能，可以使用 `man bpf-helpers` 来查看有哪些helper。而不同的eBPF program
+type能调用的helper也不同，关于tracing的helper里比较有意思的是下面几个：
+  * bpf_probe_read：安全地从内核空间读取数据 
+  * bpf_probe_write_user：尝试以一种安全的方式向用户态空间写数据 
+  * bpf_override_return：用于 `error injection` ，可以用于修改kprobe监控的函数返回值 
+这些helper提供了读写整个机器上任意进程用户态空间的功能，同时提供了内核空间的读取数据功能，当攻击者能向内核加载eBPF程序，那么有许多种办法进行权限提升或者容器逃逸：
+  * 读取内核空间里的敏感信息，或者hook关键系统调用的返回点，获取其他进程空间里的敏感信息 
+  * 修改其他高权限进程里的数据，注入shellcode或者改变进程关键执行路径执行自己的命令 
+  * 其他更有想象力的方法... 
+需要注意的是eBPF无法改变进入Syscall时的参数，但是可以改变用户态进程空间里的内存数据。
+有了上述思路，shellcode暂且不论，有什么进程或服务是linux各个发行版最常见，并且可以拿来执行命令的呢？对，那就是安全和运维的老朋友 `cron`
+了。 `cron`
+作为计划任务用的linux最常见服务，可以定时执行任务，甚至可以指定用户，而且由于需要及时更新配置文件，调用相关文件syscall十分频繁，用eBPF来hook再简单不过。
+`cron` 其实有许多不同的实现，因此若从蓝军角度来看需要针对不同的cron实现进行分析，这里挑选 `vixie-cron`
+(https://github.com/vixie/cron)作为分析对象， `vixie-cron` 是一个较多linux发行版使用的cron实现，像
+`debian` 、 `centos` 都是用的这个实现，当然不同发行版也会有一些定制修改，这个在稍后分析中会简单提及。
+### vixie-cron分析
+`vixie-cron` 的整体逻辑比较简单，它有一个主循环，每次等待一段时间后都会执行任务并加载 `cron`
+的一些配置文件，加载相关的配置文件的关键函数 `load_database`
+位于https://github.com/vixie/cron/blob/690fc534c7316e2cf6ff16b8e83ba7734b5186d2/database.c#L47。
+在正式读取配置之前，它会先获取一些文件和目录的文件信息：
+        load_database(cron_db *old_db) {
+        // ...
+        /* before we start loading any data, do a stat on SPOOL_DIR
+         * so that if anything changes as of this moment (i.e., before we've
+         * cached any of the database), we'll see the changes next time.
+         */
+        if (stat(SPOOL_DIR, &statbuf) mtim, TMAX(statbuf.st_mtim, syscron_stat.st_mtim))) {
+            Debug(DLOAD, ("[%ld] spool dir mtime unch, no load needed.\n",
+                      (long)getpid()))
+            return;
+        }
+        // ...
+        if (!TEQUAL(syscron_stat.st_mtim, ts_zero))
+            process_crontab("root", NULL, SYSCRONTAB, &syscron_stat,
+                    &new_db, old_db);
+这两个判断比较有意思的地方是当老的配置的 `mtime` 和新的文件 `mtime` 不同即可进入处理流程，而新的文件 `mtime` 是
+`SPOOL_DIR` 和 `SYSCRONTAB` 中的最大值。
+从上述分析可以得出结论，当我们用eBPF程序去attach `stat` syscall返回的时候，如果能够修改返回的`struct
+stat`buf里的数据，就可以成功让 `vixie-cron`立刻去处理`/etc/crontab`。
+最后在 `process_crontab` 里还有一次判断：
+    if (fstat(crontab_fd, statbuf) mtim, statbuf->st_mtim)) {
+                Debug(DLOAD, (" [no change, using old data]"))
+                unlink_user(old_db, u);
+                link_user(new_db, u);
+                goto next_crontab;
+            }
+只是这处判断用的是 `fstat` 。
+### eBPF program编写
+内核提供给用户使用的仅仅是 `bpf` 系统调用，因此有一系列工具来帮助使用者更方便简单地编写和使用eBPF。比较主流的两个前端是 `bcc`
+(https://github.com/iovisor/bcc)和 `libbpf`
+(https://github.com/libbpf/libbpf)。考虑到部署的方便性，如果使用bcc，它的大量依赖会影响蓝军实战中的可用性，所以本文在编写测试的时候使用的是libbpf，而且libbpf有社区提供的一个“脚手架”：https://github.com/libbpf/libbpf-bootstrap 。使用这个也可以非常方便快捷地开发出自己的eBPF program。
+本文修改libbpf-bootstrap中的minimal示例程序来加载自己的eBPF program。接下来就让我们了解一下整个eBPF程序的完整流程。
+    #define BPF_NO_PRESERVE_ACCESS_INDEX
+    #include "vmlinux.h"
+    #include 
+    #include 
+    // ...
+libbpf-bootstrap自带的 `vmlinux.h` 是通过 `bpftool` 导出的内核数据结构的定义，这个文件主要是用于实现bpf的
+`CO-RE` ，即编译一次到处执行，这里只是用到了 `vmlinux.h` 里带的内核数据结构的定义。
+`BPF_NO_PRESERVE_ACCESS_INDEX` 实际上是 `vmlinux.h` 里的一个 `BTF`
+引用开关，如果没有定义这个宏，那么在eBPF中任意引用了 `vmlinux.h` 中的数据结构定义都会在clang生成的eBPF
+object文件里留下记录，这样编译出来的eBPF程序如果在没有嵌入 `BTF`
+类型信息的内核上是无法加载的，这里为了保证能稳定加载，所以关闭了clang生成 `BTF` 重定向信息的功能。
+本文挑选的是使用 `raw_tracepoint` 来hook系统调用， `raw_tracepoint/sys_enter`
+用于将eBPF程序attach到进入系统调用时：
+    // ...
+    #define TARGET_NAME "cron"
+    // ...
+    SEC("raw_tracepoint/sys_enter")
+    int raw_tp_sys_enter(struct bpf_raw_tracepoint_args *ctx)
+    {
+        unsigned long syscall_id = ctx->args[1];
+        char comm[TASK_COMM_LEN];
+        bpf_get_current_comm(&comm, sizeof(comm));
+        // executable is not cron, return
+        if (memcmp(comm, TARGET_NAME, sizeof(TARGET_NAME)))
+            return 0;
+        switch (syscall_id)
+        {
+            case 0:
+                handle_enter_read(ctx);
+                break;
+            case 3:  // close
+                handle_enter_close(ctx);
+                break;
+            case 4:
+                handle_enter_stat(ctx);
+                break;
+            case 5:
+                handle_enter_fstat(ctx);
+                break;
+            case 257:
+                handle_enter_openat(ctx);
+                break;
+            default:
+                return 0;
+        }
+    }
+这个eBPF程序比较简单，判断进程文件名是否是我们想要的进程文件，这里是 `cron` ，接下来根据系统调用进入不同的逻辑。
+不过光hook进入syscall可不够，我们需要在syscall返回时马上修改已经返回至用户态空间的返回数据，比如说 `struct stat`
+buf，因此还要再来一个eBPF程序：
+    SEC("raw_tracepoint/sys_exit")
+    int raw_tp_sys_exit(struct bpf_raw_tracepoint_args *ctx)
+    {
+        if (cron_pid == 0)
+            return 0;
+        int pid = bpf_get_current_pid_tgid() & 0xffffffff;
+        if (pid != cron_pid)
+            return 0;

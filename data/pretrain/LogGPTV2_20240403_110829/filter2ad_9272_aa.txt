@@ -1,0 +1,95 @@
+# 前言
+将目光聚焦到2018年10月，我注意到 Niklas
+Baumstark发表了一篇关于VirtualBox的chromium库的一篇[文章](https://phoenhex.re/2018-07-27/better-slow-than-sorry "文章")。在这之后的两周，我发现并报告了十几个可以轻松实现虚拟机逃逸的漏洞。但VM逃逸的原理都千篇一律。  
+2018年12月底，我注意到Niklas发了一条关于3C35
+CTF的推文，他称VirtualBox挑战chromacity尚未被任何人解决。这句话勾起了我的好奇心，我想要成为第一个攻克这个难题的人。
+# 挑战
+挑战是要以64位xubuntu上以VirtualBox v5.2.22为目标，实现虚拟机逃逸。这个挑战包含了一个提示，提示是API
+`glShaderSource()`文档的一张图片。起初，我认为是出题方为了出题人为地在这个函数中注入了一个bug，然而，在查看了它在chromium中的实现之后，我意识到这个bug是真实存在的。
+# 漏洞
+下面是`src/VBox/HostServices/SharedOpenGL/unpacker/unpack_shaders.c`的代码摘录
+    void crUnpackExtendShaderSource(void)
+    {
+        GLint *length = NULL;
+        GLuint shader = READ_DATA(8, GLuint);
+        GLsizei count = READ_DATA(12, GLsizei);
+        GLint hasNonLocalLen = READ_DATA(16, GLsizei);
+        GLint *pLocalLength = DATA_POINTER(20, GLint);
+        char **ppStrings = NULL;
+        GLsizei i, j, jUpTo;
+        int pos, pos_check;
+        if (count >= UINT32_MAX / sizeof(char *) / 4)
+        {
+            crError("crUnpackExtendShaderSource: count %u is out of range", count);
+            return;
+        }
+        pos = 20 + count * sizeof(*pLocalLength);
+        if (hasNonLocalLen > 0)
+        {
+            length = DATA_POINTER(pos, GLint);
+            pos += count * sizeof(*length);
+        }
+        pos_check = pos;
+        if (!DATA_POINTER_CHECK(pos_check))
+        {
+            crError("crUnpackExtendShaderSource: pos %d is out of range", pos_check);
+            return;
+        }
+        for (i = 0; i = INT32_MAX - pLocalLength[i] || !DATA_POINTER_CHECK(pos_check))
+            {
+                crError("crUnpackExtendShaderSource: pos %d is out of range", pos_check);
+                return;
+            }
+            pos_check += pLocalLength[i];
+        }
+        ppStrings = crAlloc(count * sizeof(char*));
+        if (!ppStrings) return;
+        for (i = 0; i  0);
+            jUpTo = i == count -1 ? pLocalLength[i] - 1 : pLocalLength[i];
+            for (j = 0; j < jUpTo; ++j)
+            {
+                char *pString = ppStrings[i];
+                if (pString[j] == '\0')
+                {
+                    Assert(j == jUpTo - 1);
+                    pString[j] = '\n';
+                }
+            }
+        }
+    //    cr_unpackDispatch.ShaderSource(shader, count, ppStrings, length ? length : pLocalLength);
+        cr_unpackDispatch.ShaderSource(shader, 1, (const char**)ppStrings, 0);
+        crFree(ppStrings);
+    }
+此方法使用宏`READ_DATA`获取用户数据。它只需读取客户机使用HGCM接口发送的消息(此消息存储在堆中)。然后调整输入并将其传递给`cr_unpackDispatch.ShaderSource()`。  
+第一个明显的攻击点是`crAlloc(count *
+sizeof(char*))`。检查变量count是否在某个(正)范围内。但是，因为它是一个带符号的整数，所以也应该检查负数。如果我们选择`count`足够大，例如`0x80000000`，由于整数溢出(这里的所有变量都是32位)，与`sizeof(char*)==8`的乘法都将生成0。理想情况下，由于分配的缓冲区太小而`count`太大，这可能导致堆溢出。然而，这段代码并不容易受到此类攻击，因为如果count为负值，则根本不会执行循环(变量i是有符号的，因此它的比较也是有符号的)。  
+实际的漏洞不太明显。即在第一个循环中，`pos_check`增加了一个数组的长度。在每次迭代中，都会验证地址，以确保总长度仍然在范围内。这段代码的问题是，pos_check只在下一次迭代中测试是否越界。这意味着数组的最后一个元素从未经过测试，并且可以任意大。  
+缺少验证会产生什么影响？本质上，在嵌套循环中，j表示`pString`的索引，并从0计数到`pLocalLength[i]`。这个循环将每个`\0`字节转换为一个`\n`字节。对于任意长度，我们可以使循环超出边界，并且由于pString指向堆上的HGCM消息中的数据，这实际上是一个堆溢出问题。
+# Exploitation
+即使我们不能溢出可控内容，如果我们明智地利用它，我们仍然可以获得任意代码执行。对于漏洞利用，我们将使用[3dpwn](https://github.com/niklasb/3dpwn
+"3dpwn")，这是一个专为攻击3D加速而设计的库。我们将大量使用`CRVBOXSVCBUFFER_t`对象，这也是之前[研究的目标](https://github.com/niklasb/3dpwn/blob/master/CVE-2018-3055%2B3085/README.md
+"研究的目标")。它包含一个唯一的ID，一个可控制的大小，一个指向guest虚拟机可以写入的实际数据的指针，以及最后一个双向链表的下一个/前一个指针：
+    typedef struct _CRVBOXSVCBUFFER_t {
+        uint32_t uiId;
+        uint32_t uiSize;
+        void*    pData;
+        _CRVBOXSVCBUFFER_t *pNext, *pPrev;
+    } CRVBOXSVCBUFFER_t;
+此外，我们还将使用`CRConnection`对象，该对象包含各种函数指针和指向缓冲区的指针，guest可以读取缓冲区。  
+如果我们破坏前一个对象，我们可以得到一个任意的写原语，如果我们破坏了后一个对象，我们就可以得到一个任意的读原语和任意的代码执行。
+## 策略
+1.泄漏`CRConnection`对象的指针。  
+2.向堆中喷射大量`CRVBOXSVCBUFFER_t`对象并保存它们的ID。  
+3.执行`glShaderSource()`并利用我们的恶意信息占领这个漏洞。然后，易受攻击的代码将使其溢出到相邻的对象中—理想情况下是溢出到`CRVBOXSVCBUFFER_t`中。我们试图破坏它的ID和大小，以使第二个堆溢出，以此类推，我们将会有更多的控制权。  
+4.查找ID列表，看看其中一个是否丢失了。缺少的ID应该是使用换行符损坏的ID。  
+5.用此ID中的换行符替换所有零字节以获取损坏的ID。  
+6.此损坏的对象现在的长度将大于原来的长度。我们将使用它溢出到第二个`CRVBOXSVCBUFFER_t`，并使它指向`CRConnection`对象。  
+7.最后，我们可以控制CRConnection对象的内容，如前所述，我们可以破坏它来实现任意读取原语和任意代码执行。  
+8.找出system()的地址，并用它覆盖函数指针Free()。  
+9.在主机上运行任意命令。
+# 堆信息披露
+由于我们的目标是VirtualBox
+v5.2.22，所以它不容易受到[CVE-2018-3055](https://www.zerodayinitiative.com/advisories/ZDI-18-684/
+"CVE-2018-3055")的攻击，因为针对CVE-2018-3055，v5.2.20已经打了补丁。  
+该漏洞被利用来泄漏CRConnection地址，为了攻克难题，我们是否应该使用新的信息？还是重新设计漏洞利用战略？  
+令人惊讶的是，即使在v5.2.22版本中，上面提到的代码仍然能够泄漏我们想要的对象！怎么可能呢？不是已经打好补丁了吗？如果我们仔细观察，就会发现分配的对象的大小为0x290字节，而连接的OFFSET_CONN_CLIENT为0x248。这并不是真正的越界！

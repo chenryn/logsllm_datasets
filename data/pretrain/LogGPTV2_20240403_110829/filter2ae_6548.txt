@@ -1,0 +1,228 @@
+**作者：b1cc@墨云科技VLab Team  
+原文链接：**
+2021年10月12日，日本安全厂商 Flatt security 披露了 Linux
+内核提权漏洞`CVE-2021-34866`。11月5日，@HexRabbit 在 Github
+上公布了此漏洞的利用方式，并写文分析，技术高超，行文简洁。但作为初次研究相关内容，笔者做了一些较基础的内容补充。
+## eBPF
+eBPF 是一种在访问内核服务和硬件的新技术。在这项技术诞生之前，如果需要在 Linux
+内核执行定制的代码有两种方式，一是提交代码到原生内核项目中，不用赘述其难度；二是使用内核模块，以扩展的方式添加代码到内核执行，可以在运行时动态加载和卸载。但内核模块也有明显的缺点：需要对每个内核版本进行适配；如果代码有问题容易导致内核崩溃。
+eBPF 可以较好地解决在内核空间实现自定义代码的问题。eBPF 是 Linux
+内核中高度灵活和高效的类似虚拟机的技术，有自己的字节码语法和特定的编译器，允许以安全的方式在各个挂钩点执行字节码。它可用于许多 Linux
+内核子系统，最突出的是网络、跟踪和安全。
+在实现上，通过调用`bpf_prog_load()`可以创建 eBPF 程序。其中需传入一个包含 eBPF 指令的结构体`bpf_insn`。
+### Verifier
+安全性是 eBPF 的突出特点。如果需要加载一个 eBPF 程序到内核中，需要通过`Verifier`的检查。它会检查 eBPF
+程序中是否有死循环、程序大小、越界、参数错误等。`Verifier`中的主要检查函数是`bpf_check()`，在这函数中，有一个针对 helper
+函数参数检查的函数`check_map_func_compatibility`，就是此次漏洞所在的函数。
+## Helper 函数
+eBPF 程序并不能调用任意的内核函数，这会导致 eBPF 程序与特定的内核版本绑定。因此 eBPF 提供的是一些常用且稳定的 API，这些 API 被称为
+`helper`函数，用于 eBPF 与内核交互数据。所有的 helper 的名称和作用在`bpf.h`中有声明。每种 eBPF 程序类型的有不同的可用的
+helper 函数。下面列举出我们后面分析相关的 helper 函数原型和作用。
+    /* long bpf_ringbuf_output(void *ringbuf, void *data, u64 size, u64 flags)
+     * Description
+     * Copy *size* bytes from *data* into a ring buffer *ringbuf*.
+     * If **BPF_RB_NO_WAKEUP** is specified in *flags*, no notification
+     * of new data availability is sent.
+     * If **BPF_RB_FORCE_WAKEUP** is specified in *flags*, notification
+     * of new data availability is sent unconditionally.
+     * If **0** is specified in *flags*, an adaptive notification
+     * of new data availability is sent.
+     *
+     * An adaptive notification is a notification sent whenever the user-space
+     * process has caught up and consumed all available payloads. In case the user-space
+     * process is still processing a previous payload, then no notification is needed
+     * as it will process the newly added payload automatically.
+     * Return
+     * 0 on success, or a negative error in case of failure.
+     * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+     * void *bpf_ringbuf_reserve(void *ringbuf, u64 size, u64 flags)
+     * Description
+     * Reserve *size* bytes of payload in a ring buffer *ringbuf*.
+     * *flags* must be 0.
+     * Return
+     * Valid pointer with *size* bytes of memory available; NULL,
+     * otherwise.
+     * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+     * u64 bpf_ringbuf_query(void *ringbuf, u64 flags)
+     *Description
+     *Query various characteristics of provided ring buffer. What
+     *exactly is queries is determined by *flags*:
+     *
+     ** **BPF_RB_AVAIL_DATA**: Amount of data not yet consumed.
+     ** **BPF_RB_RING_SIZE**: The size of ring buffer.
+     ** **BPF_RB_CONS_POS**: Consumer position (can wrap around).
+     ** **BPF_RB_PROD_POS**: Producer(s) position (can wrap around).
+     *
+     *Data returned is just a momentary snapshot of actual values
+     *and could be inaccurate, so this facility should be used to
+     *power heuristics and for reporting, not to make 100% correct
+     *calculation.
+     *Return
+     *Requested value, or 0, if *flags* are not recognized.
+     */
+    #define __BPF_FUNC_MAPPER(FN)\
+    FN(ringbuf_output),\
+    FN(ringbuf_reserve),\
+    FN(ringbuf_query),\
+helper 函数并不是直接被调用的，而是被用宏`BPF_CALL_0`~`BPF_CALL_5`封装为系统调用的形式，在编写 eBPF
+指令时会直接通过这种宏的形式调用 helper 函数。`bpf_func_proto`类型的结构体则记录的是 helper
+函数的信息，包括返回值类型、参数类型等。调用的例子如下所示：
+    BPF_CALL_4(bpf_map_update_elem, struct bpf_map *, map, void *, key,
+               void *, value, u64, flags)
+    {
+        WARN_ON_ONCE(!rcu_read_lock_held());
+        return map->ops->map_update_elem(map, key, value, flags);
+    }
+    const struct bpf_func_proto bpf_map_update_elem_proto = {
+        .func           = bpf_map_update_elem,
+        .gpl_only       = false,
+        .ret_type       = RET_INTEGER,
+        .arg1_type      = ARG_CONST_MAP_PTR,
+        .arg2_type      = ARG_PTR_TO_MAP_KEY,
+        .arg3_type      = ARG_PTR_TO_MAP_VALUE,
+        .arg4_type      = ARG_ANYTHING,
+    };
+## Maps
+`Map`是一种键值对，eBPF 程序可以用来和内核或者用户空间共享数据。Maps 工作的示意图如下：
+eBPF 程序可以通过 helper 函数来操作 map，map有不同类型，其中各类型的数据结构是有差别的。下面列出现在支持的 map 类型，共31种：
+    enum bpf_map_type {
+    BPF_MAP_TYPE_UNSPEC,
+    BPF_MAP_TYPE_HASH,
+    BPF_MAP_TYPE_ARRAY,
+    BPF_MAP_TYPE_PROG_ARRAY,
+    BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+    BPF_MAP_TYPE_PERCPU_HASH,
+    BPF_MAP_TYPE_PERCPU_ARRAY,
+    BPF_MAP_TYPE_STACK_TRACE,
+    BPF_MAP_TYPE_CGROUP_ARRAY,
+    BPF_MAP_TYPE_LRU_HASH,
+    BPF_MAP_TYPE_LRU_PERCPU_HASH,
+    BPF_MAP_TYPE_LPM_TRIE,
+    BPF_MAP_TYPE_ARRAY_OF_MAPS,
+    BPF_MAP_TYPE_HASH_OF_MAPS,
+    BPF_MAP_TYPE_DEVMAP,
+    BPF_MAP_TYPE_SOCKMAP,
+    BPF_MAP_TYPE_CPUMAP,
+    BPF_MAP_TYPE_XSKMAP,
+    BPF_MAP_TYPE_SOCKHASH,
+    BPF_MAP_TYPE_CGROUP_STORAGE,
+    BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
+    BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE,
+    BPF_MAP_TYPE_QUEUE,
+    BPF_MAP_TYPE_STACK,
+    BPF_MAP_TYPE_SK_STORAGE,
+    BPF_MAP_TYPE_DEVMAP_HASH,
+    BPF_MAP_TYPE_STRUCT_OPS,
+    BPF_MAP_TYPE_RINGBUF,
+    BPF_MAP_TYPE_INODE_STORAGE,
+    BPF_MAP_TYPE_TASK_STORAGE,
+    BPF_MAP_TYPE_BLOOM_FILTER,
+    };
+## Ringbuf
+`Ringbuf`是CPU 共享缓冲区，可以用于从内核向用户空间发送数据。管理 Ringbuf 的 map
+类型是`BPF_MAP_TYPE_RINGBUF`，它的数据结构是：
+    struct bpf_ringbuf_map {
+    struct bpf_map map;
+    struct bpf_ringbuf *rb;
+    };
+    struct bpf_ringbuf {
+    wait_queue_head_t waitq;
+    struct irq_work work;
+    u64 mask;
+    struct page **pages;
+    int nr_pages;
+    spinlock_t spinlock ____cacheline_aligned_in_smp;
+    /* Consumer and producer counters are put into separate pages to allow
+     * mapping consumer page as r/w, but restrict producer page to r/o.
+     * This protects producer position from being modified by user-space
+     * application and ruining in-kernel position tracking.
+     */
+    unsigned long consumer_pos __aligned(PAGE_SIZE);
+    unsigned long producer_pos __aligned(PAGE_SIZE);
+    char data[] __aligned(PAGE_SIZE);
+    };
+# 漏洞成因
+漏洞出现在`check_map_func_compatibility`函数中，这个函数主要检测的内容是调用的 helper 函数和对应的 map
+类型是否匹配。可以看到这是一个双向的检查，第一个 switch 检查是检查创建的`map->map_type`是否可以调用需要的 helper 函数，第二个
+switch 检查是检查调用的 helper 函数是否可以处理相应的 map 类型。
+    static int check_map_func_compatibility(struct bpf_verifier_env *env,
+    struct bpf_map *map, int func_id)
+    {
+    if (!map)
+    return 0;
+    /* We need a two way check, first is from map perspective ... */
+    switch (map->map_type) {
+         case BPF_MAP_TYPE_PROG_ARRAY:
+    if (func_id != BPF_FUNC_tail_call)
+    goto error;
+    ......
+             default:
+    break;
+    }
+    /* ... and second from the function itself. */
+    switch (func_id) {
+             case BPF_MAP_TYPE_PROG_ARRAY:
+    if (func_id != BPF_FUNC_tail_call)
+    goto error;
+    break;
+         ......
+    }
+    return 0;
+    error:
+    verbose(env, "cannot pass  %d into func %s#%d\n",
+    map->map_type, func_id_name(func_id), func_id);
+    return -EINVAL;
+    }
+在第一个 switch 中，有22个 case 进行检查，但是这并未完全覆盖 map 的类型，剩余的不需要进行这一步检查的 map 类型是：
+BPF_MAP_TYPE_PERCPU_HASH
+    BPF_MAP_TYPE_PERCPU_ARRAY
+    BPF_MAP_TYPE_LPM_TRIE
+    BPF_MAP_TYPE_STRUCT_OPS
+    BPF_MAP_TYPE_LRU_HASH
+    BPF_MAP_TYPE_ARRAY
+    BPF_MAP_TYPE_LRU_PERCPU_HASH
+    BPF_MAP_TYPE_HASH
+    BPF_MAP_TYPE_UNSPEC
+同样的，在第二个 switch 中，也并非对所有的 helper 进行了检查。
+以上双向检查的缺漏，导致了此次漏洞的产生。先查看修复漏洞的 commit 。可以看到，漏洞产生的 map
+类型是`BPF_MAP_TYPE_RINGBUF`，并且在第二个检查中加入了`BPF_FUNC_ringbuf_output`,`BPF_FUNC_ringbuf_reserve`,`BPF_FUNC_ringbuf_query`函数的检查。而这些函数是会对
+ringbuf 进行操作的，如果定义一个非`BPF_MAP_TYPE_RINGBUF`类型的 map
+类型，并调用了上面的三个函数，那么就会将非`BPF_MAP_TYPE_RINGBUF`
+类型的结构体当成是`BPF_MAP_TYPE_RINGBUF`类型的结构体进行解析，从而导致了类型混淆。
+    @@ -5150,8 +5150,6 @@ static int check_map_func_compatibility(struct bpf_verifier_env *env,
+    case BPF_MAP_TYPE_RINGBUF:
+    if (func_id != BPF_FUNC_ringbuf_output &&
+        func_id != BPF_FUNC_ringbuf_reserve &&
+    -    func_id != BPF_FUNC_ringbuf_submit &&
+    -    func_id != BPF_FUNC_ringbuf_discard &&
+        func_id != BPF_FUNC_ringbuf_query)
+    goto error;
+    break;
+    @@ -5260,6 +5258,12 @@ static int check_map_func_compatibility(struct bpf_verifier_env *env,
+    if (map->map_type != BPF_MAP_TYPE_PERF_EVENT_ARRAY)
+    goto error;
+    break;
+    +case BPF_FUNC_ringbuf_output:
+    +case BPF_FUNC_ringbuf_reserve:
+    +case BPF_FUNC_ringbuf_query:
+    +if (map->map_type != BPF_MAP_TYPE_RINGBUF)
+    +goto error;
+    +break;
+    case BPF_FUNC_get_stackid:
+    if (map->map_type != BPF_MAP_TYPE_STACK_TRACE)
+    goto error;
+对该漏洞可用
+`BPF_MAP_TYPE_LPM_TRIE`代替`BPF_MAP_TYPE_RINGBUF`，并调用`BPF_FUNC_ringbuf_reserve`来触发类型混淆：
+    int vuln_mapfd = bpf_create_map(BPF_MAP_TYPE_LPM_TRIE, key_size, 0x3000, 1, BPF_F_NO_PREALLOC);
+    ...
+    struct bpf_insn prog[] = {    
+    BPF_LD_MAP_FD(BPF_REG_1, vuln_mapfd),
+    ...
+    BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_ringbuf_reserve),
+    }
+接着需要绕过`__bpf_ringbuf_reserve`函数内对`bpf_ringbuf`结构体中`size`,`consumer_pos`,`producer_pos`的检查；然后通过覆盖提前通过堆喷射设计好的`bpf_array`来泄露内核基址和堆地址，通过伪造`bpf_array.map.ops`指向的`bpf_map_ops`来分别修改其中的`map_delete_elem`和`map_fd_put_ptr`指针为`fd_array_map_delete_elem`和`commit_creds`，最后调用`bpf_delete_elem()`来触发已经被修改的函数指针，调用`commit_creds(&init_cred)`，达到提权的目的。
+# 修复方案
+1.漏洞在 5.13.14 内核版本已修复，请及时更新。  
+2.设置`/proc/sys/kernel/unprivileged_bpf_disabled`为1，禁止非特权用户使用 eBPF 来进行缓解。
+# 参考链接
+* * *

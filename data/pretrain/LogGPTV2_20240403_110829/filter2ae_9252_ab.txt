@@ -1,0 +1,101 @@
+# 示例exp
+经过逆向分析的努力，我们发现，为了从SYSTEM32加载DLL，需要执行以下步骤：
+  1. 使用`IStandardCollectorService :: CreateSession`创建新的诊断会话。
+  2. 在新会话上调用`ICollectionSession :: AddAgent`方法，传递要加载的DLL的名称（没有任何路径信息）。  
+ICollectionSession :: AddAgent的简化加载代码如下：
+        void EtwCollectionSession::AddAgent(LPWCSTR dll_path, 
+                                    REFGUID guid) {
+    WCHAR valid_path[MAX_PATH];
+    if ( !GetValidAgentPath(dll_path, valid_path)) {
+    return E_INVALID_AGENT_PATH;
+    HMODULE mod = LoadLibraryExW(valid_path, 
+        nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    dll_get_class_obj = GetProcAddress(hModule, "DllGetClassObject");
+    return dll_get_class_obj(guid);
+    }
+我们可以看到它检查代理路径是否有效并返回完整路径（这是以前的EoP错误存在的位置，检查不足）。
+使用`LoadLibraryEx`加载此路径，然后查询DLL以获取导出的方法`DllGetClassObject`，再调用该方法。
+为了使代码更容易执行，我们需要实现该方法并将文件放入SYSTEM32。
+已实现的`DllGetClassObject`将在加载程序锁之外调用，以便我们执行任何操作。
+以下代码（删除错误处理）可以加载名为dummy.dll的DLL。
+    IStandardCollectorService* service;
+    CoCreateInstance(CLSID_CollectorService, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&service));
+    SessionConfiguration config = {};
+    config.version = 1;
+    config.monitor_pid = ::GetCurrentProcessId();
+    CoCreateGuid(&config.guid);
+    config.path = ::SysAllocString(L"C:\Dummy");
+    ICollectionSession* session;
+    service->CreateSession(&config, nullptr, &session);
+    GUID agent_guid;
+    CoCreateGuid(&agent_guid);
+    session->AddAgent(L"dummy.dll", agent_guid);
+现在我们需要的是任意文件写入，以便将DLL放入SYSTEM32，加载并提升我们的权限。 为此，我将演示我在`Storage
+Service`系统中`SvcMoveFileInheritSecurity RPC`方法里发现的漏洞。
+这个功能引起了我的注意，因为它用于探索由[ClémentRouault](https://twitter.com/hakril)和[Thomas
+Imbert](https://twitter.com/masthoon)在[PACSEC
+2017](https://pacsec.jp/psj17/PSJ2017_Rouault_Imbert_alpc_rpc_pacsec.pdf)中发现和呈现的ALPC中的漏洞。虽然这种方法只是漏洞的有效原函数，但我意识到，潜伏在其中的实际上是两个漏洞（至少来自普通用户权限）。
+`SvcMoveFileInheritSecurity`的任何修复之前的代码如下所示：
+    void SvcMoveFileInheritSecurity(LPCWSTR lpExistingFileName, 
+                                   LPCWSTR lpNewFileName, 
+                                   DWORD dwFlags) {
+     PACL pAcl;
+     if (!RpcImpersonateClient()) {
+       // Move file while impersonating.
+       if (MoveFileEx(lpExistingFileName, lpNewFileName, dwFlags)) {
+         RpcRevertToSelf();
+         // Copy inherited DACL while not.
+         InitializeAcl(&pAcl, 8, ACL_REVISION);
+         DWORD status = SetNamedSecurityInfo(lpNewFileName, SE_FILE_OBJECT, 
+             UNPROTECTED_DACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+             nullptr, nullptr, &pAcl, nullptr);
+           if (status != ERROR_SUCCESS)
+             MoveFileEx(lpNewFileName, lpExistingFileName, dwFlags);
+       }
+       else {
+         // Copy file instead...
+         RpcRevertToSelf();
+       }
+     }
+    }
+这个方法的目的似乎是移动文件，然后将任何继承的ACE从新目录位置应用于DACL。
+这是必要的，因为当文件在同一卷上移动时，旧文件名被取消链接并且文件链接到新位置。 但是，新文件将保持从其原始位置分配的安全性。
+只有在目录中创建新文件时才能应用继承的ACE，或者在这种情况下，通过调用`SetNamedSecurityInfo`等函数显式应用ACE。
+要确保此方法不允许任何人在作为服务的用户（在本例中为本地系统）运行时移动任意文件，需要模拟RPC调用者。
+在第一次调用`MoveFileEx`后立即启动故障，模拟被还原并调用`SetNamedSecurityInfo`。
+如果该调用失败，则代码再次调用`MoveFileEx`以尝试恢复原始移动操作。 这是第一个漏洞; 原始文件名位置现在可能指向其他位置，例如滥用符号链接。
+这很容易导致`SetNamedSecurityInfo`失败，只需将本地系统的拒绝ACL添加到文件的WRITE_DAC的ACE中，它会返回一个错误，导致恢复并获得任意文件创建。
+这被报告为问题[1427](https://bugs.chromium.org/p/project-zero/issues/detail?id=1427)。
+事实上，这并不是我们将要利用的漏洞，因为这太简单了。
+相反，我们将在同一代码中利用第二个漏洞：在本地系统运行时获取服务以在我们喜欢的任何文件上调用`SetNamedSecurityInfo`。
+这可以通过在执行初始`MoveFileEx`时滥用模拟设备映射来重定向本地驱动器号（例如C
+:)来实现，然后导致`lpNewFileName`指向任意位置，或者更有趣地滥用硬链接。
+这被报告为问题[1428](https://bugs.chromium.org/p/project-zero/issues/detail?id=1428)。我们可以使用硬链接来利用它，如下所示：  
+  1. 在SYSTEM32中创建一个我们要覆盖的目标文件的硬链接。 因为你不需要对文件具有写权限来创建到它的硬链接，至少在沙箱之外。
+  2. 创建一个新目录位置，该目录位置具有可为每个人或经过身份验证的用户的组的可继承ACE，以允许修改任何新文件。 甚至不需要明确地执行此操作; 例如，在C盘根目录中创建的任何新目录都有一个用于Authenticated Users的继承ACE。 然后，请求RPC服务将硬链接文件移动到新目录位置。 只要我们有`FILE_DELETE_CHILD`访问新位置的`FILE_DELETE_CHILD`和我们可以编辑的`FILE_ADD_FILE`，该移动就会在模拟下成功。
+  3. 该服务现在将在移动的硬链接文件上调用`SetNamedSecurityInfo`。`SetNamedSecurityInfo`将从新目录位置获取继承的ACE，并将它们应用于硬链接文件。 将ACE应用于硬链接文件的原因是从`SetNamedSecurityInfo`的角度看，硬链接文件位于新位置，即使我们链接到的原始目标文件位于SYSTEM32中。
+利用这一点，我们可以修改本地系统以访问WRITE_DAC访问的任何文件的安全系统。 然后我们修改SYSTEM32中的文件，再使用DiagHub服务加载它。
+但是，有一个小问题。 SYSTEM32中的大多数文件实际上由TrustedInstaller组拥有，即使是本地系统也无法修改。
+因此，我们需要找到一个可以写入的文件，该文件不归TrustedInstaller所有。 此外，我还想选择一个不会导致操作系统安装损坏的文件。
+我们不关心文件的扩展名，因为`AddAgent`仅检查文件是否存在并使用`LoadLibraryEx`加载它。  
+可以通过多种方式找到合适的文件，例如使用SysInternals [AccessChk](https://docs.microsoft.com/en-us/sysinternals/downloads/accesschk)实用程序，但要100％确定存储服务的令牌可以修改文件，然后使用我的[NtObjectManager](https://www.powershellgallery.com/packages/NtObjectManager)
+PowerShell模块（特别是其`Get-AccessibleFile cmdlet`，它接受从中进行访问检查的进程）。  
+虽然该模块设计用于检查沙箱中的可访问文件，但它也可用于检查特权服务可访问的文件。
+如果以管理员身份运行以下脚本并安装了模块，则`$files`变量将包含Storage Service具有WRITE_DAC访问权限的文件列表。
+    Import-Module NtObjectManager
+    Start-Service -Name "StorSvc"
+    Set-NtTokenPrivilege SeDebugPrivilege | Out-Null
+    $files = Use-NtObject($p = Get-NtProcess -ServiceName "StorSvc") {
+       Get-AccessibleFile -Win32Path C:\Windows\system32 -Recurse `
+        -MaxDepth 1 -FormatWin32Path -AccessRights WriteDac -CheckMode FilesOnly
+    }
+查看文件列表，我决定选择文件license.rtf，其中包含Windows的简短许可证声明。
+这个文件的优点是它很可能对系统的操作不是很关键，因此覆盖它应该不会导致安装损坏。  
+把它们放在一起：
+  1. 使用Storage Service漏洞更改SYSTEM32中`license.rtf`文件的安全性。
+  2. 复制DLL，它通过`license.rtf`文件实现`DllGetClassObject`。
+  3. 使用DiagHub服务将修改后的许可证文件作为DLL加载，将代码执行作为本地系统并执行我们想要的任何操作。
+如果你有兴趣看到一个完整的示例，我已经在[tracker](https://bugs.chromium.org/p/project-zero/issues/detail?id=1428#c9)上上传了原始问题的完整漏洞。
+# 总结
+在这篇博客文章中，我描述了一个适用于Windows 10的有用漏洞原函数，你甚至可以从Edge LPAC等沙盒环境中使用它。
+找到这些类型的原函数使得利用更简单，更不容易出错。 此外，我已经让你了解如何在类似的DCOM实现中找到自己的错误。

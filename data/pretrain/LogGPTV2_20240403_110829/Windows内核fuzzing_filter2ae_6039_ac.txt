@@ -1,0 +1,78 @@
+###  WSL fuzzing结果
+总体而言，我们用38个vCPU对WSL进行了4周的模糊测试。最后，我们有了一个工作原型，并更好地理解了Syzkaller的工作原理。
+我们发现了4个DoS错误和一些死锁，然而却没有发现任何安全漏洞，这令我们感到失望，但我们决定转向真正的PE目标。
+## 迈向真实目标
+Fuzzing
+WSL是在Windows上理解Syzkaller的很好的方式。但此时我们想回到一个真正的特权提升目标上——一个默认随Windows一起提供并可从各种沙箱访问的目标。
+我们研究了Windows内核攻击面，并决定从Win32k开始。Win32k是Windows子系统的内核端，它是操作系统的GUI基础结构。它也是本地特权提升（LPE）的常见目标，因为可以从许多沙箱中访问它。
+它包括两个子系统的内核端：
+• 窗口管理器，也称为User。
+• 图形设备接口，也称为GDI。
+它有许多系统调用（约1200个），意味着它是基于语法的fuzzer的理想目标（如先前所示的[CVE-2018-0744](https://crbug.com/project-zero/1389)）。从Windows 10开始，win32k分为多个驱动程序：win32k、win32kbase和win32kfull。
+为了使Syzkaller适用于win32k，我们还必须做一些改动：
+• 将fuzzer和executor二进制文件编译到Windows。
+• 与OS相关的更改。
+• 向fuzzer公开Windows 系统调用。
+• 为方便起见，使用mingw++进行交叉编译。
+###  Win32k调整
+从fuzzer源代码开始，我们添加了Windows的相关实现，例如管道、共享内存等。
+语法是fuzzer 的关键部分，稍后我们将对其进行深入说明。
+然后，我们使用MinGW将executor修复为交叉编译。我们还必须修复共享内存和管道，并禁用fork模式，因为它在Windows中不存在。
+作为语法编译的一部分，syz-sysgen会生成一个头文件（syscalls.h），其中包括所有系统调用的名称数字。对于Windows，我们选定导出的系统调用封装和WinAPI（例如CreateWindowExA和NtUserSetSystemMenu）。
+大多数系统调用封装都在 **win32u.dll** 和 **gdi32.dll**
+中被导出。要将它们公开给executor二进制程序，我们使用[gendef](https://sourceforge.net/p/mingw-w64/wiki2/gendef/)从dll中生成定义文件。然后，使用mingw-dlltool生成库文件，最终将它们链接到executor。
+###  完整性检查
+如前所述，我们想确保fuzzer能够复现旧的漏洞，否则就是在浪费CPU时间。
+这次我们有了一个真实的漏洞（CVE-2018-0744，参见图4），并且想复现它。我们添加了相关的系统调用，运行fuzzer去寻找漏洞，但不幸的是它失败了。我们怀疑出现了错误，所以写了一个syz程序，并使用syz-execprog，Syzkaller直接执行syz程序，以查看它是否正常工作。系统调用已成功调用执行，但机器还是没有崩溃。
+短时间后，我们意识到fuzzer正在会话0下运行。所有服务（包括ssh服务）都是运行在会话0下的[控制台应用程序](https://docs.microsoft.com/en-us/windows/win32/services/interactive-services)，并不是为运行GUI而设计的。因此，我们将其更改为在会话1下以普通用户身份运行。之后，Syzkaller能够成功复现该漏洞。
+由此可得出结论，必须通过模拟漏洞或复现旧漏洞来测试新代码。
+###  稳定性检查
+我们总共添加了15个API，然后再次运行fuzzer。
+我们在win32kfull!_OpenClipboard中遇到了第一个崩溃，该崩溃是UAF引起的。但是由于某种原因，此崩溃没有在其他机器上重现。起初，我们以为这是由于我们创建的另一个bug引起的，但是它可以在没有运行fuzzer的同一台机器上重现。
+调用堆栈和崩溃的程序无法帮助我们理解问题所在。因此，我们把引起崩溃的部分放到IDA中查看：
+图11：崩溃位置–win32kfull!_OpenClipboard
+我们注意到，崩溃发生在条件块内，该条件块是否执行取决于ETW provider的标志：Win32kTraceLoggingLevel。
+此标志在某些机器上是打开状态，在其他机器上是关闭状态，因此我们推断可能得到了A/B测试机器。我们报告了此崩溃，并再次重新安装了Windows。
+再次运行fuzzer，我们得到了一个新的漏洞，这次是RegisterClassExA中的拒绝服务。此时，我们积极性大涨，因为如果15个系统调用导致2个漏洞，那么意味着1500个系统调用将导致200个漏洞。
+## Win32k中的语法
+因为之前没有关于syscall fuzzing win32k的公开研究，所以我们必须从头开始创建正确的语法。
+我们最初的想法是，也许可以使这个过程自动化，但却遇到了两个问题：
+首先，Windows头文件不足以生成语法，因为它们无法为系统调用fuzzer提供关键信息（如唯一字符串），一些DWORD参数实际上是标志位，许多结构体被定义为LPVOID。
+其次，许多系统调用根本没有文档（例如NtUserSetSystemMenu）。
+幸运的是，Windows的许多部分在技术上都是开源的：
+• Windows NT泄漏的源码– 
+• Windows 2000泄漏的源码-
+• ReactOS（泄漏的w2k3源码？）– 
+• Windows Research Kit –
+我们在MSDN和泄漏的源码中寻找每个系统调用，并且使用IDA和WinDBG对其进行验证。
+我们制作的许多API签名都易于生成，但有些却相当棘手——涉及大量结构体、未公开的参数、一些具有15个参数的系统调用等。
+经过几百次系统调用后，再次运行fuzzer，我们得到了3个GDI漏洞和一些DoS错误！
+至此，我们覆盖到了win32k中的数百个系统调用。我们想继续找到更多的bug。因此，是时候更深入地寻找有关Win32k的更多信息并达到更复杂的攻击面了。  
+Fuzzer并不神奇，为了发现bug，我们需要确保覆盖了目标中的绝大部分攻击面。我们回头查看了Win32k的更多先前的工作，理解了老的漏洞和漏洞分类。然后，我们尝试使fuzzer支持新学习的攻击面。
+一个示例是GDI共享句柄。_PEB！GdiSharedHandleTable是指向结构体的指针数组，该结构体具有所有进程之间关于共享GDI句柄的信息。我们通过添加伪系统调用GetGdiHandle(type,
+index)将它添加到Syzkaller中，该伪系统调用需要句柄类型和索引。这个函数遍历GDI共享句柄表数组，从初始化一直到 _索引_
+，并返回与请求类型相同的最后一个句柄。
+这导致[CVE-2019-1159](https://cpr-zero.checkpoint.com/vulns/cprid-2132/)，由在启动时创建的具有全局GDI句柄的一个系统调用触发的UAF漏洞。
+###  结果
+我们用60个vCPU进行了1个半月的模糊测试，发现了10个漏洞（3个待处理，1个重复）:
+[CVE-2019-1014](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-1014)，[CVE-2019-1096](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-1096)，[CVE-2019-1159](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-1159)，
+[CVE-2019-1164](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-1164)，[CVE-2019-1256](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-1256)，[CVE-2019-1286](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-1286)
+另外还发现了3个DoS错误，1个WinLogon中的崩溃和一些死锁。
+## LPE→RCE？
+本地特权提升漏洞很酷，那远程代码执行怎么样呢？
+Windows图元文件格式（WMF）简介。
+WMF是图形文件格式。它的设计可追溯到1990年代，同时支持矢量图形和位图。Microsoft多年来将该格式扩充为以下格式
+• EMF  
+• EMF+  
+• EMFSPOOL
+Microsoft还为该格式增加了一项功能，允许添加可回放的记录，以重现图形输出。当回放这些记录时，图像解析器会调用NtGdi系统调用。可以在[j00ru的PPT](https://j00ru.vexillium.org/slides/2016/pacsec.pdf)中了解有关此格式的更多信息。
+接受EMF文件的系统调用数量是有限的，但很幸运，我们在接受EMF文件的StretchBlt中发现了一处漏洞。
+视频链接：
+## 总结
+我们的目标是使用fuzzer发现Windows内核bug。
+我们开始在Windows内核中探索fuzzer领域，由于我们有使用AFL样式fuzzer的经验，因此我们寻找性能类似的工具并找到了kAFL。
+我们分析了kAFL，并搜索Windows内核中的攻击面，但是很快发现，系统调用fuzzer可以达到更多的攻击面。
+搜索系统调用fuzzer后，我们找到了Syzkaller。
+至此，我们开始将其移植到WSL，因为WSL与Linux内核最为相似，并且我们可以获得在Windows上使用Syzkaller的一些经验；我们使用IntelPT实现了Windows内核的覆盖率检测；分享了一种崩溃检测机制，即崩溃符号器方法，并用于错误重复数据删除；发现了一些覆盖率稳定性问题，并为此分享了我们的解决方案。
+在发现一些DoS错误后，我们决定转向一个真正的PE目标——win32k，但必须在Syzkaller中实现缺失的部分。然后，我们进行了完整性检查和压力测试，以确保fuzzer没有浪费CPU时间。之后，我们投入了大量时间来编写语法，阅读分析目标，并最终向fuzzer中添加对Win32k中新学习部分的支持。
+总体而言，我们的研究使我们在Windows 10内核中发现了8个漏洞、DoS错误和死锁。

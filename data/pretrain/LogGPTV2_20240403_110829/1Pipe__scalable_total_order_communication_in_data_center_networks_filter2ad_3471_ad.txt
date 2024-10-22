@@ -1,0 +1,226 @@
+to record all failure and recovery timestamps, adding complexity.
+Limitations. If a process fails permanently, the last timestamp
+it has delivered cannot be known exactly, so, 1Pipe only ensures
+all correct receivers and recovered receivers deliver messages con-
+sistently. In addition, when network partition occurs, separated
+receivers may deliver messages after failure timestamp. 1Pipe relies
+on the application to coordinate such failures.
+6 IMPLEMENTATION
+6.1 Processing on End Hosts
+We implement an 1Pipe library, lib1pipe, at the end host. The library
+is built on top of RDMA verbs API. 1Pipe obtains timestamp from
+CPU cycle counter and assigns it to messages in software. Because
+RDMA RC buffers messages in different QPs, we cannot ensure
+timestamp monotonicity on the NIC-to-ToR link. Ideally, we would
+like to use a SmartNIC and attach timestamps to packets when
+they egress to the port. However, because we only have access
+to standard RDMA NICs, we use RDMA UD instead. Each 1Pipe
+message is fragmented into one or more UD packets.
+1Pipe implements end-to-end flow and congestion control in
+software. When a destination process is first accessed, it establishes
+a connection with the source process and provisions a receive buffer
+for it, whose size is the receive window. A packet sequence number
+(PSN) is used for loss detection and defragmentation. Congestion
+control follows DCTCP [10] where ECN mark is in the UD header.
+When a scattering is sent by the application, it is stored in a send
+buffer. If the send buffer is full, the send API returns fail. Each
+destination maintains a send window, which is the minimum of the
+receive and congestion windows. When all messages of a scattering
+in send buffer are within the send window for the corresponding
+destination, they are attached with the current timestamp and sent
+out. This means that when some destinations or network paths
+of a scattering are congested, it is held back in the send buffer
+rather than slowing down the entire network. To avoid live-locks,
+a scattering acquires “credits” from the send windows. If the send
+window for a destination is insufficient, the scattering is held in a
+wait queue without releasing credits. This makes sure that large
+scatterings can eventually be sent, at the cost of wasting credits
+that could be used to send other scatterings out-of-order. Beacon
+packets are sent to the ToR switch, and they are not blocked by
+flow control.
+A UD packet in 1Pipe adds 24 bytes of headers: 3 timestamps
+including message, best-effort barrier, and commit barrier; PSN;
+SIGCOMM ’21, August 23–28, 2021, Virtual Event, USA
+Bojie Li, Gefei Zuo, Wei Bai, and Lintao Zhang
+an opcode and a flag that marks end of message. A timestamp is a
+48-bit integer, indicating the number of nanoseconds passed on the
+host. We use PAWS [50] to handle the timestamp wrap around.
+When lib1pipe initializes, it registers to the controller and spawns
+a polling thread to: (1) generate periodic beacon packets; (2) poll
+RDMA completion queues and process received packets, including
+generating end-to-end ACKs and retransmitting lost packets; (3)
+reorder messages in the receive buffer and deliver them to appli-
+cation threads. lib1pipe uses polling rather than interrupt because
+RDMA RTT is only 1 ∼ 2𝜇s, while interrupt would add ∼ 10𝜇s of
+delay [97].
+Processes within a host are exposed directly to the Top-of-Rack
+(ToR) switch(es), and the ToR aggregates timestamps of all pro-
+cesses in the rack. In future work, the software process of lib1pipe
+may be offloaded to a programmable NIC [37, 59], which assigns
+timestamps to messages on egress pipeline.
+The controller is a replicated service that stores routing graph,
+process information, failure notifications, and undeliverable recall
+messages in etcd [5]. In a large network, future work can distribute
+the controller to a cluster, each of which serves a portion of the
+network.
+6.2 In-Network Processing
+We implement in-network processing at three types of the network
+switches with different programming capabilities.
+6.2.1 Programmable Switching Chip. We implement the in net-
+work processing using P4 [20] and compile it to Tofino [45]. Be-
+cause a Tofino switch has 4 pipelines, it is regarded as 4 ingress
+and 4 egress switches connected via 16 all-to-all links. Each of the
+8 “switches” derives barriers independently. 1Pipe needs 2 state
+registers per input link, storing the two barriers for best effort and
+reliable 1Pipe, respectively. For each packet, barrier register of the
+input link is updated in the first stateful pipeline stage of the switch.
+Because each stage can only compute the minimum of two barriers,
+the switch uses a binary tree of registers with 𝑂(log 𝑁) pipeline
+stages to compute the minimum link barrier 𝐵𝑛𝑒𝑤, where 𝑁 is the
+number of ports. For a typical 32 port switch, it would cost 5 stages
+out of the 16 ingress stages. At the final pipeline stage, the bar-
+rier field in packet is updated to 𝐵𝑛𝑒𝑤. The control plane software
+routinely checks link barriers and reports failure if a link barrier
+significantly lags behind. The expected delay of best effort 1Pipe
+is (base delay + clock skew) when links are fully utilized, or (base
+delay + beacon interval/2 + clock skew) when most links are idle.
+6.2.2
+Switch CPU. For a switch without a programmable switch-
+ing chip, e.g., Arista 7060 which uses Broadcom Tomahawk chip,
+we implement in-network processing on the switch CPU. Although
+commodity switches cannot process packets in data plane, they
+have a CPU to process control-plane packets, analogous to directly
+connecting a server to a port of the switch. Compared to server
+CPUs and NICs, the switch CPU is typically less powerful (e.g., 4
+cores at 1 GHz) and has lower bandwidth (e.g., 1 Gbps). Because
+the switch CPU cannot process every packet, data packets are for-
+warded by the switching chip directly. The CPU sends beacons
+periodically on each output link, regardless of whether the link
+is idle or busy. Received barriers in beacons are stored in regis-
+ters per input link. A thread on the CPU periodically computes
+the minimum of link barriers and broadcasts new beacons to all
+output links. Computing the minimum barrier takes hundreds of
+cycles, which is not a bottleneck compared to the cost of broadcast.
+Because data and beacon packets are FIFO in switch queues and
+on network links, the barrier property is preserved. On receivers,
+buffered data packets are delivered to the application according
+to barriers in beacon packets. Compared with the programmable
+chip, switch CPU has higher latency due to CPU processing. So,
+the expected delay is base delay + (switch CPU processing delay ×
+number of hops + beacon interval/2 + clock skew).
+6.2.3 Delegate Switch Processing to a Host. If the switch vendor
+does not expose access interfaces to switch CPUs, we can offload
+the beacon processing to end hosts. We designate an end-host repre-
+sentative for each network switch. The challenge is that best effort
+1Pipe requires the barrier timestamp to be the lower bound of future
+message timestamps on a network link 𝐿. So, beacons with barrier
+timestamps on 𝐿 must pass through 𝐿. That is, for two directly
+connected switches 𝑆1, 𝑆2 and their representatives 𝐻1, 𝐻2, beacon
+packets from 𝐻1 to 𝐻2 need to go through the link 𝑆1 → 𝑆2. If
+the routing path between two representatives does not go through
+𝑆1 → 𝑆2, beacon packets needs to detour: they are sent with three
+layers of IP headers: 𝐻1 → 𝑆1, 𝑆1 → 𝑆2, and 𝑆2 → 𝐻2. We install
+tunnel termination rules in each network switch to de-capsulate
+one layer of IP header, so the beacon packet will traverse through
+𝐻1 → 𝑆1 → 𝑆2 → 𝐻2.
+Beacon packets use one-sided RDMA write to update barriers
+on representative host. Similar to Sec.6.2.2, minimum barriers are
+periodically computed and broadcast to downstream representa-
+tives. The expected delay is base delay + ((RTT between switch and
+host + host processing delay) × number of hops + beacon interval/2
++ clock skew). Because CPUs on end hosts may have shorter pro-
+cessing delay (via RDMA) than switch CPU (via OS IP stack), host
+delegation may have shorter overall delay. This is why we use host
+delegation for evaluations in Sec.7.
+7 EVALUATION
+7.1 Methodology
+Our testbed has 10 Arista 7060CX-32S 100G switches [1] and 32
+servers, forming a 3-layer fat-tree topology (4 ToR, 4 Spine, and 2
+Core) similar to Figure 3. The network has no oversubscription be-
+cause our traffic pattern is all-to-all. Each server has 2 Xeon E5-2650
+v2 CPUs and a Mellanox ConnectX-4 NIC running RoCEv2 [12].
+We dedicate a CPU core as representative of each switch and NIC to
+process beacons (Sec.6.2.3). The host representative is directly con-
+nected to the switch, so beacon packets do not need to detour. For
+microbenchmarks in Sec.7.2, we use Tofino [45] switches in place
+of Arista switches. In small-scale experiments (1∼32 processes),
+each process runs on a distinct server. Each process uses a pair of
+threads for sending and receiving, respectively. With less or equal
+to 8 servers, they colocate in one rack. With 16 servers, they are in
+two racks in a row. For experiments with 64∼512 processes, each
+server hosts the same number of processes. Clocks are synchro-
+nized via PTP [28] every 125 ms, achieving an average clock skew
+1Pipe: Scalable Total Order Communication in Data Center Networks
+SIGCOMM ’21, August 23–28, 2021, Virtual Event, USA
+(a) Throughput.
+(a) Scalability on testbed. Error bars show 5𝑡ℎ and 95𝑡ℎ per-
+centile.
+Figure 10: Failure recovery time of reliable
+1Pipe. Error bars show 5𝑡ℎ and 95𝑡ℎ percentile.
+(b) Latency.
+Figure 8: Scalability comparison of total order
+broadcast algorithms.
+of 0.3 𝜇s (1.0 𝜇s at 95% percentile), which agrees with Mellanox’s
+whitepaper [6]. We choose beacon interval to be 3 𝜇s.
+7.2 Microbenchmarks
+Scalability. 1Pipe can achieve total order broadcast. Figure 8a
+compares the scalability of 1Pipe with other total order broadcast
+approaches using token [86], Lamport timestamp [63], and cen-
+tralized sequencer at host NIC [57] or programmable switch [51].
+We test an all-to-all traffic pattern where each process broadcasts
+64-byte messages to all processes. 1Pipe scales linearly to 512 pro-
+cesses, achieving 5M messages per second per process (i.e., 80M
+msg/s per host). The throughput of 1Pipe is limited by CPU pro-
+cessing and RDMA messaging rate. Reliable 1Pipe (1Pipe/R) has
+25% lower throughput than best effort 1Pipe (1Pipe/BE) due to 2PC
+overhead. Programmable chip and host representative (not shown)
+deliver the same high throughput because 1Pipe decouples message
+forwarding from barrier propagation.
+In contrast, the sequencer is a central bottleneck and introduces
+extra network delays to detour packets (Figure 8b). The latency
+soars when throughput of sequencer saturates and congestion ap-
+pears. Token has low throughput because only one process may
+send at any time. We apply a common optimization to Lamport
+timestamp [63] which exchanges received timestamps per interval
+rather than per message. It has a trade-off between latency and
+throughput, e.g., for 512 processes, even if 50% throughput is used
+for timestamp exchange, broadcasting the messages takes 200 𝜇s.
+Message delivery latency. Figure 9a shows the message delivery
+latency of 1Pipe when the system is idle and thus has zero queuing
+delay. 1Pipe/BE with programmable chip delivers the lowest latency
+(b) Simulation of varying packet loss rates.
+Figure 9: Message delivery latency of 1Pipe
+variants.
+Figure 11: Reorder overhead on a host.
+overhead compared to the unordered baseline. The average over-
+head (1.7∼2.3𝜇s) is almost constant with different number of the
+network layers and processes, which is half of the beacon interval
+plus average clock skew. The tail latency overhead (1.7∼3.3𝜇s) is
+half of the beacon interval plus maximum clock skew. End host
+representatives introduce extra forwarding delay from the switch
+to the end host, which is ∼ 2𝜇s and contributes 10𝜇s for the 5-hop
+topology. In our testbed, ≤8, 16, and ≥32 processes have 1, 3, and 5
+network hops, respectively. Reliable 1Pipe adds an RTT (2 ∼ 10𝜇s)
+to best effort 1Pipe due to Prepare phase in 2PC. The RTT and host
+forwarding delay are proportional to network hop count.
+As Sec.2.1 discussed, packet loss rate of links are typically lower
+than 10−8, but faulty links may have loss rates above 10−6. In Fig-
+ure 9b, we simulate random message drop in lib1pipe receiver to
+evaluate how packet loss affects latency in the testbed with 512
+processes. When loss rate is higher than 10−5, latency of 1Pipe
+starts to grow. In both BE- and R-1Pipe, a lost beacon packet on
+any link will stall delivery of barrier until the next beacon, and all
+receivers need to wait for the worst link. In R-1Pipe, a lost message
+in prepare phase will trigger retransmission, which will stall the
+network for an RTT (and possibly multiple RTTs if retransmissions
+are lost). So, R-1Pipe is more sensitive to packet loss. Packet loss
+has little impact on throughput because 1Pipe can transfer new
+messages while retransmitting lost packets.
+Besides packet loss, queuing delay caused by background traffic
+can also increase 1Pipe latency. As Figure 12a shows, with 10 back-
+ground TCP flows per host, the latency inflation of BE-1Pipe and
+R-1Pipe are 30 and 50 𝜇s, respectively. A higher oversubscription
+ratio would also increase latency due to increased buffering at the
+core of the network. In Figure 12b, we increase oversubscription
+ratio of the network, and the delay increases due to congestion and
+ 0 1 2 3 4 5 6248163264128256512Tput per Process (M msg/s)Number of Processes1Pipe/BE1Pipe/RSwitchSeqHostSeqTokenLamport222324252627248163264128256512Latency (us, log)Number of Processes1Pipe/chip1Pipe/hostSwitchSeqHostSeqTokenLamport 0 5 10 15 20 25 30 3581632512Latency (us)Number of ProcessesBE-chipBE-hostR-chipR-hostunorder 0 10 20 30 40 50 60 70 801e-81e-71e-61e-51e-41e-31e-21e-1Average Latency (us)Packet Loss ProbabilityBE-chipBE-hostR-chipR-hostunorder 0 100 200 300 400 500 6002481632Recovery Time (us)Number of HostsHostToR SwitchCore LinkCore Switch 0 1 2 3 4 5 6 701525125 0 0.5 1 1.5 2 2.5 3 3.5Tput per Process (M msg/s)Memory (MB)Delivery Latency (us)ThroughputMemory (MB)SIGCOMM ’21, August 23–28, 2021, Virtual Event, USA

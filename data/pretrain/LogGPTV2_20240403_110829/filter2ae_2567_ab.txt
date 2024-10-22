@@ -1,0 +1,41 @@
+此时数组的类型已经发生了改变而JIT并没有检查到这一点所以产生了漏洞。
+再来看一个较为复杂点的例子[CVE-2018-0835](https://bugs.chromium.org/p/project-zero/issues/list?q=label:CVE-2018-0835)。
+该漏洞存在于JavascriptArray::ReverseHelper函数中，函数会调用JavascriptArray::FillFromPrototypes，该函数通过遍历prototype来填充array。
+在程序中，函数确保prototype中的array不能是NativeArray。
+也就是说，如果prototype是NativeArray数组则会被程序转换为VarArray，如果能够使一个数组的prototype为NativeArray，就可以通过数组的Reverse方法将其prototype的NativeArray转换为VarArray。不过这里还有一个问题就是如何确保prototype是NativeArray，一般情况下如果一个数组被当作prototype，则它会被转化为VarArray。
+在JavascriptArray::EntrySort中存在如下代码。
+如果arr是一个NativeArray，它首先会变成一个VarArray执行sort回调，再变回NativeArray，如果能够在回调中将这个arr赋给prototype，之后它的类型又会变回来，这样就可以得到一个类型混淆漏洞。
+#### 2.3. 思路三：MissingItem
+CVE-2018-0953同样也是通过函数调用修改数组类型，这个漏洞特别之处在于引出了另一个关注点，即数组的MissingItem。MissingItem是一个数值，在64位程序上等于0x8000000280000002。Chakra引擎在数组创建的时候会使用这个值对数组元素进行初始化，表示数组中该元素还未进行赋值，另外数组还会保留一个标志位（NoMissingValues）来标志此数组是否有未被赋值的元素。
+先看看下面这段代码。
+当执行数组的赋值操作，调用了NativeArray的SetItem函数，SetItem函数实现如下。
+当给NativeArray赋值时，如果这个值等于MissingItem，可以将NativeArray转化为VarArray。优化逻辑假设对数组进行赋值是一个很安全的操作，只要传入参数不是一个对象那么就不会改变数组类型，但是并没有考虑到如果赋值的值等于MissingItem的话会引起数组类型的变化，正是这种疏忽导致了漏洞的发生。
+这个漏洞本身非常好理解，但是MissingItem本身又引出了一连串的问题。该漏洞的补丁程序修补了通过OP_SetElementI来调用SetItem的情况，但是这样修补远远不够，因为对该函数调用的位置其实非常多，于是找漏洞的思路变成了寻找为NativeArray赋值的各种路径的问题。
+CVE-2018-0953的漏洞发现者[lokihardt](https://bugs.chromium.org/p/project-zero/issues/list?q=label:Finder-lokihardt)在补丁修补后又提出两种思路来绕过补丁，第一个是通过arraypush来调用SetItem。
+触发漏洞代码如下：
+因为通过push对数组进行插入的操作会调用SetItem，所以数组改变的情况仍旧会存在。
+第二个思路是先直接修改数组的元素，再通过cancat来修改数组类型。漏洞触发代码如下：
+POC首先通过set修改了数组中元素的值。
+对应的JIT代码是这样的。
+在修改了数组元素后，创造了一个有MissingItem但是HasNoMissingValues的array。
+接着脚本调用了trigger函数，由于数组的HasNoMissingValues标志位为真，下图代码中的条件是满足的。
+因为数组有了MissingItem，所以可以进行到如下分支。
+InternalFillFromPrototype函数会对buggy数组prototype链上所有对象调用EnsureNonNativeArray，也就是说会对arr调用EnsureNonNativeArray，这样就可以修改其数组类型，但是JIT引擎并不知道arr类型已经改变，所以会导致类型混淆。
+针对此问题，Chakra的工作人员开始大规模的检查NativeArray的input，在LowerStElemC、GenerateProfiledNewScObjArrayFastPath、GenerateHelperToArrayPopFastPath等诸多函数上添加了MissItem的检测（由于修补函数较多，这里就不一一列举了，详情请参考地址）。
+但是，通过如下代码调用的OP_Memset函数并没有对value进行检查，仍旧可以用来构造拥有MissingItem但是HasNoMissingValues的array，并通过concat来得到一个类型混淆漏洞。
+值得一提的是，在11月的补丁中Chakra直接对concat方法做了严格的处理，从情况上推测应该是找到了新的方法来将MissingItem写入array，但由于网上没找到相应的信息，再加上补丁并没有对将值写入array的代码进行修补，反而限制了concat，所以也无法判断具体情况。
+#### 2.4. 思路四：将数组伪装成对象
+最后一种思路，通过迷惑Chakra引擎，使其在生成JIT代码过程中错误的将NativeArray当作其他对象，以至于没有在恰当的位置添加检查代码。
+公开的例子是[CVE-2018-8466](https://bugs.chromium.org/p/project-zero/issues/list?q=label:CVE-2018-8466)。
+Chakra使用JavascriptArray::GetArrayForArrayOrObjectWithArray来判断对象是否是array，其逻辑如下所示。
+通过CrossSite
+class来wrap一个对象的时候会替换该对象的虚表，所以被wrapping的数组将不会被识别为数组，这将导致无法在正确的地方生成对数组类型的检查并产生类型混淆漏洞。
+补丁除了验证虚表是否是array对象之外，还检查了对象是否是被CrossSite wrap的数组。
+另一个例子是CVE-2018-8542，其补丁在ValueType::MergeWithObject中。
+该函数主要用于合并两个对象，可以看到补丁添加了验证，用于确定两个对象中是否有数组，再观察一下没打过补丁的问题代码，如果两个对象都不是UninitializedObject，则合并为Object对象，大致可以获知漏洞产生的原因，在执行到这句的时候如果两个对象中有一个是数组，在合并时数组会被当作对象来处理，优化过程中引擎把合并的数组当作了对象，那么对数组类型是否改变的检测当然就不被需要，于是最终导致了类型混淆。
+### 3\. 总结
+在过去一年左右，JIT编译优化过程中的类型混淆是Chakra漏洞挖掘方面的一个主要关注点。从早期的利用未被保护的回调和正常函数来修改数组类型，再到寻找验证过程中的逻辑问题，利用数组的MissingItem特性，将数组伪装成其他类型对象思路，我们可以看到随着研究者对Chakra引擎的深入研究，漏洞产生的位置已经从简单的对象方法慢慢向JIT优化代码生成过程中产生的各种逻辑和判断问题靠拢，漏洞挖掘的门槛也有了显著的提升。
+* * *
+**启明星辰积极防御实验室（ADLab）**
+ADLab成立于1999年，是中国安全行业最早成立的攻防技术研究实验室之一，微软MAPP计划核心成员。截止目前，ADLab通过CVE发布Windows、Linux、Unix等操作系统安全或软件漏洞近400个，持续保持国际网络安全领域一流水准。实验室研究方向涵盖操作系统与应用系统安全研究、移动智能终端安全研究、物联网智能设备安全研究、Web安全研究、工控系统安全研究、云安全研究。研究成果应用于产品核心技术研究、国家重点科技项目攻关、专业安全服务等。
+* * *

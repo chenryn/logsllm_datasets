@@ -1,0 +1,243 @@
+## PostgreSQL 11 preview - 并行排序、并行索引 (性能线性暴增) 单实例100亿TOP-K仅40秒   
+### 作者      
+digoal         
+### 日期      
+2018-02-04      
+### 标签      
+PostgreSQL , 并行排序 , 外排 , merge sort , TOP-K , 并行创建索引 , 分区并行 , ranking , percent , midean , 数据分布      
+----        
+## 背景     
+在OLAP场景，排序是一个非常重要的功能。也是衡量数据库是否适合OLAP场景的一个重要指标。例如这些场景：  
+1、求TOP-K，例如在对数据进行分组后，取出每个分组的TOP-K。  
+2、求中位数，要求对数据排序，并取出处于中间水位的值。  
+3、数据柱状图，需要对数据进行排序，并按记录均匀分割成若干BUCKET，获得bucket边界。  
+4、ranking排序，对数据进行排序，取出TOP-K。  
+5、数据按窗口分组，求数据分布，或groupAGG等。  
+https://www.postgresql.org/docs/devel/static/functions-window.html   
+6、海量数据，取percent value，例如每一天的网站访问延迟水位数（99%, 95%, ......）。  
+7、创建索引(在TP场景，如果数据频繁更新删除，索引可能会逐渐膨胀，PG 11并行创建索引功能推出，索引维护性能杠杠的了(不堵塞DML的语法也支持并行, create index concurrently))。  
+排序能力真的很重要对吧，怪不得那么多企业参加计算机排序性能大赛呢。  
+PostgreSQL 11 在排序上有了长足的进步，支持了并行排序。  
+并行排序, 创建索引流程如下（并行扫描 -> 并行排序(阶段性quicksort+external sort) -> 合并排序并写索引文件），如果是求TOP-K，采用top-n heapsort并且不需要合并落盘的过程，爆快：  
+![pic](20180204_01_pic_001.jpg)  
+下面有一组测试数据，以及如何操纵并行排序的并行度，以及一些简单的原理介绍。有两个数字值得关注（也说明了PostgreSQL 进步飞速）：  
+```  
+单实例 100亿排序求TOP-K，40秒。  
+单实例 100亿创建索引，26分钟。  
+```  
+## 环境介绍  
+64线程，512G，NVME SSD  
+CentOS 7.x x64   
+PostgreSQL 11  
+一些预设参数，帮助控制并行度。  
+```  
+max_worker_processes = 128  
+max_parallel_workers = 64  
+max_parallel_workers_per_gather = 64  
+max_parallel_maintenance_workers = 64  
+# 并行建索引使用了external sort，和work_mem关系不大  
+#   （当串行排序，如果要使用quick sort的话需要够大的work_mem；  
+#     或者使用hash agg , hash join时需要够大的work_mem）。  
+work_mem='128MB'   
+# 至少满足每个worker有最少32MB的可用内存。否则可能并行度会低于预期。  
+maintenance_work_mem='16GB'    
+```  
+测试数据量1亿、10亿、100亿。排序字段为INT8类型。  
+## 准备测试数据  
+1、表结构  
+```  
+-- 1亿  
+create unlogged table ttt(id int8, info text);  
+-- 10亿  
+create unlogged table t(id int8, info text);  
+-- 100亿  
+create unlogged table tbl(id int8, info text);  
+```  
+2、使用dblink异步调用，并行加载数据。  
+```  
+postgres=# create extension dblink;  
+CREATE EXTENSION  
+```  
+3、创建生成dblink连接的函数，重复创建不报错。        
+```        
+create or replace function conn(        
+  name,   -- dblink名字        
+  text    -- 连接串,URL        
+) returns void as $$          
+declare          
+begin          
+  perform dblink_connect($1, $2);         
+  return;          
+exception when others then          
+  return;          
+end;          
+$$ language plpgsql strict;          
+```        
+4、并行加载1亿    
+```      
+do language plpgsql $$     
+declare        
+begin        
+for i in 0..99 loop         
+  perform conn('link'||i,  'hostaddr=127.0.0.1 port=9999 user=postgres dbname=postgres');         
+  perform 1 from dblink_get_result('link'||i) as t(id int, c1 int);        
+  perform dblink_send_query('link'||i, format('insert into tbl select generate_series(%s::int8, %s::int8), ''test''', i*1000000::int8+1, (i+1)*1000000::int8));        
+end loop;           
+end;        
+$$;        
+```      
+5、并行加载10亿    
+```      
+do language plpgsql $$     
+declare        
+begin        
+for i in 0..99 loop         
+  perform conn('link'||i,  'hostaddr=127.0.0.1 port=9999 user=postgres dbname=postgres');         
+  perform 1 from dblink_get_result('link'||i) as t(id int, c1 int);        
+  perform dblink_send_query('link'||i, format('insert into tbl select generate_series(%s::int8, %s::int8), ''test''', i*10000000::int8+1, (i+1)*10000000::int8));        
+end loop;           
+end;        
+$$;        
+```      
+6、并行加载100亿    
+```      
+do language plpgsql $$     
+declare        
+begin        
+for i in 0..99 loop         
+  perform conn('link'||i,  'hostaddr=127.0.0.1 port=9999 user=postgres dbname=postgres');         
+  perform 1 from dblink_get_result('link'||i) as t(id int, c1 int);        
+  perform dblink_send_query('link'||i, format('insert into tbl select generate_series(%s::int8, %s::int8), ''test''', i*100000000::int8+1, (i+1)*100000000::int8));        
+end loop;           
+end;        
+$$;        
+```      
+## 并行求TOP-K  
+### 1、1亿  
+非并行  
+```  
+postgres=# select * from ttt order by id limit 10;  
+ id | info   
+----+------  
+  1 | test  
+  2 | test  
+  3 | test  
+  4 | test  
+  5 | test  
+  6 | test  
+  7 | test  
+  8 | test  
+  9 | test  
+ 10 | test  
+(10 rows)  
+Time: 9374.943 ms (00:09.375)  
+```  
+并行(强制N个并行)  
+```  
+alter table ttt set (parallel_workers =64);  
+set min_parallel_index_scan_size =0;  
+set min_parallel_table_scan_size =0;  
+set parallel_tuple_cost =0;  
+set parallel_setup_cost =0;  
+postgres=# select * from ttt order by id limit 10;  
+ id | info   
+----+------  
+  1 | test  
+  2 | test  
+  3 | test  
+  4 | test  
+  5 | test  
+  6 | test  
+  7 | test  
+  8 | test  
+  9 | test  
+ 10 | test  
+(10 rows)  
+Time: 501.723 ms  
+```  
+看一个执行计划，这个不涉及索引落盘，所以不受max_parallel_maintenance_workers参数控制，仅与其他几个并行参数相关。  
+```  
+postgres=# show max_parallel_maintenance_workers ;  
+ max_parallel_maintenance_workers   
+----------------------------------  
+ 0  
+(1 row)  
+postgres=# explain select * from ttt order by id limit 10;  
+                                        QUERY PLAN                                          
+------------------------------------------------------------------------------------------  
+ Limit  (cost=589933.02..589933.35 rows=10 width=13)  
+   ->  Gather Merge  (cost=589933.02..3855023.18 rows=100000000 width=13)  
+         Workers Planned: 64  
+         ->  Sort  (cost=589931.06..593837.31 rows=1562500 width=13)  
+               Sort Key: id  
+               ->  Parallel Seq Scan on ttt  (cost=0.00..556166.00 rows=1562500 width=13)  
+(6 rows)  
+```  
+### 2、10亿  
+非并行  
+```  
+postgres=# select * from t order by id limit 10;  
+ id | info   
+----+------  
+  1 | test  
+  2 | test  
+  3 | test  
+  4 | test  
+  5 | test  
+  6 | test  
+  7 | test  
+  8 | test  
+  9 | test  
+ 10 | test  
+(10 rows)  
+Time: 95162.659 ms (01:35.163)  
+```  
+并行(强制N个并行)  
+```  
+alter table t set (parallel_workers =64);  
+set min_parallel_index_scan_size =0;  
+set min_parallel_table_scan_size =0;  
+set parallel_tuple_cost =0;  
+set parallel_setup_cost =0;  
+postgres=# select * from t order by id limit 10;  
+ id | info   
+----+------  
+  1 | test  
+  2 | test  
+  3 | test  
+  4 | test  
+  5 | test  
+  6 | test  
+  7 | test  
+  8 | test  
+  9 | test  
+ 10 | test  
+(10 rows)  
+Time: 5112.469 ms (00:05.112)  
+```  
+### 3、100亿  
+非并行  
+```  
+postgres=# select * from tbl order by id limit 10;  
+ id | info   
+----+------  
+  1 | test  
+  2 | test  
+  3 | test  
+  4 | test  
+  5 | test  
+  6 | test  
+  7 | test  
+  8 | test  
+  9 | test  
+ 10 | test  
+(10 rows)  
+Time: 1107549.801 ms (18:27.550)  
+```  
+并行(强制N个并行)  
+```  
+alter table tbl set (parallel_workers =64);  
+set min_parallel_index_scan_size =0;  
+set min_parallel_table_scan_size =0;  
+set parallel_tuple_cost =0;  
+set parallel_setup_cost =0;  

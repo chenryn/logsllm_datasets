@@ -1,0 +1,108 @@
+# Linux kernel 4.20 BPF 整数溢出-堆溢出漏洞及其利用
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 内容简介
+近日，我发现Linux内核BPF模块中一个质量较高linux内核堆溢出漏洞([已向linux社区提交漏洞补丁](https://www.mail-archive.com/PI:EMAIL/msg256054.html)）。
+我们可以100%稳定触发这个漏洞，并且可以利用它来进行本地提权获得root权限。这篇文章主要分析漏洞的成因以及基本漏洞利用方法。
+## 漏洞模块
+BPF(Berkeley Packet
+Filter)模块[1]是用于支持用户态自定义包过滤方法的内核模块，目前各大Linux发行版都默认开启了bpf支持，关于bpf官方文档的介绍如下：
+> Linux Socket Filtering (LSF) is derived from the Berkeley Packet Filter.  
+>  Though there are some distinct differences between the BSD and Linux  
+>  Kernel filtering, but when we speak of BPF or LSF in Linux context, we  
+>  mean the very same mechanism of filtering in the Linux kernel.
+>
+> BPF allows a user-space program to attach a filter onto any socket and  
+>  allow or disallow certain types of data to come through the socket. LSF  
+>  follows exactly the same filter code structure as BSD’s BPF, so referring  
+>  to the BSD bpf.4 manpage is very helpful in creating filters.
+## 漏洞分析
+###  引入时间
+该漏洞位于kernel/bpf/queue_stack_maps.c文件中，于2018-10-19在commit
+[f1a2e44a3aeccb3ff18d3ccc0b0203e70b95bd92](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/kernel/bpf?id=f1a2e44a3aeccb3ff18d3ccc0b0203e70b95bd92)中为bpf模块引入了名为queue/stack
+map的新功能。
+> Queue/stack maps implement a FIFO/LIFO data storage for ebpf programs.  
+>  These maps support peek, pop and push operations that are exposed to eBPF  
+>  programs through the new bpf_map[peek/pop/push] helpers. Those operations  
+>  are exposed to userspace applications through the already existing  
+>  syscalls in the following way:
+>
+> BPF_MAP_LOOKUP_ELEM -> peek
+>
+> BPF_MAP_LOOKUP_AND_DELETE_ELEM -> pop
+>
+> BPF_MAP_UPDATE_ELEM -> push
+###  影响范围
+该漏洞影响Linux Kernel 4.20rc1-4.20rc4，主要Linux发行版并不受其影响。
+###  整数溢出
+这枚漏洞的根本成因是在创建queue_stack_map时发生的整数溢出导致申请出的对象偏小，函数调用链如下：
+    __x64_sys_bpf() 
+      ->map_create()
+        ->find_and_alloc_map()
+          ->queue_stack_map_alloc()
+漏洞函数queue_stack_map_alloc如下：
+    static struct bpf_map *queue_stack_map_alloc(union bpf_attr *attr)
+    {
+        int ret, numa_node = bpf_map_attr_numa_node(attr);
+        struct bpf_queue_stack *qs;
+        u32 size, value_size;
+        u64 queue_size, cost;
+        size = attr->max_entries + 1; //整数溢出漏洞点
+        value_size = attr->value_size;
+        queue_size = sizeof(*qs) + (u64) value_size * size;
+        cost = queue_size;
+        if (cost >= U32_MAX - PAGE_SIZE)
+            return ERR_PTR(-E2BIG);
+        cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+        ret = bpf_map_precharge_memlock(cost);
+        if (ret map, attr);
+        qs->map.pages = cost;
+        qs->size = size;
+        raw_spin_lock_init(&qs->lock);
+        return &qs->map;
+    }
+上述函数在计算size时，使用了用户传入的参数attr->max_entries。由于size的类型是u32,
+如果attr->max_entries=0xffffffff，那么attr->max_entries+1时就会发生整数溢出使得size=0。后续在bpf_map_area_alloc函数中会申请一块大小为queue_size的堆内存，queue_size的大小由以下表达式计算：
+    sizeof(*qs) + (u64) value_size * size; // value_size 和 size我们都可控
+可以看出，由于`size`在之前的计算过程中发生整数溢出变成了0，分配的大小只有`sizeof(*qs)`。
+###  堆溢出
+之后，可以在另一个bpf系统调用update这块map过程中，向这块过小的queue stack区域拷入数据，导致内核堆溢出。调用链如下：
+    __x64_sys_bpf()
+      ->map_update_elem()
+        ->queue_stack_map_push_elem()//堆溢出
+其中发生溢出的是queue_stack_map_hash_elem()函数中的memcpy调用。由源码可知，memcpy的dst就是上面申请的queue
+stack区域，src是由用户态拷入的大小为qs->map.value_size的buffer,
+拷贝长度由创建queue_stack时用户提供的attr.value_size决定，因此拷贝长度用户可控。
+queue_stack_map_push_elem()函数如下：
+    static int queue_stack_map_push_elem(struct bpf_map *map, void *value,
+                         u64 flags)
+    {
+        struct bpf_queue_stack *qs = bpf_queue_stack(map);
+        unsigned long irq_flags;
+        int err = 0;
+        void *dst;
+        bool replace = (flags & BPF_EXIST);
+        if (flags & BPF_NOEXIST || flags > BPF_EXIST)
+            return -EINVAL;
+        raw_spin_lock_irqsave(&qs->lock, irq_flags);
+        if (queue_stack_map_is_full(qs)) {
+            if (!replace) {
+                err = -E2BIG;
+                goto out;
+            }
+            if (unlikely(++qs->tail >= qs->size))
+                qs->tail = 0;
+        }
+        dst = &qs->elements[qs->head * qs->map.value_size];
+        memcpy(dst, value, qs->map.value_size); //堆溢出
+        if (unlikely(++qs->head >= qs->size))
+            qs->head = 0;
+    out:
+        raw_spin_unlock_irqrestore(&qs->lock, irq_flags);
+        return err;
+    }
+可以看出`memcpy(dst, value, qs->map.value_size);
+//堆溢出`处是一个明显的堆溢出漏洞。由于`dst`堆块在之前计算堆块分配大小的过程中发生了整数溢出大小只有`sizeof(struct
+bpf_queue_stack)`也就是256个字节，如果`value_size > 256 - (&qs->elements -&qs)`，就会发生越界拷贝。
+## 漏洞利用：

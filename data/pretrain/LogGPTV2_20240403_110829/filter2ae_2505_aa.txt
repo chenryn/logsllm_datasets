@@ -1,0 +1,48 @@
+翻译自:
+# 前言
+我在Mozilla工作中最有趣（有时甚至是可怕的）部分之一就是处理安全漏洞。我们并不总是能提供完美的代码——没有人能做到这点——但我很荣幸能与一个伟大的工程师团队和安全人员合作，他们知道如何处理出现的安全问题。我也很荣幸能够在公开场合工作，并通过此来分享我的一些经验。
+学习如何编写更安全的代码的最佳途径之一就是在实践中观察失败代码的样例。考虑到这一点，我打算写一写我在Mozilla期间参与处理安全漏洞的经历。我们从最近的一个bug说起:[Bug
+1447452](https://bugzilla.mozilla.org/show_bug.cgi?id=1447452)，其中Firefox
+Accounts API服务器对unicode字符的一些错误处理可能允许攻击者向后端数据存储发起任意请求。
+# Bug：HTTP请求路径中的unicode字符损坏
+一切都开始于我调试的一个非关联的unicode处理issue，并最终将我引向一个错误报告：[bug report against the Node.js
+`http` module](https://github.com/nodejs/node/issues/13296),报告中提到：
+换句话说，报告者使用Node.js向特定路径发出HTTP请求，但是发出的请求实际上被定向到了不一样的路径！深入研究一下，发现这个问题是由Node.js将HTTP请求写入路径时对unicode字符的有损编码引起的。
+虽然用户发出的`http`请求通常将请求路径指定为字符串，但Node.js最终必须将请求作为原始字节输出。JavaScript支持unicode字符串，因此将它们转换为字节意味着选择并应用适当的unicode编码。对于不包含主体的请求，Node.js默认使用“latin1”，这是一种单字节编码，不能表示高编号的unicode字符，例如。相反，这些字符被截断为其JavaScript表示的最低字节：  
+处理用户输入时的坏数据通常是底层安全问题的危险信号，我知道我们的代码库发出了可能包含用户输入的路径的HTTP请求。所以我立即在[Bugzilla](https://bugzilla.mozilla.org/)中提交了一个保密的安全漏洞，向[node安全团队](https://nodejs.org/en/security/)寻求更多信息，然后根据用户提供的unicode字符串寻找我们可能构建URL的地方。
+# 漏洞：通过拆分请求实现的SSRF攻击
+我所担心的这种漏洞被称为[request
+splitting](http://projects.webappsec.org/w/page/13246929/HTTP%20Request%20Splitting)，基本文本的协议（比如`HTTP`）通常是很脆弱的。假设一个服务器，接受用户输入，并将其包含在通过HTTP公开的内部服务请求中，像这样：
+    GET /private-api?q= HTTP/1.1
+    Authorization: server-secret-key
+如果服务器未正确验证用户输入，则攻击者可能会直接注入`协议控制字符`到请求里。假设在这种情况下服务器接受了以下用户输入：
+    "x HTTP/1.1\r\n\r\nDELETE /private-api HTTP/1.1\r\n"
+    >
+在发出请求时，服务器可能会直接将其写入路径，如下：
+    GET /private-api?q=x HTTP/1.1
+    DELETE /private-api
+    Authorization: server-secret-key
+接收服务将此解释为两个单独的HTTP请求，一个`GET`后跟一个`DELETE`，它无法知道调用者的意图。
+实际上，这种精心构造的用户输入会欺骗服务器，使其发出额外的请求，这种情况被称为[服务器端请求伪造](https://www.owasp.org/index.php/Server_Side_Request_Forgery)，或者“SSRF”。服务器可能拥有攻击者不具有的权限，例如访问内网或者秘密api密钥，这就进一步加剧了问题的严重性。
+好的HTTP库通通常包含阻止这一行为的措施，Node.js也不例外：如果你尝试发出一个路径中含有控制字符的HTTP请求，它们会被URL编码：
+    > http.get('http://example.com/\r\n/test').output
+    [ 'GET /%0D%0A/test HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n' ]
+不幸的是，上述的处理unicode字符错误意味着可以规避这些措施。考虑如下的URL，其中包含一些带变音符号的unicode字符：
+    > 'http://example.com/\u{010D}\u{010A}/test'
+    http://example.com/čĊ/test
+当Node.js版本8或更低版本对此URL发出`GET`请求时，它不会进行转义，因为它们不是HTTP控制字符：
+    > http.get('http://example.com/\u010D\u010A/test').output
+    [ 'GET /čĊ/test HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n' ]
+但是当结果字符串被编码为latin1写入路径时，这些字符将分别被截断为“\r”和“\n”：
+    > Buffer.from('http://example.com/\u{010D}\u{010A}/test', 'latin1').toString()
+    'http://example.com/\r\n/test'
+因此，通过在请求路径中包含精心选择的unicode字符，攻击者可以欺骗Node.js将HTTP协议控制字符写入线路。
+这个bug已经在Node.js10中被修复，如果请求路径包含非ascii字符，则会抛出错误。但是对于Node.js8或更低版本，如果有下列情况，任何发出传出HTTP请求的服务器都可能受到通过请求拆实现的SSRF的攻击：
+  * 接受来自用户输入的unicode数据
+  * 并将其包含爱HTTP请求的路径中
+  * 且请求具有一个0长度的主体（比如一个`GET`或者`DELETE`）
+# 影响：向FxA数据存储伪造请求
+我们审计了FxA服务器堆栈，以查找在请求路径中使用0长度主体和用户提供的数据发出HTTP请求的位置，我们发现了三个可以触发上述错误的位置。
+第一个在[WebPush](https://developer.mozilla.org/en-US/docs/Web/API/Push_API)，一个登陆服务器提供一个用于接受用户账户状态更改通知的https
+URI，可以通过发送一个0长度的`PUT`请求访问服务器。幸运的是，这种情况下服务器发出的请求不具有任何特殊权限或API令牌。这里可以利用这个bug欺骗FxA服务器向webpush通知主机发出恶意请求，但该请求不会比攻击者直接提出的请求更具威胁性。
+第一个在[BrowseID](https://en.wikipedia.org/wiki/Mozilla_Persona)的证书认证，其中FxA服务器从用户提供的JSON

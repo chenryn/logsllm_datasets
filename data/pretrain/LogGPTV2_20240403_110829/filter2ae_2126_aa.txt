@@ -1,0 +1,200 @@
+### 0x01 前言
+我们在使用ysoserial的时候，经常会用它生成序列化的payload，用于攻击具有反序列化功能的endpoint，而这些payload大部分都是比较长的一条执行链，在反序列化期间，由执行程序执行攻击者可控的source，然后通过依赖中存在的执行链，最终触发至slink，从而达到攻击的效果。
+这些gadget chain有长有短，大部分可以通过类似Intellij
+idea这类工具去根据slink，查找调用者，以及各种调用者的实现，一路反向的跟踪，对于一些比较简单比较短的链，通常通过人工查找也能快速的找到，但是对于一些比较长的链，人工查找会耗费巨大的精力和时间，并且不一定能挖掘到gadget
+chain。
+而有段时间，我苦恼于人工查找浪费巨大精力得不偿失时，忽然发现这样一款自动化挖掘gadget
+chain的工具，通过阅读分析它的源码，它给我带来了非常多的知识以及自动化挖掘的思路，其中就包括类似污点分析，如何去分析方法调用中，参数是否可以影响返回值，从而跟踪数据流动是否可以从source最终流动至slink，并影响至最终的slink点。
+**gadgetinspector** ：
+**个人加了点注释的gadgetinspector**
+**slink** ：
+  * Runtime.exec()：这种利用最为简单，但是实际生产情况基本不会遇到
+  * Method.invoke()：这种方式通过反射执行方法，需要方法以及参数可控
+  * RMI/JRMP：通过反序列化使用RMI或者JRMP链接到我们的exp服务器，通过发送序列化payload至靶机实现
+  * URL.openStream：这种利用方式需要参数可控，实现SSRF
+  * Context.lookup：这种利用方式也是需要参数可控，最终通过rmi或ldap的server实现攻击
+  * ...等等
+在分析gadgetinspector源码的时候，大概会在以下几方面去讲解，并核心分析ASM部分，详细讲解如何进行污点分析：
+  1. GadgetInspector：main方法，程序的入口，做一些配置以及数据的准备工作
+  2. MethodDiscovery：类、方法数据以及父子类、超类关系数据的搜索
+  3. PassthroughDiscovery：分析参数能影响到返回值的方法，并收集存储
+  4. CallGraphDiscovery：记录调用者caller方法和被调用者target方法的参数关联
+  5. SourceDiscovery：入口方法的搜索，只有具备某种特征的入口才会被标记收集
+  6. GadgetChainDiscovery：整合以上数据，并通过判断调用链的最末端slink特征，从而判断出可利用的gadget chain
+### 0x02 GadgetInspector：入口代码的分析
+程序启动的入口，在该方法中，会做一些数据的准备工作，并一步步调用MethodDiscovery、PassthroughDiscovery、CallGraphDiscovery、SourceDiscovery、GadgetChainDiscovery，最终实现gadget
+chain的挖掘
+参数合法判断：
+    if (args.length == 0) {
+        printUsage();
+        System.exit(1);
+    }
+在程序的入口处，会先判断启动参数是否为空，若是空，则直接退出，因为程序对挖掘的gadget chain会有类型的区分，以及class所在位置的配置
+日志、序列化类型配置：
+    //配置log4j用于输出日志
+    configureLogging();
+    boolean resume = false;
+    //挖掘的gadget chain序列化类型，默认java原生序列化
+    GIConfig config = ConfigRepository.getConfig("jserial");
+日志配置是便于统一的输出管理，而序列化类型的配置，因为对链的挖掘前，我们需要确定挖掘的是哪种类型的链，它可以是jackson的json序列化，也可以是java原生的序列化等等
+序列化配置接口：
+    public interface GIConfig {
+        String getName();
+        SerializableDecider getSerializableDecider(Map methodMap, InheritanceMap inheritanceMap);
+        ImplementationFinder getImplementationFinder(Map methodMap,
+                                                     Map> methodImplMap,
+                                                     InheritanceMap inheritanceMap);
+        SourceDiscovery getSourceDiscovery();
+    }
+既然我们选择了不同的序列化形式，那么，相对来说，它们都会有自身特有的特征，因此我们需要实现jackson特有的SerializableDecider、ImplementationFinder、SourceDiscovery，从而能达到区分，并最终实现gadget
+chain的挖掘，
+例jackson：
+  * SerializableDecider-JacksonSerializableDecider：
+    public class JacksonSerializableDecider implements SerializableDecider {
+        //类是否通过决策的缓存集合
+        private final Map cache = new HashMap<>();
+        //类名-方法集合 映射集合
+        private final Map> methodsByClassMap;
+        public JacksonSerializableDecider(Map methodMap) {
+            this.methodsByClassMap = new HashMap<>();
+            for (MethodReference.Handle method : methodMap.keySet()) {
+                Set classMethods = methodsByClassMap.get(method.getClassReference());
+                if (classMethods == null) {
+                    classMethods = new HashSet<>();
+                    methodsByClassMap.put(method.getClassReference(), classMethods);
+                }
+                classMethods.add(method);
+            }
+        }
+        @Override
+        public Boolean apply(ClassReference.Handle handle) {
+            Boolean cached = cache.get(handle);
+            if (cached != null) {
+                return cached;
+            }
+            Set classMethods = methodsByClassMap.get(handle);
+            if (classMethods != null) {
+                for (MethodReference.Handle method : classMethods) {
+                    //该类，只要有无参构造方法，就通过决策
+                    if (method.getName().equals("") && method.getDesc().equals("()V")) {
+                        cache.put(handle, Boolean.TRUE);
+                        return Boolean.TRUE;
+                    }
+                }
+            }
+            cache.put(handle, Boolean.FALSE);
+            return Boolean.FALSE;
+        }
+    }
+这一块代码，我们可以主要关心在apply方法中，可以看到，具体细节的意思就是，只要存在无参的构造方法，都表示可以被序列化。因为在java中，若没有显式的实现无参构造函数，而实现了有参构造函数，在这种情况下，该类是不具有无参构造方法的，而jackson对于json的反序列化，都是先通过无参构造方法进行实例化，因此，若无无参构造方法，则表示不能被jackson进行反序列化。所以，该决策类的存在意义，就是标识gadget
+chian中不可被反序列化的类，不可被反序列化就意味着数据流不可控，gadget chain无效。
+  * ImplementationFinder-JacksonImplementationFinder
+    public class JacksonImplementationFinder implements ImplementationFinder {
+        private final SerializableDecider serializableDecider;
+        public JacksonImplementationFinder(SerializableDecider serializableDecider) {
+            this.serializableDecider = serializableDecider;
+        }
+        @Override
+        public Set getImplementations(MethodReference.Handle target) {
+            Set allImpls = new HashSet<>();
+            // For jackson search, we don't get to specify the class; it uses reflection to instantiate the
+            // class itself. So just add the target method if the target class is serializable.
+            if (Boolean.TRUE.equals(serializableDecider.apply(target.getClassReference()))) {
+                allImpls.add(target);
+            }
+            return allImpls;
+        }
+    }
+该实现类核心方法是getImplementations，因为java是一个多态性的语言，只有在运行时，程序才可知接口的具体实现类是哪一个，而gadgetinspector并不是一个运行时的gadget
+chain挖掘工具，因此，当遇到一些接口方法的调用时，需要通过查找该接口方法的所有实现类，并把它们组成链的一节形成实际调用的链，最后去进行污点分析。而该方法通过调用JacksonSerializableDecider的apply方法进行判断，因为对于接口或者子类的实现，我们是可控的，但是该json是否可被反序列化，需要通过JacksonSerializableDecider判断是否存在无参构造方法。
+  * SourceDiscovery-JacksonSourceDiscovery
+    public class JacksonSourceDiscovery extends SourceDiscovery {
+        @Override
+        public void discover(Map classMap,
+                             Map methodMap,
+                             InheritanceMap inheritanceMap) {
+            final JacksonSerializableDecider serializableDecider = new JacksonSerializableDecider(methodMap);
+            for (MethodReference.Handle method : methodMap.keySet()) {
+                if (serializableDecider.apply(method.getClassReference())) {
+                    if (method.getName().equals("") && method.getDesc().equals("()V")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                    if (method.getName().startsWith("get") && method.getDesc().startsWith("()")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                    if (method.getName().startsWith("set") && method.getDesc().matches("\\(L[^;]*;\\)V")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                }
+            }
+        }
+    }
+该实现类，仅有discover这一个方法，不过，对于gadget chain的挖掘，它可以肯定是最重要的，因为一个gadget
+chain的执行链，我们必须要有一个可以触发的入口，而JacksonSourceDiscovery的作用就是找出具备这样特征的入口方法，对于jackson反序列化json时，它会执行无参构造方法以及setter、getter方法，若我们在数据字段可控的情况下，并由这些被执行的方法去触发，若存在gadget
+chain，那么就能触发source-slink整条链的执行。
+    int argIndex = 0;
+    while (argIndex B B->C C->D，其中参数随着调用关系从A流向B，在B调用C过程中作为入参并随着方法结束返回，最后流向D）
+        //该方法主要是追踪上面所说的"B调用C过程中作为入参并随着方法结束返回"，入参和返回值之间的关联
+        passthroughDiscovery.discover(classResourceEnumerator, config);
+        passthroughDiscovery.save();
+    }
+    if (!Files.exists(Paths.get("callgraph.dat"))) {
+        LOGGER.info("Analyzing methods in order to build a call graph...");
+        CallGraphDiscovery callGraphDiscovery = new CallGraphDiscovery();
+        //记录参数在方法调用链中的流动关联（如：A、B、C三个方法，调用链为A->B B->C，其中参数随着调用关系从A流向B，最后流C）
+        //该方法主要是追踪上面所说的参数流动，即A->B入参和B->C入参的关系，以确定参数可控
+        callGraphDiscovery.discover(classResourceEnumerator, config);
+        callGraphDiscovery.save();
+    }
+    if (!Files.exists(Paths.get("sources.dat"))) {
+        LOGGER.info("Discovering gadget chain source methods...");
+        SourceDiscovery sourceDiscovery = config.getSourceDiscovery();
+        //查找利用链的入口（例：java原生反序列化的readObject）
+        sourceDiscovery.discover();
+        sourceDiscovery.save();
+    }
+    {
+        LOGGER.info("Searching call graph for gadget chains...");
+        GadgetChainDiscovery gadgetChainDiscovery = new GadgetChainDiscovery(config);
+        //根据上面的数据收集，最终分析利用链
+        gadgetChainDiscovery.discover();
+    }
+    LOGGER.info("Analysis complete!");
+最后这部分，就是核心的挖掘逻辑。
+### 0x03 MethodDiscovery
+这部分，主要进行了类数据、方法数据以及类继承关系数据的收集
+    if (!Files.exists(Paths.get("classes.dat")) || !Files.exists(Paths.get("methods.dat"))
+            || !Files.exists(Paths.get("inheritanceMap.dat"))) {
+        LOGGER.info("Running method discovery...");
+        MethodDiscovery methodDiscovery = new MethodDiscovery();
+        methodDiscovery.discover(classResourceEnumerator);
+        //保存了类信息、方法信息、继承实现信息
+        methodDiscovery.save();
+    }
+从上述代码可以看到，先判断了classes.dat、methods.dat、inheritanceMap.dat三个文件是否存在，若不存在则执行MethodDiscovery的实例化，并依次调用其discover、save方法
+    public void discover(final ClassResourceEnumerator classResourceEnumerator) throws Exception {
+        for (ClassResourceEnumerator.ClassResource classResource : classResourceEnumerator.getAllClasses()) {
+            try (InputStream in = classResource.getInputStream()) {
+                ClassReader cr = new ClassReader(in);
+                try {
+                    //使用asm的ClassVisitor、MethodVisitor，利用观察模式去扫描所有的class和method并记录
+                    cr.accept(new MethodDiscoveryClassVisitor(), ClassReader.EXPAND_FRAMES);
+                } catch (Exception e) {
+                    LOGGER.error("Exception analyzing: " + classResource.getName(), e);
+                }
+            }
+        }
+    }
+MethodDiscovery.discover方法中，通过调用classResourceEnumerator.getAllClasses()获取到rt.jar以及程序参数配置的jar、war中所有的class，然后遍历每一个class，接着通过ASM，对其每个类进行观察者模式的visit
+跟进MethodDiscoveryClassVisitor，对于ClassVisitor，ASM对其每个方法的调用顺序是这样的：
+**visit顺序：**
+    void visit(int version, int access, String name, String signature, String superName, String[] interfaces)
+    visit( 类版本 , 修饰符 , 类名 , 泛型信息 , 继承的父类 , 实现的接口)
+->
+    void visitSource(String source, String debug)
+->
+    void visitOuterClass(String owner, String name, String descriptor)
+->
+    void visitAttribute(Attribute attribute)
+->
+    AnnotationVisitor visitAnnotation(String descriptor, boolean visible)

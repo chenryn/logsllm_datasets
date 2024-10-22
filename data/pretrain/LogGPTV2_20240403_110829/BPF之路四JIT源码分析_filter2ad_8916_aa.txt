@@ -1,0 +1,194 @@
+# BPF之路四JIT源码分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 环境搭建
+编译内核时需要开启如下配置
+BPF程序如下, 按照之前说的方法提取BPF指令后, 利用系统把指令加载进入内核
+    //clang -O2 -target bpf -c ./prog.c -o ./prog.o
+    #include 
+    unsigned long prog(void){
+        unsigned long a=0x231;
+        return a+0x456;
+    }
+`echo 2 > /proc/sys/net/core/bpf_jit_enable`开启jit并且把翻译出指令输出在内核日志中, 结果如下.
+如果编译时设置了`CONFIG_BPF_JIT_ALWAYS_ON=y`,
+那么`/proc/sys/net/core/bpf_jit_enable`就只能是1, 就不发看到JIT编译出的指令了
+内核源码树中`tools/bpf/bpf_jit_disasm`工具可用于从日志中提取JITcode, 然后反编译成x86汇编,
+这样就能看到BPF指令翻译成x86的结果. 但是这个工具需要许多依赖, 安装在busybox中比较烦琐, 所以我直接用py反编译生成的指令
+    form pwn import *
+    context(arch='amd64', os='linux')
+    def bpf_jit_disasm(JIT_code):
+        JIT_code = JIT_code.split('\n')
+        x86_code = ''
+        for line in JIT_code:
+            idx = line.find(': ')+2
+            idx = line.find(': ', idx)+2 # secodary ': ' position
+            for C in line[idx:].split(' '):
+                x86_code+= chr(int(C, 16))
+        print(disasm(x86_code))
+    JIT_code = '''[   18.353267] JIT code: 00000000: 66 66 66 66 90 55 48 89 e5 48 81 ec 08 00 00 00
+    [   18.353587] JIT code: 00000010: 53 41 55 41 56 41 57 6a 00 bf 31 02 00 00 48 89
+    [   18.353972] JIT code: 00000020: 7d f8 48 8b 7d f8 48 81 c7 56 04 00 00 48 89 f8
+    [   18.354265] JIT code: 00000030: 5b 41 5f 41 5e 41 5d 5b c9 c3'''
+    bpf_jit_disasm(JIT_code)
+我们把反编译的结果与BPF指令进行对比可以发现, 两者极其相似, BPF程序几乎就是直接在硬件上执行, 不需要模拟, 这也是JIT高性能的原因
+## 入口点
+`sys_bpf()`从用户空间获取bpf_attr对象, 然后根据cmd调用具体的函数, 目前只关注`bpf_prog_load()`
+    //bpf系统调用入口点
+    SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user*, uattr, unsigned int, size)
+    {
+        union bpf_attr attr = {};   //bpf属性   
+        int err;
+        ...;
+        err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);  //检查: 用户传入的uattr超过内核中sizeof(attr)的部分必须是0
+        ...;
+        /* 从用户空间复制一些bpf属性, 可能个比sizeof(bof_attr)更小  */
+        if (copy_from_user(&attr, uattr, size) != 0)
+            return -EFAULT;
+        ...;
+        //根据cmd分配到对应函数
+        switch (cmd) {
+        ...;
+        case BPF_PROG_LOAD: //加载BPF程序
+            err = bpf_prog_load(&attr, uattr);
+            break;
+        ...;
+        default:
+            err = -EINVAL;
+            break;
+        }
+        return err;
+    }
+## bpf_prog_load()
+内核中一个BPF程序使用`struct bpf_prog`来表示
+    struct bpf_prog {
+        u16 pages; /* 占据了多少页 */
+        u16 jited : 1, /* 是否被JIT翻译过 */
+            jit_requested : 1, /* 架构要求对程序进行 */
+            gpl_compatible : 1, /* 是否匹配GPL许可 */
+            cb_access : 1, /* 是否访问控制块 */
+            dst_needed : 1, /* 是否需要dst条目 Do we need dst entry? */
+            blinded : 1, /* 是否进行过常数致盲 */
+            is_func : 1, /* 程序是一个bpf函数*/
+            kprobe_override : 1, /* 是否覆盖了一个kprobe */
+            has_callchain_buf : 1, /* callchain buffer allocated? */
+            enforce_expected_attach_type : 1; /* Enforce expected_attach_type checking at attach time */
+        enum bpf_prog_type type; /* BPF程序的类型 */
+        enum bpf_attach_type expected_attach_type; /* 要附着的类型 */
+        u32 len; /* BPF程序长多少字节 */
+        u32 jited_len; /* jit之后程序长多少字节  */
+        u8 tag[BPF_TAG_SIZE];
+        struct bpf_prog_aux* aux; /* 辅助字段 */
+        struct sock_fprog_kern* orig_prog; /* 原BPF程序*/
+        unsigned int (*bpf_func)(const void* ctx, const struct bpf_insn* insn); //执行BPF程序的函数指针, 第一个参数为执行环境
+        /* 伪数组, 后面存放的是给解释器的BPF指令 */
+        union {
+            struct sock_filter insns[0];
+            struct bpf_insn insnsi[0];
+        };
+    };
+`bpf_prog_load()`会首先分配一个prog对象并进行初始化. 然后调用`bpf_check()`检查程序,
+最后调用`bpf_prog_select_runtime()`进行JIT编译. 至此BPF程序已经翻译为x86指令注入到内核中.
+后续分配id与fd供用户使用
+    static int bpf_prog_load(union bpf_attr* attr, union bpf_attr __user* uattr)
+    {
+        enum bpf_prog_type type = attr->prog_type;
+        struct bpf_prog* prog;
+        int err;
+        char license[128];
+        bool is_gpl;
+        ...;
+        /* 分配一个bpf_prog对象, 所需大小 = bpf_prog对象大小 + BPF程序大小 */
+        prog = bpf_prog_alloc(bpf_prog_size(attr->insn_cnt), GFP_USER);
+        if (!prog)
+            return -ENOMEM;
+        //初始化bpf_prog对象
+        prog->expected_attach_type = attr->expected_attach_type; //程序期望附着的事件的类型
+        ...;
+        prog->len = attr->insn_cnt;
+        //从用户空间复制BPF程序到内核空间
+        err = -EFAULT;
+        if (copy_from_user(prog->insns, u64_to_user_ptr(attr->insns), bpf_prog_insn_size(prog))
+            != 0)
+            goto free_prog;
+        prog->orig_prog = NULL; 
+        prog->jited = 0;        //还未进行jit
+        atomic64_set(&prog->aux->refcnt, 1);    //设置引用计数为1
+        ...;
+        /* 进行BPF验证 */
+        err = bpf_check(&prog, attr, uattr);
+        if (err bpf_func)
+            goto finalize;
+        //根据栈的深度从interpreters中选择一个作为fp->bpf_func
+        bpf_prog_select_func(fp);
+        //在开启常数致盲得到情况下eBPF JIT会重写程序. 
+        //然而为防止致盲时发生错误, bpf_int_jit_compile()必须返回一个有效的程序, 此时就不会被JIT, 而转交给解释器
+        if (!bpf_prog_is_dev_bound(fp->aux)) {  // if(!fp->aux->offload_requested)
+            ...;
+            fp = bpf_int_jit_compile(fp);   //进行JIT编译
+            ...;
+        } else {
+            ...;
+        }
+        ...;
+        //尾调用兼容性检查只能在最后阶段进行. 
+        //因为我们要确定, 如果我们处理JITed或者非JITed程序的链接, 并且不是所有的eBPF JIT都能立刻支持所有的特性
+        *err = bpf_check_tail_call(fp);
+        return fp;
+    }
+`bpf_prog_select_func()`根据栈深度从解释器数组`interpreters`中选择.
+`interpreters`中的解释器函数的第一个参数为eBPF运行上下文, 第二个参数为eBPF指令.
+    //解释器数组
+    static unsigned int (*interpreters[])(const void* ctx, const struct bpf_insn* insn)
+        = {
+              EVAL6(PROG_NAME_LIST, 32, 64, 96, 128, 160, 192)
+                  EVAL6(PROG_NAME_LIST, 224, 256, 288, 320, 352, 384)
+                      EVAL4(PROG_NAME_LIST, 416, 448, 480, 512)
+          };
+    static void bpf_prog_select_func(struct bpf_prog* fp)
+    {
+    #ifndef CONFIG_BPF_JIT_ALWAYS_ON
+        u32 stack_depth = max_t(u32, fp->aux->stack_depth, 1);
+        fp->bpf_func = interpreters[(round_up(stack_depth, 32) / 32) - 1];
+    #else
+        fp->bpf_func = __bpf_prog_ret0_warn;
+    #endif
+    }
+JIT编译会直接令`fp->bpf_func`指向编译出的函数. 这样执行`fp->bpf_func(ctx,
+insn)`就可以涵盖解释器执行与JIT编译两种情况
+## bpf_int_jit_compile()
+`bpf_int_jit_compile(fp)`在`core.c`中是一个弱符号, 仅是一个占位符.链接时如果有同名的函数则会被替换掉. 类似于重载的概念
+    //这是只支持cBPF的JIT的占位符. eBPF程序可以被解释执行. 应尽量去实现此函数, 这样eBPF和cBPF都可以JIT执行
+    struct bpf_prog* __weak bpf_int_jit_compile(struct bpf_prog* prog)
+    {
+        return prog;
+    }
+在`arch/x86/net/bpf_jit_comp.c`中就定义了一个强符号`bpf_int_jit_compile()`, 编译时会链接到此函数,
+此函数负责真正的JIT工作.
+`bpf_int_jit_compile()`可以分为三部分:
+  * 首先是调用`bpf_jit_blind_constants(prog)`对eBPF指令中的立即数进行致盲.
+  * 然后循环调用`do_jit()`进行编译, 直到收敛为止,
+  * 然后调用`bpf_jit_binary_alloc()`分配可执行内存image保存JIT编译出的函数, 下一次调用`do_jit()`时JIT就会向image中写入指令
+    struct bpf_prog* bpf_int_jit_compile(struct bpf_prog* prog)
+    {
+        struct bpf_binary_header* header = NULL;
+        struct bpf_prog *tmp, *orig_prog = prog;
+        struct x64_jit_data* jit_data;
+        int proglen, oldproglen = 0;
+        struct jit_context ctx = {};
+        bool tmp_blinded = false;
+        bool extra_pass = false;
+        u8* image = NULL;
+        int* addrs;
+        int pass;
+        int i;
+        if (!prog->jit_requested) //是否被翻译过了
+            return orig_prog;
+        tmp = bpf_jit_blind_constants(prog); //致盲eBPF指令中的立即数
+        //如果要求致盲, 但是有又失败了, 那么就不能进行JIT, 直接调用解释器
+        if (IS_ERR(tmp))
+            return orig_prog;
+        if (tmp != prog) { //切换到致盲后的程序
+            tmp_blinded = true;

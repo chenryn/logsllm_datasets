@@ -1,0 +1,144 @@
+**作者：360 Alpha Lab  
+原文链接：**
+> 在2020年7月，我们向谷歌上报了一条远程ROOT利用链，该利用链首次实现了针对谷歌旗舰机型Pixel
+> 4的一键远程ROOT，从而在用户未察觉的情况下实现对设备的远程控制。截至漏洞公开前，360 Alpha
+> Lab已协助厂商完成了相关漏洞的修复。该漏洞研究成果也被2021年BlackHat
+> USA会议收录，相关资料可以在[这里](https://www.blackhat.com/us-21/briefings/schedule/#typhoon-> mangkhut-one-click-remote-universal-root-formed-with-two-> vulnerabilities-22946)找到。
+> **该项研究成果也因其广泛的影响力在谷歌2020年官方漏洞奖励计划年报中得到了公开致谢，并斩获“安全界奥斯卡”Pwnie
+> Awards的“史诗级成就”和“最佳提权漏洞”两大奖项的提名。这条利用链也因其广泛的影响力被我们命名为“飓风山竹”。**
+这篇文章将对利用链中使用的Chrome
+V8引擎漏洞（CVE-2020-6537）进行分析，并介绍该漏洞在利用过程中遇到的困难与限制，在研究过程中，我们先后提出了两种不同利用思路，其中的心路历程也会在文中进行分享。
+## The Bug
+`Promise.allSettled`
+是一个JavaScript内建函数。从MDN的介绍可以了解到，该函数接收一个可迭代的对象作为参数，并返回一个promise对象。在所有位于可迭代对象中的promise-like元素得到处理后，这个promise对象将被resolve，从而得到一个结果数组。下面是`Promise.allSettled` 的用法示例：
+    Promise.allSettled([
+      Promise.resolve(1),
+      Promise.reject(2)
+    ])
+    .then(results => console.log(results));
+    // output will be:
+    // [
+    //   {status: "fulfilled", value: 1},
+    //   {status: "rejected", reason: 2},
+    // ]
+可以看到，结果数组中包含了2个对象，分别描述了参数中传递的2个promise的处理结果。
+在详细分析V8引擎对于`Promise.allSettled`的实现之前，需要强调一点：只有当参数中所有的promise都被处理后，allSettled返回的promise才会被resolve，这意味着V8内部应当有相应的实现机制，用于判断是否所有的promise都已经被处理，并决定何时resolve作为返回值的promise。
+以下源码分析均基于V8 8.4.371版本。`Promise.allSettled`是使用[Touque
+language](https://v8.dev/docs/torque)来实现的：
+    // ES#sec-promise.allsettled
+    // Promise.allSettled ( iterable )
+    transitioning javascript builtin PromiseAllSettled(
+        js-implicit context: Context, receiver: JSAny)(iterable: JSAny): JSAny {
+      return GeneratePromiseAll(
+          receiver, iterable, PromiseAllSettledResolveElementFunctor{},
+          PromiseAllSettledRejectElementFunctor{});
+    }
+`PromiseAllSettled`仅仅是调用了`GeneratePromiseAll`,
+然后再调用至`PerformPromiseAll`。这个函数代码比较多，因此只在这里列出相关的部分：
+    transitioning macro PerformPromiseAll(
+        implicit context: Context)(
+        constructor: JSReceiver, capability: PromiseCapability,
+        iter: iterator::IteratorRecord, createResolveElementFunctor: F1,
+        createRejectElementFunctor: F2): JSAny labels
+    Reject(Object) {
+      // ...
+      while (true) {
+        let nextValue: JSAny;
+        const next: JSReceiver = iterator::IteratorStep(
+            iter, fastIteratorResultMap) otherwise goto Done;
+        nextValue = iterator::IteratorValue(next, fastIteratorResultMap);
+        // Set remainingElementsCount.[[Value]] to
+        //     remainingElementsCount.[[Value]] + 1.
+        const remainingElementsCount = UnsafeCast(
+            resolveElementContext[PromiseAllResolveElementContextSlots::
+                                      kPromiseAllResolveElementRemainingSlot]);
+        resolveElementContext[PromiseAllResolveElementContextSlots::
+                                  kPromiseAllResolveElementRemainingSlot] =
+            remainingElementsCount + 1;
+        const resolveElementFun = createResolveElementFunctor.Call(
+            resolveElementContext, nativeContext, index, capability);
+        const rejectElementFun = createRejectElementFunctor.Call(
+            resolveElementContext, nativeContext, index, capability);
+        // Let nextPromise be ? Call(constructor, _promiseResolve_, ?
+        // nextValue ?).
+        const nextPromise = CallResolve(
+          UnsafeCast(constructor), promiseResolveFunction,
+          nextValue);
+        const then = GetProperty(nextPromise, kThenString);
+        const thenResult = Call(
+          nativeContext, then, nextPromise, resolveElementFun,
+          rejectElementFun);
+        // ...
+      }
+      return promise;
+    }
+大致上说，这个函数对传入的参数进行迭代，并对其中的每一个元素都调用了promiseResolve。同时，函数中使用了`remainingElementsCount`这个变量来代表“尚未处理完成的promise数量”，并将这个值保存在了resolveElementContext中，便于全局访问。我们可以用下面的伪代码来概括性的描述这个函数所做的事情：
+    for(promise in iterable) {
+      remainingElementsCount += 1
+      promiseResolve(promise).then(resolveElementFun, rejectElementFun)
+    }
+当promise被resolve时，就会调用`resolveElementFun`；相应的，promise被reject时，就会调用
+`rejectElementFun` 。这两个函数分别由`createResolveElementFunctor` 和
+`createRejectElementFunctor`生成，并且它们最终都会调用至`PromiseAllResolveElementClosure`。在这里，V8会将promise处理的结果保存至一个数组中，同时减少“尚未处理完成的promise数量”的值。
+    transitioning macro PromiseAllResolveElementClosure(
+        implicit context: Context)(
+        value: JSAny, function: JSFunction, wrapResultFunctor: F): JSAny {
+      //...
+      let remainingElementsCount =
+          UnsafeCast(context[PromiseAllResolveElementContextSlots::
+                                      kPromiseAllResolveElementRemainingSlot]);
+      remainingElementsCount = remainingElementsCount - 1;       // ---> [1]
+      context[PromiseAllResolveElementContextSlots::
+                  kPromiseAllResolveElementRemainingSlot] = remainingElementsCount;
+      if (remainingElementsCount == 0) {
+        const capability = UnsafeCast(
+            context[PromiseAllResolveElementContextSlots::
+                        kPromiseAllResolveElementCapabilitySlot]);
+        const resolve = UnsafeCast(capability.resolve);
+        Call(context, resolve, Undefined, valuesArray);          // ---> [2]
+      }
+      return Undefined;
+    }
+可以看到，函数会从resolveElementContext中读取出remainingElementsCount，减去1，然后再保存回去（代码[1]处）。当remainingElementsCount减少至0时，代表所有promise都处理完毕，那么函数就会将结果数组返回给用户（代码[2]处）。
+正常而言，`resolveElementFun` 和`rejectElementFun`
+这两个函数，最多只能有一个被调用，代表着这个promise是被resolve，还是被reject（promise不可能既resolve，同时又reject）。但是，通过一些回调手法，我们可以获得`resolveElementFun`
+和`rejectElementFun`
+这两个函数对象，从而有机会同时调用这两个函数。这将导致在处理一个promise对象时，`remainingElementsCount`
+会被减去2次，于是进一步导致我们可以在并非所有promise都被处理完的情况下，提前拿到结果数组。此时，V8内部和我们都会持有`valuesArray`
+，这就为类型混淆创造了机会。
+## Type Confusion
+让我们重新来审计`PromiseAllResolveElementClosure`这个函数，只不过这一次我们关心的是V8如何将promise的处理结果保存至`valuesArray`
+中。
+    transitioning macro PromiseAllResolveElementClosure(
+        implicit context: Context)(
+        value: JSAny, function: JSFunction, wrapResultFunctor: F): JSAny {
+      // ...
+      // Update the value depending on whether Promise.all or
+      // Promise.allSettled is called.
+      const updatedValue = wrapResultFunctor.Call(nativeContext, value); // ---> [3]
+      const identityHash =
+          LoadJSReceiverIdentityHash(function) otherwise unreachable;
+      assert(identityHash > 0);
+      const index = identityHash - 1;
+      // Check if we need to grow the [[ValuesArray]] to store {value} at {index}.
+      const valuesArray = UnsafeCast(
+          context[PromiseAllResolveElementContextSlots::
+                      kPromiseAllResolveElementValuesArraySlot]);
+      const elements = UnsafeCast(valuesArray.elements);   // ---> [4]
+      const valuesLength = Convert(valuesArray.length);
+      if (index  [5]
+      } 
+      // ...
+    }
+在代码 [4] 处，`valuesArray`
+的element被直接当作FixedArray来进行处理。但与此同时，我们已经获得了`valuesArray`，并能够对其进行操作了。通过在其上设置一个较大的索引值，我们可以把它转换为一个dictionary
+array，此时，就会出现FixedArray和NumberDictionary之间的类型混淆。
+## Exploitation
+在发现这个漏洞后，我们实现的第一套利用方法，在稳定性和兼容性上都存在一定问题，但仍不失为一个有趣的思路。最终的Android
+Root利用链中，我们采取的是另一种稳定性更高的方法。下面我们将分别进行介绍。
+### Limitations
+乍一看上去，利用FixedArray和NumberDictionary之间的类型混淆似乎很容易就能造成可控的越界写。当V8想要将结果保存至`valuesArray`时，会首先检查index是否越界。如果index
+ {
+      macro TryAtIndex(index: intptr):&T labels OutOfBounds {
+        if (Convert(index) (this.length)) {
+          return unsafe::NewReference(

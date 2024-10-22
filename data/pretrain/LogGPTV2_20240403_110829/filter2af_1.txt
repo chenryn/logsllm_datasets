@@ -1,0 +1,121 @@
+# 通过IndexedDB条件竞争实现Chrome沙箱逃逸（下）
+|
+##### 译文声明
+本文是翻译文章，文章原作者 bluefrostsecurity，文章来源：labs.bluefrostsecurity.de
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+接着上文，我们开始讲这个漏洞的利用。
+## Exploitation
+一旦我们通过竞争条件触发了UAF（free-after-free）场景，则可以绕过时间的限制，我们可以完美控制使用已释放对象的时间。
+在下面部分中，我们要分享漏洞利用的目标是在Android上运行的64位版本的Chrome。 但只需稍加修改，该漏洞即可在Linux或Windows上利用。
+###  构造信息泄漏
+首先我们要做的事是把bug转为信息泄漏漏洞，为此我们需要将Chrome的基地址泄漏到渲染器中。 有几种方法可以完成，但我们决定使用IndexedDB
+mojo接口及其回调来实现。
+我们没有找到直接泄漏Chrome基地址的方法，因此我们需要触发bug两次。
+####  泄漏堆指针
+我们通过分别使用两次连接（版本0，2），实现两次Open调用从而触发bug，然后调用Close和AbortTransactionsForDatabase方法来触发竞争条件并最终释放IndexedDBDatabase对象。
+然后，我们可以调用CreateObjectStore方法，使用相应的对象库创建的元数据的IDB
+keypath字符串，重新分配释放的IndexedDBDatabase对象。
+我们可以完全控制字符串keypath的内容，并用于构造假的IndexedDBDatabase对象，同时将`pending_requests_.buffer`和`pending_requests_.capacity`字段设置为0。
+如果现在我们调用Open方法，获取指向已释放的IndexedDBDatabase对象的mojo接口指针，即可对伪对象做一些操作。
+调用Open只会向`pending_requests_` queue（队列）添加一个新的OpenRequest。
+因为我们将buffer（缓冲区）和capacity（容量）设置为0，所以将重新分配缓冲区，并将伪对象的`pending_requests_.buffer`设置为新的堆指针，而且该指针实际上存储在keypath字符串中。
+通过调用Commit（数据库事务）方法，可以将对象存储库的元数据泄漏到渲染器中。因此，我们可以轻松泄漏出指向渲染器的指针。
+在这之前，我们继续在已释放的IndexedDBDatabase上调用Open方法，这可以为`pending_requests_`队列添加更多的OpenRequest指针，从而增加底层的后备缓冲区。
+通过控制对Open的调用次数，我们还可以控制分配的后备缓冲区的大小。
+最后我们可以通过调用Commit方法，从返回的元数据中提取出堆指针，最终泄漏出指向后备缓冲区的指针。
+####  使用对象替换堆指针内存
+一旦我们获取指向`pending_requests_`的后备缓冲区的指针，我们将在释放的IndexedDBDatabase对象上继续调用几次Open方法，之后将再次重新分配后备缓冲区并且增长。
+这将导致我们泄漏的堆指针被释放。
+为了防止其他代码占用已泄漏指针指向的内存，需要再次调用CreateObjectStore方法，以便使用新对象库的keypath重新分配释放的后备缓冲区。
+通过这点我们可以控制何时再次释放内存。
+现在，我们已将一个堆指针泄漏到渲染器中，指向对象存储库的元数据中已分配的keypath字符串。
+####  泄漏Vtable指针
+为了泄漏vtable指针，我们需要再次触发漏洞。
+首先我们要再次使用正常的IndexedDBDatabase对象，重新分配之前释放的IndexedDBDatabase对象，以便在第二次触发时不引发程序崩溃。
+因为调用AbortTransactionsForDatabase方法会遍历`database_map_`并接触所有引用的对象。
+在第二次触发错误之后，我们要再次使用CreateObjectStore方法，通过新制作的假对象重新分配已释放的IndexedDBDatabase对象。
+在精心设计的假对象中，需要将`pending_requests_.buffer`设置为先前泄漏的堆指针（指向先前创建的对象存储库的元数据中的keypath字符串），并`pending_requests_.capacity`设置为1。
+现在，我们在已释放的IndexedDBDatabase上调用Open方法一次，这将会把新的OpenRequest附加到伪对象的`pending_requests_`队列中。
+由于容量设置为1，因此代码会尝试重新分配后备缓冲区，并释放`pending_requests_.buffer`指向的内存，并将其替换为更大的缓冲区。
+这将会释放泄漏的堆指针指向的内存，然后我们可以通过更改数据库名称重复调用Open方法，以便重新分配有效的IndexedDBDatabase对象。
+这里我们会用到一个小trick，我们把创建的数据库名称设置为一个非常大的0x4000字节的字符串。
+稍后，我们将泄漏其中一个创建的IndexedDBDatabase对象的内容。该过程不仅会泄漏出vtable指针，还会泄漏指向数据库的名称字符串的指针，然后它将返回我们一个指向巨大的slcak
+space（松弛空间）的堆指针，我们可以利用它来存储ROP链和shellcode。
+但现在我们只读取先前创建的对象存储库的元数据，该对象存储将接收其中一个IndexedDBDatabase对象的内容。
+然后，我们可以使用来自已泄漏的IndexedDBDatabase对象的vtable指针以及指向对象的名称字符串的指针，从而泄漏出一个指向大内存的指针，以便我们存储ROP链和shellcode。
+## 远程代码执行
+只要我们泄漏出指向松弛内存和Chrome基地址的指针，我们就可以在松弛内存中放置一个伪OpenRequest对象，然后使用它的虚拟化Perform方法来获取远程代码执行并启用ROP链。
+然后，我们将精心构造的伪对象放入已释放的IndexedDBDatabase的内存中，并将`processing_pending_requests_`设置为0，将`pending_requests_.buffer`设置为我们放置伪OpenRequest指针的内存。
+因为`processing_pending_requests`
+_为0，对已释放的IndexedDBDatabase调用Open方法，将会对存储在`pending_requests_
+`中的请求调用Perform方法，从而启用我们的伪对象并且获取代码执行。
+###  ROP链
+通过调用IndexedDBDatabase::ProcessRequestQueue方法，我们可以控制程序的counter（计数）。
+    void IndexedDBDatabase::ProcessRequestQueue() {
+      // Don't run re-entrantly to avoid exploding call stacks for requests that
+      // complete synchronously. The loop below will process requests until one is
+      // blocked.
+      if (processing_pending_requests_)
+        return;
+      DCHECK(!active_request_);
+      DCHECK(!pending_requests_.empty());
+      base::AutoReset processing(&processing_pending_requests_, true);
+      do {
+        active_request_ = std::move(pending_requests_.front());
+        pending_requests_.pop();
+        active_request_->Perform();                                             [13]
+        // If the active request completed synchronously, keep going.
+      } while (!active_request_ && !pending_requests_.empty());
+    }
+在[13]处，执行ConnectionRequest::Perform方法后我们可以已获得控制权。
+在调用时寄存器x0指向我们先前分配的松弛空间，这样我们就获取到远程代码执行。 相应的汇编代码如下所示：
+    :   ldr x0, [x21]
+    :   ldr x8, [x0]
+    :   ldr x8, [x8,#16]
+    :   blr x8              [13]
+    :   ldr x8, [x21]
+####  策略
+由于我们已经泄露出分配的松弛空间（x0）地址和Chrome基地址，那我们可以构建一个简单的ROP链，用于将松弛空间的权限提升为read/write/executable（读写执行），最后跳转到松弛空间内存中的ROP链之后，即shellcode处。
+####  Gadgets
+我们使用下面六个ROP gadgets（基于我们测试时的偏移量）：
+    * G1: 0x4959c14 : ldr x8, [x0, #0x48]! ; ldr x1, [x8, #0x100] ; br x1
+    * G2: 0x1df7f8c : ldr x9, [x8, #0x190] ; ldr x6, [x8, #0x80] ; blr x9
+    * G3: 0x3e7a4b0 : ldr x20, [x0, #0x68] ; ldr x9, [x8] ; mov x0, x8 ;
+                      ldr x9, [x9, #0xf8] ; blr x9
+    * G4: 0x3f9152c : ldr x2, [x0, #0x18] ; ldr x0, [x0, #0x38] ; br x2
+    * G5: 0x2fbf400 : ldr x8, [x8, #0x10] ; blr x8 ; ldr x8, [x20, #0x3b8] ;
+                      cbz x8, #0x2fbf424 ; blr x8
+    * G6: 0x3f0fd88 : ldr x5, [x6, #0x28] ; ldr x4, [x6, #0x20] ;
+                      ldr x3, [x6, #0x18] ; ldr x2, [x6, #0x10] ;
+                      ldr x1, [x6, #8] ; mov x8, x0 ; ldr x0, [x6] ; svc #0 ; ret
+在目标二进制文件上查找相应的偏移量（比如使用ROPgadget）。 第一个gadget G1是用于启动ROP链。
+####  内存布局
+ROP链以及shellcode将会被放入松弛存储空间。 具体地放置方式如下：
+    | Offset              | Value               | Used By | Comment                                    |
+    | ------------------  |:-------------------:|:-------:| ------------------------------------------:|
+    | 0x50 (0x48+8)       | slackbase+0x100     | G1      | x8 = slackbase+0x100                       |
+    | 0xb8 (0x48+0x68+8)  | slackbase           | G3      | x20 = slackbase                            |
+    | 0x100               | slackbase+0x260     | G3      | x9 = slackbase+0x260, x0 = slackbase+0x100 |
+    | 0x110 (0x100+0x10)  | gadget addr G6      | G5      | x30 = addr of ldr x8                       |
+    | 0x118 (0x100+0x18)  | gadget addr G5      | G4      | x2 = addr of G5                            |
+    | 0x138 (0x100+0x38)  | 226                 | G4      | x0 = 226                                   |
+    | 0x180 (0x100+0x80)  | slackbase+0x300     | G2      | x6 = slackbase+0x300                       |
+    | 0x200 (0x100+0x100) | gadget addr G2      | G1      | x1 = addr of G2                            |
+    | 0x290 (0x100+0x190) | gadget addr G3      | G2      | x9 = addr of G3                            |
+    | 0x300               | slackbase (aligned) | G6      | x0 = aligned slackbase                     |
+    | 0x308 (0x300+0x8)   | 0x4000              | G6      | x1 = 0x4000                                |
+    | 0x310 (0x300+0x10)  | 7                   | G6      | x2 = 7                                     |
+    | 0x318 (0x300+0x18)  | 0                   | G6      | x3 = 0                                     |
+    | 0x320 (0x300+0x20)  | 0                   | G6      | x4 = 0                                     |
+    | 0x328 (0x300+0x28)  | 0                   | G6      | x5 = 0                                     |
+    | 0x358 (0x260+0xf8)  | gadget addr G4      | G3      | x9 = addr of G4                            |
+    | 0x3b8               | 0x1000              | G5      | x8 = slackbase+0x1000                      |
+    | 0x1000              | shellcode           |         |                                            |
+更改松弛内存权限为read/write/executable后，跳转到该内存中的shellcode处。
+关于进程运行问题，我们在虚拟函数调用之后直接返回，那里我们可以控制程序流，从而让程序继续安全运行。
+###  Android Exploit
+针对Android
+64位的Chrome利用代码，你可以在[这里](https://labs.bluefrostsecurity.de/files/chrome_indexeddb_exploit.tgz)找到。
+它是用于测试Chromiunm渲染器新补丁而制作的，带有一些简单JavaScript参考代码。
+如要使用，需要调整偏移和gadgets。如果成功，那么可以获取一个具有浏览器进程权限的反向shell。

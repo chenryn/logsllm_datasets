@@ -1,0 +1,169 @@
+  ```
+  > [!TIP]
+  > Late-arriving data in a datetime group-by key can have a negative impact on the materialized view's performance. For example, assume that a materialized view uses `bin(Timestamp, 1d)` as one of its group-by keys, and several outliers in the data have very old `Timestamp` values. These outliers might negatively affect the materialized view.
+  >
+  > We recommend that in the materialized view query, you either filter out the outlier records or normalize these records to the current time.
+* **Define a lookback period**: If applicable to your scenario, adding a `lookback` property can significantly improve query performance. For details, see [Supported properties](#supported-properties).  
+* **Add columns frequently used for filtering as group-by keys**: Materialized view queries are optimized when they're filtered by one of the materialized view's group-by keys. If you know that your query pattern will often filter by a column that's immutable according to a unique entity in the materialized view, include it in the materialized view's group-by keys.
+    For example, a materialized view exposes `arg_max` by a `ResourceId` value that will often be filtered by `SubscriptionId`. Assuming that a `ResourceId` value always belongs to the same `SubscriptionId` value, define the materialized view query as:
+    ```kusto
+    .create materialized-view ArgMaxResourceId on table FactResources
+    {
+        FactResources | summarize arg_max(Timestamp, *) by SubscriptionId, ResourceId 
+    }
+    ```
+    The preceding definition is preferable over the following:
+    ```kusto
+    .create materialized-view ArgMaxResourceId on table FactResources
+    {
+        FactResources | summarize arg_max(Timestamp, *) by ResourceId 
+    }
+    ```
+* **Use update policies where appropriate**: The materialized view can include transformations, normalizations, and lookups in dimension tables. However, we recommend that you move these operations to an [update policy](../update-policy.md). Leave only the aggregation for the materialized view.
+    For example, it's better to define the following update policy:
+    ```kusto
+    .alter-merge table Target policy update 
+    @'[{"IsEnabled": true, 
+        "Source": "SourceTable", 
+        "Query": 
+            "SourceTable 
+            | extend ResourceId = strcat('subscriptions/', toupper(SubscriptionId), '/', resourceId)", 
+            | lookup DimResources on ResourceId
+            | mv-expand Events
+        "IsTransactional": false}]'  
+    ```
+    And define the following materialized view:
+    ```kusto
+    .create materialized-view Usage on table Events
+    {
+        Target 
+        | summarize count() by ResourceId 
+    }
+    ```
+    The alternative, of including the update policy as part of the materialized view query, might perform worse and therefore not recommended:
+    ```kusto
+    .create materialized-view Usage on table SourceTable
+    {
+        SourceTable
+        | extend ResourceId = strcat('subscriptions/', toupper(SubscriptionId), '/', resourceId)
+        | lookup DimResources on ResourceId
+        | mv-expand Events
+        | summarize count() by ResourceId
+    }
+    ```
+> [!TIP]
+> If you require the best query time performance, but you can tolerate some data latency, use the [materialized_view() function](../../query/materialized-view-function.md).
+### Backfill a materialized view
+When you're creating a materialized view by using the `backfill` property, the materialized view will be created based on the records available in the source table. Or it will be created based on a subset of those records, if you use `effectiveDateTime`.
+Behind the scenes, the backfill process splits the data to backfill into multiple batches and executes several ingest operations to backfill the view. The process might take a long while to complete when the number of records in source table is large. The process duration depends on cluster size. Track the progress of the backfill by using the [`.show operations`](../operations.md#show-operations) command.
+Transient failures that occur as part of the backfill process are retried. If all retries are exhausted, the command will fail and require a manual re-execution of the create command.
+We don't recommend that you use backfill when the number of records in the source table exceeds `number-of-nodes X 200 million` (sometimes even less, depending on the complexity of the query). An alternative is the [backfill by move extents](#backfill-by-move-extents) option.
+Using the backfill option is not supported for data in a cold cache. Increase the hot cache period, if necessary, for the duration of the view creation. This might require scale-out.
+If you experience failures in view creation, try changing these properties:
+* `MaxSourceRecordsForSingleIngest`: By default, the number of source records in each ingest operation during backfill is 2 million per node. You can change this default by setting this property to the desired number of records. (The value is the *total* number of records in each ingest operation.)
+  Decreasing this value can be helpful when creation fails on memory limits or query timeouts. Increasing this value can speed up view creation, assuming that the cluster can execute the aggregation function on more records than the default.
+* `Concurrency`: The ingest operations, running as part of the backfill process, run concurrently. By default, concurrency is `min(number_of_nodes * 2, 5)`. You can set this property to increase or decrease concurrency. We recommend increasing this value only if the cluster's CPU is low, because the increase can significantly affect the cluster's CPU consumption.
+For example, the following command will backfill the materialized view from `2020-01-01`. The maximum number of records in each ingest operation is 3 million. The command will execute the ingest operations with concurrency of `2`.
+```kusto
+.create async materialized-view with (
+        backfill=true,
+        effectiveDateTime=datetime(2020-01-01),
+        MaxSourceRecordsForSingleIngest=3000000,
+        Concurrency=2
+    )
+    CustomerUsage on table T
+{
+    T
+    | summarize count(), dcount(User), max(Duration) by Customer, bin(Timestamp, 1d)
+} 
+```
+If the materialized view includes a datetime group-by key, the backfill process supports overriding the [extent creation time](../extents-overview.md#extent-creation-time) based on the datetime column. This can be useful, for example, if you want older records to be dropped before recent ones, because the [retention policy](../retention-policy.md) is based on the extent creation time. For example, the following backfill will assign creation time based on the `Timestamp` group-by key:
+```kusto
+.create async materialized-view with (
+        backfill=true,
+        updateExtentsCreationTime=true
+    )
+    CustomerUsage on table T
+{
+    T
+    | summarize count() by Customer, bin(Timestamp, 1d)
+} 
+```
+### Backfill by move extents
+The option of backfilling by move extents backfills the materialized view based on an existing table, which isn't necessarily the source table of the materialized view. You achieve the backfill by [moving extents](../move-extents.md) from the specified table into the underlying materialized view table. This process implies that:
+* The data in the specified table should have the same schema as the materialized view schema.
+* Records in the specified table are moved to the view as is. They're assumed to be deduped based on the definition of the materialized view.
+For example, if the materialized view has the following aggregation:
+```kusto
+T | summarize arg_max(Timestamp, *) by EventId
+```
+Then the records in the source table for the move extents operation should already be deduped by `EventID`.
+Because the operation uses [.move extents](../move-extents.md), the records will be *removed* from the specified table during the backfill (moved, not copied).
+Backfill by move extents is not supported for all [aggregation functions supported in materialized views](#supported-aggregation-functions). It will fail for aggregations such as `avg()`, `dcount()`, in which the underlying data stored in the view is different than the aggregation itself.
+The materialized view is backfilled *only* based on the specified table. Materialization of records in the source table of the view will start from view creation time, by default.
+If the source table of the materialized view is continuously ingesting data, creating the view by using move extents might result in some data loss. This is because records ingested into the source table, in the short time between the time of preparing the table to backfill from and the time that the view is created, won't be included in the materialized view. To handle this scenario, you can set the `source_ingestion_time_from` property to the start time of the materialized view over the source table.
+#### Use cases
+The option of backfilling by move extents can be useful in two main scenarios:
+* When you already have a table that includes the deduplicated source data for the materialized view, and you don't need these records in this table after view creation because you're using only the materialized view.
+* When the source table of the materialized view is very large, and backfilling the view based on the source table doesn't work well because of the limitations mentioned earlier. In this case, you can orchestrate the backfill process yourself into a temporary table by using [ingest from query commands](../data-ingestion/ingest-from-query.md) and one of the [recommended orchestration tools](../../../tools-integrations-overview.md#orchestration). When the temporary table includes all records for the backfill, create the materialized view based on that table.
+**Examples:**
+* In the following example, table `DeduplicatedTable` includes a single record per `EventId` instance and will be used as the baseline for the materialized view. Only records in `T` that are ingested after the view creation time will be included in the materialized view.
+    ```kusto
+    .create async materialized-view with (move_extents_from=DeduplicatedTable) MV on table T
+    {
+        T
+        | summarize arg_max(Timestamp, *) by EventId
+    } 
+    ```
+* If the `effectiveDateTime` property is specified along with the `move_extents_from` property, only extents in `DeduplicatedTable` whose `MaxCreatedOn` value is greater than `effectiveDateTime` are included in the backfill (moved to the materialized view):
+    ```kusto
+    .create async materialized-view with 
+        (move_extents_from=DeduplicatedTable, effectiveDateTime=datetime(2019-01-01)) 
+        MV on table T
+    {
+        T
+        | summarize arg_max(Timestamp, *) by EventId
+    } 
+    ```
+* The following example demonstrates the use of the `source_ingestion_time_from` property in the option of backfilling by move extents. Using both `source_ingestion_time_from` and `move_extents_from` indicates that the materialized view is backfilled from two sources:
+  * **The `move_extents_from` table**: `DeduplicatedTable` in the following example. This table should include all historical data to backfill. You can optionally use the `effectiveDateTime` property to include only extents in `DeduplicatedTable` whose `MaxCreatedOn` value is greater than `effectiveDateTime`.
+  * **The source table of the materialized view**: `T` in the following example. Backfill from this table includes only records whose [ingestion_time()](../../query/ingestion-time-function.md) value is greater than `source_ingestion_time_from`.
+     The `source_ingestion_time_from` property should be used only to handle the possible data loss in the short time between preparing the table to backfill from (`DeduplicatedTable`) and the time that the view is created. Don't set this property too far in the past. That would start the materialized view with a significant lag, which might be hard to catch up with.
+   In the following example, assume that the current time is `2020-01-01 03:00`. Table `DeduplicatedTable` is a deduped table of `T`. It includes all historical data, deduplicated until `2020-01-01 00:00`. The `create` command uses `DeduplicatedTable` for backfilling the materialized view by using move extents. The `create` command also includes all records in `T` that were ingested since `2020-01-01`.
+    ```kusto
+    .create async materialized-view with (move_extents_from=DeduplicatedTable, source_ingestion_time_from=datetime(2020-01-01)) MV on table T
+    {
+        T
+        | summarize arg_max(Timestamp, *) by EventId
+    } 
+    ```
+### Cancel materialized view creation
+You can cancel the process of materialized view creation when you're using the backfill option. This action is useful when creation is taking too long and you want to stop it while it's running.  
+> [!WARNING]
+> The materialized view can't be restored after you run this command.
+The creation process can't be canceled immediately. The cancel command signals materialization to stop, and the creation periodically checks if a cancel was requested. The cancel command waits for a maximum period of 10 minutes until the materialized view creation process is canceled, and it reports back if cancellation was successful.
+Even if the cancellation doesn't succeed within 10 minutes, and the cancel command reports failure, the materialized view will probably cancel itself later in the creation process. The [`.show operations`](../operations.md#show-operations) command indicates if the operation was canceled.
+If the operation is no longer in progress when the `.cancel operation` command is issued, the command will report an error saying so.
+#### Syntax
+`.cancel operation` *operationId*
+[!INCLUDE [syntax-conventions-note](../../../includes/syntax-conventions-note.md)]
+#### Parameters
+| Name          | Type | Required | Description                                                                   |
+|---------------|------|----------|-------------------------------------------------------------------------------|
+| `operationId` | `guid` |  :heavy_check_mark:  | The operation ID returned from the `.create async materialized-view` command. |
+#### Output
+| Name              | Type     | Description
+|-------------------|----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| OperationId       | `guid` |The operation ID of the `.create materialized-view` command.                                                                                                                                            |
+| Operation         | `string` |The type of operation.                                                                                                                                                                                  |
+| StartedOn         | `datetime` |The start time of the create operation.                                                                                                                                                                 |
+| CancellationState | `string` |One of: `Canceled successfully` (creation was canceled), `Cancellation failed` (wait for cancellation timed out), `Unknown` (view creation is no longer running but wasn't canceled by this operation). |
+| ReasonPhrase      | `string` |The reason why cancellation wasn't successful.                                                                                                                                                          |
+#### Examples
+```kusto
+.cancel operation c4b29441-4873-4e36-8310-c631c35c916e
+```
+|OperationId|Operation|StartedOn|CancellationState|ReasonPhrase|
+|---|---|---|---|---|
+|`c4b29441-4873-4e36-8310-c631c35c916e`|`MaterializedViewCreateOrAlter`|`2020-05-08 19:45:03.9184142`|`Canceled successfully`||
+If the cancellation hasn't finished within 10 minutes, `CancellationState` will indicate failure. Creation can then be canceled.

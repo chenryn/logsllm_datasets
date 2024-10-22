@@ -1,0 +1,32 @@
+#### 0x2 Bypass KALSR
+Android
+8.0之后安卓手机普遍启用了内核地址随机化，而三星手机启用的要更早一些。此漏洞本身泄露内核地址比较困难，所以还需要一个信息泄露漏洞。debugfs
+文件系统一直是比较容易出问题的，我们尝试着用简单指令测试了一下：find /sys/kernel/debug | xargs
+cat，片刻之后，屏幕上打印出了如下信息：
+经过分析，这是/sys/kernel/debug/tracing/printk_formats文件所泄露出来的地址，有些函数地址，比如dpm_suspend，此地址加上一个固定的偏移量即可得到内核启动后的真实函数地址。经过fuzz发现，类似的信息泄露不止一处。
+#### 0x3 Bypass PXN && CFI
+我们曾在16年mosec会议上介绍过几种过PXN方法。其中一个方法是，将函数指针kernel_setsockopt覆盖到ptmx_fops->check_flags，然后通过控制第一个参数跳转，绕过set_fs(oldfs)语句，当函数执行完，本进程addr_limit被设为0xffffffffffffffff，此时我们可以在用户态通过一些系统调用直接读写内核数据。
+然而在s8上使用此方法时确出现了系统崩溃，仔细检查s8的kernel_sock_ioctl汇编代码时，发现跳转指令改变了，跳转到寄存器的指令改成的直接跳转到固定地址0xffffffc000c56f6c的指令：
+下面看看跳转到0xffffffc000c56f6c这个地址干了些什么：
+如上代码，实际上是对跳转地址做了检查，如果跳转到的地址的上一条语句是0x00be7bad，则认为是合法地址，执行跳转，如果不是则认为是非法地址，执行一条非法语句导致内核崩溃。为什么必须要上一条语句是0x00be7bad呢？原来s8在编译时每一个函数结尾都加上了一句0x00be7bad作为标记，如果上一条语句是0x00be7bad，则表明这个地址是函数的起始地址，否则不是。也就是说，在每一个跳转到寄存器地址之前都要检查地址是否为函数的起始地址，否则非法。
+虽然此路不通，但是另外一个办法还是可以的。我们找到了一个比较好用的bug，在s2mm005_flash函数中有一个代码片段：
+文件CCIC_DEFAULT_UMS_FW定义为：”/sdcard/Firmware/usbpd/s2mm005.bin”，由于此文件并不存在，当调用到此代码时，filp_open将返回错误，跳到done返回。可以看到错误处理中并没有恢复addr_limit。也就是当调用此函数失败时，本进程将得到读写内核的权限。
+当然上面这个办法有赖于这个简单的bug，在错误处理中漏掉了set_fs(old_fs)的操作。如果没有这种bug怎么办呢？还是有办法的，我们在内核中找到了这样的函数：
+将此函数地址，利用漏洞覆盖掉ptms_fops->
+check_flags指针，当我们调用check_flags时，可以控制第一个入参，那么合理设置参数内容，可以达到读写内核的目的。
+#### 0x4 KNOX2.8 && SELinux
+三星手机为了提高手机安全性，加入了KNOX，使内核利用难度大大加强。这里简单介绍一下KNOX2.8在内核中主要实现的特性：
+1.与root相关的关键数据，比如cred，页表项等需要在特定内存中分配，此内存中通用cpu端被设为只读，当需要修改时，则发送指令通过TrustZone进行修改；
+2.在调用rkp_call让TrustZone执行命令时，TrustZone同样将对数据完整性进行校验，比如commit_creds函数在创建cred后，调用rkp_call时，TrustZone会检查本进程credential是否在只读内存区，检查本进程id是否大于1000，如果大于1000则不能将新创建的credential修改为小于1000的值，这也使得通过调用rkp_override_creds来修改credential用户id的办法不再有效；
+3.在SELinux原有权限管理基础上，增加了额外的完整性校验，这几乎影响所有系统调用接口。以open系统调用为例，当打开CONFIG_RKP_KDP配置项时，增加了security_integrity_current的校验：
+可以看到，在security_integrity_current这个函数里，将校验：进程描述符中cred和security是否在只读内存区分配，bp_cred与cred是否一致（防止被修改），bp_task是否就是本进程，mm->pgd和cred->bp_pgd是否一致，current->nsproxy->mnt_ns->root和current->nsproxy->mnt_ns->root->mnt->bp_mount是否一致。如果其中某一项关键数据被修改而导致检验不通过，则导致系统产生panic，并打印出错误信息；
+4.在load_elf_binary ->
+flush_old_exec函数中增加校验，如果进程为id小于1000，为内核进程，并且load的二进制文件及不再”/”目录又不在”/system”目录下则内核panic。
+这使得利用用户态调用`__orderly_poweroff`函数在内核中创建内核线程的方法将被阻止；KNOX还在内核其他地方加入了大量的检验。
+KNOX的加入，使得以前常用的一些修改credential
+用户id去root办法都比较难办了。随着KNOX版本的迭代，势必会对内核的保护越来越强化。但是就笔者当时研究的KNOX2.8而言，依然还有一些弱点可供利用，进而拿到root权限，读写高权限文件，起内核shell等。
+前面提到，KNOX限制root的一个措施就是在大部分系统调用中，都会进行数据完整性校验，如果我们将进程credential修改非只读区，则会校验失败。这些校验函数都是挂接在全局变量security_hook_heads下面，比如open系统调用会调用security_hook_heads下挂的file_open钩子函数，最后调用到selinux_file_open进行权限和数据完整性校验。但是security_hook_heads这个全局变量却是可读写的，我们可以利用漏洞读写内核，将此变量下面挂的钩子函数有选择的设置为NULL，不仅可以绕过该校验，还可以绕过SELinux的检查。比如，我们可以把本进程credential设置为替换为一块可读写内存，将id修改为root用户，同时将和读写相关的校验函数设为NULL。这样可以用root用户稳定的读写系统中高权限文件。进行其他操作时，也可以通过禁用相关校验函数绕过校验，当然这种方法有些简单粗暴，需要小心使用，因为这些校验函数有些和系统耦合紧密，如果不小心很容易引起系统crash，操作完成后应该尽快恢复。在KNOX之前版本中，有研究员曾经通过调用`__orderly_poweroff`函数，可以利用内核起一个root进程，绕过了commit_creds中的校验，但是KNOX2.8中在load_elf_binary中增加了对用户id和binary路径的校验。然而我们发现，虽然load_elf_binary增加了此校验，但是load_script中却没有加上这个校验，这就意味着，虽然我们不能在内核中加载自己的binary，但是可以起一个root脚本进程，在脚本中进行我们需要的操作。
+#### 总结：
+本文介绍了如何利用一个s8中race
+condition驱动漏洞，一步步绕过KALSR，PXN，CFI，KNOX2.8等mitigation机制，拿到root权限，读写高权限文件，并在内核中起一个shell进程。三星在内核加固方面下了很大功夫，KNOX的引入显著提高了root的难度，随着后面版本的不断迭代，对内核的加固会越来越强，值得持续的跟踪研究。
+* * *

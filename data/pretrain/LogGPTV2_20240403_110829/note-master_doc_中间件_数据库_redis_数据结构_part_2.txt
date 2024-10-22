@@ -1,0 +1,118 @@
+struct {
+  type // 表示当前对象使用的数据类型
+  encoding // 代表当前对象内部采用哪种数据结构实现
+  lru // 记录对象最后一次被访问的时间
+  refcount // 记录当前对象被引用的次数 Redis可以使用共享对象的方式来节省内存
+  *ptr // 如果是整数，直接存储数据；否则表示指向数据的指针 如果对象是字符串且长度ptr = sh+1;
+    ...
+    //... 初始化字符串空间
+    return o;
+}
+```
+### 字典
+redis 使用了链表来应对哈希冲突
+```c
+typedef struct dictIterator {
+    dict *ht;
+    int index;
+    dictEntry *entry, *nextEntry;
+} dictIterator;
+typedef struct dict {
+    dictEntry **table;
+    dictType *type;
+    unsigned long size;
+    unsigned long sizemask;
+    unsigned long used;
+    void *privdata;
+} dict;
+struct dictEntry {
+    void *key;
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v;
+    struct dictEntry *next;     /* Next entry in the same hash bucket. */
+};
+```
+redis使用了两张哈希表来方便扩容时的rehash操作
+当满足以下条件，就会进行rehash
+- 刚开始时哈希表长度为0
+- 哈希表中的元素数量 / 哈希表长度 > dict_force_resize_ratio(负载因子)
+在进行rehash时，为避免给服务器带来过大负担，并不是一次性将所有值rehash到另外一张表，而是通过渐进的方式，每次对字典执行添加、删除、查找或者更新操作时，将哈希表 entry 的转移操作分散在后续的每一次请求中以及定时任务中，而非一次性执行完。每迁移一个 key，结构体 dict 的 used就会 - 1，当这个used为0时，就代表迁移完了
+此时新增的 key 都会写到目标ht中，而删改则会先对迁移源表找，没有的话再在新ht中找
+### 压缩列表
+数组中的每一个元素都对应保存一个数据。和数组不同的是，压缩列表在表头有三个字段 zlbytes、zltail 和 zllen，分别表示列表长度、列表尾的偏移量和列表中的 entry 个数；压缩列表在表尾还有一个 zlend，表示列表结束
+针对不同长度的数据，使用不同大小的元数据信息（prevlen 和 encoding）来描述每一个位置的数据，从而提升内存效率
+如果我们要查找定位第一个元素和最后一个元素，可以通过表头三个字段的长度直接定位
+虽然 ziplist 节省了内存开销，可它也存在两个设计代价：一是不能保存过多的元素，否则访问性能会降低；二是不能保存过大的元素，否则当一个元素插入后，会引起当前位置元素新增 prevlensize 的空间。而当前位置元素的空间增加后，又会进一步引起该元素的后续元素，其 prevlensize 所需空间的增加
+### 跳表
+- O(N) 的空间复杂度，O(logN) 的插入、查询、删除的时间复杂度
+![202031284446](/assets/202031284446.png)
+查找时，从上层开始查找，找到对应的区间后再到下一层继续查找，类似于二分查找
+这种查找数据结构跟红黑树相比：
+- 插入非常快，因为不需要在插入后进行旋转
+- 实现容易
+- 支持无锁操作
+完美跳表：所用的存储空间和查询过程，应该和二叉树是非常像的，我们会要求每一层都包含下一层一半的节点，且同一层指针跨越的节点数量是一样的
+但随着元素不断增减，很难维护这样的完美跳表
+引入随机性：通过 50% 的概率决策，决定是否需要继续将这个插入到更高的一层
+### SortedSet
+Sorted Set 能支持范围查询，这是因为它的核心数据结构设计采用了跳表，而它又能以常数复杂度获取元素权重，这是因为它同时采用了哈希表进行索引
+```c
+typedef struct zset {
+    dict *dict;
+    zskiplist *zsl;
+} zset;
+```
+### quicklist
+一个 quicklist 就是一个链表，而链表中的每个元素又是一个 ziplist。quicklist 通过控制每个 quicklistNode 中，ziplist 的大小或是元素个数，就有效减少了在 ziplist 中新增或修改元素后，发生连锁更新的情况
+```c
+typedef struct quicklist {
+    quicklistNode *head;
+    quicklistNode *tail;
+    unsigned long count;        /* total count of all entries in all listpacks */
+    unsigned long len;          /* number of quicklistNodes */
+    signed int fill : QL_FILL_BITS;       /* fill factor for individual nodes */
+    unsigned int compress : QL_COMP_BITS; /* depth of end nodes not to compress;0=off */
+    unsigned int bookmark_count: QL_BM_BITS;
+    quicklistBookmark bookmarks[];
+} quicklist;
+typedef struct quicklistNode {
+    struct quicklistNode *prev;
+    struct quicklistNode *next;
+    unsigned char *entry;
+    size_t sz;             /* entry size in bytes */
+    unsigned int count : 16;     /* count of items in listpack */
+    unsigned int encoding : 2;   /* RAW==1 or LZF==2 */
+    unsigned int container : 2;  /* PLAIN==1 or PACKED==2 */
+    unsigned int recompress : 1; /* was this node previous compressed? */
+    unsigned int attempted_compress : 1; /* node can't compress; too small */
+    unsigned int dont_compress : 1; /* prevent compression of entry that will be used later */
+    unsigned int extra : 9; /* more bits to steal for future usage */
+} quicklistNode;
+```
+### listpack
+紧凑列表，它的特点就是用一块连续的内存空间来紧凑地保存数据，同时为了节省内存空间，listpack 列表项使用了多种编码方式，来表示不同长度的数据，这些数据包括整数和字符串
+listpack 中每个列表项不再包含前一项的长度了，因此当某个列表项中的数据发生变化，导致列表项长度变化时，其他列表项的长度是不会受影响的
+### rax
+一种前缀树的变体，如果一系列单字符节点之间的分支连接是唯一的，那么这些单字符节点就可以合并成一个节点，而这种结构的树，就正是 Radix Tree，也被称为基数树
+```mermaid
+stateDiagram-v2
+  g --> o
+  o --> l
+  l --> d
+  o --> s
+  s --> e
+```
+```mermaid
+stateDiagram-v2
+  go --> ld
+  go --> se
+```
+## 操作复杂度
+- 集合类型对单个数据实现的增删改查操作，复杂度由集合采用的数据结构决定，如 Hash 的增加查找都是O(1)
+- 集合类型中的遍历操作，返回集合中的所有数据，这类操作的复杂度一般是 O(N)
+- 集合类型对集合中所有元素个数的记录，复杂度为 O(1)，因为这些结构中专门记录了元素的个数统计
+- 还有一些特殊情况，压缩列表和双向链表都会记录表头和表尾的偏移量，所以POP PUSH 操作也为 O(1)

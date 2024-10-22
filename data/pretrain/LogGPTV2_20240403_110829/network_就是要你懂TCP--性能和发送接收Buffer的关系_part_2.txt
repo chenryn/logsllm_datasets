@@ -1,0 +1,128 @@
+网络不通，重传超过一定的时间（tcp_retries2)然后断开这个连接是正常的，这里的问题是：
+1.  为什么这种场景下丢包了，而且是针对某个stream一直丢包
+可能是因为这种场景下触发了中间环节的流量管控，故意丢包了（比如proxy、slb、交换机都有可能做这种选择性的丢包）
+这里server认为连接断开，没有发reset和fin,因为没必要，server认为网络连通性出了问题。client还不知道server上这个连接清理掉了，等client回复了一个window update，server早就认为这个连接早断了，突然收到一个update，莫名其妙，只能reset
+## 接收窗口和SO_RCVBUF的关系
+### ss 查看socket buffer大小
+初始接收窗口一般是 **mss乘以初始cwnd（为了和慢启动逻辑兼容，不想一下子冲击到网络）**，如果没有设置SO_RCVBUF，那么会根据 net.ipv4.tcp_rmem 动态变化，如果设置了SO_RCVBUF，那么接收窗口要向下面描述的值靠拢。
+[初始cwnd可以大致通过查看到](https://access.redhat.com/discussions/3624151)：
+```
+ss -itmpn dst "10.81.212.8"
+State      Recv-Q Send-Q Local Address:Port  Peer Address:Port
+ESTAB      0      0      10.xx.xx.xxx:22     10.yy.yy.yyy:12345  users:(("sshd",pid=1442,fd=3))
+         skmem:(r0,rb369280,t0,tb87040,f4096,w0,o0,bl0,d92)
+Here we can see this socket has Receive Buffer 369280 bytes, and Transmit Buffer 87040 bytes.Keep in mind the kernel will double any socket buffer allocation for overhead. 
+So a process asks for 256 KiB buffer with setsockopt(SO_RCVBUF) then it will get 512 KiB buffer space. This is described on man 7 tcp. 
+```
+初始窗口计算的代码逻辑，重点在17行：
+```
+    /* TCP initial congestion window as per rfc6928 */
+    #define TCP_INIT_CWND           10
+    /* 3. Try to fixup all. It is made immediately after connection enters
+       established state.
+             */
+            void tcp_init_buffer_space(struct sock *sk)
+            {
+          int tcp_app_win = sock_net(sk)->ipv4.sysctl_tcp_app_win;
+          struct tcp_sock *tp = tcp_sk(sk);
+          int maxwin;
+        if (!(sk->sk_userlocks & SOCK_SNDBUF_LOCK))
+                tcp_sndbuf_expand(sk);
+		//初始最大接收窗口计算过程
+        tp->rcvq_space.space = min_t(u32, tp->rcv_wnd, TCP_INIT_CWND * tp->advmss);
+        tcp_mstamp_refresh(tp);
+        tp->rcvq_space.time = tp->tcp_mstamp;
+        tp->rcvq_space.seq = tp->copied_seq;
+        maxwin = tcp_full_space(sk);
+        if (tp->window_clamp >= maxwin) {
+                tp->window_clamp = maxwin;
+                if (tcp_app_win && maxwin > 4 * tp->advmss)
+                        tp->window_clamp = max(maxwin -
+                                               (maxwin >> tcp_app_win),
+                                               4 * tp->advmss);
+        }
+        /* Force reservation of one segment. */
+        if (tcp_app_win &&
+            tp->window_clamp > 2 * tp->advmss &&
+            tp->window_clamp + tp->advmss > maxwin)
+                tp->window_clamp = max(2 * tp->advmss, maxwin - tp->advmss);
+        tp->rcv_ssthresh = min(tp->rcv_ssthresh, tp->window_clamp);
+        tp->snd_cwnd_stamp = tcp_jiffies32;
+}
+```
+传输过程中，最大接收窗口会动态调整，当指定了SO_RCVBUF后，实际buffer是两倍SO_RCVBUF，但是要分出一部分（2^net.ipv4.tcp_adv_win_scale)来作为乱序报文缓存以及metadata
+> 1.  net.ipv4.tcp_adv_win_scale = 2  //2.6内核，3.1中这个值默认是1
+如果SO_RCVBUF是8K，总共就是16K，然后分出2^2分之一，也就是4分之一，还剩12K当做接收窗口；如果设置的32K，那么接收窗口是48K（64-16）
+​    static inline int tcp_win_from_space(const struct sock *sk, int space)
+​    {//space 传入的时候就已经是 2*SO_RCVBUF了
+​            int tcp_adv_win_scale = sock_net(sk)->ipv4.sysctl_tcp_adv_win_scale;
+```
+        return tcp_adv_win_scale >(-tcp_adv_win_scale)) :
+                space - (space>>tcp_adv_win_scale); //sysctl参数tcp_adv_win_scale 
+}
+```
+tcp_adv_win_scale 的取值
+tcp_adv_win_scale
+TCP window size
+4
+15/16 * available memory in receive buffer
+3
+⅞ * available memory in receive buffer
+2
+¾ * available memory in receive buffer
+1
+½ * available memory in receive buffer
+0
+available memory in receive buffer
+-1
+½ * available memory in receive buffer
+-2
+¼ * available memory in receive buffer
+-3
+⅛ * available memory in receive buffer
+接收窗口有最大接收窗口和当前可用接收窗口。
+一般来说一次中断基本都会将 buffer 中的包都取走。
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/d7d3af2c03653e6c-d7d3af2c03653e6cf8ae2befa0022832.png)
+绿线是最大接收窗口动态调整的过程，最开始是1460*10，握手完毕后略微调整到1472*10（可利用body增加了12），随着数据的传输开始跳涨
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/d0e12e8bad876438-d0e12e8bad8764385549f9b391c62ab0.png)
+上图是四个batch insert语句，可以看到绿色接收窗口随着数据的传输越来越大，图中蓝色竖直部分基本表示SQL上传，两个蓝色竖直条的间隔代表这个insert在服务器上真正的执行时间。这图非常陡峭，表示上传没有任何瓶颈.
+### 设置 SO_RCVBUF 后通过wireshark观察到的接收窗口基本
+下图是设置了 SO_RCVBUF 为8192的实际情况：
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/d0e12e8bad876438-d0e12e8bad8764385549f9b391c62ab0.png)
+从最开始的14720，执行第一个create table语句后降到14330，到真正执行batch insert就降到了8192*1.5. 然后一直保持在这个值
+# 从kernel来看buffer相关信息
+## kernel相关参数
+```
+sudo sysctl -a | egrep "rmem|wmem|tcp_mem|adv_win|moderate"
+net.core.rmem_default = 212992
+net.core.rmem_max = 212992
+net.core.wmem_default = 212992 //core是给所有的协议使用的,
+net.core.wmem_max = 212992
+net.ipv4.tcp_adv_win_scale = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_rmem = 4096	87380	6291456
+net.ipv4.tcp_wmem = 4096	16384	4194304 //tcp有自己的专用选项就不用 core 里面的值了
+net.ipv4.udp_rmem_min = 4096
+net.ipv4.udp_wmem_min = 4096
+vm.lowmem_reserve_ratio = 256	256	32
+net.ipv4.tcp_mem = 88560        118080  177120
+```
+发送buffer系统比较好自动调节，依靠发送数据大小和rt延时大小，可以相应地进行调整；但是接受buffer就不一定了，接受buffer的使用取决于收到的数据快慢和应用读走数据的速度，只能是OS根据系统内存的压力来调整接受buffer。系统内存的压力取决于 net.ipv4.tcp_mem.
+需要特别注意：**tcp_wmem 和 tcp_rmem 的单位是字节，而 tcp_mem 的单位的页面**
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/ea04e40acda98667-ea04e40acda986675bf0ad0ea7b9b8ff.png)
+## kernel相关源码
+从内核代码来看如果应用代码设置了sndbuf(比如java代码中：socket.setOption(sndbuf, socketSendBuffer))那么实际会分配socketSendBuffer*2的大小出来
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/1de3f2916346e390-1de3f2916346e390be55263d59f5730d.png)
+比如应用代码有如下设置：
+```
+    		protected int socketRecvBuffer = 32 * 1024;   //接收32K
+    		protected int socketSendBuffer = 64 * 1024;   //发送64K，实际会分配128K
+        // If bufs set 0, using '/etc/sysctl.conf' system settings on default
+        // refer: net.ipv4.tcp_wmem / net.ipv4.tcp_rmem
+        if (socketRecvBuffer > 0) {
+            socket.setReceiveBufferSize(socketRecvBuffer);
+        }
+        if (socketSendBuffer > 0) {
+            socket.setSendBufferSize(socketSendBuffer);
+        }
+```

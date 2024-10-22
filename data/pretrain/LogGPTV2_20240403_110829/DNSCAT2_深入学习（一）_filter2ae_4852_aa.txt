@@ -1,0 +1,165 @@
+# DNSCAT2 深入学习（一）
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+最近在学习一款隐蔽信道通信工具，[dnscat2](https://github.com/iagox86/dnscat2/)，这是一个十分成熟的工具，我准备通过一系列文章，从架构出发，立足于源码，深入分析，既作为学习记录，也和大家进行交流，希望能对大家有所帮助。时间仓促，如有分析不当之处还请大家多多指出。
+## 简介
+dnscat2是基于DNS协议的通信工具，一般的通信工具基于TCP等的传输方式非常容易被防火墙拦截，但是dnscat2基于的DNS查询与响应报文一般不会被拦截，进而可以完成信息传输。
+dnscat2分为client端和server端，client运行在被控机器上，server运行在DNS服务器上。client，server部分分别是用C，ruby写的。其中作者在实现client部分时实现了跨平台，支持linux和windows编译运行。在完成连接建立后可以实现建立shell，上传下载文件等功能，运行效果如下：
+## 架构分析
+借用官方文档的一张图：
++—————+  
+| tunnel_driver | (only 1)  
++—————+  
+|  
+(has one)  
+|  
+v  
++————+  
+| controller | (only 1)  
++————+  
+|  
+(has one or more)  
+|  
+v  
++———+  
+| session | (at least one)  
++———+  
+|  
+(has exactly one)  
+|  
+v  
++——–+  
+| driver | (exactly one / session)  
++——–+
+整个工具分为四层架构，从下到上分别是tunnel_driver，controller，session，和driver。收到数据后，数据经下层流到上层，上层处理完毕之后产生响应数据，再由上层经下层一步步封装后经udpsocket发送出去。
+整个工具在运行过程中只包含一个tunneldriver和controller，他们负责接收和分发数据给各个session。可以有多个session和driver，分别处理不同的任务（shell，download,upload…）。
+下面分析各个层次的具体功能。
+在分析之前先列出接收和发送报文函数流，以免迷失方向。
+## tunnel_driver
+这个层次是通过udp接受和发送报文的,它几乎没有对报文做任何处理，只是将上层来的报文封装给udp发出去，接收外部来的响应报文。
+创建udp_socket并且设置相关参数：
+    driver->s = udp_create_socket(0, host);
+    /* Set the domain and stuff. */
+    driver->group      = group;
+    driver->domain     = domain;
+    driver->dns_port   = port;
+    driver->dns_server = server;
+dnscat2采用select库来实现异步socket操作,设置各种回调函数，其中比较重要的是recvsocketcallback，当接收到报文时就调用这个回调函数来处理报文：
+    select_group_add_socket(group, driver->s, SOCKET_TYPE_STREAM, driver);
+    select_set_recv(group, driver->s, recv_socket_callback);
+    select_set_timeout(group, timeout_callback, driver);
+    select_set_closed(group, driver->s, dns_data_closed);
+在recvsocketcallback中根据不同种类的dns报文进行不同的处理。具体的处理过程和dns协议有关，有关dnscat2如何利用dns协议进行数据封装的介绍留在之后介绍。
+        if(type == _DNS_TYPE_TEXT)
+        {
+          LOG_INFO("Received a TXT response: %s", dns->answers[0].answer->TEXT.text);
+          /* Get the answer. */
+          tmp_answer    = dns->answers[0].answer->TEXT.text;
+          answer_length = dns->answers[0].answer->TEXT.length;
+          /* Decode it. */
+          answer = buffer_decode_hex(tmp_answer, &answer_length);
+        }
+        else if(type == _DNS_TYPE_CNAME)
+        {
+          LOG_INFO("Received a CNAME response: %s", (char*)dns->answers[0].answer->CNAME.name);
+          /* Get the answer. */
+          tmp_answer = remove_domain((char*)dns->answers[0].answer->CNAME.name, driver->domain);
+          if(!tmp_answer)
+          {
+            answer = NULL;
+          }
+          else
+          {
+            answer_length = strlen((char*)tmp_answer);
+            /* Decode it. */
+            answer = buffer_decode_hex(tmp_answer, &answer_length);
+            safe_free(tmp_answer);
+          }
+        }
+        .......
+        else
+        {
+          LOG_ERROR("Unknown DNS type returned: %d", type);
+          answer = NULL;
+        }
+###  controller
+session作为tunneldriver和session的中间层次所做的工作就是根据tunneldriver传来的报文id来识别和报文相对应的session并且将它发送给session:
+    NBBOOL controller_data_incoming(uint8_t *data, size_t length)
+    {
+      uint16_t session_id = packet_peek_session_id(data, length);
+      session_t *session = sessions_get_by_id(session_id);
+      /* If we weren't able to find a session, print an error and return. */
+      if(!session)
+      {
+        LOG_ERROR("Tried to access a non-existent session (%s): %d", __FUNCTION__, session_id);
+        return FALSE;
+      }
+      /* Pass the data onto the session. */
+      return session_data_incoming(session, data, length);
+    }
+### session
+session层次可以说时整个工具里最重要的层次，dnscat2协议就在这个层次里体现（关于dnscat2
+protocol的介绍在后面进行），在session里有一个有限状态机，类似于tcp的协议过程对报文的内容进行识别与认定，以及解密响应等操作。
+在进行具体的操作之前先向各个driver询问是否有数据输出，因为马上就要有新的报文需要处理响应了。
+    packet_t *packet;
+      /* Set to TRUE if data was properly ACKed and we should send more right away. */
+      NBBOOL send_right_away = FALSE;
+      /* Suck in any data we can from the driver. */
+      poll_driver_for_data(session);
+然后就是设置有限状态机的各种处理函数，从各种处理函数中我们能看出有限状态机的脉络（这一部分在protocol里介绍）：
+    #ifndef NO_ENCRYPTION
+        handlers[PACKET_TYPE_SYN][SESSION_STATE_BEFORE_INIT]    = _handle_error;
+        handlers[PACKET_TYPE_SYN][SESSION_STATE_BEFORE_AUTH]    = _handle_error;
+    #endif
+        handlers[PACKET_TYPE_SYN][SESSION_STATE_NEW]            = _handle_syn_new;
+        handlers[PACKET_TYPE_SYN][SESSION_STATE_ESTABLISHED]    = _handle_warning;
+    #ifndef NO_ENCRYPTION
+        handlers[PACKET_TYPE_MSG][SESSION_STATE_BEFORE_INIT]    = _handle_error;
+        handlers[PACKET_TYPE_MSG][SESSION_STATE_BEFORE_AUTH]    = _handle_error;
+    #endif
+        handlers[PACKET_TYPE_MSG][SESSION_STATE_NEW]            = _handle_warning;
+        handlers[PACKET_TYPE_MSG][SESSION_STATE_ESTABLISHED]    = _handle_msg_established;
+    #ifndef NO_ENCRYPTION
+        handlers[PACKET_TYPE_FIN][SESSION_STATE_BEFORE_INIT]    = _handle_fin;
+        handlers[PACKET_TYPE_FIN][SESSION_STATE_BEFORE_AUTH]    = _handle_fin;
+    #endif
+        handlers[PACKET_TYPE_FIN][SESSION_STATE_NEW]            = _handle_fin;
+        handlers[PACKET_TYPE_FIN][SESSION_STATE_ESTABLISHED]    = _handle_fin;
+    #ifndef NO_ENCRYPTION
+        handlers[PACKET_TYPE_ENC][SESSION_STATE_BEFORE_INIT]   = _handle_enc_before_init;
+        handlers[PACKET_TYPE_ENC][SESSION_STATE_BEFORE_AUTH]   = _handle_enc_before_auth;
+        handlers[PACKET_TYPE_ENC][SESSION_STATE_NEW]           = _handle_error;
+        handlers[PACKET_TYPE_ENC][SESSION_STATE_ESTABLISHED]   = _handle_enc_renegotiate;
+在session确认报文被全部接收后，最后会调用handlemsg_established回调函数来将数据发送给driver，进行进一步的处理（理解数据的内容，比如说是要建立一个shell？上传一个文件？等等）
+      if(packet->body.msg.seq == session->their_seq)
+      {
+        /* Verify the ACK is sane */
+        uint16_t bytes_acked = packet->body.msg.ack - session->my_seq;
+        .....
+          /* Increment their sequence number */
+          session->their_seq = (session->their_seq + packet->body.msg.data_length) & 0xFFFF;
+          /* Remove the acknowledged data from the buffer */
+          buffer_consume(session->outgoing_buffer, bytes_acked);
+          /* Increment my sequence number */
+          if(bytes_acked != 0)
+          {
+            session->my_seq = (session->my_seq + bytes_acked) & 0xFFFF;
+          }
+          /* Print the data, if we received any, and then immediately receive more. */
+          if(packet->body.msg.data_length > 0)
+          {
+            driver_data_received(session->driver, packet->body.msg.data, packet->body.msg.data_length);
+            you_can_transmit_now(session);
+          }
+        }
+###  driver
+每一个session对应着一个driver，用来从更高层次上处理报文。在dnscat2中作者总共提供了4中driver，分别是driverconsole，driverexec，driverping和drivercommand，每种不同的driver都实现了一种不同的功能。
+其中最简单的就是driver_console，它将收到的数据直接打印出来,实现一个类似交互的功能：
+    void driver_console_data_received(driver_console_t *driver, uint8_t *data, size_t length)
+    {
+      size_t i;
+      for(i = 0; i command_id)
+        {
+          case COMMAND_PING:
+            out = handle_ping(driver, in);

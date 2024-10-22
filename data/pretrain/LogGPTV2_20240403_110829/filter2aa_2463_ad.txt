@@ -1,0 +1,240 @@
+(gdb) x/x ((struct mbuf *)($esp+0x6c))->m_hdr.mh_next->m_hdr.mh_next->m_hdr.mh_data 
+0xd620e040:     0xbadc0ded  
+The symbol resolver used by all the stages resides in stage 2 (more about this later). Stage 1 uses this to 
+resolve the address of inet6sw. This is an array containing various data for IPv6. We find the address 
+to the current icmp6_input routine in this array (inet6sw[4].pr_input). Once the address is 
+found, stage 2 checks if the backdoor is already installed by comparing the first four bytes in the 
+function with the comparing bytes in the backdoor (the backdoor does not start with the push %ebp 
+instruction, but with a call to get its current location).  
+If the backdoor is not installed, stage 1 resolves malloc and allocates a chunk of memory for stage 2 
+and “arguments”. The information required (the address to the pointer, and the value) to restore the 
+current icmp6_input routine in inet6sw is added to the allocated buffer, to make it possible for 
+stage 2 to uninstall itself later on. 
+Since we are currently running with network interrupts disabled, we simply overwrite the function 
+pointer with the address of the allocated buffer. 
+Stage 1 then clean up the stack and returns (as suggested in the PoC code by Alfredo Ortega): 
+addl    $0x20, %esp 
+popl    %ebx 
+popl    %esi 
+popl    %edi 
+leave 
+ret 
+Stage 2 – The backdoor 
+Stage 2 monitors all ICMPv6 packets arriving to the network interface and searches for a sequence of 
+magic bytes that marks the payload data as a stage 3 command. Since ICMPv6 packets are used when 
+exploiting the vulnerability we know that these packets can reach the system if the exploit succeeded 
+and that we have a way to fully control the system from remote. 
+In order to make the exploit as general as possible, the stage 3 commands should use system calls. 
+Performing system calls from within the kernel requires a process context, which we don't have in the 
+icmp6_input routine since this is called from within an interrupt. 
+In earlier versions of OpenBSD it was possible to fork1() from the initproc process structure 
+while running from an interrupt, this does not work any more. The solution is simply to wrap a system 
+call and wait for a process to call it and then fork1() from that process to create a new process that 
+can be fully controlled from within the kernel, without affecting the system processes. Looking at the 
+default installations of OpenBSD, the gettimeofday() system call is used frequently by many 
+processes, so this is a good target. 
+Once a stage 3 command is detected in the payload of an ICMPv6 packet, the code is copied to a new 
+memory region (created by malloc as type M_DEVBUF) and set as the routine that handles the 
+gettimeofday() system call. In order for the stage 3 command to remove itself, the index of the 
+wrapped system call and the previously used address is stored at the beginning of the buffer. The 
+address to the symbol resolver routine is stored there as well. The stage 3 command starts its execution 
+by saving the current address to be able to restore the syscall: 
+stage3_start: 
+# Get our location 
+call get_location 
+nop 
+get_location: 
+# Point to start of code 
+# to be able to extract syscall information 
+popl    %ecx 
+subl    $5, %ecx 
+The following macros can be used for getting/setting the address of the routine that handles the system 
+call: 
+# Resolve syscall address from table 
+.macro get_syscall sysent, idx, reg 
+movl   \sysent, %ecx 
+movl   \idx, \reg # Index 
+movl   4(%ecx, \reg, 8), \reg 
+.endm 
+# Set syscall address in table 
+.macro set_syscall sysent, idx, addr 
+movl   \sysent, %ecx 
+movl   \idx, %eax # Index 
+movl   \addr, 4(%ecx, %eax, 8) 
+.endm 
+Symbol resolver 
+The symbol resolver is used by all the stages to simplify portability between the stages. It compares 
+hashes against strings in the dynsym section in the ELF header to find symbols. The initial code for the 
+resolver was written by Crister Öberg  for another project. Unfortunately, 
+the ELF header is not mapped on a fixed address on OpenBSD. But it is mapped right after the .bss 
+section, so the Interrupt Descriptor Table (which can be obtained with the sidt instruction) is used as 
+a start address when searching for the start of the header (“\x7fELF”). The following code, written 
+by Joel Eriksson can be used for finding the ELF header with this method: 
+# Copyright (C) Joel Eriksson  2007 
+# Get the ELF-header mapped after .bss, can be used for symbol resolving 
+get_elfhdr: 
+push %edi 
+push %ecx 
+sidt -6(%esp) 
+mov -4(%esp), %edi 
+cld 
+xor %ecx, %ecx 
+dec %ecx 
+mov $0x464c457f, %eax 
+repne scasl 
+lea -4(%edi), %eax 
+pop %ecx 
+pop %edi 
+ret 
+Stage 3 commands 
+Stage 3 commands can easily be executed directly from within the kernel, bypassing all the user level 
+protections. The stage 3 command starts with obtaining the current address of execution as described 
+above to be able to restore the previous handler of the wrapped system call. The next step is to create a 
+new process using the fork1() routine: 
+     int 
+     fork1(struct proc *p1, int exitsig, int flags, void *stack, 
+             size_t stacksize, void (*func)(void *), void *arg, 
+             register_t *retval); 
+From the fork1(9) manual: 
+     “If arg is not NULL, it is the argument to the previous function.  It de- 
+     faults to a pointer to the new process.” 
+This means that arguments, like the address to the symbol resolver, can not be passed on to the new 
+process (as *arg) since we would end up without the pointer to the process that we control. But we 
+know that the address is prepended to the stage 3 command by stage 2, so we use an offset from the 
+instruction that fetches the address to the symbol resolver. This could be hard-coded but editing the 
+code before it is sent simplify reuse for new commands later on. 
+From connect_back.S: 
+connect_back_resolve_hash_offset: 
+subl    $0x41424344, %ecx 
+movl    (%ecx), %ecx 
+From iact.c: 
+/* Labels in connect_back.S */ 
+extern uint8_t connect_back_resolve_hash_offset; 
+extern uint8_t connect_back_start; 
+uint32_t off; 
+... 
+/* Set offset to hash_resolve in connect_back */ 
+     off = (uint32_t)&connect_back_resolve_hash_offset - 
+(uint32_t)&connect_back_start+2; 
+     *((uint32_t *)&cmd->data[off+4]) = off;    
+0x41424344 is then replaced with the offset from the start off the command to the label. Once the 
+new process has been created, stage 2 calls the real syscall handler and returns. 
+The following commands are implemented in the exploit: 
+Connect-back 
+TCP connect back to given IP and port which executes /bin/sh. This command of course requires that 
+no firewall rules are blocking the connection attempt since we try to connect from user space by 
+running system calls from the created process.   
+Shell Command 
+This command allows for running shell commands using ICMPv6 packets. The commands are 
+executed as /bin/sh -c “” from the created process. No output from the commands can 
+be seen (the output is actually sent to the standard streams of the created process, so be careful when 
+typing your commands). Although the exploit can be modified to send output using raw packets, it is 
+still possible that the firewall blocks the response. This command was mainly implemented to be able 
+to edit firewall rules from remote, making connect back possible. 
+Set Secure level 
+Some parts of the system is intended not to be controlled even as the root user at certain security levels, 
+such as loading/unloading kernel modules, writing to /dev/kmem etc. This command allows setting the 
+secure level to an arbitrary value. 
+Uninstall 
+The uninstall command does not run as a user land process; it just resets the icmp6_input function 
+pointer to the original value. 
+References 
+1. http://www.coresecurity.com/index.php5?module=ContentMod&action=item&id=1703 
+2. http://www.openbsd.org/  
+3. TCP/IP Illustrated Volume 2 “The Implementation”, W. Richard Stevens, Gary R. Wright 
+FreeBSD 802.11 Remote Integer Overflow 
+Vulnerability found and exploit developed by 
+Karl Janmar 
+IEEE802.11 framework in FreeBSD 
+The IEEE802.11 system in FreeBSD in its current shape is relatively new (around 2001). The 
+framework unifies all the handling of wireless devices. 
+Problems faced auditing the code 
+Complex link-layer protocol 
+IEEE802.11 has a complex link-layer protocol, as a rough metric we compare the size of some input 
+functions. 
+ IEEE802.11 input function, ieee80211_input(), 437 lines 
+ Ethernet input function, ether_input(), 107 lines 
+ Internet Protocol input function, ip_input(), 469 lines 
+Source-code hard to read 
+The code itself is not written to be easily read. It contains huge recursive switch-statements, for 
+example a 274-line recursive switch-statement in the input function. Other examples are macros that 
+include return statements and so on. 
+User-controlled data 
+The link-layer management in IEEE802.11 is unencrypted and unauthenticated, and because the traffic 
+is transmitted in the air it's very easy for an attacker to manipulate state. 
+Issues found 
+An issue was found in an IOCTL, this issue was the result of a logical error. The vulnerability could 
+allow a local user-process to disclose kernel-memory. 
+Another more interesting issue was also found, it is in a function called by the IOCTL which retrieves 
+the list of access-points in a scan. This list is maintained by the kernel, and is built from beacon frames 
+received.  
+Here is a snippet of the code in question: 
+static int 
+ieee80211_ioctl_getscanresults(struct ieee80211com *ic, struct ieee80211req *ireq) 
+{ 
+union { 
+struct ieee80211req_scan_result res; 
+char data[512]; 
+/* XXX shrink? */ 
+} u; 
+struct ieee80211req_scan_result *sr = &u.res; 
+struct ieee80211_node_table *nt; 
+struct ieee80211_node *ni; 
+int error, space; 
+u_int8_t *p, *cp;
+p = ireq->i_data; 
+space = ireq->i_len; 
+error = 0; 
+/* XXX locking */ 
+nt =  &ic->ic_scan; 
+TAILQ_FOREACH(ni, &nt->nt_node, ni_list) { 
+/* NB: skip pre-scan node state */  
+if (ni->ni_chan == IEEE80211_CHAN_ANYC) 
+continue; 
+get_scan_result(sr, ni); isr_len > sizeof(u)) 
+continue; 
+/* XXX */ 
+if (space isr_len) 
+break; 
+cp = (u_int8_t *)(sr+1); 
+memcpy(cp, ni->ni_essid, ni->ni_esslen); ni_esslen; 
+if (ni->ni_wpa_ie != NULL) { 
+memcpy(cp, ni->ni_wpa_ie, 2+ni->ni_wpa_ie[1]); ni_wpa_ie[1]; 
+} 
+if (ni->ni_wme_ie != NULL) { 
+memcpy(cp, ni->ni_wme_ie, 2+ni->ni_wme_ie[1]);    ni_wme_ie[1]; 
+} 
+error = copyout(sr, p, sr->isr_len); 
+if (error) 
+break; 
+p += sr->isr_len; 
+space -= sr->isr_len; 
+} 
+ireq->i_len -= space; 
+return error; 
+} 
+This function iterates through a list of all access-points found by the system, for every access point it 
+create a scan-result chunk that contains all the information known about the access point. This scan-
+result is first created on the stack into the area of the union u, and then copied to the userland process. 
+The scan-result contain some fixed parameters like supported speed, privacy-mode etc. Then at the end 
+there are some variable-sized fields: SSID and optionally WPA and WME fields. 
+The function get_scan_result() extract these fixed parameters and calculates the size of the resulting 
+scan-result, we are going to take a deeper look into how that size is calculated.
+Here is that code: 
+static void 
+get_scan_result(struct ieee80211req_scan_result *sr, const struct ieee80211_node *ni) 
+{ 
+struct ieee80211com *ic = ni->ni_ic; 
+memset(sr, 0, sizeof(*sr)); 
+sr->isr_ssid_len = ni->ni_esslen; 
+if (ni->ni_wpa_ie != NULL) 
+sr->isr_ie_len += 2+ni->ni_wpa_ie[1]; 
+if (ni->ni_wme_ie != NULL) 
+sr->isr_ie_len += 2+ni->ni_wme_ie[1]; isr_len = sizeof(*sr) + sr->isr_ssid_len + sr->isr_ie_len; 
+sr->isr_len = roundup(sr->isr_len, sizeof(u_int32_t)); 
+if (ni->ni_chan != IEEE80211_CHAN_ANYC) { 
+sr->isr_freq = ni->ni_chan->ic_freq; 
+sr->isr_flags = ni->ni_chan->ic_flags; 
+} 
+……… 
+……… 

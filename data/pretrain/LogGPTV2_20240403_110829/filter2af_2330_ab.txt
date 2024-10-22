@@ -1,0 +1,111 @@
+为此有人提出了一些改进的方式
+    https://abiondo.me/2018/09/21/improving-afl-qemu-mode/
+为了能够启用 `chain` 功能，可以直接把统计覆盖率的代码插入到每个翻译的基本块的前面
+    TranslationBlock *tb_gen_code(CPUState *cpu,
+         ............................
+         ............................
+         tcg_ctx->cpu = ENV_GET_CPU(env);
+         afl_gen_trace(pc);  // 生成统计覆盖率的代码
+         gen_intermediate_code(cpu, tb);
+         tcg_ctx->cpu = NULL;
+         ............................
+`afl_gen_trace` 的作用是插入一个函数调用在翻译的基本块前面，之后在每次执行基本块前会执行 `afl_maybe_log`
+统计程序执行的覆盖率信息。
+同时为了能够进一步提升速度可以把子进程生成的 基本块`chain` 也同步到 `fork server` 进程。
+    bool was_translated = false, was_chained = false;
+         tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+         if (tb == NULL) {
+             mmap_lock();
+             tb = tb_gen_code(cpu, pc, cs_base, flags, cf_mask);
+             was_translated = true; // 表示当前基本块被翻译了
+             mmap_unlock();
+         /* See if we can patch the calling TB. */
+         if (last_tb) {
+             tb_add_jump(last_tb, tb_exit, tb);
+             was_chained = true; // 表示当前基本块执行了 chain 操作
+         }
+         if (was_translated || was_chained) {
+             // 如果有新翻译的基本块或者新构建的 chain 就通知 fork server 更新 cache
+             afl_request_tsl(pc, cs_base, flags, cf_mask, was_chained ? last_tb : NULL, tb_exit);
+         }
+主要流程就是当有新的基本块和新的 `chain` 构建时就通知父进程 (`fork server`进程)更新父进程的 `cache`.
+基于`qemu`还可以实现 `afl` 的 `persistent` 模式，具体的实现细节就是在被测函数的开始和末尾插入指令
+    #define AFL_QEMU_TARGET_i386_SNIPPET                                          \
+      if (is_persistent) {                                                        \
+                                                                                  \
+        if (s->pc == afl_persistent_addr) {                                       \
+                                                                                  \
+          I386_RESTORE_STATE_FOR_PERSISTENT;                                      \
+                                                                                  \
+          if (afl_persistent_ret_addr == 0) {                                     \
+                                                                                  \
+            TCGv_ptr paddr = tcg_const_ptr(afl_persistent_addr);                  \
+            tcg_gen_st_tl(paddr, cpu_regs[R_ESP], persisent_retaddr_offset);      \
+                                                                                  \
+          }                                                                       \
+          tcg_gen_afl_call0(&afl_persistent_loop);                                \
+                                                                                  \
+        } else if (afl_persistent_ret_addr && s->pc == afl_persistent_ret_addr) { \
+                                                                                  \
+          gen_jmp_im(s, afl_persistent_addr);                                     \
+          gen_eob(s);                                                             \
+                                                                                  \
+        }                                                                         \
+                                                                                  \
+      }
+  1. 在被测函数的开头（`afl_persistent_addr`）插入指令调用 `afl_persistent_loop` 函数， 该函数的作用是在每次进入被测函数前初始化一些信息，比如存储程序执行的覆盖率信息的共享内存。
+  2. 然后在 被测函数的末尾 `afl_persistent_ret_addr` 增加一条跳转指令直接跳转到函数的入口(`afl_persistent_addr`)
+  3. 通过这样可以实现不断对函数进行循环测试
+# AFL unicorn 模式
+**源码地址**
+    https://github.com/vanhauser-thc/AFLplusplus
+`afl` 可以使用 `unicorn` 来搜集覆盖率，其实现方式和 `qemu` 模式类似（因为 `unicorn` 本身也就是基于 `qemu`
+搞的）.它通过在 `cpu_exec` 执行基本块前插入设置`forkserver`和统计覆盖率的代码，这样在每次执行基本块时 afl 就能获取到覆盖率信息
+    static tcg_target_ulong cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr);
+    @@ -228,6 +231,8 @@
+                                 next_tb & TB_EXIT_MASK, tb);
+                     }
+                     AFL_UNICORN_CPU_SNIPPET2; // unicorn 插入的代码
+                     /* cpu_interrupt might be called while translating the
+                        TB, but before it is linked into a potentially
+                        infinite loop and becomes env->current_tb. Avoid
+插入的代码如下
+    #define AFL_UNICORN_CPU_SNIPPET2 do { \
+        if(afl_first_instr == 0) { \  // 如果是第一次执行就设置 forkserver
+          afl_setup(); \  // 初始化管道
+          afl_forkserver(env); \  // 设置 fork server
+          afl_first_instr = 1; \
+        } \
+        afl_maybe_log(tb->pc); \  // 统计覆盖率
+      } while (0)
+和 `qemu` 类似在执行第一个基本块时初始化 `afl` 的命名管道并且设置好 `forkserver`，然后通过 `afl_maybe_log` 与
+`afl-fuzz` 端同步覆盖率。
+`forkserver` 的作用和 `qemu` 模式中的类似，主要就是接收命令 `fork` 新进程并且处理子进程的基本块翻译请求来提升执行速度。
+# libFuzzer unicorn 模式
+**源码地址**
+    https://github.com/PAGalaxyLab/uniFuzzer
+`libfuzzer` 支持从外部获取覆盖率信息
+    __attribute__((section("__libfuzzer_extra_counters")))
+    uint8_t Counters[PCS_N];
+上面的定义表示 `libfuzzer` 从 `Counters` 里面取出覆盖率信息来引导变异。
+那么下面就简单了，首先通过 `unicorn` 的基本块 `hook` 事件来搜集执行的基本块信息，然后在回调函数里面更新`Counters`, 就可以把被
+`unicorn` 模拟执行的程序的覆盖率信息反馈给 `libfuzzer`
+    // hook basic block to get code coverage
+        uc_hook hookHandle;
+        uc_hook_add(uc, &hookHandle, UC_HOOK_BLOCK, hookBlock, NULL, 1, 0);
+下面看看 `hookBlock` 的实现
+    // update code coverage counters by hooking basic block
+    void hookBlock(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+        uint16_t pr = crc16(address);
+        uint16_t idx = pr ^ prevPR;
+        Counters[idx]++;
+        prevPR = (pr >> 1);
+    }
+其实就是模拟 `libfuzzer` 统计覆盖率的方式在 `Counters` 更新覆盖率信息并反馈给 `libfuzzer`.
+# 总结
+通过分析 `afl` 的 `forkserver` 机制、 `afl qemu`的实现机制以及 `afl unicorn` 的实现机制可以得出`afl`
+的变异策略调度模块和被测程序执行和覆盖率信息搜集模块是相对独立的，两者通过命名管道进行通信。假设我们需要实现一种新的覆盖率搜集方式并把覆盖率反馈给
+`afl` 来使用 `afl` 的 `fuzz` 策略，我们主要就需要模拟 `fork server` 和 `afl-fuzz`
+进行通信，然后把覆盖率反馈给 `afl-fuzz` 即可。
+对于 `libfuzzer` 而言，它本身就支持从外部获取程序执行的覆盖率信息（通过 **全局变量** 来传递），所以如果要实现新的覆盖率搜集方式，按照
+`libfuzzer` 的规范来实现即可。

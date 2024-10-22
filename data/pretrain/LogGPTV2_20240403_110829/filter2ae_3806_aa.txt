@@ -1,0 +1,132 @@
+## 1\. 前言
+随着对rmi反序列化的深入学习，发现它的攻击面并没有一开始理解的浅显。主要还是在看这篇[针对RMI服务的九重攻击](https://xz.aliyun.com/t/7930)时，发现攻击中涉及的类和通信协议足以让我单独花上时间研究一阵子了。因此这篇算是我单独研究rmi调用流程和源码的总结。
+## 2\. 回顾
+先回顾一下rmi工作的流程：
+  1. 注册端开启注册服务
+  2. 服务端在注册端通过`String - Object`的映射关系绑定对象
+  3. 客户端通过一个字符串向注册端查询获取到操纵远程对象的stub(?)
+  4. 客户端通过stub来执行远程方法
+在整个流程中，涉及了两组关系：
+  * 客户端——注册端
+  * 客户端——服务端
+这里的两个客户端都是相对而言的，并不是指代同一个对象。比如，注册端开放在`192.168.242.1:1099`端口，下述代码的行为就是我说的第一个客户端：
+    Registry registry = LocateRegistry.getRegistry("192.168.242.1", 1099);
+    String[] lists = registry.list();
+    registry.lookup("Hello");
+    registry.bind("las", new myRemoteObj());  // only work for localhost
+再比如，当通过lookup方法获取到一个对象后，对该对象的操作就是指代第二种实体关系：
+    ...
+    myInterface obj = registry.lookup("Hello");
+    obj.myMethod("param");
+上面两种实体之间的通讯细节和协议，就是我接下来要尝试解释的东西。
+由于分析rmi源码也是为了能够更深入的学习rmi安全问题，所以我列出了分析中的一些关注点以助于理解：
+  * 当服务端要抛出一个错误时，它的调用栈是怎样的。这个错误是怎样被发送给客户端的。
+  * 客户端的`DGCClient`对象发起`dirty call`的流程。这里实际上就是ysoserial中 **JRMPClient** 载荷利用的地方。
+  * `UnicastServerRef#dispatch`方法的两个分支。
+## 3\. 客户端—注册端
+### 注册端
+简单来说，注册端监听在1099端口，解析客户端发起的所有连接，判断它们是`list`、`bind`、`rebind`、`lookup`、`unbind`这五种行为的哪一种，并调用相应的方法来处理。不过在此之前，它们还会传递一些数据包用于认证和信息交换。比如，下面是客户端在执行`lookup`方法时所产生的流量：
+不过注册端不只会处理这些api调用，后面会看到，注册端还会处理`dgc`和一些心跳包的发送。
+分析清楚了注册端的行为，就能搞清楚客户端所做的事情，两者是相对的。
+* * *
+我们首先分析注册端。
+一般来说，注册端的关键代码如下：
+    IRemoteHelloWorld remoteHelloWorld = new RemoteHelloWorldImpl();
+    Registry registry = LocateRegistry.createRegistry(1099);
+    registry.bind("Hello", remoteHelloWorld);
+#### 处理网络数据前的调用链
+进入`createRegistry`方法：
+>
+> 这里获取到的是一个`RegistryImpl`对象。需要说明的是，客户端一般调用的是`LocateRegistry.getRegsitry(ip,port)`，它获取到的是一个`RegistryImpl_Stub`对象。故可知，stub和skel的概念是相对而言的，并不只存在于
+> **服务端和客户端** 之间。
+进入`RegistryImpl`的构造方法：
+可以看到，无论是if还是else语句块中，核心代码都是：
+    LiveRef var2 = new LiveRef(id, var1);
+    this.setup(new UnicastServerRef(var2));
+这里之所以有个if，是为了保证当程序设置了`SecurityManager`后，只有当rmi注册服务开放在1099端口时才能执行核心代码。在设置`SecurityManager`策略后，程序本身可能会没有特权去执行核心代码，因此需要通过`AccessController.doPrivileged`的形式去赋予特权。关于AccessController可参见[连接](http://www.blogjava.net/DLevin/archive/2016/07/18/390637.html)。
+总的来说，这里的if相当于提供了一个安全策略：程序员可以通过设置`securityManager`来保证rmi服务只能开放在1099端口。
+接下来进入`this.setup()`方法：
+这里执行了`UnicastServerRef`上的`exportObject`方法，这也是第一次看到`exportObject`方法出现。执行了它之后，客户端就可以调用注册端上的api了，就好像注册端（object）被暴露（export）在了1099端口一样。
+在openjdk代码的注释中解释的则更detail：
+    /**
+         * Export this object, create the skeleton and stubs for this
+         * dispatcher.  Create a stub based on the type of the impl,
+         * initialize it with the appropriate remote reference. Create the
+         * target defined by the impl, dispatcher (this) and stub.
+         * Export that target via the Ref.
+         */
+说明在这个方法里，会创建注册端相应的`stub`对象和`skeleton`对象。
+继续跟进：
+这里先跟进`Util.createProxy()`方法：
+发现最后执行了`createStub`方法，这个方法通过反射实例化了`sun.rmi.registryImpl_Stub`对象并将其作为返回值。
+这里就知道了，`var5`就是一个`registryImpl_Stub`对象。
+同时这里也调用了`this.setSkeleton`来设置一个`registryImpl_Skel`：
+接下来回到刚刚的`exportObject`方法中，发现它创建了一个`Target`对象`var6`，然后调用了`this.ref.exportObject(var6)`，这里的`ref`，就是我们前面创建`UnicastServerRef`时传入的`liveRef`对象：
+于是跟进`liveRef#exportObject()`方法：
+跟进：
+继续跟进：
+这里的`this.listen()`方法是重点，执行它之后注册端就开始监听1099端口了。于是我们跟进看它的内部逻辑：
+这里会进入到第一个if代码块内。
+可以看到这里又出现了`AccessController.doPrivileged()`方法。由于它最终会调用到`TCPTransport.AcceptLoop#run`方法，我们直接在这个方法下断点并跟进：
+跟进：
+下面的代码都是`catch`块就不贴出来了。
+这里的`this.serverSocket`就是在`TCPTransport#listen`方法中创建的，它监听的端口就是我们最开始传入的port。
+接下来进入try中的代码块，它其实又创建了新线程。跟进`ConnectionHandler#run`方法：
+再跟进`this.run0()`方法。
+#### 处理网络数据
+需要说明的是，从这个方法开始，就能看到注册端开始读取并解析客户端传递的TCP数据，根据字段的类型来执行相应的`bind`、`list`等操作，并将结果返回。
+由于该方法比较长，所以我逐段进行分析。
+前面的一些代码主要是设置TCP的一些参数，不管，看下面的部分：
+这里是第一次从输入流读取数据，接下来会根据`var6`的值判断进入哪个if块：
+这里的 **1347375956** 转为十六进制再转为字符串就是： **POST** 。说明这里的逻辑是判断它是否为http流量，一般不会进入这个分支。
+我们进入第二个if。 **1246907721** 转为十六进制其实是 **0x4a524d49**
+，这其实就是rmi协议的魔术头，同时第二个short字段表示版本：
+在这个if分支里又读取了一个字节存到`var15`，然后进入`switch`。这里一般来说读取到的是0x4b，即75：
+进入case后，由于已经解析完了第一个接受包，注册端开始构造第一个回复包：
+直到`var10.flush();`，注册端缓冲区的数据被发送出去。
+接下来的代码：
+    String var16 = var5.readUTF();
+    int var17 = var5.readInt();
+用于解析客户端发送的第二个数据包，不过这个数据包似乎没起到什么作用。第二个数据包内容如下：
+接下来进入`TCPTransport.this.handleMessages(var14,
+true)`。注意第二个参数为true，它让接下来的代码中的while语句不断循环。见红框圈处：
+这里`int var5 =
+var4.read()`其实已经开始解析客户端发送的第三个数据包了（说明注册端并没有回复第二个数据包，从流量图也能看出），第三个数据包的内容将在之后贴出。初看这个var5是int仿佛是读取4个字节，但是跟进`var4.read()`能看到其实还是读取的一个字节：
+`var5`的内容其实是表示该数据包是哪种类型。一般来说有下面三种：
+  * 80，即`0x50`，表示执行业务方法。这里是调用注册端的某个方法（如`list`、`bind`），后面会看到，客户端在执行远程方法时，服务端也会从这里进去。
+例如下述数据包：
+  * 82，即`0x52`，心跳包（大概），这里可以看到注册端回复了一个字节`0x53`。例如下面两个数据包：
+  * 84，即`0x54`，`DgcAck`，如下：
+这里继续跟进80，也就是调用注册端api方法的case。进入`StreamRemoteCall#serviceCall`：
+我们首先贴出第三个数据包的内容：
+需要注意的是，我们上面已经读取了一个字节了，接下来的`aced`之后的内容，按理来说都是序列化的内容了。
+但是注意这里的`var39 = ObjID.read(var1.getInputStream());`，它是从什么地方读取的内容呢？
+其实内容是在序列化数据的`BlockData`块。
+读取了`ObjID`后，又开启了新线程。进入`var6.dispatch()`，也就是`UnicastServerRef#dispatch`：
+这里其实是进入`this.oldDispatch`。继续跟进：
+> 后面在分析 **客户端—服务端** 时可知，如果不进入这个if语句，之后所作的事情其实就是服务端处理客户端调用远程对象方法的部分。这里留个印象就好。
+这里的`this.skel`就是在之前调用`UnicastServerRef#exportObject`方法时设置的`registryImpl_Skel`。跟进`registryImpl_Skel#dispatch`：
+终于到这里了！这里就是注册端最后调用各个api（`list`、`bind`等）的地方。
+看一眼堆栈：
+不过到这里，我们只跟进了`LocateRegistry.createRegistry`的内容。注册端的代码还有一条：
+    registry.bind("Hello", remoteHelloWorld);
+万幸是`registryImpl#bind`的逻辑很简单：
+这里只是将 **String——obj** 的映射关系放到了`registryImpl`的`bindings`中。
+后续可以看到，客户端执行`lookup`方法时，注册端就会从`registryImpl`的`bindings`中查询对象：
+注册端分析完毕。接下来分析客户端。
+#### 图示
+注册端调用`LocateRegistry#createRegistry`的流程比较复杂，所以截了下图便于更直观的看到调用关系。
+每一个线程单独为一张图。
+主线程：
+线程一：
+线程二：
+线程三，从这里开始处理网络数据：
+线程四，又回到了`UnicastServerRef`方法，最终调用了`RegistryImpl_Skel#dispatch`：
+### 客户端
+客户端代码如下：
+    Registry registry = LocateRegistry.getRegistry("192.168.242.1", 1099);
+     registry.lookup("Hello");
+开启注册端后开始debug。
+首先跟进`LocateRegistry#getRegistry`方法：
+继续跟进：
+最后同样调用`Util#createProxy`创建了一个`registryImpl_Stub`对象（这个方法在注册端的`UnicastServerRef#exportObject`中曾被调用）。传入的`UnicastRef`中包含了`ObjID`、`host`、`port`等信息，用于连接注册端：

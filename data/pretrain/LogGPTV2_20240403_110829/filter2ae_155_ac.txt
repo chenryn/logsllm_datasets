@@ -1,0 +1,194 @@
+        }
+        public static void main(String[] args) throws IOException {
+            test t = new test();
+            ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream("testcase"));
+            out.writeObject(t);
+            out.writeObject(t); //二次序列化
+            out.close();
+        }
+    }
+对比一下可以发现，在该序列化数据的结构中最后多了
+    TC_REFERENCE - 0x71
+        Handle - 8257537 - 0x00 7e 00 01
+这里对应的就是前文基础知识里“序列化中的两个机制”中引用机制里的一段话
+>
+> 每一个写入字节流的对象都会被赋予引用`Handle`，并且这个引用`Handle`可以反向引用该对象（使用`TC_REFERENCE`结构，引用前面handle的值），引用`Handle`会从`0x7E0000`开始进行顺序赋值并且自动自增，一旦字节流发生了重置则该引用Handle会重新从`0x7E0000`开始。
+那么反序列化是如何处理`TC_REFERENCE`块的呢？
+我在[反序列化流程分析总结](https://www.cnpanda.net/sec/928.html) 一文中写到这样一个流程：
+> 在`readObject0`方法里有这样的一个判断：
+>
+>
+> 
+是的，在反序列化的流程中，进入了`readObject0`方法后，会判断读取的字节流中是否有`TC_REFERENCE`标识，如果有，那么会调用`readHandle`函数，但是我没有在文中具体说明`readHandle`函数，可以一起来看看：
+    private Object readHandle(boolean unshared) throws IOException {
+            if (bin.readByte() != TC_REFERENCE) {
+                throw new InternalError();
+            }
+            passHandle = bin.readInt() - baseWireHandle;
+            if (passHandle = handles.size()) {
+                throw new StreamCorruptedException(
+                    String.format("invalid handle value: %08X", passHandle +
+                    baseWireHandle));
+            }
+            if (unshared) {
+                // REMIND: what type of exception to throw here?
+                throw new InvalidObjectException(
+                    "cannot read back reference as unshared");
+            }
+            Object obj = handles.lookupObject(passHandle);
+            if (obj == unsharedMarker) {
+                // REMIND: what type of exception to throw here?
+                throw new InvalidObjectException(
+                    "cannot read back reference to unshared object");
+            }
+            return obj;
+        }
+这个方法会从字节流中读取`TC_REFERENCE`标记段，它会把读取的引用`Handle`赋值给`passHandle`变量，然后传入`lookupObject()`，在`lookupObject()`方法中，如果引用的`handle`不为空、没有关联的`ClassNotFoundException`（`status[handle]
+!= STATUS_EXCEPTION`），那么就返回给定`handle`的引用对象，最后由`readHandle`方法返回给对象。
+也就是说，反序列化流程还原到`TC_REFERENCE`的时候，会尝试还原引用的`handle`对象。
+谈完了引用机制现在在来看数据插入的问题，
+**如何能在类`AnnotationInvocationHandler`的序列化数据中插入一部分源代码中没有的数据？**
+利用`objectAnnotation`！
+继续来看个例子：
+    package com.panda.sec;
+    import java.io.*;
+    public class test implements Serializable {
+        private static final long serialVersionUID = 100L;
+        public static int num = 0;
+        private void readObject(ObjectInputStream input) throws Exception {
+            input.defaultReadObject();
+            System.out.println("hello!");
+        }
+        private void writeObject(ObjectOutputStream output) throws IOException {
+            output.defaultWriteObject();
+            output.writeObject("Panda");
+            output.writeUTF("This is a test data!");
+        }
+        public static void main(String[] args) throws IOException, ClassNotFoundException {
+            test t = new test();
+            ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream("testcase_new"));
+            out.writeObject(t);
+            out.writeObject(t);
+            out.close();
+        }
+    }
+在这个示例中，我们重写了`writeObject`方法，并且在该方法中利用`writeObject`和`writeUTF`方法写入了`Panda`对象以及`This
+is a test data!`字符串，该段序列化数据内容如下：
+为了更直白的看变化，我们可以用`compare`工具来对比一下：
+可以看到原先表示类描述信息标记由`0x02 - SC_SERIALIZABLE`变成了`0x03 - SC_WRITE_METHOD |
+SC_SERIALIZABLE`，并且在原有序列化数据结构的最下方还多了由`objectAnnotation`标识的内容段，这里的内容段会在反序列化的时候被还原
+**为什么会有这种变化？**
+**知识点1：**
+如果一个可序列化的类重写了`writeObject`方法，而且向字节流写入了一些额外的数据，那么会设置`SC_WRITE_METHOD`标识，这种情况下，一般使用结束符`TC_ENDBLOCKDATA`来标记这个对象的数据结束；
+**知识点2：**
+如果一个可序列化的类重写了`writeObject`方法，在该序列化数据的`classdata`部分，还会多出个`objectAnnotation`部分，并且如果重写的`writeObject()`方法内除了调用`defaultWriteObject()`方法写对象字段数据，还向字节流中写入了自定义数据，那么在`objectAnnotation`部分会有写入自定义数据对应的结构和值；
+这样一来是不是就有点明了了？
+正常情况下，我们没有办法修改可序列化类本身的内容，也就没办法重写这个类中的`writeObject`方法，也就没法让序列化数据中多出来`objectAnnotation`内容段
+可真的没办法吗？当然不是了！
+序列化数据只是一块二进制的数据而已，只要按照序列化预定的规则来修改其hex数据，那么实际上就是相当于在重写的`writeObject`方法中添加数据
+在写入数据前，我们要考虑一件事， **谁向谁写入数据？**
+是先序列化`AnnotationInvocationHandler`类然后向其中插入`BeanContextSupport`对象，还是先序列化`BeanContextSupport`类然后向其中插入`AnnotationInvocationHandler`对象？
+先思考`jdk7u21`被修复的原因是什么？是因为在反序列化的过程中有异常抛出，从而导致反序列化的进程被终止了！
+这让我们不得不联想到我们在基础知识的`Try/catch块的作用`中做的结论：
+> **在一个存在`try ... catch`块的方法（无异常抛出）中去调用另一个存在`try ...
+> catch`块的方法（有异常抛出），如果被调用的方法（有异常抛出）出错，那么会导致`调用方法`出错且不会继续执行完`调用方法`的代码逻辑，但是`不会`终止代码运行的进程**
+我们要的就是不要终止我们的反序列化进程，这样我们就可以取得反序列化后的类对象。
+所以我们需要先序列化`BeanContextSupport`类（无异常抛出）然后向其中插入`AnnotationInvocationHandler`对象（有异常抛出）
+这里还有一点要注意，因为根据`成员抛弃`机制我们知道，如果序列化流新增的这个值是一个对象的话，那么会为这个值分配一个`Handle`，但由于我们是手动插入`Handle`，所以需要修改引用`Handle`的值（就是`TC_ENDBLOCKDATA`块中`handle`的引用值）为`AnnotationInvocationHandler`对象的`handle`地址
+具体过程如下：
+**第一步，** 先序列化`BeanContextSupport`类，然后利用`SerializationDumper`工具可以得到以下数据结构：
+    STREAM_MAGIC - 0xac ed
+    STREAM_VERSION - 0x00 05
+    Contents
+      TC_OBJECT - 0x73
+        TC_CLASSDESC - 0x72
+          className
+            Length - 32 - 0x00 20
+            Value - com.panda.sec.BeanContextSupport - 0x636f6d2e70616e64612e7365632e4265616e436f6e74657874537570706f7274
+          serialVersionUID - 0x00 00 00 00 00 00 00 14
+          newHandle 0x00 7e 00 00
+          classDescFlags - 0x02 - SC_SERIALIZABLE
+          fieldCount - 0 - 0x00 00
+          classAnnotations
+            TC_ENDBLOCKDATA - 0x78
+          superClassDesc
+            TC_NULL - 0x70
+        newHandle 0x00 7e 00 01
+        classdata
+          com.panda.sec.BeanContextSupport
+            values
+**第二步，**
+序列化`AnnotationInvocationHandler`类，然后利用`SerializationDumper`工具可以得到以下数据结构：
+    STREAM_MAGIC - 0xac ed
+    STREAM_VERSION - 0x00 05
+    Contents
+      TC_OBJECT - 0x73
+        TC_CLASSDESC - 0x72
+          className
+            Length - 41 - 0x00 29
+            Value - com.panda.sec.AnnotationInvocationHandler - 0x636f6d2e70616e64612e7365632e416e6e6f746174696f6e496e766f636174696f6e48616e646c6572
+          serialVersionUID - 0x00 00 00 00 00 00 00 0a
+          newHandle 0x00 7e 00 00
+          classDescFlags - 0x02 - SC_SERIALIZABLE
+          fieldCount - 1 - 0x00 01
+          Fields
+            0:
+              Int - I - 0x49
+              fieldName
+                Length - 4 - 0x00 04
+                Value - zero - 0x7a65726f
+          classAnnotations
+            TC_ENDBLOCKDATA - 0x78
+          superClassDesc
+            TC_NULL - 0x70
+        newHandle 0x00 7e 00 01
+        classdata
+          com.panda.sec.AnnotationInvocationHandler
+            values
+              zero
+                (int)0 - 0x00 00 00 00
+**第三步，** 利用`objectAnnotation`插入`AnnotationInvocationHandler`对象：
+    STREAM_MAGIC - 0xac ed
+    STREAM_VERSION - 0x00 05
+    Contents
+      TC_OBJECT - 0x73
+        TC_CLASSDESC - 0x72
+          className
+            Length - 32 - 0x00 20
+            Value - com.panda.sec.BeanContextSupport - 0x636f6d2e70616e64612e7365632e4265616e436f6e74657874537570706f7274
+          serialVersionUID - 0x00 00 00 00 00 00 00 14
+          newHandle 0x00 7e 00 00
+          classDescFlags - 0x02 - SC_SERIALIZABLE
+          fieldCount - 0 - 0x00 00
+          classAnnotations
+            TC_ENDBLOCKDATA - 0x78
+          superClassDesc
+            TC_NULL - 0x70
+        newHandle 0x00 7e 00 01
+        classdata
+          com.panda.sec.BeanContextSupport
+            values
+          objectAnnotation      //  从这里开始
+                TC_OBJECT - 0x73
+                TC_CLASSDESC - 0x72
+                  className
+                    Length - 41 - 0x00 29
+                    Value - com.panda.sec.AnnotationInvocationHandler - 0x636f6d2e70616e64612e7365632e416e6e6f746174696f6e496e766f636174696f6e48616e646c6572
+                  serialVersionUID - 0x00 00 00 00 00 00 00 0a
+                  newHandle 0x00 7e 00 00
+                  classDescFlags - 0x02 - SC_SERIALIZABLE
+                  fieldCount - 1 - 0x00 01
+                  Fields
+                    0:
+                      Int - I - 0x49
+                      fieldName
+                        Length - 4 - 0x00 04
+                        Value - zero - 0x7a65726f
+                  classAnnotations
+                    TC_ENDBLOCKDATA - 0x78
+                  superClassDesc
+                    TC_NULL - 0x70
+                newHandle 0x00 7e 00 01
+                classdata
+                  com.panda.sec.AnnotationInvocationHandler
+                    values

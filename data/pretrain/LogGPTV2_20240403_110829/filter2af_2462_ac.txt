@@ -1,0 +1,204 @@
+      movq %r11,  64(%rsp)
+      movq %xmm0,  96(%rsp)
+      movq %xmm1,  112(%rsp)
+      movq %xmm2,  128(%rsp)
+      movq %xmm3,  144(%rsp)
+      movq %xmm4,  160(%rsp)
+      movq %xmm5,  176(%rsp)
+      movq %xmm6,  192(%rsp)
+      movq %xmm7,  208(%rsp)
+      movq %xmm8,  224(%rsp)
+      movq %xmm9,  240(%rsp)
+      movq %xmm10, 256(%rsp)
+      movq %xmm11, 272(%rsp)
+      movq %xmm12, 288(%rsp)
+      movq %xmm13, 304(%rsp)
+      movq %xmm14, 320(%rsp)
+      movq %xmm15, 336(%rsp)
+      /* Map SHM, jumping to __afl_setup_abort if something goes wrong. */
+      /* The 64-bit ABI requires 16-byte stack alignment. We'll keep the
+         original stack ptr in the callee-saved r12. */
+      pushq %r12
+      movq  %rsp, %r12
+      subq  $16, %rsp
+      andq  $0xfffffffffffffff0, %rsp
+      leaq .AFL_SHM_ENV(%rip), %rdi
+    call _getenv
+      testq %rax, %rax
+      je    __afl_setup_abort
+      movq  %rax, %rdi
+    call _atoi
+      xorq %rdx, %rdx   /* shmat flags    */
+      xorq %rsi, %rsi   /* requested addr */
+      movq %rax, %rdi   /* SHM ID         */
+    call _shmat
+      cmpq $-1, %rax
+      je   __afl_setup_abort
+      /* Store the address of the SHM region. */
+      movq %rax, %rdx
+      movq %rax, __afl_area_ptr(%rip)
+      movq %rax, __afl_global_area_ptr(%rip)
+      movq %rax, %rdx
+首先，保存所有寄存器的值，包括 `xmm` 寄存器组；
+然后，进行 `rsp` 的对齐；
+然后，获取环境变量 `__AFL_SHM_ID`，该环境变量保存的是共享内存的ID：
+  * 如果获取失败，跳转到 `__afl_setup_abort` ； 
+  * 如果获取成功，调用 `_shmat` ，启用对共享内存的访问，启用失败跳转到 `__afl_setup_abort`。
+接下来，将 `_shmat` 返回的共享内存地址存储在 `__afl_area_ptr` 和 `__afl_global_area_ptr` 变量中。
+后面即开始运行 `__afl_forkserver`。
+##### 5\. __afl_forkserver
+    __afl_forkserver:
+         /* Enter the fork server mode to avoid the overhead of execve() calls. We
+         push rdx (area ptr) twice to keep stack alignment neat. */
+      pushq %rdx
+      pushq %rdx
+      /* Phone home and tell the parent that we're OK. (Note that signals with
+         no SA_RESTART will mess it up). If this fails, assume that the fd is
+         closed because we were execve()d from an instrumented binary, or because
+         the parent doesn't want to use the fork server. */
+      movq $4, %rdx               /* length    */
+      leaq __afl_temp(%rip), %rsi /* data      */
+      movq $" STRINGIFY((FORKSRV_FD + 1)) ", %rdi       /* file desc */
+    CALL_L64("write")
+      cmpq $4, %rax
+      jne  __afl_fork_resume
+这一段实现的主要功能是向 `FORKSRV_FD+1` （也就是198+1）号描述符（即状态管道）中写 `__afl_temp` 中的4个字节，告诉
+fork server （将在后续的文章中进行详细解释）已经成功启动。
+##### 6\. __afl_fork_wait_loop
+    __afl_fork_wait_loop:
+      /* Wait for parent by reading from the pipe. Abort if read fails. */
+      movq $4, %rdx               /* length    */
+      leaq __afl_temp(%rip), %rsi /* data      */
+      movq $" STRINGIFY(FORKSRV_FD) ", %rdi            /* file desc */
+    CALL_L64("read")
+      cmpq $4, %rax
+      jne  __afl_die
+      /* Once woken up, create a clone of our process. This is an excellent use
+         case for syscall(__NR_clone, 0, CLONE_PARENT), but glibc boneheadedly
+         caches getpid() results and offers no way to update the value, breaking
+         abort(), raise(), and a bunch of other things :-( */
+    CALL_L64("fork")
+      cmpq $0, %rax
+      jl   __afl_die
+      je   __afl_fork_resume
+      /* In parent process: write PID to pipe, then wait for child. */
+      movl %eax, __afl_fork_pid(%rip)
+      movq $4, %rdx                   /* length    */
+      leaq __afl_fork_pid(%rip), %rsi /* data      */
+      movq $" STRINGIFY((FORKSRV_FD + 1)) ", %rdi             /* file desc */
+    CALL_L64("write")
+      movq $0, %rdx                   /* no flags  */
+      leaq __afl_temp(%rip), %rsi     /* status    */
+      movq __afl_fork_pid(%rip), %rdi /* PID       */
+    CALL_L64("waitpid")
+      cmpq $0, %rax
+      jle  __afl_die
+      /* Relay wait status to pipe, then loop back. */
+      movq $4, %rdx               /* length    */
+      leaq __afl_temp(%rip), %rsi /* data      */
+      movq $" STRINGIFY((FORKSRV_FD + 1)) ", %rdi         /* file desc */
+    CALL_L64("write")
+      jmp  __afl_fork_wait_loop
+  1. 等待fuzzer通过控制管道发送过来的命令，读入到 `__afl_temp` 中：
+  2. 读取失败，跳转到 `__afl_die` ，结束循环；
+  3. 读取成功，继续；
+  4. fork 一个子进程，子进程执行 `__afl_fork_resume`；
+  5. 将子进程的pid赋给 `__afl_fork_pid`，并写到状态管道中通知父进程；
+  6. 等待子进程执行完成，写入状态管道告知 fuzzer；
+  7. 重新执行下一轮 `__afl_fork_wait_loop` 。
+##### 7\. __afl_fork_resume
+    __afl_fork_resume:
+    /* In child process: close fds, resume execution. */
+      movq $" STRINGIFY(FORKSRV_FD) ", %rdi
+    CALL_L64("close")
+      movq $(" STRINGIFY(FORKSRV_FD) " + 1), %rdi
+    CALL_L64("close")
+      popq %rdx
+      popq %rdx
+      movq %r12, %rsp
+      popq %r12
+      movq  0(%rsp), %rax
+      movq  8(%rsp), %rcx
+      movq 16(%rsp), %rdi
+      movq 32(%rsp), %rsi
+      movq 40(%rsp), %r8
+      movq 48(%rsp), %r9
+      movq 56(%rsp), %r10
+      movq 64(%rsp), %r11
+      movq  96(%rsp), %xmm0
+      movq 112(%rsp), %xmm1
+      movq 128(%rsp), %xmm2
+      movq 144(%rsp), %xmm3
+      movq 160(%rsp), %xmm4
+      movq 176(%rsp), %xmm5
+      movq 192(%rsp), %xmm6
+      movq 208(%rsp), %xmm7
+      movq 224(%rsp), %xmm8
+      movq 240(%rsp), %xmm9
+      movq 256(%rsp), %xmm10
+      movq 272(%rsp), %xmm11
+      movq 288(%rsp), %xmm12
+      movq 304(%rsp), %xmm13
+      movq 320(%rsp), %xmm14
+      movq 336(%rsp), %xmm15
+      leaq 352(%rsp), %rsp
+      jmp  __afl_store
+  1. 关闭子进程中的fd；
+  2. 恢复子进程的寄存器状态；
+  3. 跳转到 `__afl_store` 执行。
+##### 8\. __afl_store
+    __afl_store:
+      /* Calculate and store hit for the code location specified in rcx. */
+      xorq __afl_prev_loc(%rip), %rcx
+      xorq %rcx, __afl_prev_loc(%rip)
+      shrq $1, __afl_prev_loc(%rip)
+      incb (%rdx, %rcx, 1)
+我们直接看反编译的代码：
+这里第一步的异或中的 `a4` ，其实是调用 `__afl_maybe_log` 时传入 的参数：
+再往上追溯到插桩代码：
+可以看到传入 `rcx` 的，实际上就是用于标记当前桩的随机id， 而 `_afl_prev_loc` 其实是上一个桩的随机id。
+经过两次异或之后，再将 `_afl_prev_loc` 右移一位作为新的 `_afl_prev_loc`，最后再共享内存中存储当前插桩位置的地方计数加一。
+## 二、AFL 的插桩 —— llvm_mode
+### （一）、LLVM 前置知识
+LLVM 主要为了解决编译时多种多样的前端和后端导致编译环境复杂、苛刻的问题，其核心为设计了一个称为 `LLVM?IR`
+的中间表示，并以库的形式提供一些列接口，以提供诸如操作 IR 、生成目标平台代码等等后端的功能。其整体架构如下所示：
+![未命名绘图.drawio
+\(1\)](https://images.seebug.org/content/images/2021/10/08/1633680571000-17edsyn.png-w331s)
+不同的前端和后端使用统一的中间代码`LLVM InterMediate Representation(LLVM
+IR)`，其结果就是如果需要支持一门新的编程语言，只需要实现一个新的前端；如果需要支持一款新的硬件设备，只需要实现一个新的后端；优化阶段为通用阶段，针对统一的
+LLVM IR ，与新的编程语言和硬件设备无关。
+GCC 的前后端耦合在一起，没有进行分离，所以GCC为了支持一门新的编程语言或一个新的硬件设备，需要重新开发前端到后端的完整过程。
+Clang 是 LLVM 项目的一个子项目，它是 LLVM 架构下的 C/C++/Objective-C 的编译器，是 LLVM
+前端的一部分。相较于GCC，具备编译速度快、占用内存少、模块化设计、诊断信息可读性强、设计清晰简单等优点。
+最终从源码到机器码的流程如下（以 Clang 做编译器为例）：
+（LLVM Pass 是一些中间过程处理 IR 的可以用户自定义的内容，可以用来遍历、修改 IR 以达到插桩、优化、静态分析等目的。）
+代码首先由编译器前端clang处理后得到中间代码IR，然后经过各 LLVM Pass 进行优化和转换，最终交给编译器后端生成机器码。
+### （二）、 AFL的afl-clang-fast
+#### 1\. 概述
+AFL的 `llvm_mode` 可以实现编译器级别的插桩，可以替代 `afl-gcc` 或 `afl-clang`
+使用的比较“粗暴”的汇编级别的重写的方法，且具备如下几个优势：
+  1. 编译器可以进行很多优化以提升效率；
+  2. 可以实现CPU无关，可以在非 x86 架构上进行fuzz；
+  3. 可以更好地处理多线程目标。
+在AFL的 `llvm_mode` 文件夹下包含3个文件： `afl-clang-fast.c` ，`?afl-llvm-pass.so.cc`，?`afl-llvm-rt.o.c`。
+`afl-llvm-rt.o.c` 文件主要是重写了 `afl-as.h` 文件中的 `main_payload` 部分，方便调用；
+`afl-llvm-pass.so.cc` 文件主要是当通过 `afl-clang-fast` 调用 clang 时，这个pass被插入到 LLVM
+中，告诉编译器添加与 ``afl-as.h` 中大致等效的代码；
+`afl-clang-fast.c` 文件本质上是 clang 的 wrapper，最终调用的还是 clang 。但是与 `afl-gcc`
+一样，会进行一些参数处理。
+`llvm_mode` 的插桩思路就是通过编写pass来实现信息记录，对每个基本块都插入探针，具体代码在 `afl-llvm-pass.so.cc`
+文件中，初始化和forkserver操作通过链接完成。
+#### 2\. 源码
+##### 1\. afl-clang-fast.c
+###### 1\. main 函数
+`main` 函数的全部逻辑如下：
+主要是对 `find_obj(),?edit_params(),?execvp()` 函数的调用，
+其中主要有以下三个函数的调用：
+  * `find_obj(argv[0])`：查找运行时library
+  * `edit_params(argc, argv)`：处理传入的编译参数，将确定好的参数放入 `cc_params[]` 数组
+  * `execvp(cc_params[0], (cahr**)cc_params)`：替换进程空间，传递参数，执行要调用的clang
+这里后两个函数的作用与 `afl-gcc.c` 中的作用基本相同，只是对参数的处理过程存在不同，不同的主要是 `find_obj()` 函数。
+###### 2\. find_obj 函数
+`find_obj()`函数的控制流逻辑如下：
+  * 首先，读取环境变量 `AFL_PATH` 的值：
+  * 如果读取成功，确认 `AFL_PATH/afl-llvm-rt.o` 是否可以访问；如果可以访问，设置该目录为 `obj_path` ，然后直接返回；

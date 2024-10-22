@@ -1,0 +1,127 @@
+    * forksrv_pid = fork()
+  * 子进程和父进程都会向下执行，我们通过pid来使它们执行不同的代码`if(!forksrv_pid)`
+    * 以下都是子进程要执行的代码 
+      * 在继续向下读之前，需要仔细阅读这篇文章 
+        * [进程间通信管道进阶篇：linux下dup/dup2函数的用法](https://www.cnblogs.com/GODYCA/archive/2013/01/05/2846197.html)
+      * 重定向文件描述符1和2到dev_null_fd，如果指定了out_file，则文件描述符0重定向到dev_null_fd，否则重定向到out_fd。 
+        * `dup2(dev_null_fd, 1);`
+        * `dup2(dev_null_fd, 2);`
+      * 重定向FORKSRV_FD到ctl_pipe[0],重定向FORKSRV_FD + 1到st_pipe[1] 
+        * 子进程只能读取命令
+        * 子进程只能发送(“写出”)状态
+      * 关闭子进程里的一些文件描述符 
+                        close(ctl_pipe[0]);
+            close(ctl_pipe[1]);
+            close(st_pipe[0]);
+            close(st_pipe[1]);
+            close(out_dir_fd);
+            close(dev_null_fd);
+            close(dev_urandom_fd);
+            close(fileno(plot_file));
+      * 读取环境变量LD_BIND_LAZY，如果没有设置，则设置环境变量LD_BIND_NOW为1
+      * 设置环境变量ASAN_OPTIONS为`"abort_on_error=1:" "detect_leaks=0:" "symbolize=0:" "allocator_may_return_null=1"`，同理设置MSAN_OPTIONS
+      * `execv(target_path, argv)`带参数执行target,这个函数除非出错不然不会返回。 
+        * execv会替换掉原有的进程空间为target_path代表的程序，所以相当于后续就是去执行target_path，这个程序结束的话，子进程就结束。
+        * **而在这里非常特殊，第一个target会进入`__afl_maybe_log`里的`__afl_fork_wait_loop`，并充当fork server，在整个Fuzz的过程中，它都不会结束，每次要Fuzz一次target，都会从这个fork server fork出来一个子进程去fuzz。**
+      * 使用一个独特的bitmaps EXEC_FAIL_SIG(0xfee1dead)写入trace_bits，来告诉父进程执行失败，并结束子进程。
+  * 以下都是父进程要执行的代码 
+    * 关闭不需要的endpoints 
+                  // 关闭不是需要的endpoints
+          close(ctl_pipe[0]);
+          close(st_pipe[1]);
+          fsrv_ctl_fd = ctl_pipe[1];//父进程只能发送("写出")命令
+          fsrv_st_fd = st_pipe[0];//父进程只能读取状态
+    * 等待fork server启动，但是不能等太久。（所以在调试时要注意这个…） 
+      * 从管道里读取4个字节到status里，如果读取成功，则代表fork server成功启动，就结束这个函数并返回。
+      * 如果超时，就抛出异常。
+  * 后续是一些子进程启动失败的异常处理逻辑，暂时不叙。
+####  has_new_bits(u8 *virgin_map)
+  * 检查有没有新路径或者某个路径的执行次数有所不同。
+  * 初始化current和virgin为trace_bits和virgin_map的u64首元素地址，设置ret的值为0
+  * 8个字节一组，每次从trace_bits，也就是共享内存里取出8个字节 
+    * 如果current不为0，且`current & virgin`不为0，即代表current发现了新路径或者某条路径的执行次数和之前有所不同 
+      * 如果ret当前小于2 
+        * 取current的首字节地址为cur，virgin的首字节地址为vir
+        * i的范围是0-7，比较`cur[i] && vir[i] == 0xff`，如果有一个为真，则设置ret为2 
+          * 这代表发现了之前没有出现过的tuple
+          * **注意==的优先级比 &&要高，所以先判断vir[i]是否是0xff，即之前从未被覆盖到，然后再和cur[i]进行逻辑与**
+        * 否则设置ret为1 
+          * 这代表仅仅只是改变了某个tuple的hit-count
+      * `*virgin &= ~*current`
+    * current和virgin移动到下一组8个字节，直到MAPSIZE全被遍历完。
+  * 如果传入给has_new_bits的参数`virgin_map`是`virgin_bits`,且ret不为0，就设置bitmap_changed为1 
+    * virgin_bits保存还没有被Fuzz覆盖到的byte，其初始值每位全被置位1,然后每次按字节置位。
+  * 返回ret的值。
+####  u32 count_bytes(u8 *mem)
+  * 初始化计数器ret的值为0，循环读取mem里的值，每次读取4个字节到u32变量v中
+  * 如果v为0，则代表这四个字节都是0，直接跳过，进入下一次循环
+  * 如果v不为0，则依次计算`v & FF(0),v & FF(1),v & FF(2),v&FF(3)`的结果，如果不为0，则计数器ret加一。 
+    * `#define FF(_b) (0xff exec_us * q->len`即执行时间和样例大小的乘积，以这两个指标来衡量权重。
+  * 遍历trace_bits数组，如果该字节的值不为0，则代表这是已经被覆盖到的path 
+    * 然后检查对应于这个path的top_rated是否存在 
+      * `static struct queue_entry *top_rated[MAP_SIZE]; /* Top entries for bitmap bytes */`
+      * 如果存在，就比较`fav_factor > top_rated[i]->exec_us * top_rated[i]->len`，即比较执行时间和样例大小的乘积，哪个更小。 
+        * 如果`top_rated[i]`的更小，则代表`top_rated[i]`的更优，不做任何处理，继续遍历下一个path。
+        * 如果q更小，就将`top_rated[i]`原先对应的queue entry的tc_ref字段减一，并将其trace_mini字段置为空。
+        * `u8 *trace_mini; /* Trace bytes, if kept */`
+        * `u32 tc_ref; /* Trace bytes ref count */`
+      * 然后设置`top_rated[i]`为q，即当前case，然后将其tc_ref的值加一
+      * 如果`q->trace_mini`为空，则将trace_bits经过minimize_bits压缩，然后存到trace_mini字段里
+      * 设置score_changed为1.
+#### void minimize_bits(u8 _dst, u8_ src)
+将trace_bits压缩为较小的位图。  
+简单的理解就是把原本是包括了是否覆盖到和覆盖了多少次的byte，压缩成是否覆盖到的bit。  
+在看这个函数和下一个函数cull_queue之前，建议把[经典算法系列之(一) – BitMap
+[数据的压缩存储]](https://blog.csdn.net/lxlmycsdnfree/article/details/78926359)读完。
+    static void minimize_bits(u8 *dst, u8 *src) {
+        u32 i = 0;
+        while (i > 3] |= 1 bit的映射，比如说将src的前0-7个字节映射到dst的第一个字节(0-7位)
+    >>> 0>>3
+    0
+    >>> 1>>3
+    0
+    >>> 2>>3
+    0
+    ...
+    >>> 7>>3
+    0
+    >>> 8>>3
+    1
+然后如果src里该字节的值不为0，i此时就代表这个字节的index索引，其与`0000
+0111`相与，最终的结果都只在0-7之间，这样我们就可以知道这个index在0-7之间对应的具体的bit是哪一个，最后通过或运算将该位置位。
+    >>> 0&7
+    0
+    >>> 1&7
+    1
+    >>> 2&7
+    2
+    >>> 3&7
+    3
+    >>> 4&7
+    4
+    >>> 5&7
+    5
+    >>> 6&7
+    6
+    >>> 7&7
+    7
+    >>> 8&7
+    0
+    >>> 9&7
+    1
+####  cull_queue
+精简队列
+  * 如果score_changed为0，即top_rated没有变化，或者dumb_mode,就直接返回
+  * 设置score_changed的值为0
+  * 创建u8 temp_v数组，大小为`MAP_SIZE除8`，并将其初始值设置为0xff，其每位如果为1就代表还没有被覆盖到，如果为0就代表以及被覆盖到了。
+  * 设置queued_favored为0，pending_favored为0
+  * 开始遍历queue队列，设置其favored的值都为0
+  * 将i从0到MAP_SIZE迭代，这个迭代其实就是筛选出一组queue entry，它们就能够覆盖到所有现在已经覆盖到的路径，而且这个case集合里的case要更小更快，这并不是最优算法，只能算是贪婪算法。 
+    * 这又是个不好懂的位运算，`temp_v[i >> 3] & (1 > 3] & (1 favored`为1，queued_favored计数器加一
+      * 如果`top_rated[i]`的was_fuzzed字段是0，代表其还没有fuzz过，则将pending_favored计数器加一
+    * 遍历queue队列 
+      * mark_as_redundant(q, !q->favored) 
+        * 也就是说，如果不是favored的case，就被标记成redundant_edges
+####  mark_as_redundant(struct queue_entry *q, u8 state)
+  * 如果`state和q->fs_redundant`相等，就直接返回
+  * 设置`q->fs_redundant`的值为state，

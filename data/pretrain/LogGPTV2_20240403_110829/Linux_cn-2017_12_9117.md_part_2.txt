@@ -1,0 +1,134 @@
+Calling recv...
+Calling recv...
+Calling recv...
+Peer disconnected; I'm done.
+```
+作为练习，给输出添加一个时间戳，确认调用 `recv` 得到结果之间花费的时间是比输入到 `nc` 中所用的多还是少（每一轮是 200 ms）。
+这里就实现了使用非阻塞的 `recv` 让监听者检查套接字变为可能，并且在没有数据的时候重新获得控制权。换句话说，用编程的语言说这就是  轮询   polling  —— 主程序周期性的查询套接字以便读取数据。
+对于顺序响应的问题，这似乎是个可行的方法。非阻塞的 `recv` 让同时与多个套接字通信变成可能，轮询这些套接字，仅当有新数据到来时才处理。就是这样，这种方式 *可以* 用来写并发服务器；但实际上一般不这么做，因为轮询的方式很难扩展。
+首先，我在代码中引入的 200ms 延迟对于演示非常好（监听器在我输入 `nc` 之间只打印几行 “Calling recv...”，但实际上应该有上千行）。但它也增加了多达 200ms 的服务器响应时间，这无意是不必要的。实际的程序中，延迟会低得多，休眠时间越短，进程占用的 CPU 资源就越多。有些时钟周期只是浪费在等待，这并不好，尤其是在移动设备上，这些设备的电量往往有限。
+但是当我们实际这样来使用多个套接字的时候，更严重的问题出现了。想像下监听器正在同时处理 1000 个客户端。这意味着每一个循环迭代里面，它都得为 *这 1000 个套接字中的每一个* 执行一遍非阻塞的 `recv`，找到其中准备好了数据的那一个。这非常低效，并且极大的限制了服务器能够并发处理的客户端数。这里有个准则：每次轮询之间等待的间隔越久，服务器响应性越差；而等待的时间越少，CPU 在无用的轮询上耗费的资源越多。
+讲真，所有的轮询都像是无用功。当然操作系统应该是知道哪个套接字是准备好了数据的，因此没必要逐个扫描。事实上，就是这样，接下来就会讲一些 API，让我们可以更优雅地处理多个客户端。
+### select
+`select` 的系统调用是可移植的（POSIX），是标准 Unix API 中常有的部分。它是为上一节最后一部分描述的问题而设计的 —— 允许一个线程可以监视许多文件描述符  注4 的变化，而不用在轮询中执行不必要的代码。我并不打算在这里引入一个关于 `select` 的全面教程，有很多网站和书籍讲这个，但是在涉及到问题的相关内容时，我会介绍一下它的 API，然后再展示一个非常复杂的例子。
+`select` 允许 *多路 I/O*，监视多个文件描述符，查看其中任何一个的 I/O 是否可用。
+```
+int select(int nfds, fd_set *readfds, fd_set *writefds,
+           fd_set *exceptfds, struct timeval *timeout);
+```
+`readfds` 指向文件描述符的缓冲区，这个缓冲区被监视是否有读取事件；`fd_set` 是一个特殊的数据结构，用户使用 `FD_*` 宏进行操作。`writefds` 是针对写事件的。`nfds` 是监视的缓冲中最大的文件描述符数字（文件描述符就是整数）。`timeout` 可以让用户指定 `select` 应该阻塞多久，直到某个文件描述符准备好了（`timeout == NULL` 就是说一直阻塞着）。现在先跳过 `exceptfds`。
+`select` 的调用过程如下：
+1. 在调用之前，用户先要为所有不同种类的要监视的文件描述符创建 `fd_set` 实例。如果想要同时监视读取和写入事件，`readfds` 和 `writefds` 都要被创建并且引用。
+2. 用户可以使用 `FD_SET` 来设置集合中想要监视的特殊描述符。例如，如果想要监视描述符 2、7 和 10 的读取事件，在 `readfds` 这里调用三次 `FD_SET`，分别设置 2、7 和 10。
+3. `select` 被调用。
+4. 当 `select` 返回时（现在先不管超时），就是说集合中有多少个文件描述符已经就绪了。它也修改 `readfds` 和 `writefds` 集合，来标记这些准备好的描述符。其它所有的描述符都会被清空。
+5. 这时用户需要遍历 `readfds` 和 `writefds`，找到哪个描述符就绪了（使用 `FD_ISSET`）。
+作为完整的例子，我在并发的服务器程序上使用 `select`，重新实现了我们之前的协议。[完整的代码在这里](https://github.com/eliben/code-for-blog/blob/master/2017/async-socket-server/select-server.c)；接下来的是代码中的重点部分及注释。警告：示例代码非常复杂，因此第一次看的时候，如果没有足够的时间，快速浏览也没有关系。
+### 使用 select 的并发服务器
+使用 I/O 的多发 API 诸如 `select` 会给我们服务器的设计带来一些限制；这不会马上显现出来，但这值得探讨，因为它们是理解事件驱动编程到底是什么的关键。
+最重要的是，要记住这种方法本质上是单线程的  注5 。服务器实际上在 *同一时刻只能做一件事*。因为我们想要同时处理多个客户端请求，我们需要换一种方式重构代码。
+首先，让我们谈谈主循环。它看起来是什么样的呢？先让我们想象一下服务器有一堆任务，它应该监视哪些东西呢？两种类型的套接字活动：
+1. 新客户端尝试连接。这些客户端应该被 `accept`。
+2. 已连接的客户端发送数据。这个数据要用 [第一节](/article-8993-1.html) 中所讲到的协议进行传输，有可能会有一些数据要被回送给客户端。
+尽管这两种活动在本质上有所区别，我们还是要把它们放在一个循环里，因为只能有一个主循环。循环会包含 `select` 的调用。这个 `select` 的调用会监视上述的两种活动。
+这里是部分代码，设置了文件描述符集合，并在主循环里转到被调用的 `select` 部分。
+```
+// “master” 集合存活在该循环中，跟踪我们想要监视的读取事件或写入事件的文件描述符（FD）。
+fd_set readfds_master;
+FD_ZERO(&readfds_master);
+fd_set writefds_master;
+FD_ZERO(&writefds_master);
+// 监听的套接字一直被监视，用于读取数据，并监测到来的新的端点连接。
+FD_SET(listener_sockfd, &readfds_master);
+// 要想更加高效，fdset_max 追踪当前已知最大的 FD；这使得每次调用时对 FD_SETSIZE 的迭代选择不是那么重要了。
+int fdset_max = listener_sockfd;
+while (1) {
+  // select() 会修改传递给它的 fd_sets，因此进行拷贝一下再传值。
+  fd_set readfds = readfds_master;
+  fd_set writefds = writefds_master;
+  int nready = select(fdset_max + 1, &readfds, &writefds, NULL, NULL);
+  if (nready  0; fd++) {
+  // 检查 fd 是否变成可读的
+  if (FD_ISSET(fd, &readfds)) {
+    nready--;
+    if (fd == listener_sockfd) {
+      // 监听的套接字就绪了；这意味着有个新的客户端连接正在联系
+      ...
+    } else {
+      fd_status_t status = on_peer_ready_recv(fd);
+      if (status.want_read) {
+        FD_SET(fd, &readfds_master);
+      } else {
+        FD_CLR(fd, &readfds_master);
+      }
+      if (status.want_write) {
+        FD_SET(fd, &writefds_master);
+      } else {
+        FD_CLR(fd, &writefds_master);
+      }
+      if (!status.want_read && !status.want_write) {
+        printf("socket %d closing\n", fd);
+        close(fd);
+      }
+    }
+```
+这部分循环检查 *可读的* 描述符。让我们跳过监听器套接字（要浏览所有内容，[看这个代码](https://github.com/eliben/code-for-blog/blob/master/2017/async-socket-server/select-server.c)） 然后看看当其中一个客户端准备好了之后会发生什么。出现了这种情况后，我们调用一个叫做 `on_peer_ready_recv` 的 *回调* 函数，传入相应的文件描述符。这个调用意味着客户端连接到套接字上，发送某些数据，并且对套接字上 `recv` 的调用不会被阻塞  注6 。这个回调函数返回结构体 `fd_status_t`。
+```
+typedef struct {
+  bool want_read;
+  bool want_write;
+} fd_status_t;
+```
+这个结构体告诉主循环，是否应该监视套接字的读取事件、写入事件，或者两者都监视。上述代码展示了 `FD_SET` 和 `FD_CLR` 是怎么在合适的描述符集合中被调用的。对于主循环中某个准备好了写入数据的描述符，代码是类似的，除了它所调用的回调函数，这个回调函数叫做 `on_peer_ready_send`。
+现在来花点时间看看这个回调：
+```
+typedef enum { INITIAL_ACK, WAIT_FOR_MSG, IN_MSG } ProcessingState;
+#define SENDBUF_SIZE 1024
+typedef struct {
+  ProcessingState state;
+  // sendbuf 包含了服务器要返回给客户端的数据。on_peer_ready_recv 句柄填充这个缓冲，
+  // on_peer_read_send 进行消耗。sendbuf_end 指向缓冲区的最后一个有效字节，
+  // sendptr 指向下个字节
+  uint8_t sendbuf[SENDBUF_SIZE];
+  int sendbuf_end;
+  int sendptr;
+} peer_state_t;
+// 每一端都是通过它连接的文件描述符（fd）进行区分。只要客户端连接上了，fd 就是唯一的。
+// 当客户端断开连接，另一个客户端连接上就会获得相同的 fd。on_peer_connected 应该
+// 进行初始化，以便移除旧客户端在同一个 fd 上留下的东西。
+peer_state_t global_state[MAXFDS];
+fd_status_t on_peer_ready_recv(int sockfd) {
+  assert(sockfd state == INITIAL_ACK ||
+      peerstate->sendptr sendbuf_end) {
+    // 在初始的 ACK 被送到了客户端，就没有什么要接收的了。
+    // 等所有待发送的数据都被发送之后接收更多的数据。
+    return fd_status_W;
+  }
+  uint8_t buf[1024];
+  int nbytes = recv(sockfd, buf, sizeof buf, 0);
+  if (nbytes == 0) {
+    // 客户端断开连接
+    return fd_status_NORW;
+  } else if (nbytes state) {
+    case INITIAL_ACK:
+      assert(0 && "can't reach here");
+      break;
+    case WAIT_FOR_MSG:
+      if (buf[i] == '^') {
+        peerstate->state = IN_MSG;
+      }
+      break;
+    case IN_MSG:
+      if (buf[i] == '$') {
+        peerstate->state = WAIT_FOR_MSG;
+      } else {
+        assert(peerstate->sendbuf_end sendbuf[peerstate->sendbuf_end++] = buf[i] + 1;
+        ready_to_send = true;
+      }
+      break;
+    }
+  }
+  // 如果没有数据要发送给客户端，报告读取状态作为最后接收的结果。
+  return (fd_status_t){.want_read = !ready_to_send,
+                       .want_write = ready_to_send};
+}

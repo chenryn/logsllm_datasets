@@ -1,0 +1,170 @@
+## 一个笛卡尔积的update from语句引发的(内存泄露?)问题  
+### 作者 
+digoal  
+### 日期
+2016-08-24  
+### 标签
+PostgreSQL , 内存泄露 , 笛卡尔
+----
+## 场景  
+PostgreSQL支持多表JOIN的更新操作，但是如果SQL没有写好，可能会导致出现笛卡尔积的情况。    
+如果是条查询语句，出现笛卡尔积时，没什么问题，大不了就是查询慢一点。    
+如果是条更新语句，现在看来可能代码中有内存泄露的BUG，已反馈给PG社区。   
+另外需要注意PostgreSQL不允许自关联的更新，但实际上使用别名可以规避这个语法错误    
+如果业务确实有自关联的更新操作需求，可以使用别名的方法。  
+```  
+postgres=# explain (analyze,verbose,timing,buffers,costs) UPDATE tbl1 SET in_predict = true FROM tbl1 , tbl2 p WHERE c.uid = p.uid;  
+ERROR:  table name "tbl1" specified more than once  
+```  
+使用别名规避以上错误    
+```  
+UPDATE tbl1 SET in_predict = true FROM tbl1 c, tbl2 p WHERE c.uid = p.uid;  
+```  
+另外需要注意，以上QUERY已经产生了笛卡尔积，三个表(tbl1, tbl1, tbl2)的JOIN，但是只提供了一个JOIN条件。      
+虽然以上是一条问题SQL，但是接下来的问题也是这样的问题SQL发现的。    
+## 复现query
+执行以下QUERY生成测试数据    
+```  
+CREATE TABLE tbl1 (  
+        id      bigserial PRIMARY KEY,  
+        uid     bigint,  
+        times   bigint,  
+        hostname_num    bigint,  
+        ip_num  bigint,  
+        session_num     bigint,  
+        device_num      bigint,  
+        page_num        bigint,  
+        platform_num    bigint,  
+        duration        bigint,  
+        duration_min    bigint,  
+        duration_max    bigint,  
+        in_server       bigint,  
+        start_time_max  timestamp,  
+        end_time_max    timestamp,  
+        in_heartbeet    boolean,  
+        in_predict              boolean  
+);  
+CREATE INDEX ON tbl1 USING BTREE(duration DESC NULLS LAST);  
+CREATE INDEX ON tbl1 USING BTREE(ip_num DESC NULLS LAST);  
+CREATE INDEX ON tbl1 USING BTREE(times DESC NULLS LAST);  
+CREATE INDEX ON tbl1 USING BTREE(uid DESC NULLS LAST);  
+CREATE FUNCTION fill_data_tbl1(numRows int) RETURNS VOID AS $$  
+DECLARE  
+BEGIN  
+                INSERT INTO tbl1 (uid, times, hostname_num, ip_num,   
+        session_num, device_num, page_num, platform_num,   
+        duration, duration_min, duration_max, in_server,   
+        start_time_max, end_time_max, in_heartbeet, in_predict)   
+        select 13000000 + cnt, FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100),   
+        FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100),   
+        FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100),   
+        FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100), FLOOR(RANDOM() * 100),  
+        TO_TIMESTAMP(FLOOR(RANDOM() * 84151112122)), TO_TIMESTAMP(FLOOR(RANDOM() * 84151112122)),   
+        false, false from generate_series(1, numrows) t(cnt);  
+END;  
+$$ LANGUAGE plpgsql;  
+select fill_data_tbl1(1500000);  
+CREATE TABLE tbl2 (  
+        id      bigint PRIMARY KEY,  
+        uid     bigint  
+);  
+CREATE INDEX ON tbl2 USING BTREE(uid DESC NULLS LAST);  
+CREATE FUNCTION fill_data_tbl2(numRows int) RETURNS VOID AS $$  
+DECLARE  
+BEGIN  
+                INSERT INTO tbl2 (id, uid) select cnt, 13001000 + cnt from generate_series(1, numrows) t(cnt);  
+END;  
+$$ LANGUAGE plpgsql;  
+select fill_data_tbl2(1500000);  
+```  
+执行以下SQL即可复现问题。    
+```  
+UPDATE tbl1 SET in_predict = true FROM tbl1 c, tbl2 p WHERE c.uid = p.uid;  
+```  
+SQL的执行计划如下    
+```  
+postgres=# explain UPDATE tbl1 SET in_predict = true FROM tbl1 c, tbl2 p WHERE c.uid = p.uid;  
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Update on tbl1  (cost=37.85..39154698995.45 rows=2252418000000 width=139)
+   ->  Nested Loop  (cost=37.85..39154698995.45 rows=2252418000000 width=139)
+         ->  Seq Scan on tbl1  (cost=0.00..43894.12 rows=1501612 width=127)
+         ->  Materialize  (cost=37.85..133276.33 rows=1500000 width=12)
+               ->  Merge Join  (cost=37.85..118451.33 rows=1500000 width=12)
+                     Merge Cond: (c.uid = p.uid)
+                     ->  Index Scan Backward using tbl1_uid_idx on tbl1 c  (cost=0.43..58384.61 rows=1501612 width=14)
+                     ->  Index Scan Backward using tbl2_uid_idx on tbl2 p  (cost=0.43..37588.43 rows=1500000 width=14)
+(8 rows)
+```  
+这里join会用到临时空间，所以如果在这一步使用temp_file_limit限制了临时文件的使用，可能会报错。    
+```
+postgres=# set temp_file_limit ='10MB';  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) UPDATE tbl1 SET in_predict = true FROM tbl1 c, tbl2 p WHERE c.uid = p.uid;  
+ERROR:  temporary file size exceeds temp_file_limit (10240kB)  
+```
+复现问题时，可以把它设到无限大(-1)，其实本例设成1GB就够用了，因为造成问题的不是temp file.    
+```
+postgres=# set temp_file_limit ='1GB';  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) UPDATE tbl1 SET in_predict = true FROM tbl1 c, tbl2 p WHERE c.uid = p.uid;  
+```
+## 问题分析
+这样会无休止执行下去，同时导致内存不断增长，这个内存占用和temp file没有关联，应该是某处内存泄露导致的。  
+```
+  PID USER      PR  NI  VIRT  RES  SHR S %CPU %MEM    TIME+  COMMAND                                                                                                                                                                           
+14105 digoal  20   0 8655m 8.3g 101m R 100.0  1.6  18:48.08 postgres: postgres postgres [local] EXPLAIN  
+```
+pmap可以看到该进程一处Anonymous内存不断的膨胀    
+```
+[root@iZ28tqoemgtZ 20733]# pmap -XX 14105  
+14105:   postgres: postgres postgres [local] EXPLAIN  
+         Address Perm   Offset Device    Inode     Size     Rss     Pss Shared_Clean Shared_Dirty Private_Clean Private_Dirty Referenced Anonymous AnonHugePages Swap KernelPageSize MMUPageSize Locked                VmFlagsMapping  
+        00400000 r-xp 00000000  fd:01  1311512     7240    2532    1954          896            0          1636             0       2532         0             0    0              4           4      0    rd ex mr mw me dw  postgres  
+        00d12000 r--p 00712000  fd:01  1311512        4       4       0            0            4             0             0          4         4             0    0              4           4      0    rd mr mw me dw ac  postgres  
+        00d13000 rw-p 00713000  fd:01  1311512       48      48      30            0           20             0            28         48        48             0    0              4           4      0 rd wr mr mw me dw ac  postgres  
+        00d1f000 rw-p 00000000  00:00        0      292      64      58            0            8             0            56         60        64             0    0              4           4      0    rd wr mr mw me ac    
+        013f5000 rw-p 00000000  00:00        0      248     216     155            0           72             0           144        164       216             0    0              4           4      0    rd wr mr mw me ac  [heap]  
+        01433000 rw-p 00000000  00:00        0     4608    4412    4412            0            0             0          4412       4412      4412             0    0              4           4      0    rd wr mr mw me ac  [heap]  
+    7eff9c68a000 rw-p 00000000  00:00        0  1602320 1601756 1601756            0            0             0       1601756    1601756   1601756       1200128    0              4           4      0    rd wr mr mw me ac    
+    7efffe34e000 rw-p 00000000  00:00        0      516     516     516            0            0             0           516        516       516             0    0              4           4      0    rd wr mr mw me ac    
+    7efffe3cf000 rw-p 00000000  00:00        0     2052    2048    2048            0            0             0          2048       2048      2048             0    0              4           4      0    rd wr mr mw me ac    
+    7efffe611000 rw-p 00000000  00:00        0     1804    1800    1800            0            0             0          1800       1800      1800             0    0              4           4      0    rd wr mr mw me ac    
+    7efffe7d4000 rw-s 00000000  00:04  5610332  8620720  321376  309186            0        23340             0        298036     321376         0             0    0              4           4      0 rd wr sh mr mw me ms  zero (deleted)  
+    7f020ca80000 r--p 00000000  fd:01   151196   103580       4       0            4            0             0             0          4         0             0    0              4           4      0          rd mr mw me  locale-archive  
+    7f0212fa7000 r-xp 00000000  fd:01   132852       88      16       0           16            0             0             0         16         0             0    0              4           4      0       rd ex mr mw me  libpthread-2.17.so  
+    7f0212fbd000 ---p 00016000  fd:01   132852     2048       0       0            0            0             0             0          0         0             0    0              4           4      0             mr mw me  libpthread-2.17.so  
+    7f02131bd000 r--p 00016000  fd:01   132852        4       4       0            0            4             0             0          0         4             0    0              4           4      0       rd mr mw me ac  libpthread-2.17.so  
+    7f02131be000 rw-p 00017000  fd:01   132852        4       4       4            0            0             0             4          4         4             0    0              4           4      0    rd wr mr mw me ac  libpthread-2.17.so  
+    7f02131bf000 rw-p 00000000  00:00        0       16       4       4            0            0             0             4          4         4             0    0              4           4      0    rd wr mr mw me ac    
+    7f02131c3000 r-xp 00000000  fd:01   132826     1752     432       9          432            0             0             0        432         0             0    0              4           4      0       rd ex mr mw me  libc-2.17.so  
+    7f0213379000 ---p 001b6000  fd:01   132826     2048       0       0            0            0             0             0          0         0             0    0              4           4      0             mr mw me  libc-2.17.so  
+    7f0213579000 r--p 001b6000  fd:01   132826       16      16       2            0           16             0             0         12        16             0    0              4           4      0       rd mr mw me ac  libc-2.17.so  
+    7f021357d000 rw-p 001ba000  fd:01   132826        8       8       8            0            0             0             8          8         8             0    0              4           4      0    rd wr mr mw me ac  libc-2.17.so  
+    7f021357f000 rw-p 00000000  00:00        0       20      16      12            0            4             0            12         12        16             0    0              4           4      0    rd wr mr mw me ac    
+    7f0213584000 r-xp 00000000  fd:01   132972     1028      68      32           44            0            24             0         68         0             0    0              4           4      0       rd ex mr mw me  libm-2.17.so  
+    7f0213685000 ---p 00101000  fd:01   132972     2044       0       0            0            0             0             0          0         0             0    0              4           4      0             mr mw me  libm-2.17.so  
+    7f0213884000 r--p 00100000  fd:01   132972        4       4       0            0            4             0             0          4         4             0    0              4           4      0       rd mr mw me ac  libm-2.17.so  
+    7f0213885000 rw-p 00101000  fd:01   132972        4       4       0            0            4             0             0          4         4             0    0              4           4      0    rd wr mr mw me ac  libm-2.17.so  
+    7f0213886000 r-xp 00000000  fd:01   132971       12       4       0            4            0             0             0          4         0             0    0              4           4      0       rd ex mr mw me  libdl-2.17.so  
+    7f0213889000 ---p 00003000  fd:01   132971     2044       0       0            0            0             0             0          0         0             0    0              4           4      0             mr mw me  libdl-2.17.so  
+    7f0213a88000 r--p 00002000  fd:01   132971        4       4       0            0            4             0             0          4         4             0    0              4           4      0       rd mr mw me ac  libdl-2.17.so  
+    7f0213a89000 rw-p 00003000  fd:01   132971        4       4       0            0            4             0             0          0         4             0    0              4           4      0    rd wr mr mw me ac  libdl-2.17.so  
+    7f0213a8a000 r-xp 00000000  fd:01   132976       28       4       0            4            0             0             0          4         0             0    0              4           4      0       rd ex mr mw me  librt-2.17.so  
+    7f0213a91000 ---p 00007000  fd:01   132976     2044       0       0            0            0             0             0          0         0             0    0              4           4      0             mr mw me  librt-2.17.so  
+    7f0213c90000 r--p 00006000  fd:01   132976        4       4       0            0            4             0             0          4         4             0    0              4           4      0       rd mr mw me ac  librt-2.17.so  
+    7f0213c91000 rw-p 00007000  fd:01   132976        4       4       0            0            4             0             0          0         4             0    0              4           4      0    rd wr mr mw me ac  librt-2.17.so  
+    7f0213c92000 r-xp 00000000  fd:01   132819      132      28       0           28            0             0             0         28         0             0    0              4           4      0    rd ex mr mw me dw  ld-2.17.so  
+    7f0213cf0000 rw-p 00000000  00:00        0      132     128     128            0            0             0           128        128       128             0    0              4           4      0    rd wr mr mw me ac    
+    7f0213e12000 rw-p 00000000  00:00        0      392     312     312            0            0             0           312        312       312             0    0              4           4      0    rd wr mr mw me ac    
+    7f0213e75000 r--s 00000000  fd:01   401548      212       0       0            0            0             0             0          0         0             0    0              4           4      0          rd mr me ms  hosts  
+    7f0213eaa000 rw-s 00000000  00:11  5610334        4       0       0            0            0             0             0          0         0             0    0              4           4      0 rd wr sh mr mw me ms  PostgreSQL.1804289383  
+    7f0213eab000 rw-s 00000000  00:04 23166976        4       0       0            0            0             0             0          0         0             0    0              4           4      0 rd wr sh mr mw me ms  SYSV001d4fe9 (deleted)  
+    7f0213eac000 rw-p 00000000  00:00        0       24      24       6            0           20             0             4         16        24             0    0              4           4      0    rd wr mr mw me ac    
+    7f0213eb2000 r--p 00020000  fd:01   132819        4       4       0            0            4             0             0          4         4             0    0              4           4      0    rd mr mw me dw ac  ld-2.17.so  
+    7f0213eb3000 rw-p 00021000  fd:01   132819        4       4       4            0            0             0             4          4         4             0    0              4           4      0 rd wr mr mw me dw ac  ld-2.17.so  
+    7f0213eb4000 rw-p 00000000  00:00        0        4       4       0            0            4             0             0          4         4             0    0              4           4      0    rd wr mr mw me ac    
+    7ffffb25f000 rw-p 00000000  00:00        0      152      60      28            0           36             0            24         24        60             0    0              4           4      0 rd wr mr mw me gd ac  [stack]  
+    7ffffb336000 r-xp 00000000  00:00        0        8       4       0            4            0             0             0          4         0             0    0              4           4      0    rd ex mr mw me de  [vdso]  
+ffffffffff600000 r-xp 00000000  00:00        0        4       0       0            0            0             0             0          0         0             0    0              4           4      0                rd ex  [vsyscall]  
+                                               ======== ======= ======= ============ ============ ============= ============= ========== ========= ============= ==== ============== =========== ======   

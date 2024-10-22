@@ -1,0 +1,121 @@
+# Windows线程保护之调试逃逸源码实现及内核逆向分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0、引言
+有过Windows下调试和反调试经历的同事可能都遇到过无法调试程序的经历，这其中所涉及的反调试手段非常多，有直接检测当前程序运行环境是否有调试器进程的，原理大抵是遍历进程，比较进程名字；腾讯的一些游戏就是这么干的；或者遍历窗口，看看窗口名字或者窗口类名字是否是某些调试器的；也有间接检测的，比如判断PEB的调试字段，GFLAGS的标志位；与堆相关的调试开关；还有一些诸如调试端口是否为空；还有一些检测当前进程加载的模块是否以D结尾的；等等诸如此类的各种检测手段；那么有没有一种系统原生的“保护方式”，来确保指定的线程无法被调试，或者说实现调试逃逸？答案当然是肯定的。这便是此文需要讲述的内容。
+涉及到的知识：
+1、反调试常见的手段；  
+2、内核调试；  
+3、IDA逆向分析及常规技巧；  
+4、x64架构下，gs寄存器的用途；  
+5、异常分发的关键流程及API；
+## 1、背景
+有时候因为某些原因，必须要调试一些程序，然而这些程序也不是傻白甜，都有一定程度的反调试措施，做破解用的比较多的调试器恐怕要数OD了，国人也为其编写了很多插件，用以实现自动过反调试，如下图所示，掌握常规的反调试技术对于做破解，安全的人来说，其好处是显而易见的；今天就来讲一下另一种系统原生的线程调试逃逸技术，笔者第一次接触这个技术是当时做一个项目，需要逆向某软件，找到它的某些关键数据的来源时，用Windbg
+Attach上去之后，发现对某个线程下的断点，断不下来，而其他线程的断点都是没有问题的，后来研究了下，发现了这么个技术，撰写此文，与君分享。
+## 2、demo源码演示
+###  2.1源码如下
+    typedef NTSTATUS (NTAPI *NTSETINFORMATIONTHREAD)(IN HANDLE ThreadHandle,IN DWORD ThreadInformationClass,IN PVOID ThreadInformation,IN ULONG ThreadInformationLength);
+    bool TestThreadHideFromDebugger();
+    int ExceptionFilter(PEXCEPTION_POINTERS pExceptionPointer);
+    int main()
+    {
+        if(!TestThreadHideFromDebugger())
+            return -1;
+        while(1)
+        {
+            printf("main thread id:%u\n",GetCurrentThreadId());
+            Sleep(500);
+        }
+    }
+    DWORD WINAPI MyThreadFun(LPVOID lpThreadParameter)
+    {
+        __try
+        {
+            while(1)
+            {
+                printf("work thread id:%u\n",GetCurrentThreadId());
+                Sleep(500);
+            }
+        }
+        __except (ExceptionFilter(GetExceptionInformation()))
+        {
+            printf("Others\n");
+        }
+        return 0;
+    }
+    bool TestThreadHideFromDebugger()
+    {
+        DWORD dwTid = 0;
+        HANDLE hThread = CreateThread(NULL,0,MyThreadFun,NULL,CREATE_SUSPENDED,&dwTid);
+        if(!hThread)
+        {
+            printf("Error:%u\n",GetLastError());
+            return false;
+        }
+        HMODULE hModule = GetModuleHandle(TEXT("ntdll.dll"));
+        NTSETINFORMATIONTHREAD NtSetInformationThread = (NTSETINFORMATIONTHREAD)GetProcAddress(hModule, "NtSetInformationThread");
+        NTSTATUS status = NtSetInformationThread(hThread, 0x11, 0, 0);//ThreadHideFromDebugger
+        if(status != 0)
+        {
+            printf("Error:%u\n",GetLastError());
+            return false;
+        }
+        ResumeThread(hThread);
+        return true;
+    }
+    int ExceptionFilter(PEXCEPTION_POINTERS pExceptionPointer)
+    {
+        if(pExceptionPointer->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT)
+        {//这边有很多,诸如EXCEPTION_SINGLE_STEP调试相关的,演示时只处理了int 3的情况
+            PVOID ExceptionAddress = pExceptionPointer->ExceptionRecord->ExceptionAddress;
+            printf("Addr:%X\n",ExceptionAddress);
+            DWORD dwOldProtect = 0;
+            VirtualProtect(ExceptionAddress,10,PAGE_EXECUTE_READWRITE,&dwOldProtect);
+            *(PBYTE)ExceptionAddress = 0x8B;
+            MessageBox(NULL,NULL,NULL,NULL);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        else
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+简单说明下上边的代码的作用：
+1、TestThreadHideFromDebugger()这个函数内以挂起的方式创建了一个线程，
+创建完后，调用NtSetInformationThread()来修改线程的“ThreadHideFromDebugger”属性，使得线程能够逃出调试器；修改完成后，再恢复线程执行；
+2、线程函数MyThreadFun()内同主线程，一个死循环不停的打印当前的线程ID；值得注意的是，工作线程必须套一层 **try**
+except，不然进程会直接挂掉；原因也是很清晰的；当触发int
+3断点时，CPU将该异常报告给OS，当然报告的方式是通过执行IDT表中相应的异常处理例程了，而后OS内核接管该异常；进过一系列的异常分发，最终到了决定是先交给调试器还是直接交给进程时，内核的异常分发引擎会判断当前线程的ThreadHideFromDebugger属性是否置位了，如果置位的话，正如我们demo中所示的这样，那内核的异常分发引擎直接将次异常抛给进程中对应的线程，CPU的模式从Ring0即切换回Ring3即从内核态切换回用户态；此时用户态的异常分发函数KiUserExceptionDispatcher()接手继续处理，处理的方式也很简单，三步走，第一步便是遍历VEH，没人处理的话，那就进行第二步，接着遍历SEH，也同样没人处理，那就到了UEH了，无他，系统默认的处理方式便是拉起WerFault.exe这个进程，然后挂掉整个进程；其实还有最后一个第三步，那就是VCH，不过这个VCH比较特殊，依赖于“别人”；关于这个异常分发，从CPU到内核再到用户态，以及双击调试时，内核调试引擎的调试数据包与Windbg之间的交互后边会专门撰文讲解，这里大家就先简单了解下就好；回到正题，加了这层
+**try**
+except就是为了在SEH遍历的过程中，拦截住这个异常，并且进行一些修改，去掉Windbg丢下的断点，这也正是很多软件开发商特别是游戏开发商做保护时用到的技术手段；
+简单的分析下，在SEH中我们调用了
+VirtualProtect()修改内存属性，改为可读可写可执行，下边紧接着就是将异常发生的地址处的数据改为0x8B，为什么是0x8B下边demo演示时会有讲解；然后返回
+EXCEPTION_CONTINUE_EXECUTION，告知内核调试引擎，继续刚刚触发异常的地方执行；
+3、主线程中就是一个简单的死循环，不停的打印线程ID，与工作线程中的形成对比，我们做实验时，分别在工作线程和主线程的printf处下断点，看看效果；
+###  2.2 演示过程及效果见下图讲解
+实验1：
+先把TestThreadHideFromDebugger()中设置线程调试逃逸的代码注释掉，看看工作线程是否能够命中断点断下来:  
+是OK的，下边我们就模拟游戏的做法，来实际感受下这个技术的利用手段；
+实验2：  
+先如图1所示，在这两个地方下断点，当图1的断点命中时，看一下工作线程中printf处断点所对应的地址和字节码，这两个信息我们后边有用；再如图2所示，先屏蔽掉修改内存属性的代码，看看执行效果；如下图图3和图4所示：
+如预期，我们在工作线程的printf处下了断点，当程序执行到此处时，调试器并没有接管到该断点异常，相反我们的异常处理try
+except接管到了，原因就是我上边讲的；在异常处理中，我们打印出了异常触发即断点指令的代码地址即0x011A1AB8，图3和图4是吻合的，并且我们在异常处理中也弹出了消息框，按照图2的方式，我们没有修改0x011A1AB8处的代码，按理说这里还是int
+3，那么我们点完确定按钮，消息框关闭后，CPU又会返回到该出继续执行int
+3，这样又会继续到我们的异常处理程序中，消息框又会再次弹出，如此重复，大家可尝试看看效果；
+实验2：
+将图2中注释掉的代码恢复回来，如下图所示：  
+此时，消息框只会弹一次，因为后续CPU再回去继续执行时，代码已经不是int3所对应的0xCC了，而是被我们复原了，那CPU再次执行时，当然不会再次报告异常；这便是很多软件中反调试用到的技术手段的全部内容，当然游戏里边反调试用这个方法的更多，特别是韩国的游戏保护；
+## 3、OS实现该调试逃逸的原理逆向分析
+###  3.1、用户态逆向分析NtSetInformationThread()的内部动作
+如上图所示，NtSetInformationThread()内部啥也没干，直接进了内核，只不过进内核时，会判断下用那种方式进，当前架构下有很多种进内核的方式，比如调用门，中断门，陷阱门，。。。Windows系统早先用的是陷阱门，索引号为0x2E，即IDT表中的0x2E号；后来intel为了提升模式切换的性能，搞了个快速调用，即syscall指令；这个有兴趣的可以去了解下；有一个比较重要的是，0x7FFE0308这个是直接写死的额，看着是全局变量，那这个全局变量指向的数据结构是什么呢？
+如下，这块内存是Ring3和Ring0共享的，Ring3只读权限，Ring0可读可写；两个虚拟地址空间映射到同一个物理页上，很简单，搞一下页表即可；这个页剩下的地址空间可以做很多事情，大家可以尝试想想；
+    0:012> dt _KUSER_SHARED_DATA
+    ntdll!_KUSER_SHARED_DATA
+       +0x000 TickCountLowDeprecated : Uint4B
+       +0x004 TickCountMultiplier : Uint4B
+       +0x008 InterruptTime    : _KSYSTEM_TIME
+       +0x014 SystemTime       : _KSYSTEM_TIME
+       +0x020 TimeZoneBias     : _KSYSTEM_TIME
+       +0x02c ImageNumberLow   : Uint2B
+       +0x02e ImageNumberHigh  : Uint2B

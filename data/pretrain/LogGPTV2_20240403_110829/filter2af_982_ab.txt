@@ -1,0 +1,195 @@
+    int netlink_attachskb(struct sock *sk, struct sk_buff *skb,
+                  long *timeo, struct sock *ssk)
+        {
+          struct netlink_sock *nlk;
+          nlk = nlk_sk(sk);
+          if (atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf || test_bit(0, &nlk->state)) {
+              // ... cut (retry path) ...
+          }
+          skb_set_owner_r(skb, sk);       // destructor);
+          __skb_orphan(skb);
+          skb->sk = sk;
+          skb->destructor = sock_rfree;
+    [0]   atomic_add(skb->truesize, &sk->sk_rmem_alloc);  // sk->sk_rmem_alloc += skb->truesize
+          sk_mem_charge(sk, skb->truesize);
+        }
+**skb_set_owner_r()中会使sk_rmem_alloc增加skb->truesize**。那么可以多次调用mq_notify()直到接收缓冲区已满？不幸的是不能这样做。
+在mq_notify()的正常执行过程中，会一开始就创建一个skb（称为“cookie”），并通过netlink_attachskb()将其附加到netlink_sock，已经介绍过这部分内容。然后netlink_sock和skb都关联到属于消息队列的“mqueue_inode_info”（参考mq_notify的正常路径）。
+**问题是一次只能有一个（cookie）“skb”与mqueue_inode_info相关联。**
+第二次调用mq_notify()将会失败并返回“-EBUSY”错误。只能增加 **sk_rmem_alloc**
+一次（对于给定的消息队列），并不足以（只有32个字节）使它大于sk_rcvbuf。
+实际上可能可以创建多个消息队列，有多个mqueue_inode_info对象并多次调用mq_notify()。或者也可以使用mq_timedsend()系统调用将消息推送到队列中。只是不想在这里研究另一个子系统（mqueue），并且坚持使用“通用的”内核路径（sendmsg），所以我们不会这样做。
+可以通过skb_set_owner_r()增加sk_rmem_alloc。
+## netlink_unicast()
+netlink_attachskb()可能会通过调用skb_set_owner_r()增加sk_rmem_alloc。netlink_attachskb()函数可以由
+**netlink_unicast()** 调用。让我们做一个自底向上的分析来检查如何系统调用到netlink_unicast()：
+    - skb_set_owner_r
+    - netlink_attachskb
+    - netlink_unicast   
+    - netlink_sendmsg   // there is a lots of "other" callers of netlink_unicast
+    - sock->ops->sendmsg()          
+    - __sock_sendmsg_nosec()
+    - __sock_sendmsg()
+    - sock_sendmsg()
+    - __sys_sendmsg()
+    - SYSCALL_DEFINE3(sendmsg, ...)
+因为 **netlink_sendmsg()**
+是netlink套接字的proto_ops（[核心概念＃1](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part1.html)），所以可以通过sendmsg()调用它。
+从sendmsg()系统调用到sendmsg的proto_ops（sock->ops->sendmsg()）的通用代码路径将在[第3部分](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part3.html)中详细介绍。现在先假设可以很轻易调用netlink_sendmsg()。
+## 从netlink_sendmsg()到netlink_unicast()
+sendmsg()系统调用声明：
+    size_t  sendmsg （int  sockfd ， const  struct  msghdr  * msg ， int  flags ）;
+在msg和flags参数中设置对应值从而调用netlink_unicast();
+    struct msghdr {
+         void         *msg_name;       /* optional address */
+         socklen_t     msg_namelen;    /* size of address */
+         struct iovec *msg_iov;        /* scatter/gather array */
+         size_t        msg_iovlen;     /* # elements in msg_iov */
+         void         *msg_control;    /* ancillary data, see below */
+         size_t        msg_controllen; /* ancillary data buffer len */
+         int           msg_flags;      /* flags on received message */
+      };
+      struct iovec
+      {
+        void __user     *iov_base;
+        __kernel_size_t iov_len;
+      };
+在本节中， **将从代码推断参数值，并逐步建立我们的“约束”列表**
+。这样做会使内核执行我们想要的路径。这就是内核漏洞利用的本质。在函数的末尾处才会调用netlink_unicast()。需要满足所有条件......
+    static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+                 struct msghdr *msg, size_t len)
+        {
+          struct sock_iocb *siocb = kiocb_to_siocb(kiocb);
+          struct sock *sk = sock->sk;
+          struct netlink_sock *nlk = nlk_sk(sk);
+          struct sockaddr_nl *addr = msg->msg_name;
+          u32 dst_pid;
+          u32 dst_group;
+          struct sk_buff *skb;
+          int err;
+          struct scm_cookie scm;
+          u32 netlink_skb_flags = 0;
+    [0]   if (msg->msg_flags&MSG_OOB)
+            return -EOPNOTSUPP;
+    [1]   if (NULL == siocb->scm)
+            siocb->scm = &scm;
+          err = scm_send(sock, msg, siocb->scm, true);
+    [2]   if (err msg_flags&MSG_DONTWAIT);   // scm);
+          return err;
+        }
+不设置 _MSG_OOB_ 标志以满足[0]处条件。这是第一个约束： **msg- >msg_flags没有设置MSG_OOB**。
+[1]处的条件为真，因为在 **__sock_sendmsg_nosec()**
+中会将“siocb->scm”置为NULL。最后，scm_send()返回值非负[2]，代码：
+    static __inline__ int scm_send(struct socket *sock, struct msghdr *msg,
+                       struct scm_cookie *scm, bool forcecreds)
+    {
+        memset(scm, 0, sizeof(*scm));
+        if (forcecreds)
+            scm_set_cred(scm, task_tgid(current), current_cred());
+        unix_get_peersec_dgram(sock, scm);
+        if (msg->msg_controllen msg_controllen等于零**（类型为size_t，没有负值）。
+继续：
+    // ... netlink_sendmsg() continuation ...
+    [0]   if (msg->msg_namelen) {
+            err = -EINVAL;
+    [1]     if (addr->nl_family != AF_NETLINK)
+              goto out;
+    [2a]    dst_pid = addr->nl_pid;
+    [2b]    dst_group = ffs(addr->nl_groups);
+            err =  -EPERM;
+    [3]     if ((dst_group || dst_pid) && !netlink_allowed(sock, NL_NONROOT_SEND))
+              goto out;
+            netlink_skb_flags |= NETLINK_SKB_DST;
+          } else {
+            dst_pid = nlk->dst_pid;
+            dst_group = nlk->dst_group;
+          }
+          // ... cut ...
+这个有点棘手。这块代码取决于“sender”套接字是否已连接到目标（receiver）套接字。如果已连接，则“nlk->dst_pid”和“nlk->dst_group”都已被赋值。但是这里不想连接到receiver套接字（有副作用），所以会采取第一个分支。
+**msg- >msg_namelen不为零[0]。**
+看一下函数的开头部分，“addr”是另一个可控的参数：msg->msg_name。通过[2a]和[2b]，可以选择任意的“dst_group”和“dst_pid”。控制这些可以做到：
+  * dst_group == 0：发送单播消息而不是广播（参考man 7 netlink）
+  * dst_pid！= 0：与我们选择的receiver套接字（用户态）通信。0代表“与内核通信”（阅读手册！）。
+将其转换成约束条件（msg_name被转换为sockaddr_nl类型）：
+msg->msg_name->dst_group 等于零  
+msg->msg_name->dst_pid 等于“目标”套接字的nl_pid
+这里还有一个隐含的条件是 **netlink_allowed(sock，NL_NONROOT_SEND)** [3]返回非零值：
+    static inline int netlink_allowed(const struct socket *sock, unsigned int flag)
+    {
+      return (nl_table[sock->sk->sk_protocol].flags & flag) || capable(CAP_NET_ADMIN));
+    }
+因为运行exp的用户是非特权用户，所以没有CAP_NET_ADMIN。唯一设置了“NL_NONROOT_SEND”标志的“netlink协议”是
+_NETLINK_USERSOCK_ 。 **所以“sender”套接字必须具有NETLINK_USERSOCK协议** 。
+另外[1]，需要使 **msg- >msg_name->nl_family等于AF_NETLINK**。
+继续：
+    [0]   if (!nlk->pid) {
+    [1]     err = netlink_autobind(sock);
+            if (err)
+              goto out;
+          }
+无法控制[0]处的条件，因为在套接字创建期间，套接字的pid会被设置为零（整个结构体由sk_alloc()清零）。后面会讨论这点，现在先假设netlink_autobind()
+[1]会为sender套接字找到“可用”的pid并且不会出错。在第二次调用sendmsg()时将不满足条件[0]，此时已经设置“nlk->pid”。继续：
+    err = -EMSGSIZE;
+    [0]   if (len > sk->sk_sndbuf - 32)
+            goto out;
+          err = -ENOBUFS;
+          skb = alloc_skb(len, GFP_KERNEL);
+    [1]   if (skb == NULL)
+            goto out;
+“len”在__sys_sendmsg()中计算。这是“所有iovec长度的总和”。因此，所有iovecs的长度总和必须小于sk->sk_sndbuf减去32[0]。为了简单起见，将使用单个iovec：
+  * msg->msg_iovlen等于1 //单个iovec
+  * msg->msg_iov->iov_len小于等于sk->sk_sndbuf减去32
+  * msg->msg_iov->iov_base必须是用户空间可读 //否则__sys_sendmsg()将出错
+最后一个约束意味着 **msg- >msg_iov也必须指向用户空间可读区域**（否则__sys_sendmsg()将出错）。
+**NOTE** ：“sk_sndbuf”等同于“sk_rcvbuf”但指的是发送缓冲区。可以通过 **sock_getsockopt()**
+“SO_SNDBUF”参数获得它的值。
+[1]处的条件不应该为真。如果为真，则意味着内核当前耗尽了内存并且处于对exp来说很糟的状态。不应该继续执行exp，否则很可能会失败，更糟的是会内核崩溃！
+可以忽略下一个代码块（不需要满足任何条件），“siocb->scm”结构体由scm_send()初始化：
+    NETLINK_CB(skb).pid   = nlk->pid;
+          NETLINK_CB(skb).dst_group = dst_group;
+          memcpy(NETLINK_CREDS(skb), &siocb->scm->creds, sizeof(struct ucred));
+          NETLINK_CB(skb).flags = netlink_skb_flags;
+继续：
+    err = -EFAULT;
+    [0]   if (memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len)) {
+            kfree_skb(skb);
+            goto out;
+          }
+[0]处的检查不会有问题，已经提供可读的iovec，否则之前的__sys_sendmsg()就已经出错（前一个约束）。
+    [0]   err = security_netlink_send(sk, skb);
+          if (err) {
+            kfree_skb(skb);
+            goto out;
+          }
+Linux安全模块（LSM，例如SELinux）检查。如果无法满足此条件，那就需要找另一条路径来执行netlink_unicast()或另一种方法来增加“sk_rmem_alloc”（提示：也许可以尝试netlink_dump()）。假设在目标机器上满足此条件。
+最后：
+    [0]   if (dst_group) {
+            atomic_inc(&skb->users);
+            netlink_broadcast(sk, skb, dst_pid, dst_group, GFP_KERNEL);
+          }
+    [1]   err = netlink_unicast(sk, skb, dst_pid, msg->msg_flags&MSG_DONTWAIT);
+还记得之前将“dst_group”赋值为"msg->msg_name->dst_group"吧。由于它为零，将跳过[0]处代码...
+**最后调用netlink_unicast()** ！
+总结一下从netlink_sendmsg()执行到netlink_unicast()所要满足的条件：
+  * **msg- >msg_flags**没有设置MSG_OOB
+  * **msg- >msg_controllen**等于0
+  * **msg- >msg_namelen**不为0
+  * **msg- >msg_name->nl_family**等于AF_NETLINK
+  * **msg- >msg_name->nl_groups**等于0
+  * **msg- >msg_name->nl_pid**不为0，指向receiver套接字
+  * sender套接字必须使用 **NETLINK_USERSOCK** 协议
+  * **msg- >msg_iovlen**等于1
+  * **msg- >msg_iov**是一个可读的用户态地址
+  * **msg- >msg_iov->iov_len**小于等于sk_sndbuf减32
+  * **msg- >msg_iov->iov_base**是一个可读的用户态地址
+这是内核漏洞利用的部分过程。分析每个检查，强制执行特定的内核路径，定制系统调用参数等。实际上，建立此约束条件列表的时间并不长。有些路径比这更复杂。
+继续前进，下一步是netlink_attachskb()。
+## 从netlink_unicast()到netlink_attachskb()
+这个应该比前一个更容易。通过以下参数调用netlink_unicast()：
+    netlink_unicast(sk, skb, dst_pid, msg->msg_flags&MSG_DONTWAIT);
+  * **sk** 是sender套接字
+  * **skb** 是套接字缓冲区，由msg->msg_iov->iov_base指向的数据填充，大小为msg->msg_iov->iov_len
+  * **dst_pid** 是可控的pid（msg->msg_name->nl_pid）指向receiver套接字
+  * **msg- >msg_flasg＆MSG_DONTWAIT**表示netlink_unicast()是否应阻塞
+**WARNING** ：在netlink_unicast()代码中，“ssk”是sender套接字，“sk”是receiver套接字。
+netlink_unicast()代码：

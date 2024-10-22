@@ -1,0 +1,172 @@
+## PostgreSQL 检查点性能影响及源码分析 - 5        
+### 作者                         
+digoal                          
+### 日期                        
+2015-05-06                            
+### 标签                        
+PostgreSQL , 检查点 , 性能影响 , full page write , FPW , 可靠性                                                        
+----                        
+## 背景          
+数据库可靠性从何而来？            
+数据库崩溃后如何恢复，从什么位置开始恢复？            
+数据库检查点是什么？            
+检查点要干些什么？            
+为什么脏数据较多时，检查点会对性能有一定的影响？            
+什么是full page write？            
+相信这些问题是搞数据库的同学都想搞明白的。            
+接下里的一系列文章，围绕检查点展开讲解，讲一讲检查点的原理，以及为什么脏数据较多是，它会对数据库产生一定的性能影响。              
+## 正文          
+我们前面分析了checkpoint的原理，并且对整个过程checkpoint了跟踪，但是并未发现到底是什么造成tps的下降。  
+http://blog.163.com/digoal@126/blog/static/16387704020154653422892/  
+本文主要针对PostgreSQL的lwlock重点跟踪一下：  
+src/backend/storage/lmgr/lwlock.c  
+```
+                TRACE_POSTGRESQL_LWLOCK_WAIT_START(T_NAME(l), T_ID(l), mode);  
+                for (;;)  
+                {  
+                        /* "false" means cannot accept cancel/die interrupt here. */  
+                        PGSemaphoreLock(&proc->sem, false);  
+                        if (!proc->lwWaiting)  
+                                break;  
+                        extraWaits++;  
+                }  
+                TRACE_POSTGRESQL_LWLOCK_WAIT_DONE(T_NAME(l), T_ID(l), mode);  
+```
+src/include/storage/lwlock.h  
+```
+typedef enum LWLockMode  
+{  
+        LW_EXCLUSIVE,  
+        LW_SHARED,  
+        LW_WAIT_UNTIL_FREE                      /* A special mode used in PGPROC->lwlockMode,  
+                                                                 * when waiting for lock to become free. Not  
+                                                                 * to be used as LWLockAcquire argument */  
+} LWLockMode;  
+```
+探针如下  
+```
+lwlock-wait-start	(char *, int, LWLockMode)	
+Probe that fires when an LWLock was not immediately available and a server process has begun to wait for the lock to become available. 
+arg0 is the LWLock's tranche. arg1 is the LWLock's offset within its tranche. arg2 is the requested lock mode, either exclusive or shared.  
+lwlock-wait-done	(char *, int, LWLockMode)	
+Probe that fires when a server process has been released from its wait for an LWLock (it does not actually have the lock yet). 
+arg0 is the LWLock's tranche. arg1 is the LWLock's offset within its tranche. arg2 is the requested lock mode, either exclusive or shared.  
+```
+压测  
+```
+$ vi test.sql  
+\setrandom id 1 50000000  
+update tbl set info=now(),crt_time=now() where id=:id;  
+$ pgbench -M prepared -n -r -f ./test.sql -c 3 -j 3 -P 2 -T 100000000  
+progress: 776.0 s, 13169.7 tps, lat 0.226 ms stddev 0.063  
+progress: 778.0 s, 7930.0 tps, lat 0.377 ms stddev 0.096  
+progress: 780.0 s, 7660.1 tps, lat 0.390 ms stddev 0.108  
+progress: 782.0 s, 8118.8 tps, lat 0.368 ms stddev 0.098  
+progress: 784.0 s, 8576.5 tps, lat 0.348 ms stddev 0.093  
+progress: 786.0 s, 9251.4 tps, lat 0.323 ms stddev 0.085  
+progress: 788.0 s, 9812.2 tps, lat 0.304 ms stddev 0.078  
+progress: 790.0 s, 10036.8 tps, lat 0.297 ms stddev 0.074  
+progress: 792.0 s, 10359.1 tps, lat 0.288 ms stddev 0.081  
+progress: 794.0 s, 10675.3 tps, lat 0.280 ms stddev 0.077  
+progress: 796.0 s, 10904.1 tps, lat 0.274 ms stddev 0.071  
+progress: 798.0 s, 11470.2 tps, lat 0.260 ms stddev 0.076  
+progress: 800.0 s, 11909.3 tps, lat 0.250 ms stddev 0.074  
+progress: 802.0 s, 12297.4 tps, lat 0.243 ms stddev 0.073  
+progress: 804.0 s, 12463.8 tps, lat 0.239 ms stddev 0.075  
+progress: 806.0 s, 12513.3 tps, lat 0.238 ms stddev 0.076  
+progress: 808.0 s, 12669.9 tps, lat 0.235 ms stddev 0.068  
+以13000为TPS，一次请求需要230786.9微秒.  
+1000000*(1/(13000/3))  
+```
+被跟踪的PID如下  
+```
+digoal=# select pid,query from pg_stat_activity;  
+ pid  |                         query                           
+------+-------------------------------------------------------  
+ 4249 | update tbl set info=now(),crt_time=now() where id=$1;  
+ 5527 | autovacuum: VACUUM ANALYZE digoal.tbl  
+ 4250 | update tbl set info=now(),crt_time=now() where id=$1;  
+ 4251 | update tbl set info=now(),crt_time=now() where id=$1;  
+ 4134 | select pid,query from pg_stat_activity;  
+(5 rows)  
+ps -ewf|grep 1484  
+postgres  1484 30863  4 12:35 ?        00:02:17 postgres: wal writer process   
+```
+跟踪这几个进程的锁等待情况。  
+```
+# stap -DMAXSKIPPED=100000 -v 11111 -e '  
+global s_var, e_var, stat_var;  
+/* probe lwlock__wait__start(const char *, int, LWLockMode); */  
+probe process("/opt/pgsql/bin/postgres").mark("lwlock__wait__start") {  
+  s_var[pid()] = gettimeofday_us()  
+}  
+/* probe lwlock__wait__done(const char *, int, LWLockMode); */  
+probe process("/opt/pgsql/bin/postgres").mark("lwlock__wait__start") {  
+  e_var[pid()] = gettimeofday_us()  
+  if ( s_var[pid()] > 0 && ((pid() >= 4249 && pid() 0 ) {  
+      printf("pid: %d, min: %d, max: %d, avg: %d, sum: %d, count: %d\n", v1, @min(stat_var[v1]), @max(stat_var[v1]), @avg(stat_var[v1]), @sum(stat_var[v1]), @count(stat_var[v1]))  
+    }  
+  }  
+  printf("----------------------------------end-----------------------------\n")  
+  delete s_var  
+  delete e_var  
+  delete stat_var  
+}'  
+```
+当检查点发生时，WAL writer process出现了比较多的lwlock等待。  
+1484是wal writer process，其他几个是数据库测试进程。  
+从count列可以看出，检查点发生后，数据库测试进程的等待次数变少了。  
+从avg来看，等待的平均时间发生了细微的变化，大概增加了1微秒的平均时间，这个等待并不足以造成性能下降。  
+因为正常的一次请求需要用掉230786.9微秒。  
+```
+pid: 1484, min: 0, max: 3, avg: 1, sum: 25, count: 19  
+pid: 4249, min: 0, max: 2, avg: 0, sum: 161, count: 214  
+pid: 4251, min: 0, max: 3, avg: 0, sum: 181, count: 227  
+pid: 4250, min: 0, max: 2, avg: 0, sum: 181, count: 232  
+----------------------------------end-----------------------------  
+pid: 4249, min: 0, max: 3, avg: 0, sum: 134, count: 150  
+pid: 4250, min: 0, max: 5, avg: 1, sum: 167, count: 157  
+pid: 4251, min: 0, max: 3, avg: 0, sum: 145, count: 168  
+pid: 1484, min: 0, max: 3, avg: 0, sum: 142, count: 255  
+----------------------------------end-----------------------------  
+pid: 4250, min: 0, max: 6, avg: 2, sum: 187, count: 75  
+pid: 4251, min: 0, max: 3, avg: 1, sum: 88, count: 83  
+pid: 4249, min: 0, max: 3, avg: 0, sum: 102, count: 107  
+pid: 1484, min: 0, max: 6, avg: 0, sum: 302, count: 467  
+----------------------------------end-----------------------------  
+pid: 4250, min: 0, max: 6, avg: 2, sum: 198, count: 84  
+pid: 4251, min: 0, max: 4, avg: 1, sum: 124, count: 102  
+pid: 4249, min: 0, max: 2, avg: 0, sum: 98, count: 108  
+pid: 1484, min: 0, max: 4, avg: 0, sum: 380, count: 633  
+----------------------------------end-----------------------------  
+pid: 4250, min: 0, max: 6, avg: 2, sum: 197, count: 77  
+pid: 4251, min: 0, max: 4, avg: 1, sum: 106, count: 102  
+pid: 4249, min: 0, max: 2, avg: 0, sum: 101, count: 111  
+pid: 1484, min: 0, max: 4, avg: 0, sum: 396, count: 719  
+----------------------------------end-----------------------------  
+pid: 4249, min: 0, max: 4, avg: 1, sum: 88, count: 85  
+pid: 4251, min: 0, max: 6, avg: 1, sum: 102, count: 91  
+pid: 4250, min: 0, max: 6, avg: 2, sum: 221, count: 108  
+pid: 1484, min: 0, max: 4, avg: 0, sum: 360, count: 705  
+----------------------------------end-----------------------------  
+pid: 4250, min: 0, max: 7, avg: 2, sum: 211, count: 93  
+pid: 4249, min: 0, max: 13, avg: 1, sum: 152, count: 124  
+pid: 4251, min: 0, max: 4, avg: 1, sum: 132, count: 130  
+pid: 1484, min: 0, max: 5, avg: 0, sum: 419, count: 730  
+----------------------------------end-----------------------------  
+```
+从另一个方面来观察，看看检查点发生时单次请求，PG所有函数的处理时间如何？  
+```
+postgres  3167  2767 93 13:59 ?        00:00:47 postgres: digoal digoal [local] UPDATE  
+```
+但是函数量太大，会死机没法跟踪，即使不死机，也不合理，因为正常1毫秒以内的请求，使用STAP跟踪后，额外开销比较大，会上升到100多毫秒。  
+```
+# stap -v 11111 -x 3167 -e '  
+global f_start[999999],f_stop[999999]  
+probe process("/opt/pgsql/bin/postgres").function("*@/opt/soft_bak/postgresql-9.4.1/src/*").call {   
+  f_start[execname(), pid(), tid(), cpu()] = gettimeofday_ns()  
+}  
+probe process("/opt/pgsql/bin/postgres").function("*@/opt/soft_bak/postgresql-9.4.1/src/*").return {   
+  t=gettimeofday_ns()  
+  a=execname()  
+  b=cpu()  

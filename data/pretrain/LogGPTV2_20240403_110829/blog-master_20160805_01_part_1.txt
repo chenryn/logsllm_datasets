@@ -1,0 +1,214 @@
+## 从PostgreSQL支持100万个连接聊起
+### 作者               
+digoal                
+### 日期               
+2016-08-05                    
+### 标签              
+PostgreSQL , systemv , sem , 100万连接                                        
+----              
+## 背景   
+100万个数据库连接，绝逼疯了，常人怎么会干这种事情。    
+没错，数据库支持100万个连接意味着什么呢？不能用连接池吗？    
+除了抱着玩一玩的心态，也能了解到操作系统层的一些知识，何乐不为？    
+## 碰壁
+根据我前几天写的《如何度量Kernel Resources for PostgreSQL》，我们可以评估得出，如果要支持100万个数据库客户端连接，操作系统应该如何配置。  
+https://yq.aliyun.com/articles/58690    
+但是实际上能如愿吗？  
+以PostgreSQL 9.5为例，100万个连接，需要多少信号量？   
+1\. 需要多少组信号量？  
+```
+SEMMNI >= (max_connections + max_worker_processes + autovacuum_max_workers + 5) / 16
+```
+100万连接，SEMMNI >= 62500  
+2\. 需要多少信号量？  
+```
+SEMMNS >= ((max_connections + max_worker_processes + autovacuum_max_workers + 5) / 16) * 17 + 其他程序的需求
+```
+100万连接，SEMMNS >= 1062500    
+3\. 每组需要多少信号量？    
+```
+SEMMSL >= 17
+```
+测试环境如下    
+CentOS 6.x x64, 512GB内存。  
+```
+kernel.sem = 18 2147483647      2147483646      512000000  
+max number of arrays = 512000000
+max semaphores per array = 18
+max semaphores system wide = 2147483647
+max ops per semop call = 2147483646
+```
+以上内核配置，信号量完全满足100万连接需求。    
+那么数据库能启动吗？  
+```
+vi postgresql.conf
+max_connections = 1000000
+pg_ctl start
+```
+启动失败。  
+### 原因分析
+报错来自如下代码：   
+使用semget创建sem失败。  
+src/backend/port/sysv_sema.c   
+```
+       /*
+   76  * InternalIpcSemaphoreCreate
+   77  *
+   78  * Attempt to create a new semaphore set with the specified key.
+   79  * Will fail (return -1) if such a set already exists.
+   80  *
+   81  * If we fail with a failure code other than collision-with-existing-set,
+   82  * print out an error and abort.  Other types of errors suggest nonrecoverable
+   83  * problems.
+   84  */
+   85 static IpcSemaphoreId
+   86 InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems)
+   87 {
+   88     int         semId;
+   89 
+   90     semId = semget(semKey, numSems, IPC_CREAT | IPC_EXCL | IPCProtection);
+   91 
+   92     if (semId 
+typedef sem_t *PGSemaphoreData;
+#endif
+#ifdef USE_UNNAMED_POSIX_SEMAPHORES
+#include 
+typedef sem_t PGSemaphoreData;
+#endif
+#ifdef USE_SYSV_SEMAPHORES
+typedef struct PGSemaphoreData
+{
+        int                     semId;                  /* semaphore set identifier */
+        int                     semNum;                 /* semaphore number within set */
+} PGSemaphoreData;
+#endif
+#ifdef USE_WIN32_SEMAPHORES
+typedef HANDLE PGSemaphoreData;
+#endif
+```
+其中posix的named和unamed分别使用如下系统调用  
+posix named 方式创建信号 :   
+```
+		mySem = sem_open(semname, O_CREAT | O_EXCL,
+						 (mode_t) IPCProtection, (unsigned) 1);
+```
+posix unamed 方式创建信号 :   
+```
+  sem_init(sem, 1, 1)
+```
+posix源码如下，注意用到的宏    
+src/backend/port/posix_sema.c  
+```
+#ifdef USE_NAMED_POSIX_SEMAPHORES
+/*
+ * PosixSemaphoreCreate
+ *
+ * Attempt to create a new named semaphore.
+ *
+ * If we fail with a failure code other than collision-with-existing-sema,
+ * print out an error and abort.  Other types of errors suggest nonrecoverable
+ * problems.
+ */
+static sem_t *
+PosixSemaphoreCreate(void)
+{
+	int			semKey;
+	char		semname[64];
+	sem_t	   *mySem;
+	for (;;)
+	{
+		semKey = nextSemKey++;
+		snprintf(semname, sizeof(semname), "/pgsql-%d", semKey);
+		mySem = sem_open(semname, O_CREAT | O_EXCL,
+						 (mode_t) IPCProtection, (unsigned) 1);
+#ifdef SEM_FAILED
+		if (mySem != (sem_t *) SEM_FAILED)
+			break;
+#else
+		if (mySem != (sem_t *) (-1))
+			break;
+#endif
+		/* Loop if error indicates a collision */
+		if (errno == EEXIST || errno == EACCES || errno == EINTR)
+			continue;
+		/*
+		 * Else complain and abort
+		 */
+		elog(FATAL, "sem_open(\"%s\") failed: %m", semname);
+	}
+	/*
+	 * Unlink the semaphore immediately, so it can't be accessed externally.
+	 * This also ensures that it will go away if we crash.
+	 */
+	sem_unlink(semname);
+	return mySem;
+}
+#else							/* !USE_NAMED_POSIX_SEMAPHORES */
+/*
+ * PosixSemaphoreCreate
+ *
+ * Attempt to create a new unnamed semaphore.
+ */
+static void
+PosixSemaphoreCreate(sem_t * sem)
+{
+	if (sem_init(sem, 1, 1) >confdefs.h
+    SEMA_IMPLEMENTATION="src/backend/port/posix_sema.c"
+  else
+    if test x"$USE_UNNAMED_POSIX_SEMAPHORES" = x"1" ; then
+$as_echo "#define USE_UNNAMED_POSIX_SEMAPHORES 1" >>confdefs.h
+      SEMA_IMPLEMENTATION="src/backend/port/posix_sema.c"
+    else
+$as_echo "#define USE_SYSV_SEMAPHORES 1" >>confdefs.h
+      SEMA_IMPLEMENTATION="src/backend/port/sysv_sema.c"
+    fi
+  fi
+else
+$as_echo "#define USE_WIN32_SEMAPHORES 1" >>confdefs.h
+  SEMA_IMPLEMENTATION="src/backend/port/win32_sema.c"
+fi
+```
+默认使用SYSV，如果要使用其他的sem方法。   
+可以这么做  
+```
+export USE_UNNAMED_POSIX_SEMAPHORES=1
+LIBS=-lpthread ./configure  --prefix=/home/digoal/pgsql9.5
+```
+记得加-lpthread ，否则报错  
+```
+/bin/ld: port/pg_sema.o: undefined reference to symbol 'sem_close@@GLIBC_2.2.5'
+/bin/ld: note: 'sem_close@@GLIBC_2.2.5' is defined in DSO /lib64/libpthread.so.0 so try adding it to the linker command line
+/lib64/libpthread.so.0: could not read symbols: Invalid operation
+collect2: error: ld returned 1 exit status
+make[2]: *** [postgres] Error 1
+make[2]: Leaving directory `/home/digoal/postgresql-9.5.3/src/backend'
+make[1]: *** [all-backend-recurse] Error 2
+make[1]: Leaving directory `/home/digoal/postgresql-9.5.3/src'
+make: *** [world-src-recurse] Error 2
+```
+通过这些系统调用的Linux编程帮助文档，了解一下posix的信号量管理  
+```
+man sem_overview 
+man sem_init , unnamed sem
+man sem_open , named sem
+        EINVAL value was greater than SEM_VALUE_MAX.
+```
+可以得知sem_open 也受到semvmx的限制  
+因此为了在不修改内核的情况下，实现PostgreSQL支持100万个连接，甚至更多。    
+必须使用USE_UNNAMED_POSIX_SEMAPHORES  
+2016.10 PG 社区开发了一个patch来修复这个问题:   
+https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=ecb0d20a9d2e09b7112d3b192047f711f9ff7e59  
+```
+Use unnamed POSIX semaphores, if available, on Linux and FreeBSD.
+author	Tom Lane 	
+Sun, 9 Oct 2016 22:03:45 +0000 (18:03 -0400)
+committer	Tom Lane 	
+Sun, 9 Oct 2016 22:03:45 +0000 (18:03 -0400)
+commit	ecb0d20a9d2e09b7112d3b192047f711f9ff7e59
+tree	7d20165ad79b5a7fc524806f779f3e8edf77fd6c	tree | snapshot
+parent	ac4a9d92fcb6869e757cc729dca2ca5ccf94b185	commit | diff
+Use unnamed POSIX semaphores, if available, on Linux and FreeBSD.
+We've had support for using unnamed POSIX semaphores instead of System V
+semaphores for quite some time, but it was not used by default on any
+platform.  Since many systems have rather small limits on the number of
+SysV semaphores allowed, it seems desirable to switch to POSIX semaphores

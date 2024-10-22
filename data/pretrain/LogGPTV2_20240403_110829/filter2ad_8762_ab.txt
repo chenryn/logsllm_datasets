@@ -1,0 +1,109 @@
+    static u32  inst_ratio = 100,   /* Instrumentation probability (%)  插桩覆盖率    */
+                as_par_cnt = 1;     /* Number of params to 'as'    传递给as的参数数量初始值         */
+注：如果在参数中没有指明 `--m32` 或 `--m64` ，则默认使用在编译时使用的选项。
+##### 2\. main函数
+main 函数全部逻辑如下：
+  1. 首先获取环境变量 `AFL_INST_RATIO` ，赋值给 `inst_ratio_str`，该环境变量主要控制检测每个分支的概率，取值为0到100%，设置为0时则只检测函数入口的跳转，而不会检测函数分支的跳转；
+  2. 通过 `gettimeofday(&tv,&tz);`获取时区和时间，然后设置 `srandom()` 的随机种子 `rand_seed = tv.tv_sec ^ tv.tv_usec ^ getpid();`
+  3. 调用 `edit_params(argc, argv)` 函数进行参数处理；
+  4. 检测 `inst_ratio_str` 的值是否合法范围内，并设置环境变量 `AFL_LOOP_ENV_VAR`；
+  5. 读取环境变量``AFL_USE_ASAN`和`AFL_USE_MSAN`的值，如果其中有一个为1，则设置`sanitizer`为1，且将`inst_ratio`除3。这是因为在进行ASAN的编译时，AFL无法识别出ASAN特定的分支，导致插入很多无意义的桩代码，所以直接暴力地将插桩概率/3；
+  6. 调用 `add_instrumentation()` 函数，这是实际的插桩函数；
+  7. fork 一个子进程来执行 `execvp(as_params[0], (char**)as_params);`。这里采用的是 fork 一个子进程的方式来执行插桩。这其实是因为我们的 `execvp` 执行的时候，会用 `as_params[0]` 来完全替换掉当前进程空间中的程序，如果不通过子进程来执行实际的 `as`，那么后续就无法在执行完实际的as之后，还能unlink掉modified_file；
+  8. 调用 `waitpid(pid, &status, 0)` 等待子进程执行结束；
+  9. 读取环境变量 `AFL_KEEP_ASSEMBLY` 的值，如果没有设置这个环境变量，就unlink掉 `modified_file`(已插完桩的文件)。设置该环境变量主要是为了防止 `afl-as` 删掉插桩后的汇编文件，设置为1则会保留插桩后的汇编文件。
+可以通过在main函数中添加如下代码来打印实际执行的参数：
+    print("\n");
+    for (int i = 0; i < sizeof(as_params); i++){
+      peinrf("as_params[%d]:%s\n", i, as_params[i]);
+    }
+在插桩完成后，会生成 `.s` 文件，内容如下（具体的文件位置与设置的环境变量相关）：
+##### 3\. add_instrumentation函数
+`add_instrumentation` 函数负责处理输入文件，生成 `modified_file` ，将 `instrumentation`
+插入所有适当的位置。其整体控制流程如下：
+整体逻辑看上去有点复杂，但是关键内容并不算很多。在main函数中调用完 `edit_params()` 函数完成 `as_params`
+参数数组的处理后，进入到该函数。
+  1. 判断 `input_file` 是否为空，如果不为空则尝试打开文件获取fd赋值给 `inf`，失败则抛出异常；`input_file` 为空则 `inf` 设置为标准输入；
+  2. 打开 `modified_file` ，获取fd赋值给 `outfd`，失败返回异常；进一步验证该文件是否可写，不可写返回异常；
+  3. `while` 循环读取 `inf` 指向文件的每一行到 `line` 数组，每行最多 `MAX_LINE = 8192`个字节（含末尾的‘\0’），从`line`数组里将读取到的内容写入到 `outf` 指向的文件，然后进入到真正的插桩逻辑。这里需要注意的是，插桩只向 `.text` 段插入，：
+    1. 首先跳过标签、宏、注释；
+    2. 这里结合部分关键代码进行解释。需要注意的是，变量 `instr_ok` 本质上是一个flag，用于表示是否位于`.text`段。变量设置为1，表示位于 `.text` 中，如果不为1，则表示不再。于是，如果`instr_ok` 为1，就会在分支处执行插桩逻辑，否则就不插桩。
+      1. 首先判断读入的行是否以‘\t’ 开头，本质上是在匹配`.s`文件中声明的段，然后判断`line[1]`是否为`.`：
+                        if (line[0] == '\t' && line[1] == '.') {
+                  /* OpenBSD puts jump tables directly inline with the code, which is
+                     a bit annoying. They use a specific format of p2align directives
+                     around them, so we use that as a signal. */
+                  if (!clang_mode && instr_ok && !strncmp(line + 2, "p2align ", 8) &&
+                      isdigit(line[10]) && line[11] == '\n') skip_next_label = 1;
+                  if (!strncmp(line + 2, "text\n", 5) ||
+                      !strncmp(line + 2, "section\t.text", 13) ||
+                      !strncmp(line + 2, "section\t__TEXT,__text", 21) ||
+                      !strncmp(line + 2, "section __TEXT,__text", 21)) {
+                    instr_ok = 1;
+                    continue; 
+                  }
+                  if (!strncmp(line + 2, "section\t", 8) ||
+                      !strncmp(line + 2, "section ", 8) ||
+                      !strncmp(line + 2, "bss\n", 4) ||
+                      !strncmp(line + 2, "data\n", 5)) {
+                    instr_ok = 0;
+                    continue;
+                  }
+                }
+        1. '\t'开头，且`line[1]=='.'`，检查是否为 `p2align` 指令，如果是，则设置 `skip_next_label = 1`；
+        2. 尝试匹配 `"text\n"` `"section\t.text"` `"section\t__TEXT,__text"` `"section __TEXT,__text"` 其中任意一个，匹配成功， 设置 `instr_ok = 1`， 表示位于 `.text` 段中，`continue` 跳出，进行下一次遍历；
+        3. 尝试匹配`"section\t"` `"section "` `"bss\n"` `"data\n"` 其中任意一个，匹配成功，设置 `instr_ok = 0`，表位于其他段中，`continue` 跳出，进行下一次遍历；
+      2. 接下来通过几个 `if` 判断，来设置一些标志信息，包括 `off-flavor assembly`，`Intel/AT&T`的块处理方式、`ad-hoc __asm__`块的处理方式等；
+                        /* Detect off-flavor assembly (rare, happens in gdb). When this is
+                   encountered, we set skip_csect until the opposite directive is
+                   seen, and we do not instrument. */
+                if (strstr(line, ".code")) {
+                  if (strstr(line, ".code32")) skip_csect = use_64bit;
+                  if (strstr(line, ".code64")) skip_csect = !use_64bit;
+                }
+                /* Detect syntax changes, as could happen with hand-written assembly.
+                   Skip Intel blocks, resume instrumentation when back to AT&T. */
+                if (strstr(line, ".intel_syntax")) skip_intel = 1;
+                if (strstr(line, ".att_syntax")) skip_intel = 0;
+                /* Detect and skip ad-hoc __asm__ blocks, likewise skipping them. */
+                if (line[0] == '#' || line[1] == '#') {
+                  if (strstr(line, "#APP")) skip_app = 1;
+                  if (strstr(line, "#NO_APP")) skip_app = 0;
+                }
+      3. AFL在插桩时重点关注的内容包括：`^main, ^.L0, ^.LBB0_0, ^\tjnz foo` （_main函数， gcc和clang下的分支标记，条件跳转分支标记），这些内容通常标志了程序的流程变化，因此AFL会重点在这些位置进行插桩：
+对于形如`\tj[^m].`格式的指令，即条件跳转指令，且`R(100)`产生的随机数小于插桩密度`inst_ratio`，直接使用`fprintf`将`trampoline_fmt_64`(插桩部分的指令)写入
+`outf` 指向的文件，写入大小为小于 `MAP_SIZE`的随机数——`R(MAP_SIZE)`
+，然后插桩计数`ins_lines`加一，`continue` 跳出，进行下一次遍历；
+                        /* If we're in the right mood for instrumenting, check for function
+                   names or conditional labels. This is a bit messy, but in essence,
+                   we want to catch:
+                     ^main:      - function entry point (always instrumented)
+                     ^.L0:       - GCC branch label
+                     ^.LBB0_0:   - clang branch label (but only in clang mode)
+                     ^\tjnz foo  - conditional branches
+                   ...but not:
+                     ^# BB#0:    - clang comments
+                     ^ # BB#0:   - ditto
+                     ^.Ltmp0:    - clang non-branch labels
+                     ^.LC0       - GCC non-branch labels
+                     ^.LBB0_0:   - ditto (when in GCC mode)
+                     ^\tjmp foo  - non-conditional jumps
+                   Additionally, clang and GCC on MacOS X follow a different convention
+                   with no leading dots on labels, hence the weird maze of #ifdefs
+                   later on.
+                 */
+                if (skip_intel || skip_app || skip_csect || !instr_ok ||
+                    line[0] == '#' || line[0] == ' ') continue;
+                /* Conditional branch instruction (jnz, etc). We append the instrumentation
+                   right after the branch (to instrument the not-taken path) and at the
+                   branch destination label (handled later on). */
+                if (line[0] == '\t') {
+                  if (line[1] == 'j' && line[2] != 'm' && R(100) < inst_ratio) {
+                    fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32,
+                            R(MAP_SIZE));
+                    ins_lines++;
+                  }
+                  continue;
+                }
+      4. 对于label的相关评估，有一些label可能是一些分支的目的地，需要自己评判
+首先检查该行中是否存在`:`，然后检查是否以`.`开始

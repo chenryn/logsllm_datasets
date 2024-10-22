@@ -1,0 +1,221 @@
+# honggfuzz-v2.X版本变异策略及const_feedback特性分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前言
+honggfuzz在4月21日fuzzbench的性能测试[1]中一骑绝尘，战胜老对手AFL、libfuzzer摘得桂冠。前段时间，google
+Project Zero
+安全研究员也是通过对honggfuzz进行二次开发成功发现苹果闭源图片处理库的多个漏洞[2]。honggfuzz的2.X版本中引入的
+`const_feedback` （使用被 fuzz
+程序中的常量整数/字符串值通过动态字典处理输入文件）显著减少运行过程中指令迭代次数[3]，提高了漏洞挖掘效率。
+honggfuzz以前也有很多前辈对其进行过分析[5]
+[6]，但大多数还是2.X版本之前的，本篇文章重点介绍新版本中`const_feedback`和新变异策略的相关实现。
+本次使用的honggfuzz版本为2.2（74e7bc161662269b6ff4cdb3e2fdd2ad0bebd69b）。此版本已经默认打开`const_feedback`功能。
+## trace-cmp
+使用 hfuzz-clang 编译目标文件代码时，`-fsanitize-coverage = trace-pc-guard，indirect-calls，trace-cmp` 标志集将自动添加到 clang 的命令行中。新版本中引入了与 trace-cmp
+相关的新变异策略，本次重点对其介绍。其余参数之前有文章分析过不再赘述[6]
+包含此标志时，编译器在比较指令和switch指令之前插入如下代码：
+    /* Standard __sanitizer_cov_trace_cmp wrappers */
+    void __sanitizer_cov_trace_cmp1(uint8_t Arg1, uint8_t Arg2) 
+    void __sanitizer_cov_trace_cmp2(uint16_t Arg1, uint16_t Arg2)
+    void __sanitizer_cov_trace_cmp4(uint32_t Arg1, uint32_t Arg2) 
+    void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2)
+    /* Standard __sanitizer_cov_trace_const_cmp wrappers */
+    void __sanitizer_cov_trace_const_cmp1(uint8_t Arg1, uint8_t Arg2)
+    void __sanitizer_cov_trace_const_cmp2(uint16_t Arg1, uint16_t Arg2) 
+    void __sanitizer_cov_trace_const_cmp4(uint32_t Arg1, uint32_t Arg2) 
+    void __sanitizer_cov_trace_const_cmp8(uint64_t Arg1, uint64_t Arg2)
+之后会调用`instrumentAddConstMem()`或
+`instrumentAddConstMemInternal()`函数将比较的常量值存入`globalCmpFeedback`中：
+    static inline void instrumentAddConstMemInternal(const void* mem, size_t len) {
+        if (len == 0) {
+            return;
+        }
+        if (len > sizeof(globalCmpFeedback->valArr[0].val)) {
+            len = sizeof(globalCmpFeedback->valArr[0].val);
+        }
+        uint32_t curroff = ATOMIC_GET(globalCmpFeedback->cnt);
+        if (curroff >= ARRAYSIZE(globalCmpFeedback->valArr)) {
+            return;
+        }
+        for (uint32_t i = 0; i valArr[i].len)) &&
+                libc_memcmp(globalCmpFeedback->valArr[i].val, mem, len) == 0) {
+                return;
+            }
+        }
+        uint32_t newoff = ATOMIC_POST_INC(globalCmpFeedback->cnt);
+        if (newoff >= ARRAYSIZE(globalCmpFeedback->valArr)) {
+            ATOMIC_SET(globalCmpFeedback->cnt, ARRAYSIZE(globalCmpFeedback->valArr));
+            return;
+        }
+        memcpy(globalCmpFeedback->valArr[newoff].val, mem, len);
+        ATOMIC_SET(globalCmpFeedback->valArr[newoff].len, len);
+        wmb();
+    }
+`globalCmpFeedback`结构体定义如下：
+    typedef struct {
+        uint32_t cnt;//存储常量值个数
+        struct {
+            uint8_t  val[32];//常量值
+            uint32_t len; //常量值长度
+        } valArr[1024 * 16];
+    } cmpfeedback_t;
+最后调用 `hfuzz_trace_cmpx_internal`若输入与待验证比较后相同的位数增加则更新 bitmap。
+    HF_REQUIRE_SSE42_POPCNT static inline void hfuzz_trace_cmp1_internal(
+        uintptr_t pc, uint8_t Arg1, uint8_t Arg2) {
+        uintptr_t        pos  = pc % _HF_PERF_BITMAP_SIZE_16M;
+        register uint8_t v    = ((sizeof(Arg1) * 8) - __builtin_popcount(Arg1 ^ Arg2));
+        uint8_t          prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
+        if (prev bbMapCmp[pos], v);
+            ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+            wmb();
+        }
+    }
+## 变异策略
+整体来讲，除了个别新策略如`mangle_ConstFeedbackDict`、`mangle_StaticDict`外，还对一些原有策略进行划分，封装。
+fuzz策略的实现主要集中在mangle.c中，在循环的`fuzzloop`函数中，会根据用户的选择的 fuzz 方式来调用
+`input_prepareDynamicInput`
+或者`input_prepareStaticFile`，但最后都是调用`mangle_mangleContent`来变异文件数据。
+`mangle_mangleContent`函数部分实现如下：
+    //mangle.c#L840
+        if (run->mutationsPerRun == 0U) {//设置变异率为0，仅作打开处理，通常用于验证崩溃
+            return;
+        }
+        if (run->dynfile->size == 0U) { //对空文件赋予随机size
+            mangle_Resize(run, /* printable= */ run->global->cfg.only_printable);
+        }
+        uint64_t changesCnt = run->global->mutate.mutationsPerRun;
+        //根据speed_factor大小设置changesCnt值，该值为之后变异的轮数
+        if (speed_factor global->mutate.mutationsPerRun);
+        } else if (speed_factor global->mutate.mutationsPerRun;
+        } else {
+            changesCnt = HF_MIN(speed_factor, 12);
+            changesCnt = HF_MAX(changesCnt, run->global->mutate.mutationsPerRun);
+        }
+        //如果最后一次获取覆盖率时间超过5秒，则提高拼接变异的使用概率
+        if ((time(NULL) - ATOMIC_GET(run->global->timing.lastCovUpdate)) > 5) {
+            if (util_rnd64() % 2) {
+                mangle_Splice(run, run->global->cfg.only_printable);
+            }
+        }
+        //随机选择变异函数对输入文件内容进行变异
+        for (uint64_t x = 0; x global->cfg.only_printable);
+        }
+变异函数列表如下：
+这里添加多个 `mangle_Shrink` 的原因是为了减少其他操作中插入或扩展文件带来的文件大小增大。
+    //mangle.c#L812
+    static void (*const mangleFuncs[])(run_t * run, bool printable) = {
+            /* Every *Insert or Expand expands file, so add more Shrink's */
+            mangle_Shrink,
+            mangle_Shrink,
+            mangle_Shrink,
+            mangle_Shrink,
+            mangle_Expand,
+            mangle_Bit,
+            mangle_IncByte,
+            mangle_DecByte,
+            mangle_NegByte,
+            mangle_AddSub,
+            mangle_MemSet,
+            mangle_MemSwap,
+            mangle_MemCopy,
+            mangle_Bytes,
+            mangle_ASCIINum,
+            mangle_ASCIINumChange,
+            mangle_ByteRepeatOverwrite,
+            mangle_ByteRepeatInsert,
+            mangle_Magic,
+            mangle_StaticDict,
+            mangle_ConstFeedbackDict,
+            mangle_RandomOverwrite,
+            mangle_RandomInsert,
+            mangle_Splice,
+        };
+###  mangle_Shrink
+删除随机长度的文件内容。
+    static void mangle_Shrink(run_t* run, bool printable HF_ATTR_UNUSED) {
+        if (run->dynfile->size dynfile->size - off_end;
+        mangle_Move(run, off_end, off_start, len_to_move);
+        input_setSize(run, run->dynfile->size - len);
+    }
+###  mangle_Expand
+文件末尾扩展随机长度的空间，用空格填充，然后在随机位置，取前面的随机长度作数据拷贝。
+    static void mangle_Expand(run_t* run, bool printable) {
+        size_t off = mangle_getOffSet(run);
+        size_t len;
+        if (util_rnd64() % 16) {
+            len = mangle_getLen(HF_MIN(16, run->global->mutate.maxInputSz - off));
+        } else {
+            len = mangle_getLen(run->global->mutate.maxInputSz - off);
+        }
+        mangle_Inflate(run, off, len, printable);
+    }
+    static inline size_t mangle_Inflate(run_t* run, size_t off, size_t len, bool printable) {
+        if (run->dynfile->size >= run->global->mutate.maxInputSz) {
+            return 0;
+        }
+        if (len > (run->global->mutate.maxInputSz - run->dynfile->size)) {
+            len = run->global->mutate.maxInputSz - run->dynfile->size;
+        }
+        input_setSize(run, run->dynfile->size + len);
+        mangle_Move(run, off, off + len, run->dynfile->size);
+        if (printable) {
+            memset(&run->dynfile->data[off], ' ', len);
+        }
+        return len;
+    }
+###  mangle_Bit
+取随机位置的数值做位翻转。
+    static void mangle_Bit(run_t* run, bool printable) {
+        size_t off = mangle_getOffSet(run);
+        run->dynfile->data[off] ^= (uint8_t)(1U dynfile->data[off]), 1);
+        }
+    }
+###  mangle_IncByte/DecByte/NegByte
+随机位置的数据加1/减1/取反。
+    static void mangle_IncByte(run_t* run, bool printable) {
+        size_t off = mangle_getOffSet(run);
+        if (printable) {
+            run->dynfile->data[off] = (run->dynfile->data[off] - 32 + 1) % 95 + 32;
+        } else {
+            run->dynfile->data[off] += (uint8_t)1UL;
+        }
+    }
+    static void mangle_DecByte(run_t* run, bool printable) {
+        size_t off = mangle_getOffSet(run);
+        if (printable) {
+            run->dynfile->data[off] = (run->dynfile->data[off] - 32 + 94) % 95 + 32;
+        } else {
+            run->dynfile->data[off] -= (uint8_t)1UL;
+        }
+    }
+    static void mangle_NegByte(run_t* run, bool printable) {
+        size_t off = mangle_getOffSet(run);
+        if (printable) {
+            run->dynfile->data[off] = 94 - (run->dynfile->data[off] - 32) + 32;
+        } else {
+            run->dynfile->data[off] = ~(run->dynfile->data[off]);
+        }
+    }
+###  mangle_AddSub
+取随机位置的1、2、4或8字节的数据长度作加减操作，新版本中对操作数范围进行划分，缩小了选择的范围。
+    static void mangle_AddSub(run_t* run, bool printable) {
+        size_t off = mangle_getOffSet(run);
+        /* 1,2,4,8 */
+        size_t varLen = 1U dynfile->size - off) dynfile->data[off] += delta;
+                break;
+            }
+            case 2: {
+                int16_t val;
+                memcpy(&val, &run->dynfile->data[off], sizeof(val));
+                if (util_rnd64() & 0x1) {
+                    val += delta;
+                } else {
+                    /* Foreign endianess */
+                    val = __builtin_bswap16(val);
+                    val += delta;
+                    val = __builtin_bswap16(val);
+                }
+                mangle_Overwrite(run, off, (uint8_t*)&val, varLen, printable);
+                break;
+            }

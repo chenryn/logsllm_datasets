@@ -1,0 +1,272 @@
+                // chunk状态转换到mem状态
+                void *p = chunk2mem(victim);
+                // 如果设置了perturb_type, 则将获取到的chunk初始化为 perturb_type ^ 0xff
+                alloc_perturb(p, bytes);
+                return p;
+            }
+```
+### 使用 top chunk
+如果所有的 bin 中的 chunk 都没有办法直接满足要求（即不合并），或者说都没有空闲的 chunk。那么我们就只能使用 top chunk 了。
+```c++
+    use_top:
+        /*
+           If large enough, split off the chunk bordering the end of memory
+           (held in av->top). Note that this is in accord with the best-fit
+           search rule.  In effect, av->top is treated as larger (and thus
+           less well fitting) than any other available chunk since it can
+           be extended to be as large as necessary (up to system
+           limitations).
+           We require that av->top always exists (i.e., has size >=
+           MINSIZE) after initialization, so if it would otherwise be
+           exhausted by current request, it is replenished. (The main
+           reason for ensuring it exists is that we may need MINSIZE space
+           to put in fenceposts in sysmalloc.)
+         */
+        // 获取当前的top chunk，并计算其对应的大小
+        victim = av->top;
+        size   = chunksize(victim);
+        // 如果分割之后，top chunk 大小仍然满足 chunk 的最小大小，那么就可以直接进行分割。
+        if ((unsigned long) (size) >= (unsigned long) (nb + MINSIZE)) {
+            remainder_size = size - nb;
+            remainder      = chunk_at_offset(victim, nb);
+            av->top        = remainder;
+            // 这里设置 PREV_INUSE 是因为 top chunk 前面的 chunk 如果不是 fastbin，就必然会和
+            // top chunk 合并，所以这里设置了 PREV_INUSE。
+            set_head(victim, nb | PREV_INUSE |
+                                 (av != &main_arena ? NON_MAIN_ARENA : 0));
+            set_head(remainder, remainder_size | PREV_INUSE);
+            check_malloced_chunk(av, victim, nb);
+            void *p = chunk2mem(victim);
+            alloc_perturb(p, bytes);
+            return p;
+        }
+        // 否则，判断是否有 fast chunk
+        /* When we are using atomic ops to free fast chunks we can get
+           here for all block sizes.  */
+        else if (have_fastchunks(av)) {
+            // 先执行一次fast bin的合并
+            malloc_consolidate(av);
+            /* restore original bin index */
+            // 判断需要的chunk是在small bin范围内还是large bin范围内
+            // 并计算对应的索引
+            // 等待下次再看看是否可以
+            if (in_smallbin_range(nb))
+                idx = smallbin_index(nb);
+            else
+                idx = largebin_index(nb);
+        }
+```
+### 堆内存不够
+如果堆内存不够，我们就需要使用 `sysmalloc` 来申请内存了。
+```c
+        /*
+           Otherwise, relay to handle system-dependent cases
+         */
+        // 否则的话，我们就只能从系统中再次申请一点内存了。
+        else {
+            void *p = sysmalloc(nb, av);
+            if (p != NULL) alloc_perturb(p, bytes);
+            return p;
+        }
+```
+## _libc_calloc
+calloc 也是 libc 中的一种申请内存块的函数。在 `libc`中的封装为 `_libc_calloc`，具体介绍如下
+```c
+/*
+  calloc(size_t n_elements, size_t element_size);
+  Returns a pointer to n_elements * element_size bytes, with all locations
+  set to zero.
+*/
+void*  __libc_calloc(size_t, size_t);
+```
+## sysmalloc
+正如该函数头的注释所言，该函数用于当前堆内存不足时，需要向系统申请更多的内存。
+```c
+/*
+   sysmalloc handles malloc cases requiring more memory from the system.
+   On entry, it is assumed that av->top does not have enough
+   space to service request for nb bytes, thus requiring that av->top
+   be extended or replaced.
+ */
+```
+### 基本定义
+```c
+static void *sysmalloc(INTERNAL_SIZE_T nb, mstate av) {
+  mchunkptr old_top;        /* incoming value of av->top */
+  INTERNAL_SIZE_T old_size; /* its size */
+  char *old_end;            /* its end address */
+  long size; /* arg to first MORECORE or mmap call */
+  char *brk; /* return value from MORECORE */
+  long correction; /* arg to 2nd MORECORE call */
+  char *snd_brk;   /* 2nd return val */
+  INTERNAL_SIZE_T front_misalign; /* unusable bytes at front of new space */
+  INTERNAL_SIZE_T end_misalign;   /* partial page left at end of new space */
+  char *aligned_brk;              /* aligned offset into brk */
+  mchunkptr p;                  /* the allocated/returned chunk */
+  mchunkptr remainder;          /* remainder frOm allocation */
+  unsigned long remainder_size; /* its size */
+  size_t pagesize = GLRO(dl_pagesize);
+  bool tried_mmap = false;
+```
+我们可以主要关注一下 `pagesize`，其
+```c
+#ifndef EXEC_PAGESIZE
+#define EXEC_PAGESIZE	4096
+#endif
+# define GLRO(name) _##name
+size_t _dl_pagesize = EXEC_PAGESIZE;
+```
+所以，`pagesize=4096=0x1000`。
+### 考虑 mmap
+正如开头注释所言如果满足如下任何一种条件
+1. 没有分配堆。
+2. 申请的内存大于 `mp_.mmap_threshold`，并且mmap 的数量小于最大值，就可以尝试使用 mmap。
+默认情况下，临界值为
+```c
+static struct malloc_par mp_ = {
+    .top_pad = DEFAULT_TOP_PAD,
+    .n_mmaps_max = DEFAULT_MMAP_MAX,
+    .mmap_threshold = DEFAULT_MMAP_THRESHOLD,
+    .trim_threshold = DEFAULT_TRIM_THRESHOLD,
+#define NARENAS_FROM_NCORES(n) ((n) * (sizeof(long) == 4 ? 2 : 8))
+    .arena_test = NARENAS_FROM_NCORES(1)
+#if USE_TCACHE
+        ,
+    .tcache_count = TCACHE_FILL_COUNT,
+    .tcache_bins = TCACHE_MAX_BINS,
+    .tcache_max_bytes = tidx2usize(TCACHE_MAX_BINS - 1),
+    .tcache_unsorted_limit = 0 /* No limit.  */
+#endif
+};
+```
+`DEFAULT_MMAP_THRESHOLD` 为 128*1024 字节，即 128 K。
+```c
+#ifndef DEFAULT_MMAP_THRESHOLD
+#define DEFAULT_MMAP_THRESHOLD DEFAULT_MMAP_THRESHOLD_MIN
+#endif
+/*
+  MMAP_THRESHOLD_MAX and _MIN are the bounds on the dynamically
+  adjusted MMAP_THRESHOLD.
+*/
+#ifndef DEFAULT_MMAP_THRESHOLD_MIN
+#define DEFAULT_MMAP_THRESHOLD_MIN (128 * 1024)
+#endif
+#ifndef DEFAULT_MMAP_THRESHOLD_MAX
+/* For 32-bit platforms we cannot increase the maximum mmap
+   threshold much because it is also the minimum value for the
+   maximum heap size and its alignment.  Going above 512k (i.e., 1M
+   for new heaps) wastes too much address space.  */
+#if __WORDSIZE == 32
+#define DEFAULT_MMAP_THRESHOLD_MAX (512 * 1024)
+#else
+#define DEFAULT_MMAP_THRESHOLD_MAX (4 * 1024 * 1024 * sizeof(long))
+#endif
+#endif
+```
+下面为这部分代码，目前不是我们关心的重点，可以暂时跳过。
+```c
+  /*
+     If have mmap, and the request size meets the mmap threshold, and
+     the system supports mmap, and there are few enough currently
+     allocated mmapped regions, try to directly map this request
+     rather than expanding top.
+   */
+  if (av == NULL ||
+      ((unsigned long)(nb) >= (unsigned long)(mp_.mmap_threshold) &&
+       (mp_.n_mmaps  (unsigned long)(nb)) {
+      mm = (char *)(MMAP(0, size, PROT_READ | PROT_WRITE, 0));
+      if (mm != MAP_FAILED) {
+        /*
+           The offset to the start of the mmapped region is stored
+           in the prev_size field of the chunk. This allows us to adjust
+           returned start address to meet alignment requirements here
+           and in memalign(), and still be able to compute proper
+           address argument for later munmap in free() and realloc().
+         */
+        if (MALLOC_ALIGNMENT == 2 * SIZE_SZ) {
+          /* For glibc, chunk2mem increases the address by 2*SIZE_SZ and
+             MALLOC_ALIGN_MASK is 2*SIZE_SZ-1.  Each mmap'ed area is page
+             aligned and therefore definitely MALLOC_ALIGN_MASK-aligned.  */
+          assert(((INTERNAL_SIZE_T)chunk2mem(mm) & MALLOC_ALIGN_MASK) == 0);
+          front_misalign = 0;
+        } else
+          front_misalign = (INTERNAL_SIZE_T)chunk2mem(mm) & MALLOC_ALIGN_MASK;
+        if (front_misalign > 0) {
+          correction = MALLOC_ALIGNMENT - front_misalign;
+          p = (mchunkptr)(mm + correction);
+          set_prev_size(p, correction);
+          set_head(p, (size - correction) | IS_MMAPPED);
+        } else {
+          p = (mchunkptr)mm;
+          set_prev_size(p, 0);
+          set_head(p, size | IS_MMAPPED);
+        }
+        /* update statistics */
+        int new = atomic_exchange_and_add(&mp_.n_mmaps, 1) + 1;
+        atomic_max(&mp_.max_n_mmaps, new);
+        unsigned long sum;
+        sum = atomic_exchange_and_add(&mp_.mmapped_mem, size) + size;
+        atomic_max(&mp_.max_mmapped_mem, sum);
+        check_chunk(av, p);
+        return chunk2mem(p);
+      }
+    }
+  }
+```
+### mmap 失败或者未分配堆
+```c
+  /* There are no usable arenas and mmap also failed.  */
+  if (av == NULL)
+    return 0;
+```
+如果是这两种情况中的任何一种，其实就可以退出了。。
+### 记录旧堆信息
+```c
+  /* Record incoming configuration of top */
+  old_top = av->top;
+  old_size = chunksize(old_top);
+  old_end = (char *)(chunk_at_offset(old_top, old_size));
+  brk = snd_brk = (char *)(MORECORE_FAILURE);
+```
+### 检查旧堆信息1
+```c
+  /*
+     If not the first time through, we require old_size to be
+     at least MINSIZE and to have prev_inuse set.
+   */
+  assert((old_top == initial_top(av) && old_size == 0) ||
+         ((unsigned long)(old_size) >= MINSIZE && prev_inuse(old_top) &&
+          ((unsigned long)old_end & (pagesize - 1)) == 0));
+```
+这个检查要求满足其中任何一个条件
+1. `old_top == initial_top(av) && old_size == 0`，即如果是第一次的话，堆的大小需要是 0。
+2. 新的堆，那么
+    1. `(unsigned long)(old_size) >= MINSIZE && prev_inuse(old_top)`，堆的大小应该不小于 `MINSIZE`，并且前一个堆块应该处于使用中。
+    2. `((unsigned long)old_end & (pagesize - 1)) == 0)`，堆的结束地址应该是页对齐的，由于页对齐的大小默认是0x1000，所以低 12 个比特需要为 0。
+### 检查旧堆信息2
+```c
+  /* Precondition: not enough current space to satisfy nb request */
+  assert((unsigned long)(old_size) size;
+    if ((long)(MINSIZE + nb - old_size) > 0 &&
+        grow_heap(old_heap, MINSIZE + nb - old_size) == 0) {
+      av->system_mem += old_heap->size - old_heap_size;
+      set_head(old_top,
+               (((char *)old_heap + old_heap->size) - (char *)old_top) |
+                   PREV_INUSE);
+    } else if ((heap = new_heap(nb + (MINSIZE + sizeof(*heap)), mp_.top_pad))) {
+      /* Use a newly allocated heap.  */
+      heap->ar_ptr = av;
+      heap->prev = old_heap;
+      av->system_mem += heap->size;
+      /* Set up the new top.  */
+      top(av) = chunk_at_offset(heap, sizeof(*heap));
+      set_head(top(av), (heap->size - sizeof(*heap)) | PREV_INUSE);
+      /* Setup fencepost and free the old top chunk with a multiple of
+         MALLOC_ALIGNMENT in size. */
+      /* The fencepost takes at least MINSIZE bytes, because it might
+         become the top chunk again later.  Note that a footer is set
+         up, too, although the chunk is marked in use. */
+      old_size = (old_size - MINSIZE) & ~MALLOC_ALIGN_MASK;
+      set_head(chunk_at_offset(old_top, old_size + 2 * SIZE_SZ),
+               0 | PREV_INUSE);
+      if (old_size >= MINSIZE) {

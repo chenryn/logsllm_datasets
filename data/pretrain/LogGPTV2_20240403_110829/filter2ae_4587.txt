@@ -1,0 +1,85 @@
+## 漏洞分析
+    gadget:
+    com.tangosol.coherence.servlet.AttributeHolder.readExternal()
+      ExternalizableHelper.readObject()
+        ExternalizableHelper.readObjectInternal()
+          ExternalizableHelper.readExternalizableLite()
+            TopNAggregator.PartialResult.readExternal()
+               TopNAggregator.PartialResult.add()
+                 (AbstractExtractor)MvelExtractor.compare()
+                   MvelExtractor.extract()
+                     MVEL.executeExpression()
+这个漏洞使用的sink点是之前CVE-2020-2883可以使用的MvelExtractor，利用它的extract方法执行EL表达式。整个漏洞的挖掘思路很有意思，这里做一个复现。
+首先根据这次打的补丁进行diff，找到一处很可疑的修复如下：
+ExternalizableHelper在进行loadClass操作前对传入的类名进行了黑名单判断。这里原本的操作就很敏感，loadClass并用newInstance调用类的无参构造方法生成对象。并且增加的过滤黑名单也是封堵之前反序列化漏洞所使用的黑名单。  
+接着分析这个函数，保留关键部分，该函数从流里读入一个class名，并用loadClass+newInstance生成对象，并调用了这个对象的readExternal方法，这里需要注意，这里的对象需要实现了ExternalizableLite
+接口。
+    public static ExternalizableLite readExternalizableLite(DataInput in, ClassLoader loader) throws IOException {
+        ExternalizableLite value;
+        if (in instanceof PofInputStream) {
+            value = (ExternalizableLite)((PofInputStream)in).readObject();
+        } else {
+            String sClass = readUTF((DataInput)in);
+            value = (ExternalizableLite)loadClass(sClass, loader, inWrapper == null ? null : inWrapper.getClassLoader()).newInstance();
+            value.readExternal((DataInput)in);
+        }
+        return value;
+    }
+回溯这个函数，可以找到这样的调用链，
+readObject()→readObjectInternal()→readExternalizableLite()
+其中在readObjectInternal函数中会进入switch，从而到达恶意类。
+这里恶意类只需要满足一个条件：实现了ExternalizableLite
+接口。漏洞发现者想到的是MvelExtractor这个类，这个类在黑名单里，这里涉及到了这个漏洞产生的另一个重要利用点。  
+weblogic在CVE-2015-4852\CVE-2015-4852补丁修复之后，进行黑名单检测的点分别是readObject调用的resolveClass方法、readExternal的resolveClass方法，以及readResolve的resolveClass方法。一般来说，序列化数据在还原成对象的过程中，会经历如下过程
+在红框部分会被weblogic自己实现的ObjectInputStream类进行黑名单检测。在这个漏洞中，恶意类从序列化数据到对象生成的过程是这样的。
+因此只要用非恶意类作为最上层类，包裹住MvelExtractor即可绕过黑名单。现在有了恶意类，剩下的工作就是找到调用MvelExtractor的extract方法的非恶意类。
+总结一下，这个类有这样的特征：
+  1. 它不在黑名单中。
+  2. 它的readObject、readExternal、readResolve方法中有调用ExternalizableHelper.readObject(）方法。并且还原的是一个MvelExtractor（或者其父类或接口）的对象。
+  3. 该方法中对ExternalizableHelper.readObject(）还原的对象有调用其extract方法。
+由于MvelExtractor继承AbstractExtractor，且它没有实现compare方法，因此MvelExtractor使用AbstractExtractor的compare方法，该方法中有调用Extractor的extract方法。因此要找的非恶意类第三点特征扩大到了extract方法和compare方法。
+作者找到的是TopNAggregator.PartialResult这个类，它是TopNAggregator的子类，先看它的readExternal方法，这个方法调用了ExternalizableHelper.readObject生成一个m_comparator
+对象
+    public void readExternal(DataInput in) throws IOException {
+        this.m_comparator = (Comparator)ExternalizableHelper.readObject(in);
+        this.m_cMaxSize = ExternalizableHelper.readInt(in);
+        this.m_map = this.instantiateInternalMap(this.m_comparator);
+        int cElems = in.readInt();
+        for(int i = 0; i  comparator, int cMaxSize) {
+        super(comparator);
+        this.m_comparator_copy = comparator;
+        this.m_cMaxSize = cMaxSize;
+    }
+    super(comparator):
+    public SortedBag(Comparator comparator) {
+        this.m_atomicNonce = new AtomicLong(0L);
+        this.m_comparator = (Comparator)(comparator == null ? SafeComparator.INSTANCE : comparator);
+        this.m_map = this.instantiateInternalMap(this.m_comparator);
+    }
+接着再看回readExternal方法，在下面的this.add中，执行了this.m_comparator.compare方法，满足了非恶意类的三个条件。
+    public boolean add(E value) {
+        if (this.size()  0) {
+            this.removeFirst();
+            super.add(value);
+            return true;
+        } else {
+            return false;
+        }
+    }
+当你按照这里的步骤构造好poc，尝试反序列化时，会发现什么都没有发生。调试后发现，在readOrdinaryObject中，程序就没有走进readExternalData，自然不会触发它的readExternal方法。
+但是其实还可以换一个思路。在前面已经说过，ExternalizableHelper的readObject方法最终可以生成任意实现了ExternalizableLite
+接口的类，并调用它的readExternal方法。而PartialResult正好实现了ExternalizableLite类，但是由于ExternalizableHelper是个抽象类，并且它也没有实现或继承Serializable类，因此无法无法直接生成ExternalizableHelper对象。但是还剩另一种办法：找到一个类，它实现了Externalizable方法，并且它的readExternal方法中有调用ExternalizableHelper.readObject()；或者实现了Serializable接口，并且它的readObject方法中调用了ExternalizableHelper.readObject()方法。  
+此时上层类的条件已经很清晰了，漏洞作者找到的是com.tangosol.coherence.servlet.AttributeHolder这个类。符合上述条件，从而串联起了整条链。
+    public void readExternal(DataInput in) throws IOException {
+         this.m_sName = ExternalizableHelper.readUTF(in);
+         this.m_oValue = ExternalizableHelper.readObject(in);
+         this.m_fActivationListener = in.readBoolean();
+         this.m_fBindingListener = in.readBoolean();
+         this.m_fLocal = in.readBoolean();
+     }
+在gadget的构造中，还有很多构造属性的具体细节，例如PartialResult的readExternal方法中，如果要走进add函数去调用恶意类的方法，需要一个前置条件。它本质上是一个Collection对象，因此，需要put进一个数据，才能在readExternal中恢复对象时，为了恢复之前put的数据，进入for循环，进入add数据。
+## 补丁分析
+增加黑名单判断，MvelExtractor无法继续使用
+## 引用
+  * [https://mp.weixin.qq.com/s?__biz=MzUyMDEyNTkwNA==&mid=2247485450&idx=1&sn=80d4eb8b9a56f83c8ce03e50a7b1e446&chksm=f9ee64b5ce99eda330ee95c78f3689fbdb6515f0e1849fa84139a70499f4553841dd9f2356f8](https://mp.weixin.qq.com/s?__biz=MzUyMDEyNTkwNA==&mid=2247485450&idx=1&sn=80d4eb8b9a56f83c8ce03e50a7b1e446&chksm=f9ee64b5ce99eda330ee95c78f3689fbdb6515f0e1849fa84139a70499f4553841dd9f2356f8)
+  * 

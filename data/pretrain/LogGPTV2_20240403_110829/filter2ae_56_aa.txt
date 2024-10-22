@@ -1,0 +1,202 @@
+该漏洞是由于对JSCreateObject操作的side-effect判断存在错误，导致优化过程中可消除类型检查节点，从而造成类型混淆，最终可执行任意代码
+## 环境搭建
+该漏洞于[commit
+52a9e67a477bdb67ca893c25c145ef5191976220](https://github.com/v8/v8/commit/52a9e67a477bdb67ca893c25c145ef5191976220)，因此可以切换至其上一版本`568979f4d891bafec875fab20f608ff9392f4f29`进行漏洞复现。
+可以直接利用如下脚本编译`release`版本
+    #!/bin/bash
+    set -Eeuxo pipefail
+    fetch v8
+    pushd v8
+    git checkout 568979f4d891bafec875fab20f608ff9392f4f29
+    gclient sync
+    ./tools/dev/gm.py x64.release
+    popd
+本文涉及的环境及代码可以从[此处](https://github.com/ret2p4nda/browser-pwn/tree/master/CVE-2018-17463)下载。
+## 漏洞原因
+### 源码分析
+漏洞存在于`src/compiler/js-operator.cc:625`。在此处，代码定义了许多常见`IR`操作的标识，存在问题的是对`JSCreateObject`操作的判断。
+    #define CACHED_OP_LIST(V)                                              \
+    ... ...
+      V(CreateObject, Operator::kNoWrite, 1, 1)                            \
+    ... ...
+关于`IR`,是`TurboFan`内部使用的一种基于图的中间表示，基于`Sea-of-Nodes`思想。`TurboFan`通过各节点的的控制依赖（`Control dependence`）、数据依赖（`Data
+dependence`）和操作依赖（`Effect
+dependence`）构建`IR`，并通过多次运行收集的类型信息进行推断优化（`speculate`）。
+而此处定义的`IR`操作标识，标识在`CreateObject`操作过程中不存在可见的副作用（`side-effects`），即无需记录到影响链(`effect chain`)中去。
+关于标志的枚举定义在`src/compiler/operator.h:28`
+    // Properties inform the operator-independent optimizer about legal
+      // transformations for nodes that have this operator.
+      enum Property {
+        kNoProperties = 0,
+        kCommutative = 1  prototype = args.at(0);
+      Handle properties = args.at(1);
+      Handle obj;
+      // 1. If Type(O) is neither Object nor Null, throw a TypeError exception.
+      if (!prototype->IsNull(isolate) && !prototype->IsJSReceiver()) {
+        THROW_NEW_ERROR_RETURN_FAILURE(
+            isolate, NewTypeError(MessageTemplate::kProtoObjectOrNull, prototype));
+      }
+      // 2. Let obj be ObjectCreate(O).
+      ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      [*]    isolate, obj, JSObject::ObjectCreate(isolate, prototype));
+    ... ...
+    }
+`JSObject::ObjectCreate`函数定义在`src/objects.cc:1360`，可以看到整个函数的流程是利用原有`Object`中的`Map`生成新的`Map`，再根据`Map`的类型，去生成新的`Object`。其中`Map`分为两个模式，`dictionary
+mode`和`fast mode`，`dictionary mode`类似于`hash`表存储，结构较复杂。`fast mode`是简单的结构体模式。
+    // Notice: This is NOT 19.1.2.2 Object.create ( O, Properties )
+    MaybeHandle JSObject::ObjectCreate(Isolate* isolate,
+                                                 Handle prototype) {
+      // Generate the map with the specified {prototype} based on the Object
+      // function's initial map from the current native context.
+      // TODO(bmeurer): Use a dedicated cache for Object.create; think about
+      // slack tracking for Object.create.
+      Handle map =
+     [*]     Map::GetObjectCreateMap(isolate, Handle::cast(prototype));
+      // Actually allocate the object.
+      Handle object;
+      if (map->is_dictionary_map()) {
+        object = isolate->factory()->NewSlowJSObjectFromMap(map);
+      } else {
+        object = isolate->factory()->NewJSObjectFromMap(map);
+      }
+      return object;
+    }
+在`Map::GetObjectCreateMap`函数中涉及了对输入的`Object`的操作，定义于`src/objects.cc:5450`。
+首先对`map`和`prototype`的类型进行判断，当满足`(prototype->IsJSObject()`且`!js_prototype->map()->is_prototype_map()`调用`JSObject::OptimizeAsPrototype(js_prototype);`输入的`Object`进行优化。
+    Handle Map::GetObjectCreateMap(Isolate* isolate,
+                                        Handle prototype) {
+      Handle map(isolate->native_context()->object_function()->initial_map(),
+                      isolate);
+      if (map->prototype() == *prototype) return map;
+      if (prototype->IsNull(isolate)) {
+        return isolate->slow_object_with_null_prototype_map();
+      }
+      if (prototype->IsJSObject()) {
+        Handle js_prototype = Handle::cast(prototype);
+        if (!js_prototype->map()->is_prototype_map()) {
+     [*]     JSObject::OptimizeAsPrototype(js_prototype);
+        }
+        Handle info =
+            Map::GetOrCreatePrototypeInfo(js_prototype, isolate);
+        // TODO(verwaest): Use inobject slack tracking for this map.
+        if (info->HasObjectCreateMap()) {
+          map = handle(info->ObjectCreateMap(), isolate);
+        } else {
+          map = Map::CopyInitialMap(isolate, map);
+          Map::SetPrototype(isolate, map, prototype);
+          PrototypeInfo::SetObjectCreateMap(info, map);
+        }
+        return map;
+      }
+      return Map::TransitionToPrototype(isolate, map, prototype);
+    }
+在`JSObject::OptimizeAsPrototype`函数中
+，定义于`src/objects.cc:12518`，当满足`PrototypeBenefitsFromNormalization(object))`时，调用`JSObject::NormalizeProperties`对原有`Object`进行优化。
+然后再根据原`Object`的`map`，申请并复制生成新`map`。
+    // static
+    void JSObject::OptimizeAsPrototype(Handle object,
+                                       bool enable_setup_mode) {
+      if (object->IsJSGlobalObject()) return;
+      if (enable_setup_mode && PrototypeBenefitsFromNormalization(object)) {
+        // First normalize to ensure all JSFunctions are DATA_CONSTANT.
+    [*]    JSObject::NormalizeProperties(object, KEEP_INOBJECT_PROPERTIES, 0,
+                                      "NormalizeAsPrototype");
+      }
+      if (object->map()->is_prototype_map()) {
+        if (object->map()->should_be_fast_prototype_map() &&
+            !object->HasFastProperties()) {
+          JSObject::MigrateSlowToFast(object, 0, "OptimizeAsPrototype");
+        }
+      } else {
+    ... ... 
+          }
+        }
+      }
+    }
+在`JSObject::NormalizeProperties`函数中，`src/objects.cc:6436`，可以发现该函数会调用`Map::Normalize`根据原有的`map`生成一个新的`map`，并且利用新的`map`重新构建输入的`Object`，这明显是一个具有`side-effect`的操作。
+    void JSObject::NormalizeProperties(Handle object,
+                                       PropertyNormalizationMode mode,
+                                       int expected_additional_properties,
+                                       const char* reason) {
+      if (!object->HasFastProperties()) return;
+      Handle map(object->map(), object->GetIsolate());
+    [*]  Handle new_map = Map::Normalize(object->GetIsolate(), map, mode, reason);
+      MigrateToMap(object, new_map, expected_additional_properties);
+    }
+继续跟进`Map::Normalize`，`src/objects.cc:9185`，新的`map`是由`Map::CopyNormalized`生成的。
+    Handle Map::Normalize(Isolate* isolate, Handle fast_map,
+                               PropertyNormalizationMode mode, const char* reason) {
+      DCHECK(!fast_map->is_dictionary_map());
+      Handle maybe_cache(isolate->native_context()->normalized_map_cache(),
+                                 isolate);
+      bool use_cache =
+          !fast_map->is_prototype_map() && !maybe_cache->IsUndefined(isolate);
+      Handle cache;
+      if (use_cache) cache = Handle::cast(maybe_cache);
+      Handle new_map;
+      if (use_cache && cache->Get(fast_map, mode).ToHandle(&new_map)) {
+    ... ...
+      } else {
+    [*]    new_map = Map::CopyNormalized(isolate, fast_map, mode);
+        if (use_cache) {
+          cache->Set(fast_map, new_map);
+          isolate->counters()->maps_normalized()->Increment();
+        }
+        if (FLAG_trace_maps) {
+          LOG(isolate, MapEvent("Normalize", *fast_map, *new_map, reason));
+        }
+      }
+      fast_map->NotifyLeafMapLayoutChange(isolate);
+      return new_map;
+    }
+在`Map::CopyNormalized`函数中,
+`src/objects.cc:9247`，利用`RawCopy`生成了新的map，随后进行了赋值，包括`set_is_dictionary_map`，比较明显的是，新生成的`map`是`dictionary`模式的。
+    Handle Map::CopyNormalized(Isolate* isolate, Handle map,
+                                    PropertyNormalizationMode mode) {
+      int new_instance_size = map->instance_size();
+      if (mode == CLEAR_INOBJECT_PROPERTIES) {
+        new_instance_size -= map->GetInObjectProperties() * kPointerSize;
+      }
+    [*]  Handle result = RawCopy(
+          isolate, map, new_instance_size,
+          mode == CLEAR_INOBJECT_PROPERTIES ? 0 : map->GetInObjectProperties());
+      // Clear the unused_property_fields explicitly as this field should not
+      // be accessed for normalized maps.
+      result->SetInObjectUnusedPropertyFields(0);
+      result->set_is_dictionary_map(true);
+      result->set_is_migration_target(false);
+      result->set_may_have_interesting_symbols(true);
+      result->set_construction_counter(kNoSlackTracking);
+    #ifdef VERIFY_HEAP
+      if (FLAG_verify_heap) result->DictionaryMapVerify(isolate);
+    #endif
+      return result;
+    }
+在`Map::RawCopy`中，`src/objects.cc:9163`，首先新建了一个`Handle`，并调用`Map::SetPrototype`为其设置`prototype`属性。
+    Handle Map::RawCopy(Isolate* isolate, Handle map, int instance_size,
+                             int inobject_properties) {
+      Handle result = isolate->factory()->NewMap(
+          map->instance_type(), instance_size, TERMINAL_FAST_ELEMENTS_KIND,
+          inobject_properties);
+      Handle prototype(map->prototype(), isolate);
+    [*]  Map::SetPrototype(isolate, result, prototype);
+    ... ... 
+      return result;
+    }
+在`Map::SetPrototype`中，`src/objects.cc:12792`，调用`JSObject::OptimizeAsPrototype`为原有`Object`的`prototype`进行优化。
+    // static
+    void Map::SetPrototype(Isolate* isolate, Handle map,
+                           Handle prototype,
+                           bool enable_prototype_setup_mode) {
+      RuntimeCallTimerScope stats_scope(isolate, *map,
+                                        RuntimeCallCounterId::kMap_SetPrototype);
+      bool is_hidden = false;
+      if (prototype->IsJSObject()) {
+        Handle prototype_jsobj = Handle::cast(prototype);
+    [*]    JSObject::OptimizeAsPrototype(prototype_jsobj, enable_prototype_setup_mode);
+    ... ...
+    }
+经过`JSObject::OptimizeAsPrototype`(`src/objects.cc:12519`) 未满足条件，故不进行优化。
+最终，原有`Object`调用`JSObject::MigrateToMap`，`src/objects.cc:4514`，根据生成的`dictionary
+mode map`进行了重构。
+    void JSObject::MigrateToMap(Handle object, Handle new_map,

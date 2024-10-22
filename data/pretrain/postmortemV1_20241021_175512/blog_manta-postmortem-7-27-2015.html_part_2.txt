@@ -1,0 +1,176 @@
+is such a severe problem, if the system gets too close to wraparound, an
+autovacuum is launched that does not back off under lock contention. The
+default configuration is aggressive: although a table can go about 2
+billion transactions without freezing, a \"wraparound autovacuum\" is
+kicked off if a table has gone at least 200 million transactions in
+total and more than 150 million transactions since the last \"freeze\"
+vacuum.
+
+#### Back to the incident
+
+As mentioned above, we hit the wraparound autovacuum condition at 10:30
+UTC on July 27. We ultimately resolved the outage by adjusting the
+PostgreSQL configuration to be less aggressive. The documentation is
+very clear that there is little impact to tuning this up as long as the
+database never gets close to the true underlying limit.
+
+When the outage was resolved, we still had a number of questions: is a
+wraparound autovacuum always so disruptive? Given that it was blocking
+all table operations, why does it throttle itself? Was this the first
+time we\'d experienced a wraparound autovacuum, or had we seen it before
+and those previous operations were less disruptive? How close were the
+other shards to hitting this condition? Now that we\'ve tuned the point
+at which PostgreSQL engages this operation, will a manual \"VACUUM
+FREEZE\" operation address the problem in a less disruptive way, or will
+it be just as disruptive? Longer-term: what\'s the correct combination
+of tunables and scheduled maintenance that will avoid the problem, and
+how can we tell that those mechanisms are working?
+
+It seemed most important to understand better whether it was expected
+that the autovacuum operation would be so disruptive. We analyzed the
+locking data that we\'d saved during the incident ([writing a program to
+summarize lock dependencies](https://github.com/joyent/pglockanalyze))
+and found that the locks held and wanted by the autovacuum operation did
+*not* conflict with the shared locks wanted by the data path queries.
+Instead, there was a single \"DROP TRIGGER\" query that was attempting
+to take an exclusive lock on the whole table. It appears that PostgreSQL
+blocks new attempts to take a shared lock while an exclusive lock is
+wanted. (This sounds bad, but it\'s necessary in order to avoid writer
+starvation.) However, the exclusive lock was itself blocked on a
+different shared lock held by the autovacuum operation. In short: the
+autovacuum itself wasn\'t blocking all the data path queries, but it was
+holding a shared lock that conflicted with the exclusive lock wanted by
+the \"DROP TRIGGER\" query, and the presence of that \"DROP TRIGGER\"
+query blocked others from taking shared locks. This explanation was
+corroborated by the fact that during the outage, the oldest active query
+in the database was the \"DROP TRIGGER\". Everything before that query
+had acquired the shared lock and completed, while queries after that one
+blocked behind it.
+
+In Manta, the \"DROP TRIGGER\" query is normally made when a certain
+component reconnects to the database. It [drops the trigger if it exists
+and then recreates
+it](https://github.com/joyent/node-libmanta/blob/898a5c7f0edbd491e2304852fd37fbbc30186485/lib/moray.js#L141-L150),
+as a simple way to idempotently make sure the trigger is present and
+up-to-date. We now know that this operation is quite disruptive (since
+it takes an exclusive table lock), even if most of the time it was not a
+big deal (because it\'s quick). It only became a problem because of the
+locking constraints introduced by the wraparound autovacuum. (Note that
+a regular autovacuum may have just aborted, seeing lock contention.
+It\'s likely that in order to see this problem you\'d have to have this
+special wraparound autovacuum.) Fortunately, we expect to be able to
+resolve this issue by simply avoiding dropping and recreating the
+trigger. With that change in place, we expect to be able to perform a
+manual \"VACUUM FREEZE\" on all shards without disruption to deal with
+the wraparound issue.
+
+This answers several of the questions above: wraparound autovacuum
+operations are not normally so disruptive, though they do have the
+potential to be much worse than other autovacuums. Throttling itself is
+not as unreasonable if it\'s not expected to be blocking all other
+queries. With the fix in place, we expect to be able to resolve this
+problem without disruption with a \"VACUUM FREEZE\", though without the
+fix, we can expect that operation would have been just as disruptive.
+
+We don\'t know if this is the first time we saw this, but based on our
+traffic patterns, we would have expected to see wraparaound autovacuums
+a few times on each shard already. It may be that we\'ve been lucky in
+the past with not having a concurrent exclusive-lock operation.
+
+To deal with this in the future, we will be monitoring the PostgreSQL
+statistics that are used to calculate when the wraparound autovacuum
+should happen. We\'ll be making sure that normal autovacuum operations
+complete regularly, and that these statistics are updated when they do.
+
+We still don\'t know why the completed autovacuum did not resolve the
+wraparound issue.
+
+### Summary of Root Cause
+
+In summary:
+
+-   All Manta operations touch our sharded, PostgreSQL-backed metadata
+    tier.
+-   During the event, one of the shard databases had all queries on our
+    primary table blocked by a three-way interaction between the data
+    path queries that wanted shared locks, a \"transaction wraparound\"
+    autovacuum that held a shared lock and ran for several hours, and an
+    errant query that wanted an exclusive table lock.
+-   We temporarily addressed the issue by configuring PostgreSQL to
+    avoid the transaction wraparound autovacuum operation. We believe
+    this is safe for quite some time, but we will be prioritizing work
+    to avoid the query that attempted to take the exclusive table lock,
+    manually vacuum the table to deal with the wraparound threat, and
+    monitor statistics that will tell us that autovacuum is proceeding
+    regularly.
+
+## Reflections
+
+First of all, we want to emphasize that we\'re sorry about this
+incident. We strive to maintain very high availability for all our
+services, and we know our customers are greatly impacted by service
+disruptions. We\'re committed to make sure we fully understand what
+happened and fix our software and procedures to make sure it does not
+happen again. That\'s why we\'ve shared this detailed analysis.
+
+While there are still some lingering questions (notably: why the first
+successful autovacuum did not clear the problem), we\'re heartened that
+the data we gathered during the outage later allowed us to identify our
+own locking issue as the most direct and actionable cause. Without that,
+we would still be wondering whether wraparound autovacuums were always
+so disruptive and whether this was at heart a PostgreSQL issue.
+
+This was not the first incident we\'ve experienced resulting from
+insufficient autovacuuming, though it was by far the most disruptive.
+Other incidents have largely affected performance of the compute
+service, and resulted from:
+
+-   table bloat, leading to more I/O, memory, and compute required to
+    process queries
+-   table fragmentation, resulting in much more I/O to read the same
+    amount of data
+-   vastly distorted query planner statistics, resulting in very
+    inefficient queries (e.g., table scans instead of index scans)
+
+We\'ve historically struggled to tune our databases to automatically
+perform these operations in the background. Many resources suggest
+running periodic \"vacuum\" and \"analyze\" operations out of cron,
+while other solutions attempt to identify periods of low activity and
+run these operations at those times. But Manta runs a 24/7 duty cycle:
+customers are using it constantly and do not expect latency bubbles for
+periodic maintenance. We had been optimistic that background autovacuum
+operations would address these issues with little impact to service, or
+at least that performance degradation would be gradual. This optimism
+was clearly not warranted, and as part of this outage we learned that we
+need to monitor these operations much more closely.
+
+This failure mode was especially painful because by its nature, a
+database can go years without seeing any symptoms \-- until the threat
+of wraparound suddenly causes a major disruption. Indeed, we were not
+the first service provider within a week to experience [an outage
+related to this
+behavior](http://blog.getsentry.com/2015/07/23/transaction-id-wraparound-in-postgres.html).
+We will take this opportunity to carefully examine the relevant tunables
+to make sure they\'re configured to run autovacuum appropriately. We\'ll
+validate those settings in our pre-production environment under high
+load. We will also be examining the relevant statistics that can be used
+to identify that these operations are running, have completed, and are
+cleaning up the issues they\'re intended to clean up.
+
+These issues aside, we\'re still happy with PostgreSQL, and we\'ve not
+seriously considered switching away from it. On the contrary, the
+documentation and data that\'s available to understand such issues is
+very valuable. We believe we can do better to tune and monitor these
+operations.
+
+## Closing
+
+We want to reiterate our apology for the magnitude of this issue and the
+impact it caused our customers and their customers. We will be working
+hard to prevent an issue like this from happening again, and do not
+hesitate to reach out to us if you have any follow-up questions about
+this outage or its postmortem!
+
+Sincerely,The Joyent Team
+
+

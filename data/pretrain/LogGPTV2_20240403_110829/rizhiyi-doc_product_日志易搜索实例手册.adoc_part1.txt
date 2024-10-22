@@ -1,0 +1,105 @@
+=== transaction
+在较为规范的IT环境中，当时间同步机制有效可信赖，日志易可以基于时间序的假设，更简便的进行跨模块事务的关联分析。这一类场景，您可以直接使用专属的transaction指令。
+比如，如下图所示的一个业务流程：
+image::images/search-example-transaction-arch.png[]
+每个子系统都会记录上游系统发送过来这次请求的唯一标识符ID，同时生成这次请求在本系统的唯一标识符ID（当然也可以继续复用同样的ID），再发送给下游。
+我们可以通过transaction指令将原始日志按照单个事务维度进行分组合并和展示，SPL指令写作：
+[source,bash]
+* | eval uuid = coalesce(haproxy.uuid, nginx.uuid) 
+  | eval request_id = coalesce(nginx.request_id, ruby.request_id)
+  | eval container_id = coalesce(ruby.container_id, golang.container_id)
+  | eval db_queryid = coalesce(golang.db_queryid, pgsql.queryid)
+  | transaction uuid, request_id, container_id, db_queryid
+在搜索页可以看到分组展示的事件列表效果：
+image::images/search-example-transaction.png[]
+图中可以看到，除了合并原始日志内容以外，SPL还自动计算出了每次事务的耗时(时间跨度)和事务内的原始日志数量(日志数)。您可以使用这两个新字段进行统计分析，比如查找响应过慢的事务：
+[source,bash]
+* | transaction trans_id | where _duration > 10
+==== transaction的分组控制策略
+由于transaction指令是通过内存队列流式处理分组，需要一定的控制策略，来保障系统对资源的高效与合理利用。可用策略包括：
+* 当我们明确一笔业务一定会在1分钟内完成，否则业务系统自身就会超时报错时，我们可以采用maxspan策略；
+* 同理，如果一笔业务最复杂的可能性也不超过10次业务日志记录，我们可以采用maxevents策略；
+* 如果日志原文中会有明显的标记，您还可以通过startswith或endswith策略来指明事务的起始或结束事件。
+所以一个比较明确的transaction检索语句会像下面这样：
+[source,bash]
+* | transaction json.aid, json.bid, json.cid maxspan=1m maxevents=10 startswith="支付开始" endswith=eval(statusCode==200)
+需要指出的是：由于日志易是一个准实时检索系统，transaction在流式处理过程中，首先收到的更接近当前时间的最新日志。这样就难免有部分边界时间点的事务日志，还没有记录到endswith标记的情况。这部分未完成的数据会被丢弃，您需要在下一次搜索时，重叠上一定的时间范围，来确保这部分事务可以在下一次搜索中体现。
+此外，transaction指令还有maxopentxn和maxopenevents两个参数，分别控制当前在内存中未闭合的事务分组数量和未分组的事件日志数量。除非内存足够大，最好不要变动这两个参数。
+==== transaction的数据流向统计
+在单次事务流程比较简单无分支的场景中，假设日志中的时间戳数据可信，我们就能以时间序推测出来不同业务系统在事务流程中的先后顺序。在累积一部分事务的流程后，最终就可以得到实际的业务流程。
+image::images/search-example-transaction-flow.png[]
+为此，日志易扩展了transaction指令的统计功能。您可以采用results by flow从句，指明进行数据流向统计。示例如下：
+[source,bash]
+* | transaction json.traceId maxspan=1m with states browser, nginx, golang in appname results by flow | stats count() by fromstate, tostate
+=== inputlookup和outputlookup实现用户留存数统计
+在业务分析需求中，拉新效果的持续跟踪分析是非常重要的一环。通过 N 日用户留存率表格，可以很方便的观察产品对新注册用户的吸引力。
+日志易支持对用户访问日志的分析处理，最终生成用户留存表格。主要操作流程如下：
+首先，利用 inputlookup 和 outputlookup 指令，定期生成用户清单字典。
+假设用户访问日志中，记录有用户账户ID，提取字段为：access.userid。我们通过 SPL 生成的用户清单字典为 userlist.csv，包含 userid 和 createday 两列，分别记录每个用户的账户 ID 和注册时间。初次使用时，您可能需要先从数据库中导出一份基准字典并通过字典表上传界面上传到日志易系统中，内容类似下面这样：
+  userid,createday
+  1,2019/07/02
+  2,2019/07/03
+然后在日志易中创建一个每天执行的定时任务，任务搜索语句如下：
+[source,bash]
+logtype:access | eval day=formatdate(timestamp, "yyyy/MM/dd") | stats count() by access.userid, day
+  | lookup createday userlist.csv on access.userid=userid
+  | where empty(createday)
+  | eval createday=day
+  | table access.userid, createday
+  | rename access.userid as userId
+  | append [[
+      | inputlookup userlist.csv
+  ]]
+  | outputlookup maxresult=500000 userlist.csv
+根据业务的实际活跃用户数量，可以灵活调整 outputlookup 指令的 maxresult 参数值。
+有了字典表以后，就可以利用 lookup 和 chart 指令，生成留存数据，搜索语句如下：
+[source,bash]
+logtype:access | eval day=formatdate(timestamp, "yyyy/MM/dd") | stats count() by access.userid, day
+  | lookup createday userlist.csv on access.userid=userid
+  | eval duration=tolong((parsedate(day,"yyyy/MM/dd")-parsedate(createday,"yyyy/MM/dd"))/86400000)
+  | chart format="$VAL天$AGG" dc(userid) as '用户留存数' over day by duration
+看到的 N 日用户留存数表格结果如下：
+image::images/search-example-lookup-user.png[]
+=== streamstats实现累积用户数趋势统计
+在上一节通过 inputlookup 和 outputlookup 指令配合生成了每天的新用户列表，而在用户分析中，还有一个场景的需求，叫累积用户数。这个需求可以通过 streamstats 指令来实现：
+[source,bash]
+inputlookup userlist.csv | stats count() by createday | streamstats sum('count()') as "累积用户数"  | rename 'count()' as "每日新用户数"
+看到的累积用户数统计表格结果如下：
+image::images/search-example-streamstats.png[]
+=== eventstats和streamstats实现帕累托图
+帕累托图是管理决策过程中经常使用的一种分析方法，方便在分组统计中快速找到拐点位置，确定关键的少数。以条形图表示频率或成本，最长的条形在左侧，最短的条形在右侧，加权累积百分比以折线图方式叠加在条形图上。
+您可以通过 eventstats 指令，给普通的分组统计附加上总值，以快速计算百分比，然后配合 streamstats 实现加权累积：
+[source,bash]
+* | stats count() as cnt by appname | eventstats sum(cnt) as s | streamstats sum(cnt) as sc | eval p=100*sc/s | table appname, cnt, p
+然后选择多 Y 轴图效果，设置 X 轴字段为 appname，展示所有标签；Y1 轴字段为 cnt，展示柱状图；Y2 轴字段为 p，展示折线图，单位为%，再换个颜色。最后可以看到按应用数据量统计的帕累托图效果如下：
+image::images/pareto.png[]
+== 检索任务管理
+您通过搜索页、仪表盘页、API提交的每一次请求，以及告警、定时任务、报表的每次运行，最终会转换成为一个SPL检索任务。日志易会智能分析系统中存在的各检索任务的相关属性信息，包括发起人、检索时段、检索类型、数据留存方式、留存时长等，切分构造合理的检索任务执行队列，以保障每个检索任务都可以得到及时运行。
+为了更好的优化不同属性的检索任务对使用者的体验，日志易将检索任务分为三类。本章将具体讲述。
+=== 即时任务
+SPL检索任务默认以即时任务类型运行。任务注册成功后，客户端(广义的包括日志易系统及其他第三方API调用方)即可循环调用任务预览接口，获取任务运行中的半成品结果。预览接口同时还将返回任务到目前为止命中的原始事件数、生成的结果数、预估的任务完成进度等信息。
+注意：任务完成度受限于切分粒度和SPL语法构造，估算不一定精确。常见的偏差情况有：
+1. 子查询未完毕之前，主查询的完成进度一直停在0%；
+2. 由于数据量不大或内存足够等原因，将切分粒度配置项es.stats.span调整到一天，则搜索一天内数据，进度只有0%和100%两种可能。
+如本手册多次强调的，日志易建议和鼓励您只检索必要的数据，当预览结果足够使用的时候，应该及时暂停/中止本次检索任务的后续执行，释放资源给同期和后续的其他任务。
+日志易搜索页的即时任务提交、暂停、中止、继续操作细节说明，请参阅《日志易使用手册》。
+日志易API有关任务操作的接口细节说明，请参阅《日志易API手册》。
+=== 后台任务
+日志易对单一用户所能同时发起的检索任务有一定限制。包括以下三个参数：
+1.  cache.memory_limit：在内存中保留的任务数
+2.  cache.memory_limit_per_user：在内存中为每个用户保留的任务数
+3.  cache.disk_limit_per_user：在磁盘上为每个用户保留的任务数
+当达到参数配置的上限时，系统会采取FIFO原则，将最先提交的检索任务中止清除。所以，对于个别确实横跨长时间、大数据量范围的检索请求，您需要将其转化成为后台任务，否则很可能被后续的任务抢占了队列。
+转化为后台任务以后，您可以关闭当前页面，任务在后台持续运行。
+后台任务和普通的即时任务一样，可以暂停、恢复、中止。当后台任务完成后，您可以点击加载任务结果，回到搜索页，和普通的即时任务一样操作使用其运行结果。
+后台任务的转换方式、列表查看和操作细节，请参阅《日志易使用手册》。
+=== 下载任务
+即时任务和后台任务，针对的场景都是在搜索页上的操作。肉眼可见的数据范围通常只在上下几页，因此，这两类检索任务，系统只会持有1000条原始日志和20000行统计结果。
+对于日志易目前尚不能支持的高级分析方法，您可能需要将日志易中的原始日志、或经过SPL初步统计的中间结果，导入到Hadoop、BI等其他系统中做后续分析。
+对此，您可以将检索完成后，另指定为一次下载任务。下载任务和后台任务类似，不过下载任务会保留更多的结果集数据在磁盘上，以满足您的需要。
+下载任务依然有相关的限制参数，您需要按实际需求适当调整。参数包括：
+1. download.files_per_user_limit：为每个用户保留的下载任务数，同样采用FIFO原则清理；
+2. download.max_events：单个下载任务最多存储的结果集行数；
+3. download.max_file_size：单个下载任务最多存储的文件字节数大小。
+注意：根据检索语法的不同，你可以选择的结果文件格式也不同。如果下载的是原始日志，您可以选择保存为txt和JSON格式；如果下载的是统计结果表格，则可以选择保存为CSV和JSON格式。
+下载任务的操作细节，请参阅《日志易使用手册》。

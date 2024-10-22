@@ -1,0 +1,243 @@
+# 0x00.一切开始之前
+CVE-2022-0995 是近日爆出来的一个存在于 _观察队列事件通知子系统_ （watch_queue event notification
+subsystem）中的一个堆溢出漏洞，该漏洞自内核版本 `5.8` 中伴随着 watch queue subsystem 引入，在 `5.17-rc7`
+版本中被修复
+不过虽然获得了 `7.1` 的 CVSS 评分，但这个漏洞似乎并没有什么热度，不过在笔者看来这仍然是一个品相不错的漏洞
+在开始之前我们先来补充一些基础知识
+## _General notification mechanism_
+> 参见
+_通用通知机制_ 是建立在标准管道驱动之上的，其可以有效地将来自内核的通知消息拼接到用户打开的管道中，我们可以通过 `CONFIG_WATCH_QUEUE`
+编译选项启用（默认开启）
+该机制通过一个以特殊模式打开的管道实现，内核生成的消息被保存到管道内部的循环环形缓冲区中（`pipe_buffer` 队列），通过 `read()`
+进行读取，由于在某些情况下我们可能想要将添加的内容还原到环上，因此在此类管道上禁用了 splice 以及类似功能（因为这可能导致其与通知消息交织在一起）
+管道的所有者应当告诉内核哪些资源其想要通过该管道进行观察，只有连接到该管道上的资源才会往里边插入消息，需要注意的是一个资源可能会与多个管道绑定并同时将消息插入所有管道
+若环中没有可用的插槽或可用的预分配的 message buffer（一个管道默认只有 16 个 `pipe_buffer` ——对应 16
+张内存页），则消息将会被丢弃，在这两种情况下，`read()` 将在读取当前缓冲区的最后一条消息后将
+`WATCH_META_LOSS_NOTIFICATION` 插入输出缓冲区
+### Watch Queue（Notification Output）API
+一个 _观测队列_ （watch
+queue）是由一个应用分配的用以记录通知的缓冲区，其工作原理完全隐藏在管道设备驱动中，但有必要获得一个对其的引用以设置一个观测，可以通过以下 API
+进行管理：
+  * `struct watch_queue *get_watch_queue(int fd);`
+由于观测队列在内核中通过实现缓冲区的管道的文件描述符表示，用户空间必须通过系统调用传递该文件描述符，这可以用于从系统调用中查找指向观测队列的不透明指针
+  * `void put_watch_queue(struct watch_queue *wqueue);`
+该函数用以丢弃从 `get_watch_queue()` 获得的引用
+### Event Filter
+当一个观测队列被创建后，我们可以应用一组 _过滤器_ （filters）以限制接收的事件：
+    struct watch_notification_filter filter = {
+            ...
+    };
+    ioctl(fd, IOC_WATCH_QUEUE_SET_FILTER, &filter)
+其中 filter 应为一个 `struct watch_notification_filter` 类型变量，其中 `nr_filters` 表示
+`filters[]` 数组中过滤器的数量，而 `__reserved` 应为 0：
+    struct watch_notification_filter {
+            __u32   nr_filters;
+            __u32   __reserved;
+            struct watch_notification_type_filter filters[];
+    };
+`filters[]` 为一个 `watch_notification_type_filter` 类型的结构体数组，该结构体定义如下：
+    struct watch_notification_type_filter {
+            __u32   type;
+            __u32   info_filter;
+            __u32   info_mask;
+            __u32   subtype_filter[8];
+    };
+  * `type` 为要过滤的事件类型，应当为类似 `WATCH_TYPE_KEY_NOTIFY` 的值
+  * `info_filter` 与 `info_mask` 充当通知记录的信息字段的过滤器，仅在以下情况才将通知写入缓冲区：
+        (watch.info & info_mask) == info_filter
+例如，这可以用于忽略不在一个挂载树上的观测点的事件
+  * `subtype_filter` 为一个指示我们感兴趣的子类型的 bitmask，`subtype_filter[0]` 的 0 位对应子类型 0，1 位对应子类型 1，以此类推
+若 ioctl() 的参数为 NULL，则过滤器将被移除，我们将接收到所有来自观测源的事件
+## 内核中 watch queue subsystem 中 Event Filter 的实现
+前面我们抄了一大段的 kernel document，现在我们来深入源码看一下 watch queue subsystem 的实现机制
+当我们调用 `ioctl(fd, IOC_WATCH_QUEUE_SET_FILTER, &filter)` 时，会调用 `do_vfs_ioctl()`
+判断 cmd 进行处理，而我们的 `IOC_WATCH_QUEUE_SET_FILTER` 不在其列表中，所以最后会走到 `vfs_ioctl()`
+    SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+    {
+        struct fd f = fdget(fd);
+        int error;
+        if (!f.file)
+            return -EBADF;
+        error = security_file_ioctl(f.file, cmd, arg);
+        if (error)
+            goto out;
+        error = do_vfs_ioctl(f.file, fd, cmd, arg);
+        if (error == -ENOIOCTLCMD)
+            error = vfs_ioctl(f.file, cmd, arg);
+    out:
+        fdput(f);
+        return error;
+    }
+在 `vfs_ioctl()` 中会调用 file 结构体自身的函数表中的 `unlocked_ioctl` 指针
+    long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+    {
+        int error = -ENOTTY;
+        if (!filp->f_op->unlocked_ioctl)
+            goto out;
+        error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
+        if (error == -ENOIOCTLCMD)
+            error = -ENOTTY;
+     out:
+        return error;
+    }
+    EXPORT_SYMBOL(vfs_ioctl);
+那么这里我们需要将目光放回管道的创建流程中分配文件描述符的部分，存在如下调用链：
+    do_pipe2()
+        __do_pipe_flags()
+            create_pipe_files()
+                alloc_file_pseudo()
+                    alloc_file()
+`alloc_file()` 分配一个 file 结构体并将其函数表设为上层调用传入的函数表，而在 `create_pipe_files()`
+中传入的函数表为 `pipefifo_fops`：
+    const struct file_operations pipefifo_fops = {
+        .open       = fifo_open,
+        .llseek     = no_llseek,
+        .read_iter  = pipe_read,
+        .write_iter = pipe_write,
+        .poll       = pipe_poll,
+        .unlocked_ioctl = pipe_ioctl,
+        .release    = pipe_release,
+        .fasync     = pipe_fasync,
+        .splice_write   = iter_file_splice_write,
+    };
+因此最终调用到的是 `pipe_ioctl()`，对于 cmd `IOC_WATCH_QUEUE_SET_FILTER` 而言，最终会调用
+`watch_queue_set_filter()` 函数
+    static long pipe_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+    {
+        struct pipe_inode_info *pipe = filp->private_data;
+        int count, head, tail, mask;
+        switch (cmd) {
+        case FIONREAD:
+            __pipe_lock(pipe);
+            count = 0;
+            head = pipe->head;
+            tail = pipe->tail;
+            mask = pipe->ring_size - 1;
+            while (tail != head) {
+                count += pipe->bufs[tail & mask].len;
+                tail++;
+            }
+            __pipe_unlock(pipe);
+            return put_user(count, (int __user *)arg);
+    #ifdef CONFIG_WATCH_QUEUE
+        case IOC_WATCH_QUEUE_SET_SIZE: {
+            int ret;
+            __pipe_lock(pipe);
+            ret = watch_queue_set_size(pipe, arg);
+            __pipe_unlock(pipe);
+            return ret;
+        }
+        case IOC_WATCH_QUEUE_SET_FILTER:
+            return watch_queue_set_filter(
+                pipe, (struct watch_notification_filter __user *)arg);
+    #endif
+        default:
+            return -ENOIOCTLCMD;
+        }
+    }
+# 0x01.漏洞分析
+漏洞便发生在 `watch_queue_set_filter()`中将 filter
+数组从用户空间拷贝到内核空间的过程当中，现在让我们仔细审视这个函数的执行流程，在一开始时首先会将用户空间的
+`watch_notification_filter` 结构拷贝到内核空间：
+    long watch_queue_set_filter(struct pipe_inode_info *pipe,
+                    struct watch_notification_filter __user *_filter)
+    {
+        struct watch_notification_type_filter *tf;
+        struct watch_notification_filter filter;
+        struct watch_type_filter *q;
+        struct watch_filter *wfilter;
+        struct watch_queue *wqueue = pipe->watch_queue;
+        int ret, nr_filter = 0, i;
+        if (!wqueue)
+            return -ENODEV;
+        if (!_filter) {
+            /* Remove the old filter */
+            wfilter = NULL;
+            goto set;
+        }
+        /* Grab the user's filter specification */
+        if (copy_from_user(&filter, _filter, sizeof(filter)) != 0)
+            return -EFAULT;
+        if (filter.nr_filters == 0 ||
+            filter.nr_filters > 16 ||
+            filter.__reserved != 0)
+            return -EINVAL;
+之后 `memdup_user()` 分配一块临时空间，将用户空间的 filter 数组拷贝至该临时空间
+    tf = memdup_user(_filter->filters, filter.nr_filters * sizeof(*tf));
+        if (IS_ERR(tf))
+            return PTR_ERR(tf);
+接下来会遍历每一个 `watch_notification_type_filter` 结构，记录 type 在指定范围的 filter 的数量到变量
+`nr_filter` 中，这里其判断一个 type 是否合法的范围是 `sizeof(wfilter->type_filter) * 8`
+    ret = -EINVAL;
+        for (i = 0; i = sizeof(wfilter->type_filter) * 8)
+                continue;
+            nr_filter++;
+        }
+接下来会分配真正储存 filter 的的空间，这里用了一个 `struct_size()` 导出的大小为 `sizeof(wfilter) +
+sizeof(filters) * nr_filter`（感兴趣的同学可以自行阅读源码），注意到这里计算大小用的是我们前面遍历计算得到的
+`nr_filter`：
+    /* Now we need to build the internal filter from only the relevant
+         * user-specified filters.
+         */
+        ret = -ENOMEM;
+        wfilter = kzalloc(struct_size(wfilter, filters, nr_filter), GFP_KERNEL);
+        if (!wfilter)
+            goto err_filter;
+        wfilter->nr_filters = nr_filter;
+之后是将 filter 数组拷贝到分配的空间上， **我们的第一个漏洞便出现在这里，其判断 type 是否合法使用的是**
+`sizeof(wfilter->type_filter) * BITS_PER_LONG)` ， **与前面 nr_filter 的计算存在不一致性**
+：
+    q = wfilter->filters;
+        for (i = 0; i = sizeof(wfilter->type_filter) * BITS_PER_LONG)
+                continue;
+            q->type         = tf[i].type;
+            q->info_filter      = tf[i].info_filter;
+            q->info_mask        = tf[i].info_mask;
+            q->subtype_filter[0]    = tf[i].subtype_filter[0];
+            __set_bit(q->type, wfilter->type_filter);
+            q++;
+        }
+而 `BITS_PER_LONG` 定义于 `/include/asm-generic/bitsperlong.h` 中， **在 32 位下为 32，64
+位下为64** ：
+    #ifdef CONFIG_64BIT
+    #define BITS_PER_LONG 64
+    #else
+    #define BITS_PER_LONG 32
+    #endif /* CONFIG_64BIT */
+那么前后对 type 范围的计算便存在不一致，我们不难想到的是 **我们可以指定几个 filter 的 type 为（计算 nr_filter 时的合法
+type 上限值，拷贝 filter 时的合法 type 上限值）这个范围内的特定值，这样就能越界拷贝一定数量的 filter，从而完成堆上的越界写**
+那么这里我们容易计算得出触发第一个漏洞的 type 的范围应为 `[0x80, 0x400)`
+而 **第二个漏洞则存在于上面这段代码中对** `__set_bit()` **的调用，该函数定义如下：**
+    static inline void __set_bit(int nr, volatile unsigned long *addr)
+    {
+        unsigned long mask = BIT_MASK(nr);
+        unsigned long *p = ((unsigned long *)addr) + BIT_WORD(nr);
+        *p  |= mask;
+    }
+其作用便是 **将 addr 偏移 BIT_WORD(nr) 处的 BIT_MASK(mask) 位进行置 1 操作** ，这里的 `BIT_WORD()`
+宏主要是除以 long 类型所占位数（64），而 `BIT_MASK()` 宏则是对 long 类型所占位数求模后结果作为 unsigned long 值
+1 左移的位数导出结果数值：
+    #define BIT_MASK(nr)        (UL(1) m_list` 双向链表
+在这份公开的 exp 中使用的其实是与 CVE-2021-22555 相同的利用技巧，只不过篡改 `msg_msg` 头部的方式不是邻接溢出写
+0，而是越界写 1；接下来笔者将使用与 CVE-2021-22555 相同的利用技巧完成对该漏洞的利用
+## 提权
+### Step.I 堆喷 `msg_msg` ，建立主从消息队列，构造重叠辅助消息
+现在我们有了一个堆上越界写 1 位，我们该怎么利用呢？比较朴素的一种思想便是覆写一个结构体中的指针，利用 partial overwrite
+使得两个这样的结构体的头部指针指向同一个结构体， **从而实现 object overlapping**
+那么选用什么样的结构体作为 victim 呢？这里我们选择使用 `msg_msg`
+这一结构体，其长度可控，且开头正好是内核双向链表结构体，我们所能覆写的为其 next 指针：
+    /* one msg_msg structure for each message */
+    struct msg_msg {
+        struct list_head m_list;
+        long m_type;
+        size_t m_ts;        /* message text size */
+        struct msg_msgseg *next;
+        void *security;
+        /* the actual message follows immediately */
+    };
+当我们在一个消息队列上发送多个消息时，会形成如下结构：
+我们不难想到的是，我们可以在一开始时先创建多个消息队列，并分别在每一个消息队列上发送两条消息，形成如下内存布局，这里为了便利后续利用，第一条消息（主消息）的大小为
+96，第二条消息（辅助消息）的大小为 0x400：
+之后我们读出其中几个消息队列的主消息以产生空洞，再利用 `ioctl(fd, IOC_WATCH_QUEUE_SET_FILTER, &filter)`
+获取到我们刚释放的 `msg_msg` 结构体的空间
+这里需要注意的是 **我们至少要释放两个主消息，因为在分配到 watch_filter 之前 memdup_user() 还需要获取一个对象**

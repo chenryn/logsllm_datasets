@@ -1,0 +1,50 @@
+**作者：且听安全  
+原文链接：**
+接上文：
+> 第一部分：样本分析
+>
+> [CVE-2021-40444-Microsoft
+> MSHTML远程命令执行漏洞分析（一）](https://paper.seebug.org/1792/)
+>
+> 第二部分：漏洞复现
+>
+> [CVE-2021-40444-Microsoft
+> MSHTML远程命令执行漏洞分析（二）](https://paper.seebug.org/1795/)
+本系列第三篇主要对漏洞成因和原理做个分析。漏洞成因分析可以说即是技术活又是体力活，整个分析过程会比较冗长，这里我们不会像其他分析文章那样直接给出结论（让人摸不着头脑），而是会按照我的分析思路一步一步往前走，那么下面开始。
+既然我们基本知道了漏洞样本的执行流程，那么能想到就是挂上调试器在感兴趣的地方下断点，第一个断点尝试下在`kernelbase!CreateFileW`，找到创建`championship.inf`文件的地方（由于调用`CreateFileW`的地方会比较多，这里建议可以设置个条件断点，比如判断文件名参数`poi(esp+4)+xx`地方的值是`0x6e0066`，即文件后缀为".inf"）：
+看一下函数调用堆栈，可以看到，大部分处理都是在`urlmon`这个模块中：
+下面可以通过IDA进行简单的静态分析，可以找到在`GetSupportedInstallScopesFromFile`这个函数中开始对cab包进行处理：
+先是通过`GetExtnAndBaseFileName`判断传入文件的后缀名，如果是`.cab`则返回2（即可以通过上面的判断，进入下一步处理），其实这里只判断了3个字节，只要文件名后缀是`.cabxx`这样的都能通过验证，算是一个小bug：
+如果临时目录创建成功，则通过`ExtractInfFile`（如下图）来解压cab包中的inf类型的文件（注意，这个函数只会解压后缀是inf的文件），从IDA中可以看到调用`GetExtnAndBaseFileName`后需要返回值为5（参考前面的图，当后缀为inf时返回5），因此该函数只会解压后缀是inf的文件，最终调用`ExtractOneFile`来实现解压功能（注意，如果cab中有多个inf文件，则只会解压第一个遇到的）：
+从上图可以看到，该函数先调用了一次`Extract`，如果成功了才会开始解压inf文件，我可以简单跟进去看一下这个`Extract`（其实后面还会再次调用`Extract`函数），内部主要的功能是顺序调用`FDICreate`、`FDICopy`和`FDIDestroy`，如果任何一个函数失败或异常则返回错误号，否则返回0：
+其中`FDIDestroy`和`FDICopy`函数则直接调用`cabinet`中的`FDIDestroy`和`FDICopy`，而`FDICreate`函数会动态加载`cabinet.dll`，并调用`cabinet`中的`FDICreate`函数来创建一个`FDI`对象：
+`cabinet.dll`我们先不跟进去，还是回到`urlmon.dll`的`ExtractInfFile`函数中，程序通过一个循环来遍历cab包中的文件，如果发现后缀为inf的文件，则会调用`ExtractOneFile`函数来解压inf文件，并退出函数：
+`ExtractOneFile`函数其实也很简单，还是通过`Extract`函数来实现解压inf文件的功能，但是跟前面第一次`Extract`不同的是传入的参数`pfnfdin`存在不同。
+通过调试可以看到，传入Extract的参数pfnfdin包含了需要解压的inf的名称 `../championship.inf`：
+现在我们再次进入这个`Extract`函数，跟进cabinet模块中的`FDICopy`看看，下图是该函数的定义：
+`FDICopy`函数处理过程其实还是会回调`urlmon`提供的回调函数来实现cab的解压：`openfunc`、`readfunc`等等（这些回调函数是在`FDICreate`的时候初始化的）：
+我重点关注的是`CreateFileW`创建inf文件的地方，`cabinet`模块回调了`urlmon`中的`fdiNotifyExtract`函数：
+现在进入`fdiNotifyExtract`函数，可以看到前面分别调用了`catDirAndFile`、`AddFile`和`NeedFile`，如果都能成功则最后调用`Win32Open`来创建inf文件（终于找到关键点了）：
+  * `catDirAndFile`函数：将解压文件夹路径和文件名被拼接在一起（ **注意** ：该函数并没有对"../"这样的字符串进行过滤，导致目录穿透）。
+  * `AddFile`函数：文件信息加入`FDI`结构体中（对漏洞触发没有什么影响）。
+  * `NeedFile`函数：判断是否需要该文件（注意：如果验证不通过将不会调用`win32Open`）。
+  * `Win32Open`函数：直接调用`CreateFileA`创建文件。
+先来看`catDirAndFile`函数，主要是会调用`PathCchCanonicalizeA`对路径进行一系列的处理（流程比较复杂，看着头晕，有兴趣的可以自己去逆一下，说不定能找到什么别的问题），幸运的是并不会对"../"进行过滤：
+而`NeedFile`功能比较简单，主要是判断文件名是否一致，还有一个关键点是`hfdi+808`这个地方必须有数据（在`ExtractOneFile`函数中，该位置被正常赋值了，因此能够通过验证）：
+最后顺利到达`Win32Open`函数，传入的路径就是`C:\Users\user\AppData\Local\Temp\Cab82BF\../championship.inf`：
+到这还没结束，大家可能还记得，我们在复现漏洞的时候发现释放的inf文件很快就会被删除，导致后面无法实现代码执行，我们继续往后走来一探究竟。创建完inf文件后，我们回到`urlmon`中的`GetSupportedInstallScopesFromFile`函数，它会立即调用`DeleteExtractedFiles`函数来删除解压出来的文件：
+但是我们用调试器跟入`DeleteExtractedFiles`后发现并没实际调用`DeleteFileA`，因为`file_info[2]`中的值非0，所以没有删除inf文件。
+我们通过内存断点看一下这个file_info[2]到底是在哪里赋值的，通过断点我们发现该位置是在`urlmon!AddFile`函数被赋值为1的，然而后面直到`DeleteExtractedFiles`函数，该位置始终没有被清空，因此inf文件得以保留：
+到底是怎么回事呢，直接调试分析比较麻烦。根据前面的测试，正常的cab也会将inf文件释放到Temp目录，但是会马上被删除。因此我们可以用一个正常的cab包再调试一遍看一下，找到该值被清零的位置。很快我们便找到了赋值点：正常流程下`fdiNotifyExtract`函数会调用`MarkExtracted`来清空该值。
+从`fdiNotifyExtract`函数中可以看到，当调用参数type为`fdintCLOSE_FILE_INFO`（值为3）时，才可能调用`MarkExtracted`：
+调用`fdiNotifyExtract`函数父函数是`Cabinet!FDIGetFile`，我们仔细看一下`FDIGetFile`中的处理流程（如下图），就是循环调用`FDIGetDataBlock`来读取inf文件的数据，并调用`urlmon!writefunc`函数将数据逐块写入文件。这里如果文件大小正常，则最后一次循环后将转跳至`LABEL_13`调用`fdiNotifyExtract`，且type就是`fdintCLOSE_FILE_INFO`，因此文件会被删除。
+**由于攻击者伪造了文件大小，导致`remain_size`超出了文件的正常大小，最终导致`FDIGetDataBlock`异常并返回0**，后面就转跳至`LABEL_20`调用`urlmon!closefunc`并返回了：
+现在我们基本理清了inf文件被创建的整个流程，最后我们总结一下：
+  * `mshtml.dll` 在处理``对象时，会利用`urlmon.dll`来实现cab安装包的下载
+  * `urlmon.dll`模块会调用`urlmon!SetInstallScopeFromFile`来设置安装文件，该文件后缀必须为".cab"
+  * 接着调用`urlmon!ExtractInfFile`来释放cab文件中的一个inf文件，该文件后缀必须为".inf"
+  * 【目录穿透漏洞】：由于inf文件名以"../"开头，拼接的文件路径其实在上一层目录
+  * 最后调用`urlmon!Win32Open`实现在Temp目录中创建inf文件
+  * 【文件驻留漏洞】：文件大小异常使标记位没有被正常清零，导致inf文件没有被删除
+至此，漏洞原理分析就告一段落了，整个漏洞分析过程还是很有意思的，下一篇计划做个补丁分析。
+* * *

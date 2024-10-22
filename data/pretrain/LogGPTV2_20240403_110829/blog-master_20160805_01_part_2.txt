@@ -1,0 +1,256 @@
+where they're available and don't create performance or kernel resource
+problems.  Experimentation by me shows that unnamed POSIX semaphores
+are at least as good as SysV semaphores on Linux, and we previously had
+a report from Maksym Sobolyev that FreeBSD is significantly worse with
+SysV semaphores than POSIX ones.  So adjust those two platforms to use
+unnamed POSIX semaphores, if configure can find the necessary library
+functions.  If this goes well, we may switch other platforms as well,
+but it would be advisable to test them individually first.
+It's not currently contemplated that we'd encourage users to select
+a semaphore API for themselves, but anyone who wants to experiment
+can add PREFERRED_SEMAPHORES=UNNAMED_POSIX (or NAMED_POSIX, or SYSV)
+to their configure command line to do so.
+I also tweaked configure to report which API it's selected, mainly
+so that we can tell that from buildfarm reports.
+I did not touch the user documentation's discussion about semaphores;
+that will need some adjustment once the dust settles.
+Discussion: 
+```
+## 开工，让PostgreSQL支持100万个连接
+使用USE_UNNAMED_POSIX_SEMAPHORES编译  
+```
+export USE_UNNAMED_POSIX_SEMAPHORES=1
+LIBS=-lpthread ./configure  --prefix=/home/digoal/pgsql9.5
+make world -j 32
+make install-world -j 32
+```
+修改参数，允许100万个连接   
+```
+vi postgresql.conf
+max_connections = 1000000
+```
+重启数据库  
+```
+pg_ctl restart -m fast
+```
+## 测试100万个数据库并发连接
+pgbench是很好的测试工具，只不过限制了1024个连接，为了支持100万个连接测试，需要修改一下。  
+代码    
+```
+vi src/bin/pgbench/pgbench.c
+#ifdef WIN32
+#define FD_SETSIZE 1024                     /* set before winsock2.h is included */
+#endif   /* ! WIN32 */
+/* max number of clients allowed */
+#ifdef FD_SETSIZE
+#define MAXCLIENTS      (FD_SETSIZE - 10)
+#else
+#define MAXCLIENTS      1024
+#endif
+                        case 'c':
+                                benchmarking_option_set = true;
+                                nclients = atoi(optarg);
+				if (nclients  MAXCLIENTS)
+                                {
+                                        fprintf(stderr, "invalid number of clients: \"%s\"\n",
+                                                        optarg);
+                                        exit(1);
+                                }
+```  
+测试表  
+```
+postgres=# create unlogged table test(id int, info text);
+CREATE TABLE
+```
+测试脚本  
+```
+vi test.sql
+\setrandom s 1 100
+select pg_sleep(:s);
+insert into test values (1,'test');
+```
+## 继续碰壁
+1\. 开始压测，遇到第一个问题  
+```
+pgbench -M prepared -n -r -f ./test.sql -c 999900 -j 1 -T 10000
+  need at least 999903 open files, but system limit is 655360
+  Reduce number of clients, or use limit/ulimit to increase the system limit.
+```
+这个问题还好，是打开文件数受限，改一些限制就可以解决  
+修改ulimit  
+```
+vi /etc/security/limits.conf
+* soft nofile 1048576
+* hard nofile 1048576
+* soft noproc 10000000
+* hard noproc 10000000
+* soft memlock unlimited
+* hard memlock unlimited
+```
+修改内核参数  
+```
+sysctl -w fs.file-max=419430400000
+```
+2\. 重测，再次遇到问题，原因是pgbench使用了ip地址连接PG，导致pgbench的动态端口耗尽。    
+```
+pgbench -M prepared -n -r -f ./test.sql -c 999900 -j 1 -T 10000
+connection to database "postgres" failed:
+could not connect to server: Cannot assign requested address
+        Is the server running on host "127.0.0.1" and accepting
+        TCP/IP connections on port 1921?
+transaction type: Custom query
+scaling factor: 1
+query mode: prepared
+number of clients: 999900
+number of threads: 1
+duration: 10000 s
+number of transactions actually processed: 0
+```
+换成unix socket连接即可解决。    
+```
+pgbench -M prepared -n -r -f ./test.sql -c 999900 -j 1 -T 10000 -h $PGDATA
+connection to database "postgres" failed:
+could not fork new process for connection: Cannot allocate memory
+could not fork new process for connection: Cannot allocate memory
+transaction type: Custom query
+scaling factor: 1
+query mode: prepared
+number of clients: 999900
+number of threads: 1
+duration: 10000 s
+number of transactions actually processed: 0
+```
+3\. 不能fork new process，后面跟了个Cannot allocate memory这样的提示，我看了当前的配置    
+```
+vm.swappiness = 0
+vm.overcommit_memory = 0
+```
+于是我加了交换分区，同时改了几个参数  
+```
+dd if=/dev/zero of=./swap1 bs=1024k count=102400 oflag=direct
+mkswap ./swap1 
+swapon ./swap1
+sysctl -w vm.overcommit_memory=1     (always over commit) 
+sysctl -w vm.swappiness=1
+```
+重新测试，发现还是有问题  
+```
+pgbench -M prepared -n  -f ./test.sql -c 999900 -j 1 -T 10000 -h $PGDATA
+could not fork new process for connection: Cannot allocate memory
+```
+使用以下手段观测，发现在约连接到 65535 时报错。        
+```
+sar -r 1 10000
+psql
+select count(*) from pg_stat_activity;
+\watch 1
+```
+找到了根源，是内核限制了  
+```
+kernel.pid_max=65535  
+```
+修改一下这个内核参数  
+```
+sysctl -w kernel.pid_max=4096000
+```
+## 支持百万连接目标达成
+重新测试  
+```
+pgbench -M prepared -n  -f ./test.sql -c 999900 -j 1 -T 10000 -h $PGDATA
+```
+继续观测  
+```
+psql
+select count(*) from pg_stat_activity;
+\watch 1
+sar -r 1 10000
+```
+连接到26万时，内存用了约330GB，每个连接1MB左右。   
+看起来应该没有问题了，只要内存足够是可以搞定100万连接的。  
+## 小结
+为了让PostgreSQL支持100万个并发连接，除了资源（主要是内存）要给足。   
+数据库本身编译也需要注意，还需要操作系统内核也需要一些调整。    
+1\. 编译PostgreSQL 时使用 posix  unname  sem  。    
+```
+export USE_UNNAMED_POSIX_SEMAPHORES=1
+LIBS=-lpthread ./configure  --prefix=/home/digoal/pgsql9.5
+make world -j 32
+make install-world -j 32
+```
+如果你不打算使用unnamed posix sem，那么务必重新编译操作系统内核，增加SEMVMX.    
+2\. 打开文件数限制    
+ulimit    
+```
+vi /etc/security/limits.conf
+* soft nofile 1048576
+* hard nofile 1048576
+* soft noproc 10000000
+* hard noproc 10000000
+```
+修改内核参数    
+```
+sysctl -w fs.file-max=419430400000
+```
+3\. 使用unix socket   
+突破pgbench测试时，动态端口数量限制。  
+4\. 每个连接约1MB，100万个连接，需要约1TB内存，需要给足内存。     
+启用swap    
+```
+dd if=/dev/zero of=./swap1 bs=1024k count=102400 oflag=direct
+mkswap ./swap1 
+swapon ./swap1
+.
+.
+sysctl -w vm.overcommit_memory=0
+sysctl -w vm.swappiness=1
+```
+实际上还是发生了OOM，而且hang了很久。    
+```
+[67504.841109] Memory cgroup out of memory: Kill process 385438 (pidof) score 721 or sacrifice child
+[67504.850566] Killed process 385438, UID 0, (pidof) total-vm:982240kB, anon-rss:978356kB, file-rss:544kB
+[67517.496404] pidof invoked oom-killer: gfp_mask=0xd0, order=0, oom_adj=0, oom_score_adj=0
+[67517.496407] pidof cpuset=/ mems_allowed=0
+[67517.496410] Pid: 385469, comm: pidof Tainted: G           --------------- H
+```
+5\. 最大PID值的限制    
+加大  
+```
+sysctl -w kernel.pid_max=4096000
+```
+6\. pgbench客户端的限制  
+修改源码，支持无限连接。    
+7\. ipcs不统计posix sem的信息，所以使用posix sem后ipcs看不到用了多少sem.    
+8\  System V 与 POSIX sem    
+```
+NOTES
+       System V semaphores (semget(2), semop(2), etc.) are an older semaphore API.  
+       POSIX semaphores provide a simpler, and better designed interface than System V semaphores;      
+       on the other hand  POSIX  semaphores  are  less  widely available (especially on older systems) than System V semaphores.
+```
+## 参考
+《DBA不可不知的操作系统内核参数》    
+https://yq.aliyun.com/articles/58751    
+《如何度量Kernel Resources for PostgreSQL》    
+https://yq.aliyun.com/articles/58690    
+有名信号量sem_open和内存信号量sem_init创建信号量的区别  
+http://blog.chinaunix.net/uid-16813896-id-4711204.html  
+sem_t *sem sem_open(const char *name, int oflag, .../*mode_t mode,unsinged int value) ;  
+int sem_init(sem_t *sem,int shared, unsigned int value);  
+区别：  
+1\.创建有名信号量必须指定一个与信号量相关链的文件名称，这个name通常是文件系统中的某个文件。  
+  基于内存的信号量不需要指定名称  
+2\.有名信号量sem 是由sem_open分配内存并初始化成value值  
+  基于内存的信号量是由应用程序分配内存，有sem_init初始化成为value值。如果shared为1，则分配的信号量应该在共享内存中。  
+3\.sem_open不需要类似shared的参数，因为有名信号量总是可以在不同进程间共享的  
+  而基于内存的信号量通过shared参数来决定是进程内还是进程间共享，并且必须指定相应的内存  
+4\.基于内存的信号量不使用任何类似于O_CREAT标志的东西，也就是说，sem_init总是初始化信号量的值，因此，对于一个给定的信号量，我们必须小心保证只调用sem_init一次，对于一个已经初始化过的信号量调用sem_init,结果是未定义的。  
+5\.内存信号量通过sem_destroy删除信号量，有名信号量通过sem_unlink删除
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

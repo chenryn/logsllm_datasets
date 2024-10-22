@@ -1,0 +1,233 @@
+## PostgreSQL large row|column performance tuning case - 包括大对象   
+### 作者                     
+digoal                      
+### 日期                      
+2013-01-09                                               
+### 标签                                                                                                                                      
+PostgreSQL , 大字段优化 , 大行优化 , toast , 大对象 , MVCC , 多版本 , IO放大        
+----                      
+## 背景         
+这篇BLOG主要针对如下场景进行优化 :     
+1\. 表的行较大, 例如1KB以上.    
+2\. 索引较多, 如4个以上.    
+3\. 表的记录大部分都要被更新, 例如1个1000万的表每天有700W条记录要被更新.    
+4\. 表包含大字段, 如text类型的字段, 单个字段可能占用1KB左右. 这种字段也有更新, 但是较少量.    
+5\. 大多数字段需要被更新.    
+由于PG通过多版本来实现数据快照和事务隔离，因此更新会产生新的版本，如果更新频繁的话，那么建议将频繁更新的字段和不频繁更新的字段隔开。 比如使用TOAST技术。     
+## 正文    
+首先构建一下测试环境 :     
+测试表 :     
+```    
+                                   Table "digoal.test"    
+ Column |            Type             | Modifiers | Storage  | Stats target | Description     
+--------+-----------------------------+-----------+----------+--------------+-------------    
+ id     | bigint                      | not null  | plain    |              |     
+ col1   | name                        |           | plain    |              |     
+ col2   | text                        |           | extended |              |     
+ col3   | text                        |           | extended |              |     
+ col4   | timestamp without time zone |           | plain    |              |     
+Indexes:    
+    "test_pkey" PRIMARY KEY, btree (id)    
+    "idx_test_col1" btree (col1)    
+    "idx_test_col2" btree (col2)    
+    "idx_test_col3" btree (col3)    
+    "idx_test_col4" btree (col4)    
+Has OIDs: no    
+```    
+测试数据 :     
+```    
+digoal=> insert into test select generate_series(1,10000),repeat(md5(clock_timestamp()::text), 10), repeat(md5(clock_timestamp()::text), 10), repeat(md5(clock_timestamp()::text), 3000), clock_timestamp();    
+INSERT 0 10000    
+Time: 92796.813 ms    
+digoal=> select id,col1,substr(col2,1,32),substr(col3,1,32),col4 from test limit 2;    
+-[ RECORD 1 ]-----------------------------------------------------------    
+id     | 1    
+col1   | 6d4d815f31340d18a6126cdc0527a0556d4d815f31340d18a6126cdc0527a05    
+substr | 52a7ab1474b77d03cfb496f6c461ab69    
+substr | 4c56be81579819e034764a562648929d    
+col4   | 2013-01-09 20:37:38.081669    
+-[ RECORD 2 ]-----------------------------------------------------------    
+id     | 2    
+col1   | 33db862bf58a9c7d080a879efbf9af8c33db862bf58a9c7d080a879efbf9af8    
+substr | 41663453b02f0dc57932feb1f2388949    
+substr | fbb5fe7f75f86fb2406f340073a0ca3c    
+col4   | 2013-01-09 20:37:38.084888    
+Time: 0.722 ms    
+```    
+平均每条记录(包括头信息等)占用1638字节 :     
+```    
+digoal=> select oid,reltoastrelid,relname from pg_class where relname='test';    
+  oid   | reltoastrelid | relname     
+--------+---------------+---------    
+ 108687 |        108690 | test    
+(1 row)    
+Time: 0.658 ms    
+digoal=> \c digoal postgres    
+You are now connected to database "digoal" as user "postgres".    
+digoal=> select pg_relation_size(108687::regclass)+pg_relation_size(108690::regclass);    
+ ?column?     
+----------    
+ 16384000    
+(1 row)    
+Time: 0.750 ms    
+digoal=# select 16384000/10000;    
+ ?column?     
+----------    
+     1638    
+(1 row)    
+Time: 0.668 ms    
+```    
+简单测试 :     
+1\. INSERT    
+如上10000条记录插入时间92796.813 ms    
+2\. UPDATE    
+```    
+digoal=> update test set col1=repeat(md5(clock_timestamp()::text), 10);    
+UPDATE 10000    
+Time: 78812.367 ms    
+```    
+3\. SELECT    
+```    
+digoal=> select count(*) from test ;    
+ count     
+-------    
+ 10000    
+(1 row)    
+Time: 2.420 ms    
+```    
+4\. DELETE    
+```    
+digoal=> delete from test ;    
+DELETE 10000    
+Time: 93.877 ms    
+```    
+UPDATE性能瓶颈主要来自索引的更新, 特别是col3上的索引, 详细见后面.    
+## 优化举例    
+### 方案1    
+1\. 既然大部分的开销是在索引上, 那么减少索引的更新是一种优化办法.    
+按列拆表, 创建视图. 通过创建视图触发器(用于插入,更新,删除操作). 如下 :     
+拆表后更新操作可以减少对索引的更新. 拆表的原则见后面.    
+把前面用到的test表拆成4个表, 这4个表通过id关联起来. 原表的col1,col2,col3,col4上的索引在分表中也要加上.    
+```    
+digoal=> \d+ t1    
+                         Table "digoal.t1"    
+ Column |  Type  | Modifiers | Storage | Stats target | Description     
+--------+--------+-----------+---------+--------------+-------------    
+ id     | bigint | not null  | plain   |              |     
+ col1   | name   |           | plain   |              |     
+Indexes:    
+    "t1_pkey" PRIMARY KEY, btree (id)    
+    "idx_col1" btree (col1)    
+Has OIDs: no    
+digoal=> \d+ t2    
+                          Table "digoal.t2"    
+ Column |  Type  | Modifiers | Storage  | Stats target | Description     
+--------+--------+-----------+----------+--------------+-------------    
+ id     | bigint | not null  | plain    |              |     
+ col2   | text   |           | extended |              |     
+Indexes:    
+    "t2_pkey" PRIMARY KEY, btree (id)    
+    "idx_col2" btree (col2)    
+Has OIDs: no    
+digoal=> \d+ t3    
+                          Table "digoal.t3"    
+ Column |  Type  | Modifiers | Storage  | Stats target | Description     
+--------+--------+-----------+----------+--------------+-------------    
+ id     | bigint | not null  | plain    |              |     
+ col3   | text   |           | extended |              |     
+Indexes:    
+    "t3_pkey" PRIMARY KEY, btree (id)    
+    "idx_col3" btree (col3)    
+Has OIDs: no    
+digoal=> \d+ t4    
+                                    Table "digoal.t4"    
+ Column |            Type             | Modifiers | Storage | Stats target | Description     
+--------+-----------------------------+-----------+---------+--------------+-------------    
+ id     | bigint                      | not null  | plain   |              |     
+ col4   | timestamp without time zone |           | plain   |              |     
+Indexes:    
+    "t4_pkey" PRIMARY KEY, btree (id)    
+    "idx_col4" btree (col4)    
+Has OIDs: no    
+```    
+拆成4个表, 每个表都包含ID字段, 也就是原test表的PK. 通过ID字段关联.     
+具体的拆表原则见末尾小结部分.    
+创建一下视图 :     
+```    
+digoal=> create or replace view v_t as select t1.id,t1.col1,t2.col2,t3.col3,t4.col4 from t1 inner join t2 using (id) inner join t3 using (id) inner join t4 using (id);    
+CREATE VIEW    
+```    
+结构如下 :     
+```    
+digoal=> \d+ v_t    
+                             View "digoal.v_t"    
+ Column |            Type             | Modifiers | Storage  | Description     
+--------+-----------------------------+-----------+----------+-------------    
+ id     | bigint                      |           | plain    |     
+ col1   | name                        |           | plain    |     
+ col2   | text                        |           | extended |     
+ col3   | text                        |           | extended |     
+ col4   | timestamp without time zone |           | plain    |     
+View definition:    
+ SELECT t1.id, t1.col1, t2.col2, t3.col3, t4.col4    
+   FROM t1    
+   JOIN t2 USING (id)    
+   JOIN t3 USING (id)    
+   JOIN t4 USING (id);    
+```    
+接下来要创建触发器函数了, 为了程序操作方便, 插入, 更新, 删除, 查询都直接操作这个视图, 那样和操作test表就没有分别了.    
+```    
+CREATE OR REPLACE FUNCTION digoal.tg_v_t()    
+ RETURNS trigger    
+ LANGUAGE plpgsql    
+AS $function$                                  
+declare    
+begin    
+  IF (TG_OP = 'UPDATE') THEN    
+    UPDATE t1 set id=NEW.id,col1=NEW.col1 where id=NEW.id and col1<>NEW.col1;    
+    UPDATE t2 set id=NEW.id,col2=NEW.col2 where id=NEW.id and col2<>NEW.col2;    
+    UPDATE t3 set id=NEW.id,col3=NEW.col3 where id=NEW.id and col3<>NEW.col3;    
+    UPDATE t4 set id=NEW.id,col4=NEW.col4 where id=NEW.id and col4<>NEW.col4;    
+    return NEW;    
+  ELSIF (TG_OP = 'INSERT') THEN    
+    insert into t1 (id, col1) values (NEW.id,NEW.col1);    
+    insert into t2 (id, col2) values (NEW.id,NEW.col2);    
+    insert into t3 (id, col3) values (NEW.id,NEW.col3);    
+    insert into t4 (id, col4) values (NEW.id,NEW.col4);    
+    return NEW;    
+  ELSIF (TG_OP = 'DELETE') THEN    
+    delete from t1 where id=OLD.id;    
+    delete from t2 where id=OLD.id;    
+    delete from t3 where id=OLD.id;    
+    delete from t4 where id=OLD.id;    
+    return OLD;    
+  END IF;    
+  return null;    
+end;    
+$function$;    
+```    
+创建触发器 :     
+```    
+digoal=> create trigger tg_v_t INSTEAD OF INSERT OR DELETE OR UPDATE ON v_t FOR EACH ROW EXECUTE PROCEDURE tg_v_t();    
+CREATE TRIGGER    
+```    
+触发器函数可以分开INSERT,UPDATE,DELETE建, 去除TG_OP的判断, 亦能提升一点性能.    
+数据校验测试 :     
+```    
+digoal=> insert into v_t values (10001,'abc','test','test1',now());    
+INSERT 0 1    
+Time: 30.599 ms    
+digoal=> update v_t set col1='digoal',col2='digoal',col3='digoal',col4=now() where id > 9995;    
+UPDATE 6    
+Time: 17.493 ms    
+digoal=> delete from v_t where col1='digoal' and id in (9997,9999);    
+DELETE 2    
+Time: 3.197 ms    
+digoal=> select * from v_t where id>9995;    
+  id   |  col1  |  col2  |  col3  |            col4                
+-------+--------+--------+--------+----------------------------    
+  9996 | digoal | digoal | digoal | 2013-01-09 15:53:04.247144    
+  9998 | digoal | digoal | digoal | 2013-01-09 15:53:04.247144    
+ 10000 | digoal | digoal | digoal | 2013-01-09 15:53:04.247144    
+ 10001 | digoal | digoal | digoal | 2013-01-09 15:53:04.247144    
+(4 rows)    

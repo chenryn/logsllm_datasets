@@ -1,0 +1,65 @@
+    domain_auto_trans(domain, crash_dump_exec, crash_dump);
+在报告此错误时，crash_dump域具有以下SELinux策略：  
+    [...]
+    allow crash_dump {
+     domain
+     -init
+     -crash_dump
+     -keystore
+     -logd
+    }:process { ptrace signal sigchld sigstop sigkill };
+    [...]
+    r_dir_file(crash_dump, domain)
+    [...]
+此策略允许crash_dump通过ptrace()连接到几乎任何域中的进程（如果DAC控件允许，则提供接管进程的能力）并允许它读取procfs中任何进程的属性。
+ptrace访问的排除列表列出了一些TCB进程; 但值得注意的是，vold不在名单上。
+因此，如果我们可以执行crash_dump64并以某种方式将代码注入其中，那么我们就可以接管vold。
+请注意，实际上ptrace()进程的能力仍由正常的Linux
+DAC检查控制，而crash_dump不能使用CAP_SYS_PTRACE或CAP_SETUID。如果一个普通的应用程序设法将代码注入crash_dump64，由于UID不匹配，它仍然无法利用它来攻击系统组件。
+如果你一直在仔细阅读，你现在可能想知道我们是否可以在我们的假/数据文件系统上放置我们自己的二进制文件u:object_r:crash_dump_exec:s0，然后执行在crash_dump域中获得代码执行。这不起作用，因为vold
+- 非常明智 -在安装USB存储设备时硬编码MS_NOSUID标志，这不仅会降低经典setuid/setgid二进制文件的执行速度，还会降低具有执行和功能的文件执行速度，通常会涉及到自动SELinux域转换（除非SELinux策略通过授予PROCESS2__NOSUID_TRANSITION明确地选择退出此行为）。
+要将代码注入crash_dump64，我们可以使用unshare()创建一个新的mount命名空间（使用我们的CAP_SYS_ADMIN功能），调用pivot_root()将进程的根目录指向我们完全控制的目录，然后执行crash_dump64。
+之后内核解析crash_dump64的ELF头，读取链接器的路径（/
+system/bin/linker64），从该路径将链接器加载到内存中（相对于进程根，所以我们可以在这里提供自己的链接器），并执行它。
+此时，我们可以在crash_dump上下文中执行任意代码，并从那里升级到vold，从而危及TCB。 此时，Android的安全策略认为我们具有内核等效权限;
+但是，为了看看你在这里需要做些什么来获得内核中的代码执行，本文会更进一步。
+# 从vold到init上下文
+看起来似乎没有一种简单的方法可以从vold进入真正的init进程; 但是，有一种进入init SELinux上下文的方法。
+通过SELinux策略查看允许转换到init上下文，我们找到以下策略：  
+`domain_auto_trans(kernel, init_exec, init)`
+这意味着如果我们可以在内核上下文中运行代码来执行一个文件，并控制标记为init_exec，在未使用MS_NOSUID挂载的文件系统上，那么我们的文件将在init上下文中执行。
+在内核上下文中运行的唯一代码是内核，因此我们必须让内核为我们执行文件。 Linux有一种称为“usermode
+helpers”的机制可以做到这一点：在某些情况下，内核会将操作（例如创建coredump，将密钥材料加载到内核，执行DNS查找......）委托给用户空间代码。
+特别是，当查找不存在的密钥时（例如，通过request_key()），/sbin/request-key（硬编码，只能在内核构建时使用CONFIG_STATIC_USERMODEHELPER_PATH更改为不同的静态路径）将被调用。
+在vold中，我们可以简单地在没有MS_NOSUID的/sbin上安装自己的ext4文件系统，然后调用request_key()，内核在init上下文中调用我们的请求密钥。
+该漏洞在此时停止; 但是，下面的部分将描述如何构建它以获得内核中的代码执行。
+# 从init上下文到内核
+从init上下文中可以在显式请求域转换后通过执行适当标记的文件转换到modprobe或vendor_modprobe上下文（请注意，这是domain_trans()，它允许在exec上进行转换，而不是domain_auto_trans()，它会自动在exec上执行转换）：
+    domain_trans(init, { rootfs toolbox_exec }, modprobe)
+    domain_trans(init, vendor_toolbox_exec, vendor_modprobe)
+modprobe和vendor_modprobe能够从标记的文件加载内核模块：
+    allow modprobe self:capability sys_module;
+    allow modprobe { system_file }:system module_load;
+    allow vendor_modprobe self:capability sys_module;
+    allow vendor_modprobe { vendor_file }:system module_load;
+Android现在不需要内核模块的签名：
+    walleye:/ # zcat /proc/config.gz | grep MODULE
+    CONFIG_MODULES_USE_ELF_RELA=y
+    CONFIG_MODULES=y
+    # CONFIG_MODULE_FORCE_LOAD is not set
+    CONFIG_MODULE_UNLOAD=y
+    CONFIG_MODULE_FORCE_UNLOAD=y
+    CONFIG_MODULE_SRCVERSION_ALL=y
+    # CONFIG_MODULE_SIG is not set
+    # CONFIG_MODULE_COMPRESS is not set
+    CONFIG_MODULES_TREE_LOOKUP=y
+    CONFIG_ARM64_MODULE_CMODEL_LARGE=y
+    CONFIG_ARM64_MODULE_PLTS=y
+    CONFIG_RANDOMIZE_MODULE_REGION_FULL=y
+    CONFIG_DEBUG_SET_MODULE_RONX=y
+因此，你可以执行标记的文件以在modprobe上下文中执行代码，然后从那里加载标记的恶意内核模块。
+# 总结
+值得注意的是，这次攻击跨越了两个弱强制的安全边界：从blkid_untrusted到vold的边界（当vold在路径名中使用由blkid_untrusted提供的UUID而不检查它是否类似于有效的UUID时）以及从zygote到TCB的边界（通过利用zygote的CAP_SYS_ADMIN功能）。非常正确地说，软件供应商一直在强调，安全研究人员必须意识到什么是安全边界，什么不是安全边界
+- 但供应商选择决定他们想要拥有安全边界的位置，然后严格执行这些边界也很重要。未强制安全边界的使用是有限的 -例如，作为一种开发辅助，同时更强的隔离正在开发中 - 但它们也可能通过混淆组件对整个系统安全性的重要性而产生负面影响。
+在这种情况下，vold和blkid_untrusted之间的弱强制安全边界实际上导致了漏洞，而不是减轻漏洞。
+如果blkid代码在vold进程中运行，则没有必要序列化其输出，并且注入假的UUID将不起作用。

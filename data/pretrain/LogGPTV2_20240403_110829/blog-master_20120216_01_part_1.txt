@@ -1,0 +1,189 @@
+## how difference when update a table's column which it in TOAST or BASETABLE(in-line)  
+### 作者                             
+digoal                              
+### 日期                              
+2012-02-16                                                      
+### 标签                                                                                                                                              
+PostgreSQL , toast , in-line , 更新toast字段与inline字段不一样的地方 , 多版本 , 大表非频繁更新字段的设计     
+----                              
+## 背景           
+今天一位合作商的同事找到我, 问了一个关于数据库优化的问题.  
+问题是这样的 :   
+```  
+我现在在优化数据库操作, 我的一个role表结构里, 有几个比较大的text.   
+然后我现在只修改一个role里的int字段, 你上次说整条role记录就会拷贝一次是么,  
+这个拷贝是不是影响数据库的操作时间啊?  
+```  
+## 正文  
+我们知道PostgreSQL的MVCC机制是通过行版本来做的, 每次删除操作, 是修改了TUPLE上的xmax标签.  
+检索TUPLE时根据（xmax的标签和当前的txid snapshot）与当前事务ID进行比较, 以及事务隔离级别 来辨别这条TUPLE对本事务是否可见。  
+例如 :   
+SESSION A :   
+```  
+digoal=> insert into t1 values(1,'digoal','DIGOAL');  
+INSERT 0 1  
+```  
+SESSION B :   
+```  
+digoal=> select xmin,xmax,ctid,cmin,cmax,* from t1;  
+   xmin    | xmax | ctid  | cmin | cmax | id | info1  | info2    
+-----------+------+-------+------+------+----+--------+--------  
+ 562469017 |    0 | (0,1) |    0 |    0 |  1 | digoal | DIGOAL  
+```  
+SESSION A :  
+```  
+digoal=> begin;  
+BEGIN  
+digoal=> delete from t1 where id=1;  
+DELETE 1  
+暂时不要COMMIT。  
+```  
+SESSION B :   
+```  
+digoal=> select xmin,xmax,ctid,cmin,cmax,* from t1;  
+   xmin    |   xmax    | ctid  | cmin | cmax | id | info1  | info2    
+-----------+-----------+-------+------+------+----+--------+--------  
+ 562469017 | 562469018 | (0,1) |    0 |    0 |  1 | digoal | DIGOAL  
+```  
+这个时候在SESSION B看到这条记录的xmax已经改变了. 但是当前是可见的.  
+当SESSION A commit之后，SESSION B就看不到这条记录了。  
+但是即使commit, 这条数据还留在PAGE里面(假设我没有开启AUTOVACUUM, 否则这条记录会被vacuum掉.). 我们可以通过pageinspect中的函数来查看t1表的PAGE raw数据。如下，  
+```  
+digoal=#  select * from heap_page_items(get_raw_page('digoal.t1',0));   
+# 参数0来自ctid中的PAGE号.  
+ lp | lp_off | lp_flags | lp_len |  t_xmin   |  t_xmax   | t_field3 | t_ctid | t_infomask2 | t_infomask | t_hoff | t_bits | t_oid   
+----+--------+----------+--------+-----------+-----------+----------+--------+-------------+------------+--------+--------+-------  
+  1 |   8144 |        1 |     42 | 562469017 | 562469018 |        0 | (0,1)  |           3 |       1282 |     24 |        |        
+(1 row)  
+```  
+UPDATE操作和DELETE操作类似，如下 :   
+SESSION A :   
+```  
+digoal=> truncate t1;  
+TRUNCATE TABLE  
+digoal=> insert into t1 values(1,'digoal','DIGOAL');  
+INSERT 0 1  
+```  
+SESSION A :   
+```  
+digoal=> begin;  
+BEGIN  
+digoal=> update t1 set id=2 where id=1;  
+UPDATE 1  
+先不要提交,  
+```  
+SESSION B :   
+```  
+digoal=> select xmin,xmax,ctid,cmin,cmax,* from t1;  
+   xmin    |   xmax    | ctid  | cmin | cmax | id | info1  | info2    
+-----------+-----------+-------+------+------+----+--------+--------  
+ 562469030 | 562469031 | (0,1) |    0 |    0 |  1 | digoal | DIGOAL  
+(1 row)  
+```  
+SESSION A :   
+```  
+digoal=> commit;   
+```  
+A提交之后,插入了一条新的记录, 老的还在, 只是看不到了.  
+SESSION B :  
+```  
+ digoal=> select xmin,xmax,ctid,cmin,cmax,* from t1;  
+   xmin    | xmax | ctid  | cmin | cmax | id | info1  | info2    
+-----------+------+-------+------+------+----+--------+--------  
+ 562469031 |    0 | (0,2) |    0 |    0 |  2 | digoal | DIGOAL  
+```  
+好了罗嗦了一堆，只是要说明PostgreSQL的MVCC机制。  
+接下来进入本文重点.  
+那么在更新一条记录的时候, 我们看到重新插入了一条记录（携带被修改的值）进去, 有几个疑问.  
+1\. 更新的时候插入的记录是不是整条记录, (例如一个5个字段的表, 更新了1个字段, 新插入的记录是不是完整的5个字段的记录, 还是只新插入了这个被更新的字段)  
+2\. 当表中有TOAST相关的字段时, 是否也需要重新插入一次.  
+解答  :   
+1\. PostgreSQL为行存储的风格, 所以是整条记录的所有字段被新插入(但是不包含未被更新的TOAST字段).  
+2\. 当一条记录中的某变长字段的值在压缩后还超过2K（1/4块大小,近似2K），并且选择了TOAST存储, 如external或者extended时。那么这条记录中的这个字段将会使用TOAST存储。也就是说, 并不是字段选择了external或者extended就一定会存储到TOAST中。  
+3\. 因此存储在TOAST中的值被更新时并不影响其他存储在TOAST中未被更新的内容, 但是会影响指向这条TOAST记录的基表中的记录。那条记录是需要删除(修改XMAX)并新插入的。  
+下面来看个测试 :   
+先关闭AUTOVACUUM，以便能看到测试效果。  
+```  
+digoal=> create table storage_test (id int primary key,info1 text,info2 text);  
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "storage_test_pkey" for table "storage_test"  
+CREATE TABLE  
+```  
+查看存储选项, 显示extended, 表示info1和info2的字段大于2K时(近似2K bytes) 存储到TOAST中.  
+```  
+digoal=> \d+ storage_test  
+              Table "digoal.storage_test"  
+ Column |  Type   | Modifiers | Storage  | Description   
+--------+---------+-----------+----------+-------------  
+ id     | integer | not null  | plain    |   
+ info1  | text    |           | extended |   
+ info2  | text    |           | extended |   
+Indexes:  
+    "storage_test_pkey" PRIMARY KEY, btree (id)  
+Has OIDs: no  
+```  
+插入测试数据 :   
+```  
+digoal=> insert into storage_test select generate_series(1,10000),'此处省略1W字','此处省略1W字');  
+```  
+查看storage_test表的TOAST表 :   
+```  
+digoal=> select reltoastrelid,reltoastidxid from pg_class where relname='storage_test';  
+ reltoastrelid | reltoastidxid   
+---------------+---------------  
+      19403055 |             0  
+```  
+查看storage_test表的空间大小 :   
+```  
+digoal=> select pg_relation_size('storage_test');  
+ pg_relation_size   
+------------------  
+           688128  
+(1 row)  
+```  
+查看storage_test表的共计(包含索引,TOAST,FSM,VM等)空间大小 :   
+```  
+digoal=> select pg_total_relation_size('storage_test');  
+ pg_total_relation_size   
+------------------------  
+               83771392  
+(1 row)  
+```  
+查看它的TOAST表的空间大小 :   
+```  
+digoal=> select pg_relation_size(19403055);  
+ pg_relation_size   
+------------------  
+         81920000  
+(1 row)  
+```  
+从空间大小上可以看出,info1和info2字段已经存储到TOAST中了。  
+不信可以看看column_size :   
+```  
+digoal=> select pg_column_size(info1),pg_column_size(info2) from storage_test limit 1;  
+ pg_column_size | pg_column_size   
+----------------+----------------  
+           3134 |           3134  
+(1 row)  
+```  
+列长3134字节, 已经超出2K了，显然是在TOAST中存着。  
+接下来更新info1字段, 看看要不要把info2字段也拷贝一份生成一条新的记录 .   
+```  
+digoal=> update storage_test set info1=info2 ;  
+UPDATE 10000  
+digoal=> analyze storage_test ;  
+ANALYZE  
+digoal=> select pg_relation_size(19403055);  
+ pg_relation_size   
+------------------  
+        122880000  
+(1 row)  
+```  
+TOAST表变大了, 大了多少呢 ?   
+```  
+digoal=> select 122880000-81920000;  
+ ?column?   
+----------  
+ 40960000  
+(1 row)  
+```  
+大了一半, 也就是说info1的更新不需要拷贝info2.  

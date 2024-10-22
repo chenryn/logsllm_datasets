@@ -1,0 +1,154 @@
+## PostgreSQL 最佳实践 - 块级增量备份(ZFS篇)方案与实战   
+##### [TAG 24](../class/24.md)
+### 作者                                                                                                                
+digoal                                                                                                                
+### 日期                                                                                                                
+2016-08-23                                                                                                           
+### 标签                                                                                                                
+PostgreSQL , 增量备份 , 块级 , COW , 写时复制 , zfs , clone , snapshot , 快照                                 
+----                                                                                                                
+## 背景  
+在实际的生产环境中, 当数据库越来越多, 越来越大.    
+备份可能会成为比较大的问题, 传统的逻辑备份对于大的数据库不适用(因为备份和还原可能是比较耗时的, 而且也不能回到任意时间点, 还会造成数据库膨胀(长时间repeatable read隔离级别), 好处是可以跨平台恢复, 可选恢复表等).    
+而基于XLOG的增量备份, 虽然备份可以在线进行，同时支持恢复到任意时间点，但是恢复需要APPLY从基础备份到恢复目标之间所有产生的XLOG，如果基础备份做得不频繁，那么恢复时可能需要APPLY的XLOG文件数很多，导致恢复时间长。    
+如果频繁的执行全量基础备份可以解决恢复时间长的问题，又会带来一系列问题，占用跟多的空间、占用更多的备份带宽、消耗数据库读资源、备份时间长等问题。    
+这些问题随着数据库变大而放大。    
+有什么好的解决方案么？    
+## 解决方案，文件系统级快照 + 归档  
+为了解决增量备份的问题，我们可能马上会想到类似Oracle的增量备份，只需要上次备份以来的变更或新增的数据块。    
+PostgreSQL目前也支持这种备份方式，我会在下一篇文档中介绍。    
+除了数据库本身支持的块级别增量备份，我们还可以使用文件系统的快照来支持块级增量备份，例如zfs或者btrfs。    
+zfs在这里主要用到它的压缩, 去重和snapshot功能.     
+使用zfs可以减少存储空间, 加快恢复速度.     
+可以放在crontab定时执行, 例如2小时1次.    
+最近在写一个集中式的PostgreSQL基于块的增量备份的CASE，刚好完美的解决了大实例的备份难题.    
+集中备份主机环境    
+```  
+CentOS 6.5 x64    
+ZFS 0.6.3    
+磁盘12*4TB SATA + 2*300G SAS, 其中4TB的盘使用RAW模式, 未配置RAID卡. 300G的使用RAID1    
+内存32G    
+CPU Intel(R) Xeon(R) CPU E5-2609 v2 @ 2.50GHz 8核    
+```  
+## 架构  
+![screenshot](20160823_05_pic_001.png)  
+归档主机配置(本例归档主机和备机主机使用同一台主机)  
+## 配置归档存储节点  
+### 配置ZFS  
+配置ZFS, 开启压缩, 同时注意写性能至少要和网卡带宽相当, 否则容易造成瓶颈.     
+一旦造成瓶颈, 可能导致主库XLOG堵塞膨胀(因为归档完成的XLOG才可以重用或被删除).    
+考虑到写居多, 所以考虑加一个性能好的ilog设备. l2arc没必要加.    
+zpool使用raidz1+ilog+spare的模式.    
+raidz1盘的数量9=2^3+1, 实际上本例使用的盘数11(当然你可以多vdev strip的模式例如12块盘分4组vdev raidz1 3+3+3+3, 可用容量为8块盘).    
+1个ilog因为这个设备底层使用了RAID1 的模式, 所以没有再次mirror. 如果底层是JBOD模式的话, 建议用mirror防止ilog数据损坏. 1块hot spare.    
+磁盘个数的选择参考 http://blog.163.com/digoal@126/blog/static/163877040201451725147753/    
+扇区大小选择4KB.     
+```  
+# zpool create -o ashift=12 zp1 raidz1 sdb sdc sdd sde sdf sdg sdh sdi sdj sdk sdl spare sdm     
+# zpool add zp1 log /dev/sda4    
+```  
+配置zpool 根 zfs默认选项, 后面创建的zfs可以继承这些选项.    
+```  
+zfs set compression=lz4 zp1    
+zfs set canmount=off zp1    
+zfs set atime=off zp1    
+```  
+### 配置归档目录  
+创建归档目录, 日志目录, PGHOME目录等.    
+```  
+zfs create -o mountpoint=/pg168104 zp1/pg168104    
+zfs create -o mountpoint=/pg_log zp1/pg_log    
+zfs create -o mountpoint=/pg_home zp1/pg_home    
+zfs create -o mountpoint=/pg_arch zp1/pg_arch    
+df -h    
+zp1/pg168104     35T   32G   35T   1% /pg168104    
+zp1/pg_log       35T  256K   35T   1% /pg_log    
+zp1/pg_arch      35T  256K   35T   1% /pg_arch    
+zp1/pg_home      35T  149M   35T   1% /pg_home    
+```  
+### 配置NFS服务  
+配置PostgreSQL归档, 例如rsync服务端, nfs, ftp 等, 如果使用NFS注意固定一下NFS端口.    
+本文以NFS为例介绍归档配置.     
+配置NFS端口固定    
+```  
+# grep "^[A-Z]" /etc/sysconfig/nfs     
+RQUOTAD_PORT=875    
+LOCKD_TCPPORT=32803    
+LOCKD_UDPPORT=32769    
+MOUNTD_PORT=892    
+STATD_PORT=662    
+STATD_OUTGOING_PORT=2020    
+RDMA_PORT=20049     
+```  
+配置nfs目录, 每个PG集群一个目录, 存放该集群的归档文件.    
+```  
+# mkdir /pg_arch/pg168104    
+# vi /etc/exports  (注意如果主节点有流复制的HA的话, 主备都需要配置权限)    
+/pg_arch/pg168104       192.168.168.16/32(rw,no_root_squash,sync)    
+/pg_arch/pg168104       192.168.168.17/32(rw,no_root_squash,sync)    
+```  
+开启NFS服务, OR service nfs reload.    
+```  
+# service nfs start    
+# chkconfig nfs on    
+```  
+## 主节点集群配置  
+( (注意如果主节点有流复制的HA的话, 主备都需要配置) )    
+### 配置NFS客户端  
+配置nfs挂载, 数据库启动用户的权限, 如果有必要的话, 可以配置NFS超时.    
+```  
+# mkdir /pgarch    
+# vi /etc/fstab  (尽量不要配置在这里, 如果挂载失败的话, 可能导致操作系统启动失败)    
+192.168.168.131:/pg_arch/pg168104 /pgarch nfs     defaults,tcp  0 0    
+# mount -a    
+```  
+推荐以下配置    
+另一种是配置在启动脚本里面    
+```  
+# vi /etc/rc.local    
+/bin/mount -t nfs -o tcp 192.168.168.131:/pg_arch/pg168104 /pgarch    
+# df -k    
+192.168.168.131:/pg_arch/pg168104    
+                     37497821184         0 37497821184   0% /pgarch    
+```  
+### 创建归档目录    
+```  
+# mkdir -p /pgarch/arch    
+# chown postgres:postgres /pgarch/arch    
+# chmod 777 /pgarch/arch    
+```  
+### 配置sudo归档权限  
+主节点集群配置归档命令(如果以前没有开启归档的话, 需要重启数据库开启归档)  (注意如果主节点有流复制的HA的话, 主备都需要配置)    
+首先要配置SUDO, 因为NFS挂载过来权限后面需要调整, 所以最好使用SUDO以免归档和还原失败.    
+```  
+sudoedit /etc/sudoers    
+#Defaults    requiretty    
+postgres ALL=(ALL) NOPASSWD: /bin/cp    
+postgres ALL=(ALL) NOPASSWD: /usr/bin/test    
+postgres ALL=(ALL) NOPASSWD: /bin/mkdir    
+```  
+### 配置归档命令  
+配置归档和还原命令 :     
+```  
+vi $PGDATA/postgresql.conf    
+archive_mode = on    
+archive_command = 'DIR=/pgarch/arch/`date +%F`; sudo test ! -d $DIR && sudo mkdir $DIR; sudo test ! -f $DIR/%f && sudo cp %p $DIR/%f; chmod +r $DIR/%f'    
+vi $PGDATA/recovery.conf    
+restore_command = 'cp /pgarch/arch/*/%f %p'    
+pg_ctl reload    
+```  
+主备同时配归档没有问题(因为原版的PostgreSQL备节点不会触发归档), 除非你像这样改了PG代码.    
+http://blog.163.com/digoal@126/blog/static/163877040201452004721783/    
+## 配置数据文件存储节点  
+配置ZFS(同归档存储节点的配置)    
+考虑到写居多, 所以需要加一个ilog设备. l2arc没必要加.    
+zpool使用raidz1+ilog+spare的模式, 盘的数量11+1+1, 1个ilog因为这个设备底层使用了RAID1 的模式, 所以没有再次mirror.如果底层是JBOD模式的话, 建议用mirror防止ilog数据损坏.    
+扇区大小选择4KB.    
+```  
+# zpool create -o ashift=12 zp1 raidz1 sdb sdc sdd sde sdf sdg sdh sdi sdj sdk sdl spare sdm     
+# zpool add zp1 log /dev/sda4    
+# zpool status    
+  pool: zp1    
+ state: ONLINE    
+  scan: none requested    
+config:    

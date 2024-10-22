@@ -1,0 +1,175 @@
+        Deps       []string
+        ImportMap  map[string]string
+        Standard   bool
+        Dir     string
+        GoFiles []string
+        // The fields below are not part of 'go list', but are still reused
+        // between garble processes. Use "Garble" as a prefix to ensure no
+        // collisions with the JSON fields from 'go list'.
+        GarbleActionID []byte
+        Private bool
+    }
+    func setListedPackages(patterns []string) error {
+      args := []string{"list", "-json", "-deps", "-export", "-trimpath"}
+      args = append(args, cache.BuildFlags...)
+      args = append(args, patterns...)
+      cmd := exec.Command("go", args...)
+      ...
+      cache.ListedPackages = make(map[string]*listedPackage)
+      for ...{
+        var pkg listedPackage
+        ...
+        cache.ListedPackages[pkg.ImportPath] = &pkg
+        ...
+      }
+    }
+核心是利用 `go list` 命令，其中指定的 `-deps` 参数官方释义为：
+> The -deps flag causes list to iterate over not just the named packages but
+> also all their dependencies. It visits them in a depth-first post-order
+> traversal, so that a package is listed only after all its dependencies.
+> Packages not explicitly listed on the command line will have the DepOnly
+> field set to true.
+这里的遍历其实与前文分析的 `go build` 创建 action 时的很相似。通过这条命令 garble
+可以获取到项目所有的依赖信息（包括间接依赖），遍历并存入 `cache.ListedPackages`。除此之外还要标记各个依赖包是否在
+`env.GOPRIVATE` 目录下，只有此目录下的文件才会被混淆（特例是使用了 `-tiny` 参数时会处理一部分
+runtime）。可以通过设置环境变量 `GOPRIVATE="*"` 来扩大范围以获得更好的混淆效果。关于混淆范围的问题，garble
+的作者也在尝试优化：[idea: break away from GOPRIVATE?
+#276](https://github.com/burrowers/garble/issues/276)。
+至此，需要混淆的目标已经明确。加上一些保存配置信息的操作，主动模式的任务已基本完成，然后就可以运行拼接起的命令，引出启动器模式。
+启动器模式中会对 compile/asm/link 这三个编译器工具进行拦截并“介入编译过程”，打起引号是因为 garble
+实际上并没有完成任何实际的编译工作，如同 `go build`
+，它只是作为中间商修改了源代码或者修改了命令中传给编译工具的参数，最后还是要依靠这三个编译工具来实现具体的编译工作，下面逐一分析。
+### compile
+实现位于 `main.go transformCompile` 函数，主要工作是处理 go 文件和修改命令参数。`go build -n`
+参数可以输出执行的命令，我们可以在使用 garble 时传入这个参数来更直观的了解编译过程。截取其中一条：
+    /home/atom/go/bin/garble /usr/local/go/pkg/tool/linux_amd64/compile -o $WORK/b016/_pkg_.a -trimpath "/usr/local/go/src/sync=>sync;$WORK/b016=>" -p sync -std -buildid FRNt7EHDh77qHujLKnmK/FRNt7EHDh77qHujLKnmK -goversion go1.16.4 -D "" -importcfg $WORK/b016/importcfg -pack -c=4 /usr/local/go/src/sync/cond.go /usr/local/go/src/sync/map.go /usr/local/go/src/sync/mutex.go /usr/local/go/src/sync/once.go /usr/local/go/src/sync/pool.go /usr/local/go/src/sync/poolqueue.go /usr/local/go/src/sync/runtime.go /usr/local/go/src/sync/runtime2.go /usr/local/go/src/sync/rwmutex.go /usr/local/go/src/sync/waitgroup.go
+这条命令使用 compile 编译工具来将 `cond.go` 等诸多文件编译成中间代码。garble 识别到当前的编译工具是
+compile，于是”拦截“，在工具运行前做一些混淆等工作。下面分析一下相对重要的部分。
+首先要将传入的 go 文件解析成 AST：
+    var files []*ast.File
+    for _, path := range paths {
+      file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+      if err != nil {
+        return nil, err
+      }
+      files = append(files, file)
+    }
+然后进行类型检查， 这也是正常编译时会进行的一步，类型检查不通过则代表文件无法编译成功，程序退出。
+因为参与反射（`reflect.ValueOf` / `reflect.TypeOf`）的节点的类型名称可能会在后续逻辑中使用，所以不能对其名称进行混淆：
+    if fnType.Pkg().Path() == "reflect" && (fnType.Name() == "TypeOf" || fnType.Name() == "ValueOf") {
+      for _, arg := range call.Args {
+        argType := tf.info.TypeOf(arg)
+        tf.recordIgnore(argType, tf.pkg.Path())
+      }
+    }
+这里引出了一个贯穿每次 compile 生命周期的重要 map，记录了所有不能进行混淆的对象：用在反射参数的类型，用在常量表达式和
+`go:linkname` 的标识符，从没被混淆的包中引入的变量和类型：
+    // ignoreObjects records all the objects we cannot obfuscate. An object
+    // is any named entity, such as a declared variable or type.
+    //
+    // So far, this map records:
+    //
+    //  * Types which are used for reflection; see recordReflectArgs.
+    //  * Identifiers used in constant expressions; see RecordUsedAsConstants.
+    //  * Identifiers used in go:linkname directives; see handleDirectives.
+    //  * Types or variables from external packages which were not
+    //    obfuscated, for caching reasons; see transformGo.
+    ignoreObjects map[types.Object]bool
+我们以判别“用在常量表达式中的标识符”且类型是 `ast.GenDecl` 的情况为例：
+    // RecordUsedAsConstants records identifieres used in constant expressions.
+    func RecordUsedAsConstants(node ast.Node, info *types.Info, ignoreObj map[types.Object]bool) {
+        visit := func(node ast.Node) bool {
+            ident, ok := node.(*ast.Ident)
+            if !ok {
+                return true
+            }
+            // Only record *types.Const objects.
+            // Other objects, such as builtins or type names,
+            // must not be recorded as they would be false positives.
+            obj := info.ObjectOf(ident)
+            if _, ok := obj.(*types.Const); ok {
+                ignoreObj[obj] = true
+            }
+            return true
+        }
+        switch x := node.(type) {
+        ...
+        // in a const declaration all values must be constant representable
+        case *ast.GenDecl:
+            if x.Tok != token.CONST {
+                break
+            }
+            for _, spec := range x.Specs {
+                spec := spec.(*ast.ValueSpec)
+                for _, val := range spec.Values {
+                    ast.Inspect(val, visit)
+                }
+            }
+        }
+    }
+假设需要混淆的代码是：
+    package obfuscate
+    const (
+        H2 string = "a"
+        H4 string = "a" + H2
+        H3 int    = 123
+        H5 string = "a"
+    )
+可以看到用于常量表达式的标识符是 H2，我们通过代码分析一下判定过程。首先整个 const 块符合 `ast.GenDecl` 类型，然后遍历其
+Specs（每个定义），对每个 spec 遍历其 Values（等号右边的表达式），再对 val 中的元素使用 `ast.Inspect()` 遍历执行
+`visit()`，如果元素节点的类型是 `ast.Ident` 且指向的 obj 的类型是 `types.Const`，则将此 obj 记入
+`tf.recordIgnore`。有点绕，我们把 AST 打印出来看：
+可以很清晰地看到 `H4 string = "a" + H2` 中的 H2 完全符合条件，所以应该被记入
+`tf.recordIgnore`。接下来要分析的功能中会涉及到大量类型断言和类型选择，看起来复杂但本质上与刚刚的分析过程类似，我们只要将写个 demo
+并打印出 AST 就很容易理解了。
+回到 `main.go transformCompile`。接下来对当前的包名进行混淆并写入命令参数和源文件中，要求文件既不是 main 包，也不在
+`env.GOPRIVATE` 目录之外。下一步将处理注释和源代码，这里会对 runtime 和 CGO 单独处理，我们大可忽略，直接看对普通 Go
+代码的处理：
+    // transformGo obfuscates the provided Go syntax file.
+    func (tf *transformer) transformGo(file *ast.File) *ast.File {
+        if opts.GarbleLiterals {
+            file = literals.Obfuscate(file, tf.info, fset, tf.ignoreObjects)
+        }
+        pre := func(cursor *astutil.Cursor) bool {...}
+        post := func(cursor *astutil.Cursor) bool {...}
+        return astutil.Apply(file, pre, post).(*ast.File)
+    }
+首先混淆字符，然后递归处理 AST 的每个节点，最后返回处理完成的 AST。这几部分的思路很相似，都是利用 `astutil.Apply(file,
+pre, post)` 进行 AST 的递归处理，其中 pre 和 post
+函数分别用于访问孩子节点前和访问后。这部分的代码大都是比较繁琐的筛选操作，下面仅作简要分析：
+  * `literals.Obfuscate pre`
+跳过如下情况：值需要推导的、含有非基础类型的、类型需要推导的（隐式类型定义）、ignoreObj 标记了的常量。将通过筛选的常量的 token 由
+const 改为 var，方便后续用匿名函数代替常量值，但如果一个 const 块中有一个不能被改为 var，则整个块都不会被修改。
+  * `literals.Obfuscate post`
+将字符串、byte 切片或数组的值替换为匿名函数，效果如图：
+  * `transformGo pre`
+跳过名称中含有 `_`（未命名） `_C / _cgo` （cgo 代码）的节点，若是嵌入字段则要找到实际要处理的 obj，再根据 obj
+的类型继续细分筛选：
+  * `types.Var` ：跳过非全局变量，若是字段则则将其结构体的类型名作为 hash salt，如果字段所属结构体是未被混淆的，则记入 `tf.ignoreObjects`
+  * `types.TypeName`：跳过非全局类型，若该类型在定义处没有混淆，则跳过
+  * `types.Func`：跳过导出的方法、main/ init/TestMain 函数 、测试函数
+若节点通过筛选，则将其名称进行哈希处理
+  * `transformGo post`：哈希处理导入路径
+至此已经完成了对源代码的混淆，只需要将新的代码写入临时目录，并把地址拼接到命令中代替原文件路径，一条新的 compile
+命令就完成了，最后执行这条命令就可以使用编译工具编译混淆后的代码。
+### asm
+比较简单，只作用于 private 的包，核心操作如下：
+  * 将临时文件夹路径添加到 `-trimpath` 参数首部
+  * 将调用的函数的名称替换为混淆后的，Go 汇编文件中调用的函数名前都有 `·`，以此为特征搜索
+### link
+比较简单，核心操作如下：
+  * 将 `-X pkg.name=str` 参数标记的包名（pkg）、变量名（name）替换为混淆后的
+  * 将 `-buildid` 参数置空以避免 build id 泄露
+  * 添加 `-w -s` 参数以移除调试信息、符号表、DWARF 符号表
+## 混淆效果
+编写一小段代码，分别进行 `go build .` 和 `go env -w GOPRIVATE="*" && garble -literals build
+.` 两次编译。可以看到左侧很简单的代码经过混淆后变得难以阅读：
+再放入 IDA 中用 [go_parser](https://github.com/0xjiayu/go_parser)
+解析一下。混淆前的文件名函数名等信息清晰可见，代码逻辑也算工整：
+混淆后函数名等信息被乱码替代，且因为字符串被替换为了匿名函数，代码逻辑混乱了许多：
+当项目更大含有更多依赖时，代码混淆所带来的混乱会更加严重，且由于第三方依赖包也被混淆，逆向破解时就无法通过引入的第三方包来猜测代码逻辑。
+## 总结
+本文从源码实现的角度探究了 Golang 编译调用工具链的大致流程以及
+[burrowers/garble](https://github.com/burrowers/garble) 项目，了解了如何利用 go/ast
+对代码进行混淆处理。通过混淆处理，代码的逻辑结构、二进制文件中存留的信息变得难以阅读，显著提高了逆向破解的难度。
+* * *

@@ -1,0 +1,207 @@
+        sock.setblocking(False)
+        try:
+            sock.connect(('xkcd.com', 80))
+        except BlockingIOError:
+            pass
+        f = Future()
+        def on_connected():
+            f.set_result(None)
+        selector.register(sock.fileno(),
+                          EVENT_WRITE,
+                          on_connected)
+        yield f
+        selector.unregister(sock.fileno())
+        print('connected!')
+```
+现在，`fetch` 是一个生成器，因为它有一个 `yield` 语句。我们创建一个未决的 future，然后 yield 它，暂停 `fetch` 直到套接字连接建立。内联函数 `on_connected` 解决这个 future。
+但是当 future 被解决，谁来恢复这个生成器？我们需要一个协程*驱动器*。让我们叫它 “task”:
+```
+class Task:
+    def __init__(self, coro):
+        self.coro = coro
+        f = Future()
+        f.set_result(None)
+        self.step(f)
+    def step(self, future):
+        try:
+            next_future = self.coro.send(future.result)
+        except StopIteration:
+            return
+        next_future.add_done_callback(self.step)
+# Begin fetching http://xkcd.com/353/
+fetcher = Fetcher('/353/')
+Task(fetcher.fetch())
+loop()
+```
+task 通过传递一个 None 值给 `fetch` 来启动它。`fetch` 运行到它 yeild 出一个 future，这个 future 被作为 `next_future` 而捕获。当套接字连接建立，事件循环运行回调函数 `on_connected`，这里 future 被解决，`step` 被调用，`fetch` 恢复运行。
+### 用 yield from 重构协程
+一旦套接字连接建立，我们就可以发送 HTTP GET 请求，然后读取服务器响应。不再需要哪些分散在各处的回调函数，我们把它们放在同一个生成器函数中：
+```
+    def fetch(self):
+        # ... connection logic from above, then:
+        sock.send(request.encode('ascii'))
+        while True:
+            f = Future()
+            def on_readable():
+                f.set_result(sock.recv(4096))
+            selector.register(sock.fileno(),
+                              EVENT_READ,
+                              on_readable)
+            chunk = yield f
+            selector.unregister(sock.fileno())
+            if chunk:
+                self.response += chunk
+            else:
+                # Done reading.
+                break
+```
+从套接字中读取所有信息的代码看起来很通用。我们能不把它从 `fetch` 中提取成一个子过程？现在该 Python 3 热捧的 `yield from` 登场了。它能让一个生成器*委派*另一个生成器。
+让我们先回到原来那个简单的生成器例子：
+```
+>>> def gen_fn():
+...     result = yield 1
+...     print('result of yield: {}'.format(result))
+...     result2 = yield 2
+...     print('result of 2nd yield: {}'.format(result2))
+...     return 'done'
+...     
+```
+为了从其他生成器调用这个生成器，我们使用 `yield from` 委派它:
+```
+>>> # Generator function:
+>>> def caller_fn():
+...     gen = gen_fn()
+...     rv = yield from gen
+...     print('return value of yield-from: {}'
+...           .format(rv))
+...
+>>> # Make a generator from the
+>>> # generator function.
+>>> caller = caller_fn()
+```
+这个 `caller` 生成器的行为的和它委派的生成器 `gen` 表现的完全一致：
+```
+>>> caller.send(None)
+1
+>>> caller.gi_frame.f_lasti
+15
+>>> caller.send('hello')
+result of yield: hello
+2
+>>> caller.gi_frame.f_lasti  # Hasn't advanced.
+15
+>>> caller.send('goodbye')
+result of 2nd yield: goodbye
+return value of yield-from: done
+Traceback (most recent call last):
+  File "", line 1, in 
+StopIteration
+```
+当 `caller` 自 `gen` 生成（`yield`），`caller` 就不再前进。注意到 `caller` 的指令指针保持15不变，就是 `yield from` 的地方，即使内部的生成器 `gen` 从一个 yield 语句运行到下一个 yield，它始终不变。（事实上，这就是“yield from”在 CPython 中工作的具体方式。函数会在执行每个语句之前提升其指令指针。但是在外部生成器执行“yield from”后，它会将其指令指针减一，以保持其固定在“yield form”语句上。然后其生成其 caller。这个循环不断重复，直到内部生成器抛出 StopIteration，这里指向外部生成器最终允许它自己进行到下一条指令的地方。）从 `caller` 外部来看，我们无法分辨 yield 出的值是来自 `caller` 还是它委派的生成器。而从 `gen` 内部来看，我们也不能分辨传给它的值是来自 `caller` 还是 `caller` 的外面。`yield from` 语句是一个光滑的管道，值通过它进出 `gen`，一直到 `gen` 结束。
+协程可以用 `yield from` 把工作委派给子协程，并接收子协程的返回值。注意到上面的 `caller` 打印出“return value of yield-from: done”。当 `gen` 完成后，它的返回值成为 `caller` 中 `yield from` 语句的值。
+```
+    rv = yield from gen
+```
+前面我们批评过基于回调的异步编程模式，其中最大的不满是关于 “ 堆栈撕裂   （    stack ripping    ） ”：当一个回调抛出异常，它的堆栈回溯通常是毫无用处的。它只显示出事件循环运行了它，而没有说为什么。那么协程怎么样？
+```
+>>> def gen_fn():
+...     raise Exception('my error')
+>>> caller = caller_fn()
+>>> caller.send(None)
+Traceback (most recent call last):
+  File "", line 1, in 
+  File "", line 3, in caller_fn
+  File "", line 2, in gen_fn
+Exception: my error
+```
+这还是非常有用的，当异常抛出时，堆栈回溯显示出 `caller_fn` 委派了 `gen_fn`。令人更欣慰的是，你可以在一次异常处理器中封装这个调用到一个子过程中，像正常函数一样：
+```
+>>> def gen_fn():
+...     yield 1
+...     raise Exception('uh oh')
+...
+>>> def caller_fn():
+...     try:
+...         yield from gen_fn()
+...     except Exception as exc:
+...         print('caught {}'.format(exc))
+...
+>>> caller = caller_fn()
+>>> caller.send(None)
+1
+>>> caller.send('hello')
+caught uh oh
+```
+所以我们可以像提取子过程一样提取子协程。让我们从 fetcher 中提取一些有用的子协程。我们先写一个可以读一块数据的协程 `read`：
+```
+def read(sock):
+    f = Future()
+    def on_readable():
+        f.set_result(sock.recv(4096))
+    selector.register(sock.fileno(), EVENT_READ, on_readable)
+    chunk = yield f  # Read one chunk.
+    selector.unregister(sock.fileno())
+    return chunk
+```
+在 `read` 的基础上，`read_all` 协程读取整个信息：
+```
+def read_all(sock):
+    response = []
+    # Read whole response.
+    chunk = yield from read(sock)
+    while chunk:
+        response.append(chunk)
+        chunk = yield from read(sock)
+    return b''.join(response)
+```
+如果你换个角度看，抛开 `yield form` 语句的话，它们就像在做阻塞 I/O 的普通函数一样。但是事实上，`read` 和 `read_all` 都是协程。`yield from` `read` 暂停 `read_all` 直到 I/O 操作完成。当 `read_all` 暂停时，asyncio 的事件循环正在做其它的工作并等待其他的 I/O 操作。`read` 在下次循环中当事件就绪，完成 I/O 操作时，`read_all` 恢复运行。
+最终，`fetch` 调用了 `read_all`：
+```
+class Fetcher:
+    def fetch(self):
+         # ... connection logic from above, then:
+        sock.send(request.encode('ascii'))
+        self.response = yield from read_all(sock)
+```
+神奇的是，Task 类不需要做任何改变，它像以前一样驱动外部的 `fetch` 协程：
+```
+Task(fetcher.fetch())
+loop()
+```
+当 `read` yield 一个 future 时，task 从 `yield from` 管道中接收它，就像这个 future 直接从 `fetch` yield 一样。当循环解决一个 future 时，task 把它的结果送给 `fetch`，通过管道，`read` 接受到这个值，这完全就像 task 直接驱动 `read` 一样：
+![Figure 5.3 - Yield From](/data/attachment/album/201703/04/160301bj00a92ax9pzxpdp.png)
+为了完善我们的协程实现，我们再做点打磨：当等待一个 future 时，我们的代码使用 yield；而当委派一个子协程时，使用 yield from。不管是不是协程，我们总是使用 yield form 会更精炼一些。协程并不需要在意它在等待的东西是什么类型。
+在 Python 中，我们从生成器和迭代器的高度相似中获得了好处，将生成器进化成 caller，迭代器也可以同样获得好处。所以，我们可以通过特殊的实现方式来迭代我们的 Future 类：
+```
+    # Method on Future class.
+    def __iter__(self):
+        # Tell Task to resume me here.
+        yield self
+        return self.result
+```
+future 的 `__iter__` 方法是一个 yield 它自身的一个协程。当我们将代码替换如下时：
+```
+# f is a Future.
+yield f
+```
+以及……：
+```
+# f is a Future.
+yield from f
+```
+……结果是一样的！驱动 Task 从它的调用 `send` 中接收 future，并当 future 解决后，它发回新的结果给该协程。
+在每个地方都使用 `yield from` 的好处是什么？为什么比用 `field` 等待 future 并用 `yield from` 委派子协程更好？之所以更好的原因是，一个方法可以自由地改变其实行而不影响到其调用者：它可以是一个当 future 解决后返回一个值的普通方法，也可以是一个包含 `yield from` 语句并返回一个值的协程。无论是哪种情况，调用者仅需要 `yield from` 该方法以等待结果就行。
+亲爱的读者，我们已经完成了对 asyncio 协程探索。我们深入观察了生成器的机制，实现了简单的 future 和 task。我们指出协程是如何利用两个世界的优点：比线程高效、比回调清晰的并发 I/O。当然真正的 asyncio 比我们这个简化版本要复杂的多。真正的框架需要处理zero-copy I/0、公平调度、异常处理和其他大量特性。
+使用 asyncio 编写协程代码比你现在看到的要简单的多。在前面的代码中，我们从基本原理去实现协程，所以你看到了回调，task 和 future，甚至非阻塞套接字和 `select` 调用。但是当用 asyncio 编写应用，这些都不会出现在你的代码中。我们承诺过，你可以像这样下载一个网页：
+```
+    @asyncio.coroutine
+    def fetch(self, url):
+        response = yield from self.session.get(url)
+        body = yield from response.read()
+```
+对我们的探索还满意么？回到我们原始的任务：使用 asyncio 写一个网络爬虫。
+（题图素材来自：[ruth-tay.deviantart.com](http://ruth-tay.deviantart.com/art/Bearded-Vulture-553800995)）
+---
+via: 
+作者：A. Jesse Jiryu Davis , Guido van Rossum 译者：[qingyunha](https://github.com/qingyunha) 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创翻译，[Linux中国](http://linux.cn/) 荣誉推出

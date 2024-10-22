@@ -1,0 +1,173 @@
+          /*FALLTHROUGH*/
+        case EOF_CMD:
+          return EOF;
+        case RSET_CMD:
+          smtp_rset_handler();
+          return ERR;
+        case NOOP_CMD:
+          HAD(SCH_NOOP);
+          smtp_printf("250 OK\r\n", FALSE);
+          goto next_cmd;
+        case BDAT_CMD:
+          {
+          int n;
+          if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n)  smtp_max_synprot_errors)
+      {
+      yield = 1;
+      log_write(0, LOG_MAIN|LOG_REJECT, "SMTP call from %s dropped: too many "
+        "syntax or protocol errors (last command was \"%s\")",
+        host_and_ident(FALSE), string_printing(smtp_cmd_buffer));
+      }
+    if (code > 0)
+      {
+      smtp_printf("%d%c%s%s%s\r\n", FALSE, code, yield == 1 ? '-' : ' ',
+        data ? data : US"", data ? US": " : US"", errmess);
+      if (yield == 1)
+        smtp_printf("%d Too many syntax or protocol errors\r\n", FALSE, code);
+      }
+    return yield;
+    }
+然后在`synprot_error`函数中有一个`string_printing`函数，位于[src/string.c](https://github.com/Exim/exim/blob/9242a7e8cfa94bbc9dd7eca6bd651b569b871c4e/src/src/string.c)代码中：
+    const uschar *
+    string_printing2(const uschar *s, BOOL allow_tab)
+    {
+    int nonprintcount = 0;
+    int length = 0;
+    const uschar *t = s;
+    uschar *ss, *tt;
+    while (*t != 0)
+      {
+      int c = *t++;
+      if (!mac_isprint(c) || (!allow_tab && c == '\t')) nonprintcount++;
+      length++;
+      }
+    if (nonprintcount == 0) return s;
+    /* Get a new block of store guaranteed big enough to hold the
+    expanded string. */
+    ss = store_get(length + nonprintcount * 3 + 1);
+    /* Copy everything, escaping non printers. */
+    t = s;
+    tt = ss;
+    while (*t != 0)
+      {
+      int c = *t;
+      if (mac_isprint(c) && (allow_tab || c != '\t')) *tt++ = *t++; else
+        {
+        *tt++ = '\\';
+        switch (*t)
+          {
+          case '\n': *tt++ = 'n'; break;
+          case '\r': *tt++ = 'r'; break;
+          case '\b': *tt++ = 'b'; break;
+          case '\v': *tt++ = 'v'; break;
+          case '\f': *tt++ = 'f'; break;
+          case '\t': *tt++ = 't'; break;
+          default: sprintf(CS tt, "%03o", *t); tt += 3; break;
+          }
+        t++;
+        }
+      }
+    *tt = 0;
+    return ss;
+    }
+在`string_printing2`函数中，用到`store_get`, 长度为`length + nonprintcount * 3 +
+1`，比如`BDAT \x7F`这句命令，就是`6+1*3+1 => 0x0a`，我们继续跟踪store中的全局变量，因为`0xa  0x10
+  * return next_yield = heap1+0x110
+  * next_yield = heap1+0x120
+  * yield_length = 0x1f00 - 0x10 = 0x1ef0
+最后一步，就是PoC中的发送大量数据去触发UAF：
+    s = 'a'*6 + p64(0xdeadbeef)*(0x1e00/8)
+    r.send(s+ ':\r\n')
+再回到`receive.c`文件中，读取用户输入的是1788行的循环，然后根据meh所说，UAF的触发点是下面这几行代码：
+    if (ptr >= header_size - 4)
+        {
+        int oldsize = header_size;
+        /* header_size += 256; */
+        header_size *= 2;
+        if (!store_extend(next->text, oldsize, header_size))
+          {
+          uschar *newtext = store_get(header_size);
+          memcpy(newtext, next->text, ptr);
+          store_release(next->text);
+          next->text = newtext;
+          }
+        }
+当输入的数据大于等于`0x100-4`时，会触发`store_extend`函数，`next->text`的值上面提了，是`heap1+0x10`，`oldsize=0x100,
+header_size = 0x100*2 = 0x200`
+然后在`store_extend`中，有这几行判断代码：
+    if (CS ptr + rounded_oldsize != CS (next_yield[store_pool]) ||
+        inc > yield_length[store_pool] + rounded_oldsize - oldsize)
+      return FALSE;
+其中`next_yield = heap1+0x120`, `ptr + 0x100 = heap1+0x110`
+因为判断的条件为true，所以`store_extend`返回False
+这是因为在之前`string_printing`函数中分配了一段内存，所以在`receive_msg`中导致堆不平衡了，
+随后进入分支会修补这种不平衡，执行`store_get(0x200)`
+  * return next_yield = heap1+0x120
+  * next_yield = heap1+0x320
+  * yield_length = 0x1ef0 - 0x200 = 0x1cf0
+然后把用户输入的数据复制到新的堆中
+随后执行`store_release`函数，问题就在这里了，之前申请的0x2000的堆还剩0x1cf0，并没有用完，但是却对其执行glibc的free操作，但是之后这个free后的堆却仍然可以使用，这就是我们所知的UAF,
+释放后重用漏洞
+    for (b = chainbase[store_pool]; b != NULL; b = b->next)
+      {
+      storeblock *bb = b->next;
+      if (bb != NULL && CS block == CS bb + ALIGNED_SIZEOF_STOREBLOCK)
+        {
+        b->next = bb->next;
+        .......
+        free(bb);
+        return;
+        }
+其中，`bb = chainbase->next = heap1`, 而且`next->text == bb + 0x10`
+所以能成功执行`free(bb)`
+因为输入了大量的数据，所以随后还会执行：
+  * store_extend(next->text, 0x200, 0x400)
+  * store_extend(next->text, 0x400, 0x800)
+  * store_extend(next->text, 0x800, 0x1000)
+但是这些都不能满足判断：
+    if (CS ptr + rounded_oldsize != CS (next_yield[store_pool]) ||
+      inc > yield_length[store_pool] + rounded_oldsize - oldsize)
+所以都是返回true，不会进入到下面分支
+但是到`store_extend(next->text, 0x1000, 0x2000)`的时候，因为满足了第二个判断`0x2000-0x1000 >
+yield_length[store_pool]`, 所以又一次返回了False
+所以再一次进入分支，调用`store_get(0x2000)`
+因为`0x2000 > yield_length`所以进入该分支：
+    if (size > yield_length[store_pool])
+      {
+      int length = (size next)
+         && newblock->length next = NULL;
+        newblock->length = length;
+        if (!chainbase[store_pool])
+          chainbase[store_pool] = newblock;
+        else
+          current_block[store_pool]->next = newblock;
+        }
+      current_block[store_pool] = newblock;
+      yield_length[store_pool] = newblock->length;
+      next_yield[store_pool] =
+        (void *)(CS current_block[store_pool] + ALIGNED_SIZEOF_STOREBLOCK);
+      (void) VALGRIND_MAKE_MEM_NOACCESS(next_yield[store_pool], yield_length[store_pool]);
+      }
+这里就是该漏洞的关键利用点
+首先：`newblock = current_block = heap1`
+然后：`newblock = newblock->next`
+我猜测的meh的情况和我加了`printf`进行测试的情况是一样的，在`printf`中需要malloc一块堆用来当做缓冲区，所以在heap1下面又多了一块堆，在free了heap1后，heap1被放入了unsortbin，fd和bk指向了arena
+所以这个时候，`heap1->next = fd = arena_top`
+之后的流程就是：
+  * current_block = arena_top
+  * next_yield = arena_top+0x10
+  * return next_yield = arena_top+0x10
+  * next_yield = arena_top+0x2010
+在执行完`store_get`后就是执行`memcpy`:
+    memcpy(newtext, next->text, ptr);
+上面的`newtext`就是`store_get`返回的值`arena_top+0x10`
+把用户输入的数据copy到了arena中，最后达到了控制`RIP=0xdeadbeef`造成crash的效果
+但是实际情况就不一样了，因为没有printf，所以heap1是最后一块堆，再free之后，就会合并到top_chunk中，fd和bk字段不会被修改，在释放前，这两个字段也是用来储存storeblock结构体的next和length，所以也是没法控制的
+#### 总结
+CVE-2017-16943的确是一个UAF漏洞，但是在我的研究中却发现没法利用meh提供的PoC造成crash的效果
+之后我也尝试其他利用方法，但是却没找到合适的利用链
+发现由于Exim自己实现了一个堆管理，所以在heap1之后利用`store_get`再malloc一块堆是不行的因为current_block也会被修改为指向最新的堆块，所以必须要能在不使用`store_get`的情况下，malloc一块堆，才能成功利用控制RIP，因为exim自己实现了堆管理，所以都是使用`store_get`来获取内存，这样就只能找`printf`这种有自己使用malloc的函数，但是我找到的这些函数再调用后都会退出`receive_msg`函数的循环，所以没办法构造成一个利用链
+#### 引用
+  1. [Exim源码](https://github.com/Exim/exim.git)
+  2. [Bugzilla-2199](https://bugs.exim.org/show_bug.cgi?id=2199)
+* * *

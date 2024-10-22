@@ -1,0 +1,101 @@
+### 一. 漏洞概述
+2016年10月18日，黑客Phil Oester提交了隐藏长达9年之久的“脏牛漏洞（Dirty
+COW）”0day漏洞，2016年10月20日，Linux内核团队成员、Linux的创始人Linus修复了这个
+0day漏洞，该漏洞是Linux内核的内存子系统在处理写时拷贝（Copy-on-Write)时存在条件竞争漏洞，导致可以破坏私有只读内存映射。黑客可以获取低权限的本地用户后，利用此漏洞获取其他只读内存映射的写权限，进一步获取root权限。
+针对该漏洞阿里云安全团队在第一时间对该漏洞进行了详细的技术分析，具体详情见“第二章节 漏洞分析”内容。
+### 二. 漏洞基本信息
+**漏洞编号：** CVE-2016-5195
+**漏洞名称：** 脏牛（Dirty COW）
+**漏洞危害：本地提权**
+黑客可以通过远程入侵获取低权限用户后，在服务器操作系统本地利用该漏洞实现本地提权，从而获取到服务器root权限。
+**影响范围：** Linux kernel>2.6.22 (released in 2007)的所有Linux系统 _**_
+**漏洞利用条件：**
+黑客可以通过远程入侵获取低权限用户后,才能进一步在操作系统本地利用该漏洞。
+### 三. 漏洞详细分析
+从漏洞描述上看，该漏洞是存在于__get_user_pages()函数中的一个条件竞争漏洞。一般而言，条件竞争漏洞的分析主要分为3点：
+**A) 竞争点**
+**B) 竞争条件**
+**C) 竞争方式**
+竞争方式比较好理解，从最初的漏洞利用代码中可以了解到，该代码作者启用两个线程并各自分别使用了madvise和write两个系统调用实现竞争点的竞争。
+### 3.1 madvise实现分析
+madvise系统调用常用于用户态程序主动通知内核其使用内存的方式，以优化系统性能，以MADV_DONTNEED为参数调用该系统调用是为了通知内核：用户态程序再后续操作中基本不会在使用该指定的内存区域。内核实际发生的操作是：
+    sys_madvise():
+    madvise_vma():
+    madvise_dontneed():
+    zap_page_range():
+    …
+    zap_pte_range():
+    // spinlock enable
+    ptep_get_and_clear_full():
+    ptep_get_and_clear() /*PTE清零*/
+    // spinlock disable
+即内核使用sys_madvise将指定内存区域在该用户态程序的页表中对应的页表项清空。
+0 6 条回复 笑然 管理 发表于：2016-10-25 12:01:48
+### 3.2 write()实现分析
+write系统调用是最常用的系统调用之一，用于帮助用户态程序向指定的存储区域写入数据。在本次漏洞利用过程中，write系统调用将被用于进入关键的竞争区域，实现漏洞的逻辑控制。
+write系统调用实际执行的操作如下：
+    sys_write():
+    …
+    __access_remote_vm():
+    get_user_pages():
+    __get_user_pages():
+    retry:
+    page = follow_page_mask();
+    if !page {
+    ret = faultin_page();
+    if ret == 0:
+    goto retry
+从上述代码逻辑中很容易了解到，当page为NULL并且ret为0时，get_user_pages将陷入retry循环块中反复调用follow_page_mask()和faultin_page()函数，直到循环条件被不满足才结束循环。  
+follow_page_mask()函数用户获取指定内存区域对应的struct page结构，其关键逻辑为：
+    follow_page_mask():
+    follow_page_pte():// 自旋锁启用
+    if pte == 0:
+    return NULL// 自旋锁关闭
+faultin_page()函数被用于处理page不存在的情况，对导致follow_page_mask()函数失败的页表项pte进行处理并保证内核上下文的正确性，即在合理的情况下，如果需要内核分配新的pte及page结构体，该函数会完成并返回0，如果用户请求存在异常，该函数将返回其他值以便退出retry循环。
+因此，follow_page_mask()函数和faultin_page()函数由于对相同的页表项pte或page结构进行处理，在逻辑上应当属于同一个原子操作，即
+//原子序列开始
+操作A：follow_page_mask() o:p/o:p
+操作B：faultin_page() o:p/o:p
+操作C：follow_page_mask()
+//原子序列结束
+但是在真实的执行逻辑中，并不存在对应的保证原子一致性的保护，该操作序列极易被打断（特别是在真实代码中，该操作序列中还存在调度逻辑）。如果存在修改同一页表项pte的其他执行流在上述操作B和操作C之间被内核调用，就可能改变操作B的执行效果，从而影响操作C及后续内核上下文的执行情况。
+遗憾的是，前面介绍的madvise系统调用正是如此。
+### 3.3 竞争分析
+在madvise(MADV_DONTNEED)的关键逻辑中存在对页表项pte的清零操作，当re-try循环的操作B完成后（分配新的页表项pte），另一条执行流madvise(MADV_DONTNEED)被调度执行时，操作B的执行效果将被重置，此时，re-try循环代表的执行流又重新获取执行资源后，操作C将返回NULL，faultin_page()函数又将重新执行。如果内核开发者未预料到该情况并且faultin_page()函数在全局资源或上下文语义上不是简单的可重入函数的话，本次条件竞争问题将会对系统产生难以预料的副作用。
+因此，这就是该该条件竞争漏洞的竞争原因。操作B和操作C之间的执行资源，就是该条件竞争漏洞的竞争点。竞争方式就是利用madvise(MADV_DONTNEED)修改faultin_page()函数分配的页表项pte。实际竞争执行流如下：
+re-try执行流: follow_page_mask()返回NULL（readonly或NULL）
+re-try执行流: faultin_page()返回0，（dirty & readonly page）
+re-try执行流：follow_page_mask()返回NULL（readonly）
+re-try执行流: faultin_page()返回0，（drop ROLL_WRITE）
+madvise执行流：zap_pte_range() (pte清零)
+re-try执行流：follow_page_mask()返回NULL（pte==0）
+/ _此刻，由于失去FOLL_WRITE标志，接下来的faultin_page()函数调用会认为其在应对一个“读”情况_ /
+re-try执行流: faultin_page()返回0，（alloc page-cache page）
+此时，faultin_page()会从page cache中请求分配了page（在实际的竞争过程中，该page基本都是同一个），并且page
+dirty标志位被标记，page内容被重新初始化对应的映射的文件中对应偏移位置开始的4K数据。
+当_get_user_pages()函数完成page-cache
+page分配和页表项修复后，write系统调用继续运行并完成了用户的写请求，用户数据被写入目标内存，即该page-cache
+page。注意，由于原始normal page的pte拥有的写标志位为0，page-cache
+page对应的写标志位同样为0，此处是内核的写用户空间的正常功能。
+当file mapped page-cache page的内容被修改后，内核的dirty-writeback线程将会负责将内容回写到文件中，高权限文件因而被修改。
+### 四、漏洞分析总结
+目前linux内核开发团队已经给出修复补丁，出于性能和效率的考虑，该修复方案并非将re-try循环中的两个操作follow_page_mask()和faultin_page()进行锁操作，而是取消了循环中的逻辑读写标志。
+因此，从技术的角度，虽然该竞争点依然存在，但madvise系统调用的页表项清零操作已不再对faultin_page()函数的内核上下文的操作带来副作用。内核中是否存在其他适合的执行流能够影响该re-try循环尚未可知。
+### 五. 该如何检测漏洞？
+阿里云官方建议用户使用以下方式自查是否存在此漏洞：
+l 阿里云云盾安骑士提供自动检查方式，用户可以登录到阿里云云盾控制台使用安骑士“安全基线检查 - 高危漏洞应急检查 ”功能自动检查，
+修复漏洞后，可以自动进行修复验证漏洞修复验证：
+**控制台链接：**
+使用uname -a查看 Linux 系统的内核版本，如：
+[Linux AYxxxx ]2.6.32-431.23.3.el6.x86_64 #1 SMP Thu Jul 31 17:20:51 UTC 2014
+x86_64 x86_64 x86_64 GNU/Linux
+上述内核版本2.6.32-431.23.3.el6.x86_64受漏洞影响。
+[Linux AYxxxx ]2.6.18-308.el5 #1 SMP Tue Feb 21 20:06:06 EST 2012 x86_64
+x86_64 x86_64 GNU/Linux
+上述内核版本2.6.18-308.el5不受漏洞影响。
+0 回复Ta 笑然 管理 发表于：2016-10-25 12:05:24
+### 六、 该如何修复漏洞？
+目前阿里云安全团队针对已经发布补丁的Linux发行版本提供了漏洞修复方案，用户可以参考官方链接进行修复:
+对于对于CentOS和AliyunOS 操作系统，官方正在研发漏洞对应的系统补丁，待补丁发布后，将系统更新到最新版本即可修复漏洞。
+**提示：由于涉及到操作系统内核的升级，我们强烈建议您：正确关闭正在运行的服务，并做好数据备份工作。同时创建服务器磁盘快照，避免修复失败造成不可逆的影响。**
+### 七. 参考链接

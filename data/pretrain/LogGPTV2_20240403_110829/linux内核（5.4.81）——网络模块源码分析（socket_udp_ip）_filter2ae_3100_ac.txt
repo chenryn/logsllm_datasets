@@ -1,0 +1,311 @@
+        __be32        faddr;
+        __be32        nexthop;
+        unsigned char    optlen;
+        unsigned char    srr;
+        unsigned char    rr;
+        unsigned char    ts;
+        unsigned char    is_strictroute:1,
+                srr_is_hit:1,
+                is_changed:1,
+                rr_needaddr:1,
+                ts_needtime:1,
+                ts_needaddr:1;
+        unsigned char    router_alert;
+        unsigned char    cipso;
+        unsigned char    __pad2;
+        unsigned char    __data[0];
+    };
+    if (!ipc.opt) {
+            struct ip_options_rcu *inet_opt;
+            rcu_read_lock();
+            inet_opt = rcu_dereference(inet->inet_opt);
+            // 将inet->inet_opt->opt拷贝给opt_copy
+            if (inet_opt) {
+                memcpy(&opt_copy, inet_opt,
+                       sizeof(*inet_opt) + inet_opt->opt.optlen);
+                // 填充ipc.opt
+                ipc.opt = &opt_copy.opt;
+            }
+            rcu_read_unlock();
+        }
+  * 检查是否设置了源记录路由(source record route, SRR) IP 选项. SRR 有两种类型: 宽松源记录路由/严格源记录路由. 如果设置SRR, 则会记录第一跳地址并保存到faddr, 然后将socket 标记为unconnected
+    if (ipc.opt && ipc.opt->opt.srr) {
+        if (!daddr) {
+            err = -EINVAL;
+            goto out_free;
+        }
+        faddr = ipc.opt->opt.faddr;
+        connected = 0;
+    }
+  * 获得tos标志(优先从控制信息ipc中获取, 没有自定义则从inet默认获取tos), tos详细见2.4.2
+    tos = get_rttos(&ipc, inet);
+  * 禁止路由设置可以由三种方式控制
+        if (sock_flag(sk, SOCK_LOCALROUTE) ||
+            (msg->msg_flags & MSG_DONTROUTE) ||
+            (ipc.opt && ipc.opt->opt.is_strictroute)) {
+            tos |= RTO_ONLINK;
+            connected = 0;
+        }
+  * 选择网卡设备, 多播见2.4.3
+    // 通过判断目的地址是否位于224.0.0.0/4 网段, 确定是否为多播
+    if (ipv4_is_multicast(daddr)) {
+        // 设置设备索引为多播设备
+        if (!ipc.oif || netif_index_is_l3_master(sock_net(sk), ipc.oif))
+            ipc.oif = inet->mc_index;
+        // 如果没有设置源地址, 则设置源地址为多播地址
+        if (!saddr)
+            saddr = inet->mc_addr;
+        connected = 0;
+    } else if (!ipc.oif) {
+        // 协议控制信息没有设置设备索引且非多播则设置设备索引为单播设备索引
+        ipc.oif = inet->uc_index;
+    } else if (ipv4_is_lbcast(daddr) && inet->uc_index) {
+        /* oif is set, packet is to local broadcast and
+            * and uc_index is set. oif is most likely set
+            * by sk_bound_dev_if. If uc_index != oif check if the
+            * oif is an L3 master and uc_index is an L3 slave.
+            * If so, we want to allow the send using the uc_index.
+            */
+        // 协议控制信息已设置设备索引&消息本地广播&inet存在单播设备&ipc未与inet单播设备绑定
+        // 如果ipc绑定inet网卡设备的l3主设备(虚拟网卡), 更改绑定设备为inet网卡(本地广播不需要l3mdev辅助实现VRF)
+        // 关于VRF建议阅读: https://blog.csdn.net/dog250/article/details/78069964
+        if (ipc.oif != inet->uc_index &&
+            ipc.oif == l3mdev_master_ifindex_by_index(sock_net(sk),
+                                    inet->uc_index)) {
+            ipc.oif = inet->uc_index;
+        }
+    }
+  * 获得路由信息
+    if (connected)
+            // 如果正在连接, 检查路由是否过期, 详细见2.4.4
+            rt = (struct rtable *)sk_dst_check(sk, 0);
+    if (!rt) {
+            struct net *net = sock_net(sk);
+            __u8 flow_flags = inet_sk_flowi_flags(sk);
+            fl4 = &fl4_stack;
+            // flowi4_init_output初始化flow, 描述udp数据流信息
+            flowi4_init_output(fl4, ipc.oif, ipc.sockc.mark, tos,
+                       RT_SCOPE_UNIVERSE, sk->sk_protocol,
+                       flow_flags,
+                       faddr, saddr, dport, inet->inet_sport,
+                       sk->sk_uid);
+            // LSM
+            security_sk_classify_flow(sk, flowi4_to_flowi(fl4));
+            // 获得路由表项
+            rt = ip_route_output_flow(net, fl4, sk);
+            if (IS_ERR(rt)) {
+                err = PTR_ERR(rt);
+                rt = NULL;
+                if (err == -ENETUNREACH)
+                    IP_INC_STATS(net, IPSTATS_MIB_OUTNOROUTES);
+                goto out;
+            }
+            err = -EACCES;
+            // 广播路由必须由具有配置SOCK_BROADCAST 标志的sock接收
+            if ((rt->rt_flags & RTCF_BROADCAST) &&
+                !sock_flag(sk, SOCK_BROADCAST))
+                goto out;
+            if (connected)
+                // 如果当前sock 处于connected状态, 则将路由保存至sk->sk_dst_cache
+                sk_dst_set(sk, dst_clone(&rt->dst));
+        }
+  * 对于用于探测的数据包, 如果配置了MSG_CONFIRM标志, 则更新邻居结点ARP缓存时间戳, 防止ARP缓存过期
+    if (msg->msg_flags&MSG_CONFIRM)
+            goto do_confirm;
+    ...
+    do_confirm:
+        if (msg->msg_flags & MSG_PROBE)
+            dst_confirm_neigh(&rt->dst, &fl4->daddr);
+  * 非阻塞情况下
+    if (!corkreq) {
+            struct inet_cork cork;
+            // 构建 skb, 详细见4.2
+            skb = ip_make_skb(sk, fl4, getfrag, msg, ulen,
+                      sizeof(struct udphdr), &ipc, &rt,
+                      &cork, msg->msg_flags);
+            err = PTR_ERR(skb);
+            if (!IS_ERR_OR_NULL(skb))
+                // 传输skb 至网络层, 详细见1.4.5
+                err = udp_send_skb(skb, fl4, &cork);
+            goto out;
+        }
+  * 阻塞情况下
+        /*
+         *    Now cork the socket to pend data.
+         */
+        fl4 = &inet->cork.fl.u.ip4;
+        fl4->daddr = daddr;
+        fl4->saddr = saddr;
+        fl4->fl4_dport = dport;
+        fl4->fl4_sport = inet->inet_sport;
+        up->pending = AF_INET;
+    do_append_data:
+        up->len += ulen;
+        err = ip_append_data(sk, fl4, getfrag, msg, ulen,
+                     sizeof(struct udphdr), &ipc, &rt,
+                     corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
+        if (err)
+            // 链接skb过程中发生错误, 丢弃skb
+            udp_flush_pending_frames(sk);
+        else if (!corkreq)
+            // 组织链接skb后调用udp_send_skb, 填充udp头部并将skb传输给ip层, 详细见2.4.6
+            err = udp_push_pending_frames(sk);
+        else if (unlikely(skb_queue_empty(&sk->sk_write_queue)))
+            up->pending = 0;
+        release_sock(sk);
+###  2.4.1 udp_cmsg_send
+  * 通过相关patch进行分析得出以下结论. [patch1](https://www.spinics.net/lists/netdev/msg496109.html) patch2: 添加GSO机制, 用户可以在一次系统调用中, 向同一目的ip发送多个报文
+> udp_cmsg_send
+    // 遍历被切割成多个cmsg的msg->control
+    int udp_cmsg_send(struct sock *sk, struct msghdr *msg, u16 *gso_size)
+    {
+        struct cmsghdr *cmsg;
+        bool need_ip = false;
+        int err;
+        for_each_cmsghdr(cmsg, msg) {
+            if (!CMSG_OK(msg, cmsg))
+                return -EINVAL;
+            // 存在非UDP层控制信息, 下一步会进入ip_cmsg_send解析
+            if (cmsg->cmsg_level != SOL_UDP) {
+                need_ip = true;
+                continue;
+            }
+            err = __udp_cmsg_send(cmsg, gso_size);
+            if (err)
+                return err;
+        }
+        return need_ip;
+    }
+> udp_cmsg_send->for_each_cmsghdr(cmsg, msg)
+  * 将msg->control切割成多个cmsg, 具体逻辑: 
+    * 获得第一个cmsg: cmsg = msg->control(msg->controllen >= sizeof(struct cmsghdr)), cmsghdr结构体包含 **cmsg_data** flexarr 成员, 该成员为可变字符数组, 用来存储cmsg, 也就是说msg->control中的数据按照cmsghdr结构储存管理, 且cmsghdr结构可变
+    * 获得next_cmsg: next_cmsg = cmsg + (align)cmsg->cmsg_len(cmsg+cmsg->cmsg_len+1-msg->control > msg->msg_controllen)
+    #define for_each_cmsghdr(cmsg, msg) \
+        for (cmsg = CMSG_FIRSTHDR(msg); \
+             cmsg; \
+             cmsg = CMSG_NXTHDR(msg, cmsg))
+    /* CMSG_FIRSTHDR:
+    #define CMSG_FIRSTHDR(msg)    __CMSG_FIRSTHDR((msg)->msg_control, (msg)->msg_controllen)
+    #define __CMSG_FIRSTHDR(ctl,len) ((len) >= sizeof(struct cmsghdr) ? \
+                      (struct cmsghdr *)(ctl) : \
+                      (struct cmsghdr *)NULL)
+    */
+    /* CMSG_NXTHDR:
+    #define CMSG_NXTHDR(mhdr, cmsg) cmsg_nxthdr((mhdr), (cmsg))
+    static inline struct cmsghdr * cmsg_nxthdr (struct msghdr *__msg, struct cmsghdr *__cmsg)
+    {
+        return __cmsg_nxthdr(__msg->msg_control, __msg->msg_controllen, __cmsg);
+    }
+    static inline struct cmsghdr * __cmsg_nxthdr(void *__ctl, __kernel_size_t __size,
+                               struct cmsghdr *__cmsg)
+    {
+        struct cmsghdr * __ptr;
+        __ptr = (struct cmsghdr*)(((unsigned char *) __cmsg) +  CMSG_ALIGN(__cmsg->cmsg_len));
+        if ((unsigned long)((char*)(__ptr+1) - (char *) __ctl) > __size)
+            return (struct cmsghdr *)0;
+        return __ptr;
+    }
+> udp_cmsg_send->__udp_cmsg_send
+    static int __udp_cmsg_send(struct cmsghdr *cmsg, u16 *gso_size)
+    {
+        switch (cmsg->cmsg_type) {
+        case UDP_SEGMENT:
+            if (cmsg->cmsg_len != CMSG_LEN(sizeof(__u16)))
+                return -EINVAL;
+            // 指定GSO报文大小, UDP_SEGMENT类型控制信息, 会在cmsg->__cmsg_data前两字节处指定gso_size
+            *gso_size = *(__u16 *)CMSG_DATA(cmsg);
+            return 0;
+        default:
+            return -EINVAL;
+        }
+    }
+###  2.4.2 TOS
+> TOS(8bits) 通过填充flag标志位, 用以表示网络设备提供的服务类型(网络设备必须能够支持, 否则没有任何意义).
+  * 前3bits: 废弃, 无意义, 默认000
+  * 4bits: 
+    * 1000 — minimize delay 最小延迟
+    * 0100 — maximize throughput 最大吞吐量
+    * 0010 — maximize reliability 最高可靠性
+    * 0001 — minimize monetary cost 最小费用
+    * 0000 — normal service 一般服务
+  * 末尾1bit: 无意义, 保留
+###  2.4.3 多播/本地广播
+  * 设置多播/本地广播 
+    * 多播可以参考这篇文章(多播技术)[], 总结概括如下: 
+      * 多播用来实现一点对多点的传播, 适用于流媒体, 视频会议等场景
+      * 多播类似于广播, 使用特殊ip地址作为目的地址(224.0.0.0/4), 多播数据报文会被路由器抄写为多份, 发送至多个目标. 与广播不同的是, 多播只会向存在多播接收请求的子网转发信息.
+      * 对于接收者来说, 如果接收者希望接收某一多播信息, 会使用IGMP协议向本地服务器发送请求申请加入某多播组, 本地路由器会将该接收者加入多播组, 并将该组信息共享至相邻路由节点.
+    * 本地广播此处不再赘述
+###  2.4.4 检查sock中路由信息是否过期
+> sk_dst_check
+    struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie)
+    {
+        struct dst_entry *dst = sk_dst_get(sk);
+        if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
+            sk_dst_reset(sk);
+            dst_release(dst);
+            return NULL;
+        }
+        return dst;
+    }
+> sk_dst_check->sk_dst_get(获得路由信息)
+    sk_dst_get(struct sock *sk)
+    {
+        struct dst_entry *dst;
+        rcu_read_lock();
+        // 从sk->sk_dst_cache去路由信息
+        dst = rcu_dereference(sk->sk_dst_cache);
+        // 引用数 +1
+        if (dst && !atomic_inc_not_zero(&dst->__refcnt))
+            dst = NULL;
+        rcu_read_unlock();
+        return dst;
+    }
+> sk_dst_check->dst->ops->check(ipv4下调用ipv4_dst_check, 检查是否过期)
+    static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
+    {
+        struct rtable *rt = (struct rtable *) dst;
+        /* All IPV4 dsts are created with ->obsolete set to the value
+         * DST_OBSOLETE_FORCE_CHK which forces validation calls down
+         * into this function always.
+         *
+         * When a PMTU/redirect information update invalidates a route,
+         * this is indicated by setting obsolete to DST_OBSOLETE_KILL or
+         * DST_OBSOLETE_DEAD.
+         */
+        // dst->obsolete 不等于DST_OBSOLETE_FORCE_CHK表示路由信息过期
+        if (dst->obsolete != DST_OBSOLETE_FORCE_CHK || rt_is_expired(rt))
+            return NULL;
+        return dst;
+    }
+###  2.4.5 udp_send_skb
+    static int udp_send_skb(struct sk_buff *skb, struct flowi4 *fl4,
+                struct inet_cork *cork)
+    {
+        struct sock *sk = skb->sk;
+        struct inet_sock *inet = inet_sk(sk);
+        struct udphdr *uh;
+        int err = 0;
+        int is_udplite = IS_UDPLITE(sk);
+        int offset = skb_transport_offset(skb);
+        int len = skb->len - offset;
+        int datalen = len - sizeof(*uh);
+        __wsum csum = 0;
+        /*
+         * Create a UDP header
+         */
+        // 填充udp头
+        uh = udp_hdr(skb);
+        uh->source = inet->inet_sport;
+        uh->dest = fl4->fl4_dport;
+        uh->len = htons(len);
+        uh->check = 0;
+        // 检查是否满足GSO机制, 直接进入硬件校验
+        if (cork->gso_size) {
+            const int hlen = skb_network_header_len(skb) +
+                     sizeof(struct udphdr);
+            if (hlen + cork->gso_size > cork->fragsize) {
+                kfree_skb(skb);
+                return -EINVAL;
+            }
+            if (skb->len > cork->gso_size * UDP_MAX_SEGMENTS) {

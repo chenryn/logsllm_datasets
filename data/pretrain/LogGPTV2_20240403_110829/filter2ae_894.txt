@@ -1,0 +1,171 @@
+# runC CVE-2019-16884-欺骗AppArmor分析及其思考
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前置技术
+###  apparmor
+> 参考链接：
+>
+> 
+>
+> 
+>
+> 如何使用内核安全模块： guide/LSM/index.html>
+>
+>
+> /proc/self/attr/exec使用：
+​
+简单来说apparmor可以让管理员通过程序的配置文件限制程序的功能，其本身作为一个内核模块集成在Linux内核中(这里可能会有人发现lsmod里面并没有apparmor，这是因为lsmod展示的是所有动态加载的内核模块，通过ls
+/sys/module/ 就可以看到所有的内核模块包括系统中内置的)，因此其通过内核提供强访问控制。
+    cat /sys/module/apparmor/parameters/enabled //查看是否开启apparmor，返回为Y表示开启
+    sudo cat /sys/kernel/security/apparmor/profiles  // 查看加载的配置文件
+​
+那么在Docker中是如何判断内核是否开启了apparmor功能模块呢？其实也是通过查看`/sys/module/apparmor/parameters/enabled`文件来确定的相关代码可以参考[这里](https://github.com/moby/moby/blob/master/daemon/apparmor_default.go)。docker
+Deamon默认的apparmor策略可以参考[这里](https://github.com/moby/moby/blob/master/profiles/apparmor/template.go)。
+​
+那么对于runC启动容器来说其也会加载[apparmor策略](https://github.com/opencontainers/runc/blob/8bf216728cd558d736eda2dff404b34b262b8c77/libcontainer/standard_init_linux.go#L115-L117)，应用的过程就是将`exec
+文件路径`写入到`/proc/self/attr/exec`，具体可参考[源码](https://github.com/opencontainers/runc/blob/8bf216728cd558d736eda2dff404b34b262b8c77/libcontainer/apparmor/apparmor.go#L23-L56)。
+## 漏洞分析
+​ CVE-2019-16884可以使得用户绕过apparmor的一些策略进而可以实现一些提权操作。
+问题函数：
+在该函数中会对需要挂载的目标路径进行合法判断：
+        default:
+            // ensure that the destination of the mount is resolved of symlinks at mount time because
+            // any previous mounts can invalidate the next mount's destination.
+            // this can happen when a user specifies mounts within other mounts to cause breakouts or other
+            // evil stuff to try to escape the container's rootfs.
+            var err error
+            if dest, err = securejoin.SecureJoin(rootfs, m.Destination); err != nil {
+                return err
+            }
+            if err := checkMountDestination(rootfs, dest); err != nil {
+                return err
+            }
+            // update the mount with the correct dest after symlinks are resolved.
+            m.Destination = dest
+            if err := os.MkdirAll(dest, 0755); err != nil {
+                return err
+            }
+            return mountPropagate(m, rootfs, mountLabel)
+但是在checkMountDestination函数中，其对invalidDestinations的判断存在问题，假设rootfs为/test那么拼接出来的非法路径就是/test/proc，那么`path`就代表相对于/test/proc的路径，条件`path
+!= "."`判断出并非路径/test/proc，条件`!strings.HasPrefix(path,
+"..")`判断出路径不在/test/proc/目录内。但是它忽略了 **path==”/test/proc”** 的情况。
+项目的[测试代码](https://github.com/opencontainers/runc/blob/7507c64ff675606c5ff96b0dd8889a60c589f14d/libcontainer/rootfs_linux_test.go#L19-L25)同样存在问题，错把`==`写错为`!=`，最终导致及时在测试阶段也没排除bug。
+    // checkMountDestination checks to ensure that the mount destination is not over the top of /proc.
+    // dest is required to be an abs path and have any symlinks resolved before calling this function.
+    func checkMountDestination(rootfs, dest string) error {
+        invalidDestinations := []string{
+            "/proc",
+        }
+        // White list, it should be sub directories of invalid destinations
+        validDestinations := []string{
+            // These entries can be bind mounted by files emulated by fuse,
+            // so commands like top, free displays stats in container.
+            "/proc/cpuinfo",
+            "/proc/diskstats",
+            "/proc/meminfo",
+            "/proc/stat",
+            "/proc/swaps",
+            "/proc/uptime",
+            "/proc/loadavg",
+            "/proc/net/dev",
+        }
+        for _, valid := range validDestinations {
+            path, err := filepath.Rel(filepath.Join(rootfs, valid), dest)
+            if err != nil {
+                return err
+            }
+            if path == "." {
+                return nil
+            }
+        }
+        for _, invalid := range invalidDestinations {
+            path, err := filepath.Rel(filepath.Join(rootfs, invalid), dest)
+            if err != nil {
+                return err
+            }
+            if path != "." && !strings.HasPrefix(path, "..") {
+                return fmt.Errorf("%q cannot be mounted because it is located inside %q", dest, invalid)
+            }
+        }
+        return nil
+    }
+整个问题函数的调用链如下：
+    libcontainer.Init() -> prepareRootfs() -> mountToRootfs() -> checkMountDestination()
+​
+因此整个挂载过程在Init()阶段就已经完成，因此就导致后期进行ApplyProfile()函数调用的时候无法使用正确的/proc/self/attr/exec，进而对runC形成了一种欺骗效果。
+​
+在看漏洞相关的[issues](https://github.com/opencontainers/runc/issues/2128)的时候得知，为了防止符号链接攻击，作者采用了以相对于宿主机根路径而不是相对与roofs的[方法](https://github.com/opencontainers/runc/pull/1832/commits/636b664027293628bbb59a58e7ec5d4cd567affb)，但是因为缺少逻辑判断导致引发的新的漏洞问题。同时，当时发现该漏洞的人发觉该漏洞同时可以[控制SELinux](https://github.com/opencontainers/runc/issues/2128#issuecomment-535478352)，因为其也会使用/proc/self/attr/目录下的，个人认为这种联想和发现问题以及将相同的问题扩展到不同场景上的能力是漏洞挖掘人员的核心能力之一。
+###  如何利用？
+​
+假设我们可以成功挂载/proc卷，那么我们就可以自定义/proc里面的内容，这样我们就可以使得/proc/self/attr/exec可控，因此就会使得相关的apparmor安全策略无法加载。
+​ 因此我们需要构造一个恶意镜像：
+    mkdir -p rootfs/proc/self/{attr,fd}
+    touch rootfs/proc/self/{status,attr/exec} # exec 我懂，别的是啥意思
+    touch rootfs/proc/self/fd/{4,5}
+    cat  Dockerfile
+    FROM busybox
+    ADD rootfs / 
+    VOLUME /proc
+    EOF
+    docker build -t apparmor-bypass .
+    docker run --rm -it --security-opt "apparmor=docker-default"  apparmor-bypass
+    # container runs unconfined
+其实思路很简单，如果我们可以挂载/proc，那么其中的内容便可以被我们控制，我们通过ADD rootfs 到/
+，从而使得相关的AppArmor策略无法在容器进程中生效。
+###  如何修复？
+​ github关于该漏洞的修复方法：
+####  修复建议一
+​ 如果要挂载的文件路径是/proc，那么判断其是否是proc类型，核心代码如下：
+        const procPath = "/proc"
+        path, err := filepath.Rel(filepath.Join(rootfs, procPath), dest)
+        if err != nil {
+            return err
+        }
+        // check if the path is outside the rootfs
+        if path == "." || !strings.HasPrefix(path, "..") {
+            // only allow a mount on-top of proc if it's source is "procfs"
+            fstype, err := mount.FSType(source)
+            if err != nil {
+                if err == mount.ErrNotMounted {
+                    return fmt.Errorf("%q cannot be mounted because it is not of type proc", dest)
+                }
+                return err
+            }
+            if fstype != "proc" {
+                return fmt.Errorf("%q cannot be mounted because it is not of type proc", dest)
+            }
+###  修复建议二
+​ 直接对”.”相对路径进行了判断，这个也是最有针对性的，被最终采纳：
+        if !strings.HasPrefix(path, "..") {
+            if path == "." {
+                // an empty source is pasted on restore
+                if source == "" {
+                    return nil
+                }
+                // only allow a mount on-top of proc if it's source is "proc"
+                isproc, err := isProc(source)
+                if err != nil {
+                    return err
+                }
+                if !isproc {
+                    return fmt.Errorf("%q cannot be mounted because it is not of type proc", dest)
+                }
+                return nil
+###  修复建议三
+​ 在容器加载AppArmor策略的时候，判断相关文件是不是proc类型的文件，这个也被采纳：
+    func setProcAttr(attr, value string) error {
+        // Under AppArmor you can only change your own attr, so use /proc/self/
+        // instead of /proc// like libapparmor does
+        path := fmt.Sprintf("/proc/self/attr/%s", attr)
+        f, err := os.OpenFile(path, os.O_WRONLY, 0)
+        if err != nil {
+            return err
+        }
+        defer f.Close()
+        if err := utils.EnsureProcHandle(f); err != nil {
+            return err
+        }
+        _, err = fmt.Fprintf(f, "%s", value)
+        return err
+    }

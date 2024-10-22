@@ -1,0 +1,124 @@
+这篇简短的文章描述了我们在实战过程中的对Linux内核漏洞的调查以及我对Semmle
+QL和Coccinelle的使用经验，我曾经用该工具来搜索类似的bug。
+### 内核漏洞
+几天前，我的自定义`syzkaller`项目代码产生了崩溃。它具有一个非常稳定的reproducer
+，所以我借用此模块进行研究。在这里，我将借此机会说`syzkaller`是一个非常棒的项目，对我们的行业产生了很大的影响。
+我发现导致此崩溃的错误已在commit 229b53c9bf4e（2017年6月）中的`drivers/block/floppy.c`中引入。
+`compat_getdrvstat()`函数代码如下所示：
+    static int compat_getdrvstat(int drive, bool poll,
+                                struct compat_floppy_drive_struct __user *arg)
+    {
+            struct compat_floppy_drive_struct v;
+            memset(&v, 0, sizeof(struct compat_floppy_drive_struct));
+    ...
+            if (copy_from_user(arg, &v, sizeof(struct compat_floppy_drive_struct)))
+                    return -EFAULT;
+    ...
+    }
+这里`copy_from_user()`将用户空间指针arg作为复制目标，将内核空间指针＆v作为源。 这显然是一个错误。
+它可以由具有访问软盘驱动器的用户触发。
+这个bug对x86_64的影响很大。 它从内核空间导致用户空间内存的`memset()`执行：
+1 `copy_from_user()`源码（第二个参数）的`access_ok()`失败。
+2 然后`copy_from_user()`尝试删除复制目标（第一个参数）。
+3 但目标是在用户空间而不是内核空间...
+4 所以我们产生了一个内核崩溃：
+    [   40.937098] BUG: unable to handle page fault for address: 0000000041414242
+    [   40.938714] #PF: supervisor write access in kernel mode
+    [   40.939951] #PF: error_code(0x0002) - not-present page
+    [   40.941121] PGD 7963f067 P4D 7963f067 PUD 0
+    [   40.942107] Oops: 0002 [#1] SMP NOPTI
+    [   40.942968] CPU: 0 PID: 292 Comm: d Not tainted 5.3.0-rc3+ #7
+    [   40.944288] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Ubuntu-1.8.2-1ubuntu1 04/01/2014
+    [   40.946478] RIP: 0010:__memset+0x24/0x30
+    [   40.947394] Code: 90 90 90 90 90 90 0f 1f 44 00 00 49 89 f9 48 89 d1 83 e2 07 48 c1 e9 03 40 0f b6 f6 48 b8 01 01 01 01 01 01 01 01 48 0f af c6 48 ab 89 d1 f3 aa 4c 89 c8 c3 90 49 89 f9 40 88 f0 48 89 d1 f3
+    [   40.951721] RSP: 0018:ffffc900003dbd58 EFLAGS: 00010206
+    [   40.952941] RAX: 0000000000000000 RBX: 0000000000000034 RCX: 0000000000000006
+    [   40.954592] RDX: 0000000000000004 RSI: 0000000000000000 RDI: 0000000041414242
+    [   40.956169] RBP: 0000000041414242 R08: ffffffff8200bd80 R09: 0000000041414242
+    [   40.957753] R10: 0000000000121806 R11: ffff88807da28ab0 R12: ffffc900003dbd7c
+    [   40.959407] R13: 0000000000000001 R14: 0000000041414242 R15: 0000000041414242
+    [   40.961062] FS:  00007f91115c4440(0000) GS:ffff88807da00000(0000) knlGS:0000000000000000
+    [   40.962603] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [   40.963695] CR2: 0000000041414242 CR3: 000000007c584000 CR4: 00000000000006f0
+    [   40.965004] Call Trace:
+    [   40.965459]  _copy_from_user+0x51/0x60
+    [   40.966141]  compat_getdrvstat+0x124/0x170
+    [   40.966781]  fd_compat_ioctl+0x69c/0x6d0
+    [   40.967423]  ? selinux_file_ioctl+0x16f/0x210
+    [   40.968117]  compat_blkdev_ioctl+0x21d/0x8f0
+    [   40.968864]  __x32_compat_sys_ioctl+0x99/0x250
+    [   40.969659]  do_syscall_64+0x4a/0x110
+    [   40.970337]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+我还没有找到一种方法来利用它来进行权限提升。
+### 变体应用分析：Semmle QL
+我的第一个想法是在整个内核源代码中搜索类似的问题。 我决定尝试`Semmle QL（Semmle最近非常活跃）`。
+这里有一个很好的QL和LGTM介绍，有足够的信息可以快速启动。  
+[introduction to QL and LGTM](https://blog.semmle.com/introduction-to-variant-analysis-part-2/)
+所以我在Query控制台中打开了Linux内核项目，搜索了`copy_from_user()`的调用：
+    import cpp
+    from FunctionCall call
+    where call.getTarget().getName() = "copy_from_user"
+    select call, "I see a copy_from_user here!"
+此查询仅提供了616个结果。 这很奇怪，因为Linux内核中应该有更多的`copy_from_user()`调用。 我在LGTM文档中找到了答案：
+> LGTM从每个代码库中提取信息并生成数据库  
+>  并准备好查询。之后对于C/C++项目，构建源代码，并作为提取过程的一部分。
+因此，用于内核构建的Linux内核配置限制了LGTM分析的范围。 如果配置中没有启用某个内核子系统，则它不会构建，因此我们无法在LGTM中分析其代码。
+LGTM文档还说：
+> 我们可能需要自定义流程以使LGTM能够构建项目。  
+>  我们可以通过向存储库添加项目的lgtm.yml文件来完成此操作。
+我决定为Linux内核创建一个自定义lgtm.yml文件，并在LGTM社区论坛上提供一个默认文件。
+LGTM团队的答案非常快速：
+我们在lgtm.com上使用的工作机器很小且资源有限，所以不幸的是，defconfig只是我们可以使用的最大配置。每次提交完整构建+提取+分析需要3.5小时，而我们最多允许4个小时的分析过程。
+这并不是一个好的回复，但他们目前正致力于大项目的解决方案。  
+所以我决定尝试另一种工具进行调查。
+### 变体分析：Coccinelle
+我听说过Coccinelle。 Linux内核社区经常使用这个工具。 此外，我记得`Kees
+Cook`用`Coccinelle`搜索了`copy_from_user()`错误。
+所以我开始学习语义补丁语言（SmPL）并最终编写了这条规则（感谢Julia Lawall的反馈）：
+    virtual report
+    @cfu exists@
+    identifier f;
+    type t;
+    identifier v;
+    position decl_p;
+    position copy_p;
+    @@
+    f(..., t v@decl_p, ...)
+    {
+    ... when any
+    copy_from_user@copy_p(v, ...)
+    ... when any
+    }
+    @script:python@
+    f << cfu.f;
+    t << cfu.t;
+    v << cfu.v;
+    decl_p << cfu.decl_p;
+    copy_p << cfu.copy_p;
+    @@
+    if '__user' in t:
+      msg0 = "function \"" + f + "\" has arg \"" + v + "\" of type \"" + t + "\""
+      coccilib.report.print_report(decl_p[0], msg0)
+      msg1 = "copy_from_user uses \"" + v + "\" as the destination. What a shame!\n"
+      coccilib.report.print_report(copy_p[0], msg1)
+它的想法很简单。通常在将用户空间指针作为参数的函数中调用`copy_from_user()`。
+我的规则描述了`copy_from_user()`将用户空间指针作为复制目标时的情况：
+  * 规则的主要部分查找所有情况，当某个函数f()的参数v用作copy_from_user()的第一个参数。
+  * 如果匹配，Python脚本将检查v是否在其类型中具有`__user`注释。
+这是Coccinelle输出：
+    ./drivers/block/floppy.c:3756:49-52: function "compat_getdrvprm" has arg "arg"
+    of type "struct compat_floppy_drive_params __user *"
+    ./drivers/block/floppy.c:3783:5-19: copy_from_user uses "arg" as the
+    destination. What a shame!
+    ./drivers/block/floppy.c:3789:49-52: function "compat_getdrvstat" has arg "arg"
+    of type "struct compat_floppy_drive_struct __user *"
+    ./drivers/block/floppy.c:3819:5-19: copy_from_user uses "arg" as the
+    destination. What a shame!
+因此，有两个（不是非常危险的）内核漏洞适合这种错误模式。
+### 公共的0 day 漏洞
+事实证明，我不是第一个发现这些错误的人。 Jann
+Horn于2019年3月向他们报告。他用[sparse](https://www.kernel.org/doc/html/latest/dev-tools/sparse.html)的方法找到它们。 我绝对相信它能找到比我的PoC Coccinelle规则更多的错误案例。
+但事实上，Jann的补丁丢失了，并没有进入官方的更新主线。  
+所以这两个错误可以称为“公开的0 day”:-)
+我已经向LKML报告了这个问题，而Jens Axboe将应用Jann的Linux内核v5.4补丁。
+    本文为翻译文章：http://blog.ptsecurity.com/2019/08/case-study-searching-for-vulnerability.html

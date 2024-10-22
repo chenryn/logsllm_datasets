@@ -1,0 +1,236 @@
+## PostgreSQL 10.0 preview 逻辑订阅 - 原理与最佳实践  
+##### [TAG 13](../class/13.md) , [TAG 24](../class/24.md)
+### 作者            
+digoal            
+### 日期            
+2016-02-27            
+### 标签            
+PostgreSQL , logical replication , 逻辑复制 , 最佳实践     
+----            
+## 背景       
+PostgreSQL 从2010年发布的9.0开始支持流式物理复制，从此备库可以作为只读库打开（使用的同时不堵塞实时流式恢复(自带冲突检测和处理机制)），提供给用户只读使用。  
+从2014年发布的9.4开始，PostgreSQL具备了流式逻辑复制的能力，有很多第三方的插件可以选择，2017年，不再需要这些插件了，因为PG已经把逻辑复制的功能加入了10的内核。    
+### 物理复制的好处  
+1\. 物理层面完全一致，这是许多商业数据库的惯用手段。例如Oracle的DG。  
+2\. 延迟低，事务执行过程中产生REDO record，实时的在备库apply，事务结束时，备库立马能见到数据。不论事务多大，都一样。  
+3\. 物理复制的一致性、可靠性达到了金融级的需求，不必担心数据逻辑层面不一致。  
+但是物理复制要求主备块级完全一致，所以有一些无法覆盖的应用场景，例如备库不仅要只读，还要可写。又比如备库不需要完全和主库一致，只需要复制部分数据，或者备库要从多个数据源复制数据，等等。  
+### 物理复制无法覆盖的场景  
+1\. 数据库实例的部分，例如单个数据库或者某些表的复制需求。  
+例如某个游戏业务，账号体系是一套数据库，如果全国各地有多个接入点，全部都连到中心数据库进行认证可能不太科学。那么就希望将登陆需要用到的一些数据表同步到多个数据中心，而不是整个数据库实例。  
+2\. 数据到达subcriber后，针对不同数据，设置触发器。  
+3\. 将多个数据库实例的数据，同步到一个目标数据库。  
+例如多个数据库同步到一个大的数据仓库。  
+4\. 在不同的数据库版本之间，复制数据。  
+5\. 将一个数据库实例的不同数据，复制到不同的目标库。  
+例如省级数据库的数据，按地区划分，分别复制到不同的地区。  
+6\. 在多个数据库实例之间，共享部分数据。  
+例如某个业务按用户ID哈希，拆分成了8个数据库，但是有些小的维度表，需要在多个数据库之间共享。  
+以上场景是物理复制无法覆盖的。  
+逻辑复制应运而生，实际上，从2014年发布的9.4版本开始，PostgreSQL就支持逻辑复制了，只是一直没有将其引入内核。  
+2017年即将发布的10.0，将会在内核层面支持基于REDO流的逻辑复制。  
+另一个好消息是，你可以针对同一个数据库实例，同时使用逻辑复制和物理复制，因为他们都是基于REDO的。  
+下面我们来看一下逻辑复制的概念、架构、监控、安全、最佳实践。  
+## 逻辑复制概念  
+PostgreSQL 逻辑复制是事务级别的复制，引入了几个概念  
+### publication - 发布者  
+发布者指数据上游节点，你需要将哪些表发布出去？  
+上游节点需要配置这些东西  
+1\. 需要将数据库的REDO的wal_level配置为logical。(support minimal, replica, or logical)    
+2\. 需要发布逻辑复制的表，必须配置表的REPLICA IDENTITY，即如何标示老的记录。  
+被复制的表，建议有PK约束。  
+```  
+alter table table_name  
+    REPLICA IDENTITY { DEFAULT | USING INDEX index_name | FULL | NOTHING }  
+```  
+解释  
+```  
+REPLICA IDENTITY  
+This form changes the information which is written to the write-ahead log to identify rows which are updated or deleted.   
+This option has no effect except when logical replication is in use.   
+记录PK列的  
+1. DEFAULT (the default for non-system tables) records the old values of the columns of the primary key, if any.   
+记录指定索引列（索引的所有列须是not null列，其实和PK一样，但是某些情况下，你可以选一个比PK更小的UK）  
+2. USING INDEX records the old values of the columns covered by the named index, which must be unique, not partial, not deferrable, and include only columns marked NOT NULL.   
+记录完整记录  
+3. FULL records the old values of all columns in the row.   
+啥也不记录，这样做是否不支持update, delete?   
+系统表，默认为replica identity nothing啥也不记录。
+4. NOTHING records no information about the old row (This is the default for system tables.)   
+仅仅当数据有变更时才会记录old value，比如delete。 或者update前后old.*<>new.*。      
+In all cases, no old values are logged unless at least one of the columns that would be logged differs between the old and new versions of the row.  
+```  
+test decoding 观察变化量  
+```
+postgres=# select pg_create_logical_replication_slot('abc','test_decoding');
+ pg_create_logical_replication_slot 
+------------------------------------
+ (abc,3A/28CAB200)
+(1 row)
+postgres=# create table tbl_sys_nonkey (id int, info text);
+CREATE TABLE
+postgres=# insert into tbl_sys_nonkey values (1,'test');
+INSERT 0 1
+postgres=# update tbl_sys_nonkey set info='test123' where id=1;
+UPDATE 1
+postgres=# delete from tbl_sys_nonkey;
+DELETE 1
+postgres=# SELECT * FROM pg_logical_slot_get_changes('abc', NULL, NULL, 'include-xids', '0');
+     lsn     |    xid    |                                  data                                   
+-------------+-----------+-------------------------------------------------------------------------
+ 3A/28CBA668 | 210387691 | BEGIN
+ 3A/28CBE198 | 210387691 | COMMIT
+ 3A/28CBE1D0 | 210387692 | BEGIN
+ 3A/28CBE1D0 | 210387692 | table public.tbl_sys_nonkey: INSERT: id[integer]:1 info[text]:'test'
+ 3A/28CBE240 | 210387692 | COMMIT
+ 3A/28CBE278 | 210387693 | BEGIN
+ 3A/28CBE278 | 210387693 | table public.tbl_sys_nonkey: UPDATE: id[integer]:1 info[text]:'test123'
+ 3A/28CBE2F8 | 210387693 | COMMIT
+ 3A/28CBE330 | 210387694 | BEGIN
+ 3A/28CBE330 | 210387694 | table public.tbl_sys_nonkey: DELETE: (no-tuple-data) -- 未记录old key
+ 3A/28CBE398 | 210387694 | COMMIT
+(11 rows)
+postgres=# drop table tbl_sys_nonkey ;
+DROP TABLE
+postgres=# create table tbl_sys_nonkey (id int, info text) with (user_catalog_table=true);;
+CREATE TABLE
+postgres=# insert into tbl_sys_nonkey values (1,'test');
+INSERT 0 1
+postgres=# update tbl_sys_nonkey set info='test123' where id=1;
+UPDATE 1
+postgres=# delete from tbl_sys_nonkey;
+DELETE 1
+postgres=# SELECT * FROM pg_logical_slot_get_changes('abc', NULL, NULL, 'include-xids', '0');
+     lsn     |    xid    |                                  data                                   
+-------------+-----------+-------------------------------------------------------------------------
+ 3A/28CBE3D0 | 210387695 | BEGIN
+ 3A/28CBF808 | 210387695 | COMMIT
+ 3A/28CBF870 | 210387696 | BEGIN
+ 3A/28CC30C0 | 210387696 | COMMIT
+ 3A/28CC30C0 | 210387697 | BEGIN
+ 3A/28CC3100 | 210387697 | table public.tbl_sys_nonkey: INSERT: id[integer]:1 info[text]:'test'
+ 3A/28CC3170 | 210387697 | COMMIT
+ 3A/28CC3170 | 210387698 | BEGIN
+ 3A/28CC31F0 | 210387698 | table public.tbl_sys_nonkey: UPDATE: id[integer]:1 info[text]:'test123'
+ 3A/28CC3270 | 210387698 | COMMIT
+ 3A/28CC3270 | 210387699 | BEGIN
+ 3A/28CC32B0 | 210387699 | table public.tbl_sys_nonkey: DELETE: (no-tuple-data)  -- 未记录old key
+ 3A/28CC3318 | 210387699 | COMMIT
+(13 rows)
+postgres=# alter table tbl_sys_nonkey replica identity full;
+ALTER TABLE
+postgres=# insert into tbl_sys_nonkey values (1,'test');
+INSERT 0 1
+postgres=# update tbl_sys_nonkey set info='test123' where id=1;
+UPDATE 1
+postgres=# delete from tbl_sys_nonkey;
+DELETE 1
+postgres=# SELECT * FROM pg_logical_slot_get_changes('abc', NULL, NULL, 'include-xids', '0');
+     lsn     |    xid    |                                                            data                                                             
+-------------+-----------+-----------------------------------------------------------------------------------------------------------------------------
+ 3A/28CC3430 | 210387700 | BEGIN
+ 3A/28CC3598 | 210387700 | COMMIT
+ 3A/28CC35D0 | 210387701 | BEGIN
+ 3A/28CC3610 | 210387701 | table public.tbl_sys_nonkey: INSERT: id[integer]:1 info[text]:'test'
+ 3A/28CC3680 | 210387701 | COMMIT
+ 3A/28CC3680 | 210387702 | BEGIN
+ 3A/28CC3700 | 210387702 | table public.tbl_sys_nonkey: UPDATE: old-key: id[integer]:1 info[text]:'test' new-tuple: id[integer]:1 info[text]:'test123'
+ 3A/28CC3790 | 210387702 | COMMIT
+ 3A/28CC3790 | 210387703 | BEGIN
+ 3A/28CC37D0 | 210387703 | table public.tbl_sys_nonkey: DELETE: id[integer]:1 info[text]:'test123'  -- 记录了old key
+ 3A/28CC3848 | 210387703 | COMMIT
+(11 rows)
+```
+如果你要让逻辑复制的表支持insert,update,delete操作，建议必须有primary KEY，如果没有primary KEY，则需要配置 replica identity full，（当然这个性能会很差很差，因为回放和DML都会很慢，并且存在不一致的风险（例如使用物理行号更新了重复行的其中一行，在订阅端这些重复行会被全部更新，导致不一致））。   
+关于user_catalog_table，主要目的是让WAL记录CID (比事务更细粒度的ID，一个事务中的一条SQL被给予一个顺序ID) ，以便将来可以回放出被设置为user_catalog_table的表的过去的任意一个状态(即使在同一个事务快照中，也能回放出他的不同状态)。     
+https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=66abc2608c7c00fcd449e00a9e23f13f02e65d04   
+```
+Add a new reloption, user_catalog_table.
+When this reloption is set and wal_level=logical is configured,
+we'll record the CIDs stamped by inserts, updates, and deletes to
+the table just as we would for an actual catalog table.  This will
+allow logical decoding to use historical MVCC snapshots to access
+such tables just as they access ordinary catalog tables.
+Replication solutions built around the logical decoding machinery
+will likely need to set this operation for their configuration
+tables; it might also be needed by extensions which perform table
+access in their output functions.
+Andres Freund, reviewed by myself and others.
+```
+```
+postgres=# begin;
+BEGIN
+postgres=# insert into another_catalog_table values ('1');
+INSERT 0 1
+postgres=# insert into another_catalog_table values ('1');
+INSERT 0 1
+postgres=# select ctid,cmin,cmax,* from another_catalog_table ;
+  ctid  | cmin | cmax | data 
+--------+------+------+------
+ (0,11) |    0 |    0 | 1
+ (0,12) |    1 |    1 | 1
+(2 rows)
+postgres=# insert into another_catalog_table values ('1');
+INSERT 0 1
+postgres=# select ctid,cmin,cmax,* from another_catalog_table ;
+  ctid  | cmin | cmax | data 
+--------+------+------+------
+ (0,11) |    0 |    0 | 1
+ (0,12) |    1 |    1 | 1
+ (0,13) |    2 |    2 | 1
+(3 rows)
+postgres=# select ctid,cmin,cmax,xmin,xmax,* from another_catalog_table ;
+  ctid  | cmin | cmax |   xmin    | xmax | data 
+--------+------+------+-----------+------+------
+ (0,11) |    0 |    0 | 210387706 |    0 | 1
+ (0,12) |    1 |    1 | 210387706 |    0 | 1
+ (0,13) |    2 |    2 | 210387706 |    0 | 1
+(3 rows)
+```
+同时被设置为user_catalog_table的表，不允许query rewrite.   
+https://git.postgresql.org/gitweb/?p=postgresql.git;a=blobdiff;f=src/backend/commands/tablecmds.c;h=b9cd88d57015416066c7f3db70d9c681708426ff;hp=1d9f29a7b7c18742cc3c2639e20c4ba4bd0763fe;hb=66abc2608c7c00fcd449e00a9e23f13f02e65d04;hpb=e55704d8b2fe522fbc9435acbb5bc59033478bd5  
+```
+postgres=# alter table another_catalog_table add column info text default 'abc';
+ERROR:  0A000: cannot rewrite table "another_catalog_table" used as a catalog table
+LOCATION:  ATRewriteTables, tablecmds.c:4154
+```
+3\. output plugin  
+发布者还需要一个output plugin，将redo按发布的定义，解析成需要的格式，等待订阅者的订阅。  
+https://www.postgresql.org/docs/devel/static/logicaldecoding-output-plugin.html  
+是不是有点像这个呢？  
+[《PostgreSQL 闪回 - flash back query emulate by trigger》](../201408/20140828_01.md)  
+#### 发布语法  
+创建发布  
+```  
+Command:     CREATE PUBLICATION
+Description: define a new publication
+Syntax:
+CREATE PUBLICATION name
+    [ FOR TABLE [ ONLY ] table_name [ * ] [, ...]
+      | FOR ALL TABLES ]
+    [ WITH ( publication_parameter [= value] [, ... ] ) ]
+publication_parameter:
+  publish (string)
+value: 
+  'insert, update, delete'
+例子
+           CREATE PUBLICATION insert_only FOR TABLE mydata
+               WITH (publish = 'insert');
+默认发布insert,update,delete。  
+```  
+修改发布  
+```  
+Command:     ALTER PUBLICATION
+Description: change the definition of a publication
+Syntax:
+ALTER PUBLICATION name ADD TABLE [ ONLY ] table_name [ * ] [, ...]
+ALTER PUBLICATION name SET TABLE [ ONLY ] table_name [ * ] [, ...]
+ALTER PUBLICATION name DROP TABLE [ ONLY ] table_name [ * ] [, ...]
+ALTER PUBLICATION name SET ( publication_parameter [= value] [, ... ] )
+ALTER PUBLICATION name OWNER TO { new_owner | CURRENT_USER | SESSION_USER }
+ALTER PUBLICATION name RENAME TO new_name
+```  
+#### 发布者小结  
+1\. 目前仅仅支持发布表，不允许发布其他对象。  
+2\. 同一张表，可以发布多次。  
+3\. 在同一个数据库中，可以创建多个publication，但是不能重名，通过系统表查看已创建的publication  

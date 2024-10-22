@@ -1,0 +1,274 @@
+## PostgreSQL 垃圾回收原理以及如何预防膨胀 - How to prevent object bloat in PostgreSQL  
+### 作者                                                 
+digoal                                                  
+### 日期                                                
+2015-04-29                     
+### 标签                                                
+PostgreSQL , 垃圾回收 , 长事务 , HEAPTUPLE_RECENTLY_DEAD , 膨胀                                                                
+----                                                
+## 背景                        
+PostgreSQL 9.6已支持snapshot too old     
+经常看到有人说表又膨胀了，那么导致对象膨胀的常见原因有哪些呢？  
+1\. 未开启autovacuum  
+对于未开启autovacuum的用户，同时又没有合理的自定义vacuum调度的话，表的垃圾没有及时回收，新的数据又不断进来，膨胀是必然的。（新的数据包括插入和更新，更新产生新版本的记录）  
+2\. 开启了autovacuum, 但是各种原因导致回收不及时，并且新的数据又不断产生，从而导致膨胀。  
+回收不及时的原因：  
+2\.1\. IO差  
+当数据库非常繁忙时，如果IO比较差，会导致回收垃圾变慢，从而导致膨胀。  
+这种一般出现在数据库中存在非常巨大的表，并且这些表在执行whole table vacuum (prevent xid wrapped, 或当表的年龄大于vacuum_freeze_table_age时会全表扫)，因此产生大量IO，这期间很容易导致自身或其他表膨胀。  
+2\.2\. autovacuum触发较迟  
+什么情况会触发autovacuum呢?  
+```  
+ * A table needs to be vacuumed if the number of dead tuples exceeds a  
+ * threshold.  This threshold is calculated as  
+ *  
+ * threshold = vac_base_thresh + vac_scale_factor * reltuples  
+```  
+如果没有设置表级别的autovacuum thresh和factor,那么默认使用参数文件配置的值。如下：  
+```  
+int                     autovacuum_vac_thresh;  // 默认50  
+double          autovacuum_vac_scale;  // 默认0.2  
+```  
+也就是说dead tuple达到约为表的20%时，才触发autovacuum。  
+然后回收又需要一定的时间，所以最终表的膨胀应该是超过20%的。  
+2\.3\. 所有worker繁忙，某些表产生的垃圾如果超过阈值，但是在此期间没有worker可以为它处理垃圾回收的事情。导致可能发生膨胀。  
+可fork的worker进程个数是参数autovacuum_max_workers决定的，初始化autovacuum共享内存时已固定了它的最大进程数。见代码，  
+src/backend/postmaster/autovacuum.c  
+```  
+/*  
+ * AutoVacuumShmemInit  
+ *              Allocate and initialize autovacuum-related shared memory  
+ */  
+void  
+AutoVacuumShmemInit(void)  
+{  
+        bool            found;  
+        AutoVacuumShmem = (AutoVacuumShmemStruct *)  
+                ShmemInitStruct("AutoVacuum Data",  
+                                                AutoVacuumShmemSize(),  
+                                                &found);  
+        if (!IsUnderPostmaster)  
+        {  
+                WorkerInfo      worker;  
+                int                     i;  
+                Assert(!found);  
+                AutoVacuumShmem->av_launcherpid = 0;  
+                dlist_init(&AutoVacuumShmem->av_freeWorkers);  
+                dlist_init(&AutoVacuumShmem->av_runningWorkers);  
+                AutoVacuumShmem->av_startingWorker = NULL;  
+                worker = (WorkerInfo) ((char *) AutoVacuumShmem +  
+                                                           MAXALIGN(sizeof(AutoVacuumShmemStruct)));  
+                /* initialize the WorkerInfo free list */  
+                for (i = 0; i av_freeWorkers,  
+                                                        &worker[i].wi_links);  
+        }  
+        else  
+                Assert(found);  
+}  
+```  
+如果数据库的表很多，而且都比较大，那么当需要vacuum的表超过了配置autovacuum_max_workers的数量，某些表就要等待空闲的worker。这个阶段就容易出现表的膨胀。  
+以前的PostgreSQL版本，一个数据库同一时间只会起一个worker进程，现在的版本已经没有这个限制了：  
+src/backend/postmaster/autovacuum.c  
+```  
+ * Note that there can be more than one worker in a database concurrently.  
+ * They will store the table they are currently vacuuming in shared memory, so  
+ * that other workers avoid being blocked waiting for the vacuum lock for that  
+ * table.  They will also reload the pgstats data just before vacuuming each  
+ * table, to avoid vacuuming a table that was just finished being vacuumed by  
+ * another worker and thus is no longer noted in shared memory.  However,  
+ * there is a window (caused by pgstat delay) on which a worker may choose a  
+ * table that was already vacuumed; this is a bug in the current design.  
+```  
+所以如果你的PostgreSQL集群有很多数据库的话，可能需要更多的worker进程来支撑。  
+另外需要注意一点，worker进程在工作时，每个worker最多会消耗的内存由以下参数决定：  
+```  
+#maintenance_work_mem = 64MB            # min 1MB  
+#autovacuum_work_mem = -1               # min 1MB, or -1 to use maintenance_work_mem  
+```  
+所以worker进程越多，内存需求量也越大。  
+2\.4\. 数据库中存在长SQL或带XID的长事务。  
+通过pg_stat_activity.backend_xid和backend_xmin来观察。  
+backend_xid表示已申请事务号的事务，例如有增删改，DLL等操作的事务。backend_xid从申请事务号开始持续到事务结束。  
+backend_xmin表示SQL执行时的snapshot，即可见的最大已提交事务。例如查询语句，查询游标。backend_xmin从SQL开始持续到SQL结束，如果是游标的话，持续到游标关闭。  
+PostgreSQL目前存在一个非常严重的缺陷，当数据库中存在未结束的SQL语句或者未结束的持有事务ID的事务，在此事务过程中，或在此SQL执行时间范围内产生垃圾的话，这些垃圾无法回收，导致数据库膨胀。  
+也即是判断当前数据库中backend_xid和backend_xmin最小的值，凡是超过这个最小值的事务产生的垃圾都不能回收。  
+原因见：  
+src/backend/utils/time/tqual.c  
+```  
+/*  
+ * HeapTupleSatisfiesVacuum  
+ *  
+ *      Determine the status of tuples for VACUUM purposes.  Here, what  
+ *      we mainly want to know is if a tuple is potentially visible to *any*  
+ *      running transaction.  If so, it can't be removed yet by VACUUM.  
+ *  
+ * OldestXmin is a cutoff XID (obtained from GetOldestXmin()).  Tuples  
+ * deleted by XIDs >= OldestXmin are deemed "recently dead"; they might  
+ * still be visible to some open transaction, so we can't remove them,  
+ * even if we see that the deleting transaction has committed.  
+ */  
+HTSV_Result  
+HeapTupleSatisfiesVacuum(HeapTuple htup, TransactionId OldestXmin,  
+                                                 Buffer buffer)  
+{  
+```  
+后面通过测试来展示。  
+2\.5\. 开启了autovacuum_vacuum_cost_delay。  
+在开启了autovacuum_vacuum_cost_delay后，会使用基于成本的垃圾回收，这个可以有利于降低VACUUM带来的IO影响，但是对于IO没有问题的系统，就没有必要开启autovacuum_vacuum_cost_delay，因为这会使得垃圾回收的时间变长。  
+当autovacuum进程达到autovacuum_vacuum_cost_limit后，会延迟autovacuum_vacuum_cost_delay后继续。  
+```  
+        /*  
+         * Adjust cost limit of each active worker to balance the total of cost  
+         * limit to autovacuum_vacuum_cost_limit.  
+         */  
+        cost_avail = (double) vac_cost_limit / vac_cost_delay;  
+        dlist_foreach(iter, &AutoVacuumShmem->av_runningWorkers)  
+        {  
+                WorkerInfo      worker = dlist_container(WorkerInfoData, wi_links, iter.cur);  
+                if (worker->wi_proc != NULL &&  
+                        worker->wi_dobalance &&  
+                        worker->wi_cost_limit_base > 0 && worker->wi_cost_delay > 0)  
+                {  
+                        int                     limit = (int)  
+                        (cost_avail * worker->wi_cost_limit_base / cost_total);  
+                        /*  
+                         * We put a lower bound of 1 on the cost_limit, to avoid division-  
+                         * by-zero in the vacuum code.  Also, in case of roundoff trouble  
+                         * in these calculations, let's be sure we don't ever set  
+                         * cost_limit to more than the base value.  
+                         */  
+                        worker->wi_cost_limit = Max(Min(limit,  
+                                                                                        worker->wi_cost_limit_base),  
+                                                                                1);  
+                }  
+```  
+限制计算方法由另外几个参数决定：  
+包括在SHARED BUFFER中命中的块，未命中的块，非脏块的额外成本。  
+```  
+vacuum_cost_page_hit (integer)  
+The estimated cost for vacuuming a buffer found in the shared buffer cache. It represents the cost to lock the buffer pool, lookup the shared hash table and scan the content of the page. The default value is one.  
+vacuum_cost_page_miss (integer)  
+The estimated cost for vacuuming a buffer that has to be read from disk. This represents the effort to lock the buffer pool, lookup the shared hash table, read the desired block in from the disk and scan its content. The default value is 10.  
+vacuum_cost_page_dirty (integer)  
+The estimated cost charged when vacuum modifies a block that was previously clean. It represents the extra I/O required to flush the dirty block out to disk again. The default value is 20.  
+```  
+对于IO没有问题的系统，不建议设置autovacuum_vacuum_cost_limit。  
+2\.6\. autovacuum launcher process 唤醒时间太长  
+唤醒时间由参数autovacuum_naptime决定，autovacuum launcher进程负责告诉postmaster需要fork worker进程来进行垃圾回收，但是如果autovacuum launcher进程一直在睡觉的话，那完蛋了，有垃圾了它还在睡觉，那不就等着膨胀吗？  
+另外还有一个限制在代码中，也就是说不能小于MIN_AUTOVAC_SLEEPTIME 100毫秒：  
+src/backend/postmaster/autovacuum.c  
+```  
+/* the minimum allowed time between two awakenings of the launcher */  
+#define MIN_AUTOVAC_SLEEPTIME 100.0               /* milliseconds */  
+......  
+        /* The smallest time we'll allow the launcher to sleep. */  
+        if (nap->tv_sec tv_usec tv_sec = 0;  
+                nap->tv_usec = MIN_AUTOVAC_SLEEPTIME * 1000;  
+        }  
+......  
+                /*  
+                 * Wait until naptime expires or we get some type of signal (all the  
+                 * signal handlers will wake us by calling SetLatch).  
+                 */  
+                rc = WaitLatch(&MyProc->procLatch,  
+                                           WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,  
+                                           (nap.tv_sec * 1000L) + (nap.tv_usec / 1000L));  
+```  
+这个后面我会进行测试来展示它。  
+2\.7 批量删除或批量更新，  
+例如对于一个10GB的表，一条SQL或一个事务中删除或更新9GB的数据，这9GB的数据必须在事务结束后才能进行垃圾回收，无形中增加了膨胀的可能。  
+2\.8 大量的非HOT更新，会导致索引膨胀，对于BTREE索引来说，整个索引页没有任何引用才能被回收利用，因此索引比较容易膨胀。  
+## 测试  
+测试过程使用如下参数：  
+```  
+autovacuum = on  
+log_autovacuum_min_duration = 0  
+autovacuum_max_workers = 10  
+autovacuum_naptime = 1  
+autovacuum_vacuum_threshold = 5  
+autovacuum_analyze_threshold = 5  
+autovacuum_vacuum_scale_factor = 0.002  
+autovacuum_analyze_scale_factor = 0.001  
+autovacuum_vacuum_cost_delay = 0  
+```  
+测试数据：  
+```  
+postgres=# create table tbl (id int primary key, info text, crt_time timestamp);  
+CREATE TABLE  
+postgres=# insert into tbl select generate_series(1,2000000),md5(random()::text),clock_timestamp();  
+INSERT 0 2000000  
+postgres=# \dt+ tbl  
+                    List of relations  
+ Schema | Name | Type  |  Owner   |  Size  | Description   
+--------+------+-------+----------+--------+-------------  
+ public | tbl  | table | postgres | 146 MB |   
+(1 row)  
+postgres=# \di+ tbl_pkey   
+                         List of relations  
+ Schema |   Name   | Type  |  Owner   | Table | Size  | Description   
+--------+----------+-------+----------+-------+-------+-------------  
+ public | tbl_pkey | index | postgres | tbl   | 43 MB |   
+(1 row)  
+```  
+测试脚本：  
+一次最多更新25万条  
+```  
+$ vi test.sql  
+\setrandom id 1 2000000  
+update tbl set info=md5(random()::text) where id between :id-250000 and :id+250000;  
+```  
+测试两个东西：  
+1\. 测试数据库中存在持有事务号的长事务，这个事务时间段内，数据库产生的垃圾无法被回收。  
+```  
+postgres@db-172-16-3-150-> pgbench -M prepared -n -r -f ./test.sql -c 1 -j 1 -T 500000  
+```  
+观察日志  
+```  
+postgres@db-172-16-3-150-> tail -f -n 1 postgresql-2015-04-29_174535.csv|grep removable  
+tuples: 500001 removed, 1710872 remain, 0 are dead but not yet removable  
+tuples: 0 removed, 478 remain, 3 are dead but not yet removable  
+tuples: 499647 removed, 1844149 remain, 0 are dead but not yet removable  
+tuples: 500001 removed, 1830118 remain, 0 are dead but not yet removable  
+tuples: 290450 removed, 1865527 remain, 0 are dead but not yet removable  
+```  
+现在看没有问题，接下来我开一个持有事务号的事务，  
+```  
+postgres=# begin;  
+BEGIN  
+postgres=# select txid_current();  
+ txid_current   
+--------------  
+    314030959  
+(1 row)  
+postgres=# select pg_backend_pid();  
+ pg_backend_pid   
+----------------  
+           6073  
+(1 row)  
+postgres=# select backend_xid,backend_xmin from pg_stat_activity where pid=6073;  
+-[ RECORD 1 ]+--------  
+backend_xid  | 314030959  -- 表示当前事务持有的事务号  
+backend_xmin | 314030959  -- 表示当前SQL可以看到的最大已提交事务的事务号+1  
+```  
+这个事务在另一个会话中通过txid_current_snapshot可以看到它是一个未结束的事务。  
+```  
+postgres=# select * from txid_current_snapshot();  
+-[ RECORD 1 ]---------+------------------------------  
+txid_current_snapshot | 314030959:314030981:314030959  
+```  
+接下来看看日志：  
+不可回收的行在不断的增长。  
+```  
+tuples: 0 removed, 2391797 remain, 500001 are dead but not yet removable  
+tuples: 0 removed, 484 remain, 9 are dead but not yet removable  
+tuples: 0 removed, 2459288 remain, 500001 are dead but not yet removable  
+tuples: 0 removed, 484 remain, 9 are dead but not yet removable  
+tuples: 0 removed, 2713489 remain, 760235 are dead but not yet removable  
+tuples: 0 removed, 487 remain, 12 are dead but not yet removable  
+tuples: 0 removed, 2572991 remain, 760235 are dead but not yet removable  
+tuples: 0 removed, 487 remain, 12 are dead but not yet removable  
+tuples: 0 removed, 2849378 remain, 760235 are dead but not yet removable  
+tuples: 0 removed, 487 remain, 12 are dead but not yet removable  
+tuples: 0 removed, 3023757 remain, 760235 are dead but not yet removable  
+tuples: 0 removed, 487 remain, 12 are dead but not yet removable  
+tuples: 0 removed, 3135900 remain, 1137469 are dead but not yet removable  

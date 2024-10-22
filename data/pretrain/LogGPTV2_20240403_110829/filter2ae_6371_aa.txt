@@ -1,0 +1,121 @@
+# 0x00 前言
+之前搞蜜罐项目，领导提了一个部署方案：主机器部署蜜罐，其他节点能否在不部署蜜罐的情况下，监听对应端口，能否直接将端口流量转发到蜜罐机器。大致流程如下图所示，故如果有端口的恶意请求到达A/B/C机器，流量转到蜜罐机器，蜜罐机器能记录到相关恶意请求，
+**且蜜罐机器能获取到恶意请求的原始ip** 。
+该方案的好处是能做到蜜罐的轻量部署，增加节点也很便捷——直接监听端口然后做转发。但是该方案也带来了新的问题，一个最实际的问题是：A/B/C的恶意请求转发到蜜罐机器后，
+**蜜罐机器如何获取到而已请求的原始ip（攻击者ip）（A/B/C如何透传ip到蜜罐机器）** ，故而解决这个问题是最迫切的。
+故笔者花了很长时间对几类端口转发方案进行调研测试。本文对每个方案的部署和配置方法及实践测试结果进行记录。希望能给也在做类似蜜罐方案及在研究端口流量转发透传ip的师傅们一些参考。
+# 0x01 端口流量转发方案调研
+_文中涉及的机器及ip地址：  
+Client：192.168.45.36  
+A-机器：192.168.40.147  
+B-蜜罐机器：192.168.40.148_
+## 1.1 rinetd
+官网地址：
+实践于蜜罐参考文章：
+但是文中说明：蜜罐收集到的日志的访问源IP是我们诱捕节点的ip，不是攻击者所在服务器的ip。文中的思路是：通过syslog的方式把端口转发（rinetd.log）和蜜罐（kippo.log）这两份日志都实时同步至splunk服务器，做关联。
+**调研结果：**
+由于上述提到的文章中，作者已对rinetd进行测试，无法获取到原始ip，故没有在本地再部署测试。文中说明：A机器经过rinetd将端口转发到蜜罐机器，蜜罐机器收到的攻击ip是A机器的，并非原始ip（攻击者ip）。但文章中的思路还是不错的，将rinetd日志与kippo蜜罐日志都收集起来，做关联。可达到我们的方案需求。
+## 1.2 haproxy
+HAProxy是一个使用C语言编写的自由及开放源代码软件，其提供高可用性、负载均衡，以及基于TCP和HTTP的应用程序代理。
+### 1.2.1 haproxy部署（A机器）
+    wget http://www.haproxy.org/download/2.1/src/haproxy-2.1.5.tar.gz
+    tar -xzf haproxy-2.1.5.tar.gz
+    cd haproxy-2.1.5/
+    # 编译
+    make -j $(nproc) PREFIX=/home/ha/haproxy TARGET=linux-glibc USE_NS=
+    # 安装
+    make install
+/etc/下新建haproxy目录，目录下新建haproxy.cfg配置文件：
+    vim /etc/haproxy/haproxy.cfg
+配置文件内容如下（监听10000端口转发到192.168.40.148的10000端口）：
+    global
+    defaults
+        log    global
+        mode    tcp
+        option    dontlognull
+            timeout connect 5000
+            timeout client  50000
+            timeout server  50000
+    frontend name-in
+        # 监听10000端口
+        bind *:10000
+        default_backend name-out
+    backend name-out
+        # 转发
+        server server1 192.168.40.148 maxconn 20480
+运行：
+    ./haproxy -D -f /etc/haproxy/haproxy.cfg
+运行结果如下：
+可以看到， **192.168.40.148的10000端口收到的请求同样是来自40.147的，并不是原始ip** 。
+### 1.2.2 haproxy实现ip透传
+#### (1) 重新编译haproxy
+    # 加上关键选项 USE_LINUX_TPROXY=1，打开透传用户IP的代码
+    make -j $(nproc) PREFIX=/home/ha/haproxy TARGET=linux-glibc USE_LINUX_TPROXY=1 USE_NS=
+    make install
+#### (2) 配置 `haproxy.cfg`
+    global
+    defaults
+        log    global
+        mode    tcp
+        # 加上下行关键配置项
+        source 0.0.0.0 usesrc clientip
+        option    dontlognull
+            timeout connect 5000
+            timeout client  50000
+            timeout server  50000
+    frontend name-in
+        bind *:10000
+        default_backend name-out
+    backend name-out
+        server server1 192.168.40.148 maxconn 20480
+#### (3) 配置返回包路由
+**蜜罐机器路由配置：**
+    # 通过添加这条路由，让后端server将返回包路由到proxy节点，192.168.40.147为proxy的Ip
+    route add -net 192.168.0.0/16 gw 192.168.40.147
+**蜜罐机器Proxy路由配置：**
+    /sbin/iptables -F
+    /sbin/iptables -t mangle -N DIVERT
+    /sbin/iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT
+    /sbin/iptables -t mangle -A DIVERT -j MARK --set-mark 1
+    /sbin/iptables -t mangle -A DIVERT -j ACCEPT
+    /sbin/ip rule add fwmark 1 lookup 100
+    /sbin/ip route add local 0.0.0.0/0 dev lo table 100
+    # 通过以上配置，将所有发往Proxy的tcp包，重定向到本地环路（lo）上。然后由TProxy内核补丁来对这些网络包进行处理，进而成功将后端server返回包路由回源客户端
+运行结果如下：
+可以看到， **蜜罐机器拿到的攻击ip是原始ip，可达到透传效果** 。
+原理参考这篇文章：
+### 1.2.3 总结
+haproxy通过重新编译，以及蜜罐机器修改相关路由，可实现透传效果。但是该方案有两个缺陷：
+（1）haproxy目前只支持tcp、http、https等，不支持udp。
+（2）该方案需要在蜜罐机器更改路由表，操作起来对蜜罐机器网络会有一定影响，会造成其他更多问题。
+## 1.3 nginx
+### 1.3.1 nginx安装配置
+    # 安装nginx
+    yum install nginx
+    # 编辑nginx配置文件
+    vim /etc/nginx/nginx.conf
+`nginx.conf`内容如下：
+    stream {
+        upstream master {
+          # 转发到40.147的10000端口
+          server 192.168.40.147:10000;
+        }
+        server {
+         # 监听tcp端口9999
+         listen 9999;
+         # 监听udp端口10000
+         listen 10000 udp;
+         proxy_timeout 20s;
+         proxy_pass master;
+         proxy_buffer_size 512k;
+        }
+    }
+运行nginx：
+    service nginx start
+    # 运行后，本地监听了tcp端口9999和udp端口10000
+### 1.3.2 tcp/udp端口转发测试
+#### (1) 测试udp端口连通性
+    # 转发的目标机器监听udp端口
+    nc -lu 10000
+    # 本地扫描机器扫描转发机器的udp端口
+    netcat -u 192.168.40.148 10000

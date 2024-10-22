@@ -1,0 +1,203 @@
+# 安卓漏洞 CVE 2017-13287 复现分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+2018年4月，Android安全公告公布了CVE-2017-13287漏洞。与同期披露的其他漏洞一起，同属于框架中Parcelable对象的写入(序列化)与读出(反序列化)的不一致所造成的漏洞。在刚看到谷歌对于漏洞给出的[补丁](https://android.googlesource.com/platform/frameworks/base/+/09ba8fdffd9c8d74fdc6bfb51bcebc27fc43884a%5E%21/)时一头雾水，
+在这里要感谢heeeeen[@MS509Team](https://github.com/MS509Team
+"@MS509Team")在这个问题上的成果，启发了我的进一步研究。
+## 原理
+谷歌在Android中提供了Parcelable作为高效的序列化实现，用来支持IPC调用中多样的对象传递需求。但是序列化和反序列化的过程依旧依靠程序员编写的代码进行同步。那么当不同步的时候，漏洞就产生了。
+###  Bundle
+传输的时候Parcelable对象按照键值对的形式存储在Bundle内，Bundle内部有一个ArrayMap用hash表进行管理。反序列化过程如下：
+        /* package */ void unparcel() {
+            synchronized (this) {
+               final Parcel parcelledData = mParcelledData;
+               int N = parcelledData.readInt();
+               if (N  map = mMap;
+               try {
+                   parcelledData.readArrayMapInternal(map, N, mClassLoader);
+               } catch (BadParcelableException e) {
+               } finally {
+                   mMap = map;
+                   parcelledData.recycle();
+                   mParcelledData = null;
+               }
+            }
+        }
+首先读取一个int指示里面有多少对键值对。
+        /* package */ void readArrayMapInternal(ArrayMap outVal, int N,
+            ClassLoader loader) {
+            if (DEBUG_ARRAY_MAP) {
+               RuntimeException here =  new RuntimeException("here");
+               here.fillInStackTrace();
+               Log.d(TAG, "Reading " + N + " ArrayMap entries", here);
+            }
+            int startPos;
+            while (N > 0) {
+               if (DEBUG_ARRAY_MAP) startPos = dataPosition();
+               String key = readString();
+               Object value = readValue(loader);
+               outVal.append(key, value);
+               N--;
+            }
+            outVal.validate();
+        }
+之后的每一对先是Key的字符串，然后是对应的Value。
+        public final Object readValue(ClassLoader loader) {
+            int type = readInt();
+            switch (type) {
+            case VAL_NULL:
+               return null;
+            case VAL_STRING:
+               return readString();
+            case VAL_INTEGER:
+               return readInt();
+            case VAL_MAP:
+               return readHashMap(loader);
+            case VAL_PARCELABLE:
+               return readParcelable(loader);
+            case VAL_SHORT:
+               return (short) readInt();
+            case VAL_LONG:
+               return readLong();
+值内部先是一个int指示值的类型，再存储实际值。
+当Bundle被写入Parcel时：
+        void writeToParcelInner(Parcel parcel, int flags) {
+            final ArrayMap map;
+            synchronized (this) {
+               if (mParcelledData != null) {
+                   if (mParcelledData == NoImagePreloadHolder.EMPTY_PARCEL) {
+                      parcel.writeInt(0);
+                   } else {
+                      int length = mParcelledData.dataSize();
+                      parcel.writeInt(length);
+                      parcel.writeInt(BUNDLE_MAGIC);
+                      parcel.appendFrom(mParcelledData, 0, length);
+                   }
+                   return;
+               }
+               map = mMap;
+            }
+        }
+先写入Bundle总共的字节数，再写入魔数，之后是指示键值对数的N，还有相应的键值对。
+###  LaunchAnyWhere
+弄明白Bundle的内部结构后，先来看看漏洞触发的地方：
+这个流程是AppA在请求添加一个帐号：
+  1. AppA请求添加一个帐号
+  2. System_server接受到请求，找到可以提供帐号服务的AppB，并发起请求
+  3. AppB返回了一个Bundle给系统，系统把Bundle转发给AppA
+  4. AccountManagerResponse在AppA的进程空间中调用startActivity(intent)调起一个Activity。
+在第4步中，如果AppA的权限较高，比如Settings，那么AppA可以调用正常App无法调用的未导出Activity。
+并且在第3步中，AppB提供的Bundle在system_server端被反序列化，之后system_server根据之前得到的内容再序列化并传递给AppA。那么如果对应的传递内容的序列化和反序列化代码不一样，就会影响到自己以及之后的内容的结果。
+传递的Bundle对象中包含一个重要键值对`{KEY_INTENT:intent}`，指定了AppA稍后调用的Activity。如果这个被指定成Setting中的`com.android.settings.password.ChooseLockPassword`,就可以在不需要原本锁屏密码的情况下重新设置锁屏密码。
+谷歌在这个过程中进行了检查，保证Intent中包含的Activity所属的签名和AppB一致，并且不是未导出的系统Actiivity。
+    protected void checkKeyIntent(int authUid, Intent intent) throws SecurityException {
+        long bid = Binder.clearCallingIdentity();
+        try {
+            PackageManager pm = mContext.getPackageManager();
+            ResolveInfo resolveInfo = pm.resolveActivityAsUser(intent, 0, mAccounts.userId);
+            ActivityInfo targetActivityInfo = resolveInfo.activityInfo;
+            int targetUid = targetActivityInfo.applicationInfo.uid;
+            if (!isExportedSystemActivity(targetActivityInfo)
+                && (PackageManager.SIGNATURE_MATCH != pm.checkSignatures(authUid, targetUid))) {
+                String pkgName = targetActivityInfo.packageName;
+                String activityName = targetActivityInfo.name;
+                String tmpl = "KEY_INTENT resolved to an Activity (%s) in a package (%s) that "
+                    + "does not share a signature with the supplying authenticator (%s).";
+                throw new SecurityException(
+                       String.format(tmpl, activityName, pkgName, mAccountType));
+                   }
+        } finally {
+               Binder.restoreCallingIdentity(bid);
+        }
+    }
+攻击思路便是在system_server进行检查时Bundle中的恶意`{KEY_INTENT:intent}`看不到，但是在重新序列化之后在`Setting`出现，这样就绕过了检查。
+## 利用
+首先来看看漏洞所在的代码
+        public static final Parcelable.Creator CREATOR
+                = new Parcelable.Creator() {
+            @Override
+            public VerifyCredentialResponse createFromParcel(Parcel source) {
+                int responseCode = source.readInt();
+                VerifyCredentialResponse response = new VerifyCredentialResponse(responseCode, 0, null);
+                if (responseCode == RESPONSE_RETRY) {
+                    response.setTimeout(source.readInt());
+                } else if (responseCode == RESPONSE_OK) {
+                    int size = source.readInt();
+                    if (size > 0) {
+                        byte[] payload = new byte[size];
+                        source.readByteArray(payload);
+                        response.setPayload(payload);
+                    }
+                }
+                return response;
+            }
+            @Override
+            public VerifyCredentialResponse[] newArray(int size) {
+                return new VerifyCredentialResponse[size];
+            }
+        };
+        @Override
+        public void writeToParcel(Parcel dest, int flags) {
+            dest.writeInt(mResponseCode);
+            if (mResponseCode == RESPONSE_RETRY) {
+                dest.writeInt(mTimeout);
+            } else if (mResponseCode == RESPONSE_OK) {
+                if (mPayload != null) {
+                    dest.writeInt(mPayload.length);
+                    dest.writeByteArray(mPayload);
+                }
+            }
+        }
+仔细阅读，会发现在`mResponseCode`为`RESPONSE_OK`时，如果`mPayload`为`null`，那么`writeToParcel`不会在末尾写入0来正确的指示`Payload`部分的长度。而在`createFromParcel`中是需要`readInt`来获知的，这个就带来了序列化与反序列化过程的不一致。可以通过精心构造的payload来绕过检查。
+**难点在于和已经有人公开过的CVE-2017-13288和CVE-2017-13315不同，它们是重新序列化之后会多出来4个字节。这里是重新序列化之后会少4个字节。**
+###  解决方案
+利用String的结构，把恶意intent隐藏在String里。上图每段注释的括号里写了其所占用的字节数。
+在第一次反序列化时，`VerifyCredentialResponse`内部的0还在，恶意intent被包装在第二对的Key中。第二对的值的类型被制定为`VAL_NULL`，也就是什么都没有，常量值为-1。
+再次序列化时`writeToParcel`没有`writeInt(0)`，所以到达Setting的Bundle在`RESPONSE_OK`之后没有0，原本的`String
+length`被视作`payload length`，调用`readByteArray`读取。
+    static jbyteArray android_os_Parcel_createByteArray(JNIEnv* env, jclass clazz, jlong nativePtr)    
+    {
+        jbyteArray ret = NULL;
+        Parcel* parcel = reinterpret_cast(nativePtr);
+        if (parcel != NULL) {
+            int32_t len = parcel->readInt32();
+            // sanity check the stored length against the true data size
+            if (len >= 0 && len dataAvail()) {
+               ret = env->NewByteArray(len);
+               if (ret != NULL) {
+                   jbyte* a2 = (jbyte*)env->GetPrimitiveArrayCritical(ret, 0);
+                   if (a2) {
+                      const void* data = parcel->readInplace(len);
+                      memcpy(a2, data, len);
+                      env->ReleasePrimitiveArrayCritical(ret, a2, 0);
+                   }
+               }
+            }
+        }
+        return ret;
+    }
+再次调用`readInt32`读取长度，之后截取数组内容。相应的从`Payload
+length`开始的指定长度的内容都被视作payload。只要设置得当，恶意intent就会显露出来成为实质上的第二对键值对。
+那么之前作为第二对值的`VAL_NULL`怎么办？之前提过它的常量值是-1，上一对恶意intent刚结束，在这里调用的是`readString`这个函数。
+    const char16_t* Parcel::readString16Inplace(size_t* outLen) const
+    {
+        int32_t size = readInt32();
+        // watch for potential int overflow from size+1
+        if (size >= 0 && size  String_length(4) + Payload_length(4) + PADDING(Size + 16) +
+> EVIL_INTENT(Size) + PADDING(8)  
+>  String_length = Payload_length = (4 + 4 + Size + 16 + Size + 8) / 2 – 1 =
+> Size + 15
+这里先给出公式，`Size`在这里就是`Evil_intent`部分的长度，`String_length`和`Payload_length`在`Setting`侧都被视作payload的长度使用，故相同。
+从两个视角去审视这个公式：
+  1. system_server侧
+对于`system_server`来说，从`String_length`开始的部分就是单纯的一个字符串，那么它先读取`String_length`并套用`readString16Inplace`中的公式。它会从`String_length`之后读取$
+2(1 + Size + 15)=2Size + 32 $，正好包括总长。
+  2. Settings侧
+对于Settings来说，从`Payload_length`之后会直接截取对应长度的内容作为数组，即`Payload_length`之后$Size +
+15$，因为`Parcel`底层的操作对4向上凑整，所以正好露出`EVIL_INTENT`。
+这样就可以达成效果。
+## 结果
+POC: 
+## 总结
+在IPC这块就算谷歌引入了AIDL这种方式来规定接口，哪怕只是中间所用到的类的序列化过程出现一点失误都会造成如此严重的漏洞。可见安全编程以及代码审计的必要性，没准以后还会有类似机理的漏洞被发掘出来。

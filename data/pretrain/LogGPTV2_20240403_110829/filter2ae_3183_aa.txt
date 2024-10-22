@@ -1,0 +1,138 @@
+本文原文来自[Analyzing Android's CVE-2019-2215 (/dev/binder
+UAF)](https://dayzerosec.com/posts/analyzing-androids-cve-2019-2215-dev-binder-uaf/ "Analyzing Android's CVE-2019-2215 \(/dev/binder
+UAF\)")。研究的过程中后来Project Zero又出了一篇博客，所以加了Project Zero博客中的一些图片和注释，好理解一点。
+## 前言
+在过去的几周中，那些经常在Twitch上访问DAY[0]的人可能已经看到我正在努力理解Project Zero发布的最新android
+binder中的UAF漏洞。这并不是一个新的漏洞，它已在2018年2月发现并在主线内核中得到修复，但是Project
+Zero发现许多设备没有在下游收到补丁。其中一些设备包括Pixel 2，华为P20和三星Galaxy
+S7，S8和S9。我相信其中许多设备在过去几周内都收到了安全补丁，这些补丁最终修补了该漏洞。  
+在虚拟机(android-x86)上运行内核调试器并使用存在漏洞的Pixel 2进行了几轮测试之后，我逐渐理解了Jann Horn和Maddie
+Stone编写的EXP。如果不了解binder(具体来说是binder_thread对象)以及vectored
+I/O的工作原理，则可能不是很好理解EXP。他们利用该漏洞的方法也很聪明，因此我认为写下EXP的原理很酷。  
+我们将主要关注如何建立任意读写原语，而不会关注诸如禁用SELinux并启用完整root功能之类的后利用的东西，因为已经有很多关于它们的文章了。这是本文要涵盖的内容的简要概述：  
+1.binder和vectored I/O的基本概述  
+2.漏洞详情  
+3.泄漏内核task结构体  
+4.建立任意读写原语  
+5.结论  
+请注意，所有代码均来自内核v4.4.177，这也是我亲自测试的内核。  
+注：对于建立任意读写原语之后如何禁用SELinux并启用完整root功能等内容如果有兴趣可以阅读[Tailoring CVE-2019-2215 to
+Achieve Root](https://hernan.de/blog/2019/10/15/tailoring-cve-2019-2215-to-achieve-root/ "Tailoring CVE-2019-2215 to Achieve Root")这篇文章。
+## binder和vectored I/O的基本概述
+### binder
+binder驱动程序是仅用于android的驱动程序，它提供了一种简单的IPC(Inter Process
+Communication，进程间通信)方法，包括RPC(Remote Procedure
+Calling，远程过程调用)。您可以在主线linux内核中找到此驱动程序的源代码，但是其未针对非android版本进行配置。  
+有几种不同的binder设备驱动程序可用于不同类型的IPC。使用AIDL(Android Interface Definition
+Language，Android接口定义语言)在framework和应用程序进程之间进行通信需要使用/dev/binder；使用HIDL(HAL
+Interface Definition
+Language，硬件抽象层接口定义语言)在framework和应用程序进程之间进行通信需要使用/dev/hwbinder。最后，对于希望在供应商进程之间使用IPC而不使用HIDL的供应商，可以使用/dev/vndbinder。研究EXP我们只需要关心第一个驱动程序/dev/binder。  
+与linux中的大多数IPC机制一样，binder通过文件描述符工作，您可以使用EPOLL API向其添加epoll。
+### vectored I/O
+vectored I/O允许使用多个缓冲区写入数据流，或将数据流读取到多个缓冲区。也称为scatter/gather I/O(分散/聚集
+I/O)。与non-vectored I/O相比，vectored
+I/O具有一些优势：可以使用不连续的不同缓冲区进行写入或读取，而不会产生大量开销。这也是原子的。  
+vectored I/O有用的一个示例是当数据包中有一个头部，后跟连续块中的数据的时候。使用vectored
+I/O可以将头部和数据保存在单独的非连续缓冲区中，并通过一个系统调用而不是两个系统调用对其进行读取或写入。  
+使用方法是定义一个iovec结构体数组，其中包含有关要用于I/O的所有缓冲区的信息。该iovec结构体相对较小，在64位系统上仅包含两个QWORD(8字节数据)。
+    struct iovec {      // Size: 0x10
+        void *iov_base; // 0x00
+        size_t iov_len; // 0x08
+    }
+## 漏洞详情
+binder驱动程序具有清理例程，可以通过ioctl函数在实际关闭驱动程序之前触发该例程。如果你熟悉驱动程序和清理例程，则可能已经猜到了为什么这会引起问题。  
+让我们看一下Project Zero报告的摘要：如上游提交中所述，`binder_poll`函数传递thread->wait
+waitqueue，该队列可以在工作时休眠。当使用epoll的线程使用`BINDER_THREAD_EXIT`显式退出时，waitqueue将被释放，但它不会从相应的epoll数据结构中删除。当进程随后退出时，epoll清理代码将尝试访问waitqueue，这将导致UAF。  
+摘要有点误导，UAF不在waitqueue本身上。waitqueue是`binder_thread`结构体中内联的结构体，`binder_thread`对象实际上才是UAF的对象。他们在此摘要中提到waitqueue的原因是此问题最初是由Google的syzkaller
+fuzzer于2017年发现的，该fuzzer在waitqueue上触发了KASAN检测到的UAF。
+### free
+让我们看一下有问题的ioctl命令`BINDER_THREAD_EXIT`。
+    static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+    {
+        // [...]
+        switch (cmd) {
+        // [...]
+        case BINDER_THREAD_EXIT:
+            binder_debug(BINDER_DEBUG_THREADS, "%d:%d exit\n",
+                     proc->pid, thread->pid);
+            binder_free_thread(proc, thread);
+            thread = NULL;
+            break;
+         // [...]
+        }
+    }
+    // [...]
+    static int binder_free_thread(struct binder_proc *proc,
+                      struct binder_thread *thread)
+    {
+        struct binder_transaction *t;
+        struct binder_transaction *send_reply = NULL;
+        int active_transactions = 0;
+        // [...]
+        while (t) {
+            active_transactions++;
+            // [...]
+        }
+        if (send_reply)
+            binder_send_failed_reply(send_reply, BR_DEAD_REPLY);
+        binder_release_work(&thread->todo);
+        kfree(thread);
+        binder_stats_deleted(BINDER_STAT_THREAD);
+        return active_transactions;
+    }
+有问题的代码是第2610行：kfree(thread)。这就是UAF中free发生的地方。
+### use(after free)
+我们已经看到了free发生的地方，让我们尝试看看free之后use发生的地方。KASAN报告中的stack trace将对此有所帮助。
+    Call Trace:
+      ...
+      _raw_spin_lock_irqsave+0x96/0xc0 kernel/locking/spinlock.c:159
+      remove_wait_queue+0x81/0x350 kernel/sched/wait.c:50
+      ep_remove_wait_queue fs/eventpoll.c:595 [inline]
+      ep_unregister_pollwait.isra.7+0x18c/0x590 fs/eventpoll.c:613
+      ep_free+0x13f/0x320 fs/eventpoll.c:830
+      ep_eventpoll_release+0x44/0x60 fs/eventpoll.c:862
+      ...
+看上去可能有点让人迷惑，因为`binder_thread`对象是间接引用的，用Ctrl+F是找不到`binder_thread`的。但是如果我们查看`ep_unregister_pollwait`函数：
+    static void ep_unregister_pollwait(struct eventpoll *ep, struct epitem *epi)
+    {
+        struct list_head *lsthead = &epi->pwqlist;
+        struct eppoll_entry *pwq;
+        while (!list_empty(lsthead)) {
+            pwq = list_first_entry(lsthead, struct eppoll_entry, llink);
+            list_del(&pwq->llink);
+            ep_remove_wait_queue(pwq);
+            kmem_cache_free(pwq_cache, pwq);
+        }
+    }
+我们会发现被释放的`binder_thread`在`eppoll_entry`链表中，即pwq。让我们来看看`ep_remove_wait_queue`函数和`remove_wait_queue`函数。
+    static void ep_remove_wait_queue(struct eppoll_entry *pwq)
+    {
+        wait_queue_head_t *whead;
+        rcu_read_lock();
+        /*
+         * If it is cleared by POLLFREE, it should be rcu-safe.
+         * If we read NULL we need a barrier paired with
+         * smp_store_release() in ep_poll_callback(), otherwise
+         * we rely on whead->lock.
+         */
+        whead = smp_load_acquire(&pwq->whead);
+        if (whead)
+            remove_wait_queue(whead, &pwq->wait);
+        rcu_read_unlock();
+    }
+    // WRITE-UP COMMENT: q points into stale data / the UAF object
+    void remove_wait_queue(wait_queue_head_t *q, wait_queue_t *wait)
+    {
+        unsigned long flags;
+        spin_lock_irqsave(&q->lock, flags);
+        __remove_wait_queue(q, wait);
+        spin_unlock_irqrestore(&q->lock, flags);
+    }
+q指向已经被释放的数据，这就是在自旋锁上发生KASAN崩溃的原因。在不使用KASAN的普通设备上，如果按原样运行POC很可能不会发生崩溃，这可能会导致你错误地认为设备不存在漏洞。这是因为已经被释放的数据可能仍然有效。  
+注：`binder_thread`结构体和`__wait_queue_head`结构体如下，`remove_wait_queue`函数中q是waitqueue的表头，指向`binder_thread`结构体中的`wait_queue_head_t`(已经被释放)；wait是waitqueue中的成员，紧随在表头之后。`remove_wait_queue`函数的功能就是删除紧随在表头之后的一个成员。  
+    struct binder_thread {
+            struct binder_proc *proc;
+            struct rb_node rb_node;
+            struct list_head waiting_thread_node;
+            int pid;
+            int looper;              /* only modified by this thread */

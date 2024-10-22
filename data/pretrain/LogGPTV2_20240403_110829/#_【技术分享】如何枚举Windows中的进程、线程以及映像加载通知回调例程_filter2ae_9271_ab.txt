@@ -1,0 +1,129 @@
+          return STATUS_ACCESS_DENIED;
+          // Allocate new data structure.
+        NewCallBackBlock = ExAllocateCallBack(NotifyRoutine, UpperFlagBits);
+        if ( !NewCallBackBlock )
+          return STATUS_INSUFFICIENT_RESOURCES;
+        Index = 0;
+        while ( !ExCompareExchangeCallBack(&PspCreateProcessNotifyRoutine[Index], NewCallBackBlock, NULL) )
+        {
+          Index++;
+          if ( Index >= 0x40 )
+          {
+            // No space for callbacks.
+            ExFreePoolWithTag(NewCallBackBlock, 0);
+            return STATUS_INVALID_PARAMETER;
+          }
+        }
+        // Increment global counters.
+        if ( bIsExRoutine )
+        {
+          _InterlockedIncrement(&PspCreateProcessNotifyRoutineExCount);
+          if ( !(PspNotifyEnableMask & 4) )
+            _interlockedbittestandset(&PspNotifyEnableMask, 2u); // Have "Ex" callbacks.
+        }
+        else
+        {
+          _InterlockedIncrement(&PspCreateProcessNotifyRoutineCount);
+          if ( !(PspNotifyEnableMask & 2) )
+            _interlockedbittestandset(&PspNotifyEnableMask, 1u); // Have base-type of callbacks.
+        }
+        return STATUS_SUCCESS;
+      }
+    }
+幸运的是，从Windows
+2000起，与回调例程有关的许多内部数据结构并没有发生改动。[ReactOS](https://www.reactos.org/)的前辈们已经给出过这些结构的定义，因此在可能的情况下，我们会使用这些结构定义，以避免重复劳动。
+每个回调都对应一个全局数组，该数组最多可以包含64个元素。在我们的案例中，用于进程创建回调的数组的起始元素为
+**nt!PspCreateProcessNotifyRoutine** 。数组中的每个元素均为EXCALLBACK类型。
+    // Source: https://doxygen.reactos.org/de/d22/ndk_2extypes_8h_source.html#l00545
+    //
+    // Internal Callback Handle
+    //
+    typedef struct _EX_CALLBACK
+    {
+        EX_FAST_REF RoutineBlock;
+    } EX_CALLBACK, *PEX_CALLBACK;
+为了避免同步问题，系统使用了nt!ExReferenceCallBackBlock来安全获取底层回调对象的引用（EXCALLBACKROUTINEBLOCK，如下所示）。我们以非线程安全形式的代码重现这一过程：
+    /*
+        nt!_EX_CALLBACK
+           +0x000 RoutineBlock     : _EX_FAST_REF
+    */
+    _EX_CALLBACK* CallBack = &PspCreateProcessNotifyRoutine[Index];
+    /*
+        kd> dt nt!_EX_FAST_REF
+           +0x000 Object           : Ptr64 Void
+           +0x000 RefCnt           : Pos 0, 4 Bits
+           +0x000 Value            : Uint8B
+    */
+    _EX_FAST_REF ReferenceObject = CallBack->RoutineBlock;
+    // We need to find the location of the actual "Object" from the
+    // _EX_FAST_REF structure. This is a union, where the lower 4 bits
+    // are the "RefCnt". So, this means we're interested in the remaining
+    // 60 bits.
+    // Strip off the "RefCnt" bits.
+    _EX_CALLBACK_ROUTINE_BLOCK* CallBackBlock = (_EX_CALLBACK_ROUTINE_BLOCK*)(ReferenceObject.Value & 0xFFFFFFFFFFFFFFF0);
+    // Source: https://doxygen.reactos.org/db/d49/xdk_2extypes_8h_source.html#l00179
+    typedef struct _EX_RUNDOWN_REF {
+      _ANONYMOUS_UNION union {
+        volatile ULONG_PTR Count;
+        volatile PVOID Ptr;
+      } DUMMYUNIONNAME;
+    } EX_RUNDOWN_REF, *PEX_RUNDOWN_REF;
+    // Source: https://doxygen.reactos.org/de/d22/ndk_2extypes_8h_source.html#l00535
+    //
+    // Internal Callback Object
+    //
+    typedef struct _EX_CALLBACK_ROUTINE_BLOCK
+    {
+        EX_RUNDOWN_REF RundownProtect;
+        PEX_CALLBACK_FUNCTION Function;
+        PVOID Context;
+    } EX_CALLBACK_ROUTINE_BLOCK, *PEX_CALLBACK_ROUTINE_BLOCK;
+如果我们想要删除某个回调对象（“Remove”为TRUE），我们要确保在数组中找到正确的EXCALLBACKROUTINEBLOCK。具体的方法是，首先使用nt!ExGetCallBackBlockRoutine来检查目标“NotifyRoutine”是否与当前的EXCALLBACK_ROUTINE相匹配：
+    PVOID __fastcall ExGetCallBackBlockRoutine(_EX_CALLBACK_ROUTINE_BLOCK *CallBackBlock)
+    {
+      return CallBackBlock->Function;
+    }
+随后，使用 **nt!ExGetCallBackBlockContext**
+检查目标类型是否正确（即是否使用正确的nt!PsSetCreateProcessNotifyRoutine/Ex/Ex2创建而得）：
+    PVOID __fastcall ExGetCallBackBlockContext(_EX_CALLBACK_ROUTINE_BLOCK *CallBackBlock)
+    {
+      return CallBackBlock->Context;
+    }
+此时，我们已经找到了数组中的那个元素。我们需要通过 **nt!ExCompareExchangeCallback**
+将EXCALLBACK的值设置为NULL，减少其对应的全局计数值（为nt!PspCreateProcessNotifyRoutineExCount或者nt!PspCreateProcessNotifyRoutineCount），通过nt!ExDereferenceCallBackBlock解除EXCALLBACKROUTINEBLOCK的引用，等待使用EXCALLBACK的其他代码（nt!ExWaitForCallBacks），最后释放内存（nt!ExFreePoolWithTag）。从这个过程中，我们可知微软为了避免释放在用的回调对象做了许多工作。
+如果遍历所有64个元素后，我们依然无法在nt!PspCreateProcessNotifyRoutine数组中找到需要删除的元素，那么系统就会返回STATUSPROCEDURENOT_FOUND错误信息。
+另一方面，如果我们想要往回调数组中添加新的元素，过程会稍微简单点。nt!MmVerifyCallbackFunctionCheckFlags函数会执行完整性检查，以确保已加载模块中存在“NotifyRoutine”。这样一来，未链接的驱动（或shellcode）就无法收到回调事件。
+    BOOL __fastcall MmVerifyCallbackFunctionCheckFlags(PVOID NotifyRoutine, DWORD Flags)
+    {
+      struct _KTHREAD *CurrentThread; // rbp
+      BOOL bHasValidFlags; // ebx
+      _KLDR_DATA_TABLE_ENTRY *Entry; // rax
+      if ( MiGetSystemRegionType(NotifyRoutine) == 1 )
+        return 0;
+      CurrentThread = KeGetCurrentThread();
+      bHasValidFlags = 0;
+      --CurrentThread->KernelApcDisable;
+      ExAcquireResourceSharedLite(&PsLoadedModuleResource, 1u);
+      Entry = MiLookupDataTableEntry(NotifyRoutine, 1u);
+      if ( Entry && (!Flags || Entry->Flags & Flags) )
+        bHasValidFlags = 1;
+      ExReleaseResourceLite(&PsLoadedModuleResource);
+      KeLeaveCriticalRegionThread(CurrentThread);
+      return bHasValidFlags;
+    }
+通过完整性检查后，系统会使用nt!ExAllocateCallBack来分配一个EXCALLBACKROUTINEBLOCK。这个函数可以用来确认EXCALLBACKROUTINEBLOCK结构的大小及布局：
+    _EX_CALLBACK_ROUTINE_BLOCK *__fastcall ExAllocateCallBack(PEX_CALLBACK_FUNCTION Function, PVOID Context)
+    {
+      _EX_CALLBACK_ROUTINE_BLOCK *CallbackBlock;
+      CallbackBlock = (_EX_CALLBACK_ROUTINE_BLOCK *)ExAllocatePoolWithTag(
+                                                      NonPagedPoolNx,
+                                                      sizeof(_EX_CALLBACK_ROUTINE_BLOCK),
+                                                      'brbC');
+      if ( CallbackBlock )
+      {
+        CallbackBlock->Function = Function;
+        CallbackBlock->Context = Context;
+        ExInitializePushLock(&CallbackBlock->RundownProtect);
+      }
+      return CallbackBlock;
+    }

@@ -1,0 +1,136 @@
+        pgaio\_io\_stage(io, PGAIO\_SCB\_READ\_SMGR);  
+}  
+```  
+Once this reaches the fd.c layer the new FileStartRead() function calls  
+pgaio\_io\_prep\_read() on the IO - but doesn't need to know anything about weird  
+higher level stuff like relfilenodes.  
+The \_sb (\_sb for shared\_buffers) variant stores the Buffer, backend and mode  
+(as in ReadBufferMode).  
+I'm not sure this is the right design - but it seems a lot better than what I  
+had earlier...  
+## Callbacks  
+In the core AIO pieces there are two different types of callbacks at the  
+moment:  
+Shared callbacks, which can be invoked by any backend (normally the issuing  
+backend / the AIO workers, but can be other backends if they are waiting for  
+the IO to complete). For operations on shared resources (e.g. shared buffer  
+reads/writes, or WAL writes) these shared callback needs to transition the  
+state of the object the IO is being done for to completion. E.g. for a shared  
+buffer read that means setting BM\_VALID / unsetting BM\_IO\_IN\_PROGRESS.  
+The main reason these callbacks exist is that they make it safe for a backend  
+to issue non-blocking IO on buffers (see the deadlock section above). As any  
+blocked backend can cause the IO to complete, the deadlock danger is gone.  
+Local callbacks, one of which the issuer of an IO can associate with the  
+IO. These can be used to issue further readahead. I initially did not have  
+these, but I found it hard to have a controllable numbers of IO in  
+flight. They are currently mainly used for error handling (e.g. erroring out  
+when XLogFileInit() cannot create the file due to ENOSPC), and to issue more  
+IO (e.g. readahead for heapam).  
+The local callback system isn't quite right, and there's  
+## AIO conversions  
+Currently the patch series converts a number of subsystems to AIO. They are of  
+very varying quality. I mainly did the conversions that I considered either be  
+of interest architecturally, or that caused a fair bit of pain due to slowness  
+(e.g. VACUUMing without AIO is no fun at all when using DIO). Some also for  
+fun ;)  
+Most conversions are fairly simple. E.g. heap scans, checkpointer, bgwriter,  
+VACUUM are all not too complicated.  
+There are two conversions that are good bit more complicated/experimental:  
+1) Asynchronous, concurrent, WAL writes. This is important because we right  
+   now are very bottlenecked by IO latency, because there effectively only  
+   ever is one WAL IO in flight at the same time. Even though in many  
+   situations it is possible to issue a WAL write, have one [set of] backends  
+   wait for that write as its completions satisfies their XLogFlush() needs,  
+   but concurrently already issue the next WAL write(s) that other backends  
+   need.  
+   The code here is very crufty, but I think the concept is mostly right.  
+2) Asynchronous buffer replacement. Even with buffered IO we experience a lot  
+   of pain when ringbuffers need to write out data (VACUUM!). But with DIO the  
+   issue gets a lot worse - the kernel can't hide the write latency from us  
+   anymore.  This change makes each backend asynchronously clean out buffers  
+   that it will need soon. When a ringbuffer is is use this means cleaning out  
+   buffers in the ringbuffer, when not, performing the clock sweep and cleaning  
+   out victim buffers.  Due to 1) the XLogFlush() can also be done  
+   asynchronously.  
+There are a *lot* of places that haven't been converted to use AIO.  
+## Stats  
+There are two new views: pg\_stat\_aios showing AIOs that are currently  
+in-progress, pg\_stat\_aio\_backends showing per-backend statistics about AIO.  
+## Code:  
+https://github.com/anarazel/postgres/tree/aio  
+I was not planning to attach all the patches on the way to AIO - it's too many  
+right now... I hope I can reduce the size of the series iteratively into  
+easier to look at chunks.  
+## TL;DR: Performance numbers  
+This is worth an email on its own, and it's pretty late here already and I  
+want to rerun benchmarks before posting more numbers. So here are just a few  
+that I could run before falling asleep.  
+1) 60s of parallel COPY BINARY of a 89MB into separate tables (s\_b = 96GB):  
+slow NVMe SSD  
+```  
+branch   dio  clients   tps/stddev      checkpoint write time  
+master   n    8         3.0/2296 ms     4.1s / 379647 buffers = 723MiB/s  
+aio      n    8         3.8/1985 ms     11.5s / 1028669 buffers = 698MiB/  
+aio      y    8         4.7/204 ms      10.0s / 1164933 buffers = 910MiB/s  
+```  
+raid of 2 fast NVMe SSDs (on pcie3):  
+```  
+branch   dio  clients   tps/stddev      checkpoint write time  
+master   n    8         9.7/62 ms       7.6s / 1206376 buffers = 1240MiB/s  
+aio      n    8         11.4/82 ms      14.3s / 2838129 buffers = 1550MiB/s  
+aio      y    8         18.1/56 ms      8.9s / 4486170 buffers = 3938MiB/s  
+```  
+2) pg prewarm speed  
+raid of 2 fast NVMe SSDs (on pcie3):  
+pg\_prewarm(62GB, read)  
+```  
+branch   dio    time            bw  
+master   n      17.4s           3626MiB/s  
+aio      n      10.3s           6126MiB/s (higher cpu usage)  
+aio      y      9.8s            6438MiB/s  
+```  
+pg\_prewarm(62GB, buffer)  
+```  
+branch   dio    time            bw  
+master   n      38.3s           1647MiB/s  
+aio      n      13.6s           4639MiB/s (higher cpu usage)  
+aio      y      10.7s           5897MiB/s  
+```  
+3) parallel sequential scan speed  
+parallel sequential scan + count(*) of 59GB table:  
+```  
+branch   dio        max\_parallel        time  
+master   n          0                   40.5s  
+master   n          1                   22.6s  
+master   n          2                   16.4s  
+master   n          4                   10.9s  
+master   n          8                   9.3s  
+aio      y          0                   33.1s  
+aio      y          1                   17.2s  
+aio      y          2                   11.8s  
+aio      y          4                   9.0s  
+aio      y          8                   9.2s  
+```  
+On local SSDs there's some, but not a huge performance advantage in most  
+transactional r/w workloads. But on cloud storage - which has a lot higher  
+latency - AIO can yield huge advantages. I've seen over 4x.  
+There's definitely also cases where AIO currently hurts - most of those I just  
+didn't get aroung to address.  
+There's a lot more cases in which DIO currently hurts - mostly because the  
+necessary smarts haven't yet been added.  
+Comments? Questions?  
+I plan to send separate emails about smaller chunks of this seperately -  
+the whole topic is just too big. In particular I plan to send something  
+around buffer locking / state management - it's a one of the core issues  
+around this imo.  
+Regards,  
+Andres  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

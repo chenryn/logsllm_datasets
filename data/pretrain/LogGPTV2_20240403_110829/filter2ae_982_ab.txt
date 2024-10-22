@@ -1,0 +1,214 @@
+      }
+      //解锁arena
+      if (ar_ptr != NULL)
+        __libc_lock_unlock(ar_ptr->mutex);
+      //安全检查
+      assert(!victim || chunk_is_mmapped(mem2chunk(victim)) ||
+             ar_ptr == arena_for_chunk(mem2chunk(victim)));
+      return victim;
+    }
+在glibc2.26之前的版本中(如glibc2.25)，没有`#if
+USE_TCACHE...#endif`和判断单线程的那些代码。另外在这些glibc版本中可以通过修改`__malloc_hook`的值来getshell，但是在glibc2.34中已经将`__malloc_hook`,
+`__realloc_hook`,`__memalign_hook` ,`__free_hook`等API删除。
+## tcache_init
+tcache的初始化函数，主要就是利用malloc的内存分配原理给tcache分配内存，完成初始化
+    static void
+    tcache_init(void)
+    {
+      //本部分与__libc_malloc的后半段基本一致，就是给tcache分配sizeof(tcache_perthread_struct)大小的内存，完成初始化
+      mstate ar_ptr;
+      void *victim = 0;
+      const size_t bytes = sizeof (tcache_perthread_struct);
+      if (tcache_shutting_down)
+        return;
+      arena_get (ar_ptr, bytes);
+      victim = _int_malloc (ar_ptr, bytes);
+      if (!victim && ar_ptr != NULL)
+        {
+          ar_ptr = arena_get_retry (ar_ptr, bytes);
+          victim = _int_malloc (ar_ptr, bytes);
+        }
+      if (ar_ptr != NULL)
+        __libc_lock_unlock (ar_ptr->mutex);
+      /* In a low memory situation, we may not be able to allocate memory
+         - in which case, we just keep trying later.  However, we
+         typically do this very early, so either there is sufficient
+         memory, or there isn't enough memory to do non-trivial
+         allocations anyway.  */
+      if (victim)
+        {
+          tcache = (tcache_perthread_struct *) victim;
+          memset (tcache, 0, sizeof (tcache_perthread_struct));
+        }
+    }
+## tcache_get
+在`__libc_malloc`中判断索引为`tc_idx`的entries中有可用的chunk后调用本函数取出对应的chunk
+    /* Caller must ensure that we know tc_idx is valid and there's
+       available chunks to remove.  */
+    static __always_inline void *
+    tcache_get (size_t tc_idx)
+    {
+      tcache_entry *e = tcache->entries[tc_idx];//找到索引为tc_idx的entries，并暂存给e
+      assert (tc_idx entries[tc_idx] > 0);//确保entries非空
+      tcache->entries[tc_idx] = e->next;//把e踢出链表
+      --(tcache->counts[tc_idx]);//链表里的chunk数减一
+      return (void *) e;//e即要找的chunk，因为e指向的就是chunk的用户数据，所以直接返回e
+    }
+## _int_malloc
+本函数就是Linux堆分配的主要内容，由于代码较长，所以分段分析。
+开始先对申请的字节数做对齐处理，使得申请的最小内存大小必须是`2*SIZE_SZ`（32位下为4,
+64位下为8）的最小整数倍，再判断当前的arena是否可用，如果不可用则调用sysmalloc申请内存
+    static void *
+    _int_malloc (mstate av, size_t bytes)
+    {
+      INTERNAL_SIZE_T nb;               /* normalized request size */
+      unsigned int idx;                 /* associated bin index */
+      mbinptr bin;                      /* associated bin */
+      mchunkptr victim;                 /* inspected/selected chunk */
+      INTERNAL_SIZE_T size;             /* its size */
+      int victim_index;                 /* its bin index */
+      mchunkptr remainder;              /* remainder from a split */
+      unsigned long remainder_size;     /* its size */
+      unsigned int block;               /* bit map traverser */
+      unsigned int bit;                 /* bit map traverser */
+      unsigned int map;                 /* current word of binmap */
+      mchunkptr fwd;                    /* misc temp for linking */
+      mchunkptr bck;                    /* misc temp for linking */
+    #if USE_TCACHE
+      size_t tcache_unsorted_count;     /* count of unsorted chunks processed */
+    #endif
+      /*
+         Convert request size to internal form by adding SIZE_SZ bytes
+         overhead plus possibly more to obtain necessary alignment and/or
+         to obtain a size of at least MINSIZE, the smallest allocatable
+         size. Also, checked_request2size traps (returning 0) request sizes
+         that are so large that they wrap around zero when padded and
+         aligned.
+       */
+      //将申请的字节数bytes根据2*SIZE_SZ对齐转换成实际分配的字节数nb
+      //并做了一些安全检查，确保不会溢出
+      checked_request2size (bytes, nb);
+      /* There are no usable arenas.  Fall back to sysmalloc to get a chunk from
+         mmap.  */
+      //如果当前的arena不可用，就用调用sysmalloc向操作系统直接申请nb大小的内存返回
+      if (__glibc_unlikely (av == NULL))
+        {
+          void *p = sysmalloc (nb, av);
+          if (p != NULL)
+        alloc_perturb (p, bytes);
+          return p;
+        }
+      ...
+    }
+### fast bin
+fast bin存储在fastbinY数组中，一共有10个，每个fast
+bin都是一个单链表，只用fd将各个chunk串起来。每个单链表中的chunk大小是一样的，这样在找特定大小的chunk的时候就不用挨个找，只需要计算出对应链表的索引即可，提高了效率。如fastbinY[0]中存储的链表里都是16字节大小的chunk（以32位系统为例），之后每个链表增加8个字节，所以最后一个fast
+bin中存储的是88字节的chunk。另外，fast bin使用的是LIFO算法（即后入先出），这样刚被释放的chunk最先被分配，利用了局部性原理。
+fast bin是除tcache外优先级最高的，如果fas tbin中有满足需求的chunk就不需要再到small bin和large
+bin中寻找。当在fast
+bin中找到需要的chunk后还将与该chunk大小相同的所有chunk放入tcache，目的就是利用局部性原理提高下一次内存分配的效率。
+    /*
+         If the size qualifies as a fastbin, first check corresponding bin.
+         This code is safe to execute even if av is not yet initialized, so we
+         can try it without checking, which saves some time on this fast path.
+       */
+    #define REMOVE_FB(fb, victim, pp) \
+      do                              \
+      {                               \
+        victim = pp;                  \
+        if (victim == NULL)           \
+          break;                      \
+      } while ((pp = catomic_compare_and_exchange_val_acq(fb, victim->fd, victim)) != victim);
+    //判断实际分配的chunk大小是否满足fastbin的要求
+    //即小于等于MAX_FAST_SIZE(在32位中是80，在64位中是160)
+      if ((unsigned long)(nb) fd;//即将victim从链表中取出
+          else
+            REMOVE_FB(fb, pp, victim);//也是将victim从链表中取出，fb指向下一个chunk
+          //确保分配的chunk属于刚才找到的fastbin链表
+          if (__glibc_likely(victim != NULL))
+          {
+            size_t victim_idx = fastbin_index(chunksize(victim));
+            if (__builtin_expect(victim_idx != idx, 0))
+              malloc_printerr("malloc(): memory corruption (fast)");
+            check_remalloced_chunk(av, victim, nb);
+            //将大小为nb的chunk放到tcache里
+    #if USE_TCACHE
+            /* While we're here, if we see other chunks of the same size,
+             stash them in the tcache.  */
+            size_t tc_idx = csize2tidx(nb);
+            if (tcache && tc_idx counts[tc_idx] fd;
+                else
+                {
+                  REMOVE_FB(fb, pp, tc_victim);
+                  if (__glibc_unlikely(tc_victim == NULL))
+                    break;
+                }
+                tcache_put(tc_victim, tc_idx);//将取出的chunk放入对应的tcache链表
+              }
+            }
+    #endif
+            //返回从fastbin中找到的chunk
+            void *p = chunk2mem(victim);
+            alloc_perturb(p, bytes);
+            return p;
+          }
+        }
+      }
+### small bin
+small bin存储在bins数组中，下标为2到63，一共62个，和fast bin一样，每个small
+bin中的chunk都是相同的大小，下标为2的small bin中存储的是16个字节的chunk，之后一次增加8个字节，所以下标为63的small
+bin中存储的是504个字节的chunk（以32位系统为例）。与fast bin不同的是，small
+bin是一个双向循环链表，且采用FIFO（先进先出）算法。
+    /*
+         If a small request, check regular bin.  Since these "smallbins"
+         hold one size each, no searching within bins is necessary.
+         (For a large request, we need to wait until unsorted chunks are
+         processed to find best fit. But for small ones, fits are exact
+         anyway, so we can check now, which is faster.)
+       */
+      if (in_smallbin_range(nb))//即小于MIN_LARGE_SIZE(在32位下为512，在64位下为1024)
+                                //所以small bin中最大的chunk为504字节和1008字节
+      {
+        idx = smallbin_index(nb);//算出对应的small bin索引
+        bin = bin_at(av, idx);//找到对应的small bin链表
+    //如果small bin链表头的上一个chunk（即链表的最后一个chunk，small bin链表是双向循环链表）
+    //不等于它自己，即该small bin链表非空
+    //取链表的最后一个chunk作为victim，即FIFO
+        if ((victim = last(bin)) != bin)
+        {
+          if (victim == 0) /* initialization check */
+            malloc_consolidate(av);//合并fastbin到unsortedbin
+          else
+          {
+            bck = victim->bk;//倒数第二个chunk
+            //确保倒数第二个chunk的fd指向最后的chunk
+            if (__glibc_unlikely(bck->fd != victim))
+              malloc_printerr("malloc(): smallbin double linked list corrupted");
+            //将victim下一个chunk的PREV_INUSE位置1，即标记victim为被使用状态
+            set_inuse_bit_at_offset(victim, nb);
+            //将victim从链表中取出
+            bin->bk = bck;
+            bck->fd = bin;
+            //如果不是main_arena将NON_MAIN_ARENA位置1
+            if (av != &main_arena)
+              set_non_main_arena(victim);
+            check_malloced_chunk(av, victim, nb);
+    #if USE_TCACHE
+            //与fast bin中那部分相似，都是将所有大小为nb的chunk放入tcache中
+            //不同的是在本部分中chunk放入tcache之前将该chunk标记为使用中
+            //而fast bin的那部分没有
+            //说明tcache和fast bin中的chunk尽管空闲还是都被标记为使用中
+            //目的是防止相邻的chunk合并
+            /* While we're here, if we see other chunks of the same size,
+             stash them in the tcache.  */
+            size_t tc_idx = csize2tidx(nb);
+            if (tcache && tc_idx counts[tc_idx] bk;
+                  set_inuse_bit_at_offset(tc_victim, nb);
+                  if (av != &main_arena)
+                    set_non_main_arena(tc_victim);
+                  bin->bk = bck;
+                  bck->fd = bin;
+                  tcache_put(tc_victim, tc_idx);
+                }
+              }
+            }

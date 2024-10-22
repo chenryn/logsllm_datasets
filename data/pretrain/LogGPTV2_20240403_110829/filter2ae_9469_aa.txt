@@ -1,0 +1,198 @@
+# 前言
+本文主要分析了`Shadowsocks`的源码和密码学漏洞原理
+## socks5
+一种网络协议, 由于支持`tcp`和`udp`所以经常用于`客户端`和外`部网络服务器`之间的中间传输
+### socks5协议分析
+本地写了个转发,监听在`8081`端口
+通过代理访问`pwnsky.com`的流量包如下
+通过`psh`包的跟踪tcp流量获取到如下流量包
+内容如下, 有缩进的为`服务端`返回的数据
+    00000000  05 02 00 01                                        ....
+        00000000  05 00                                              ..
+    00000004  05 01 00 01 76 c1 45 9e  00 50                     ....v.E. .P
+        00000002  05 00 00 01 00 00 00 00  00 00                     ........ ..
+    0000000E  47 45 54 20 2f 20 48 54  54 50 2f 31 2e 31 0d 0a   GET / HT TP/1.1..
+    0000001E  48 6f 73 74 3a 20 70 77  6e 73 6b 79 2e 63 6f 6d   Host: pw nsky.com
+    0000002E  0d 0a 55 73 65 72 2d 41  67 65 6e 74 3a 20 63 75   ..User-A gent: cu
+    0000003E  72 6c 2f 37 2e 37 38 2e  30 0d 0a 41 63 63 65 70   rl/7.78. 0..Accep
+    0000004E  74 3a 20 2a 2f 2a 0d 0a  0d 0a                     t: */*.. ..
+#### 逐行分析
+##### 客户端第一次请求与服务端第一次回复
+###### 客户端
+VER | NMETHODS | METHODS  
+---|---|---  
+0x05 | 1 | 1 TO 255  
+###### 服务端
+VER | METHOD  
+---|---  
+0x05 | 1  
+VER 的值当被设置为 0x05，标明当前版本为Socks5
+NMETHODS中包含在 METHODS 中出现的方法标识的数据,每种有各自对应的格式
+  * 0x00 无需认证
+  * 0x02 需要认证, 用户名/密码
+  * 0xFF 无可接受方法
+    00000000  05 02 00 01                                        ....
+        00000000  05 00                                              ..
+##### 客户端第二次回复
+VER | REP | PSV | ATYP | BND.ADDR | BND.PORT  
+---|---|---|---|---|---  
+0x05 | 1 | 0x00 | 1 | Variable | 2  
+  * VER: 0x05, 表明版本
+  * REP: 只有0x00标识连接成功,其他的见手册
+  * RSV: 保留字段,为0x00
+  * AYTP: 目标地址, 0x01  ipv4, 0x03  域名, 0x04  ipv6
+  * BND.ADDR: 服务器绑定地址
+  * BND.PORT: 服务器绑定端口
+    00000004  05 01 00 01 76 c1 45 9e  00 50                     ....v.E. .P
+#### 完整流程
+通过以上分析, 可总结, 完整连接流程为
+  * tcp握手
+  * 客户端请求连接
+  * 如果收到 0x05 0x00 则可以建立连接
+  * 发送 0x05 0x01 0x00 地址类型 + 目的地址 + 目的端口
+  * 接受服务器返回的自身地址和端口
+这只是一次简单的socks5协议抓包分析, 更详细的内容可以参考文档
+[RFC 1928 - SOCKS 5
+协议中文文档“译”](https://www.quarkay.com/code/383/socks5-protocol-rfc-chinese-traslation)
+# 源码分析
+## 工作方式
+    user request  sslocal  ssserver  destination
+可以理解为原本访问的流量是`A  B`
+`AB`之间的流量可能被遮蔽或干扰
+而`A  C  D  B`
+`AB`没有直接通信, 中间所传输的数据都是加密后的, 所以被屏蔽或干扰的概率下降了很多
+(主动嗅探等手段这里暂且不提)
+## 模块介绍
+一些重要的模块
+  * tcprelay.py:TCP 代理的实现
+  * udprelay.py: UDP 代理的实现
+  * asyncdns.py:异步 DNS 查询
+  * crypto:加密用到的依赖等
+  * cryptor.py: 加密的接口
+  * daemon.py:守护进程
+  * shell.py:读取命令行参数，检查配置
+  * local.py: 客户端
+  * server.py: 服务器
+### local.py && server.py
+程序入口
+两者大致内容相似, 可归纳为
+    ...
+    # 获取配置
+    config = shell.get_config(True)
+    # 是否用守护进程的方式运行
+    daemon.daemon_exec(config)
+    ...
+    # 注册dns解析器、tcp转发器、udp转发器
+    dns_resolver = asyncdns.DNSResolver()
+    tcp_server = tcprelay.TCPRelay(config, dns_resolver, True)
+    udp_server = udprelay.UDPRelay(config, dns_resolver, True)
+    # 放入循环中
+    loop = eventloop.EventLoop()
+    dns_resolver.add_to_loop(loop)
+    tcp_server.add_to_loop(loop)
+    udp_server.add_to_loop(loop)
+    loop.run()
+    ...
+### 发包
+这里首先需要确定是`tcp`还是`udp`流量, 然后交由`tcprelay.py`或`udprelay.py`处理
+中间实现代码很复杂, 尤其是`TCPRelay`, `TCPRelayHandler`且和本文关系不大
+我们主要看数据收发、加解密部分
+#### 头
+    def parse_header(data):
+        addrtype = ord(data[0])
+        dest_addr = None
+        dest_port = None
+        header_length = 0
+        if addrtype & ADDRTYPE_MASK == ADDRTYPE_IPV4:
+            if len(data) >= 7:
+                dest_addr = socket.inet_ntoa(data[1:5])
+                dest_port = struct.unpack('>H', data[5:7])[0]
+                header_length = 7
+            else:
+                logging.warn('header is too short')
+        elif addrtype & ADDRTYPE_MASK == ADDRTYPE_HOST:
+            if len(data) > 2:
+                addrlen = ord(data[1])
+                if len(data) >= 4 + addrlen:
+                    dest_addr = data[2:2 + addrlen]
+                    dest_port = struct.unpack('>H', data[2 + addrlen:4 +
+                                                         addrlen])[0]
+                    header_length = 4 + addrlen
+                else:
+                    logging.warn('header is too short')
+            else:
+                logging.warn('header is too short')
+        elif addrtype & ADDRTYPE_MASK == ADDRTYPE_IPV6:
+            if len(data) >= 19:
+                dest_addr = socket.inet_ntop(socket.AF_INET6, data[1:17])
+                dest_port = struct.unpack('>H', data[17:19])[0]
+                header_length = 19
+            else:
+                logging.warn('header is too short')
+        else:
+            logging.warn('unsupported addrtype %d, maybe wrong password or '
+                         'encryption method' % addrtype)
+        if dest_addr is None:
+            return None
+        return addrtype, to_bytes(dest_addr), dest_port, header_length
+以上功能主要是:
+判断数据为`ipv4`, `域名`或`ipv6`中的哪一种 并解析数据`ip`, `port`
+返回地址类型`addrtype`，IP`dest_addr`，port `dest_port`,长度`header_length`
+#### 选择服务器
+    def _get_a_server(self):
+        server = self._config['server']
+        server_port = self._config['server_port']
+        if type(server_port) == list:
+            server_port = random.choice(server_port)
+        if type(server) == list:
+            server = random.choice(server)
+        logging.debug('chosen server: %s:%d', server, server_port)
+        return server, server_port
+然后是从`config`里面随机选择一个服务端,这里`tcp` ,`udp`都一样
+#### 加密
+###### udp
+    ...
+    key, iv, m = cryptor.gen_key_iv(self._password, self._method)
+    ...
+    try:
+        data = cryptor.encrypt_all_m(key, iv, m, self._method, data,
+                                     self._crypto_path)
+    ...
+首先生成key,iv, 跟踪进去查看生成方式
+    def gen_key_iv(password, method):
+        method = method.lower()
+        (key_len, iv_len, m) = method_supported[method]
+        if key_len > 0:
+            key, _ = EVP_BytesToKey(password, key_len, iv_len)
+        else:
+            key = password
+        iv = random_string(iv_len)
+        return key, iv, m
+可以看到最后使用`EVP_BytesToKey`的方式生成`key`
+##### tcp
+    data = self._cryptor.encrypt(data)
+    def encrypt(self, buf):
+        if len(buf) == 0:
+            return buf
+        if self.iv_sent:
+            return self.cipher.encrypt(buf)
+        else:
+            self.iv_sent = True
+            return self.cipher_iv + self.cipher.encrypt(buf)
+使用`cipher.encrypt`来加密
+跟进去查看`cipher`的初始化
+    self.cipher = self.get_cipher(
+        password, method, CIPHER_ENC_ENCRYPTION,
+        random_string(self._method_info[METHOD_INFO_IV_LEN])
+    )
+调用`get_cipher`来初始化
+    def get_cipher(self, password, method, op, iv):
+        password = common.to_bytes(password)
+        m = self._method_info
+        if m[METHOD_INFO_KEY_LEN] > 0:
+            key, _ = EVP_BytesToKey(password,
+                                    m[METHOD_INFO_KEY_LEN],
+                                    m[METHOD_INFO_IV_LEN])
+        else:
+            # key_length == 0 indicates we should use the key directly
+            key, iv = password, b''

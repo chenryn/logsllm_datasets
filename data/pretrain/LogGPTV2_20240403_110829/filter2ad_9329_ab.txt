@@ -1,0 +1,101 @@
+在安卓中只有极少的几个服务还可以与沙箱中进程通信，我们可以看一下在Android 10上isolated_app域selinux的规则：
+    system/sepolicy/private/isolated_app.te
+    # b/17487348
+    # Isolated apps can only access three services,
+    # activity_service, display_service, webviewupdate_service, and
+    # ashmem_device_service.
+    neverallow isolated_app {
+        service_manager_type
+        -activity_service
+        -ashmem_device_service
+        -display_service
+        -webviewupdate_service
+    }:service_manager find;
+而到了Android
+11上，ashmem_device_service被从中移出，沙箱中进程无法再直接通过请求ashmem_device_service来创建一片ashmem。
+在这为数不多的几个可访问的Binder服务中，其中的大部分接口调用还会有进步一步的强制检查来进行封堵。以activity_service为例，在从servicemanager获取Binder代理后，通过该代理大部分接口都会调用enforceNotIsolatedCaller()来检查是否为isolated
+app，对于isolated_app域的进程会直接抛出安全检查异常。
+    frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+    public class ActivityManagerService extends IActivityManager.Stub
+            implements Watchdog.Monitor, BatteryStatsImpl.BatteryCallback {
+        ... skip ...
+        private void enforceNotIsolatedCaller(String caller) {
+            if (UserHandle.isIsolated(Binder.getCallingUid())) {
+                throw new SecurityException("Isolated process not allowed to call " + caller);
+            }
+        }
+        ... skip ...
+        @Override
+        public boolean clearApplicationUserData(final String packageName, boolean keepState,
+                final IPackageDataObserver observer, int userId) {
+            enforceNotIsolatedCaller("clearApplicationUserData");
+            int uid = Binder.getCallingUid();
+            int pid = Binder.getCallingPid();
+            final int resolvedUserId = mUserController.handleIncomingUser(pid, uid, userId, false,
+                    ALLOW_FULL_ONLY, "clearApplicationUserData", null);
+            ... skip ...
+        }
+        ... skip ...
+    }
+而我们发现的这枚CVE-2020-0423漏洞并不担心这个问题，因为其触发条件受限极低，仅需能与任意一个Binder服务能够通信即可，这意味着我们可以通过借助这些能够被访问的Binder服务来触发漏洞。
+**• 有限的系统调用**
+诸如绑定CPU这类系统调用在沙箱中不再被支持，这对于利用一些条件竞争类型的UAF漏洞可能会造成限制。
+**• 受限的文件/设备访问权限**
+沙箱进程有着极为严格的约束限制，来保证即便通过浏览器入口实现了远程代码执行，在沙箱中也面临寸步难行的囧地。尤其是对于文件或设备的写操作有着极为严格的限制。
+**• 更多的安全防护措施**
+安卓系统在设计上采用了最小化权限准则，除了约束极为严格的selinux策略，在沙箱进程中还采用了BPF安全机制，设备了白名单机制，只有必要的系统的调用才会被加到这个名单中。这也使得我们在编写漏洞利用时常用的一些系统调用，如CPU/socket/相关的堆喷函数都无法再被调用。
+**• 在32位的Chrome渲染进程中攻击64位kernel**
+同一系统调用，32位和64位场景下特性不一致，这在实际编写漏洞利用时会遇到很多意料之外的麻烦，甚至导致一些接口无法使用。同时，对于镜像攻击这类方法在沙箱进程中无法施展，32位的地址空间是无法构造出镜像攻击所需的条件。
+安卓内核的经过多年的攻防对抗，其安全性得到了极大的提高，先后引入了包括SELinux, PXN, PAN, KASLR,
+CFI等一系列防护。想利用这样一枚自身存在诸多限制的条件竞争型漏洞在沙箱进程中成功完成一系列的提权操作，并能稳定控制住内核，听起来总有点crazy。这就像在物资极其匮乏的条件下造这枚“核弹头”，不过好在我们拥有最核心的原料——漏洞。安卓内核经历了多年的攻防对抗，现有的利用技术也多被封堵，在代表当时谷歌安卓最高防御水平的旗舰机型Pixel
+4上实现这样一条利用链，也唯有出奇，才能致胜。接下来的章节会将会带着大家再度领略这条漏洞利用之路。
+### How to spray?
+对于尝试利用这类UAF类型的漏洞，第一步依然是从堆喷、劫持执行流开始。我们在上面的章节中讨论了漏洞转化的方向，下一步是选择堆喷方案。我们必须代码[1]和代码[2]这个竞争窗口之间完成三个动作：  
+1、把binder_node释放掉；  
+2、把释放的slab申请回来；  
+3、修改type对应的内存。  
+但这个漏洞留给我们的竞争窗口非常窄，所以我们面临的第一个问题就是： **如何在非常窄的竞争窗口中通过堆喷控制type？**
+我们有两种方案：1、 **扩大竞争窗口** ；2、 **让竞争场景出现的更频繁** 。
+  * 对于第一种方案，我们在CVE-2019-2025“水滴”漏洞利用中使用过一种非常有效的方法。这个漏洞在触发的时候，会涉及到mutex锁unlock操作，这个操作最终会调用wake_up_q()函数去唤醒等待同一个mutex锁的线程。如果我们触发漏洞的线程与另一个线程（等待同一个互斥锁）绑定到同一个CPU上，在当前线程调用unlock的时候便会唤醒另一个线程，也就是当前线程会主动让出CPU，这就给我们留下了足够多的时间来完成释放以及后续的堆喷操作。不过，这个方法并不适用于spinlock。
+  * 对于第二种方案，常规的解决方案是将存在条件竞争的线程和堆喷的线程绑定到多核CPU的一个核上去执行。 `bool bind_cpu(int cpu) { cpu_set_t set;CPU_ZERO(&set); CPU_SET(cpu, &set); if (sched_setaffinity(0, sizeof(set), &set) type的成功率就会大大提高。
+但是这个方案无法迁移到沙箱环境中，原因主要是两个：
+1、箱中用于绑定CPU的系统调用被禁用了，这是比较关键的原因；2、沙箱环境中不能注册Service，我们只能使用系统原生的service_manager，这就导致释放binder_node的过程不可控。因此如果想要在沙箱中利用这个漏洞，必须要解决的第一个问题就是如何触发漏洞。在这个阶段，我们甚至不考虑使用堆喷去修改w->type，因为失去了绑定CPU这个功能的辅助，非常窄的竞争窗口使得漏洞触发变成了一件几乎不可能的事。在深入探索之后，我们成功的解决了这个问题，我们不仅可以尝试布局堆，也可以尝试布局CPU。我们熟悉的Heap-Fengshui更多的是从空间布局上来思考，而CPU-Fengshui更多的是从时间上思考，通过影响CPU调度来布局进程的在时间上的分布，这种方法也被我们称为CPU-Fengshui。通过CPU-Fengshui最终来实现各段代码逻辑在运行时间关系上的排列、布局，如果能通过有限的操作来达到布局CPU的效果，将会为漏洞利用的实现创造条件。
+#### CPU-Fengshui
+首先，我们需要思考一个问题—— **绑定CPU为什么能提高条件竞争的成功率？**
+Android系统是一个基于Linux内核的分时系统，在分时系统中，内核会把一个时间段切割成多个CPU时间片，然后根据特定的调度算法把这些时间片分配给等待执行的线程。除非线程自己主动放弃CPU，每个线程在使用完自己的时间片后才会被强制让出CPU。因此，如果将多个存在竞争的线程绑定到同一个CPU上，内核为了保证每个线程都被调度到，那就必须提高切换线程的频率。线程切换频率越高，就越有可能在竞争窗口切换出去，从而给堆喷提供机会。沿着这个思路，我们在触发漏洞代码中引入了Padding线程。
+    void *padding_thread(void *arg)
+    {
+        volatile int counter = 0;    
+        set_thread_name("padding_thread");
+        while(!exploit){
+            counter++;
+        }
+        return NULL;
+    }
+不难看出，Padding线程是一个CPU密集型的线程，它唯一的操作就是对counter做自加一。在引入这个线程之后，我们发现就算没有CPU绑定，沙箱中也能通过堆喷修改type了，不过漏洞触发时间依旧不太理想。为了找到最优的Padding线程数量，我们在Pixel
+4上做了一个简单的[实验](https://github.com/360AlphaLab/cpu-fengshui/blob/main/src/fengshui.c)。
+从实验结果可以看到，随着Padding线程数量的增加，CPU切换线程的次数是在逐步增加的，但当线程数量超过25之后，这个值就进入了一个稳定的状态。再来看我们关心的漏洞触发线程（Race
+Thread），当Padding线程数量介于0~25之间时，CPU切换到漏洞触发线程的次数会在一定范围内波动，但当它超过25之后，这个值就呈现明显的下降趋势。依据这些数据，我们可以得出一个结论：
+**当Padding线程数量是25左右时，CPU切换最为频繁，同时漏洞触发线程获得CPU的次数也能达到一个较高的区间值。**
+那么，如果将Padding线程数量设置为25，漏洞触发时间是否就是最短的呢？有趣的是，实验结果支持我们的结论。
+**除了Padding线程数量可以影响漏洞触发时间之外，线程优先级也能作为一个变量来影响实验结果。**
+    int setprio(int priority)
+    {
+        int ret;
+        ret = setpriority(PRIO_PROCESS, syscall(__NR_gettid), priority);
+        if (ret exit_signal);
+        seq_put_decimal_ll(m, " ", task_cpu(task));     rt_priority);
+        seq_put_decimal_ull(m, " ", task->policy);
+确定可以通过`/proc/self/stast`获取所属CPU之后，我们就可以基于特定CPU做堆布局了。
+### Arbitrary address read/write model
+能够成功实现对喷意味着我们可以控制w->type，从对该漏洞原理的分析，我们可以触发一个kfree(A+8)的操作。但沙箱中一系列的限制，使得现有的漏洞利用技术无法施展。对于这样一枚条件竞争类型的漏洞，面对内核的重重防护，如果需要多次触发漏洞，其稳定性、成功率、利用难度都会成为极大的问题。这让我们决定从漏洞利用模型的本源上再去重新思考，基于本质原理再寻他路。
+#### **Case study**
+我们总结了安卓ROOT历史上一些强大的漏洞利用方式，以其中的一些作为例子：
+  * put_user/get_user，CVE-2013-6282， ARM平台没有校验地址合法性，使得攻击者可以通过这两个系统调用实现任意内核地址读写。
+  * addr_limit + iovec， 将thread_info->addr_limit修改为0xFFFFFFFFFFFFFFFE来关掉内核对用户态及内核地址空间地址检查，进而实现稳定的任意地址读写。
+  * mmap + ret2dir，最初在2014 USENIX会议上提出。用户态映射的内存会分配到内核的physmap区域，实际上达到了一种“看不见的”内存共享的效果。用户态和内核都可以按照各自的地址访问这片共享内存。
+  * KSMA，通过创建新的页表项来达到一种物理内存共享的效果。
+  * mmap + sysctl，最近在CVE-2020-0041漏洞利用中使用的方法.。通过在kern_table中插入一个新的节点，使该节点对应的结构体存储在用户态通过mmap分配的内存中，因而攻击者可在用户态直接修改该结构体的内容，同时结合sysctl文件自身的功能来实现稳定的任意地址写。
+从上面这几个例子可以看到其中极为关键的两个基本元素，前两者为“内存共享”，第三个例子和第四个例子其实是基于“指针控制”，而第五个例子则是同时基于这两者。这是一个有趣的发现，这些利用方式从本质来看竟有着这般关联，而其本质原理竟如此简单。
+#### **Arbitrary read/write model**
+我们不妨基于这两个元素来构建模型。

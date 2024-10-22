@@ -1,0 +1,229 @@
+## Get stream replication state from standby  
+### 作者              
+digoal              
+### 日期               
+2015-08-04            
+### 标签              
+PostgreSQL , stream , replication , state     
+----                          
+## 背景               
+本文的目的是在standby节点获得几个stream replication相关的信息，从而判断当前standby节点的状态：  
+```  
+wal receiver进程启动时间，  
+wal receiver进程状态，  
+wal receiver进程的PID，  
+wal receiver进程连接到上游节点的连接信息，  
+接收到的XLOG的最大的地址，  
+已恢复的XLOG的最大地址，  
+standby节点的replay时间延迟（当前时间 减去 已恢复的XLOG的最后一条commit/abort/pitr target中的时间戳），  
+上游节点最后一次将WAL record传给wal receiver的时间。(仅仅当wal receiver进程状态为streaming时有意义，否则是wal receiver进程的初始启动时间)。  
+```  
+查询结果如下：  
+```  
+postgres=# select now(),  
+extract(epoch from now()) as now_epoch,  
+* from get_rcv_replication_stat() as   
+t (last_walend_time timestamptz,   
+last_recv_lsn pg_lsn,   
+last_apply_lsn pg_lsn,   
+last_apply_delay_ms int,  
+receiver_pid int,  
+receiver_state int,  
+receiver_start_epoch int8,  
+conninfo text );  
+-[ RECORD 1 ]--------+---------------------------------------------------------------  
+now                  | 2015-08-04 16:09:21.276554+08  
+now_epoch            | 1438675761.27655  
+last_walend_time     | 2015-08-04 16:09:20.752082+08  
+last_recv_lsn        | 5/4B53BFF0  
+last_apply_lsn       | 5/4B53BFF0  
+last_apply_delay_ms  | 0  
+receiver_pid         | 6667  
+receiver_state       | 2  
+receiver_start_epoch | 1438675316  
+conninfo             | host=192.168.150.128 port=1921 user=replica keepalives_idle=60  
+```  
+## 具体的实现  
+以下5类信息直接在PostgreSQL共享内存中获取(用于管理receiver进程的数据结构)：  
+1\. wal receiver进程启动时间，  
+2\. wal receiver进程状态，  
+3\. wal receiver进程的PID，  
+4\. wal receiver进程连接到上游节点的连接信息，  
+5\. 上游节点最后一次将WAL record传给wal receiver的时间。(仅仅当wal receiver进程状态为streaming时有意义，否则是wal receiver进程的初始启动时间，因为receiver和主节点断开后会自动重启，这个时间会被初始化掉)。  
+用于管理receiver进程的数据结构：  
+```  
+/* Shared memory area for management of walreceiver process */  
+typedef struct  
+{  
+        /*  
+         * PID of currently active walreceiver process, its current state and  
+         * start time (actually, the time at which it was requested to be  
+         * started).  获取receiver进程pid,状态,启动时间,(注意pg_time_t这个数据类型中存储的是time获取到的时间,是一个int64类型,和PostgreSQL的TimestampTz数据类型有区别. 请查看man 2 time)  
+         */  
+        pid_t           pid;  
+        WalRcvState walRcvState;  
+        pg_time_t       startTime;  
+        /*  
+         * receiveStart and receiveStartTLI indicate the first byte position and  
+         * timeline that will be received. When startup process starts the  
+         * walreceiver, it sets these to the point where it wants the streaming to  
+         * begin.  
+         */  
+        XLogRecPtr      receiveStart;    // 准备从什么位置开始接收  
+        TimeLineID      receiveStartTLI;  
+        /*  
+         * receivedUpto-1 is the last byte position that has already been  
+         * received, and receivedTLI is the timeline it came from.  At the first  
+         * startup of walreceiver, these are set to receiveStart and  
+         * receiveStartTLI. After that, walreceiver updates these whenever it  
+         * flushes the received WAL to disk.  
+         */  
+        XLogRecPtr      receivedUpto;  // 已接收到什么位置  
+        TimeLineID      receivedTLI;  
+        /*  
+         * latestChunkStart is the starting byte position of the current "batch"  
+         * of received WAL.  It's actually the same as the previous value of  
+         * receivedUpto before the last flush to disk.  Startup process can use  
+         * this to detect whether it's keeping up or not.  
+         */  
+        XLogRecPtr      latestChunkStart;     
+        /*  
+         * Time of send and receive of any message received.  
+         */  
+        TimestampTz lastMsgSendTime;  
+        TimestampTz lastMsgReceiptTime;  
+        /*  
+         * Latest reported end of WAL on the sender  
+         */  
+        XLogRecPtr      latestWalEnd;    //  最后一次接收到的XLOG位置  
+        TimestampTz latestWalEndTime;  //  最后一次接收到WAL信息的时间(主节点发送WAL record包时的系统时间，所以在流复制的数据包中，存储为8个字节)  
+        /*  
+         * connection string; is used for walreceiver to connect with the primary.  
+         */  
+        char            conninfo[MAXCONNINFO];    //  连接信息  
+        /*  
+         * replication slot name; is also used for walreceiver to connect with the  
+         * primary  
+         */  
+        char            slotname[NAMEDATALEN];  
+        slock_t         mutex;                  /* locks shared variables shown above */  
+        /*  
+         * Latch used by startup process to wake up walreceiver after telling it  
+         * where to start streaming (after setting receiveStart and  
+         * receiveStartTLI).  
+         */  
+        Latch           latch;  
+} WalRcvData;  
+```  
+receiver进程的几种状态如下：  
+```  
+typedef enum  
+{  
+        WALRCV_STOPPED,                         /* stopped and mustn't start up again */  
+        WALRCV_STARTING,                        /* launched, but the process hasn't  
+                                                                 * initialized yet */  
+        WALRCV_STREAMING,                       /* walreceiver is streaming */  
+        WALRCV_WAITING,                         /* stopped streaming, waiting for orders */  
+        WALRCV_RESTARTING,                      /* asked to restart streaming */  
+        WALRCV_STOPPING                         /* requested to stop, but still running */  
+} WalRcvState;  
+```  
+以下信息其实也来自receiver进程的共享内存：  
+1\. 接收到的XLOG的最大的地址，  
+使用GetWalRcvWriteRecPtr()函数获得  
+```  
+/*  
+ * Returns the last+1 byte position that walreceiver has written.  
+ *  
+ * Optionally, returns the previous chunk start, that is the first byte  
+ * written in the most recent walreceiver flush cycle.  Callers not  
+ * interested in that value may pass NULL for latestChunkStart. Same for  
+ * receiveTLI.  
+ */  
+XLogRecPtr  
+GetWalRcvWriteRecPtr(XLogRecPtr *latestChunkStart, TimeLineID *receiveTLI)  
+{  
+        /* use volatile pointer to prevent code rearrangement */  
+        volatile WalRcvData *walrcv = WalRcv;  
+        XLogRecPtr      recptr;  
+        SpinLockAcquire(&walrcv->mutex);  
+        recptr = walrcv->receivedUpto;  
+        if (latestChunkStart)  
+                *latestChunkStart = walrcv->latestChunkStart;  
+        if (receiveTLI)  
+                *receiveTLI = walrcv->receivedTLI;  
+        SpinLockRelease(&walrcv->mutex);  
+        return recptr;  
+}  
+```  
+以下2类信息来自控制文件：  
+1\. 已恢复的XLOG的最大地址，  
+2\. standby节点的replay时间延迟（当前时间 减去 已恢复的XLOG的最后一条commit/abort/pitr target中的时间戳），  
+对应代码  
+src/backend/access/transam/xlog.c  
+```  
+/*  
+ * Get latest redo apply position.  
+ *  
+ * Exported to allow WALReceiver to read the pointer directly.  
+ */  
+XLogRecPtr  
+GetXLogReplayRecPtr(TimeLineID *replayTLI)  
+{  
+        /* use volatile pointer to prevent code rearrangement */  
+        volatile XLogCtlData *xlogctl = XLogCtl;  
+        XLogRecPtr      recptr;  
+        TimeLineID      tli;  
+        SpinLockAcquire(&xlogctl->info_lck);  
+        recptr = xlogctl->lastReplayedEndRecPtr;  
+        tli = xlogctl->lastReplayedTLI;  
+        SpinLockRelease(&xlogctl->info_lck);  
+        if (replayTLI)  
+                *replayTLI = tli;  
+        return recptr;  
+}  
+```  
+src/backend/replication/walreceiverfuncs.c  
+```  
+/*  
+ * Returns the replication apply delay in ms or -1  
+ * if the apply delay info is not available  
+ */  
+int  
+GetReplicationApplyDelay(void)  
+{  
+        /* use volatile pointer to prevent code rearrangement */  
+        volatile WalRcvData *walrcv = WalRcv;  
+        XLogRecPtr      receivePtr;  
+        XLogRecPtr      replayPtr;  
+        long            secs;  
+        int                     usecs;  
+        TimestampTz     chunckReplayStartTime;  
+        SpinLockAcquire(&walrcv->mutex);  
+        receivePtr = walrcv->receivedUpto;  
+        SpinLockRelease(&walrcv->mutex);  
+        replayPtr = GetXLogReplayRecPtr(NULL);  
+        if (receivePtr == replayPtr)  
+                return 0;  
+        chunckReplayStartTime = GetCurrentChunkReplayStartTime();  
+        if (chunckReplayStartTime == 0)  
+                return -1;  
+        TimestampDifference(chunckReplayStartTime,  
+                                                GetCurrentTimestamp(),  
+                                                &secs, &usecs);  
+        return (((int) secs * 1000) + (usecs / 1000));  
+}  
+```  
+有了以上的信息，我们就可以编写一个函数来获得这些信息了。  
+如何写一个返回复合类型的C函数？  
+```  
+# vi get_upstream_conninfo.c  
+#include "postgres.h"  
+#include   
+#include "fmgr.h"  
+#include "access/xlog.h"  
+#include "replication/walreceiver.h"  
+#include "utils/elog.h"  
+#include "utils/builtins.h"  
+#include "utils/timestamp.h"  
+#include "funcapi.h"  

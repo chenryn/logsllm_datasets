@@ -1,0 +1,109 @@
+## 0x00 前言
+我们知道代码审计Java的SQL注入主要有两点：参数可控和SQL语句可拼接（没有预编译）。并且我们也清楚修复SQL注入的方式就是预编译，但是可能我们并不清晰内部预编译的具体实现。本文主要从代码层面深入分析三种Java不同数据库框架下的SQL注入以及预编译。  
+本次实验代码：
+## 0x01 JDBC SQLi
+### 不使用占位符拼接情况分析
+    Statement statement = connection.createStatement();
+    String sql = "select * from user where id=" + value;
+    ResultSet resultSet = statement.executeQuery(sql);
+不使用占位符时，输入的内容和sql拼接形成最终的sql语句：
+### 预编译情况：
+    String sql = "select * from user where id=?";
+    PreparedStatement preparedStatement = connection.prepareStatement(sql);
+    preparedStatement.setString(1,value);
+    ResultSet resultSet = preparedStatement.executeQuery();
+预编译会在传入的字符串前后添加`'`，然后再进行拼接，保证了输入的字符串在SQL语句中是数值而不是关键字。
+最终在执行的时候`select * from user where id='2 and 1=2 union select * from user'`。
+到这里我们肯定会想就算在两边加了`'`，也可以在value中添加`'`来闭合绕过：
+    2' and 1=2 union select * from user where '1'='1
+然而事实并非那么简单，JDBC在`ClientPreparedQueryBindings.setString()`中对一些特殊符号包括`'`做了转义处理，因此预编译可以防止SQL注入：
+## 0x02 Mybatis SQLi
+### Mybatis解析执行过程
+Mybatis解析执行过程如下图：
+以查询SQL分析，主要步骤如下：
+  1. SqlSession创建过程：`SqlSessionFactoryBuilder().build(inputStream)`创建一个SqlSession，创建的时候会进行配置文件解析生成Configuration属性实例，解析时会将mapper解析成MapperStatement加到Configuration中，MapperStatement是执行SQL的必要准备，SqlSource是MapperStatement的属性，实例化前会先创建动态和非动态SqlSource即DynamicSqlSource和RawSqlSource，DynamicSqlSource对应解析`$`以及动态标签如`foreach`，RawSqlSource创建时解析`#`并将`#{}`换成占位符`?`；
+  2. 执行准备过程：`DefaultSqlSession.selectOne()`执行sql（如果是从接口`getMapper`方式执行，首先会从MapperProxy动态代理获取DefaultSqlSession执行方法`selectxxx|update|delete|insert`），首先从Configuration获取MapperStatement，执行`executor.query()`。executor执行的第一步会先通过`MapperStatement.getBoundSql()`获取SQL，此时如果`MapperStatement.SqlSource`是动态即DynamicSqlSource，会先解析其中的动态标签比如`${}`会换成具体传入的参数值进行拼接，获取到SQL之后调用`executor.doQuery()`，如果存在预编译首先会调用JDBC处理预编译的SQL，最终通过PreparedStatementHandler调用JDBC执行SQL；
+  3. JDBC执行SQL并返回结果集
+如下是mapper的select示例，第一个使用`${id}`，第二个使用`#{id}`，我们具体通过调试来看下`#`和`$`这两种符号的解析和执行过程中的处理方式。
+        SELECT * FROM user where id=${id}
+        SELECT * FROM user where id=#{id}
+### 解析过程中`$`和`#`的不同
+在解析StatementNode过程中创建SqlSource时，会调用`XMLScriptBuilder.parseScriptNode()`来生成动态和非动态SqlSource
+深入分析`XMLScriptBuilder.parseScriptNode()`，先调用`XMLScriptBuilder.parseDynamicTags()`解析动态tag
+在解析时会先通过`TextSqlNode.isDynamic()`判断是否存在动态标志
+`TextSqlNode.isDynamic()`首先创建一个DynamicCheckerTokenParser用来解析动态标识符，调用createParser创建GenericTokenParser
+createParser会返回一个`${}`标识符的标识符解析
+#### `$`解析过程：
+继续下一步调用`GenericTokenParser.parse()`
+GenericTokenParser.parse中找到了openhandler即`${`，会调用`builder.append(handler.handleToken(expression.toString()))`
+`handler.handleToken()`将isDynamic标志为`true`
+当isDynamic为`true`，会实例化一个DynamicSqlSource对象，至此`$`动态SqlSource创建完成。
+#### `#`解析过程：
+当SQL是`SELECT * FROM user where id=#{id}`的情况下调用isDynamic()
+，进一步调用`GenericTokenParser.parse()`
+`GenericTokenParser.parse()`中没有找到openhandler即`${`，就不会进入后面的处理，直接将原来的text进行返回，因此isDynamic还是false
+返回后初始化一个RawSqlSource实例
+在RawSqlSource初始化时会自动进行解析：
+SqlSourceBuilder$ParameterMappingTokenHandler主要解析`#{}`的情况
+将`#{id}`替换成`?`进行占位，此时sql变成了`SELECT * FROM user where id=?`
+小结：在创建SqlSource时，会根据`$`及动态标签来创建DynamicSqlSource，DynamicSqlSource不会对`${}`进行具体的处理，而非动态情况会创建RawSqlSource，在其初始化过程会直接将`#{}`替换成`?`占位符。
+### 执行过程中`$`和`#`的不同：
+#### `$`在执行过程中的解析：
+在调用`MappedStatement.getBoundSql()`时，由于`$`对应的是DynamicSqlSource，会调用`DynamicSqlSource.getBoundSql()`获取sql
+在`DynamicSqlSource.getBoundSql()`会调用`rootSqlNode.apply()`处理，此时调用的是`TextSqlNode.apply()`
+在`TextSqlNode.apply()`中会创建一个`${}`的GenericTokenParser然后进行parse解析和追加
+在解析时，调用`handler.handleToken()`根据标识符获取参数的内容
+`handleToken()`中会将参数值`1 and 1=2 union select Host,User,1,authentication_string
+from mysql.user limit 1`返回
+拼接 最终获取的sql是`SELECT * FROM user where id=1 and 1=2 union select
+Host,User,1,authentication_string from mysql.user limit 1`
+#### `#`在执行过程中的解析：
+`$`是在`getBoundSql()`获取sql过程中就将符号进行了处理，跟`$`不同的是，`#`是在执行器的执行过程中（本例是doQuery）进行处理，先通过调用`SimpleExecutor.prepareStatement()`处理预编译情况后，获取statement，然后调用JDBC执行
+深入`prepareStatement()`，发现其最终通过动态代理调用`ClientPreparedStatement.setString()`
+调用JDBC`ClientPreparedStatement.setString()`处理过程跟上述0x01部分的JDBC预编译处理statement一样。
+### 注入场景：
+除了上面的where，`like`、`in`、`order
+by`查询条件不能直接使用`#{}`会报错，因此在开发时可能会直接使用`${}`从而产生SQL注入漏洞：
+1、like:
+当mapper如下：
+        SELECT * FROM user where name like '%${name}%'
+调用时传入参数为`wang%' and 1=2 union select Host,User,1,authentication_string from
+mysql.user where User like '%root`时，绕过`%'`从而获取数据：
+针对该场景可考虑以下形式修复：
+        SELECT * FROM user where name like concat('%',#{name}, '%')
+        SELECT * FROM user where name like "%"#{name}"%"
+2、in：
+当mapper如下：
+        SELECT * FROM user where id in (${id})
+调用时传入参数为`0) and 1=2 union select Host,User,1,authentication_string from
+mysql.user where (1)=(1`时，闭合`)`从而获取数据：
+针对该场景可考虑以下形式修复，传入数组：
+        SELECT * FROM user where id in
+            #{id}
+3、order by：
+当mapper如下：
+        SELECT * FROM user order by ${coln} asc
+调用时传入参数为`IF((select user())='root@localhost',id,name)`时：
+针对该场景可考虑以下形式修复：
+        SELECT * FROM user order by
+                ${coln}
+                name
+        asc
+## 0x03 Hibernate SQLi
+Hibernate 属于 **全自动 ORM 映射** 工具，使用
+Hibernate查询关联对象或者关联集合对象时，可以根据对象关系模型直接获取。Hibernate查询方式如下代码，其中的
+**表名不能是元数据表，必须是实体类名** ，并且区分大小写，并且Hibernate **不支持union联合查询**
+。因此Hibernate的注入存在一定的局限性，不能像常规SQL注入一样利用。
+    Query query = session.createQuery("from User where name = '" + name + "'", User.class);
+上面代码采用拼接方式，当`lisi' and
+user()='root@localhost`，返回数据时证明`user()='root@localhost'`，没有返回数据时证明user不是root，可以导致SQL注入：
+当采用占位符预编译时：
+    Query query = session.createQuery("from User where name = :name", User.class);
+    query.setParameter("name",name);
+    User user = query.getSingleResult();
+`Loader.prepareQueryStatement()`会调用`QueryLoader.bindParameterValues`来处理预编译情况
+最终`QueryLoader.bindParameterValues`同样会调用JDBC的`ClientPreparedStatement.setString()`完成预编译来防止SQL注入
+## 0x04 参考链接：
+    https://b1ngz.github.io/java-sql-injection-note/
+    https://www.secpulse.com/archives/57197.html
+    https://www.redhatzone.com/ask/article/1448.html

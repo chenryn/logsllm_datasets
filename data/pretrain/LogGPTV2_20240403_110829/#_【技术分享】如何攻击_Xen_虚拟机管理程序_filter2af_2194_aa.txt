@@ -1,0 +1,95 @@
+# 【技术分享】如何攻击 Xen 虚拟机管理程序
+|
+##### 译文声明
+本文是翻译文章，文章来源：googleprojectzero.blogspot.tw
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+****
+翻译：[ **兴趣使然的小胃**](http://bobao.360.cn/member/contribute?uid=2819002922)
+**预估稿费：200RMB**
+投稿方式：发送邮件至linwei#360.cn，或登陆网页版在线投稿
+**  
+**
+**一、概述**
+2017年3月14日，我向Xen安全团队报告了一个[漏洞](https://bugs.chromium.org/p/project-zero/issues/detail?id=1184)，该漏洞允许攻击者在控制半虚拟化（paravirtualized，PV）x86-64架构的Xen客户机（guest）内核的条件下，能够突破Xen的虚拟机管理程序（hypervisor），获取宿主机物理内存的完全控制权限。Xen项目组于2017年4月4日公布了一份[安全公告](https://xenbits.xen.org/xsa/advisory-212.html)以及一个[补丁](https://xenbits.xen.org/xsa/xsa212.patch)，解决了这个问题。
+为了演示这个问题所造成的影响，我写了一个漏洞利用工具，当工具以root权限运行在一个64位PV客户机上时，可以获取同一宿主机上其他所有64位PV客户机（包括dom0）的root权限的shell。
+**二、背景**
+**（一）access_ok()**
+在x86-64架构上，Xen PV客户机与hypervisor共享虚拟地址空间。大致的内存布局如下图所示:
+Xen允许客户机内核执行超级调用 （hypercall），hypercall本质上就是普通的系统调用，使用了System V AMD64
+ABI实现从客户机内核到hypervisor的过渡。hypercall使用指令执行，寄存器中传递的参数最多不超过6个。与普通的syscall类似，Xen的hypercall经常将客户机指针作为参数使用。由于与hypervisor共享地址空间，客户机只需要简单传入其虚拟指针（guest-virtual pointer）即可。
+与其他内核一样，Xen必须确保客户机的虚拟指针在解除引用前不能指向hypervisor所拥有的内存。Xen通过使用类似于Linux内核的用户空间访问器（userspace
+accessor）来实现这一点，例如：
+1、使用access_ok(addr,
+size)，检查是否能够安全访问客户机所提供的虚拟内存区域，换句话说，它会检查访问这片内存是否导致hypervisor内存被修改。
+2、使用__copy_to_guest(hnd, ptr,
+nr)，从hypervisor的ptr地址拷贝nr字节数据到客户机的hnd地址，但并不检查hnd是否是安全的。
+3、使用copy_to_guest(hnd, ptr,
+nr)，如果hnd是安全的，则从hypervisor的ptr地址拷贝nr字节数据到客户机的hnd地址。
+在Linux内核中，access_ok()宏会使用任意内存访问模式，检查是否可以安全访问从addr到addr+size-1的内存区域。然而，Xen的access_ok()宏并不能保证这一点：
+    /*
+     * Valid if in +ve half of 48-bit address space, or above Xen-reserved area.
+     * This is also valid for range checks (addr, addr+size). As long as the
+     * start address is outside the Xen-reserved area then we will access a
+     * non-canonical address (and thus fault) before ever reaching VIRT_START.
+     */
+    #define __addr_ok(addr) 
+        (((unsigned long)(addr) = HYPERVISOR_VIRT_END))
+    #define access_ok(addr, size) 
+        (__addr_ok(addr) || is_compat_arg_xlat_range(addr, size))
+Xen通常只会检查addr指针指向的是用户区域或者内核区域，而不检查size值。如果实际访问的客户机内存起始于addr地址附近，在不跳过大量内存空间的前提下，Xen对内存地址进行线性检查，一旦客户机内存访问失败则退出检查过程，此时由于大量非标准（non-canonical）地址的存在（这些地址可以当作守护区域），只检查addr值的确已经足够。然而，如果某个hypercall希望访问客户机中以64位偏移量开始的缓冲区，它需要确保access_ok()的检查过程中使用的是正确的偏移量，此时只检查整个用户空间的缓冲区并不安全！
+Xen提供了access_ok()的封装函数，用来访问客户机内存中的数组。如果要确认访问某个从0开始的数组是否安全，你可以使用guest_handle_okay(hnd,
+nr)。然而，如果要确认访问某个从其他元素开始的数组是否安全，你需要使用guest_handle_subrange_okay(hnd, first,
+last)。
+当我看到access_ok()的定义时，我并不能直观地看出这种不安全性会带来什么影响，因此我开始搜索它的调用函数，查看是否存在对access_ok()的不安全调用。
+**（二）Hypercall抢占**
+当某个任务调度时钟触发时，Xen需要具备从当前执行的vCPU快速切换到另一个虚拟机（VM）vCPU的能力。然而，简单中断某个hypercall的执行并不能做到这一点（比如hypercall可能正处于自旋锁（spinlock）状态），因此，与其他操作系统类似，Xen需要使用某种机制，延迟vCPU的切换，直到可以安全进行状态切换。
+在Xen中，hypercall的抢占通过自愿抢占（voluntary
+preemption）机制实现，即：任何长时间运行的hypercall代码都应该定期调用hypercall_preempt_check()来检查调度器是否愿意切换到另一个vCPU。如果这种情况发生，那么hypercall代码会退出，退回到客户机，并向调度器发送信号，表明此时可以安全抢占当前任务的资源。当之前的vCPU重新被调度时，调度器会调整客户机寄存器或客户机内存中的hypercall参数，重新进入hypercall中，执行剩余的任务。Hypercall不会去区分是被正常调用还是在抢占恢复后被重新调用。
+Xen之所以使用这种hypercall恢复机制，原因在于Xen并没有为每个vCPU维护一个hypervisor栈，而仅仅为每个物理核心维护一个hypervisor栈。这意味着，虽然其他操作系统（比如Linux）可以在内核栈中存储被中断的syscall状态，但对Xen而言这个任务并不简单。
+这种设计意味着对某些hypercall而言，为了能够正常恢复任务状态，客户机内存中需要存储额外的数据，而这种数据可能会被客户机篡改，从而实现对hypervisor的攻击。
+**（三）memory_exchange()**
+HYPERVISOR_memory_op(XENMEM_exchange,
+arg)这个hypercall使用了“xen/common/memory.c”文件中的memory_exchange(arg)函数。该函数允许客户机使用当前分配给客户机的物理页面列表进行“交易”，以换取另一个新的连续物理页面。这对希望执行DMA的客户机是非常有用的，因为DMA要求具备物理上连续的缓冲区。
+HYPERVISOR_memory_op以xen_memory_exchange这个结构体对象作为参数，结构体的定义如下：
+    struct xen_memory_reservation {
+        /* [...] */
+        XEN_GUEST_HANDLE(xen_pfn_t) extent_start; /* in: physical page list */
+        /* Number of extents, and size/alignment of each (2^extent_order pages). */
+        xen_ulong_t    nr_extents;
+        unsigned int   extent_order;
+        /* XENMEMF flags. */
+        unsigned int   mem_flags;
+        /*
+         * Domain whose reservation is being changed.
+         * Unprivileged domains can specify only DOMID_SELF.
+         */
+        domid_t        domid;
+    };
+    struct xen_memory_exchange {
+        /*
+         * [IN] Details of memory extents to be exchanged (GMFN bases).
+         * Note that @in.address_bits is ignored and unused.
+         */
+        struct xen_memory_reservation in;
+        /*
+         * [IN/OUT] Details of new memory extents.
+         * We require that:
+         *  1. @in.domid == @out.domid
+         *  2. @in.nr_extents  << @in.extent_order == 
+         *     @out.nr_extents << @out.extent_order
+         *  3. @in.extent_start and @out.extent_start lists must not overlap
+         *  4. @out.extent_start lists GPFN bases to be populated
+         *  5. @out.extent_start is overwritten with allocated GMFN bases
+         */
+        struct xen_memory_reservation out;
+        /*
+         * [OUT] Number of input extents that were successfully exchanged:
+         *  1. The first @nr_exchanged input extents were successfully
+         *     deallocated.
+         *  2. The corresponding first entries in the output extent list correctly
+         *     indicate the GMFNs that were successfully exchanged.
+         *  3. All other input and output extents are untouched.
+         *  4. If not all input exents are exchanged then the return code of this
+         *     command will be non-zero.
+         *  5. THIS FIELD MUST BE INITIALISED TO ZERO BY THE CALLER!

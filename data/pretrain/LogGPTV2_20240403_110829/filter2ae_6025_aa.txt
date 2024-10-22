@@ -1,0 +1,144 @@
+**作者：raycp**  
+**原文来自安全客：**
+**cve-2015-7504是pcnet网卡中的一个堆溢出漏洞，可以溢出四字节，通过构造特定的数据可以劫持程序执行流，结合前面的cve-2015-5165中的信息泄露，便可以实现任意代码执行。**
+## 漏洞分析
+首先仍然是先介绍pcnet网卡的部分信息。
+网卡有16位和32位两种模式，这取决于DWIO（存储在网卡上的变量）的实际值，16位模式是网卡重启后的默认模式。网卡有两种内部寄存器：CSR（控制和状态寄存器）和BCR（总线控制寄存器）。两种寄存器都需要通过设置对应的我们要访问的RAP（寄存器地址端口）寄存器来实现对相应CSR或BCR寄存器的访问。
+网卡的配置可以通过填充一个初始化结构体，并将该结构体的物理地址传送到网卡（通过设置CSR[1]和CSR[2]）来完成，结构体定义如下：
+    struct pcnet_config {
+        uint16_t  mode;      /* working mode: promiscusous, looptest, etc. */
+        uint8_t   rlen;      /* number of rx descriptors in log2 base */
+        uint8_t   tlen;      /* number of tx descriptors in log2 base */
+        uint8_t   mac[6];    /* mac address */
+        uint16_t _reserved;
+        uint8_t   ladr[8];   /* logical address filter */
+        uint32_t  rx_desc;   /* physical address of rx descriptor buffer */
+        uint32_t  tx_desc;   /* physical address of tx descriptor buffer */
+    };
+漏洞代码在`./hw/net/pcnet.c`的`pcnet_receive`函数中，关键代码如下：
+    ssize_t print pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
+    {
+        int size = size_;
+        PCNetState *s = qemu_get_nic_opaque(nc);
+        ...
+                    uint8_t *src = s->buffer;
+                        ....
+                } else if (s->looptest == PCNET_LOOPTEST_CRC ||
+                           !CSR_DXMTFCS(s) || size buffer`是网卡接收的数据，`size`是数据大小，可以看到代码计算出当前数据包的crc值并写到了数据包的末尾。但是当`size`刚好为`s->buffer`的大小时，会导致最后会将crc值越界到缓冲区之外，溢出的数据为数据包中的crc值。
+接下来看越界会覆盖什么，`s`的定义是`PCNetState`，定义如下：
+    struct PCNetState_st {
+        NICState *nic;
+        NICConf conf;
+        QEMUTimer *poll_timer;
+        int rap, isr, lnkst;
+        uint32_t rdra, tdra;
+        uint8_t prom[16];
+        uint16_t csr[128];
+        uint16_t bcr[32];
+        int xmit_pos;
+        uint64_t timer;
+        MemoryRegion mmio;
+        uint8_t buffer[4096];
+        qemu_irq irq;
+        void (*phys_mem_read)(void *dma_opaque, hwaddr addr,
+                             uint8_t *buf, int len, int do_bswap);
+        void (*phys_mem_write)(void *dma_opaque, hwaddr addr,
+                              uint8_t *buf, int len, int do_bswap);
+        void *dma_opaque;
+        int tx_busy;
+        int looptest;
+    };
+可以看到`buffer`的大小为`4096`，当`size`为`4096`时，会使得`crc`覆盖到后面的`qemu_irq
+irq`低四字节。`irq`的定义是`typedef struct IRQState
+*qemu_irq`，为一个指针。溢出会覆盖该结构体指针的低四字节，该结构体定义如下：
+    struct IRQState {
+        Object parent_obj;
+        qemu_irq_handler handler;
+        void *opaque;
+        int n;
+    };
+在覆盖率变量`irq`的第四字节后，在程序的末尾有一个`pcnet_update_irq(s);`的函数调用，该函数中存在对`qemu_set_irq`函数的调用，由于可控`irq`，所以可控`irq->handler`，使得有可能控制程序执行流。
+    void qemu_set_irq(qemu_irq irq, int level)
+    {
+        if (!irq)
+            return;
+        irq->handler(irq->opaque, irq->n, level);
+    }
+可以看到覆盖的值的内容是数据包的crc校验的值，该值是可控的。我们可以通过构造特定的数据包得到我们想要的crc校验的值，有需要可以去看具体[原理](https://blog.affien.com/archives/2005/07/15/reversing-crc/)，因此该漏洞可实现将`irq`指针低四字节覆盖为任意地址的能力。
+再看如何触发漏洞`pcnet_receive`函数，找到调用它的函数`pcnet_transmit`，需要设置一些标志位如`BCR_SWSTYLE`等才能触发函数：
+    static void pcnet_transmit(PCNetState *s)
+    {
+        hwaddr xmit_cxda = 0;
+        int count = CSR_XMTRL(s)-1;
+        int add_crc = 0;
+        int bcnt;
+        s->xmit_pos = -1;
+                    ...
+            if (s->xmit_pos + bcnt > sizeof(s->buffer)) {
+                s->xmit_pos = -1;
+                goto txdone;
+            }
+            ...
+            if (CSR_LOOP(s)) {
+                if (BCR_SWSTYLE(s) == 1)
+                    add_crc = !GET_FIELD(tmd.status, TMDS, NOFCS);
+                s->looptest = add_crc ? PCNET_LOOPTEST_CRC : PCNET_LOOPTEST_NOCRC;
+                pcnet_receive(qemu_get_queue(s->nic), s->buffer, s->xmit_pos);
+                s->looptest = 0;
+            } else {
+                ...
+再看调用`pcnet_transmit`的函数：一个是在`pcnet_csr_writew`中调用；一个是在`pcnet_poll_timer`中。
+主要看`pcnet_csr_writew`函数，它被`pcnet_ioport_writew`调用，了io_port函数，可以去对程序流程进行分析了。
+    void pcnet_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
+    {
+        PCNetState *s = opaque;
+        pcnet_poll_timer(s);
+    #ifdef PCNET_DEBUG_IO
+        printf("pcnet_ioport_writew addr=0x%08x val=0x%04x\n", addr, val);
+    #endif
+        if (!BCR_DWIO(s)) {
+            switch (addr & 0x0f) {
+            case 0x00: /* RDP */
+                pcnet_csr_writew(s, s->rap, val);
+                break;
+            case 0x02:
+                s->rap = val & 0x7f;
+                break;
+            case 0x06:
+                pcnet_bcr_writew(s, s->rap, val);
+                break;
+            }
+        }
+        pcnet_update_irq(s);
+    }
+### 流程分析
+因为流程中很多关键数据都是使用CSR（控制和状态寄存器）表示的，这些寄存器各个位的意义看起来又很麻烦，所以这次流程分析更多的是基于poc的流程。
+先看网卡信息，I/O端口为`0xc140`，大小为32：
+    root@ubuntu:~# lspci -v -s 00:05.0
+    00:05.0 Ethernet controller: Advanced Micro Devices, Inc. [AMD] 79c970 [PCnet32 LANCE] (rev 10)
+            Flags: bus master, medium devsel, latency 0, IRQ 10
+            I/O ports at c140 [size=32]
+            Memory at febf2000 (32-bit, non-prefetchable) [size=32]
+            Expansion ROM at feb80000 [disabled] [size=256K]
+            Kernel driver in use: pcnet32
+    lspci: Unable to load libkmod resources: error -12
+再看`./hw/net/pcnet-pci.c`中的`realize`函数中的pmio空间的相关声明：
+    memory_region_init_io(&d->io_bar, OBJECT(d), &pcnet_io_ops, s, "pcnet-io",
+                              PCNET_IOPORT_SIZE);
+    #define PCNET_IOPORT_SIZE       0x20    
+    static const MemoryRegionOps pcnet_io_ops = {
+        .read = pcnet_ioport_read,
+        .write = pcnet_ioport_write,
+        .endianness = DEVICE_LITTLE_ENDIAN,
+    };
+    static void pcnet_ioport_write(void *opaque, hwaddr addr,
+                                   uint64_t data, unsigned size)
+    {
+        PCNetState *d = opaque;
+        trace_pcnet_ioport_write(opaque, addr, data, size);
+        if (addr < 0x10) {
+            ...
+        }
+    }
+    static uint64_t pcnet_ioport_read(void *opaque, hwaddr addr,
+                                      unsigned size)

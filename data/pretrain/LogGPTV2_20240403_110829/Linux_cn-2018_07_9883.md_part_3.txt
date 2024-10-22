@@ -1,0 +1,212 @@
+你可能会疑惑，`--broadcast-address` 参数是做什么用的？默认情况下，`nsqlookup` 使用容器的主机名作为广播地址；这意味着，当用户运行回调时，回调试图访问的地址类似于 `http://nsqlookup-234kf-asdf:4161/lookup?topics=image`，但这显然不是我们期望的。将广播地址设置为内部 DNS 后，回调地址将是 `http://nsqlookup.default.svc.cluster.local:4161/lookup?topic=images`，这正是我们期望的。
+NSQ 查询还需要转发两个端口，一个用于广播，另一个用于 nsqd 守护进程的回调。在 Dockerfile 中暴露相应端口，在 Kubernetes 模板中使用它们，类似如下：
+容器模板：
+```
+        ports:
+        - containerPort: 4160
+          hostPort: 4160
+        - containerPort: 4161
+          hostPort: 4161
+```
+服务模板：
+```
+spec:
+  ports:
+  - name: main
+    protocol: TCP
+    port: 4160
+    targetPort: 4160
+  - name: secondary
+    protocol: TCP
+    port: 4161
+    targetPort: 4161
+```
+端口名称是必须的，Kubernetes 基于名称进行区分。（LCTT 译注：端口名更新为作者 GitHub 对应文件中的名称）
+像之前那样，使用如下命令创建服务：
+```
+kubectl apply -f nsqlookup.yaml
+```
+nsqlookupd 部分到此结束。截至目前，我们已经准备好两个主要的组件。
+### 接收器
+这部分略微复杂。接收器需要完成三项工作：
+* 创建一些部署
+* 创建 nsq 守护进程
+* 将本服务对外公开
+#### 部署
+第一个要创建的部署是接收器本身，容器镜像为 `skarlso/kube-receiver-alpine`。
+#### NSQ 守护进程
+接收器需要使用 NSQ 守护进程。如前所述，接收器在其内部运行一个 NSQ，这样与 nsq 的通信可以在本地进行，无需通过网络。为了让接收器可以这样操作，NSQ 需要与接收器部署在同一个节点上。
+NSQ 守护进程也需要一些调整的参数配置：
+```
+        ports:
+        - containerPort: 4150
+          hostPort: 4150
+        - containerPort: 4151
+          hostPort: 4151
+        env:
+        - name: NSQLOOKUP_ADDRESS
+          value: nsqlookup.default.svc.cluster.local
+        - name: NSQ_BROADCAST_ADDRESS
+          value: nsqd.default.svc.cluster.local
+        command: ["/nsqd"]
+        args: ["--lookupd-tcp-address=$(NSQLOOKUP_ADDRESS):4160", "--broadcast-address=$(NSQ_BROADCAST_ADDRESS)"]
+```
+其中我们配置了 `lookup-tcp-address` 和 `broadcast-address` 参数。前者是 nslookup 服务的 DNS 地址，后者用于回调，就像 nsqlookupd 配置中那样。
+#### 对外公开
+下面即将创建第一个对外公开的服务。有两种方式可供选择。考虑到该 API 负载较高，可以使用负载均衡的方式。另外，如果希望将其部署到生产环境中的任选节点，也应该使用负载均衡方式。
+但由于我使用的本地集群只有一个节点，那么使用 `NodePort` 的方式就足够了。`NodePort` 方式将服务暴露在对应节点的固定端口上。如果未指定端口，将从 30000-32767 数字范围内随机选其一个。也可以指定端口，可以在模板文件中使用 `nodePort` 设置即可。可以通过 `:` 访问该服务。如果使用多个节点，负载均衡可以将多个 IP 合并为一个 IP。
+更多信息，请参考文档：[服务发布](https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services---service-types)。
+结合上面的信息，我们定义了接收器服务，对应的模板如下：
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: receiver-service
+spec:
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: receiver
+  type: NodePort
+```
+如果希望固定使用 8000 端口，需要增加 `nodePort` 配置，具体如下：
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: receiver-service
+spec:
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: receiver
+  type: NodePort
+  nodePort: 8000
+```
+（LCTT 译注：虽然作者没有写，但我们应该知道需要运行的部署命令 `kubectl apply -f receiver.yaml`。）
+### 图片处理器
+图片处理器用于将图片传送至识别组件。它需要访问 nslookupd、 mysql 以及后续部署的人脸识别服务的 gRPC 接口。事实上，这是一个无聊的服务，甚至其实并不是服务（LCTT 译注：第一个服务是指在整个架构中，图片处理器作为一个服务；第二个服务是指 Kubernetes 服务）。它并需要对外暴露端口，这是第一个只包含部署的组件。长话短说，下面是完整的模板：
+```
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-processor-deployment
+spec:
+  selector:
+    matchLabels:
+      app: image-processor
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: image-processor
+    spec:
+      containers:
+      - name: image-processor
+        image: skarlso/kube-processor-alpine:latest
+        env:
+        - name: MYSQL_CONNECTION
+          value: "mysql.default.svc.cluster.local"
+        - name: MYSQL_USERPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kube-face-secret
+              key: mysql_userpassword
+        - name: MYSQL_PORT
+          # TIL: If this is 3306 without " kubectl throws an error.
+          value: "3306"
+        - name: MYSQL_DBNAME
+          value: kube
+        - name: NSQ_LOOKUP_ADDRESS
+          value: "nsqlookup.default.svc.cluster.local:4161"
+        - name: GRPC_ADDRESS
+          value: "face-recog.default.svc.cluster.local:50051"
+```
+文件中唯一需要提到的是用于配置应用的多个环境变量属性，主要关注 nsqlookupd 地址 和 gRPC 地址。
+运行如下命令完成部署：
+```
+kubectl apply -f image_processor.yaml
+```
+### 人脸识别
+人脸识别服务的确包含一个 Kubernetes 服务，具体而言是一个比较简单、仅供图片处理器使用的服务。模板如下：
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: face-recog
+spec:
+  ports:
+  - protocol: TCP
+    port: 50051
+    targetPort: 50051
+  selector:
+    app: face-recog
+  clusterIP: None
+```
+更有趣的是，该服务涉及两个卷，分别为 `known_people` 和 `unknown_people`。你能猜到卷中包含什么内容吗？对，是图片。`known_people` 卷包含所有新图片，接收器收到图片后将图片发送至该卷对应的路径，即挂载点。在本例中，挂载点为 `/unknown_people`，人脸识别服务需要能够访问该路径。
+对于 Kubernetes 和 Docker 而言，这很容易。卷可以使用挂载的 S3 或 某种 nfs，也可以是宿主机到虚拟机的本地挂载。可选方式有很多 （至少有一打那么多）。为简洁起见，我将使用本地挂载方式。
+挂载卷分为两步。第一步，需要在 Dockerfile 中指定卷：
+```
+VOLUME [ "/unknown_people", "/known_people" ]
+```
+第二步，就像之前为 MySQL Pod 挂载卷那样，需要在 Kubernetes 模板中配置；相比而言，这里使用 `hostPath`，而不是 MySQL 例子中的 `PersistentVolumeClaim`：
+```
+        volumeMounts:
+        - name: known-people-storage
+          mountPath: /known_people
+        - name: unknown-people-storage
+          mountPath: /unknown_people
+      volumes:
+      - name: known-people-storage
+        hostPath:
+          path: /Users/hannibal/Temp/known_people
+          type: Directory
+      - name: unknown-people-storage
+        hostPath:
+          path: /Users/hannibal/Temp/
+          type: Directory
+```
+（LCTT 译注：对于多节点模式，由于人脸识别服务和接收器服务可能不在一个节点上，故需要使用共享存储而不是节点本地存储。另外，出于 Python 代码的逻辑，推荐保持两个文件夹的嵌套结构，即 known\_people 作为子目录。）
+我们还需要为 `known_people` 文件夹做配置设置，用于人脸识别程序。当然，使用环境变量属性可以完成该设置：
+```
+        env:
+        - name: KNOWN_PEOPLE
+          value: "/known_people"
+```
+Python 代码按如下方式搜索图片：
+```
+        known_people = os.getenv('KNOWN_PEOPLE', 'known_people')
+        print("Known people images location is: %s" % known_people)
+        images = self.image_files_in_folder(known_people)
+```
+其中 `image_files_in_folder` 函数定义如下：
+```
+    def image_files_in_folder(self, folder):
+        return [os.path.join(folder, f) for f in os.listdir(folder) if re.match(r'.*\.(jpg|jpeg|png)', f, flags=re.I)]
+```
+看起来不错。
+如果接收器现在收到一个类似下面的请求（接收器会后续将其发送出去）：
+```
+curl -d '{"path":"/unknown_people/unknown220.jpg"}' http://192.168.99.100:30251/image/post
+```
+图像处理器会在 `/unknown_people` 目录搜索名为 unknown220.jpg 的图片，接着在 `known_folder` 文件中找到 `unknown220.jpg` 对应个人的图片，最后返回匹配图片的名称。
+查看日志，大致信息如下：
+```
+# 接收器
+❯ curl -d '{"path":"/unknown_people/unknown219.jpg"}' http://192.168.99.100:30251/image/post
+got path: {Path:/unknown_people/unknown219.jpg}
+image saved with id: 4
+image sent to nsq
+# 图片处理器
+2018/03/26 18:11:21 INF    1 [images/ch] querying nsqlookupd http://nsqlookup.default.svc.cluster.local:4161/lookup?topic=images
+2018/03/26 18:11:59 Got a message: 4
+2018/03/26 18:11:59 Processing image id:  4
+2018/03/26 18:12:00 got person:  Hannibal
+2018/03/26 18:12:00 updating record with person id
+2018/03/26 18:12:00 done
+```

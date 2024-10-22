@@ -1,0 +1,141 @@
+# AFL源码阅读笔记
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前言
+想提高一下自己读代码的能力，加上对FUZZ知之甚少，仅仅是知道模糊的过程，这对于一个二进制选手来说是远远不够的，因此这几天放弃了调试内核CVE，转而阅读AFL源码，到现在已经有很多基于AFL的开源软件了，比如AFL
+plusplus和AFL
+Unicorn，但是都是基于AFL，可见这一开源的FUZZ工具是多么经典，因此花了大概五天进行源码阅读(太菜了，代码看着看着就看不懂了)，虽然`afl-fuzz`的源码有8000+行，但是代码逻辑很清晰，注释也非常完整，结合着注释以及网上看到的其他资料，这里自己总结一下学习到的东西，也是一篇集他人之长的杂文，不写点东西以我的记性应该很快就忘掉了。
+## 基本使用
+我基本是参考[初探AFL-Fuzz](https://xz.aliyun.com/t/4314)这篇文章，安装，插桩编译，之后使用`afl-fuzz`进行fuzz，最后成功将一个栈溢出的demo搞崩并得到测试的case。qemu无源码的没有实验，大概知道了用法就去看源代码了
+## 设计思想
+FUZZ基本大家都有一些大概的认识，对于有源码的项目来说我们使用`afl-gcc`或者`alf-g++`，这是gcc的wraper(封装)，在编译前向一些关键节点进行插桩，这些桩能够记录程序的执行路径，从而反馈出程序的执行情况。如果我们自己想写个fuzz的程序，最简单的思路莫过于将输入用例做随机变换之后尝试将其作为输入给程序查看执行情况，即调用`execv`这样的函数，但是这样的代价是很高的，因为在调用exec这个函数之后将产生一个的新程序来代替原进程，当前进程的数据段、代码段和堆栈段都会被改变，且新的进程的PID同原进程相同，我们无法通过PID来标识不同的测试用例，这种方式是很低效的。因此原作者用一种新的结构进行开发，即`forserver`架构。也就是每次要进行测试的时候就fork出一个子进程进行测试，子进程复制父进程的数据段等，且拥有自己的PID，这就是进程的`写时复制`。这样的好处就是我们省去了重新装载程序的时间[原作者博客](https://lcamtuf.blogspot.com/2014/10/fuzzing-binaries-without-execve.html)。
+## 整体架构
+在看雪上找到了一篇很详细的分析，其中解答了我很多看源码困惑的地方，其中一个关键的点就是这个架构，在`alf-gcc`中先起了一个`fork-server`，在这个fork出的子进程里调用了`execve`去执行二进制程序，然后结合`afl-as`的代码可以看到插桩的桩代码中也包含了fork函数的调用，这样的话就是fuzzer->forkserver->exec target
+Bin->bin->bin_sub_process(被fuzz的app)，这样看起来fuzzer是最终被fuzz的程序的祖祖父进程，但是execve根据我们之前的介绍是直接将创建的进程替换掉原进程的，除非出错否则不会返回，因此实际上forkserver与target
+bin可以看作是同一个进程的不同程序，其父进程都是fuzzer，故最终的调用关系是下面这样的
+## afl-gcc.c
+这个文件用来编译源代码，其实际上是gcc的封装,在组装参数的时候可以看到，as_path是afl-as，查看gcc的参数可以看到`-B`是指定编译器，也就是说这里先把汇编码给了`afl-as`，看后者的代码会发现它也只是个真正as的wrapper，在源程序的汇编中插桩之后再传递给real as。
+    tmp = alloc_printf("%s/afl-as", dir);
+        if (!access(tmp, X_OK)) {
+          as_path = dir;
+          ck_free(tmp);
+          return;
+        }
+    //......
+    cc_params[cc_par_cnt++] = "-B";
+    cc_params[cc_par_cnt++] = as_path;
+## afl-as.c
+正如之前提到的，这里有是插桩的核心部分，主要函数为`add_instrumentation()`，插桩完毕之后用fork起子进程调用真正的汇编器。下面源码中增加了注释，作者也提到了需要插桩的部分有条件跳转和基本块。其中R(MAP_SIZE)等同于`random(2^16)`，这个是为每个桩分配独有的ID，根据碰撞概率一般不会重复。
+    static void add_instrumentation(void) 
+    {
+        //前面忽略，这个循环是核心
+      while (fgets(line, MAX_LINE, inf)) {
+        /* In some cases, we want to defer writing the instrumentation trampoline
+           until after all the labels, macros, comments, etc. If we're in this
+           mode, and if the line starts with a tab followed by a character, dump
+           the trampoline now. */
+        //这里猜测是在main函数等基本块之前插桩，`t`+alpha
+        if (!pass_thru && !skip_intel && !skip_app && !skip_csect && instr_ok &&
+            instrument_next && line[0] == 't' && isalpha(line[1])) {
+          fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32,
+                  R(MAP_SIZE));
+          instrument_next = 0;
+          ins_lines++;
+        }
+        /* Output the actual line, call it a day in pass-thru mode. */
+        //原样输出
+        fputs(line, outf);
+        //省略
+        /* If we're in the right mood for instrumenting, check for function
+           names or conditional labels. This is a bit messy, but in essence,
+           we want to catch:
+             ^main:      - function entry point (always instrumented)
+             ^.L0:       - GCC branch label
+             ^.LBB0_0:   - clang branch label (but only in clang mode)
+             ^tjnz foo  - conditional branches
+           ...but not:
+             ^# BB#0:    - clang comments
+             ^ # BB#0:   - ditto
+             ^.Ltmp0:    - clang non-branch labels
+             ^.LC0       - GCC non-branch labels
+             ^.LBB0_0:   - ditto (when in GCC mode)
+             ^tjmp foo  - non-conditional jumps
+           Additionally, clang and GCC on MacOS X follow a different convention
+           with no leading dots on labels, hence the weird maze of #ifdefs
+           later on.
+         */
+        if (skip_intel || skip_app || skip_csect || !instr_ok ||
+            line[0] == '#' || line[0] == ' ') continue;
+        /* Conditional branch instruction (jnz, etc). We append the instrumentation
+           right after the branch (to instrument the not-taken path) and at the
+           branch destination label (handled later on). */
+        //条件跳转
+        if (line[0] == 't') {
+          if (line[1] == 'j' && line[2] != 'm' && R(100) B`或`B->A`，直接对两个Key异或结果是一样的，因此右移可以区分出一些特殊情况。下面那个incb代码中`edx`为map,`edi`为索引，即map表中对应的索引加一，表明一次hit。
+如果之前的共享内存地址为空，就进入`__afl_setup`这个标签，如果`__afl_setup_failure`的值不为0(0为正常，非零异常)，通过`getenv($SHM_ENV_VAR)`环境变量来获得共享内存的ID，如果不为空就调用`atoi`以及`shmat`，最终将这个地址存储在`__afl_area_ptr`中方便之后使用(不必再初始化)，下面启动`fork_server`。
+fork_server和fuzzer之间是通过管道通信的，在宏定义里可以看到默认的`FORKSRV_FD`为`198`，这里读管道为`198`，写管道为`199`。开始先通知fuzzer，之后在read处阻塞等待fuzzer的消息，得到fuzzer通知之后父进程fork出一个子进程，在这个子进程里会关闭与fuzzer通信的文件描述符，jmp到`__afl_store`记录下基本块的`hit`情况之后向后继续执行main函数。而父进程记录下刚才启动的子进程的pid发送给fuzzer并等待子进程执行完毕，子进程结束之后将其状态告知fuzzer。之后开始新一轮的等待。后面每次基本块都会执行`__afl_maybe_log`，但由于已经得到了共享内存的位置不会fork新的进程，之后只是记录基本块的跳转情况，这样就大大节约了资源。
+至此，在目标程序的插桩代码基本分析完毕。
+    static const u8* main_payload_32 = 
+      "n"
+      "/* --- AFL MAIN PAYLOAD (32-BIT) --- */n"
+      "n"
+      ".textn"
+      ".att_syntaxn"
+      ".code32n"
+      ".align 8n"
+      "n"
+      "__afl_maybe_log:n"
+      "n"
+      "  lahfn"
+      "  seto %aln"
+      "n"
+      "  /* Check if SHM region is already mapped. */n"
+      "n"
+      "  movl  __afl_area_ptr, %edxn"
+      "  testl %edx, %edxn"
+      "  je    __afl_setupn"
+      "n"
+      "__afl_store:n"
+      "n"
+      "  /* Calculate and store hit for the code location specified in ecx. Theren"
+      "     is a double-XOR way of doing this without tainting another register,n"
+      "     and we use it on 64-bit systems; but it's slower for 32-bit ones. */n"
+      "n"
+    #ifndef COVERAGE_ONLY
+      "  movl __afl_prev_loc, %edin"
+      "  xorl %ecx, %edin"
+      "  shrl $1, %ecxn"
+      "  movl %ecx, __afl_prev_locn"
+    #else
+      "  movl %ecx, %edin"
+    #endif /* ^!COVERAGE_ONLY */
+      "n"
+    #ifdef SKIP_COUNTS
+      "  orb  $1, (%edx, %edi, 1)n"
+    #else
+      "  incb (%edx, %edi, 1)n"
+    #endif /* ^SKIP_COUNTS */
+      "n"
+      "__afl_return:n"
+      "n"
+      "  addb $127, %aln"
+      "  sahfn"
+      "  retn"
+      "n"
+      ".align 8n"
+      "n"
+      "__afl_setup:n"
+      "n"
+      "  /* Do not retry setup if we had previous failures. */n"
+      "n"
+      "  cmpb $0, __afl_setup_failuren"
+      "  jne  __afl_returnn"
+      "n"
+      "  /* Map SHM, jumping to __afl_setup_abort if something goes wrong.n"
+      "     We do not save FPU/MMX/SSE registers here, but hopefully, nobodyn"
+      "     will notice this early in the game. */n"
+      "n"
+      "  pushl %eaxn"
+      "  pushl %ecxn"
+      "n"

@@ -1,0 +1,110 @@
+> 本文是翻译文章，原文链接： exploiting-mig-reference.html>
+在这篇文章中，我将描述我如何发现和利用[CVE-2019-6225](https://support.apple.com/en-us/HT209443)，这是`XNU`的`task_swap_mach_voucher()`函数中的`MIG`引用计数漏洞。我们将看到如何利用iOS
+12.1.2上的这个错误来 **构建虚假内核任务端口** ，使我们能够 **读写任意内核内存**
+。（这个错误是由[@S0rryMybad](https://twitter.com/S0rryMybad)独立发现的）
+在后面的文章中，我们将看看如何使用这个错误作为分析和绕过Apple在A12设备(例如iPhone XS)上`ARMv8.3指针认证(PAC)`的起点。
+# 一个奇怪的发现
+`MIG`是一个产生Mach消息解析代码的工具，错误的`MIG`语义造成漏洞并不是什么新鲜的事：例如，伊恩·比尔[async_wake](https://bugs.chromium.org/p/project-zero/issues/detail?id=1417#c3)利用一个漏洞，即`IOSurfaceRootUserClient`将 **过解除分配(over-deallocate)** 一个`Mach`端口，而它由`iOS 11.1.2 MIG`语义管理。
+大多数先前与MIG相关的问题是MIG服务例程 **不遵守对象生命周期和所有权的语义** 的结果。通常，MIG所有权规则表示如下：
+  1. 如果MIG服务例程返回成功，则它将获取所有传入资源的所有权。
+  2. 如果MIG服务例程返回失败，那么它将不会获得传入的资源的所有权。
+不幸的是，正如我们将要看到的，此描述并未涵盖MIG管理的 **内核对象** 的完整复杂性，这可能导致意外错误。
+这是`_Xsemaphore_destroy()`的相关代码：
+    task = convert_port_to_task(In0P->Head.msgh_request_port);
+        OutP->RetCode = semaphore_destroy(task,
+                convert_port_to_semaphore(In0P->semaphore.name));
+        task_deallocate(task);
+    #if __MigKernelSpecificCode
+        if (OutP->RetCode != KERN_SUCCESS) {
+            MIG_RETURN_ERROR(OutP, OutP->RetCode);
+        }
+        if (IP_VALID((ipc_port_t)In0P->semaphore.name))
+            ipc_port_release_send((ipc_port_t)In0P->semaphore.name);
+    #endif /* __MigKernelSpecificCode */
+函数`convert_port_to_semaphore()`接受`Mach`端口并在底层信号量对象上生成引用，而不消耗端口上的引用。如果我们假设上面代码的正确实现，没有泄漏或消耗额外的引用，那么我们可以得出`semaphore_destroy()`的以下预期语义：
+  1. 成功时，`semaphore_destroy()`应该使用信号量引用。
+  2. 如果失败，`semaphore_destroy()`应该 **仍然** 消耗信号的引用计数值。
+因此，`semaphore_destroy()`似乎不遵循MIG语义的传统规则：正确的实现总是取得信号量对象的所有权，无论服务例程是返回成功还是失败。
+这当然引出了一个问题：管理MIG语义的完整规则是什么？是否存在违反这些其他MIG规则的代码实例？
+# 糟糕的swap
+在我对扩展的MIG语义的研究中，我发现了函数`task_swap_mach_voucher()`。这是[osfmk/mach/task.defs](https://opensource.apple.com/source/xnu/xnu-4903.221.2/osfmk/mach/task.defs.auto.html)中的MIG定义
+    routine task_swap_mach_voucher(
+                    task            : task_t;
+                    new_voucher     : ipc_voucher_t;
+            inout   old_voucher     : ipc_voucher_t);
+这是来自`_Xtask_swap_mach_voucher()`的相关代码，自动生成的MIG包装器：
+    mig_internal novalue _Xtask_swap_mach_voucher
+           (mach_msg_header_t *InHeadP, mach_msg_header_t *OutHeadP)
+    {
+    ...
+       kern_return_t RetCode;
+       task_t task;
+       ipc_voucher_t new_voucher;
+       ipc_voucher_t old_voucher;
+    ...
+       task = convert_port_to_task(In0P->Head.msgh_request_port);
+       new_voucher = convert_port_to_voucher(In0P->new_voucher.name);
+       old_voucher = convert_port_to_voucher(In0P->old_voucher.name);
+       RetCode = task_swap_mach_voucher(task, new_voucher, &old_voucher);
+       ipc_voucher_release(new_voucher);
+       task_deallocate(task);
+       if (RetCode != KERN_SUCCESS) {
+           MIG_RETURN_ERROR(OutP, RetCode);
+       }
+    ...
+       if (IP_VALID((ipc_port_t)In0P->old_voucher.name))
+           ipc_port_release_send((ipc_port_t)In0P->old_voucher.name);
+       if (IP_VALID((ipc_port_t)In0P->new_voucher.name))
+           ipc_port_release_send((ipc_port_t)In0P->new_voucher.name);
+    ...
+       OutP->old_voucher.name = (mach_port_t)convert_voucher_to_port(old_voucher);
+       OutP->Head.msgh_bits |= MACH_MSGH_BITS_COMPLEX;
+       OutP->Head.msgh_size = (mach_msg_size_t)(sizeof(Reply));
+       OutP->msgh_body.msgh_descriptor_count = 1;
+    }
+再一次，假设正确的实现不会泄漏或消耗额外的引用计数值，我们可以推断出`task_swap_mach_voucher()`的以下预期语义：
+  1. `task_swap_mach_voucher()`没有对`new_voucher`的引用; 该`new_voucher`引用是借来的，不应该被消耗掉。
+  2. `task_swap_mach_voucher()`包含对应该使用的`old_voucher`输入值的引用。
+  3. 失败时，`old_voucher`的输出值 **不应对指向的凭证对象持有任何引用** 。
+  4. 成功时，输出值`old_voucher`持有一个凭证的引用，而它由`task_swap_mach_voucher()`到`_Xtask_swap_mach_voucher()`得到，其经由后者消耗`convert_voucher_to_port()`
+考虑到这些语义，我们可以与实际实现进行比较。这是来自`XNU
+4903.221.2`的[osfmk/kern/task.c](https://opensource.apple.com/source/xnu/xnu-4903.221.2/osfmk/kern/task.c.auto.html)的代码，可能是一个占位符实现：
+    kern_return_t
+    task_swap_mach_voucher(
+           task_t          task,
+           ipc_voucher_t   new_voucher,
+           ipc_voucher_t   *in_out_old_voucher)
+    {
+       if (TASK_NULL == task)
+           return KERN_INVALID_TASK;
+       *in_out_old_voucher = new_voucher;
+       return KERN_SUCCESS;
+    }
+此实现不符合预期的语义：
+  1. `in_out_old_voucher`的输入值是`task_swap_mach_voucher`拥有的凭证引用。但是无条件地覆盖它，而不是首先调用`ipc_voucher_release()`，`task_swap_mach_voucher()`泄漏了凭证引用。
+  2. 值`new_voucher`不归`task_swap_mach_voucher()`所有，但它在`in_out_old_voucher`的输出值中返回。这会消耗不是`task_swap_mach_voucher()`持有的凭证引用。
+因此，`task_swap_mach_voucher()`实际上包含两个引用计数问题！
+我们可以通过使用凭证作为第三个参数调用`task_swap_mach_voucher()`来 **泄漏凭证对象的引用计数**
+，并且我们可以通过将凭证作为第二个参数来 **减少凭证对象的引用计数** 。这是一个很好的开发原语，因为它为我们提供了
+**几乎完全控制凭证对象的引用计数** 的方法。
+> 进一步的调查显示，`thread_swap_mach_voucher()`包含一个类似的漏洞，但iOS 12中的更改使漏洞无法利用。
+# 凭证的其他相关内容
+为了掌握这个漏洞的影响，了解更多关于`Mach凭证`的信息是有帮助的，尽管全部细节对于利用并不重要。  
+Mach凭证由内核中的`ipc_voucher_t`类型表示，具有以下结构定义：
+    /*
+    * IPC Voucher
+    *
+    * Vouchers are a reference counted immutable (once-created) set of
+    * indexes to particular resource manager attribute values
+    * (which themselves are reference counted).
+    */
+    struct ipc_voucher {
+       iv_index_t      iv_hash;        /* checksum hash */
+       iv_index_t      iv_sum;         /* checksum of values */
+       os_refcnt_t     iv_refs;        /* reference count */
+       iv_index_t      iv_table_size;  /* size of the voucher table */
+       iv_index_t      iv_inline_table[IV_ENTRIES_INLINE];
+       iv_entry_t      iv_table;       /* table of voucher attr entries */
+       ipc_port_t      iv_port;        /* port representing the voucher */
+       queue_chain_t   iv_hash_link;   /* link on hash chain */
+    };

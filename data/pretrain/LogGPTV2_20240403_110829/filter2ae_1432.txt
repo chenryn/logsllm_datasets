@@ -1,0 +1,115 @@
+# Chakra漏洞调试笔记3——MissingValue
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x0 Array
+Javascript中Array是一种特殊的Object。Chakra中的Array继承自DynamicObject，Chakra中有三种Array：
+（1）JavascriptNativeIntArray：用来存放4字节的整型元素，如let intarr = [0x1111, 0x2222,
+0x3333, 0x4444];
+（2）JavascriptNativeFloatArray: 用来存放8字节的浮点型元素，如let floatarr = [1.1, 2.2, 3.3,
+4.4];
+（3）JavascriptArray：用来存放混合数据类型元素，如let vararr = [0x1111, 1.1, {}];
+JavascriptNativeIntArray在内存中的布局：
+主要成员变量偏移：
++0x8: type
++0x18: arrayFlags
++0x20: length
++0x28: head
++0x30: segment
+[segment]
++0x0: left
++0x4: length
++0x8: size
++0xc: next
++0x18: elements
+JavascriptNativeFloatArray在内存的中布局：
+（主要成员变量偏移同JavascriptNativeIntArray）
+JavascriptArray在内存的中布局：
+（主要成员变量偏移同JavascriptNativeIntArray）
+通过上面三种Array的内存布局可以看到，JavascriptNativeIntArray和JavascriptNativeFloatArray的元素以原始数据形式存放在内存中，而JavascriptArray中的元素为了区分对象（指针）和数据，将整数和浮点数进行了box，其中整数与0x0001000000000000
+或运算，浮点数与0xfffc000000000000 异或运算：
+通过上面三种Array的内存布局，我们还可以发现一个有意思的地方，Array的elements中没有被赋值的索引内存存放的数据是0x80000002 (4
+Bytes)和0x8000000280000002(8
+Bytes)，那么这两个数代表什么呢，通过搜索ChakaCore的源码，可以发现他们在如下地方被定义：
+那么什么是MissingItem呢？我们知道Javascript中Array可以间隔存放数据，未被赋值的元素将返回undefined：
+实际上ChakraCore就是用0x80000002和0x8000000280000002这两个pattern以及Array的成员变量arrayFlags中是否存在HasNoMissingValues标志位来表示Array中的MissingValue（空缺的元素）的。
+例如：let floatarr = [1.1, 2.2, , 4.4]; 在内存中的布局如下：
+回忆我们在笔记1和笔记2中介绍的这样一种JIT的类型混淆模板：
+其中笔记1中介绍了通过脚本回调的方式改变Object Memory Layout，笔记2中介绍了一种不需要脚本回调的方式：OpCode Side
+Effect，这里OpCode Side
+Effect实际上是对目标操作数的重新定值。笔记3中我们将介绍另一种不需要脚本回调的方式：MissingValue。
+## 0x2 Case Study: CVE-2018-0953
+根据case的描述可以知道，向JavascriptNativeFloatArray保存元素的时候会先判断保存的value是否等于JavascriptNativeFloatArray::MissingItem（0x8000000280000002），如果相等的话则会将JavascriptNativeFloatArray转换为JavascriptArray，并将value
+box后存放。为什么有这样的转换逻辑呢？笔者猜测是因为MissingItem（0x8000000280000002）本身也是可以被浮点数表示的，即-5.304989478401e-314。如果不做处理的话则无法区分内存中的0x8000000280000002表示的是undefined还是-5.304989478401e-314。因此Chakra做了如上的处理，如果输入是-5.304989478401e-314，就把JavascriptNativeFloatArray转换为JavascriptArray，这样-5.304989478401e-314会被box从而区分0x8000000280000002：
+那么这样的转换逻辑在JIT中是否安全呢？我们观察PoC中函数opt Globopt后的IR：
+可以看到在第一条语句arr[1] = value;中，存在两个BailOut检查：BailOutOnNotNativeArray 和
+BailOutOnMissingValue，而第二条语句arr[0] = 2.3023e-320;
+则没有相关检查。这是因为在GlobOpt::CheckJsArrayKills时对于Opcode:InlineArrayPush，如果数组类型和push元素类型一样，则不会kill
+NativeArray：
+但是通过前面的分析可以知道向JavascriptNativeFloatArray保存的浮点数=-5.304989478401e-314时会将JavascriptNativeFloatArray转换为JavascriptArray（并且这样不会产生回调，可以绕过StElemI_A中BailOutOnImplicitCallsPreOp的检查），最终在执行第二条赋值语句arr[0]
+=
+2.3023e-320时，由于arr已经在runtime中被转换为JavascriptArray，但是JIT没有做array的类型检查，仍然将2.3023e-320（0x1234）以原始数据的方式存放在array中，从而形成JIT中的类型混淆，最终在Interpreter中访问arr[0]时指针解引用异常：
+## 0x3 Patch and Bypass
+这里微软的补丁思路是检查OP_SetNativeFloatElementI中调用arr->SetItem(indexInt,
+dValue);后arr的类型是否发生变化，并在BackwardPass::UpdateArrayBailOutKind中对于NativeArray生成BailOutConvertedNativeArray类型转换的Bailout检查，补丁后Globopt的IR：
+可以看到，对于这个MissingValue引发的JIT类型混淆漏洞，微软是在NativeArray
+SetItem_A的入口点（OP_SetNativeIntElementI，OP_SetNativeFloatElementI）做了类型转换的检查，但是这只是针对该漏洞做了修补，从根本上其实并没有修复MissingValue可能引发的一系列问题。
+针对这个补丁，lokihardt发现了两个新的bypass方式：
+（1）寻找其他OpCode触发JavascriptNativeFloatArray::SetItem中的类型转换（Issue
+1578，CVE-2018-8372）
+（2）针对Array中有MissingValue并且arrayFlags中存在HasNoMissingValues标志位这样一种错误状态，寻找一种可以触发这种错误状态并导致类型转换的代码逻辑（Issue
+1581，Duplicate with CVE-2018-8372）。
+Issue 1578
+这个case比较好理解：arr.push(value)也可以走到JavascriptNativeFloatArray::SetItem中触发arr的类型转换：
+arr.push(value);
+在JIT代码中会调用JavascriptNativeFloatArray::Push，进一步会再次调用到JavascriptNativeFloatArray::SetItem触发JavascriptNativeFloatArray的类型转换：
+另外需要注意的是PoC中delete
+tmp[1];是为了给Profile一个有MissingValue的Array从而绕过GlobOpt::ProcessValueKills中对Array类型的修改：
+Issue 1581
+这个case理解起来有点复杂，主要是需要理解Array.prototype.concat()的实现。根据MDN的介绍Array.prototype.concat()
+方法用于合并两个或多个数组，此方法不会更改现有数组，而是返回一个新数组。Array.prototype.concat()对应ChakraCore的入口点为JavascriptArray::EntryConcat，如果合并的数组元素为浮点型则进入JavascriptArray::ConcatFloatArgs函数。JavascriptArray::ConcatFloatArgs函数和漏洞相关的几处分支如下：
+（1）判断是否需要从数组元素的原型链中取值：
+函数IsFillFromPrototypes做如下检查：
+这里因为存在错误的MissingValue状态，isFillFromPrototypes = false。
+（2）调用JavascriptArray::CopyNativeFloatArrayElements逐个元素拷贝到新数组：
+这里存在一个因为错误的MissingValue状态引发的计数问题：e.MoveNext()会跳过数组元素为MissingValue的赋值操作，计数器count不增加，导致数组元素计数错误，最终进入if
+(start + count !=
+end)分支调用：JavascriptArray::InternalFillFromPrototype从数组元素的原型链取值。
+（3）JavascriptArray::InternalFillFromPrototype从原型链中寻找Array
+PoC中首先将buggy的原型指向Proxy，再通过arr.getPrototypeOf =
+Object.prototype.valueOf;使prototype = prototype->GetPrototype();返回arr自身。
+（4）ForEachOwnMissingArrayIndexOfObject
+触发EnsureNonNativeArray调用，最终改变arr类型，再次实现类型混淆：
+## 0x4 Thinking
+MissingValue这一类漏洞出现后，微软做了一系列的修补，其中包括重新定义了MissingItem的Pattern:
+可以看到新的FloatMissingItemPattern不可以再通过浮点数表示，这就阻止了直接通过脚本给数组赋值构造MissingValue的方法。但是可以看到IntMissingItemPattern
+= 0xFFF80002; 0xFFF80002依然可以由整数-524286表示，因此根据lokihardt的思路，同样可以考虑如下两种情况：
+（1）寻找其他的OpCode通过给NativeIntArray赋值MissingValue触发JavascriptNativeFloatArray::SetItem中的类型转换
+（2）针对Array中有MissingValue并且arrayFlags中存在HasNoMissingValues标志位这样一种错误状态，寻找一种可以触发这种错误状态并导致类型转换的代码逻辑
+对于思路（1）：Jonathan Jacobi的议题From Zero to Zero Day中提到了CVE-2018-8505，根据其补丁：
+这里是在JavascriptOperators::OP_Memset中对于array类型是NativeIntArray的数组，增加了MissingValue的判断，说明NativeIntArray中也存在MissingValue的问题，但是如何触发呢？
+由于并未搜索到这个CVE的PoC，笔者只能从补丁的信息中尝试构造。这里我们的目标是生成一个带有MissingValue并且存在HasNoMissingValues标志位的NativeIntArray。首先考虑如何通过Javascript触发OP_Memset。通过搜索ChakraCore源码可以知道OP_Memset由OpCode::Memset生成，而OpCode::Memset是存在于Backend的Opcode，通过GlobOpt::EmitMemop生成：
+而GlobOpt::EmitMemop则是在loop中有连续内存操作的时候被调用：
+因此可以考虑通过loop中数组的连续赋值生成OpCode::Memset来触发OP_Memset的调用：
+接下来只需要构造一个HasNoMissingValues的NativeIntArray，并通过opt函数将0xFFF80002（-524286）赋值给数组元素即可得到一个带有MissingValue并且存在HasNoMissingValues标志位这样错误状态的NativeIntArray了：
+那么得到这个错误状态的NativeIntArray如何利用呢，可以参考Non JIT Bug, JIT Exploit中大宝的利用思路，首先通过arr[0]
+= 1.1得到一个错误状态的NativeFloatArray，再通过victim[0x100] = arr[1]
+触发JavascriptNativeFloatArray::SetItem中的类型转换。
+对于思路（2）From Zero to Zero Day给出了完整的PoC：
+可以看到这次是通过在JavascriptArray中构造MissingValue，再通过Array.prototype.concat()来触发。这里5.562748303551415e-309
+=
+0x00040002fff80002，由于浮点型数据存放到JavascriptArray会被box，box后的值为0xfff80002fff80002，从而构造了一个JavascriptArray中的MissingValue。
+在多个MissingValue的漏洞利用Array.prototype.concat()触发类型转换后，微软直接将有concat操作符的NativeArray
+Symbol
+Kill掉，这样始终会生成NativeArray的类型检查，从而修补了Array.prototype.concat()中的MissingValue带来的Side
+Effect。
+最后想要说的是Non JIT Bug, JIT Exploit中大宝的利用思路非常值得大家学习：所有错误返回0值操作的bug都可以尝试通过 [1, 0 –
+524286]
+构造一个有MissingValue并且存在HasNoMissingValues标志位这样错误状态的NativeIntArray，最终转换为JIT类型混淆漏洞：
+## 0x5 References
+  1. 
+  2. 
+  3. 
+  4. 
+  5. 
+  6. 

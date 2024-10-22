@@ -1,0 +1,147 @@
+# 性能小结
+**环境：阿里云 ECS + 320T ESSD**  
+表SIZE: 120 TB    写入耗时 810688秒，约123.3万行/s   
+索引SIZE: 20 TB    创建耗时 427800秒 
+索引深度: 4级(BLOCK_SIZE=32K, 每一页可以存储的item比8k多，所以1万亿的索引层级比1000亿低（8K）)    
+单表数据量 | TEST CASE | QPS | TPS  
+---|---|---|--- 
+1万亿 | tpcb 活跃数据1亿 只读 | 1068052 | 1068052 
+1万亿 | tpcb 活跃数据10亿 只读 | 1039962 | 1039962  
+1万亿 | tpcb 活跃数据100亿 只读 | 590692 | 590692  
+1万亿 | tpcb 活跃数据1000亿 只读 | 23101 | 23101  
+1万亿 | tpcb 活跃数据10000亿 只读 | 21492 | 21492  
+1万亿 | tpcb 活跃数据1亿 读写 | 393235 | 78647  
+1万亿 | tpcb 活跃数据10亿 读写 | 410740 | 82148  
+1万亿 | tpcb 活跃数据100亿 读写 | 375010 | 75002  
+1万亿 | tpcb 活跃数据1000亿 读写 | 90630 | 18126  
+1万亿 | tpcb 活跃数据10000亿 读写 | 80715 | 16143    
+添加字段（含default值）耗时：1.25 秒。  
+删除字段耗时：1 毫秒。   
+# 附录 - pgbench_accounts 分区, 并行加载测试数据, 动态查询  
+## 1万亿单表，会带来什么问题？  
+1、单表125TB，创建索引耗时增加。PG 11 引入并行创建索引，解决。  
+2、单表125TB，垃圾回收时间拉长。PG 12 使用zheap引擎彻底杜绝。  
+3、单表125TB，FREEZE耗时拉长，甚至可能无法在20亿个事务内完成。PG未来版本，使用超过32位的XID，彻底解决。  
+4、单表125TB，必须放在单个目录下，可能导致文件系统上限（INODE，容量等上限）。   
+5、单表125TB，要做一些数据清理时不方便，如果有时间维度老化概念，用分区表，可以更好的管理冷热数据，例如pg_pathman。    
+## pgbench转换为分区表。  
+1、建议使用pg_pathman，性能损失低。内置分区功能，目前还有性能问题。  
+[《PostgreSQL 9.x, 10, 11 hash分区表 用法举例》](../201805/20180524_05.md)    
+[《PostgreSQL 10 内置分区 vs pg_pathman perf profiling》](../201710/20171015_01.md)    
+[《分区表锁粒度差异 - pg_pathman VS native partition table》](../201802/20180206_01.md)    
+[《PostgreSQL 查询涉及分区表过多导致的性能问题 - 性能诊断与优化(大量BIND, spin lock, SLEEP进程)》](../201801/20180124_01.md)    
+使用内部分区，建议使用动态SQL，避免BIND问题。  
+## 分区demo  
+[《PostgreSQL pgbench tpcb 数据生成与SQL部分源码解读》](../201809/20180919_03.md)    
+[《PostgreSQL pgbench tpcb 海量数据库测试 - 分区表测试优化》](../201809/20180919_04.md)    
+### 装载数据  
+1、表  
+```  
+pgbench -i -I dt --tablespace=tbs1 -s 10000000  
+```  
+2、分区  
+```  
+create table p (like pgbench_accounts) partition by RANGE ( aid ) tablespace tbs1;  
+do language plpgsql $$                                                           
+declare  
+  i_rows_perpartition int8 := 244140625;  
+begin  
+  for i in 0..4096 loop  
+    execute format ('create table pgbench_accounts%s partition of p for values from (%s) to (%s) tablespace tbs1', i, i*i_rows_perpartition, (i+1)*i_rows_perpartition);  
+  end loop;  
+end;  
+$$;  
+drop table pgbench_accounts;  
+alter table p rename to pgbench_accounts;  
+-- alter table pgbench_accounts add constraint pk_pgbench_accounts_aid primary key (aid) using index tablespace tbs2;  
+```  
+3、加载任务  
+```  
+drop table task;  
+create table task(id int primary key);  
+insert into task select i from generate_series(0,4095) t(i);  
+```  
+4、初始化记录  
+```  
+create table init_accounts(aid int8);  
+insert into init_accounts select generate_series(0,244140624);  
+```  
+5、并行状态UDF  
+```  
+create or replace function tpcb_init_accounts() returns void as $$  
+declare  
+  v_id int;  
+begin  
+  with tmp as (select * from task limit 1 for update skip locked),  
+    tmp1 as (delete from task using tmp where task.id=tmp.id)  
+    select id into v_id from tmp;  
+  if found then  
+    execute format ('insert into pgbench_accounts%s select aid+%s*244140625::int8, ((aid+%s*244140625::int8)-1)/100000 + 1, 0 from init_accounts on conflict do nothing', v_id, v_id, v_id);  
+  end if;  
+end;  
+$$ language plpgsql strict;  
+```  
+6、并行装载数据  
+```  
+vi test.sql  
+select tpcb_init_accounts();  
+nohup pgbench -M prepared -n -r -f ./test.sql -c 64 -j 64 -t 100 >./init.log 2>&1 &  
+```  
+### 初始化索引  
+1、任务表  
+```  
+drop table task;  
+create table task(id int primary key);  
+insert into task select i from generate_series(0,4095) t(i);  
+```  
+2、并行创建索引UDF  
+```  
+create or replace function tpcb_init_accounts_pkey() returns void as $$  
+declare  
+  v_id int;  
+begin  
+  with tmp as (select * from task limit 1 for update skip locked),  
+    tmp1 as (delete from task using tmp where task.id=tmp.id)  
+    select id into v_id from tmp;  
+  if found then  
+    execute format ('analyze pgbench_accounts%s', v_id);  
+    execute format ('alter table pgbench_accounts%s add constraint pk_pgbench_accounts%s_aid primary key (aid) using index tablespace tbs2', v_id, v_id);  
+  end if;  
+end;  
+$$ language plpgsql strict;  
+```  
+3、并行创建索引  
+```  
+vi test.sql  
+select tpcb_init_accounts_pkey();  
+nohup pgbench -M prepared -n -r -f ./test.sql -c 64 -j 64 -t 100 >./init.log 2>&1 &  
+```  
+## 小结  
+1、8K的block size，单表最大32TB，（由于ctid的block num是32BIT的寻址，所以8K block算出来的最大容量就是32TB，本文测试的单表1万亿，已经超过了32TB，所以需要选择更大的BLOCK SIZE才行，32K即可到达256TB单表）。  
+```
+编译时加上--with-blocksize=
+./configure --with-blocksize=32
+```
+2、这么大的数据库怎么高效的备份，时间点恢复？
+全量备份：1、ZFS快照，将快照发送到备份机（万兆网可以把网卡带宽跑满）。2、使用pg_basebackup备份全量。3、使用pg_rman备份全量。4、使用云盘快照备份全量。
+增量备份：1、ZFS快照，将快照增量发送到备份机。2、pg_basebackup只能备份全量。3、使用pg_rman备份增量（通过BLOCK LSN号区分上一次备份以来修改过的数据块）。4、使用云盘快照备份增量。
+归档备份：备份wal文件归档。
+时间点恢复： 1、zfs快照克隆+归档恢复到时间点。 2、全量恢复+归档恢复到时间点。4、全量+增量+归档恢复到时间点。
+3、此次测试tpcb，并发64时，前十几秒bind耗费的时间较多。  
+4、建议使用pg_pathman对大表进行分区，多大的表需要进行分区？  
+[《HTAP数据库 PostgreSQL 场景与性能测试之 45 - (OLTP) 数据量与性能的线性关系(10亿+无衰减), 暨单表多大需要分区》](../201711/20171107_46.md)  
+[《PostgreSQL 9.5+ 高效分区表实现 - pg_pathman》](../201610/20161024_01.md)    
+## 参考  
+[《PostgreSQL 11 tpcc 测试(103万tpmC on ECS) - use sysbench-tpcc by Percona-Lab》](../201809/20180913_01.md)    
+[《(TPC-H测试 SF=10,SF=200) PostgreSQL 11 vs 10 vs Deepgreen》](../201808/20180823_01.md)    
+[《PostgreSQL 100亿 tpcb 性能 on ECS》](../201809/20180916_01.md)    
+[《[未完待续] PostgreSQL on 阿里云ECS+ESSD - 1000亿 tpcb、1000W tpcc 测试》](../201809/20180917_01.md)    
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

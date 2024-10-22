@@ -1,0 +1,184 @@
+## PostgreSQL 9.6 黑科技 bloom 算法索引，一个索引支撑任意列组合查询   
+### 作者                                     
+digoal                                      
+### 日期                                    
+2016-05-23                                       
+### 标签                                    
+PostgreSQL , bloom , 任意列组合查询  
+----                                    
+## 背景        
+在很多前端页面中，通常会让用户勾选需要的查询条件，而用户往往会在几十个查询条件中，选择任意的组合。    
+![pic](20160523_01_pic_001.png)    
+那么难题来了，是不是要为每列创建索引呢，或者有什么好的方法来实现任意列的选择呢？    
+## bloom filter  
+PostgreSQL 确实是学术界和工业界的璀璨明珠，它总是喜欢将学术界的一些玩意工业化，这次的bloom又是一个代表。    
+在PG很多的地方都能看到学术的影子，比如pgbench支持产生泊松分布，高斯分布的随机值。    
+bloom filter是一个有损过滤器，使用有限的比特位存储一些唯一值集合所产生的bits。    
+通过这些bits可以满足这样的场景需求，给定一个值，判断这个值是否属于这个集合。    
+例如    
+```  
+create table test(c1 int);  
+insert into test select trunc(random()*100000) from generate_series(1,10000);  
+```  
+使用所有的 test.c1 值，通过bloom filter算法生成一个值val。    
+然后给定一个值例如 100，判断100是否在test.c1中。     
+```  
+select * from test where c1=100;   
+```  
+通过bloom filter可以快速得到，不需要遍历表来得到。    
+判断方法是使用100和val以及统一的bloom算法。    
+可能得到的结果是true or false。    
+true表示100在这里面，false表示100不在这里面。    
+必须注意，由于bloom filter是有损过滤器，并且真的不一定为真，但是假的一定为假。    
+PostgreSQL 9.6使用custom access methods接口定义了一个索引接口bloom，使用到它的特性：    
+真的不一定为真，但是假的一定为假。      
+目前已实现的场景是，支持=查询，但是这个=会包含一些假的值，所以需要recheck。    
+反过来，它如果要支持<>也是很方便的，并且不需要recheck。    
+(这句话的理解是=和<>互斥, 所以=为假<>就一定为真。实际上利用了优化器中的互斥推理。    
+请参考 https://yq.aliyun.com/articles/6653     
+negator 优化选项， not(x = y) 等价于 x <> y ，   
+由此可以推理出    
+(x <> y) == not ( x = y ) == not (false) == true 是肯定的    
+(如果单独实现<>，则不能这么理解了，和单独实现=是一样的，<>为真时不一定为真，为假时一定为假。 但是也能用<>的假来推理=的真    
+(x = y) == not ( x <> y ) == not (false) == true 是肯定的    
+使用PostgreSQL 函数接口也能实现bloom过滤器。    
+bloom需要m个bit位。    
+添加元素时，需要k个hash函数，通过每一个hash和传入的值计算得到另一个值（[0,m]）。    
+得到的值用于设置对应的bit位为1。    
+例子    
+创建一个类型，存储bloom。    
+```  
+CREATE TYPE dumbloom AS (  
+  m    integer,  -- bit 位数  
+  k    integer,  --  hash 函数数量  
+  -- Our bit array is actually an array of integers  
+  bits integer[]    --  bit  
+);  
+```  
+创建一个空的bloom ，设置false值异常设置为TRUE的概率p，  设置期望存储多少个唯一值n  。    
+```  
+CREATE FUNCTION dumbloom_empty (  
+  -- 2% false probability  
+  p float8 DEFAULT 0.02,  
+  -- 100k expected uniques  
+  n integer DEFAULT 100000  
+) RETURNS dumbloom AS  
+$$  
+DECLARE  
+  m    integer;  
+  k    integer;  
+  i    integer;  
+  bits integer[];     
+BEGIN  
+  -- Getting m and k from n and p is some math sorcery  
+  -- See: https://en.wikipedia.org/wiki/Bloom_filter#Optimal_number_of_hash_functions  
+  m := abs(ceil(n * ln(p) / (ln(2) ^ 2)))::integer;  
+  k := round(ln(2) * m / n)::integer;  
+  bits := NULL;  
+  -- Initialize all bits to 0  
+  FOR i in 1 .. ceil(m / 32.0) LOOP  
+    bits := array_append(bits, 0);  
+  END LOOP;  
+  RETURN (m, k, bits)::dumbloom;  
+END;  
+$$  
+LANGUAGE 'plpgsql' IMMUTABLE;  
+```  
+创建一个指纹函数，存储使用K个哈希函数得到的值，存入数组。    
+![pic](20160523_01_pic_002.png)    
+```  
+CREATE FUNCTION dumbloom_fingerprint (  
+  b    dumbloom,  
+  item text  
+) RETURNS integer[] AS   
+$$  
+DECLARE  
+  h1     bigint;  
+  h2     bigint;  
+  i      integer;  
+  fingerprint integer[];  
+BEGIN  
+  h1 := abs(hashtext(upper(item)));  
+  -- If lower(item) and upper(item) are the same, h1 and h2 will be identical too,  
+  -- let's add some random salt  
+  h2 := abs(hashtext(lower(item) || 'yo dawg!'));  
+  finger := NULL;   
+  FOR i IN 1 .. b.k LOOP  
+    -- This combinatorial approach works just as well as using k independent  
+    -- hash functions, but is obviously much faster  
+    -- See: https://www.eecs.harvard.edu/~michaelm/postscripts/tr-02-05.pdf  
+    fingerprint := array_append(fingerprint, ((h1 + i * h2) % b.m)::integer);  
+  END LOOP;  
+  RETURN fingerprint;  
+END;  
+$$  
+LANGUAGE 'plpgsql' IMMUTABLE;  
+```  
+添加元素的函数      
+同样也是设置对应的bit为1    
+```  
+CREATE FUNCTION dumbloom_add (  
+  b    dumbloom,  
+  item text,  
+) RETURNS dumbloom AS   
+$$  
+DECLARE  
+  i    integer;  
+  idx  integer;  
+BEGIN  
+  IF b IS NULL THEN  
+    b := dumbloom_empty();  -- 生成空bloom  
+  END IF;  
+  FOREACH i IN ARRAY dumbloom_fingerprint(b, item) LOOP  -- 设置k个哈希产生的值对应的bit位为1  
+    -- Postgres uses 1-indexing, hence the + 1 here  
+    idx := i / 32 + 1;  
+    b.bits[idx] := b.bits[idx] | (1 << (i % 32));  
+  END LOOP;  
+  RETURN b;  
+END;  
+$$  
+LANGUAGE 'plpgsql' IMMUTABLE;  
+```  
+是否包含某元素    
+![pic](20160523_01_pic_003.png)    
+```  
+CREATE FUNCTION dumbloom_contains (  
+  b    dumbloom,  
+  item text  
+) RETURNS boolean AS   
+$$  
+DECLARE  
+  i   integer;  
+  idx integer;  
+BEGIN  
+  IF b IS NULL THEN  
+    RETURN FALSE;  
+  END IF;  
+  FOREACH i IN ARRAY dumbloom_fingerprint(b, item) LOOP  -- 计算k个哈希产生的值，判断是否有非1的bit, 有则返回false，如果全部为1则返回true.   
+    idx := i / 32 + 1;  
+    IF NOT (b.bits[idx] & (1 << (i % 32)))::boolean THEN  
+      RETURN FALSE;  
+    END IF;  
+  END LOOP;  
+  RETURN TRUE;  
+END;  
+$$  
+LANGUAGE 'plpgsql' IMMUTABLE;  
+```  
+测试    
+```  
+CREATE TABLE t (  
+  users dumbloom  
+);  
+INSERT INTO t VALUES (dumbloom_empty());  
+UPDATE t SET users = dumbloom_add(users, 'usmanm');  
+UPDATE t SET users = dumbloom_add(users, 'billyg');  
+UPDATE t SET users = dumbloom_add(users, 'pipeline');  
+-- This first three will return true  
+SELECT dumbloom_contains(users, 'usmanm') FROM t;  
+SELECT dumbloom_contains(users, 'billyg') FROM t;  
+SELECT dumbloom_contains(users, 'pipeline') FROM t;  
+-- This will return false because we never added 'unknown' to the Bloom filter  
+SELECT dumbloom_contains(users, 'unknown') FROM t;  
+```  
+以上例子来自pipelinedb文档， 用C语言写成聚合函数，可以实现流式计算。        

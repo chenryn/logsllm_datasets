@@ -1,0 +1,213 @@
+# 【系列分享】探索QEMU-KVM中PIO处理的奥秘
+##### 译文声明
+本文是翻译文章，文章来源：安全客
+译文仅供参考，具体内容表达以及含义原文为准。
+作者：[Terenceli @ 360 Gear
+Team](http://bobao.360.cn/member/contribute?uid=2612165517)
+投稿方式：发送邮件至linwei#360.cn，或登陆网页版在线投稿
+我们都知道在kvm/qemu的虚拟机中向端口读写输入会陷入kvm中（绝大部分端口)。但是其具体过程是怎么样的，虚拟机、kvm和qemu这三者的关系在这个过程中又是如何相互联系来完成这一模拟过程的。
+**本文就是对这一问题的探索，通过对kvm进行调试来了解其中的奥秘。**
+**  
+**
+**零. 准备工作**
+工欲善其事，必先利其器。为了了解kvm如何对PIO进行截获处理，首先需要调试kvm，这需要
+配置双机调试环境，网上很多例子，需要注意的是，4.x内核清除kernel text的可写保护有点问题。
+所以本文还是用的3.x内核，具体为3.10.105。所以我们的环境是target为3.10.105的内核，debugger随意。
+如果我们直接用kvm/qemu调试，由于一个完整的环境会有非常多的vm exit，会干扰我们的分析。 这里我们只需要建立一个使用kvm
+api建立起一个最简易虚拟机的例子，在虚拟机中执行in/out 指令即可。网上也有很多这种例子。比如[ **使用KVM API实现Emulator
+Demo, Linux KVM as a Learning
+Tool**](http://www.linuxjournal.com/magazine/linux-kvm-learning-tool).
+这里我们使用第一个例子，首先从
+把代码clone下来，直接make，如果加载了kvm应该就可以看到输出了，kvm的api用法这里不表，仔细看看
+前两篇文章之一就可以了，qemu虽然复杂，本质上也是这样运行的。这个例子中的guest是向端口输出数据。
+**  
+**
+**一. IO端口在KVM中的注册**
+首先我们需要明确的一点是，IO port 这个东西是CPU用来与外设进行数据交互的，也不是所有CPU都有。 在虚拟机看来是没有IO
+port这个概念的，所以是一定要在vm exit中捕获的。
+对于是否截获IO指令，是由vmcs中的VM-Execution controls中的两个域决定的。 参考intel SDM 24.6.2:
+我们可以看到如果设置了Use I/O bitmpas这一位，Unconditional I/O exiting就无效了，如果在IO bitmap
+中某一位被设置为1，则访问该端口就会发生vm exit，否则客户机可以直接访问。 IO bitmap的地址存在vmcs中的I/O-Bitmap
+Addresses域中，事实上，有两个IO bitmap，我们叫做A和B。 再来看看SDM
+每一个bitmap包含4kb，也就是一个页，bitmap A包含了端口0000H到7FFFFH(4*1024*8)，第二个端口包含了8000H到
+FFFFH。
+好了，我们已经从理论上对IO port有了了解了，下面看看kvm中的代码。
+首先我们看到arch/x86/kvm/vmx.c中，定义了两个全局变量表示bitmap A和B的地址。
+在vmx_init函数中这两个指针都被分配了一个页大小的空间，之后所有位都置1，然后在bitmap A中对第 80位进行了清零，也就是客户机访
+这个0x80端口不会发生vm exit。
+    static unsigned long *vmx_io_bitmap_a;
+    static unsigned long *vmx_io_bitmap_b;
+    static int __init vmx_init(void)
+    {
+        vmx_io_bitmap_a = (unsigned long *)__get_free_page(GFP_KERNEL);
+        vmx_io_bitmap_b = (unsigned long *)__get_free_page(GFP_KERNEL);
+        /*
+        * Allow direct access to the PC debug port (it is often used for I/O
+        * delays, but the vmexits simply slow things down).
+        */
+        memset(vmx_io_bitmap_a, 0xff, PAGE_SIZE);
+        clear_bit(0x80, vmx_io_bitmap_a);
+        memset(vmx_io_bitmap_b, 0xff, PAGE_SIZE);
+        ...
+    }
+在同一个文件中，我们看到在对vcpu进行初始化的时候会把这个bitmap A和B的地址写入到vmcs中去，这样 就建立了对IO port的访问的截获。
+    static int vmx_vcpu_setup(struct vcpu_vmx *vmx)
+    {
+        /* I/O */
+        vmcs_write64(IO_BITMAP_A, __pa(vmx_io_bitmap_a));
+        vmcs_write64(IO_BITMAP_B, __pa(vmx_io_bitmap_b));
+        return 0;
+    }
+**二. PIO中out的处理流程**
+本节我们来探讨一下kvm中out指令的处理流程。首先，将上一节中的test.S代码改一下，只out一次。
+    .globl _start
+        .code16
+    _start:
+        xorw %ax, %ax
+        mov  $0x0a,%al
+        out %ax, $0x10
+        inc %ax
+        hlt
+kvm中guest发送vm exit之后会根据发送exit的原因调用各种handler。这也在vmx.c中
+    static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+        [EXIT_REASON_EXCEPTION_NMI]           = handle_exception,
+        [EXIT_REASON_EXTERNAL_INTERRUPT]      = handle_external_interrupt,
+        [EXIT_REASON_TRIPLE_FAULT]            = handle_triple_fault,
+        [EXIT_REASON_NMI_WINDOW]          = handle_nmi_window,
+        [EXIT_REASON_IO_INSTRUCTION]          = handle_io,
+        ...
+    }
+对应这里，处理IO的回调是handle_io。我们在target中执行：
+    root@ubuntu:/home/test# echo g >/proc/sysrq-trigger
+这样调试机中的gdb会断下来，给handle_io下个断点：
+    (gdb) b handle_io
+    Breakpoint 1 at 0xffffffff81037dca: file arch/x86/kvm/vmx.c, line 4816.
+    (gdb) c
+    接着，我们用gdb启动target中的kvmsample，并且在main.c的84行下个断点。
+    test@ubuntu:~/kvmsample$ gdb ./kvmsample 
+    ...
+    Reading symbols from ./kvmsample...done.
+    (gdb) b ma
+    main        main.c      malloc      malloc@plt  
+    (gdb) b main.c:84
+    Breakpoint 1 at 0x400cac: file main.c, line 84.
+第84行恰好是从ioctl KVM_RUN中返回回来的时候。
+好了，开始r，会发现debugger已经断下来了：
+    Thread 434 hit Breakpoint 1, handle_io (vcpu=0xffff8800ac528000)
+    at arch/x86/kvm/vmx.c:4816
+    4816    {
+    (gdb)
+从handle_io的代码我们可以看出，首先会从vmcs中读取exit的一些信息，包括访问这个端口是in还是out, 大小，以及端口号port等。
+    static int handle_io(struct kvm_vcpu *vcpu)
+    {
+        unsigned long exit_qualification;
+        int size, in, string;
+        unsigned port;
+        exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
+        string = (exit_qualification & 16) != 0;
+        in = (exit_qualification & 8) != 0;
+        ++vcpu->stat.io_exits;
+        if (string || in)
+            return emulate_instruction(vcpu, 0) == EMULATE_DONE;
+        port = exit_qualification >> 16;
+        size = (exit_qualification & 7) + 1;
+        skip_emulated_instruction(vcpu);
+        return kvm_fast_pio_out(vcpu, size, port);
+    }
+之后通过skip_emulated_instruction增加guest的rip之后调用kvm_fast_pio_out，在该函数中，
+我们可以看到首先读取guest的rax，这个值放的是向端口写入的数据，这里是，0xa
+    int kvm_fast_pio_out(struct kvm_vcpu *vcpu, int size, unsigned short port)
+    {
+        unsigned long val = kvm_register_read(vcpu, VCPU_REGS_RAX);
+        int ret = emulator_pio_out_emulated(&vcpu->arch.emulate_ctxt,
+                            size, port, &val, 1);
+        /* do not return to emulator after return from userspace */
+        vcpu->arch.pio.count = 0;
+        return ret;
+    }
+我们可以对比gdb中看看数据：
+    Thread 434 hit Breakpoint 1, handle_io (vcpu=0xffff8800ac528000)
+        at arch/x86/kvm/vmx.c:4816
+    4816    {
+    (gdb) n
+    4821        exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
+    (gdb) n
+    4825        ++vcpu->stat.io_exits;
+    (gdb) n
+    4827        if (string || in)
+    (gdb) n
+    4832        skip_emulated_instruction(vcpu);
+    (gdb) n
+    [New Thread 3654]
+    4834        return kvm_fast_pio_out(vcpu, size, port);
+    (gdb) s
+    kvm_fast_pio_out (vcpu=0xffff8800ac528000, size=16, port=16)
+        at arch/x86/kvm/x86.c:5086
+    5086    {
+    (gdb) n
+    [New Thread 3656]
+    5087        unsigned long val = kvm_register_read(vcpu, VCPU_REGS_RAX);
+    (gdb) n
+    [New Thread 3657]
+    5088        int ret = emulator_pio_out_emulated(&vcpu->arch.emulate_ctxt,
+    (gdb) p /x val
+    $1 = 0xa
+    (gdb)
+再往下，我们看到在emulator_pio_out_emulated，把值拷贝到了vcpu->arch.pio_data中，接着调用
+emulator_pio_in_out。
+    static int emulator_pio_out_emulated(struct x86_emulate_ctxt *ctxt,
+                        int size, unsigned short port,
+                        const void *val, unsigned int count)
+    {
+        struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+        memcpy(vcpu->arch.pio_data, val, size * count);
+        return emulator_pio_in_out(vcpu, size, port, (void *)val, count, false);
+    }
+    static int emulator_pio_in_out(struct kvm_vcpu *vcpu, int size,
+                    unsigned short port, void *val,
+                    unsigned int count, bool in)
+    {
+        trace_kvm_pio(!in, port, size, count);
+        vcpu->arch.pio.port = port;
+        vcpu->arch.pio.in = in;
+        vcpu->arch.pio.count  = count;
+        vcpu->arch.pio.size = size;
+        if (!kernel_pio(vcpu, vcpu->arch.pio_data)) {
+            vcpu->arch.pio.count = 0;
+            return 1;
+        }
+        vcpu->run->exit_reason = KVM_EXIT_IO;
+        vcpu->run->io.direction = in ? KVM_EXIT_IO_IN : KVM_EXIT_IO_OUT;
+        vcpu->run->io.size = size;
+        vcpu->run->io.data_offset = KVM_PIO_PAGE_OFFSET * PAGE_SIZE;
+        vcpu->run->io.count = count;
+        vcpu->run->io.port = port;
+        return 0;
+    }
+在后一个函数中，我们可以看到vcpu->run->io.data_offset设置为4096了，我们可以看到之前已经把我们
+向端口写的值通过memcpy拷贝到了vpuc->arch.pio_data中去了，通过调试我们可以看出其中的端倪。
+vcpu->arch.pio_data就在kvm_run后面一个页的位置。这也可以从kvm_vcpu_init中看出来。
+    4405        vcpu->run->io.size = size;
+    (gdb) n
+    [New Thread 3667]
+    4406        vcpu->run->io.data_offset = KVM_PIO_PAGE_OFFSET * PAGE_SIZE;
+    (gdb) n
+    4407        vcpu->run->io.count = count;
+    (gdb) n
+    4408        vcpu->run->io.port = port;
+    (gdb) p count
+    $7 = 1
+    (gdb) n
+    4410        return 0;
+    (gdb) x /2b 0xffff88002a2a2000+0x1000
+    0xffff88002a2a3000: 0x0a    0x00
+    (gdb) p vcpu->run
+    $9 = (struct kvm_run *) 0xffff88002a2a2000
+    (gdb) p vcpu->arch.pio_data
+    $10 = (void *) 0xffff88002a2a3000
+    (gdb)
+这样，我们看到vcpu->run->io保存了一些PIO的基本信息，比如大小，端口号等，run后面的一个页
+vcpu->arch.pio_data则保存了实际out出来的数据。让target继续执行，这个时候我们断回了kvmsample 程序中。
+    (gdb) p kvm->vcpus->kvm_run->io 
+    $2 = {direction = 1 '01', size = 2 '02', port = 16, count = 1, 
+    data_offset = 4096}

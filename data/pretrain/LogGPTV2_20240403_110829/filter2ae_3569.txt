@@ -1,0 +1,97 @@
+# CVE-2021-22555 linux内核提权
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+该漏洞作者Andy Nguyen (theflow@) ，writeup已经公开。
+## 简单概述
+主要是在`xt_compat_target_from_user()`中有溢出，经过特殊构造产生uaf，
+具体exp中，使用了`struct
+msg_msg`作为溢出，导致两个指针指向同一个chunk，使用套接字简化了uaf的使用流程，最后利用pipe()管道中的`struct
+pipe_buf_operations` 来泄露地址，以及伪造修改关闭pipes时调用的`release`
+函数地址调用rop链，完成权限提升以及返回用户空间
+## 修补方案
+在查询源代码过程中发现某些版本的代码中选择将`xt_compat_target_from_user()`的漏洞触发代码删除（简单明了）
+## 漏洞具体分析
+在兼容模式下，即存在#`define CONFIG_COMPAT`条件下
+套接字 `IPT_SO_SET_REPLACE` 或者`IP6T_SO_SET_REPLACE`被调用，
+在`xt_compat_target_from_user()`中`memset()`参数`target->targetsize`没有检查偏移，导致可能出现字节越界。
+    #ifdef CONFIG_COMPAT
+    int xt_compat_target_offset(struct xt_target *target)
+    {
+        u_int16_t csize = target->compatsize ? : target->targetsize;
+        return XT_ALIGN(target->targetsize) - COMPAT_XT_ALIGN(csize);
+    }
+    EXPORT_SYMBOL_GPL(xt_compat_target_offset);
+    void xt_compat_target_from_user(struct xt_entry_target *t, void **dstptr, int *size)
+    {                    //t 表示用户或者内核的target_size target_name
+                        //
+        struct xt_target *target = t->u.kernel.target;//内核target 对应struct xt_target 即target基本类型
+        struct compat_xt_entry_target *ct = (struct compat_xt_entry_target *)t; //xt = t的副本
+        int pad, off = xt_compat_target_offset(target);
+        u_int16_t tsize = ct->u.user.target_size;
+        t = *dstptr;
+        memcpy(t, ct, sizeof(*ct));//将ct覆盖到dst
+        //当内核偏移与用户态偏移不同时使用
+        if (target->compat_from_user)
+            target->compat_from_user(t->data, ct->data);
+        else
+            memcpy(t->data, ct->data, tsize - sizeof(*ct));
+        pad = XT_ALIGN(target->targetsize) - target->targetsize;
+        //漏洞触发点
+        if (pad > 0)
+            memset(t->data + target->targetsize, 0, pad);//末位补0，控制target->targetsize偏大，可以造成\x00溢出
+        //这里有越界 off by null 设置偏移
+        tsize += off;
+        t->u.user.target_size = tsize;
+        *size += off;
+        *dstptr += tsize;
+    }
+`target->targetsize`不由用户控制，可以通过选择不同大小的target类型结构体来控制targetsize大小。
+## 如何触发漏洞？
+漏洞成因 在`xt_compat_target_from_user()`中`memset()`参数`target->targetsize` 溢出导致
+    memset(t->data + target->targetsize, 0, pad);
+原本目的应该是将未满足的偏移填充0。targetsize不被用户直接控制，可以通过选择不同的target类型，但是targetsize不能是8位偏移整齐，满足`pad>0`,
+构造数据data，通过控制pad。控制溢出数量。
+exp利用时，选择创建data数据，date数据长度为0x1012。这样刚好覆盖到接下来申请0x1000大小堆块的对应结构体的指针后2bit，造成指针的指向错误。
+## 具体实现 uaf
+由于在内核中无法直接申请固定大小堆块，exp选择使用创建`msg_msg`结构体，
+msgsend()内部使用alloc_msg(),
+alloc_msg将一定长度的msg利用kmalloc多次分配每一段msg开头都有msg_msg结构体
+    /* one msg_msg structure for each message */
+    struct msg_msg {
+        struct list_head m_list;/*链表头*/
+        long m_type; /*类型*/
+        size_t m_ts;        /* message text size */
+        struct msg_msgseg *next;
+        void *security;
+        /* the actual message follows immediately */
+    };
+    //把id取出来
+    struct list_head {
+        struct list_head *next, *prev;
+    };
+    struct msg_msgseg {
+        struct msg_msgseg *next;
+        /* the next part of the message follows immediately */
+    };
+`msgget()`首先创建4096个消息队列，对每一个队列先发送msg_primary,大小为0x1000，再对每一队列发送msg_secondary,大小为0x400，这样对于每一个队列中都有两条消息，分别对应0x1000
+和0x400大小的chunk，并且分别对每一个msg进行标号，使msg内部存有对应msg标号，`struct msg_msg`位于整个chunk的头部，
+以上是基础chunk的构造
+通过读取msg，将对应chunk释放，由于释放的是0x1000大小，使用触发漏洞，将下一个堆块`msg_msg`的`struct
+list_head`的后两位溢出为0，如果正确运行，成功将一个primary_msg对应的secondary_msg指向不属于它本身队列的secondary
+_msg，此时就会有一个secondary_msg同时被两个指针指向，由此造成uaf。
+为继续利用，我们需要找到哪两个`primary_msg`指针指向了同一个`secondary_msg`.由于在发送`msg`时提前将标号放入`msg`的内容中，可以使用`msgrcv()`获取`secondary_msg`
+，这时的获取通过`primary_msg`的`struct
+msg_msg->m_list`获取，被修改的`msg`会指向id与消息队列id不同的`secondary_msg`,这时可以通过当前消息队列的id与`secondary_msg`的id获取具体哪两个指针指向同一个`msg`。
+## SMAP
+smap阻止内核直接访问用户空间的内容，这使泄露内核的地址会更复杂。
+先将被双重指针指向的地址free掉，创建一个fakemsg内容如下：
+    build_msg_msg((void *)secondary_buf, 0x41414141, 0x42424242,
+                    PAGE_SIZE - MSG_MSG_SIZE, 0);
+采用套接字将fakemsg放到可以被uaf的地方，
+    int spray_skbuff(int ss[NUM_SOCKETS][2], const void *buf, size_t size) {
+      for (int i = 0; i 
+–
+–
+–

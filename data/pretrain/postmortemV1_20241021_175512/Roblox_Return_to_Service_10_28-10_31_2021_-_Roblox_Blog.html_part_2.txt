@@ -1,0 +1,335 @@
+But what was going on with the slow leaders? We did not figure this out
+during the incident, but HashiCorp engineers determined the root cause
+in the days after the outage. Consul uses a popular open-source
+persistence library named BoltDB to store Raft logs. It is
+*not *[used to
+store the current state within Consul, but rather a rolling log of the
+operations being applied. To prevent BoltDB from growing indefinitely,
+Consul regularly performs snapshots. The snapshot operation writes the
+current state of Consul to disk and then deletes the oldest log entries
+from BoltDB. 
+
+However, due to the design of BoltDB, even when the oldest log entries
+are deleted, the space BoltDB uses on disk never shrinks. Instead, all
+the pages (4kb segments within the file) that were used to store deleted
+data are instead marked as "free" and re-used for subsequent writes.
+BoltDB tracks these free pages in a structure called its "freelist."
+Typically, write latency is not meaningfully impacted by the time it
+takes to update the freelist, but Roblox's workload
+exposed a pathological performance issue in
+BoltDB that made freelist maintenance extremely
+expensive. 
+
+## Restoring Caching Service (10/30 20:00 -- 10/31 05:00)
+
+It had been 54 hours since the start of the outage. With streaming
+disabled and a process in place to prevent slow leaders from staying
+elected, Consul was now consistently stable. The team was ready to focus
+on a return to service.
+
+Roblox uses a typical microservices pattern for its backend. At the
+bottom of the microservices "stack" are databases and caches. These
+databases were unaffected by the outage, but the caching system, which
+regularly handles 1B requests-per-second across its multiple layers
+during regular system operation, was unhealthy. Since our caches store
+transient data that can easily repopulate from the underlying databases,
+the easiest way to bring the caching system back into a healthy state
+was to redeploy it.
+
+The cache redeployment process ran into a series of
+issues: 
+
+1.  Likely due to the Consul cluster snapshot reset that had been
+    performed earlier on, internal scheduling data that the cache system
+    stores in the Consul KV were incorrect. 
+2.  Deployments of small caches were taking longer than expected to
+    deploy, and deployments of large caches were not finishing. It
+    turned out that there was an unhealthy node that the job scheduler
+    saw as completely open rather than unhealthy. This resulted in the
+    job scheduler attempting to aggressively schedule cache jobs on this
+    node, which failed because the node was
+    unhealthy. 
+3.  The caching system's automated deployment tool was built to support
+    incremental adjustments to large scale deployments that were already
+    handling traffic at scale, not iterative attempts to bootstrap a
+    large cluster from scratch. 
+
+The team worked through the night to identify and address these issues,
+ensure cache systems were properly deployed, and verify correctness. At
+05:00 on October 31, 61 hours since the start of the outage, we had a
+healthy Consul cluster and a healthy caching system. We were ready to
+bring up the rest of Roblox.
+
+## The Return of Players (10/31 05:00 -- 10/31 16:00)
+
+The final return to service phase began officially at 05:00 on the
+31st.  Similar to the caching system, a significant portion of running
+services had been shut down during the initial outage or the
+troubleshooting phases.  The team needed to restart these services at
+correct capacity levels and verify that they were functioning correctly.
+This went smoothly, and by 10:00, we were ready to open up to
+players.
+
+With cold caches and a system we were still uncertain about, we did not
+want a flood of traffic that could potentially put the system back into
+an unstable state.  To avoid a flood, we used DNS steering to manage the
+number of players who could access Roblox. This allowed us to let in a
+certain percentage of randomly selected players while others continued
+to be redirected to our static maintenance page. Every time we increased
+the percentage, we checked database load, cache performance, and overall
+system stability. Work continued throughout the day, ratcheting up
+access in roughly 10% increments. We enjoyed seeing some of our most
+dedicated players figure out our DNS steering scheme and start
+exchanging this information on Twitter so that they could get "early"
+access as we brought the service back up. At 16:45 Sunday, 73 hours
+after the start of the outage, 100% of players were given access and
+Roblox was fully operational.
+
+## Further Analysis and Changes Resulting from the Outage
+
+While players were allowed to return to Roblox on October 31st, Roblox
+and HashiCorp continued refining their understanding of the outage
+throughout the following week. Specific contention issues in the new
+streaming protocol were identified and isolated. While HashiCorp had
+[benchmarked
+streaming](https://www.hashicorp.com/cgsb) at similar scale to Roblox usage, they had not observed
+this specific behavior before due to it manifesting from a combination
+of both a large number of streams and a high churn rate. The HashiCorp
+engineering team is creating new laboratory benchmarks to reproduce the
+specific contention issue and performing additional scale tests.
+HashiCorp is also working to improve the design of the streaming system
+to avoid contention under extreme load and ensure stable performance in
+such conditions. 
+
+Further analysis of the slow leader problem also uncovered the key
+cause of the two-second Raft data writes and cluster consistency issues.
+Engineers looked at flame graphs like the one below to get a better
+understanding of the inner workings of BoltDB.
+
+
+![](./Roblox%20Return%20to%20Service%2010_28-10_31%202021%20-%20Roblox%20Blog_files/5-boltdb-flame.png)
+
+5\. BoltDB freelist operations analysis.
+
+As previously mentioned, Consul uses a persistence library called
+BoltDB to store Raft log data. Due to a specific usage pattern created
+during the incident, 16kB write operations were instead becoming much
+larger. You can see the problem illustrated in these
+screenshots:
+
+![](./Roblox%20Return%20to%20Service%2010_28-10_31%202021%20-%20Roblox%20Blog_files/6-boltdb-freelist.png)
+
+6\. Detailed BoldDB statistics used in analysis.
+
+The preceding command output tells us a number of
+things:
+
+-   This 4.2GB log store is only storing 489MB of actual data
+    (including all the index internals).
+    **3.8GB is "empty" space.**
+-   The **freelist is 7.8MB** since it
+    contains nearly a million free page ids.
+    
+
+That means, for every log append (each Raft write after some batching),
+a new 7.8MB freelist was also being written out to disk even though the
+actual raw data being appended was 16kB or
+less. 
+
+Back pressure on these operations also created full TCP buffers and
+contributed to 2-3s write times on unhealthy leaders. The image below
+shows research into TCP Zero Windows during the incident.
+
+
+![](./Roblox%20Return%20to%20Service%2010_28-10_31%202021%20-%20Roblox%20Blog_files/7-TCP-zerowindow.png)
+
+7\. Research into TCP zero windows. When a TCP receiver's buffer begins
+to fill, it can reduce its receive window. If it fills, it can reduce
+the window to zero, which tells the TCP sender to stop sending.
+
+HashiCorp and Roblox have developed and deployed a process using
+existing BoltDB tooling to "compact" the database, which resolved the
+performance issues.
+
+## Recent Improvements and Future Steps
+
+It has been 2.5 months since the outage. What have we been up to? We
+used this time to learn as much as we could from the outage, to adjust
+engineering priorities based on what we learned, and to aggressively
+harden our systems. One of our Roblox values is Respect The Community,
+and while we could have issued a post sooner to explain what happened,
+we felt we owed it to you, our community, to make significant progress
+on improving the reliability of our systems before
+publishing. 
+
+The full list of completed and in-flight reliability improvements is
+too long and too detailed for this write-up, but here are the key
+items:
+
+**Telemetry Improvements**
+
+There was a circular dependency between our telemetry systems and
+Consul, which meant that when Consul was unhealthy, we lacked the
+telemetry data that would have made it easier for us to figure out what
+was wrong. We have removed this circular dependency. Our telemetry
+systems no longer depend on the systems that they are configured to
+monitor.
+
+We have extended our telemetry systems to provide better visibility
+into Consul and BoltDB performance. We now receive highly targeted
+alerts if there are any signs that the system is approaching the state
+that caused this outage. We have also extended our telemetry systems to
+provide more visibility into the traffic patterns between Roblox
+services and Consul. This additional visibility into the behavior and
+performance of our system at multiple levels has already helped us
+during system upgrades and debugging
+sessions.
+
+**Expansion Into Multiple Availability Zones and Data Centers**
+
+Running all Roblox backend services on one Consul cluster left us
+exposed to an outage of this nature. We have already built out the
+servers and networking for an additional, geographically distinct data
+center that will host our backend services. We have efforts underway to
+move to multiple availability zones within these data centers; we have
+made major modifications to our engineering roadmap and our staffing
+plans in order to accelerate these efforts.
+
+**Consul Upgrades and Sharding**
+
+Roblox is still growing quickly, so even with multiple Consul clusters,
+we want to reduce the load we place on Consul. We have reviewed how our
+services use Consul's KV store and health checks, and have split some
+critical services into their own dedicated clusters, reducing load on
+our central Consul cluster to a safer level.
+
+Some core Roblox services are using Consul's KV store directly as a
+convenient place to store data, even though we have other storage
+systems that are likely more appropriate. We are in the process of
+migrating this data to a more appropriate storage system. Once complete,
+this will also reduce load on Consul.
+
+We discovered a large amount of obsolete KV data. Deleting this
+obsolete data improved Consul performance.
+
+We are working closely with HashiCorp to deploy a new version of Consul
+that replaces BoltDB with a successor called
+bbolt](https://github.com/etcd-io/bbolt){target="_blank"
+rel="noopener"}[ that does not have the same issue with unbounded
+freelist growth. We intentionally postponed this effort into the new
+year to avoid a complex upgrade during our peak end-of-year traffic. The
+upgrade is being tested now and will complete in
+Q1.
+
+**Improvements To Bootstrapping Procedures and Config Management**
+
+The return to service effort was slowed by a number of factors,
+including the deployment and warming of caches needed by Roblox
+services. We are developing new tools and processes to make this process
+more automated and less error-prone.  In particular, we have redesigned
+our cache deployment mechanisms to ensure we can quickly bring up our
+cache system from a standing start. Implementation of this is
+underway.
+
+We worked with HashiCorp to identify several Nomad enhancements that
+will make it easier for us to turn up large jobs after a long period of
+unavailability. These enhancements will be deployed as part of our next
+Nomad upgrade, scheduled for later this
+month.
+
+We have developed and deployed mechanisms for faster machine
+configuration changes.
+
+**Reintroduction of Streaming**
+
+We originally deployed streaming to lower the CPU usage and network
+bandwidth of the Consul cluster. Once a new implementation has been
+tested at our scale with our workload, we expect to carefully
+reintroduce it to our systems.
+
+## A Note on Public Cloud
+
+In the aftermath of an outage like this, it's natural to ask if Roblox
+would consider moving to public cloud and letting a third party manage
+our foundational compute, storage, and networking
+services.
+
+Another one of our Roblox values is Take The Long View, and this value
+heavily informs our decision-making. We build and manage our own
+foundational infrastructure on-prem because, at our current scale, and
+more importantly, the scale that we know we'll reach as our platform
+grows, we believe it's the best way to support our business and our
+community. Specifically, by building and managing our own data centers
+for backend and network edge services, we have been able to
+significantly control costs compared to public cloud. These savings
+directly influence the amount we are able to pay to creators on the
+platform. Furthermore, owning our own hardware and building our own edge
+infrastructure allows us to minimize performance variations and
+carefully manage the latency of our players around the world. Consistent
+performance and low latency are critical to the experience of our
+players, who are not necessarily located near the data centers of public
+cloud providers.
+
+Note that we are not ideologically wedded to any particular approach:
+we use public cloud for  use cases where it makes the most sense for our
+players and developers. As examples, we use public cloud for burst
+capacity, large portions of our DevOps workflows, and most of our
+in-house analytics. In general we find public cloud to be a good tool
+for applications that are not performance and latency critical, and that
+run at a limited scale. However, for our most performance and latency
+critical workloads, we have made the choice to build and manage our own
+infrastructure on-prem. We made this choice knowing that it takes time,
+money, and talent, but also knowing that it will allow us to build a
+better platform. This is consistent with our Take The Long View
+value.
+
+## System Stability Since The Outage
+
+Roblox typically receives a surge of traffic at the end of December. We
+have a lot more reliability work to do, but we are pleased to report
+that Roblox did not have a single significant production incident during
+the December surge, and that the performance and stability of both
+Consul and Nomad during this surge were excellent. It appears that our
+immediate reliability improvements are already paying off, and as our
+longer term projects wrap up we expect even better
+results.
+
+## Closing Thoughts
+
+We want to thank our global Roblox community for their understanding
+and support.  Another one of our Roblox values is Take Responsibility,
+and we take full responsibility for what happened here. We would like to
+once again extend our heartfelt thanks to the team at HashiCorp. Their
+engineers jumped in to assist us at the outset of this unprecedented
+outage and did not leave our side. Even now, with the outage two months
+behind us, Roblox and HashiCorp engineers continue to collaborate
+closely to ensure we're collectively doing everything we can to prevent
+a similar outage from ever happening again.
+
+Finally, we want to thank our Roblox colleagues for validating why this
+is an amazing place to work. At Roblox we believe in civility and
+respect. It's easy to be civil and respectful when things are going
+well, but the real test is how we treat one another when things get
+difficult. At some point during a 73-hour outage, with the clock ticking
+and the stress building, it wouldn't be surprising to see someone lose
+their cool, say something disrespectful, or wonder aloud whose fault
+this all was. But that's not what happened. We supported one another,
+and we worked together as one team around the clock until the service
+was healthy. We are, of course, not proud of this outage and the impact
+it had on our community, but we ***are***
+proud of how we came together as a team to bring Roblox back to life,
+and how we treated each other with civility and respect at every step
+along the way.
+
+We have learned tremendously from this experience, and we are more
+committed than ever to make Roblox a stronger and more reliable platform
+going forward.
+
+Thank you again. 
+
+------------------------------------------------------------------------
+
+ ¹ Note all dates and time in this blog
+post are in Pacific Standard Time (PST).
+
+

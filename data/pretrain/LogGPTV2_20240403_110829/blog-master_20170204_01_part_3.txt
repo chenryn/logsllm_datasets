@@ -1,0 +1,179 @@
+ * tuple header on disk, it's very important not to waste space with  
+ * structure padding bytes.  The struct is designed to be six bytes long  
+ * (it contains three int16 fields) but a few compilers will pad it to  
+ * eight bytes unless coerced.  We apply appropriate persuasion where  
+ * possible, and to cope with unpersuadable compilers, we try to use  
+ * "SizeOfIptrData" rather than "sizeof(ItemPointerData)" when computing  
+ * on-disk sizes.  
+ */  
+typedef struct ItemPointerData  
+{  
+        BlockIdData ip_blkid;  
+        OffsetNumber ip_posid;  
+}  
+```  
+2\. posting tree 叶子页面  
+叶子页面的标记为GIN_DATA|GIN_LEAF，其页面结构如下：  
+![pic](20170204_01_pic_008.png)  
+与正常的索引页面类似，开始是页面头信息，结尾是special区，不同的是中间区用来记录posting list(即HEAP CTID)。  
+注意posting list会分段压缩存储，包括用于SKIP优化等。  
+src/backend/access/gin/README  
+请仔细阅读  
+```  
+Posting tree leaf pages also use the standard PageHeader and opaque struct,  
+and the right bound of the page is stored right after the page header, but  
+the page content comprises of a number of compressed posting lists. The  
+compressed posting lists are stored one after each other, between page header  
+and pd_lower. The space between pd_lower and pd_upper is unused, which allows  
+full-page images of posting tree leaf pages to skip the unused space in middle  
+(buffer_std = true in XLogRecData).  
+The item pointers are stored in a number of independent compressed posting  
+lists (also called segments), instead of one big one, to make random access  
+to a given item pointer faster: to find an item in a compressed list, you  
+have to read the list from the beginning, but when the items are split into  
+multiple lists, you can first skip over to the list containing the item you're  
+looking for, and read only that segment. Also, an update only needs to  
+re-encode the affected segment.  
+```  
+#### 5 pending list 页面  
+与entry tree的页面类似，如下：  
+![pic](20170204_01_pic_009.png)  
+不同之处是元组的结构，将在元组结构中介绍。  
+special区有一个指针，用来指向页面的下一个页面，这样就把所有的pending list页面以单链表的方式组织起来。  
+### 元组结构  
+#### 1 entry tree 内的 indextuple 元组  
+entry tree的元组依然使用IndexTuple来表示，其结构为：  
+src/include/access/itup.h  
+```  
+/*  
+ * Index tuple header structure  
+ *  
+ * All index tuples start with IndexTupleData.  If the HasNulls bit is set,  
+ * this is followed by an IndexAttributeBitMapData.  The index attribute  
+ * values follow, beginning at a MAXALIGN boundary.  
+ *  
+ * Note that the space allocated for the bitmap does not vary with the number  
+ * of attributes; that is because we don't have room to store the number of  
+ * attributes in the header.  Given the MAXALIGN constraint there's no space  
+ * savings to be had anyway, for usual values of INDEX_MAX_KEYS.  
+ */  
+typedef struct IndexTupleData  
+{  
+        ItemPointerData t_tid;          /* reference TID to heap tuple */  
+        /* ---------------  
+         * t_info is laid out in the following fashion:  
+         *  
+         * 15th (high) bit: has nulls  
+         * 14th bit: has var-width attributes  
+         * 13th bit: unused  
+         * 12-0 bit: size of tuple  
+         * ---------------  
+         */  
+        unsigned short t_info;          /* various info about tuple */  
+} IndexTupleData;   
+```  
+但是对于不同的节点，其t_tid和后面的key会有所不同。  
+1\. 非叶子节点  
+![pic](20170204_01_pic_010.png)  
+与普通索引的元组结构一样，由IndexTupleData + key组成，KEY存储的都是被索引列的值，不同的是，其t_tid不是指向heap 元组，而是指向孩子页面。  
+2\. 叶子节点  
+叶子节点的元组是由IndexTupleData + key 或者是IndexTupleData + key + posting list表示的，对于posting list超长的情况，元组只记录posting list对于的posting tree的root 节点页面号，所以其元组结构如下：  
+![pic](20170204_01_pic_011.png)  
+注意entry tree 叶子节点的tid已经没有指向意义(指向KEY对应的heap的ctid)了，因为具有指向意义的内容存储在VALUE里面:  即posting list, 或者指向posting tree root page的pointer。   
+那么entry tree 叶子节点的tid用来干什么呢？如下。      
+元组结构a(posting list) :   
+src/backend/access/gin/ginpostinglist.c  
+该结构的元组，由于posting list太长，无法存储在元组内部，所以把posting list采用外部存储，索引元组只记录posting tree的root页面号。  
+为了区分这两种结构，使用元组中的tid中的ip_posid(tid ItemPointerData结构的后半部，只有2字节)来区分，  
+ip_posid == GIN_TREE_POSTING，则表示记录的是posting tree，此时tid的ip_blkid用来存储posting tree的root页面号。    
+元组结构b(posting tree) :   
+src/backend/access/gin/gindatapage.c  
+该结构的元组，把posting list直接存储到key后面的连续空间中，使用tid的ip_posid(2字节)来存储posting list的长度，tid的ip_blkid(4字节)来存储posting list在元组内部的偏移?。  
+注：  
+GIN索引页面至少要存储3个索引元组(实际上有改进空间，nbtree双向链表才有这个限制)，所以对于8K的数据块，indextuple(索引元组)的最大值大约是8192/3 = 2730, 每个itempointer为48bit，所以一个索引元组最多可以存储(2730*8)/48 = 455个ctid，(如果是32K的数据块呢，算一算，数据块大小编译PostgreSQL软件时使用configure指定), GIN_TREE_POSTING定义为0xffff(保证与ip_posid 类型长度一致 2 bytes)。  
+#### 2 posting tree 内的 indextuple 元组  
+posting tree的元组格式比较简单，就是itempointer或者postingitem：  
+非叶子节点：  
+```  
+[child pointer (指向孩子节点)] [item pointer (孩子节点的最小?heap ctid)]  
+```  
+叶子节点：  
+```  
+[item pointer list]  (posting list分段压缩存储)
+```  
+实际上posting tree的叶子节点物理结构没有这么简单，item pointer list在叶子节点中可能分段，压缩，以posting list形式存储，见src/backend/access/gin/README。  
+#### 3 pending list 内的 indextuple 元组  
+pending list的页面存储的是临时的索引元组，其元组格式为：  
+```  
+[tid] [flags] [key]  
+```  
+其中tid指向的是heap元组，这与普通元组一样。  
+key 为被索引的列值(row tuple)  
+## 5 GIN索引的构建  
+GIN索引的构建是根据基表构建GIN索引，在PG中通过index_build接口调用索引注册的build函数完成GIN索引的构建。index_build是一个通用接口，该接口会根据索引的不同类型，自动调用合适的build函数，GIN索引的build接口是ginbuild接口。  
+GIN索引在构建时，会调用用户定义的compare接口和extractValue接口，compare接口用来实现entry的比较，而extractValue接口用来把基表的属性值提取出对应的entry。  
+GIN索引在构建时为了提高性能，使用了一种RB二叉树的结构来缓存索引元组，然后在RB二叉树大于maintenance_work_mem时，批量的把RB树中的索引元组插入到GIN的entry tree中。  
+GIN索引的构建流程是：  
+1\. 初始化GinState结构  
+主要是从系统表中读取GIN索引支持的那5个用户自定义函数：compare、extractValue、extractQuery、consistent、comparePartial  
+2\. 初始化meta和root页面  
+其中meta页面的blkno是0，root页面的blkno是1  
+3\. 记录构建日志  
+4\. 初始化构建时的临时内存上下文和用于缓存的RB树  
+5\. 调用IndexBuildHeapScan扫描基表，并调用ginBuildCallback对每个基表的索引属性处理  
+ginBuildCallback实现对每个基表列的处理：  
+a) 对每一个索引列，调用extractValue接口提取entry值  
+b) 把所有的对插入到RB树中  
+c) 如果RB树大于maintenance_work_mem，则把RB树中的对插入到GIN索引中  
+此处在查找entry的插入位置时，会调用compare接口比较两个entry之间的大小  
+6\. 把RB树中的所有索引元组插入到GIN的entry tree中  
+7\. 结束  
+## 6 GIN索引的扫描  
+GIN索引的扫描是根据扫描条件，同GIN索引中查询满足条件的基表元组，GIN索引的扫描接口与btree索引类似：ginbeginscan/ ginrescan/ ginendscan/ gingetbitmap，不同之处是GIN索引没有提供返回单条基表元组的接口(即类似于btgettuple的接口)。  
+GIN索引扫描的基本用法是：  
+```  
+gscan = ginbeginscan(heap, nkeys);  
+ginrescan(gscan, scankey);  
+ntids = gingetbitmap(gscan, &btmap);  
+while(BitmapHeapNext(btmap))  
+{  
+         // do something;  
+}  
+ginendscan(gscan)  
+```  
+从上面可以看出GIN索引的扫描结果是一个bitmap，里面存储的是所有满足条件的基表元组的tid。  
+### ScanKey TO GinScanKey (where 转换)  
+scankey描述了SQL语句的where的条件，pg中使用ScanKeyData来描述，每一个ScanKeyData描述一个条件，ScanKeyData[]的数组描述了所有ScanKeyData的AND操作。而每一个ScanKeyData[]数组对应于一次扫描，所以对于有OR的查询，在执行时至少分成两个扫描，输出结果是两个扫描结果集的并集。对于如下的where条件A and B or C，分成两个扫描A and B 和C。我们研究的重点在于对索引的一次扫描。  
+对应于全文检索，如下的查询：  
+```  
+r1 @@ to_tsquery('A | B') and r2 @@ to_tsquery('C & D') or r3 @@ to_tsquery('E| F')  
+```  
+其会分成：  
+```  
+scan1： r1 @@ to_tsquery('A | B') and r2 @@ to_tsquery('C & D')  
+scan2： r3 @@ to_tsquery('E| F')  
+```  
+结果是：scan1 U(并集) scan2  
+以一次扫描为例，在GIN扫描时，系统会先把scankey转换成GinScanKey，然后根据GinScanKey进行索引的过滤。一个scankey会转换成一个GinScanKey，而每个GinScanKey又会包含多个GinScanEntry，每个GinScanEntry表示scankey中的to_tsquery中的每一项。以r1 @@ to_tsquery('A | B') and r2 @@ to_tsquery('C & D')为例，其scankey为：  
+```  
+ScanKey[0] : r1 @@ to_tsquery('A | B')  
+ScanKey[1] : r2 @@ to_tsquery('C & D')  
+```  
+其转换后的结构是：  
+![pic](20170204_01_pic_012.png)  
+转换的实现是通过用户定义函数extractQuery来完成的，还以上面的查询为例，系统对每一to_tsquery('A | B')类型的查询调用extractQuery，提取出每个用于查询的键值（对于to_tsquery('A | B')提取后的键值是querykey = {"A", "B"}），然后对每个查询键值创建一个GinScanEntry。GIN索引的每个GinScanEntry就是对GIN索引的一次扫描。  
+如下：  
+![pic](20170204_01_pic_013.png)  
+### gingetbitmap GIN扫描接口  
+gingetbitmap是实现GIN扫描的接口，该接口根据GinScanKey把满足过滤条件的所有基表元组的tid存储到bitmap中。  
+bitmap的大小由work_mem参数控制，如果gin索引扫描出过多元组，则bitmap会自动的根据需要选择lossy存储。bitmap的lossy存储是不再存储元组的tid而是直接存储元组所在页面的blkno。由于此种存储bitmap没有存储具体元组，所以在执行层必须对bitmap返回的元组做recheck。  
+对于GIN索引，除了上面的情况下gin返回的元组需要做recheck外，还有一种情况需要做recheck：consistent方法会根据查询设置是否需要做recheck。  
+我们还以查询r1 @@ to_tsquery('A | B') and r2 @@ to_tsquery('C & D')来说明gingetbitmap实现原理。查询r1 @@ to_tsquery('A | B') and r2 @@ to_tsquery('C & D')，会分解为2个GinScanKey：GinScanKey1(r1 @@ to_tsquery('A | B'))和GinScanKey2(r2 @@ to_tsquery('C & D'))，这两个条件的关系是∩，而GinScanKey1又分解为2个entry scan：entryA ∪entryB；GinScanKey2分解为entryC  ∩ entryD。每个entry scan扫描的结果都是一个posting list(posting tree也是posting list)，因此r1 @@ to_tsquery('A | B') and r2 @@ to_tsquery('C & D')就转化为：  
+(plA ∪ plB) ∩ (plC ∩ plD), 其中pl是posting list的缩写  
+即对posting list集合的逻辑运算，运算的结果构成的集合就是查询的结果。  
+gingetbitmap会调用用户4个自定义的接口：compare、extractQuery、consistent、comparePartial。compare在entry scan时用于比较两个entry key的大小；extractQuery用来把查询字符串转换成entry key；consistent用来合并每一个GinScanKey的结果集；comparePartial用来实现部分匹配。gingetbitmap的流程如下：  
+1\. 把ScanKey转换成GinScanKey  
+会调用extractQuery把查询字符串转换成entry key，然后对每个entry key创建一个GinEntryScan  
+2\. 扫描pending list，把满足条件的基表元组tid加入到bitmap中  
+3\. 对每个GinEntryScan进行扫描，找到GinEntryScan的key对应的叶子节点  
+a) 如果是部分匹配，则把所有满足部分匹配的基表元组存储GinEntryScan的临时bitmap中  

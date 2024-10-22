@@ -1,0 +1,366 @@
+terfaces (such as the Intel 82599EB that we used) use a ﬁxed hash-
+ing type, which only ensures that the packets of the uni-directional
+streams of a connection will result to the same hash value. This
+means that the client-to-server stream of the ﬂow will may end up
+to one Rx-queue, and the server-to-client stream to a different one.
+In order to insure that packets of both directions end up into the
+same ring buffer, a symmetric hashing is further applied on the 5-
+tuple ﬁelds of each packet header. Eventually, all packets of the
+same ﬂow will always be placed in the same ring buffer, and will be
+processed by the same user-level process. In addition, we bind the
+process that reads from each ring buffer to the same core using the
+CPU afﬁnity of the Linux scheduler (see sched_setaffini-
+ty(2)), in order to increase cache locality. We assume that the
+monitored trafﬁc consists of many different concurrent ﬂows (at
+least as many as the available CPU cores), hence all processes are
+fed with data. This is not an issue even in small networks, since
+even a single host usually has tens of concurrent active connections.
+3.2 Processing Engine
+Incoming trafﬁc is forwarded to the processing engines for anal-
+ysis. Each processing engine is implemented as a single process
+and is mapped to a certain CPU core to avoid costs due to process
+scheduling. The basic functionality of each processing engine is
+to retrieve the network packets from its assigned hardware queue,
+decode them and apply higher-level protocol analysis, and ﬁnally
+transfer them to the GPU for content inspection.
+3.2.1 Preprocessing
+Preprocessing modules are built on top of the decoding subsys-
+tem and preprocessor engines of Snort 2.9. The purpose of the
+decoder is to parse the packet headers according to lower-layer pro-
+tocols (Ethernet, IP, TCP, and so on). After packets have been de-
+coded, they are sent through a preprocessing stage that includes
+ﬂow reassembly and protocol analysis.
+TCP packets are reassembled into TCP streams to build the entire
+application dialog before they are forwarded to the pattern match-
+ing engine. Packets that belong to the same direction of a TCP ﬂow,
+are merged into a single packet by concatenating their payloads ac-
+cording to the TCP protocol. Inspecting the concatenation of sev-
+eral network packets, instead of each network packet separately,
+enables the handling of overlapping data and other TCP anoma-
+lies. This allows the detection engine to match patterns that span
+multiple packets. Content normalization is also applied for higher-
+Network traffic
+Detection Engines
+Matches
+Push
+Push
+Push
+Match
+Match
+Match
+Packet Buffer
+GPU
+Figure 2: Batching different ﬂows to a single buffer.
+level protocols, such as HTTP and DCE/RPC, to remove potential
+ambiguities and neutralize evasion tricks.
+Once ﬂow reassembly and normalization is complete, the data is
+forwarded to the detection engine, which performs signature match-
+ing on the incoming trafﬁc. In existing NIDS like Snort [36], the
+detection signatures are organized in port groups, based on the
+source and destination port numbers of each rule. Additionally,
+a separate detection engine instance is used to search for the string
+patterns of a particular rule group. To achieve intra-ﬂow paral-
+lelization, MIDeA takes advantage of the data-parallel capabilities
+of modern graphics processors.
+Incoming trafﬁc is transferred to the memory space of the GPU
+in batches. As we discuss in Section 5.2, small transfers results
+to signiﬁcant PCIe throughput degradation, hence we batch lots of
+data together to reduce the PCIe transaction overhead. Also, in-
+stead of allocating a different buffer for each port group, we simply
+mark each packet so that it will be processed by the appropriate
+detection engine in the searching phase. Consequently, only one
+buffer is needed per process, instead of one for each port group,
+as shown in Figure 2. This results to signiﬁcantly lower memory
+consumption and reduces response latency for port groups with low
+trafﬁc. Whenever the buffer gets full, all packets are transferred to
+the GPU in one operation.
+The buffer that is used to collect the network packets is allo-
+cated as a special type of memory, called page-locked or “pinned
+down” memory. Page-locked memory is a physical memory area
+that does not map to the virtual address space, and thus cannot be
+swapped out to secondary storage. The use of this memory area
+results to higher data transfer throughput between the host and the
+GPU device, because the GPU driver knows the location of the data
+in RAM and does not have to locate it—neither swap it from disk,
+nor copy it to a non-pageable buffer—before transferring it to the
+GPU. Data transfers between page-locked memory and the GPU
+are performed through DMA, without occupying the CPU.
+3.2.2 Parallel Multi-Pattern Engine
+A major design criterion for matching large data streams against
+many different patterns, is the choice of an efﬁcient pattern match-
+ing algorithm. The majority of network intrusion detection systems
+use a ﬂavor of the Aho-Corasick algorithm [5] for string searching,
+which uses a transition function to match input data. The transi-
+tion function gives the next state T [state, ch] for a given state
+and a character ch. A pattern is matched when starting from the
+start state and moving from state to state, the algorithm reaches
+a ﬁnal state. The memory and performance requirements of Aho-
+Corasick depend on the way the transition function is represented.
+In the full representation, each transition is represented with 256
+elements, one for each 8-bit character. Each element contains the
+300Full State Table
+256
+Time
+Input Stream
+ch = ch_next;
+s
+e
+t
+a
+t
+s
+#
+Automaton
+int state;
+// current state
+char ch;
+// input character
+uint offset; // current offset
+state = T[state][ch];
+Compute state
+Compacted State Table
+256
+s
+e
+t
+a
+t
+s
+#
+AC-Full
+AC-Compact
+Figure 3: State tables of AC-Full vs. AC-Compact.
+next state to move to, hence given an input character, the next state
+can be found in O(1) steps. This gives a linear complexity over the
+input data, independently on the number of patterns, which is very
+efﬁcient in terms of performance.
+In the full state representation, hereinafter AC-Full, every possi-
+ble input byte leads to at most one new state, which ensures high
+performance. Unfortunately, a full state representation requires
+large amounts of memory, even for small signature sets. When
+compiling the whole rule set of Snort, the size of the compiled state
+table can reach up to several hundreds Megabytes of memory. On
+most modern graphics cards, available memory is not a constraint
+any more, since they are usually equipped with ample amounts of
+memory—a GeForce GTX480 comes with 1.5GB of memory at a
+reasonable price. Unfortunately, in the CUDA runtime system [32],
+on which MIDeA is based, each CPU thread is executed in its own
+CUDA context. In other words, a different memory space has to
+be allocated in the GPU for each process, since they cannot share
+memory on the GPU device. As we discuss in Section 5.2, when
+using the AC-Full algorithm, only the detection engines of a single
+Snort instance can ﬁt in the memory space of the GPU. That means
+that only one Snort instance can fully utilize the GPU at a time.
+To overcome the memory sharing limitation of CUDA and main-
+tain scalability, it is important to keep the memory requirements
+low. Instead of creating a full state table, we use a compacted state
+table structure for representing the compiled patterns [31]. The
+compacted state table is represented in a banded-row format, where
+only the elements from the ﬁrst non-zero value to the last non-zero
+value of the table are actually stored. The number of the stored el-
+ements is known as the bandwidth of the sparse table. In our new
+implementation, AC-Compact, the next state is not directly accessi-
+ble while matching input bytes, but it has to be computed, as shown
+in Figure 3. This computation adds a small overhead at the search-
+ing phase, which is amortized by the signiﬁcantly lower memory
+consumption.
+Moreover, it is common that many patterns are case-insensitive,
+or share the same ﬁnal state in the transition table. Instead of insert-
+ing every different combination of lowercase and capital letters for
+the pattern, we simply insert only one combination (i.e., all charac-
+ters are converted to lowercase), and mark that pattern in the pattern
+list as case-insensitive. In case the pattern is matched in a packet,
+an extra case-insensitive search should be made at the index where
+the pattern was found. If two patterns share the same ﬁnal list (i.e.,
+GPU
+CPU
+Copy Buffer 0 to Texture Memory
+Pattern matching of Buffer 0
+Copy Results to CPU
+Copy Buffer 1 to Texture Memory
+Pattern matching of Buffer 1
+Copy Results to CPU
+Packet acquisition,
+Decoding and
+Preprocessing
+Copy packets to Buffer 0
+Packet acquisition,
+Decoding
+Preprocessing
+Copy packets to Buffer 1
+Filter Results of Buffer 0
+Detection Plugins
+(PCRE, Packet Header inspection,etc)
+Output Plugins
+Packet acquisition,
+Decoding and
+Preprocessing
+Copy packets to Buffer 0
+Filter Results of Buffer 1
+Detection Plugins
+(PCRE, Packet Header inspection,etc)
+Output Plugins
+Figure 4: Execution ﬂow of a single CPU process.
+the match list contains more than one pointers to patterns), the pat-
+terns contained in the list have to be veriﬁed for ﬁnding the actual
+match.
+Each packet is processed by a different GPU thread. Packets are
+stored into an array, which dimensions are equal to the number of
+the packets that are processed at once and the Maximum Transmis-
+sion Unit (MTU). Packets that exceed MTU (which is 1500 bytes
+in Ethernet) are splitted down into several smaller ones, and are
+copied in consecutive rows in the array. To detect attacks that span
+multiple rows, each thread continues its search to the following
+portions of the packet (if any) iteratively, until a ﬁnal or fail state is
+reached.
+3.2.3 Multi-GPU Support
+A key feature of MIDeA is its support for pattern matching using
+several GPUs at a data-parallel level. Modern motherboards, such
+as the one we used in our evaluation, support multiple GPUs on the
+PCI Express bus. MIDeA utilizes the different GPUs by dividing
+the incoming ﬂows equally and performing the signature matching
+in parallel across all devices.
+By default, MIDeA utilizes as many GPUs as it can ﬁnd in the
+system; however, this can be controlled by deﬁning the number of
+GPUs it should try to use in the conﬁguration ﬁle. In the CUDA
+runtime system, on which MIDeA is based, each CPU process is
+bound to one device. To make multi-GPU computation possible,
+several host processes must then be created, with at least one pro-
+cess per device. A static GPU assignment is used for each process.
+Each process receives a uniform amount of ﬂows, due to the load
+balancing scheme described in Section 3.1.2, and thus ﬂows are
+equally distributed to the different GPUs.
+4. PERFORMANCE OPTIMIZATIONS
+Having described our architecture, we now go into a couple of
+optimizations that improve: (i) memory accesses on the GPU, and
+(ii) CPU and GPU execution through pipelining.
+301a) synchronous execution
+socket-0
+socket-1
+Process 1: Transfer to
+GPU
+GPU Execution
+Transfer
+from GPU
+Process 2:
+Transfer to
+GPU
+GPU Execution
+Transfer
+from GPU
+Time
+32 GB/s
+y
+r
+o
+m
+e
+M
+r
+e
+l
+l
+o
+r
+t
+n
+o
+C
+y
+r
+o
+m
+e
+M
+Core
+Core
+Core
+Core
+L3
+Cache
+Inter-socket
+link
+L3
+Cache
+Core
+Core
+Core
+Core
+M
+e
+m
+o
+r
+y
+C
+o
+n
+t
+r
+o
+l
+l
+e
+r
+32 GB/s
+M
+e
+m
+o
+r
+y
+b) asynchronous execution
+25.6 GB/s
+QuickPack Interconnect
+25.6 GB/s
+Process 1:
+Transfer to
+GPU
+GPU Execution
+Transfer
+from GPU
+Process 2:
+Transfer to
+GPU
+GPU Execution
+Transfer
+from GPU
+GPU
+8 GB/s
+PCIe
+I/O HUB
+25.6 GB/s
+I/O HUB
+8 GB/s
+PCIe
+4 GB/s
+GPU
+NIC
+(10 Gb)
+Time
+Figure 6: Hardware setup.
+Figure 5: Data transfers and GPU execution of different pro-
+cesses can overlap.
+Optimizing GPU Memory Accesses. One important optimiza-
+tion for the GPU pattern matching algorithm is related to the way
+the input data are loaded from the device memory. Since pattern
+matching is performed byte-wise, each input symbol is represented
+with 8 bits. However, the minimum size for every device mem-
+ory transaction is 32 bytes. Thus, by reading the input stream one
+byte at a time, the overall memory throughput may be reduced by
+a factor of up to 32.
+We have found that memory is better utilized when multiple
+bytes are fetched at a time, instead of just one. To that end, we
+redesigned the input reading process so that each thread accesses
+data using the int4 built-in data type (int4 is a vector type, con-
+sisting of 4 integer variables). Data is stored into a 128-bit register,
+and is accessed a byte at a time. Int4 is the largest data-type that
+can be used to read data from the texture memory of the device,
+utilizing up to 50% of the total GPU memory bandwidth.
+Pipelined Execution. Our core idea for hiding the pattern match-
+ing computation time on the GPU is double buffering. Our archi-
+tecture improves the achieved parallelism by pipelining the execu-
+tion of CPU cores and the GPUs. For each process, when the ﬁrst
+buffer becomes full, it is copied to a texture bounded array that can
+be later read by the GPU through the kernel invocation. While the
+GPU is performing pattern matching on the ﬂows of the ﬁrst buffer,

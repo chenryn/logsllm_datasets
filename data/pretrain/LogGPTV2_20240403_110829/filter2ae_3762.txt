@@ -1,0 +1,76 @@
+# Chakra漏洞调试笔记1——ImplicitCall
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x0 写在前面的话
+Chakra是微软新一代浏览器Microsoft
+Edge的Javascript解析引擎，继承自IE浏览器的jscript9.dll，并在GitHub上开源为ChakraCore。Chakra自开源以来就成为Windows平台漏洞挖掘的主要目标之一，也是大家学习二进制漏洞挖掘非常好的实战项目。
+笔者在学习Chakra漏洞这几个月中发现Chakra漏洞学习资料相对IE、Flash等较少，公开的exp数量也非常有限。幸运的是Google Project
+Zero团队公开了他们提交的Chakra漏洞case，这对学习Chakra漏洞非常有帮助：
+笔者在调试了部分case后，萌生了一个想法：把这些case按照从高向低的ID编号将分析过程逐一记录下来，与大家分享，一起学习Chakra的漏洞。因此就有了这个系列《Chakra漏洞调试笔记》。但是笔者水平有限，这些漏洞的分析主要是利用业余时间完成，文中错误之处恳请斧正。
+## 0x1 ImplicitCall
+Chakra执行过程分为解释执行（Interpreter）和JIT（Just-in-time），Interpreter执行被parse成字节码（bytecode）的Javascript代码，并且在解释执行过程中会收集例如变量类型或者函数调用次数等profile信息。当一个函数或者循环体被调用多次时，Chakra就会调用JIT编译器根据之前收集的profile信息将热点代码优化并编译成机器指令（JITed
+Code），再用生成的机器指令替换被优化的函数或者循环体的入口点，使得之后对热点函数或者循环体的调用可以直接执行JIT编译器生成的机器码，从而提高了JavaScript脚本执行的速度。
+但是Javascript是弱类型的，变量的类型一般都是可以动态修改的，而生成的JIT代码是强类型的，对变量的访问的偏移都是固定的。一般来说，根据profile信息生成的变量类型是正确的，但是如果JIT代码中存在脚本的回调时，情况就会变得比较复杂。
+看这样一个例子：
+假设Interpreter在执行完第9行opt()后Chakra将函数opt()
+JIT，根据profile信息opt函数内部o.a=0;生成的机器指令类似于：mov [o + 0x10], 0 （这里我们假设o.a在o偏移0x10处）
+在第二次执行opt函数时前，由于在Object的原型绑定了x属性的Get函数，当JIT再次执行到o.x时就会触发__defineGetter__的脚本回调，而在__defineGetter__回调内部却删除了o的第一个属性a，因此对象o的layout发生了改变，0x10处不再存放a属性。
+__defineGetter__函数返回后再次回到JIT，如果JIT不知道回调函数__defineGetter__修改了对象o的layout，并仍然按照之前的偏移存放数据：mov
+[o + 0x10], 0就会出错。
+因此需要一种机制来同步Interpreter和JIT对同一个变量的修改，这就是ImplicitCall。
+继续观察Demo1.js GlobOpt阶段的Dump:
+这里主要关注第5行
+可以产生脚本回调语句o.x生成的IR，可以看到LdRootFld对应的Bailout类型是BailOutOnImplicitCallsPreOp，LdFld对应的Bailout类型是BailOutOnImplicitCalls。
+继续观察Demo1.js Lowerer阶段的Dump，LdRootFld对应dump如下:
+这段代码主要做三件事：
+1：比较GlobalObject的Object Type是否发生变化，没有则直接取对象o；
+2：如果GlobalObject的Type发生变化则比较GlobalObject的InlineCahe是否发生变化，没有则按照InlineCahe取对象o；
+3：如果如果GlobalObject的InlineCahe也发生变化则调用Op_PatchGetRootValue获取对象o。
+而LdRootFld对应的Bailout类型是BailOutOnImplicitCallsPreOp，因此在调用Op_PatchGetRootValue前设置了ImplicitCallFlags=1，DisableImplicitCallFlags=1，并且在Op_PatchGetRootValue返回后恢复DisableImplicitCallFlags=0并比较ImplicitCallFlags
+?=1。如果ImplicitCallFlags !=
+1，则说明Op_PatchGetRootValue调用过程中发生了脚本的回调，则触发Bailout：SaveAllRegistersAndBailOut回到Interpreter。
+同理LdFld对应Lowerer阶段的dump如下:
+对于BailOutOnImplicitCalls的Bailout，Lowerer阶段后会在可能触发回调的函数前设置ImplicitCallFlags=1并在函数返回后比较ImplicitCallFlags
+?=1，与BailOutOnImplicitCallsPreOp逻辑类似，不再详述。
+那么DisableImplicitCallFlags和ImplicitCallFlags是什么呢，为什么通过设置这两个Flag就可以实现Interpreter和JIT的信息同步呢？Chakra是通过ExecuteImplicitCall实现的：
+简单地说Chakra会通过ExecuteImplicitCall来调用可能的脚本回调函数，ExecuteImplicitCall内部首先判断调用的函数是否存在SideEffect，如果没有就直接执行调用函数；如果DisableImplicitCallFlags=1则不执行调用函数，直接返回Undefined；否则在调用函数前设置ImplicitCallFlags，再调用函数。
+这样在回到JIT代码后就可以通过检查ImplicitCallFlags是否被修改来判断是否发生脚本回调了，而DisableImplicitCallFlags的作用显然就是禁用回调了。
+## 0x2 Case Study: CVE-2019-0568
+理解了ImplicitCall机制后，自然就会想到Chakra需要在可能触发脚本回调的函数前显示调用ExecuteImplicitCall，
+那么如果忘记添加ExecuteImplicitCall就会有问题。事实上确实有一些漏洞就是因为忘记添加ExecuteImplicitCall而通过脚本回调来实现类型混淆的，比如CVE-2017-11802。
+另一种情况，如果Chakra需要调用自己内部的js文件又该如何处理的呢，看今天要分析的这个case：
+函数opt里可以触发回调的语句是 o.x。首先观察对应指令lowerer阶段的dump:
+可以看到由于指令LdFld的Bailout类型为BailOutOnImplicitCallsPreOp，在Lowerer阶段的slow
+path调用Op_PatchGetValue前正确的设置了DisableImplicitCallFlags和ImplicitCallFlags，没有问题。
+继续观察Op_PathchGetValue的调用：
+Op_PathchGetValue会调用JavascriptOperators::CallGetter，而JavascriptOperators::CallGetter在调用回调函数的时候已经将调用过程通过ExecuteImplicitCall封装：
+所以LdFld本身的回调是没有问题的，那么问题出在哪里呢？
+通过lokihardt对case root
+cause的描述可以知道：Chakra在JsBuiltIn.js文件里定义了一些内建的对象，通过JsBuiltInEngineInterfaceExtensionObject::InjectJsBuiltInLibraryCode来注入JsBuiltIn.js，但是由于JsBuiltIn.js是js文件，如果在调用过程中DisableImplicitCallFlags已经被置1了就无法执行JsBuiltIn.js里的js代码，因此JsBuiltInEngineInterfaceExtensionObject::InjectJsBuiltInLibraryCode需要在调用JsBuiltIn.js里的js代码前先清除DisableImplicitCallFlags：
+可以看到JsBuiltInEngineInterfaceExtensionObject::InjectJsBuiltInLibraryCode中为了能够调用JsBuiltIn.js，在调用前直接清除了DisableImplicitCallFlags，但是调用完JsBuiltIn.js却忘记恢复之前清除的DisableImplicitCallFlags值。
+因此可以利用这个Bug构造一个本来不允许产生脚本回调(DisableImplicitCallFlags=1)，却因为被InjectJsBuiltInLibraryCode清除DisableImplicitCallFlags
+而最终错误的产生脚本回调机会。
+这里lokihardt选择了Error.prototype.toString：
+Error.prototype.toString会相继调用name.toString()和message.toString()：
+通过将name绑定到Array的prototype触发JsBuiltInEngineInterfaceExtensionObject::
+InjectJsBuiltInLibraryCode的调用从而清除了DisableImplicitCallFlags：
+接着设置了message属性的getter方法，并在getter方法中保存了栈上对象的this指针（局部变量o的地址）到全局变量leaked_stack_object，最终在opt()函数返回后局部变量o被释放，形成栈上的UAF：
+另外一点需要注意的是，当局部变量存在被外部读取的可能性时，局部变量不再直接分配在栈上，而是通过Js::JavascriptOperators::JitRecyclerAlloc分配，局部变量的地址也就不在栈上。
+因为这个漏洞的根本原因是在调用JsBuiltIn.js后忘记恢复原来的DisableImplicitCallFlags，所以补丁也就很容易理解了，通过结构体AutoRestoreFlags的析构函数来实现DisableImplicitCallFlags和ImplicitCallFlags的恢复：
+## 0x3 思考
+整理下这个漏洞利用的流程：
+JIT(opt) -> Set DisableImplicitCallFlags && Set ImplicitCallFlags ->
+ImpliciteCall -> InjectJsBuiltInLibraryCode ->
+Save ImplicitCallFlags && Clear DisableImplicitCallFlags -> JsBuilt.js ->
+Restore ImplicitCallFlags ->ImpliciteCall (read stack object address) ->
+Compare ImplicitCallFlags (Bailout)-> Interpreter
+Bugfix后这个流程就真的没有问题了吗？我们可以看到除了DisableImplicitCallFlags，在调用JsBuilt.js后还有一个恢复ImplicitCallFlags的操作，那么是否有可能在JsBuilt.js里构造一个callback呢，也就是说在恢复ImplicitCallFlags前构造一个脚本的回调的机会。实际上这也是可以的，感兴趣的同学可以看下zenhumany师傅在Blackhat
+Asia 2019议题上介绍的他提交的漏洞：CVE-2019-0650。
+## 0x4 参考文献
+尽管Chakra漏洞相关的资料相对较少，但是还是有一些非常值得大家学习的，这里笔者列出一些对自己帮助很大的Blog或者paper，感谢他们的分享。最后特别感谢zenhumany师傅的指导。
+  1. ChakraCore: 
+  2. Google Project Zero: [https://bugs.chromium.org/p/project-zero/issues/list?can=1&q=chakra](https://bugs.chromium.org/p/project-zero/issues/list?can=1&q=chakra)
+  3. Project Moon: 
+  4. Phoenhex: 
+  5. Zenhumany:

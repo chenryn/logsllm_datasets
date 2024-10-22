@@ -1,0 +1,140 @@
+## PostgreSQL 优化CASE - 无序UUID性能问题诊断  
+### 作者                                                                                                                                   
+digoal                                                                                 
+### 日期                                                                                   
+2012-10-24                                                                                  
+### 标签                                                                                 
+PostgreSQL , uuid , 无序uuid , 索引分裂 , io , 性能诊断       
+----                                                                                
+## 背景          
+某数据库的IO等待非常高, 基本上iostat 看到的磁盘使用率都是接近100%的.  
+分析这个业务库有如下特征 :   
+1\. 最大的单表20GB左右, 1.2亿数据, 有插入操作, 无更改无删除, 有少量查询.  
+2\. 这些表的索引较少, 只有PK和时间字段上的索引, 注意这里的PK是text类型, 并且使用的是业务系统生成的UUID。  
+分析统计信息如下 :   
+1\. 从pg_stat_statements分析占用CPU时间最多的SQL中, 多数是涉及大表的INSERT语句.  
+2\. 从iostat看到的基本上是写入的请求居多. 读请求较少. 写请求的等待队列较大.  
+其他分析 :   
+1\. 在业务系统上线初期并没有暴露出严重的IO等待问题, 跟进后面的分析这个应该是和业务量的增长有关, 增长后暴露出来的问题.  
+2\. 存储没有异常, 也就是说不是硬件带来的问题. 操作系统层面也没有异常.  
+3\. 从iostat上分析, IO写请求基本上集中在索引所在的目录.  
+那么到底是什么导致了这么高的写IO等待呢?   
+就是UUID的索引 , 为什么这么说呢? 来看几个内容取样 :   
+```  
+                id                  
+----------------------------------  
+ f649e41701d6469396b6256a52a449d7  
+ 731533dc86ba4a449d43a2cbfdf5c8e0  
+ f28b6efce57e42ed8526293043482a44  
+ 24e5cb3208874f529cf03e9e114b11f1  
+ f17da47fa0b34f2888d1e97b36c921f6  
+ 175bbb128d2d49df9950dc34a31dab8e  
+ 6bcc21b43ada42128cc45d1b11c4a05f  
+ c1e7e50fb5824fc9b934314c820941fa  
+ 9a7e490db3c2409d80e6203e84440234  
+ bae295da28d944a68ecf79b54672811e  
+ 640ad54a5dc84d29b08b74456b3d002a  
+ 09645443e4344dd183ab2c03d573ca2d  
+ ddd7122ec0484125aeaf3a7599264f3f  
+ 7e9ae853159c456db5dc3820ad463638  
+ 026148ab2d694de69acb6b04055b418c  
+ 9d89d4c9c74b4d02a37dca934e177277  
+ 676d37cc9c9247328f96b6f8eff0f155  
+ e9aa8f4b96794b9e85a9b46797d07896  
+```  
+很乱, 每次插入的值和前面的值没有关系, 也没有顺序 .   
+因此每次插入的值可能存在索引中的位置也是非常随机的, 所以btree索引的树节点和叶节点需要不断的调整, 产生大量的离散IO .   
+下面在测试系统进行验证,  分别考虑几种情况.  
+1\. 测试3中类型的主键, uuid , text , int8   
+2\. 针对 uuid 和 text 测试4种存储配置(plain, main, external, extended)  
+3\. 测试数据量不同的情况下对性能的影响.  
+4\. 测试没有索引的情况.  
+测试需求 :   
+1\. 为了生成uuid, 这里需要用到uuid-ossp模块.  
+2\. 测试用到PostgreSQL 9.2.0版本.  
+安装PostgreSQL  
+1\. 首先要安装uuid需要的依赖包, 在以下网址下载 :   
+http://www.ossp.org/pkg/lib/uuid/  
+```  
+wget ftp://ftp.ossp.org/pkg/lib/uuid/uuid-1.6.2.tar.gz  
+tar -zxvf uuid-1.6.2.tar.gz  
+cd uuid-1.6.2  
+./configure --prefix=/opt/uuid-1.6.2  
+make  
+make install  
+```  
+2\. 安装PostgreSQL  
+```  
+wget http://ftp.postgresql.org/pub/source/v9.2.0/postgresql-9.2.0.tar.bz2  
+tar -jxvf postgresql-9.2.0.tar.bz2  
+CPPFLAGS=-I/opt/uuid-1.6.2/include ./configure --prefix=/home/pg9.2.0/pgsql9.2.0 --with-pgport=9200 --with-perl --with-python --with-tcl --with-openssl --with-pam --without-ldap --with-libxml --with-libxslt --enable-thread-safety --with-wal-blocksize=16 --with-ossp-uuid --with-libs=/opt/uuid-1.6.2/lib  
+gmake world  
+gmake install-world  
+```  
+3\. 初始化数据库略  
+4\. 创建两个表空间, 分布在两个不同的独立物理硬盘上, 目的是将索引和数据文件分开, 容易观察和定位到IO问题的发生. (最好能够完全独立, 和GLOBAL表空间, pg_xlog都分开.)  
+我这里使用的表空间如下 :   
+```  
+ tbs_digoal       | postgres | /data04/pg9.2.0/tbs_digoal  
+ tbs_digoal_idx | postgres | /data03/pgdata/pg9.2.0/tbs_digoal_idx  
+```  
+其中索引所在表空间位于/dev/sda3,  表所在表空间位于/dev/sdb  
+5\. 安装uuid-ossp模块  
+```  
+pg9.2.0@db-172-16-3-150-> psql digoal postgres  
+psql (9.2.0)  
+Type "help" for help.  
+digoal=# create extension "uuid-ossp";  
+```  
+6\. 创建测试表, 指定索引表空间和表的表空间.  
+```  
+digoal=> create table test_uuid_pk (id uuid primary key using index tablespace tbs_digoal_idx) tablespace tbs_digoal;  
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_uuid_pk_pkey" for table "test_uuid_pk"  
+CREATE TABLE  
+digoal=> create table test_text_pk (id text primary key using index tablespace tbs_digoal_idx) tablespace tbs_digoal;  
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_text_pk_pkey" for table "test_text_pk"  
+CREATE TABLE  
+digoal=> create table test_int8_pk (id int8 primary key using index tablespace tbs_digoal_idx) tablespace tbs_digoal;  
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_int8_pk_pkey" for table "test_int8_pk"  
+CREATE TABLE  
+digoal=> create sequence test_seq start with 1 cache 100;  
+CREATE SEQUENCE  
+```  
+开始测试, 每次测试前手工执行checkpoint, 以免影响测试的结果.  
+需要关注几组数据 :   
+top里面的%wa, iostat里面的%util, pgbench里面的tps.  
+1\. 测试uuid字段类型的主键, 使用pgbench测试插入离散uuid数据到测试表.  
+pgbench script :   
+```  
+vi pgbench.sql  
+insert into test_uuid_pk (id) values (uuid_generate_v4());  
+```  
+测试,   
+```  
+digoal=# checkpoint;  
+CHECKPOINT  
+```  
+pgbench测试结果 :   
+```  
+pg9.2.0@db-172-16-3-150-> pgbench -M prepared -n -j 8 -c 8 -T 60 -f ./pgbench.sql -U digoal digoal   
+transaction type: Custom query  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 8  
+number of threads: 8  
+duration: 60 s  
+number of transactions actually processed: 2462748  
+tps = 41039.584555 (including connections establishing)  
+tps = 41044.669903 (excluding connections establishing)  
+```  
+测试过程中的top截取 :   
+```  
+Tasks: 247 total,  11 running, 236 sleeping,   0 stopped,   0 zombie  
+Cpu(s): 41.1%us, 36.9%sy,  0.0%ni, 14.8%id,  4.1%wa,  0.2%hi,  2.8%si,  0.0%st  
+Mem:  98992440k total, 89684600k used,  9307840k free,  1246100k buffers  
+Swap:  8385920k total,        0k used,  8385920k free, 85007228k cached  
+  PID USER      PR  NI  VIRT  RES  SHR S %CPU %MEM    TIME+  COMMAND                                                                  
+ 6267 pg9.2.0   15   0  319m 2100 1524 S 75.0  0.0   0:32.29 pgbench -M prepared -n -j 8 -c 8 -T 60 -f ./pgbench.sql -U digoal digoa  
+ 6278 pg9.2.0   16   0 1184m 130m 128m R 68.1  0.1   0:28.46 postgres: digoal digoal [local] BIND                                     
+ 6277 pg9.2.0   16   0 1184m 129m 128m R 66.1  0.1   0:27.94 postgres: digoal digoal [local] idle                                     
+ 6282 pg9.2.0   16   0 1184m 129m 128m R 66.1  0.1   0:27.83 postgres: digoal digoal [local] idle                                     

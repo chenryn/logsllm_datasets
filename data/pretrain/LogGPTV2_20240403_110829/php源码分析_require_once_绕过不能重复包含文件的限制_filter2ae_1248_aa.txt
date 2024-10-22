@@ -1,0 +1,99 @@
+# php源码分析 require_once 绕过不能重复包含文件的限制
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 简介
+众所周知，在php中，`require_once`在调用时php会检查该文件是否已经被包含过，如果是则不会再次包含，那么我们可以尝试绕过这个机制吗？不写入webshell只读文件有办法吗？
+     flag.php ->
+$content`所以我们给了个伪协议，就先绕过去了，但是如果`/proc/self/root`的长度给短了，会发现解析出来的`opened_path`变成了`/var/www/html/flag.php`，为什么呢？我们可以跟踪一下代码，当进行`require_once($content)`跟进`zend_stream_open()`，找到`opened_path`被修改的地方。
+###  0x01 步入正轨
+跟跟跟，发现在`php_stream_open_for_zend_ex`里，`&handle->opened_path`的指针被作为第三个参数传递出去了，给了`_php_stream_open_wrapper_ex()`，然后经过一番波折返回回去。
+我们可以用Clion的计算表达式功能看一下它的地址`&handle->opened_path`，这里是`0x7ffd908b3580`。，我们得知道它在哪里被修改的，修改的值在哪生成的。先发现它是由`plain_wrapper.c:
+_php_stream_fopen()`第1026行进行写入：
+    /*
+    此时_php_stream_open_wrapper_ex执行到了这里：
+        if (wrapper) {
+            if (!wrapper->wops->stream_opener) {
+                php_stream_wrapper_log_error(wrapper, options ^ REPORT_ERRORS,
+                        "wrapper does not support stream open");
+            } else {
+    ---->        stream = wrapper->wops->stream_opener(wrapper,
+                    path_to_open, mode, options ^ REPORT_ERRORS,
+                    opened_path, context STREAMS_REL_CC);
+            }
+    */
+    #ifdef PHP_WIN32
+        fd = php_win32_ioutil_open(realpath, open_flags, 0666);
+    #else
+        fd = open(realpath, open_flags, 0666);
+    #endif
+        if (fd != -1)    {
+            if (options & STREAM_OPEN_FOR_INCLUDE) {
+                ret = php_stream_fopen_from_fd_int_rel(fd, mode, persistent_id);
+            } else {
+                ret = php_stream_fopen_from_fd_rel(fd, mode, persistent_id);
+            }
+            if (ret)    {
+                if (opened_path) {
+                    //由realpath写入opened_path
+                    *opened_path = zend_string_init(realpath, strlen(realpath), 0);
+                }
+                if (persistent_id) {
+                    efree(persistent_id);
+                }
+知道了哪里写的，那怎么来的就好找到了，用计算表达式的功能，取址，记下来：`0x7ffebc13cd50`。
+同样在这个函数里，往前翻一点点，注意到了这。是`expand_filepath`它改写了`realpath`，而`realpath`就是想要的`/proc/24273/root/proc/self/root/var/www/html/flag.php`：
+    if (options & STREAM_ASSUME_REALPATH) {
+        //直接把传入的filename当成真实路径处理，然而没有执行这里
+        strlcpy(realpath, filename, sizeof(realpath));
+    } else {
+        if (expand_filepath(filename, realpath) == NULL) {
+            //对文件名进行路径扩展，找到真实的路径
+            return NULL;
+        }
+    }
+跟进去，发现是在`virtual_file_ex`里，调用`tsrm_realpath_r`获取解析结果`resolved_path`，处理了一番，把结果通过`state`带回去
+    add_slash = (use_realpath != CWD_REALPATH) && path_length > 0 && IS_SLASH(resolved_path[path_length-1]);
+    t = CWDG(realpath_cache_ttl) ? 0 : -1;
+    path_length = tsrm_realpath_r(resolved_path, start, path_length, &ll, &t, use_realpath, 0, NULL);
+    //路径解析结果真正是从tsrm_realpath_r来的，通过resolved_path传过来
+    //值就是'/proc/24273/root/proc/self/root/var/www/html/flag.php'
+    //然后经过下面的处理一下，实际上根本没处理什么
+    ...
+    if (verify_path) {
+        ...
+    } else {
+        state->cwd_length = path_length;
+        tmp = erealloc(state->cwd, state->cwd_length+1);
+        state->cwd = (char *) tmp;
+        //在这里把结果先写入了state->cwd，通过这个state把结果带回去
+        memcpy(state->cwd, resolved_path, state->cwd_length+1);
+        ret = 0;
+    }
+    /* Stacktrace
+    virtual_file_ex zend_virtual_cwd.c:1385
+    expand_filepath_with_mode fopen_wrappers.c:816
+    expand_filepath_ex fopen_wrappers.c:754
+    expand_filepath fopen_wrappers.c:746
+    _php_stream_fopen plain_wrapper.c:991
+    */
+然后在`expand_filepath_with_mode`这里写入：
+    if (virtual_file_ex(&new_state, filepath, NULL, realpath_mode)) {
+        //刚才的virtual_file_ex没忘吧，结果在new_state->cwd里面
+        efree(new_state.cwd);
+        return NULL;
+    }
+    if (real_path) {
+        copy_len = new_state.cwd_length > MAXPATHLEN - 1 ? MAXPATHLEN - 1 : new_state.cwd_length;
+        memcpy(real_path, new_state.cwd, copy_len);
+        //在这在这，这里写进去了，不信看看real_path的地址是不是0x7ffebc13cd50
+        real_path[copy_len] = '\0';
+    } else {
+        real_path = estrndup(new_state.cwd, new_state.cwd_length);
+    }
+###  0x02 路径的解析
+验证了从哪里来，要到哪里去，那现在就该看看是怎么蹦出来的了。
+`tsrm_realpath_r`是用来解析真实路径的，这一堆解析字符串的代码看着就让人头大，而且还递归调用。
+这个函数做了哪些事情呢？从后往前进行匹配，对于`. ..
+//`等进行特殊处理，特殊处理后重新调整路径的总长度，比如遇到`/var/www/..`的时候就移除掉`www/..`，剩下`/var`，再进行下面的操作。最后把路径传入`tsrm_realpath_r`继续递归调用。
+那先让他递归调用好了，递归到要返回的最后一层，看看每一层递归时函数接受的参数就好办了。

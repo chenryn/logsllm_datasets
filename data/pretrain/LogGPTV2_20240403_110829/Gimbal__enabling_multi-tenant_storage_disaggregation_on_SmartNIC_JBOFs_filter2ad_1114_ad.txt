@@ -1,0 +1,292 @@
+(Section 3.3).
+• Number of virtual slots and the size: Gimbal uses 128KB as
+the slot size as it is the de facto maximum IO size of the NVMe-oF
+implementation. If the system supports a larger size, the value
+may be increased accordingly. However, such a larger virtual
+slot degrades fairness. The threshold of the number of virtual
+112
+SIGCOMM ’21, August 23–28, 2021, Virtual Event, USA
+Min and Liu, et al.
+slots for a single tenant is highly related to the outstanding bytes
+required for the maximum sequential read bandwidth. We found
+that 8 × 128KB sequential read I/Os is the minimum to reach
+3.3GB/s bandwidth. Gimbal uses the value 8 for the threshold.
+• Write cost and decrement factor 𝛿: 𝑊 𝑟𝑖𝑡𝑒 𝑐𝑜𝑠𝑡𝑤𝑜𝑟𝑠𝑡 describes
+the maximum cost of a write IO on the SSD. It can be measured via
+a microbenchmark or simply calculated by using the maximum
+random read and write IOPS from the datasheet. We choose the
+latter way and set the parameter to 9 for the Samsung DCT983
+NVMe SSD. The additive decrements factor decides how fast
+Gimbal reacts to observed write latencies. It should reduce the
+write cost only when writes are served fast from the SSD (not
+intermediate low write latency). We set 𝛿 to 0.5 empirically.
+4.3 Case Study: RocksDB over Gimbal
+This section describes how we support a log-structured merge-tree
+(LSM) key-value store (i.e., RocksDB) in a multi-tenant environment.
+We show how to optimize its various components using the per-SSD
+virtual view exposed by the storage switch.
+Overview. RocksDB [20] is based on an LSM-tree data structure
+(Appendix E). We run the RocksDB over a blobstore file system
+in an NVMe-oF aware environment. Our modifications include a
+hierarchical blob allocator over a pool of NVMe-oF backends, an
+IO rate limiter to control outstanding read/write IOs, and a load
+balancer that steers read requests based on the runtime loading
+factor of a storage node.
+Hierarchical blob allocator. We allocate storage blobs across a
+pool of remote storage nodes. Upon an allocation request, it chooses
+a blob from an available NVMe SSD and then updates blob address
+mappings. The blob address in our case includes . A free
+operation then releases allocated sectors and puts them back into
+the pool. Such an allocator should (1) fully use the storage capacity
+and provide the appropriate granularity to reduce the storage waste;
+(2) use a small amount of metadata for block management.
+We apply a hierarchical blob allocator (HBA) to satisfy these
+requirements. First, there is a global blob allocator at the rack-scale
+that divides total storage into mega blobs (i.e., a large chunk of
+contiguous storage blocks, 4GB in our current implementation),
+and uses a bitmap mechanism to maintain availability. Within the
+RocksDB remote environment layer, there is a local agent perform-
+ing allocation in the granularity of micro blobs (i.e., a small chunk
+of contiguous storage blocks, 256KB in our case). It also maintains
+a free micro blob list based on allocated mega blobs. A file blob
+allocation request is served by the local allocator first and will trig-
+ger the global allocator when the local free pool becomes empty.
+To minimize the IO interference impact, we employ a load-aware
+policy to choose a free mega/micro blob: selecting the one with the
+maximum credit (i.e., the least load) of the NVMe SSD.
+IO rate limiter. Since our RocksDB is built on top of the SSD virtual
+view, which applies the credit-based flow control with the NVMe-oF
+target, it automatically supports an IO rate limiter. Specifically, a
+read/write request is issued when there are enough credits; other-
+wise, it is queued locally. Under an NVMe-oF completion response,
+if the credit amount is updated in the virtual view, the database will
+submit more requests from the queue.
+Replication and load balancing We also built a replication mech-
+anism to tolerate flash failures [61, 69] and a load balancer to im-
+prove remote read performance. Each file has a primary and a
+shadow copy that is spread across different remote backends. When
+there is an allocation request (during file creation/resize), we will
+reserve primary and secondary microblobs from two different back-
+ends in the HBA. If any of their local pools run out of microblobs,
+a megablob allocation request is triggered. A write operation will
+result in two NVMe-oF writes and is completed only when the
+two writes finish. In terms of read, since there are two data copies,
+RocksDB will issue a read request to the copy whose remote SSD
+has the least load. We simply rely on the number of allocated credits
+to decide the loading status on the target. As described before, since
+credit is normalized in our case, the one with more credits is able
+to absorb more read/write requests.
+5 Evaluation
+5.1 Experiment Methodology
+Testbed setup. Our testbed comprises a local rack-scale RDMA-
+capable cluster with x86 servers and Stingray PS1100R storage
+nodes, connected to a 100Gbps Arista 716032-CQ switch. Each
+server has two Intel Xeon processors, 64/96GB memory, and a
+100Gbps dual-port Mellanox ConnectX-5 NIC via PCIe 3.0 × 16-
+lanes. Section 2.2 describes the Stingray setup, and we configure
+it to use 4 × NVMe SSDs. We use Samsung DCT983 960GB NVMe
+SSDs for all experiments unless otherwise specified. We run CentOS
+7.4 on Intel machines and Ubuntu 16.04 on Stingray nodes, where
+their SPDK version is 19.07 and 19.10, respectively.
+Comparison Schemes. We compare Gimbal against the following
+multi-tenancy solutions designed for shared storage. Since none
+of these systems target NVMe-oF, we ported these systems onto
+SmartNIC JBOFs and tailored them to our settings.
+• ReFlex [49], enables fast remote Flash access over Ethernet. It
+applies three techniques: kernel-bypass dataplane executor for
+IO request processing, SLO-based request management, and DRR-
+like QoS-aware scheduler. We implemented their scheduler model
+within the SPDK NVMe-oF target process and used the proposed
+curve-fitting method to calibrate the SSD cost model.
+• Parda [38], enforces proportional fair share of remote storage
+among distributed hosts. Each client regulates the IO submission
+based on the observed average IO latency. We emulated Parda at
+the NVMe-oF client-side and applied a similar flow control. To
+obtain the IO RTT, we encode a timestamp into the NVMe-oF
+submission command and piggy it back upon completion.
+• FlashFQ [70], is a fair queueing IO scheduler. It applies the start-
+time fair queueing mechanism [37] and combines two techniques
+to mitigate IO interference and deceptive idleness: throttled dis-
+patching and dynamically adjusting the virtual start time based
+on IO anticipation. It uses a linear model to calculate the virtual
+finish time. We implemented these techniques and calibrated
+the parameters (including the dispatching threshold and model)
+based on our SSD.
+SSD and Workloads. We emulate two SSD conditions: Clean-SSD,
+pre-conditioned with 128KB sequential writes; Fragment-SSD, pre-
+conditioned with 4KB random writes for multiple hours. They
+present different "bathtub" characteristics (Figure 14). We use a
+113
+Gimbal: Enabling Multi-tenant Storage Disaggregation on SmartNIC JBOFs
+SIGCOMM ’21, August 23–28, 2021, Virtual Event, USA
+variety of synthetic FIO [9] benchmarks to evaluate different aspects
+of Gimbal and compare with the other three approaches. We set
+the maximum outstanding IOs (i.e., queue depth or QD) 4 and 32 to
+128KB and 4KB workloads, respectively. All read workloads in the
+microbenchmark are random, while 128KB write is sequential and
+4KB write is random. We re-condition the SSD with the same pattern
+before each test. We use YCSB [32] for the RocksDB evaluation.
+Evaluation metric. When multiple applications run simultane-
+ously over an SSD, the bandwidth allocated to each application
+depends on its storage profile and may differ from each other sig-
+nificantly. To examine fairness quantitatively, we propose the term
+fair utilization or 𝑓 -Util as a worker-specific normalized utilization
+ratio. As shown below, it is calculated by dividing the per-worker
+achieved bandwidth over its standalone maximum bandwidth when
+it runs exclusively on the SSD, and the ideal ratio is 1.
+𝑓 -Util(𝑖) =
+𝑝𝑒𝑟_𝑤𝑜𝑟𝑘𝑒𝑟_𝑏𝑤(𝑖)
+𝑠𝑡𝑎𝑛𝑑𝑎𝑙𝑜𝑛𝑒_𝑚𝑎𝑥_𝑏𝑤(𝑖)/𝑡𝑜𝑡𝑎𝑙_#_𝑜 𝑓 _𝑤𝑜𝑟𝑘𝑒𝑟𝑠
+5.2 Utilization
+We run 16 workers of the same workload (i.e., standalone bench-
+mark) to evaluate the utilization of each scheme. Figure 6 describes
+the standalone bandwidth of workloads and their average latency.
+Gimbal performs similarly to the FlashFQ on both Clean-SSD and
+Fragment-SSD but outperforms ReFlex on Clean-SSD by x2.4 and
+x6.6 for read and write, respectively. It also outperforms Parda on
+Fragment-SSD by x2.6 in the read utilization. This is mainly because
+our SSD congestion control mechanism can estimate the accurate
+bandwidth headroom so that the scheduler submits just the right
+amount of IOs. The offline-profiled cost model (used by ReFlex)
+overestimates the IO cost for writes and large IOs, resulting in lower
+throughput. Parda fails to reach the maximum bandwidth in the
+4KB read workload on Fragment-SSD because the end-to-end RTT
+between clients and NVMe-oF targets in Parda is too large to detect
+both the throughput capacity and congestion. In terms of latency,
+FlashFQ is a work-conserving SFQ scheduler and will issue much
+more IOs to the SSD without considering the request QoS. Gimbal
+keeps the latency low by employing the credit-based flow control
+and performs similar to the Parda for Clean-SSD. The write latency
+of Gimbal on Fragment-SSD is higher than Parda by x3.4, but it
+outperforms other schemes by x9 on average. Note that Gimbal
+does not improve the read latency for Fragment-SSDs because the
+maximum number of outstanding IOs in the workload is the same
+as the total credit count for the tenant.
+5.3 Fairness
+Different IO Sizes. On our testbed, the maximum 128KB random
+read performance on Clean-SSD (3.16GB/s) is 89% higher than the
+4KB read performance (1.67GB/s). We run the benchmark with
+16-workers of 4KB read and 4-workers of 128KB read. Figure 7a
+and 7d present the bandwidth of one worker for each IO size and
+the 𝑓 -Util for each scheme. We define the utilization deviation as
+|𝑎𝑐𝑡𝑢𝑎𝑙_𝑈 𝑡𝑖𝑙−𝑖𝑑𝑒𝑎𝑙_𝑈 𝑡𝑖𝑙 |
+to identify how each tenant achieves its fair
+bandwidth share. Gimbal shows the closest bandwidth to the ideal
+value and the utilization deviation of the 128KB IO case is x2.1, x8.7,
+and x6.4 less than ReFlex, FlashFQ, and Parda, respectively (x1.9,
+x4.1 and x7.1 for 4KB). Unlike other schemes, Gimbal considers
+the cost difference in the virtual slot mechanism so that it is able
+𝑖𝑑𝑒𝑎𝑙_𝑈 𝑡𝑖𝑙
+ReFlex
+FlashFQ
+Parda
+Gimbal
+)
+s
+/
+B
+M
+(
+/
+W
+B
+d
+e
+t
+a
+g
+e
+r
+g
+g
+A
+3,000
+2,000
+1,000
+0
+C-R
+C-W
+F-R
+F-W
+SSD Condition and IO types
+(a) Bandwidth
+)
+c
+e
+s
+u
+(
+y
+c
+n
+e
+a
+L
+t
+.
+g
+v
+A
+104
+103
+102
+101
+C-R
+C-W
+F-R
+F-W
+SSD Condition and IO types
+(b) Avg. Latency (Log-scale)
+Figure 6: Device utilization on different schemes. IO size is 128KB
+and 4KB for Clean-SSD and Fragment-SSD, respectively. (C:Clean-
+SSD, F:Fragment-SSD, R:Read, W:Write)
+to allocate 22.0% more bandwidth for 128KB IO in the experiment.
+The IO cost in ReFlex is proportional to the request size and shows
+the same bandwidth for both cases.
+Different IO Types. In this experiment, we run 16 workers for
+each read and write and compare the 𝑓 -Util of each scheme. The
+Clean-SSD case executes 128KB sequential read and 128KB random
+write, while the Fragment-SSD one contains 4KB random read and
+4KB random write. Figure 7b, 7c, 7e and 7f describe the aggregated
+read/write bandwidth and 𝑓 -Util. Gimbal only shows a difference of
+13.8% for Clean-SSD and 3.8% for Fragment-SSD between read and
+write 𝑓 -Util, and outperforms ReFlex, FlashFQ, and Parda by x12.8,
+x10.4 and x7.5 on Clean-SSD (x4.2, x184.2 and x330.2 on Fragment-
+SSD), respectively. Gimbal improves the fair bandwidth allocation
+for read/write cases because it addresses the cost of different IO
+types and the SSD conditions with the virtual slot and the write
+cost mechanism. Note that Gimbal shows a lower utilization on
+Clean-SSDs because the congestion control prevents the latency
+from growing beyond the maximum threshold. Parda fails to allot
+the read bandwidth on Fragment-SSD since the write latency for
+small IO size is not correlated to the IO cost (possibly lower than
+the same-sized read latency). The linear model of FlashFQ does not
+provide fairness in modern SSDs, and the read and write bandwidths
+are the same on both Clean-SSD and Fragment-SSD. ReFlex has
+a fixed pre-calibrated model, irrespective of SSD conditions, and
+limits the write bandwidth substantially on Clean-SSD. As a result,
+it only works on Fragment-SSD; it would require re-calibration of
+the model in an online manner to adapt to SSD conditions.
+5.4 Latency
+Figures 8 presents the average and tail latency of different IO types
+from the previous experiment (i.e., read and write mixed workload).
+We report the end-to-end average, 99th and 99.9th latency includ-
+ing in-network queueing delay along the data path as well as the
+request execution time. Gimbal not only maximizes the SSD usage
+but also provides the best service guarantee compared with Parda.
+The benefits mainly come from the fact Gimbal can (1) balance the
+number of outstanding reads and writes to mitigate the IO inter-
+ference at the device; (2) use credits to control the request rate. On
+average, compare with Parda, Gimbal reduces the 99th read and
+write latency by 48.6% and 57.1% for a Clean-SSD (57.5% and 62.6%
+for a Fragment-SSD). Parda shows an average latency lower than
+Gimbal on Fragment-SSD, but it suffers from poor utilization and
+imbalanced resource allocation. The IO RTT observed by the client
+alone is not sufficient to avoid the congestion on the shared SSD,
+and Gimbal outperforms Parda in the 99th and 99.9th latency across
+114
+SIGCOMM ’21, August 23–28, 2021, Virtual Event, USA
+Min and Liu, et al.
+)
+s
+/

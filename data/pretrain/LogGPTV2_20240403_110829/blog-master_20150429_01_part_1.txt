@@ -1,0 +1,183 @@
+## PostgreSQL Oracle 兼容性之 - 事件触发器实现类似Oracle的回收站功能
+##### [TAG 21](../class/21.md)
+### 作者                                                                   
+digoal                                                                    
+### 日期                                                                  
+2015-04-29                                                                     
+### 标签                                                                  
+PostgreSQL , 事件触发器 , event trigger , oracle recycle bin , 回收站                                                                                                                                         
+----                                                                  
+## 背景                    
+早上一位网友问我，能否让用户在删除表时，不执行删除操作，而是重命名表。  
+这不就是Oracle的recycle bin的特性吗？即删表时将表放到回收站，以后还可以恢复。  
+从9.3开始，PostgreSQL提供了event trigger的功能。目前支持几个TAG：  
+ddl_command_start  
+sql_drop  
+table_rewrite  
+ddl_command_end  
+如果要获取被删除的对象名，目前只有sql_drop的TAG支持，也就是在sql_drop的事件触发器函数中可以调用以下函数类获取对象信息。  
+pg_event_trigger_dropped_objects returns a list of all objects dropped by the command in whose sql_drop event it is called.   
+If called in any other context, pg_event_trigger_dropped_objects raises an error.   
+pg_event_trigger_dropped_objects returns the following columns:  
+Name	|Type	|Description  
+---|---|---  
+classid|	Oid|	OID of catalog the object belonged in  
+objid|	Oid|	OID the object had within the catalog  
+objsubid|	int32|	Object sub-id (e.g. attribute number for columns)  
+original|	bool|	Flag used to identify the root object(s) of the deletion  
+normal|	bool|	Flag indicating that there's a normal dependency relationship in the dependency graph leading to this object  
+is_temporary|	bool|	Flag indicating that the object was a temporary object.  
+object_type|	text|	Type of the object  
+schema_name|	text|	Name of the schema the object belonged in, if any; otherwise NULL. No quoting is applied.  
+object_name|	text|	Name of the object, if the combination of schema and name can be used as a unique identifier for the object; otherwise NULL. No quoting is applied, and name is never schema-qualified.  
+object_identity|	text|	Text rendering of the object identity, schema-qualified. Each and every identifier present in the identity is quoted if necessary.  
+address_names|	text[]|	An array that, together with object_type and address_args, can be used by the pg_get_object_address() to recreate the object address in a remote server containing an identically named object of the same kind.  
+address_args|	text[]|	Complement for address_names above.  
+那么我们是否能用它来实现类似oracle recycle bin的功能呢？  
+即 用户在删除表时，不执行删除操作，而是重命名表。  
+当然是可以的，本文将为大家揭示event trigger的recycle bin功能实现。   
+## 挑战
+我们在事务中可以模拟这样的情形。  
+例子：  
+```
+postgres=# begin;  
+BEGIN  
+postgres=# drop table test12;  
+DROP TABLE  
+postgres=# alter table test12 rename to t;  
+ERROR:  relation "test12" does not exist  
+postgres=# rollback;  
+ROLLBACK  
+```
+如果是这样的话，使用事件触发器可能会遇到同样的问题，没法rename操作了。    
+但是幸运的是，我们可以使用dblink的异步QUERY来处理，所以可以避免以上的问题。  
+```
+postgres=# create extension dblink;    
+```
+异步接口参考  
+https://www.postgresql.org/docs/9.6/static/contrib-dblink-send-query.html   
+既然这样，那就开工吧。   
+## 用事件触发器来实现recycle bin
+依赖DBLINK异步调用。  
+```
+create extension dblink;
+```
+我们创建一个schema来存放重命名的对象。  
+用一个表来记录重命名的前后关系。  
+```
+postgres=# create schema recyclebin;  
+postgres=# create table recyclebin.trace(id serial8 primary key,type_name text,nsp_name text,obj_name text,tg_tag text,new_nsp_name text,new_obj_name text,crt_time timestamp);  
+CREATE TABLE  
+```
+创建一个事件触发器函数进行测试：  
+在遇到sql_drops事件时被触发，执行rename的动作，而不是真实的DROP TABLE。从而实现recycle bin的功能。   
+```
+CREATE OR REPLACE FUNCTION test_event_trigger_for_drops()  
+        RETURNS event_trigger LANGUAGE plpgsql AS $$  
+DECLARE  
+    obj record;  
+    v_type_name text[] := '{}'::text[];  
+    v_nsp_name text[] := '{}'::text[];  
+    v_obj_name text[] := '{}'::text[];  
+    v_tg_tag text := TG_TAG;  
+    v_crt_time timestamp := now();  
+    i int := 1;  
+    v_new_nsp_name text := 'recyclebin';  
+    v_new_obj_name text;  
+    have_table boolean := false;  
+    x text;  
+    tt text;  
+    v_sql1 text;  
+    v_sql2 text;  
+    v_sql text;  
+    v_insert text;  
+    v_cname text;  
+BEGIN  
+    FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()  
+    LOOP  
+	RAISE NOTICE '% dropped object: % %.% %',  
+                     v_tg_tag,  
+                     obj.object_type,  
+                     obj.schema_name,  
+                     obj.object_name,  
+                     obj.object_identity;  
+	v_type_name := array_append(v_type_name, obj.object_type);  
+	v_nsp_name := array_append(v_nsp_name, obj.schema_name);  
+	v_obj_name := array_append(v_obj_name, obj.object_name);  
+--  调试, 在这里已经查不到被删除对象的信息了.  
+      select t.*::text into tt from pg_class t where relname=obj.object_name and relnamespace=(select oid from pg_namespace where nspname=obj.schema_name);  
+      raise notice '%', tt;  
+        if (obj.object_type = 'table') then  
+	  RAISE NOTICE 'Found table in drop list. %', v_obj_name;  
+	  have_table := true;  
+	end if;  
+    END LOOP;  
+    if ( have_table = true ) then  
+      RAISE NOTICE 'Move table to recycle bin';  
+      RAISE exception 'Found table in drop list.';  
+    end if;  
+    EXCEPTION WHEN others then  
+      raise notice 'exception handler';  
+--  调试, 在这里已经查不到被删除对象的信息了.  
+      select t.*::text into tt from pg_class t where relname=obj.object_name and relnamespace=(select oid from pg_namespace where nspname=obj.schema_name);  
+      raise notice '%', tt;  
+      FOREACH x in ARRAY v_obj_name LOOP  
+        raise notice 'loop';  
+	if v_type_name[i] = 'table' then  
+	  v_new_obj_name := 'md5'||md5(random()::text||clock_timestamp()::text);  
+	  -- 如果这里调用DBLINK则可以做到，因为当前会话未提交，其他会话还是能看到被删除的表的。  
+	  -- 每个连接只能有一条异步QUERY  
+	  v_sql1 := 'alter table '||v_nsp_name[i]||'.'||x||' set schema '||v_new_nsp_name;  
+	  v_sql2 := 'alter table '||v_new_nsp_name||'.'||x||' rename to '||v_new_obj_name;  
+	  v_sql := v_sql1||';'||v_sql2||';' ;  
+	  v_insert := format('insert into recyclebin.trace(type_name,nsp_name,obj_name,tg_tag,new_nsp_name,new_obj_name,crt_time)   
+	                        values (%L, %L, %L, %L, %L, %L, %L)',  
+				v_type_name[i],v_nsp_name[i],v_obj_name[i],v_tg_tag,v_new_nsp_name,v_new_obj_name,v_crt_time);  
+	  -- raise notice '%', v_insert;  
+	  -- execute v_sql;  
+	  v_cname := 'myconn'||i;  
+	  if (dblink_get_connections() @> array[v_cname] is not true) then  
+	    perform dblink_connect(v_cname, 'dbname='||current_database());  
+	  else  
+	    perform dblink_disconnect(v_cname);  
+	    perform dblink_connect(v_cname, 'dbname='||current_database());  
+	  end if;  
+	  perform dblink_exec(v_cname, v_insert, true);  
+	  perform dblink_send_query(v_cname, v_sql);  
+          perform dblink_disconnect(v_cname);  
+          -- 需要注意DDL锁等待的问题，比如某个表正在被查询或者某个长事务持有共享锁，DDL会失败  
+          -- 另外，如果一个事务中删除多个表时，如删除主表，导致一堆子表被删除，小心异步调用占用所有连接  
+	  -- 建议还是使用HOOK解决这个问题，见本文末尾  
+	end if;  
+        i := i+1;  
+      END LOOP;  
+    raise exception 'Table remove to recyclebin.';  
+END;  
+$$;  
+```
+创建事件触发器：  
+```
+CREATE EVENT TRIGGER test_event_trigger_for_drops  
+   ON sql_drop   
+   EXECUTE PROCEDURE test_event_trigger_for_drops();  
+```
+删除表测试：  
+```
+postgres=# create table test(id int);  
+CREATE TABLE  
+postgres=# create table test1(like test including all) inherits(test);  
+NOTICE:  merging column "id" with inherited definition  
+CREATE TABLE  
+postgres=# create table test2(like test including all) inherits(test);  
+NOTICE:  merging column "id" with inherited definition  
+CREATE TABLE  
+postgres=# \dt  
+         List of relations  
+ Schema | Name  | Type  |  Owner     
+--------+-------+-------+----------  
+ public | test  | table | postgres  
+ public | test1 | table | postgres  
+ public | test2 | table | postgres  
+(3 rows)  
+```
+由于被删除的表使用了继承，这一次删除了3张表  

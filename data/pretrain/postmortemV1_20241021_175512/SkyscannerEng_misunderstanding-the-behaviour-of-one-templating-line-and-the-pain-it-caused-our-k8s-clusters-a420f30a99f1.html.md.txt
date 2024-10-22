@@ -1,0 +1,239 @@
+# Misunderstanding the behaviour of one templating line --- and the pain it caused our k8s clusters 
+
+## How an assumption about the behaviour of a single line led to problems for all of the services receiving traffic through the ingress layer of our Kubernetes clusters 
+Kubernetes (often shortened to k8s) is Greek for 'helmsman' - the k8s
+logo is a ship's wheel. Pictured: the sun setting behind an actual
+ship's wheel in Marseille, France
+
+# **tl;dr** 
+
+Misunderstanding the behaviour of a single line of templating led to
+unexpected behaviour and a significant degradation in experiences for
+users of our k8s clusters.
+
+# Progress with ingress 
+
+Kubernetes uses an object known as 'ingress' to expose HTTP and HTTPS
+routes from outside a cluster to services running within a cluster.
+
+To control this resource, it's necessary to deploy one of a number of
+[ingress
+controllers](https://kubernetes.io/docs/concepts/services-networking/ingress/) - in our case we use
+the open source [HAProxy ingress
+controller](https://github.com/jcmoraisjr/haproxy-ingress) partially supported by the
+maintainers of HAProxy. This project consists of a golang wrapper around
+the HAProxy binary. The wrapper is responsible for watching the
+Kubernetes API server for new pods and services, generating the HAProxy
+config file, and reloading HAProxy to use the new config. The generated
+config creates [an HAProxy
+backend](https://www.haproxy.com/blog/the-four-essential-sections-of-an-haproxy-configuration/) for each service in the
+cluster.
+
+The controller generates this HAProxy config from a template file
+(lightly modified by us from the upstream codebase) and the [golang
+text/template library](https://golang.org/pkg/text/template/). Where it can it will
+dynamically reload the config - however this isn't always possible, and
+the controller will sometimes need to restart the HAProxy process. This
+means that any round robin load balancing will start from the beginning
+of the list of servers/pods.
+
+
+Backends/Pods sorted alphabetically by Pod IP as seen in HAProxy's stats
+screen in a staging environment
+
+We run the ingress controllers as a
+[daemonset](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/), meaning that we run a
+pod on each worker in the cluster. In the case of our largest clusters
+this means we have around 80 instances running at any time, with the ELB
+in front of them load balancing across them equally (assuming that all
+are healthy).
+
+# Hot-podding, a problem, and a patch 
+
+We'd previously had users of our clusters report issues with the ingress
+layer: whilst running v0.3 of the ingress controller their pods would
+experience a phenomenon we dubbed "hot podding" . This meant they were
+seeing uneven distributions of requests across their pods, with some
+pods consistently seeing a higher rate of requests than others. The fact
+they'd only see this with traffic coming through the ingress layer
+suggested the cause, as well as a possible workaround.
+
+After some digging into the code we realised that the data structure
+storing the servers/pods for each backend was sorting the pods, and
+therefore the servers for each backend would always be sorted
+identically in each HAProxy pod. This meant that if an event occurred
+where the HAProxy process could not be gracefully reloaded, all HAProxy
+instances would begin round robin load balancing from the start of the
+sorted list again. We created a workaround for this by adding a default
+annotation to all services deployed to our clusters to use upstream
+[Service
+VIP](https://kubernetes.io/docs/concepts/services-networking/service/#virtual-ips-and-service-proxies)s rather than individual
+pod IPs. This allowed us to let Kubernetes take care of the load
+balancing across each service's pods rather than HAProxy, albeit with a
+number of significant trade-offs (e.g. HAProxy was no longer able to
+mark individual servers/pods as unhealthy).
+
+Due to the drawbacks of this approach we always intended for this to be
+a temporary workaround and to keep our eyes on the upstream project in
+the hope that it would address this shortcoming.
+
+The documentation for version v0.5 of the ingress controller [introduced
+a flag called
+sort-backends](https://github.com/jcmoraisjr/haproxy-ingress/commit/ee43ed47b4dd78e3af0e35878dd623974d8c0ccd), and clarified that the
+default behaviour was that this was false, i.e. that the servers for
+each backend would be randomly shuffled by default. Members of our squad
+went through the changes to the code and thought we understood what the
+code was doing to shuffle or sort backends depending on the flag, so
+after some brief testing we went ahead with upgrading to v0.6.
+
+One shortfall of our testing at this point was that we load-tested a
+fairly static cluster, not the more dynamic clusters we have in
+production, thereby missing the regular config rewrite and HAProxy
+non-graceful restarts which were at the root of our problem.
+
+However, all seemed fine until, once again, a user appeared, drawing our
+attention to unusual request distribution across their pods. We filed
+this away as a curiosity, but we were fairly confident given our
+testing, reading of the code, and the fact that only one squad had
+reported the behaviour, that this wasn't a priority.
+
+
+*What the uneven request distribution looked like from the perspective
+of one service*
+
+That held true until one fateful Sunday...
+
+# "A spiral of failures" 
+
+A user of one of our clusters manually paged the out-of-hours support
+for k8s as they were seeing elevated latency, especially at the p90 and
+max levels. After some collaborative digging and a few false starts we
+found that this could be explained by the fact that the request queues
+of some pods were being filled and refusing to take any more requests.
+With some more Prometheus querying we then managed to track this to the
+same sorting of backends leading to hot-podding, which in this case was
+leading to a "spiral of failures". This included some of our ingress
+containers becoming so overloaded with requests that they were
+OOMKilled, putting the others under even more stress.
+
+From our perspective this meant that a few pods received enough requests
+to fill their queues, at which point they (correctly) marked themselves
+as unready and therefore unwilling to take more traffic. Unfortunately,
+this meant that they then were taken out of the list of servers for the
+backend they belonged to, leading to a config reload, and the next pod
+in the list being overloaded. Happily, we still had our previous
+stop-gap solution to fall back on: we could patch the affected service's
+manifest to disable default use of the pod IPs and revert to using the
+Service VIP. This only required a simple config change to [Slingshot,
+our internal deployment
+tool.](/@SkyscannerEng/our-essential-developer-enablement-tools-for-software-engineers-1e61d3751e46) Given it was a Sunday and multiple engineers had
+spent multiple hours diagnosing and mitigating the issue it was decided
+the diagnosis of *why* the hot-podding had occurred could wait until the
+next day.
+
+
+Can you guess where we switched to Service VIPs?
+
+# The mother of all mistakes 
+
+We started off confused as to why this was happening --- we'd read the
+docs, even looked at the code, and could see how the map of backends was
+sorted if the relevant sort-backends option was set. What had we missed?
+
+After some testing and debugging we realised that the random ordering of
+servers/pods in each backend was being maintained in the Go code right
+up until it got templated into the config file actually used by HAProxy.
+
+It was at this point we realised that one major assumption we'd made
+regarding consistency had come back to bite us. None of us had
+extensively used the *text/template* library before, but it was just
+using range to iterate over each list of backends, after the code had
+already taken care of whether or not to sort, and we knew how using
+range worked, didn't we...?
+
+Since version 1.0, Golang's behaviour when iterating over a map using
+the range keyword has been that [iteration order is not guaranteed to be
+the same as insertion
+order](https://blog.golang.org/go-maps-in-action).
+
+However, the templating library does *not* behave in the same way.
+Instead, the *text/template* library's documentation explicitly states
+that:
+
+> If the value is a map and the keys are of basic type with a defined
+> order ("comparable"), the elements will be visited in sorted key
+> order.
+
+This has been the case [since the release of Go
+1.0](https://github.com/golang/go/issues/2696). This difference confused
+us at first, and that's not surprising when you consider that neither
+the issue linked to above, or the commit resolving the issue, explain
+why the maintainers of Go think this behaviour is desirable. However,
+you can see why deterministic behaviour is probably what you want out of
+a templating library - you'd certainly be confused if every time you ran
+through a template you got a different ordering of rows in a table!
+
+So how does this difference in behaviour lead to us "hot-podding" some
+service containers with more traffic than others?
+
+Well, the template shipped with the pod, and used by ourselves in
+slightly modified form, iterates over a map where the keys are of the
+form *pod_ip:port.* Given the behaviour of the templating library above,
+this meant the pods always ended up ordered by pod IP in ascending
+order. We now just needed to find a way to ensure that the templating
+library didn't perform unexpected re-ordering of the pods at templating
+time.
+
+After a bit of reading we realised we could work around this with some
+minimal patching of the controller; we used a slice to maintain the
+order of insertion to the map of backends for each server. We could then
+modify the template to iterate over this slice instead, and lookup the
+elements in the map by key. We quickly threw together the required
+changes to both the codebase and config template to enable this, and
+tested it in our sandbox clusters. Once we had begun rolling it out to
+production clusters we checked the same graphs we had been looking at
+above which showed up the hot-podding, and lo and behold:
+
+
+*Request distribution for the same service post patching*
+
+This led to us raising a [GitHub
+issue](https://github.com/jcmoraisjr/haproxy-ingress/issues/240) with [the upstream
+project](http://github.com/jcmoraisjr/haproxy-ingress) and a corresponding [pull
+request](https://github.com/jcmoraisjr/haproxy-ingress/pull/241). Unfortunately the project
+doesn't currently have anything in the way of a test suite ([plans are
+afoot](https://github.com/jcmoraisjr/haproxy-ingress/issues/274) for a major rewrite which
+is intended to solve this shortcoming) so we hadn't realised that our
+patch would break functionality we weren't using. The maintainer however
+quickly picked up on this and [pushed an alternative fix to the next
+release](https://github.com/jcmoraisjr/haproxy-ingress/pull/247), as well as offering to
+backport it if we needed to continue running the v0.6 release.
+
+
+Randomly sorted backends in the same staging environment as above ---
+Perfect for a good even request distribution
+
+We've now been successfully running with the patch internally for a
+number of months, gaining all of the benefits of returning to using pod
+IPs by default for backends.
+
+# Lessons learned 
+
+We have been forcibly reminded that when we change the components in our
+cluster we need to test those changes with specific behaviour and
+conditions in mind.
+
+We already knew about the risks of hot-podding and the link with sorted
+lists of backends but failed to test the new flag enough to realise that
+it wasn't working as expected.
+
+Never assume you know how something is going to behave due to the
+behaviour of the same word in another part of the language - this is the
+core assumption that hurt us when we examined v0.5 of the controller.
+
+As [others](https://twitter.com/sszuecs/status/1085292025895940097) have
+[documented](https://www.slideshare.net/try_except_/running-kubernetes-in-production-a-million-ways-to-crash-your-cluster-devopscon-munich-2018) time and [time
+again](https://www.youtube.com/watch?v=xZO9nx6GBu0), changes in one small
+component of your k8s cluster can have outsized negative impacts on
+users of your clusters, and ultimately, on your customers.
+

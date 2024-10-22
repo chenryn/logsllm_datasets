@@ -1,0 +1,103 @@
+**作者：360 Alpha Lab 韩洪立，简容，王晓东，周鹏  
+原文链接：**
+> 在2020年7月，我们向谷歌上报了一条远程ROOT利用链，该利用链首次实现了针对谷歌旗舰机型Pixel
+> 4的一键远程ROOT，从而在用户未察觉的情况下实现对设备的远程控制。截至漏洞公开前，360 Alpha
+> Lab已协助厂商完成了相关漏洞的修复。该漏洞研究成果也被2021年BlackHat
+> USA会议收录，相关资料可以[这里](https://www.blackhat.com/us-21/briefings/schedule/#typhoon-> mangkhut-one-click-remote-universal-root-formed-with-two-> vulnerabilities-22946)找到。
+> **该项研究成果也因其广泛的影响力在谷歌2020年官方漏洞奖励计划年报中得到了公开致谢，并斩获“安全界奥斯卡”Pwnie
+> Awards的“史诗级成就”和“最佳提权漏洞”两大奖项的提名。这条利用链也因其广泛的影响力被我们命名为“飓风山竹”。**
+在上一篇[文章](https://vul.360.net/archives/144)中，我们已经介绍了利用链的RCE部分，因此这篇文章将介绍利用链的沙箱提权部分。本文将首先对沙箱提权所使用的Binder驱动漏洞（CVE-2020-0423）进行分析，然后介绍在沙箱环境中提权遇到的挑战及对应的解决方案，最后是我们对这部分内核漏洞利用的总结。
+## Introduction
+Binder是安卓系统中最为核心且广泛使用的进程间通信方式，这使得系统设计者需要保证上层应用在各种场景下能够正常调用Binder驱动接口，包括限制最为严格的沙箱环境。近年来，Binder模块先后爆出了多个被证实可以被利用的漏洞，包括我们在2019年发现的“水滴”漏洞（CVE-2019-2025），这个漏洞影响了2016年11月~2019年3月的安卓系统。在此之后，CVE-2019-2215，谷歌Project
+Zero团队于2019年9月发现该漏洞存在1-day在野利用，影响Pixel
+2及以下机型，后于2019年10月安全公告中修补。CVE-2020-0041，由bluefrostsec团队发现，是一枚OOB类型的漏洞，影响了2019年2月~2020年3月的安卓系统，影响的设备包括运行Android
+10的Pixel 4及Pixel 3/3a
+XL。除去这些被证实可被利用的漏洞之外，Binder模块也爆出了一些其他相关的安全问题。按照行业的相关研究结论，大概每1000~1500行代码中间便会存在一枚漏洞，而Binder驱动核心代码binder.c文件中只有不到6000行代码。这不禁让我们有一个疑问，这个模块是否还存在此类漏洞呢？这也是本文将要介绍的CVE-2020-0423，也是利用链中使用的沙箱逃逸提权漏洞。利用该漏洞实现了仅触发一次漏洞就拿到了稳定的任意地址读写元语，可直接从沙箱逃逸提权至ROOT。实现了仅用两枚漏洞就打通了整条利用链，且该利用方案具备通用性。下文将会将其技术实现细节详细的分享给大家，以期能够促进攻防技术的共同进步。
+## The Bug
+一个典型的Binder通信过程大致分为四步：  
+（1）Client发送BC_TRANSACTION命令到内核；  
+（2）内核经过处理之后把BC_TRANSACTION转发到Server；  
+（3）Server接收到BC_TRANSACTION后开始处理任务，处理完成之后通过BC_REPLY命令把结果返回到内核；  
+（4）内核经过处理之后把BC_REPLY结果转发给Client。
+Binder进程间通信模型:
+Binder支持多种[类型](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-crosshatch-4.9-android10/include/uapi/linux/android/binder.h)的对象传递，该漏洞和BINDER_TYPE_BINDER类型的对象传递有关。在如下所示的代码中，首先构造一个flat_binder_object结构体，然后通过BC_TRANSACTION命令发送到内核。
+    int send_service_handle(struct binder_state *bs, uint32_t target, int code, int handle)
+    {
+        struct flat_binder_object binder_obj; 
+        uint64_t offsets = 0;
+        int obj_size = sizeof(struct flat_binder_object);
+        int offset_size = sizeof(uint64_t);
+        int res;
+        binder_obj.hdr.type = BINDER_TYPE_BINDER;
+        binder_obj.binder = handle;
+        binder_obj.cookie = 0xbbbbbbbb;
+        res = send_transaction(bs, target, code, &binder_obj, obj_size, &offsets, offset_size);
+        return res;
+    }
+一般情况下，当内核接收到BINDER_TYPE_BINDER对象后，会将其[转换](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-crosshatch-4.9-android10/drivers/android/binder.c#3439)成一个binder_node。在转换的过程中，binder_node结构体中类型为binder_work的成员work将以指针形式插入到当前线程对应的todo链表中。同时内核还会给该binder_node创建对应的binder_ref，这样Server端进程就可以通过该binder_ref找到对应的binder_node。如下图所示，work会被链接到thread->todo
+链表上。
+那么Server可以用这个binder_ref来做什么呢？当Server在使用完对应的binder_obj之后，会给内核[发送](https://cs.android.com/android/platform/superproject/+/android-10.0.0_r1:frameworks/native/cmds/servicemanager/binder.c;l=287)BC_BUFFER_FREE命令。当内核收到该命令后，就会根据该binder_ref找到对应的binder_node，然后减少引用计数器。当计数器变成0时，该binder_node就会被释放掉。
+与此同时，Client端也能通过发送BINDER_THREAD_EXIT命令访问到这个binder_work对象。这个命令最终会调用到binder_release_work函数，该函数代码如下所示。在代码[1]处，先从todo链上取出binder_work，这里有锁保护，不存在竞争问题。在代码[2]处，会根据binder_work的type进行相应的清理工作，但是这里没有锁保护。
+    static void binder_release_work(struct binder_proc *proc,
+                    struct list_head *list)
+    {
+        struct binder_work *w;
+        while (1) {
+            w = binder_dequeue_work_head(proc, list);   // [1]从链上取出w时有锁保护
+            if (!w)
+                return;
+            switch (w->type) {                          // [2]这里没有锁保护，竞争成功会导致UAF问题
+            ...
+        }
+    }
+因此，Client和Server之间存在条件竞争问题。这个过程可以分为几步：  
+1、Client发送BINDER_THREAD_EXIT命令，然后从todo链上取出w；  
+2、Server发送BC_BUFFER_FREE命令，内核根据binder_ref找到binder_node，并减少引用计数至0，使得binder_node被释放掉；  
+3、此时binder_work所处内存已经处于释放状态，Client访问w->type就会导致UAF。
+## Exploitation
+> 前面我们分析了CVE-2020-0423漏洞的原理，接下来我们将给大家介绍如何利用这个漏洞以及这个过程中遇到的一些挑战。
+### How to exploit the bug?
+经过上面的分析，我们知道这是一个UAF漏洞。这种类型的漏洞利用的关键是Use点，从binder_release_work函数的实现可以看到，这里如果我们可以通过堆喷控制type，switch(w->type)就会进入我们需要的分支。
+    4575 static void binder_release_work(struct binder_proc *proc,
+    4576                 struct list_head *list)
+    4577 {
+    4578     struct binder_work *w;
+    4579  
+    4580     while (1) {
+    4581         w = binder_dequeue_work_head(proc, list);
+    4582         if (!w)  type) { cmd);
+    4601         } break;
+    4602         case BINDER_WORK_TRANSACTION_COMPLETE: {
+    4603             binder_debug(BINDER_DEBUG_DEAD_TRANSACTION,
+    4604                 "undelivered TRANSACTION_COMPLETE\n");
+    4605             kfree(w);
+    4606             binder_stats_deleted(BINDER_STAT_TRANSACTION_COMPLETE);
+    4607         } break;
+    4608         case BINDER_WORK_DEAD_BINDER_AND_CLEAR:
+    4609         case BINDER_WORK_CLEAR_DEATH_NOTIFICATION: {
+    4610             struct binder_ref_death *death;
+    4611  
+    4612             death = container_of(w, struct binder_ref_death, work);
+    4613             binder_debug(BINDER_DEBUG_DEAD_TRANSACTION,
+    4614                 "undelivered death notification, %016llx\n",
+    4615                 (u64)death->cookie);
+    4616             kfree(death);
+    4617             binder_stats_deleted(BINDER_STAT_DEATH);
+    4618         } break;
+    4619         default:
+    4620             pr_err("unexpected work type, %d, not freed\n",
+    4621                    w->type);
+    4622             break;
+    4623         }
+    4624     }
+    4626 }
+首先，我们假定binder_node对应的地址是 **X** 。根据上面的代码，不同的type值可能导致不同的结果：
+（1）type是BINDER_WORK_TRANSACTION，可能触发double-free问题，但需要满足较为苛刻的条件，较难控制；
+（2）type是BINDER_WORK_RETURN_ERROR，没有实际影响；
+（3）type是BINDER_WORK_TRANSACTION_COMPLETE、BINDER_WORK_DEAD_BINDER_AND_CLEAR和BINDER_WORK_CLEAR_DEATH_NOTIFICATION之一，导致
+**X+8** 被释放；
+（4）剩下的情况将直接进入default分支。
+综合来看场景（3）流程较为简单，具备较好的可利用性。
+### **Vision of kernel from sandbox process**
+由于Binder模块的特点，通过它可以搭建一条从沙箱进程通往内核的桥梁，但在这条通道上仍有着各种各样的安全策略来保证系统安全稳定的运行。正常情况下我们只能完成一些被规则允许的事情，而我们发现的这枚漏洞便有可能成为这规则之外的”力量”。我们需要避开这一系列的检查，与这一“力量”完成一系列的协作、布局，逐步完成对关键元素控制，并最后一举拿下内核的控制权。但想要完成这一切并不容易，在高度沙箱化的进程中实现逃逸一直以来都是极具挑战性的目标，无论是在各类国际赛事中，还是从安卓历史上来看，在Pixel系列机型上能够实现沙箱逃逸都能称得上是高难度目标，而能够直接提权至ROOT权限的案例就更是罕见。这主要是由于沙箱进程中一系列限制导致的：
+**极少的攻击面**

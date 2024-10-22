@@ -1,0 +1,152 @@
+当攻击者将PreviousSize字段设置为漏洞块的大小时，这将允许在UAF的情况下实现池溢出。因此，在请求释放被覆盖的块时，漏洞块将被取代，并处于UAF的状态，图14展示了这个技术。
+图14. Exploitation using vulnerable chunk Use-After-Free
+然而，我们选择了另一种技术。该原语可以被用来在漏洞块的中间触发被覆盖的块的释放。可以在漏洞块中伪造一个假的POOL_HEADER（或者是替换它的块），并且使用PoolType攻击重定向该块上的空闲区。这将允许在合法的块中间创建一个虚假的块，并且处于相当好的溢出情况。这个块相应的被称为“幽灵块”。
+幽灵块至少覆盖两个块，漏洞块和被覆盖区块，图15展示了这种技术
+图15. 选择的利用技术
+最后一项利用技术看起来比UAF更好利用，因为它使得攻击者处于更好的状态来控制任意对象的内容。
+然后，可以使用允许任何数据控制的对象来重新分配漏洞块。这允许攻击者能够控制部分“幽灵块”中分配的对象。
+为了放置“幽灵块”，必须找到一个有趣的对象。为了使漏洞利用程序更加通用，对象应该满足下列要求：
+  1. 如果可以完全控制或部分控制的情况下，能提供任意读写原语。
+  2. 有能力控制它的分配和释放
+  3. 具有最小0x210的可变大小，以便从相应的快表中分配到“幽灵块”中，但要尽可能小（避免在分配时浪费太多堆空间）
+由于漏洞块可以放置在PagedPool和NonPagedPoolNx中，因此需要两个此类对象，一个PagedPool中分配，另一个在NonPagedPoolNx中分配。
+这种对象不是常见的，所以作者没有发现完美的此类对象。这就是为什么使用仅能提供任意读原语的对象作为开发EXP策略的原语。攻击者依然可以控制幽灵块的POOL_HEADER。这意味着Quota
+Pointer Process
+Overwrite攻击可以被用于获取任意递减原语。ExpPoolQuotaCookie和幽灵块的地址可以使用任意地址读原语恢复。
+开发的利用程序使用的是最后的这个技术。通过利用堆处理和有趣的对象的溢出，实现4个字节溢出转为从低完整性到System完整性的权限提升。
+### 4.3 目标对象
+分页池创建管道后，用户可以向管道添加属性。属性是存储在链表中的键值对。管道属性对象在分页池中分配，使用下面的内核中的结构体来定义。
+    //PipeAttribute是未公开的结构体
+    struct PipeAttribute {
+    LIST_ENTRY list;
+    char * AttributeName;
+    uint64_t AttributeValueSize ;
+    char * AttributeValue ;
+    char data [0];
+    };
+分配的大小和填充的数据完全由攻击者控制。属性名和属性值是指向数据区不同偏移的两个指针。
+可以使用NtFsControlFile系统调用和0x11003C控制码在管道上创建管道属性，见下图所示的代码
+    HANDLE read_pipe;
+    HANDLE write_pipe;
+    char attribute [] = "attribute_name \00 attribute_value"
+    char output [0 x100 ];
+    CreatePipe(read_pipe , write_pipe , NULL , bufsize);
+    NtFsControlFile (write_pipe ,
+    NULL ,
+    NULL ,
+    NULL ,
+    &status ,
+    0x11003C ,
+    attribute ,
+    sizeof(attribute),
+    output ,
+    sizeof(output)
+    );
+可以使用0x110038控制码来读取属性值。属性值指针和属性值大小将被用于读取属性值并返回给用户。属性值可以被修改，但这会触发先前的PipeAttribute的释放和新的PipeAttribute的分配。
+这意味着如果攻击者可以控制PipeAttribute结构体的AttributeValue和AttributeValueSize字段，它就可以在内核中任意读取数据，但不能任意写。这个对象也非常适合在内核中放置任意数据。这意味着它可以用来申请一个漏洞块并控制幽灵块的内容。
+**NonPagedPoolNx**
+在管道中使用WriteFile是一种众所周知的NonPagedPoolNx喷射技术。当往管道中写入时，NpAddDataQueueEntry函数会创建下图所示的结构体
+    struct PipeQueueEntry
+    {
+    LIST_ENTRY list;
+    IRP *linkedIRP;
+    __int64 SecurityClientContext ;
+    int isDataInKernel ;
+    int remaining_bytes__ ;
+    int DataSize;
+    int field_2C;
+    char data [1];
+    };
+PipeQueueEntry的大小和数据是由用户控制的，因为数据直接存储在结构体后面。
+当使用函数NpReadDataQueue中的条目时，内核将会遍历条目列表，并使用条目来检索数据。
+    if ( PipeQueueEntry -> isDataAllocated == 1 )
+        data_ptr = (PipeQueueEntry ->linkedIRP ->SystemBuffer);
+    else
+        data_ptr = PipeQueueEntry ->data;
+    [...]
+    memmove (( void *)(dst_buf + dst_len - cur_read_offset ), &data_ptr[
+        PipeQueueEntry ->DataSize - cur_entry_offset ], copy_size);
+如果isDataAllocated字段等于1，则数据没有直接存储在结构体后面，但是其指针存储在IRP中，由linkedIRP指向。如果攻击者能够完全控制这个结构体，他可以设置isDataInKernel为1，并且使指针linkIRP在用户层。然后使用用户层的LinkedIRP字段的SystemBuffer字段（偏移0x18）读取条目中的数据。这就提供了一个任意读原语。这个对象也非常适合在内核中存储任意数据。它可以被用于申请一个易受攻击的块且控制幽灵块的内容。
+### 4.4 喷射
+本节描述了喷射内核堆以获取所需的内存布局的技术。
+为了获取4.2节中介绍的内存布局，必须要进行一些堆喷射。堆喷取决于漏洞块的大小，因为它最终会在不同的分配后端中。
+为了便于喷射可以确保相应的快表是空的。分配超过256个大小合适的块可以确保这一点。
+如果漏洞块小于0x200，那么它将位于LFH后端。然后，喷射将会在完全相同的块中完成，对相应的bucket粒度求模？以确保他们都从同一个bucket中分配。正如2.1节的介绍，当请求分配时，LFH后端将扫描最多以32个block块为一组的BlockBitmap，并随机选择一个空闲块。在分配的漏洞块的前后各分配超过32个合适大小的块应该可以对抗随机化。
+如果漏洞块大于0x200但小于0x10000，最终它将在可变大小后端中。然后喷射将以漏洞块的大小完成。过大的块会被分开，因此堆喷将会失败。首先，分配上千个选中大小的块，以确保清空所有FreeChunkTree中大于选中大小的块，然后分配器将分配一个0x10000字节大小的新的VS子段并放在FreeChunkTree中。然后再分配上千个块，最终都位于一个新的大空闲块，因此是连续的。然后释放最后分配的块的三分之一，以填充FreeChunkTree。仅仅释放三分之一以确保没有块被合并。然后使得漏洞块被分配。最终，释放的块将被重新分配以最大限度的增加喷射机会。
+由于所有的利用技术都需要释放和重新分配漏洞块和幽灵块，因此启动相应的动态快表以简化空闲块的恢复真的非常有趣。为此，一个简单的方案是分配上千个相应大小的块，等两秒，分配另外上千个块并等一秒。因此，我们可以确保平衡管理器重新平衡了相应的快表。分配上千个块以确保快表在最常使用的快表中，因此将被打开并且确保有足够的空间。
+### 4.5 利用
+**演示设置** 为了演示下面的利用，创建了一个虚假的漏洞。
+开发了一个windows驱动，暴露了许多IOCTL，他们可以：
+  * 在PagedPool中分配一个大小可控的块
+  * 在块中触发一个受控的memcpy，实现一个受控的池溢出
+  * 释放分配的块
+当然，这仅仅是为了做一个演示，并且提供了更多漏洞利用所需的控制。
+这些设置允许攻击者可以：
+  * 控制漏洞块的大小，这不是强制的，但是最好可以实现，因为可控的大小会简化漏洞利用。
+  * 控制漏洞块的分配和释放
+  * 使用受控的值覆盖下一个块的POOL_HEADER的前4个字节
+当然，漏洞块分配在PagedPool中。这非常重要，因为池的类型也许会改变在利用中使用的对象，同时对利用程序自身也有很大的影响。此外，针对NonPagedPoolNx的利用是非常相似的，仅使用PipeQueueEntry就可以取代PipeAttribute，实现喷射并得到任意读原语。
+对于这个例子，将选择0x180作为漏洞块的大小。关于漏洞块的大小和漏洞利用中的影响将在4.6节中讨论。
+**创建幽灵块** 这里的第一步是处理堆，以便在漏洞块后放置受控的对象。
+用来覆盖块的对象可以是任意的，唯一需要控制的是什么时候释放。为了简化利用，最好选择一个可以被喷射对象，在4.2节中可以看到。
+现在可以触发漏洞了，被覆盖的POOL_HEADER要被以下值取代：
+  * PreviousSizes：0x15。此大小将乘以0x10。0x180-0x150=0x30，漏洞块中虚假的POOL_HEADER的偏移。
+  * PoolIndex：0，或者是任意值，这个值没有使用
+  * BlockSize：0，或者是任意值，这个值没有使用
+  * PoolType：PoolType|4，设置CacheAligned位
+图16. 触发溢出
+虚假的POOL_HEADER必须放在漏洞块的已知偏移处。这是通过释放漏洞块对象且使用PipeAttribute对象重新分配块实现的。
+为了演示，虚假POOL_HEADER在易受攻击的块偏移0x30位置处。虚假的POOL_HEADER格式如下：
+  * PreviousSize：0，或任意值，这个值没有被使用
+  * PoolIndex：0，或任意值，这个值没有被使用
+  * BlockSize：0x21，这个值将乘以0x10，且是已释放的块的大小
+  * PoolType：PoolType，不要设置CacheAligned和PoolQuota位
+BlockSize的选择不是随机的，它是实际要释放的块的大小。由于目标是在之后重用此分配，因此需要选一个易于重用的大小。由于所有小于0x200的块都在LFH中，因此必须避免这样的大小。不在LFH中的最小大小为0x200，块的大小为0x210。0x210大小使用VS
+分配器，并且有资格使用2.1节中描述的动态快表。
+可以通过喷射和释放0x210字节的块来启用。
+现在可以释放被覆盖的块，并且这将触发缓存对齐。它将在OverwritenChunkAddress-（0x15*0x10）处释放区块，也是VulnerableChunkAddress+0x30处，而不是在被覆盖区块的地址释放区块。用于释放的块POOL_HEADER是虚假POOL_HEADER，内核并没有释放漏洞的块，而是释放了一个0x210大小的块，并且将其放在动态链表的顶部。在图17中进行了展示。
+图17. 释放被覆盖的块
+不幸的是，虚假POOL_HEADER的PoolType对释放的块是放在PagedPool还是NonPagedPoolNx中没有影响。
+动态快表是由分配的段来选择的，该段是从块的地址派生的。它意味着如果漏洞块在Paged Pool中，那么幽灵块将被放在Paged Pool的快表中。
+覆盖的块现在处于丢失状态；内核认为它已经释放了，并且块上的所有引用都已经被删除。它将不会再被使用了。
+**泄露幽灵块的内容**
+幽灵块现在也可以使用PipeAttribute对象重新分配。PipeAttribute结构会覆盖放在漏洞块的属性值。通过读此管道的属性值，就可以导致幽灵块的PipeAttribute属性内容被泄露。现在已知幽灵块和漏洞块的地址。这一步在图18中介绍了。
+图18. 泄露幽灵块的属性
+**得到一个任意读原语**
+可以再次释放漏洞块，并使用其他的PipeAttribute再次分配。这时，PipeAttribute的数据将覆盖幽灵块的PipeAttribute。因此，幽灵块的PipeAttribute属性将被完全控制。一个新的PipeAttribute属性将被注入到位于用户层的列表中。这一步在图19中进行了介绍。
+图19. 复写幽灵块的PipeAttribute
+现在，通过请求读取幽灵块的PipeAttribute属性，内核将使用用户层的PipeAttribute，因此可以实现完全控制。正如之前看到的，通过控制属性值指针和属性值大小，可以提供到一个任意读原语。图20介绍了一个任意读原语。
+图20. 使用注入的 PipeAttribute 进行任意读取
+使用泄露的第一个指针和任意读原语，可以检索npfs的代码节上的指针。通过读取导入表，可以读取ntoskrnl代码节上的指针，它可以提供内核的基址。从那儿开始，攻击者能够读取ExpPoolQuotaCookie值，并检索EXP进程的EPROCESS结构体的地址和TOKEN的地址。
+**得到一个任意递减原语** 首先，使用PipeQueueEntry在内核区精心制作一个虚假的EPROCESS结构，并使用任意读来检索它的地址。
+然后，EXP可以再次释放和重新分配漏洞块，来改变幽灵块的内容和POOL_HEADER。
+幽灵块的POOL_HEADER被下列值覆盖：
+  * PreviousSize：0，或者任意值，这个值没有使用
+  * PoolIndex：0，或者任意值，这个值没有使用
+  * BlockSize：0x21，这个值将乘以0x10
+  * PoolType：8，PoolQuota位被设置
+  * PoolQuota：ExpPoolQuotaCookie 异或FakeEprocessAddress 异或 GhostChunkAddress
+释放幽灵块后，内核将尝试解引用与EPROCESS相关的Quota counter。它将使用虚假EPROCESS结构体来寻找要解引用的指针值。
+这将提供任意递减原语。递减的值是PoolHeader中的BlockSize，所以它在0x0到0xff0以0x10对齐。
+**从任意递减到System权限** 在2012年，Cesar
+Cerrudo[3]描述了一种通过设置TOKEN结构体的Privileges.Enable字段来实现权限提升的技术。
+Privileges.Enable字段保存了这个进程开启的权限。默认情况下，低完整性的Token的Privileges.Enable字段被设置为0x0000000000800000，这个值只会授予SeChangeNotifyPrivilege。将此位的值减去1，它将变成
+0x000000000007fff，这将启用更多的权限。
+在bit字段上设置第20bit，可以启用SeDebugPrivilege。SeDebugPrivilege允许一个进程调试系统上的任意进程。因此有能力注入任意代码到特权进程。
+EXP在[1]介绍了配额进程指针覆盖（Quota Pointer Process
+Overwrite），可以使用任意递减原语来设置其进程的SeDebugPrivilige权限。图21对这个技术进行了介绍。
+图21. EXP利用任意递减原语获得SYSTEM权限
+然而，自windows 10
+v1607开始，内核开始检查Token结构体的Privileges.Present字段的值。Token的Privileges.Present字段可以通过使用AdjustTokenPrivileges
+API开启权限列表。所以，Token的实际权限，现在是由Privileges.Present & Privileges.Enable的位域结果来定的。
+默认情况下，低完整性级别的Token的Privileges.Present被设置为0x602880000。因为0x602880000 & (1<<20)
+==0，在Privileges.Enabled中设置SeDebugPrivilege不足以获取SeDebugPrivilege。
+为了获得Privileges.Present
+bitfield中的SeDebugPrivilege，一个想法是递减Privileges.Present的bitfield。然后，攻击者可以使用AdjustTokenPrivileges
+API来打开SeDebugPrivilege。然而，SepAdjustPrivileges函数额外进行了检查，并且这取决于Token的完整性，一个进程不能启用任意权限，即使需要的权限在Privileges.Present的bitfield中。对于高完整性级别，进程可以启用Privileges.Present位域中的任何权限。对于中完整性级别，一个进程只能开启Privileges.Present特权和0x1120160684位域。对于低完整性级别，一个进程只能开启Privileges.Present特权和0x202800000位域。
+这意味着从单一的任意递减原语获取SYSTEM权限的技术已经凉凉。
+但是，它完全可以用两种任意递减原语来实现，先递减Privileges.Enable，然后递减Privileges.Present。
+幽灵块可以被重新分配，且它的POOL_HEADER可以被再次覆盖，来获得第二个任意递减。
+一旦再次获取到SeDebugPrivilege，EXP即可打开任意SYSTEM权限进程，并注入shellcode实现弹出一个SYSTEM权限的shell。
+### 4.6 讨论当前的EXP
+所提供的漏洞利用代码可在 [2] 处获得，以及易受攻击的驱动程序。 这个漏洞只是一个概念证明，可以随时改进。

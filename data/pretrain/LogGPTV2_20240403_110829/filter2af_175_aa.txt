@@ -1,0 +1,91 @@
+# 前言
+这里是Sulley使用手册的第三部分，从这里开始本系列文章将开始讲述Sulley fuzzer的实际应用。  
+手册链接：
+# A Complete Walkthrough: Trend Micro Server Protect
+为了更好地将这些东西联系在一起。我们将从头到尾完成一个实例的演示。这个例子将涉及许多中级到高级的Sulley概念，应该有助于巩固您对框架的理解。本节的主要目的是演示许多高级Sulley功能的用法，因此跳过了有关target的许多细节，所选目标是Trend
+Micro Server Protect.具体来说是由SpntSvc.exe服务绑定的TCP端口5168上的Microsoft DCE / RPC端点。
+RPC端点从TmRpcSrv.dll以下面的接口定义语言（IDL）stub信息公开：
+    // opcode: 0x00, address: 0x65741030
+    // uuid: 25288888-bd5b-11d1-9d53-0080c83a5c2c
+    // version: 1.0
+    error_status_t rpc_opnum_0 (
+    [in] handle_t arg_1, // not sent on wire
+    [in] long trend_req_num,
+    [in][size_is(arg_4)] byte some_string[],
+    [in] long arg_4,
+    [out][size_is(arg_6)] byte arg_5[], // not sent on wire
+    [in] long arg_6
+    );
+参数'arg_1'和'arg_6'实际上都不是通过wire传输的。 当我们编写实际的fuzz
+request时，这是一个需要考虑的重要情况。进一步检查发现参数'trend_req_num'具有特殊含义。此参数的上半部分和下半部分控制一对跳转表，可通过此单个RPC函数公开许多的可到达子例程。  
+对跳转表进行逆向工程，出了下列组合：
+    When the value for the upper half is 0x0001, 1 through 21 are valid lower half values.
+    When the value for the upper half is 0x0002, 1 through 18 are valid lower half values.
+    When the value for the upper half is 0x0003, 1 through 84 are valid lower half values.
+    When the value for the upper half is 0x0005, 1 through 24 are valid lower half values.
+    When the value for the upper half is 0x000A, 1 through 48 are valid lower half values.
+    When the value for the upper half is 0x001F, 1 through 24 are valid lower half values.
+接下来我们必须创建一个自定义编码器例程，它将负责将已定义的blok封装为有效的DCE / RPC请求。
+我们定义了一个围绕utisl.dcerpc.request（）的基本包装器，它将操作码参数硬编码为零：
+    # dce rpc request encoder used for trend server protect 5168 RPC service.
+    # opnum is always zero.
+    def rpc_request_encoder (data):
+    return utils.dcerpc.request(0, data)
+## Building the Requests
+有了这些信息和我们的编码器，我们就可以开始定义我们的Sulley requests了。 我们创建一个文件'requests \
+trend.py'来包含我们所有与Trend相关的请求和helpers定义并开始编码.我们利用一些Python循环来自动为'trend_req_num'生成每个有效上限值的单独请求：
+    for op, submax in [(0x1, 22), (0x2, 19), (0x3, 85), (0x5, 25), (0xa, 49), (0x1f, 25)]:
+    s_initialize("5168: op-%x" % op)
+    if s_block_start("everything", encoder=rpc_request_encoder):
+    # [in] long trend_req_num,
+    s_group("subs", values=map(chr, range(1, submax)))
+    s_static("\x00") # subs is actually a little endian word
+    s_static(struct.pack("<H", op)) # opcode
+    # [in][size_is(arg_4)] byte some_string[],
+    s_size("some_string")
+    if s_block_start("some_string", group="subs"):
+    s_static("A" * 0x5000, name="arg3")
+    s_block_end()
+    # [in] long arg_4,
+    s_size("some_string")
+    # [in] long arg_6
+    s_static(struct.pack("<L", 0x5000)) # output buffer size
+    s_block_end()
+在每个生成的请求中，初始化新block并传到我们先前定义的自定义编码器。接下来，s_group（）原语用于定义名为“subs”的序列，该序列表示我们之前看到的“trend_req_num”的下半部分值。接下来将上半字值作为静态值添加到请求流中。我们不会fuzz
+'trend_req_num'，因为我们已经逆向了它的有效值，如果我们没有，我们也可以fuzz这些字段。接下来，将'some_string'的NDR大小前缀添加到请求中。我们可以选择在这里使用Sulley
+DCE / RPC NDR
+Lego原语，但由于RPC请求非常简单，我们决定手动表示NDR格式。接下来，将'some_string'值添加到请求中。字符串值封装在一个块中，以便可以测量它的长度。在这个例子中，我们使用”A”字符串的静态大小（大约20k）。通常我们会在这里插入一个s_string（）原语，但由于我们知道Trend会因任何长字符串而崩溃，所以我们通过使用静态值来减少测试集。字符串的长度再次附加到请求以满足'arg_4'的size_is要求。最后，我们为输出缓冲区大小指定任意静态大小并关闭block。
+我们的request现已准备就绪，我们可以继续创建session。
+## Creating the Session
+我们在Sulley根文件夹中为我们的会话创建了一个名为“fuzz_trend_server_protect_5168.py”的新文件。当此文件已经完成其任务，会移至'archived_fuzzies'文件夹。首先，我们从requests库中import
+Sulley和创建的Trend request：
+    from sulley import *
+    from requests import trend
+接下来，我们将定义一个预发送函数，该函数负责在传输任何测试用例之前建立DCE /
+RPC连接。预发送例程接受单个参数，即传输数据的套接字。这是一个简单的编写例程，这要归功于utils.dcerpc.bind（）的可用性，这是一个Sulley实用程序例程：
+    def rpc_bind (sock):
+        bind = utils.dcerpc.bind("25288888-bd5b-11d1-9d53-0080c83a5c2c", "1.0")
+        sock.send(bind)
+        utils.dcerpc.bind_ack(sock.recv(1000))
+现在是时候启动session并定义target了。我们将fuzz一个目标，一个安装在VMWare虚拟机的Trend Server
+Protect，地址为10.0.0.1。我们将遵循框架准则，将序列化的session信息保存到'audits'目录中。最后，我们用定义的target注册一个网络监视器、进程监视器和虚拟机控制代理：
+    sess = sessions.session(session_filename="audits/trend_server_protect_5168.session")
+    target = sessions.target("10.0.0.1", 5168)
+    target.netmon = pedrpc.client("10.0.0.1", 26001)
+    target.procmon = pedrpc.client("10.0.0.1", 26002)
+    target.vmcontrol = pedrpc.client("127.0.0.1", 26003)
+由于存在VMWare控制代理，因此无论何时检测到故障或无法到达target，Sulley都将默认恢复到正常的快照。如果VMWare控制代理程序不可用但进程监视器代理程可用，则Sulley会尝试重新启动target进程以恢复fuzz。
+    target.procmon_options = \
+    {
+    "proc_name" : "SpntSvc.exe",
+    "stop_commands" : ['net stop "trend serverprotect"'],
+    "start_commands" : ['net start "trend serverprotect"'],
+    }
+每当您使用进程监视器代理时，'proc_name'参数都是必需的，它指定调试器应附加到哪个进程名称并查找其中的错误。如果VMWare控制代理和进程监视代理都不可用，那么Sulley别无选择，只能在数据传输失败的情况下提供target恢复时间。
+接下来，我们通过调用VMWare控制代理程序restart_target（）例程来指示target启动。运行后，将target添加到session中，定义预发送例程，并将每个定义的request连接到fuzz根节点。、
+    # start up the target.
+    target.vmcontrol.restart_target()
+    print "virtual machine up and running"
+    sess.add_target(target)
+    sess.pre_send = rpc_bind
+    sess.connect(s_get("5168: op-1"))

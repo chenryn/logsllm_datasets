@@ -1,0 +1,258 @@
+## PostgreSQL 实践 - 实时广告位推荐 1 (任意字段组合、任意维度组合搜索、输出TOP-K)      
+### 作者            
+digoal            
+### 日期             
+2018-04-20        
+### 标签            
+PostgreSQL , gin , 倒排 , rum , gin_fuzzy_search_limit , 随机采样 , 分区索引 , 分段索引 , score分段     
+----                        
+## 背景         
+店铺，广告推荐位，自动计算，高效检索，高效更新。  
+根据：本店、全网用户行为，库存等进行运算，得到每个商品的分值，推荐排行靠前的商品。  
+维度可能很多，例如：北京的男性用户在秋天买袜子的可能性是0.431，这里面就是4个维度。实际场景维度可能有几十个，几百个，甚至几千个。  
+需要支持任意维度，排序，求TOP 100，要求毫秒级延迟，100万QPS。  
+## 设计1  
+1、定义维度  
+```  
+create table tbl_weidu (  
+  wid int primary key,  
+  info json  
+);   
+```  
+2、定义推荐表，只存储排在前100的商品和分值  
+```  
+create table tbl_score (  
+  wid int not null,   -- 维度ID  
+  uid int8 not null,  -- ToB 店铺ID  
+  top10 text[] not null, -- top 10的 item_score  
+  primary key(wid,uid)  
+);   
+```  
+3、定义一个函数，用于合并两个text数组，在有新的商品分值输入时，合并为一个新值(当商品重复时，新值覆盖旧值，最后排序，保留输出TOP N)  
+```  
+create or replace function merge_top10(  
+text[],   -- old value  
+text[],   -- new value  
+ln int    -- 按score排序，保留 top N  
+) returns text[] as $$  
+  select array_agg(v2||'_'||v3 order by v3 desc) from   
+  (  
+    select v2,v3 from   
+    (  
+      select v2,v3,row_number() over(partition by v2 order by v1 desc) as rn from   -- 同一个商品, 使用new values  
+      (  
+        select 1 as v1,split_part(info,'_',1)::text as v2,split_part(info,'_',2)::float4 as v3 from unnest($1) t(info) -- old values  
+        union all  
+        select 2 as v1,split_part(info,'_',1)::text as v2,split_part(info,'_',2)::float4 as v3 from unnest($2) t(info) -- new values  
+      ) t  
+    ) t where rn=1 order by v3 desc limit ln   -- 同一个商品, 使用new values  
+  ) t;  
+$$ language sql strict immutable;  
+```  
+4、定义日志表，用于记录商品在某个维度上的值的变更，后面消费这个LOG表，合并更新最后的tbl_score表  
+```  
+create unlogged table tbl_score_log (  
+  wid int not null,   -- 维度ID  
+  uid int8 not null,  -- ToB 店铺ID  
+  item int8 not null, -- 商品ID  
+  score float4 not null,  -- 打分  
+  crt_time timestamp not null   
+);   
+create index idx_tbl_score_log_1 on tbl_score_log (wid,uid,crt_time);  
+```  
+5、定义消费函数  
+```  
+create or replace function consume_log(  
+  i_loop int,    -- 循环处理多少次，（多少组wid,uid）  
+  i_limit int,   -- 对于同一组wid,uid，单次处理多少行  
+  i_topn int     -- 每个wid,uid 维度，保留TOP N个item (score高的前N个)  
+) returns void as $$  
+declare  
+  v_wid int;  
+  v_uid int8;  
+  v_top1 text[];  
+  i int := 0;  
+begin  
+  LOOP  
+  exit when i >= i_loop;   --  loops  
+  select wid,uid into v_wid,v_uid from tbl_score_log for update skip locked limit 1;  
+  with  
+  a as (  
+    delete from tbl_score_log where ctid= any (array(  
+      select ctid from tbl_score_log where wid=v_wid and uid=v_uid order by crt_time limit i_limit  -- limit batch  
+    )) returning item,score  
+  )  
+  select   
+    array_agg((item||'_'||score)::text order by score desc) into v_top1   
+    from  
+    (select item,score from a order by score desc limit i_topn) t;        -- limit topn  
+  insert into tbl_score   
+  values (v_wid, v_uid, v_top1)  
+  on conflict (wid,uid)  
+  do update set top10 = merge_top10(tbl_score.top10, excluded.top10, i_topn)  
+  where  
+  tbl_score.top10 is distinct from merge_top10(tbl_score.top10, excluded.top10, i_topn);  
+  i := i+1;  
+  END LOOP;  
+end;  
+$$ language plpgsql strict;  
+```  
+6、压测1，生成分值变更日志  
+（1000个维度，1万家店，1亿个商品）  
+```  
+vi test.sql  
+\set wid random(1,1000)  
+\set uid random(1,10000)  
+\set item random(1,100000000)  
+insert into tbl_score_log values (:wid,:uid,:item,random()*100,now());  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 32 -j 32 -T 120  
+tps = 257737.493753 (including connections establishing)  
+tps = 257752.428348 (excluding connections establishing)  
+```  
+写入超过25万行/s.    
+8、消费LOG表，合并结果到分值表  
+```  
+postgres=# select consume_log(10, 10000, 100);  
+ consume_log   
+-------------  
+(1 row)  
+postgres=# \timing  
+Timing is on.  
+postgres=# select * from tbl_score limit 10;  
+ wid | uid  |                top10                  
+-----+------+-------------------------------------  
+ 115 |   69 | {989915_22.2217}  
+ 441 | 3914 | {7521898_39.2669}  
+ 423 | 7048 | {75494665_92.5439}  
+ 789 | 1335 | {57756208_23.4602}  
+ 776 | 8065 | {41134454_46.8727}  
+ 785 | 6248 | {76364646_93.4671,94065193_69.2552}  
+ 567 | 7539 | {97116865_6.93694}  
+ 207 | 6926 | {45163995_14.1626}  
+ 788 | 9025 | {73053901_80.3204}  
+ 334 | 2805 | {80532634_78.1224}  
+(10 rows)  
+Time: 0.300 ms  
+```  
+9、跟踪每一次消费消耗的资源  
+```  
+load 'auto_explain';  
+set auto_explain.log_analyze =on;  
+set auto_explain.log_buffers =on;  
+set auto_explain.log_min_duration =0;  
+set auto_explain.log_nested_statements =on;  
+set auto_explain.log_time=on;  
+set auto_explain.log_verbose =on;  
+set client_min_messages ='log';  
+```  
+```  
+postgres=# select consume_log(1, 10000, 100);  
+LOG:  duration: 0.819 ms  plan:  
+Query Text: select wid,uid                  from tbl_score_log for update skip locked limit 1  
+Limit  (cost=10000000000.00..10000000000.03 rows=1 width=18) (actual time=0.816..0.816 rows=1 loops=1)  
+  Output: wid, uid, ctid  
+  Buffers: shared hit=177  
+  ->  LockRows  (cost=10000000000.00..10000876856.44 rows=30947272 width=18) (actual time=0.815..0.815 rows=1 loops=1)  
+        Output: wid, uid, ctid  
+        Buffers: shared hit=177  
+        ->  Seq Scan on public.tbl_score_log  (cost=10000000000.00..10000567383.72 rows=30947272 width=18) (actual time=0.808..0.808 rows=1 loops=1)  
+              Output: wid, uid, ctid  
+              Buffers: shared hit=176  
+LOG:  duration: 0.104 ms  plan:  
+Query Text: with  
+  a as (  
+    delete from tbl_score_log where ctid= any (array(  
+      select ctid from tbl_score_log where wid=v_wid and uid=v_uid order by crt_time limit i_limit  -- limit batch  
+    )) returning item,score  
+  )  
+  select   
+    array_agg((item||'_'||score)::text order by score desc)                  from  
+    (select item,score from a order by score desc limit i_topn) t  
+Aggregate  (cost=13.56..13.57 rows=1 width=32) (actual time=0.100..0.100 rows=1 loops=1)  
+  Output: array_agg((((a.item)::text || '_'::text) || (a.score)::text) ORDER BY a.score DESC)  
+  Buffers: shared hit=20  
+  CTE a  
+    ->  Delete on public.tbl_score_log tbl_score_log_1  (cost=2.06..13.16 rows=10 width=6) (actual time=0.059..0.063 rows=4 loops=1)  
+          Output: tbl_score_log_1.item, tbl_score_log_1.score  
+          Buffers: shared hit=20  
+          InitPlan 1 (returns $0)  
+            ->  Limit  (cost=0.56..2.05 rows=1 width=14) (actual time=0.017..0.043 rows=4 loops=1)  
+                  Output: tbl_score_log.ctid, tbl_score_log.crt_time  
+                  Buffers: shared hit=8  
+                  ->  Index Scan using idx_tbl_score_log_1 on public.tbl_score_log  (cost=0.56..5.02 rows=3 width=14) (actual time=0.017..0.041 rows=4 loops=1)  
+                        Output: tbl_score_log.ctid, tbl_score_log.crt_time  
+                        Index Cond: ((tbl_score_log.wid = $5) AND (tbl_score_log.uid = $6))  
+                        Buffers: shared hit=8  
+          ->  Tid Scan on public.tbl_score_log tbl_score_log_1  (cost=0.01..11.11 rows=10 width=6) (actual time=0.053..0.055 rows=4 loops=1)  
+                Output: tbl_score_log_1.ctid  
+                TID Cond: (tbl_score_log_1.ctid = ANY ($0))  
+                Buffers: shared hit=12  
+  ->  Limit  (cost=0.37..0.37 rows=1 width=12) (actual time=0.077..0.079 rows=4 loops=1)  
+        Output: a.item, a.score  
+        Buffers: shared hit=20  
+        ->  Sort  (cost=0.37..0.39 rows=10 width=12) (actual time=0.076..0.077 rows=4 loops=1)  
+              Output: a.item, a.score  
+              Sort Key: a.score DESC  
+              Sort Method: quicksort  Memory: 25kB  
+              Buffers: shared hit=20  
+              ->  CTE Scan on a  (cost=0.00..0.20 rows=10 width=12) (actual time=0.060..0.066 rows=4 loops=1)  
+                    Output: a.item, a.score  
+                    Buffers: shared hit=20  
+LOG:  duration: 0.046 ms  plan:  
+Query Text: insert into tbl_score   
+  values (v_wid, v_uid, v_top1)  
+  on conflict (wid,uid)  
+  do update set top10 = merge_top10(tbl_score.top10, excluded.top10, i_topn)  
+  where  
+  tbl_score.top10 is distinct from merge_top10(tbl_score.top10, excluded.top10, i_topn)  
+Insert on public.tbl_score  (cost=0.00..0.01 rows=1 width=44) (actual time=0.045..0.045 rows=0 loops=1)  
+  Conflict Resolution: UPDATE  
+  Conflict Arbiter Indexes: tbl_score_pkey  
+  Conflict Filter: (tbl_score.top10 IS DISTINCT FROM merge_top10(tbl_score.top10, excluded.top10, $3))  
+  Tuples Inserted: 1  
+  Conflicting Tuples: 0  
+  Buffers: shared hit=7  
+  ->  Result  (cost=0.00..0.01 rows=1 width=44) (actual time=0.000..0.001 rows=1 loops=1)  
+        Output: $5, $6, $7  
+LOG:  duration: 1.951 ms  plan:  
+Query Text: select consume_log(1, 10000, 100);  
+Result  (cost=0.00..0.26 rows=1 width=4) (actual time=1.944..1.944 rows=1 loops=1)  
+  Output: consume_log(1, 10000, 100)  
+  Buffers: shared hit=212  
+ consume_log   
+-------------  
+(1 row)  
+Time: 2.390 ms  
+```  
+消耗1万个指标，约1.5秒。  
+10、压测2，查询某个维度，某个店铺的广告位推荐  
+```  
+vi test1.sql  
+\set wid random(1,1000)  
+\set uid random(1,10000)  
+select * from tbl_score where wid=:wid and uid=:uid;  
+pgbench -M prepared -n -r -P 1 -f ./test1.sql -c 32 -j 32 -T 120  
+tps = 470514.018510 (including connections establishing)  
+tps = 470542.672975 (excluding connections establishing)  
+```  
+查询速度可以达到 45万 qps.   
+## 设计2  
+设计1的一个可以优化的点，在写入tbl_score_log时，如果不同维度的数据夹杂在一起输入，在消费时会引入IO放大的问题：  
+[《PostgreSQL 时序最佳实践 - 证券交易系统数据库设计 - 阿里云RDS PostgreSQL最佳实践》](../201704/20170417_01.md)    
+我们可以使用以上同样的方法来对维度数据分区存放，消费时也按分区消费。  
+1、创建维度描述表  
+```  
+create table tbl_weidu (  
+  wid int primary key,  
+  info json   
+);   
+```  
+2、创建TOP-K分值表  
+```  
+create table tbl_score (  
+  wid int not null,   -- 维度ID  
+  uid int8 not null,  -- ToB 店铺ID  
+  top10 text[] not null, -- top 10的item_score  
+  primary key(wid,uid)  
+);   
+```  

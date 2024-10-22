@@ -1,0 +1,126 @@
+  c=pid()  
+  d=pp()  
+  e=tid()  
+  if (f_start[a,c,e,b]) {  
+    f_stop[a,d]  update tbl set info=now() where id=1;  
+UPDATE 1  
+Time: 1.129 ms  
+```
+开启stap后  
+```
+digoal=> update tbl set info=now() where id=1;  
+UPDATE 1  
+Time: 167.001 ms  
+```
+可以缩小function("*@/opt/soft_bak/postgresql-9.4.1/src/*")的范围，再跟踪。  
+例如我们首先怀疑是锁的问题，那么可以缩小范围到function("*@/opt/soft_bak/postgresql-9.4.1/src/backend/storage/lmgr/*")  
+```
+# stap -v 11111 -x 3167 -e '  
+global f_start[999999],f_stop[999999]  
+probe process("/opt/pgsql/bin/postgres").function("*@/opt/soft_bak/postgresql-9.4.1/src/backend/storage/lmgr/*").call {   
+  f_start[execname(), pid(), tid(), cpu()] = gettimeofday_ns()  
+}  
+probe process("/opt/pgsql/bin/postgres").function("*@/opt/soft_bak/postgresql-9.4.1/src/backend/storage/lmgr/*").return {   
+  t=gettimeofday_ns()  
+  a=execname()  
+  b=cpu()  
+  c=pid()  
+  d=pp()  
+  e=tid()  
+  if (f_start[a,c,e,b]) {  
+    f_stop[a,d]  0)  
+        {  
+......  
+```
+StrategySyncStart是指根据LRU算法，让checkpointer从nextVictimBuffer开始sync。  
+```
+/*  
+ * StrategySyncStart -- tell BufferSync where to start syncing  
+ *  
+ * The result is the buffer index of the best buffer to sync first.  
+ * BufferSync() will proceed circularly around the buffer array from there.  
+ *  
+ * In addition, we return the completed-pass count (which is effectively  
+ * the higher-order bits of nextVictimBuffer) and the count of recent buffer  
+ * allocs if non-NULL pointers are passed.  The alloc count is reset after  
+ * being read.  
+ */  
+int  
+StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc)  
+{  
+        int                     result;  
+        LWLockAcquire(BufFreelistLock, LW_EXCLUSIVE);  
+        result = StrategyControl->nextVictimBuffer;  
+        if (complete_passes)  
+                *complete_passes = StrategyControl->completePasses;  
+        if (num_buf_alloc)  
+        {  
+                *num_buf_alloc = StrategyControl->numBufferAllocs;  
+                StrategyControl->numBufferAllocs = 0;  
+        }  
+        LWLockRelease(BufFreelistLock);  
+        return result;  
+}  
+```
+但是对于我们的测试用例来说，实际上几乎所有的dirty buffer都是热的。从哪里开始都一样。  
+所以，性能下降与这个并无关联：  
+1\. sync buffer时，可能有短暂的锁冲突，但是，从我们前面LWLock和再前面的跟踪结果来看影响极小，几乎可以忽略。  
+2\. 检查点会将脏块同步到磁盘，然后脏块会变成非脏块，但是它依旧还在shared buffer中，所以紧接着的操作也不需要物理读（md read）。  
+```
+$ pgbench -M prepared -n -r -f ./test.sql -P 1 -c 26 -j 26 -T 10000000  
+progress: 1.0 s, 13550.0 tps, lat 1.891 ms stddev 3.474  
+progress: 2.0 s, 15505.7 tps, lat 1.655 ms stddev 3.549  
+progress: 3.0 s, 18030.0 tps, lat 1.443 ms stddev 3.210  
+progress: 4.0 s, 20844.0 tps, lat 1.258 ms stddev 2.867  
+progress: 5.0 s, 25317.6 tps, lat 1.025 ms stddev 2.127  
+progress: 6.0 s, 31146.7 tps, lat 0.833 ms stddev 1.702  
+progress: 7.0 s, 40137.8 tps, lat 0.646 ms stddev 0.975  
+progress: 8.0 s, 51564.9 tps, lat 0.502 ms stddev 0.368  
+progress: 9.0 s, 53915.6 tps, lat 0.480 ms stddev 0.311  
+progress: 10.0 s, 56830.9 tps, lat 0.456 ms stddev 0.281  
+progress: 11.0 s, 57333.8 tps, lat 0.452 ms stddev 0.283  
+progress: 12.0 s, 58938.8 tps, lat 0.439 ms stddev 0.270  
+progress: 13.0 s, 59608.3 tps, lat 0.434 ms stddev 0.265  
+progress: 14.0 s, 59014.8 tps, lat 0.439 ms stddev 0.281  
+progress: 15.0 s, 60241.9 tps, lat 0.430 ms stddev 0.259  
+progress: 16.0 s, 61337.1 tps, lat 0.422 ms stddev 0.248  
+progress: 17.0 s, 60821.9 tps, lat 0.426 ms stddev 0.259  
+progress: 18.0 s, 60850.2 tps, lat 0.425 ms stddev 0.265  
+```
+我们可以来跟踪一下物理读和物理写，你就可以看到，检查点发生后，其实并没有物理读。  
+探针如下  
+```
+smgr-md-read-start	(ForkNumber, BlockNumber, Oid, Oid, Oid, int)	
+Probe that fires when beginning to read a block from a relation. 
+arg0 and arg1 contain the fork and block numbers of the page. arg2, arg3, and arg4 contain the tablespace, database, and relation OIDs identifying the relation. 
+arg5 is the ID of the backend which created the temporary relation for a local buffer, or InvalidBackendId (-1) for a shared buffer.  
+smgr-md-read-done	(ForkNumber, BlockNumber, Oid, Oid, Oid, int, int, int)	
+Probe that fires when a block read is complete. 
+arg0 and arg1 contain the fork and block numbers of the page. arg2, arg3, and arg4 contain the tablespace, database, and relation OIDs identifying the relation. 
+arg5 is the ID of the backend which created the temporary relation for a local buffer, or InvalidBackendId (-1) for a shared buffer. 
+arg6 is the number of bytes actually read, while arg7 is the number requested (if these are different it indicates trouble).  
+```
+src 如下      
+```
+/*  
+ * ReadBuffer_common -- common logic for all ReadBuffer variants  
+ *  
+ * *hit is set to true if the request was satisfied from shared buffer cache.  
+ */  
+static Buffer  
+ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,  
+                                  BlockNumber blockNum, ReadBufferMode mode,  
+                                  BufferAccessStrategy strategy, bool *hit)  
+{  
+......  
+        probe buffer__read__start(ForkNumber, BlockNumber, Oid, Oid, Oid, int, bool);  
+        probe buffer__read__done(ForkNumber, BlockNumber, Oid, Oid, Oid, int, bool, bool);  
+```
+跟踪读写：  
+```
+# stap -DMAXSKIPPED=100000 -v 11111 -e '  
+global s_var, e_var, stat_var;  
+/* probe smgr__md__read__start(ForkNumber, BlockNumber, Oid, Oid, Oid, int); */  
+probe process("/opt/pgsql/bin/postgres").mark("smgr__md__read__start") {  
+  s_var[pid(),1] = gettimeofday_us()  
+}  

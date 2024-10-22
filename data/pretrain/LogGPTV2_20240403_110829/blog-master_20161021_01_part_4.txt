@@ -1,0 +1,221 @@
+      with tmp as (select * from t_user_tags t where dic=true and appid=v_appid and id>=min_id order by id limit v_rows for update), 
+           tmp0 as (select * from ( select *, row_number() over (partition by appid,userid,tag order by id desc) as rn from tmp ) as ss where ss.rn=1),  -- 同一个appid,userid用窗口取最后一条状态
+           tmp1 as (delete from t_user_tags t where exists (select 1 from tmp where tmp.id=t.id)) 
+           select t1.tag, array_remove(array_agg(case when not t1.ins then t2.rowid else null end), null) code_del, array_remove(array_agg(case when t1.ins then t2.rowid else null end), null) code_add 
+	     from tmp3 t1 join t_userid_dic t2 on (t1.type=t2.type and t1.code=t2.code and t2.appid=v_appid) group by t1.tag_name   
+	   -- select tag, array_agg(case when not ins then userid else null end) userid_del, array_agg(case when ins then userid else null end) userid_add from tmp group by tag
+    loop
+      -- execute format('select coalesce(array_agg(rowid), array[]::int[]) from t_userid_dic where appid=%L and userid = any (%L)', v_appid, array_remove(i_userid_del, null) ) into i_rowid_del;
+      -- execute format('select coalesce(array_agg(rowid), array[]::int[]) from t_userid_dic where appid=%L and userid = any (%L)', v_appid, array_remove(i_userid_add, null) ) into i_rowid_add;
+      -- 判断TAG是否存在, 存在则更新，否则插入
+      perform 1 from t_tags where appid=v_appid and tag=i_tag;
+      if found then
+        update t_tags set userids = set_bit_array( set_bit_array(userids, 0, 0, i_rowid_del), 1, 0, i_rowid_add )::text::varbit where appid=v_appid and tag=i_tag;
+      else
+        insert into t_tags(appid, tag, userids) values (v_appid, i_tag, set_bit_array( set_bit_array('0'::varbit, 0, 0, i_rowid_del), 1, 0, i_rowid_add )::text::varbit);
+      end if;
+    end loop;
+  end if;
+end;
+$$ language plpgsql;
+-- 不要使用strict
+```
+速度测试  
+```
+$ vi test.sql
+\set tag random(1,10000)
+select merge_tags(1,:tag,10000);
+$ pgbench -M prepared -n -r -P 1 -f ./test.sql -c 128 -j 128 -T 100
+每秒约合并15万记录。  
+```
+验证方法，merge的结果数据与被merge的数据一致即可。  
+符合要求    
+```
+truncate t_tags;
+select update_dict(100000);
+create table check_merge1 as select tag,count(*) cnt from (select tag,userid from t_user_tags where dic=true order by id limit 10000) t group by tag;
+select merge_tags(1,null,10000);
+。。。。。。
+select merge_tags(1,null,10000);
+create table check_merge2 as select tag, count_bit(userids,1) cnt from t_tags; 
+postgres=# select t1.*,t2.* from check_merge1 t1 full outer join check_merge2 t2 on (t1.tag=t2.tag and t1.cnt=t2.cnt) where t1.* is null or t2.* is null;
+ tag | cnt | tag | cnt 
+-----+-----+-----+-----
+(0 rows)
+Time: 5.133 ms
+如果有结果说明合并有问题。  
+```
+#### 查询单个用户有哪些TAG
+找到userid对应的rowid, 根据userids rowid位置的bit，判断是否有该tag.  
+```
+select tag from (select tag, get_bit(t1.userids, t2.rowid-1) bt from t_tags t1, (select rowid from t_userid_dic where userid=?) t2) t where bt=1;
+例子，注意对齐（或者改造get_bit函数，支持没有BIT位的操作）
+postgres=# \set FETCH_COUNT 1
+postgres=# select tag from (select tag, get_bit(t1.userids, t2.rowid-1) bt from t_tags t1, (select rowid from t_userid_dic where userid=100000) t2) t where bt=1;
+  tag   
+--------
+ 226813
+ 226824
+ 226818
+ 226810
+ 226782
+ 226790
+ 226792
+ 226787
+ 226803
+ 226826
+(10 rows)
+Time: 152.636 ms
+```
+查询单个用户有哪些TAG是一个比较重的操作，如果碰到有很多TAG并且用户数非常庞大时，建议使用并行。  
+```
+并行相关参数配置  
+postgres=# show parallel_tuple_cost;
+ parallel_tuple_cost 
+---------------------
+ 0
+postgres=# show parallel_setup_cost ;
+ parallel_setup_cost 
+---------------------
+ 0
+postgres=# show max_parallel_workers_per_gather ;
+ max_parallel_workers_per_gather 
+---------------------------------
+ 27
+postgres=# show max_worker_processes ;
+ max_worker_processes 
+----------------------
+ 128
+postgres=# show force_parallel_mode ;
+ force_parallel_mode 
+---------------------
+ on
+postgres=# alter table t_tags set (parallel_workers=27);
+ALTER TABLE
+返回用户数组，并行化之后，每个tag处理约耗时0.76毫秒。   
+如果用游标返回，可以快速得到第一个用户。   
+postgres=# explain (analyze,verbose,costs,buffers,timing) select array_agg(tag) from t_tags where get_bit(userids,10000)=1;
+                                                              QUERY PLAN                                                              
+---------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1047.68..1047.69 rows=1 width=32) (actual time=7176.745..7176.745 rows=1 loops=1)
+   Output: array_agg(tag)
+   Buffers: shared hit=15912565
+   ->  Gather  (cost=0.00..1047.55 rows=50 width=4) (actual time=8.940..7175.486 rows=4957 loops=1)
+         Output: tag
+         Workers Planned: 27
+         Workers Launched: 27
+         Buffers: shared hit=15912565
+         ->  Parallel Seq Scan on public.t_tags  (cost=0.00..1047.55 rows=2 width=4) (actual time=51.974..6023.333 rows=177 loops=28)
+               Output: tag
+               Filter: (get_bit((t_tags.userids)::"bit", 10000) = 1)
+               Rows Removed by Filter: 180
+               Buffers: shared hit=15909973
+               Worker 0: actual time=24.376..5791.799 rows=158 loops=1
+                 Buffers: shared hit=528366
+               Worker 1: actual time=23.143..6749.264 rows=198 loops=1
+                 Buffers: shared hit=632954
+               Worker 2: actual time=55.201..6400.872 rows=186 loops=1
+                 Buffers: shared hit=604388
+               Worker 3: actual time=23.456..5351.070 rows=152 loops=1
+                 Buffers: shared hit=482151
+               Worker 4: actual time=71.248..6179.161 rows=181 loops=1
+                 Buffers: shared hit=580237
+               Worker 5: actual time=124.402..5395.424 rows=140 loops=1
+                 Buffers: shared hit=493010
+               Worker 6: actual time=111.926..6013.077 rows=168 loops=1
+                 Buffers: shared hit=553851
+               Worker 7: actual time=24.483..7170.148 rows=202 loops=1
+                 Buffers: shared hit=677578
+               Worker 8: actual time=23.284..5448.081 rows=139 loops=1
+                 Buffers: shared hit=487985
+               Worker 9: actual time=54.677..7057.927 rows=233 loops=1
+                 Buffers: shared hit=666715
+               Worker 10: actual time=73.070..6615.151 rows=177 loops=1
+                 Buffers: shared hit=622393
+               Worker 11: actual time=25.978..5977.110 rows=182 loops=1
+                 Buffers: shared hit=552329
+               Worker 12: actual time=22.975..5366.569 rows=150 loops=1
+                 Buffers: shared hit=480447
+               Worker 13: actual time=76.756..6940.743 rows=201 loops=1
+                 Buffers: shared hit=655799
+               Worker 14: actual time=54.590..5362.862 rows=161 loops=1
+                 Buffers: shared hit=482488
+               Worker 15: actual time=106.099..5454.446 rows=153 loops=1
+                 Buffers: shared hit=494638
+               Worker 16: actual time=53.649..6048.233 rows=165 loops=1
+                 Buffers: shared hit=553771
+               Worker 17: actual time=23.089..5810.984 rows=160 loops=1
+                 Buffers: shared hit=532711
+               Worker 18: actual time=55.039..5981.338 rows=165 loops=1
+                 Buffers: shared hit=542380
+               Worker 19: actual time=24.163..6187.498 rows=182 loops=1
+                 Buffers: shared hit=571046
+               Worker 20: actual time=23.965..6119.395 rows=194 loops=1
+                 Buffers: shared hit=566214
+               Worker 21: actual time=106.038..6238.629 rows=187 loops=1
+                 Buffers: shared hit=582724
+               Worker 22: actual time=54.568..6488.311 rows=183 loops=1
+                 Buffers: shared hit=613989
+               Worker 23: actual time=24.021..5368.295 rows=152 loops=1
+                 Buffers: shared hit=488385
+               Worker 24: actual time=53.327..5658.396 rows=178 loops=1
+                 Buffers: shared hit=515591
+               Worker 25: actual time=23.201..5358.615 rows=142 loops=1
+                 Buffers: shared hit=483975
+               Worker 26: actual time=109.940..5560.662 rows=163 loops=1
+                 Buffers: shared hit=505844
+ Planning time: 0.081 ms
+ Execution time: 7637.509 ms
+(69 rows)
+Time: 7638.100 ms
+postgres=# select tag from t_tags where get_bit(userids,10000)=1;
+  tag   
+--------
+ 226813
+ 226824
+Cancel request sent
+ERROR:  canceling statement due to user request
+Time: 17.521 ms
+profile，get_bit的瓶颈在memcpy，这个可以通过优化PG内核改进。  
+             3647.00 34.2% memcpy                        /lib64/libc-2.12.so      
+```
+### 分片
+大APPID，按USER号段切分  
+APPID+号段分片  
+如果一个APPID 1万个TAG，1亿用户，只占用120GB。  
+通常是出现倾斜时才需要重分布。  
+PostgreSQL使用postgres_fdw可以原生支持数据分片。  
+参考我之前写的文档  
+[《PostgreSQL 9.6 单元化,sharding (based on postgres_fdw) - 内核层支持前传》](20161004_01.md)   
+[《PostgreSQL 9.6 sharding + 单元化 (based on postgres_fdw) 最佳实践 - 通用水平分库场景设计与实践》](20161005_01.md)    
+同一个APPID的一批TAG必须在一个节点
+## 字典翻译 - 从bit位置得到字典中的VALUE.
+假设字典为imei+id(id为无缝自增ID)，  如何从bit位置得到对应的imei呢.
+```
+create table imei_dict(
+  id int primary key,
+  imei text
+);
+```
+```
+select imei from imei_dict where id = any (bit_posite(....));
+你也可以用游标慢慢返回，提高瞬间响应速度。
+```
+这个SQL很快，走索引扫描，1亿记录中in 100万，只需要380毫秒。
+[《HTAP数据库 PostgreSQL 场景与性能测试之 25 - (OLTP) IN , EXISTS 查询》](../201711/20171107_26.md)
+至于字典怎么生成？可以参考这里：
+[《PostgreSQL 无缝自增ID的实现 - by advisory lock》](../201610/20161020_02.md)
+## 扩展阅读
+机器学习，生成TAG，本文不涉及。  
+参考 MADlib、R  ，聚类分析 PostgreSQL都可以非常好的支持。  
+使用varbitx+阅后即焚, 实现高效增量计算。     
+[《HTAP数据库 PostgreSQL 场景与性能测试之 27 - (OLTP) 物联网 - FEED日志, 流式处理 与 阅后即焚 (CTE)》](../201711/20171107_28.md)  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

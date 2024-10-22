@@ -1,0 +1,247 @@
+# 造轮子寻找UAF漏洞
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前言
+  1. 轮子的核心是使用[Frida](https://www.frida.re/docs/javascript-api/)来实现的。
+  2. 菜鸡的心得，大神骂的时候温柔点，谢谢^_^
+>
+> 由于本人没有做过漏洞挖掘(目前苦逼码农)，也没有研究过漏洞原理，就只是听说过大概有两种内存漏洞，一种栈的，一种堆的。这整个文章都是基于我自己的理解，所以很有可能想法理论都是错的，希望大家能指正。
+UAF(Use After Free)字面意思就是释放内存后再使用这块释放的内存。
+根据自己的理解，写了一个demo如下：
+    #include 
+    #include 
+    void uaf_printf() {
+        char *buff = (char *)malloc(1024);
+        free(buff);
+        strcpy(buff, "use printf after free memoryn");
+        printf("%sn", buff);
+    }
+    int main(int argc, char *argv[]) {
+        uaf_printf();
+        return 0;
+    }
+由于自己也不确定这到底是不是UAF漏洞，然后经过一些复杂的途径，询问大佬，得知这就是一个UAF(暗暗自喜，随手一写就是一个漏洞)。
+## 分析
+从上面的demo可以看出来，UAF这个漏洞实际上就是释放内存之后再重新使用这块内存。所以我的大致思路就是记录下所有malloc分配的内存的地址，然后记录free的时候传递的地址是多少，然后标记内存的分配释放情况，如果某块内存分配了，直到结束都没有被释放，那么就可能导致内存泄漏；如果某块内存分配了然后释放了，这个时候这个分配的内存再被使用就存在UAF了。
+## 开始造轮子
+>
+> 开始我以为我是第一个想出这种方法的，本来想着自己留着说不定能挖到一个CVE。后面才听大佬说，有很多成熟的堆漏洞检测工具。而我这个轮子不仅效率低，准确率还不如别人的。所以说这是一次失败的造轮子的经历。
+既然有了上一步分析的结果，那我们就根据这个结果来造轮子，我们需要实现以下功能：
+  1. 记录malloc分配的内存的位置，分配内存的大小以及当时堆栈情况
+  2. 记录free传入的地址，当时的堆栈情况
+  3. 记录一些常见可以读写内存的函数使用情况(下面代码只实现了`strcpy`和`printf`)
+程序大致流程为，js脚本执行hook操作，然后把信息传递给python脚本，python把接受的数据存到内存中，有`malloc`分配内存的时候，就记录分配内存的地址；有`free`释放内存的时候，就遍历之前存放的`malloc`分配的内存，将其标记为释放；有使用`printf`和`strcpy`这一类函数读写内存的时候，就去看那块内存是否被标记为已经释放，已经释放了的时候使用就是UAF。但是需要注意一些坑：
+  1. 一块内存`malloc`分配了之后使用`free`释放，下一次使用`malloc`分配内存的时候还是分配到这个地址，所以一个地址可能分配不止一次。我们可以记录分配的次数和释放的次数。如果释放的次数减去分配的次数等于零，那么就是已经释放了，如果大于零，那么就是一块内存被释放了多次，如果小于零，那么就是没有被释放。
+  2. `printf`函数内部有使用`malloc`分配内存，但是在改函数里面`free`的时候传递的值是`0`,所以脚本会误报很多使用`printf`的地方分配内存未释放。
+具体怎么做的就看代码了，下面贴出专研好几个小时的代码：
+js脚本
+    var malloc = Module.findExportByName(null, "malloc");
+    var calloc = Module.findExportByName(null, "calloc");
+    var free = Module.findExportByName(null, "free");
+    var strcpy = Module.findExportByName(null, "strcpy");
+    var memcpy = Module.findExportByName(null, "memcpy");
+    var read = Module.findExportByName(null, "read");
+    var strncpy = Module.findExportByName(null, "strncpy");
+    var sprintf = Module.findExportByName(null, "sprintf");
+    var snprintf = Module.findExportByName(null, "snprintf");
+    var printf = Module.findExportByName(null, "printf");
+    var _strlen = Module.findExportByName(null, "strlen");
+    var strlen = new NativeFunction(_strlen, 'ulong', ['pointer']);
+    var module_count = 0;
+    var start_trace = false;
+    const EXEC_NAME = "EXEC_NAME";
+    function init() {
+        Process.enumerateModules({
+            onMatch: function (module) {
+                var data = {}
+                data.type = "module";
+                data.name = module.name;
+                data.base = module.base;
+                data.path = module.path;
+                data.size = module.size;
+                send(JSON.stringify(data))
+            },
+            onComplete: function () {
+            }
+        });
+    }
+    function onStart() {
+        start_trace = true;
+    }
+    function onEnd() {
+        start_trace = false;
+        var enddata = {};
+        enddata.type = "end";
+        send(JSON.stringify(enddata));
+    }
+    function addressExists(addr) {
+        for(var item in result) {
+            if(result[item][ADDRESS] == addr) {
+                return true;
+            }
+        }
+        return false;
+    }
+    function __trace_memory_use() {
+        if(malloc != undefined) {
+            Interceptor.attach(malloc, {
+                onEnter: function (args) {
+                    if(start_trace) {
+                        size = "0x" + args[0].toString(16);
+                        stack = Thread.backtrace(this.context, Backtracer.ACCURATE);
+                    }
+                },
+                onLeave: function (retval) {
+                    if(start_trace) {
+                        ret = "" + retval;
+                        var data = {};
+                        data.type = "alloc";
+                        data.method = "malloc";
+                        data.address = ret;
+                        data.size = size;
+                        data.stack = stack;
+                        send(JSON.stringify(data));
+                    }
+                }
+            });
+        }
+        if(calloc != undefined) {
+        }
+        if(free != undefined) {
+            Interceptor.attach(free, {
+                onEnter: function (args) {
+                    if(start_trace) {
+                        var data = {};
+                        data.type = "free";
+                        data.address = "" + args[0];
+                        send(JSON.stringify(data));
+                    }
+                },
+                onLeave: function (retval) {
+                }
+            });
+        }
+        if(strcpy != undefined) {
+            Interceptor.attach(strcpy, {
+                onEnter: function (args) {
+                    if(start_trace) {
+                        var data = {};
+                        data.type = "use";
+                        data.address = "" + args[0];
+                        data.method = "strcpy";
+                        data.sourcelen = strlen(args[1]);
+                        data.source = Memory.readUtf8String(args[1]);
+                        data.stack = Thread.backtrace(this.context, Backtracer.ACCURATE);
+                        send(JSON.stringify(data));
+                    }
+                },
+                onLeave: function (retval) {
+                }
+            });
+        }
+        if(printf != undefined) {
+            Interceptor.attach(printf, {
+                onEnter: function (args) {
+                    if(start_trace) {
+                        var format = Memory.readUtf8String(args[0]);
+                        var nformat = format.split('%').length - 1;
+                        var data = {};
+                        data.type = "printf";
+                        data.method = "printf";
+                        data.format = format;
+                        data.nformat = nformat;
+                        var forarg = [];
+                        for(var i = 0; i < nformat; i++) {
+                            forarg[i] = args[i + 1];
+                        }
+                        data.forarg = forarg;
+                        data.stack = Thread.backtrace(this.context, Backtracer.ACCURATE);
+                        send(JSON.stringify(data));
+                    }
+                },
+                onLeave: function (retval) {
+                }
+            });
+        }
+    }
+    function trace() {
+        var main = Module.findExportByName(EXEC_NAME, "main");
+        if(main != undefined) {
+            Interceptor.attach(main, {
+                onEnter: function (args) {
+                    onStart();
+                },
+                onLeave: function (retval) {
+                    onEnd();
+                }
+            });
+        }
+    }
+    init();
+    __trace_memory_use();
+    trace();
+python脚本
+    #!/usr/bin/env python
+    # -*- coding: utf-8 -*-    
+    import frida
+    import json
+    import os
+    # 下面这一段是从 https://github.com/TheCjw/Frida-Android-Scripts/blob/master/loader.py#L19 抄的
+    import colorlog
+    from colorlog import ColoredFormatter
+    handler = colorlog.StreamHandler()
+    formatter = ColoredFormatter(
+        "%(log_color)s[%(asctime)s] [%(levelname)s]%(reset)s %(message)s",
+        datefmt="%H:%M:%S",
+        reset=True,
+        log_colors={
+            "DEBUG": "cyan",
+            "INFO": "green",
+            "WARNING": "yellow",
+            "ERROR": "red",
+            "CRITICAL": "red,bg_white",
+        }
+    )
+    handler.setFormatter(formatter)
+    logger = colorlog.getLogger("loader")
+    logger.addHandler(handler)
+    logger.level = 10  # DEBUG
+    # 抄完了
+    class dofrida(object):
+        def __init__(self, _exepath, _exename, _mode):
+            self.loads = json.loads
+            self.log = logger
+            self.modules = []
+            self.result = []
+            self.uafresult = []
+            self.exepath = _exepath
+            self.exename = _exename
+            self.exe = os.path.join(self.exepath, self.exename)
+            if _mode == "start":
+                device = frida.get_local_device()
+                pid = device.spawn([self.exe])
+                session = frida.attach(pid);
+                fd = open("./tool.js")
+                src = fd.read()
+                fd.close()
+                src = src.replace('const EXEC_NAME = "EXEC_NAME";', ('const EXEC_NAME = "%s";' %self.exename))
+                script = session.create_script(src)
+                if script :
+                    script.on("message", self.on_message)
+                    script.load()
+                device.resume(pid)
+            elif _mode == "attach":
+                device = frida.get_local_device()
+                pid = -1
+                for p in device.enumerate_processes():
+                    if p.name == self.exename:
+                        pid = p.pid
+                if pid != -1 :
+                    session = frida.attach(pid)
+                    fd = open("./tool.js")
+                    src = fd.read()
+                    fd.close()
+                    src = src.replace('const EXEC_NAME = "EXEC_NAME";', ('const EXEC_NAME = "%s";' %self.exename))
+                    src = src.replace('var start_trace = false;', 'var start_trace = true;')
+                    session.on('detached', self.on_end)

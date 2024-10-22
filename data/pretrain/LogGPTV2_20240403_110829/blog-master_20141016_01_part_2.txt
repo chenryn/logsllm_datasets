@@ -1,0 +1,143 @@
+   ON c.x_key = x.key  
+WHERE c.key = ANY (VALUES (15368196), -- 11,000 other keys --)  
+  AND c.x_key = 1  
+  AND c.tags @> ARRAY[E'blah'];  
+```  
+Can you spot the difference? ARRAY has been changed to VALUES.  
+The query optimizer is fooled by the use of ARRAY[...] to list all the primary keys to look up. VALUES (...), (...) lets the optimizer make full use of the primary key index instead. It is literally a one-line change, which makes no semantic difference.  
+Here is the plan of the new query. The 2 major differences are on lines 3 and 14.  
+```  
+Nested Loop  (cost=168.22..2116.29 rows=148 width=362) (actual time=22.134..256.531 rows=10858 loops=1)  
+  Buffers: shared hit=44967  
+  ->  Index Scan using x_pkey on x  (cost=0.00..8.27 rows=1 width=37) (actual time=0.071..0.073 rows=1 loops=1)  
+        Index Cond: (id = 1)  
+        Buffers: shared hit=4  
+  ->  Nested Loop  (cost=168.22..2106.54 rows=148 width=329) (actual time=22.060..242.406 rows=10858 loops=1)  
+        Buffers: shared hit=44963  
+        ->  HashAggregate  (cost=168.22..170.22 rows=200 width=4) (actual time=21.529..32.820 rows=11215 loops=1)  
+              ->  Values Scan on "*VALUES*"  (cost=0.00..140.19 rows=11215 width=4) (actual time=0.005..9.527 rows=11215 loops=1)  
+        ->  Index Scan using context_pkey on context c  (cost=0.00..9.67 rows=1 width=329) (actual time=0.015..0.016 rows=1 loops=11215)  
+              Index Cond: (c.key = "*VALUES*".column1)  
+              Filter: ((c.tags @> '{blah}'::text[]) AND (c.x_id = 1))  
+              Buffers: shared hit=44963  
+Total runtime: 263.639 ms  
+```  
+From 22,000ms to 200ms. That’s a 100x speedup for a simple one-line change.  
+以下为PG 14的测试, 实际上高版本做了很多query rewrite优化, 以后需要改写SQL来实现优化的场景会越来越少.    
+```  
+create unlogged table t1 (id int primary key, info text, crt_time timestamp);  
+create unlogged table t2 (id int primary key, ids int[]);  
+insert into t1 select generate_series(0,1000000), md5(random()::text), clock_timestamp();  
+create or replace function gen_rands_arr (int,int) returns int[] as $$  
+  select array(select (random()*$1)::int from generate_series(1,$2));  
+$$ language sql strict;  
+insert into t2 select i, gen_rands_arr (1000000, 10000) from generate_series(1,100) i;  
+postgres=# select gen_rands_arr(1000000,10);  
+                             gen_rands_arr                                
+------------------------------------------------------------------------  
+ {630532,37943,859776,954808,667104,872734,345623,794281,481436,225114}  
+(1 row)  
+select * from t1 where id = any (array(select ids from t2 where id=1));   
+select * from t1 where id in (select unnest(ids) from t2 where id=1);   
+select * from t1 where id in (...);   
+select * from t1 where id = any (values (),(),...);   
+select * from t1 where id in (values (),(),...);   
+load 'auto_explain';  
+set auto_explain.log_analyze =on;  
+set auto_explain.log_nested_statements =on;  
+set auto_explain.log_timing =on;  
+set auto_explain.log_min_duration=0;  
+set client_min_messages =log;  
+do language plpgsql $$  
+declare  
+  v_ids text;  
+begin  
+  select rtrim(ltrim(ids::text, '{'),'}') into v_ids from t2 where id=1;  
+  execute format('select * from t1 where id in (%s)', v_ids);  
+end;  
+$$;  
+LOG:  duration: 23.104 ms  plan:   
+Query Text: select * from t1 where id in ( ... )  
+Index Scan using t1_pkey on t1  (cost=0.42..7538.60 rows=10000 width=45) (actual rows=9958 loops=1)  
+  Index Cond: (id = ANY ('{...}'::integer[]))  
+DO  
+do language plpgsql $$  
+declare  
+  v_ids text;  
+begin  
+  select string_agg('('||unnest||')',',') into v_ids from (select unnest(ids) from t2 where id=1) t;  
+  execute format('select * from t1 where id = any (values %s)', v_ids);  
+end;  
+$$;  
+set work_mem='256kB';  --  = any (values (),()...) 和work_mem有很大关系, 可能用hashagg也可能用sort   
+LOG:  duration: 32.177 ms  plan:  
+Query Text: select * from t1 where id = any (values (),...)    
+Nested Loop  (cost=10000000871.81..10000015430.85 rows=10000 width=45) (actual rows=9958 loops=1)  
+  ->  Unique  (cost=871.39..921.39 rows=10000 width=4) (actual rows=9958 loops=1)  
+        ->  Sort  (cost=871.39..896.39 rows=10000 width=4) (actual rows=10000 loops=1)  
+              Sort Key: "*VALUES*".column1  
+              Sort Method: external merge  Disk: 160kB  
+              ->  Values Scan on "*VALUES*"  (cost=0.00..125.00 rows=10000 width=4) (actual rows=10000 loops=1)  
+  ->  Index Scan using t1_pkey on t1  (cost=0.42..1.46 rows=1 width=45) (actual rows=1 loops=9958)  
+        Index Cond: (id = "*VALUES*".column1)  
+DO  
+set work_mem='4MB';  --  = any (values (),()...) 和work_mem有很大关系, 可能用hashagg也可能用sort   
+LOG:  duration: 39.728 ms  plan:  
+Query Text: select * from t1 where id = any (values (),...)  
+Nested Loop  (cost=10000000150.42..10000014759.46 rows=10000 width=45) (actual rows=9958 loops=1)  
+  ->  HashAggregate  (cost=150.00..250.00 rows=10000 width=4) (actual rows=9958 loops=1)  
+        Group Key: "*VALUES*".column1  
+        Batches: 1  Memory Usage: 913kB  
+        ->  Values Scan on "*VALUES*"  (cost=0.00..125.00 rows=10000 width=4) (actual rows=10000 loops=1)  
+  ->  Index Scan using t1_pkey on t1  (cost=0.42..1.46 rows=1 width=45) (actual rows=1 loops=9958)  
+        Index Cond: (id = "*VALUES*".column1)  
+DO  
+LOG:  duration: 32.334 ms  plan:  
+Query Text: select * from t1 where id in (values (),...)   
+Nested Loop  (cost=10000000871.81..10000015430.85 rows=10000 width=45) (actual rows=9958 loops=1)  
+  ->  Unique  (cost=871.39..921.39 rows=10000 width=4) (actual rows=9958 loops=1)  
+        ->  Sort  (cost=871.39..896.39 rows=10000 width=4) (actual rows=10000 loops=1)  
+              Sort Key: "*VALUES*".column1  
+              Sort Method: external merge  Disk: 160kB  
+              ->  Values Scan on "*VALUES*"  (cost=0.00..125.00 rows=10000 width=4) (actual rows=10000 loops=1)  
+  ->  Index Scan using t1_pkey on t1  (cost=0.42..1.46 rows=1 width=45) (actual rows=1 loops=9958)  
+        Index Cond: (id = "*VALUES*".column1)  
+DO  
+```  
+[参考]  
+1\. src/backend/parser/parse_relation.c  
+```  
+                case RTE_VALUES:  
+                        {  
+                                /* Values RTE --- get type info from first sublist */  
+                                /* collation is stored separately, though */  
+                                List       *collist = (List *) linitial(rte->values_lists);  
+                                Node       *col;  
+                                if (attnum  list_length(collist))  
+                                        elog(ERROR, "values list %s does not have attribute %d",  
+                                                 rte->eref->aliasname, attnum);  
+                                col = (Node *) list_nth(collist, attnum - 1);  
+                                *vartype = exprType(col);  
+                                *vartypmod = exprTypmod(col);  
+                                *varcollid = list_nth_oid(rte->values_collations, attnum - 1);  
+                        }  
+```  
+2\. https://www.datadoghq.com/2013/08/100x-faster-postgres-performance-by-changing-1-line/  
+3\.   
+```  
+ * 4. ScalarArrayOpExpr ("indexkey op ANY (array-expression)").  If the index  
+ * has rd_am->amsearcharray, we handle these the same as simple operators,  
+ * setting the SK_SEARCHARRAY flag to tell the AM to handle them.  Otherwise,  
+ * we create a ScanKey with everything filled in except the comparison value,  
+ * and set up an IndexArrayKeyInfo struct to drive processing of the qual.  
+ * (Note that if we use an IndexArrayKeyInfo struct, the array expression is  
+ * always treated as requiring runtime evaluation, even if it's a constant.)  
+```  
+#### [期望 PostgreSQL 增加什么功能?](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+#### [PolarDB for PostgreSQL云原生分布式开源数据库](https://github.com/ApsaraDB/PolarDB-for-PostgreSQL "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

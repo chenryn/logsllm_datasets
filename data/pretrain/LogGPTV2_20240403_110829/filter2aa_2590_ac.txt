@@ -1,0 +1,303 @@
+7.1
+Background
+The TIOCSTI ioctl command simulates input to a terminal and allows the caller
+to inject a specified character into the terminal’s input stream. This allows mal-
+ware to write characters into a victim’s terminal window(s), essentially “faking”
+input typed by the user. This capability has led to a number of vulnerabilities
+and malware opportunities, such as hijacking su/sudo sessions to run commands
+as root [25]. The wide ranging threat posed by this IOCTL command led to
+OpenBSD making it a NOOP [26] and many attempts to lock it down on Linux
+and within sandboxes.
+20
+7.2
+Internals
+Internally, the handler for this IOCTL simply calls the same code path as if a user
+had actually typed the given character directly from a keyboard or ssh session.
+The tiocsti function in the Linux kernel implements this and the comment
+defining the function states: “Fake input to a tty device”. Figure 21 shows our
+POC written in Python that performs keylogging by abusing TIOCSTI.
+Figure 20: TIOCSTI abuse for keylogging
+Our POC must first open a handle to the desired terminal device, such as
+“/dev/pts/0”, hosting an SSH session or physical keyboard. Next, it continually
+reads from the device, and for each set of characters read, it immediately sends
+them back to the input stream with TIOCSTI. This is required as the read
+performed by our keylogger removes the bytes from the same input queue as
+used by the victim’s terminal. To ensure that characters are reflected back to the
+terminal and that the user does see any suspicious behavior when our keylogger
+is active, all characters are immediately reinserted back into the queue this way.
+tcdrain is then used to ensure that all characters are written. Our POC then
+writes the captured characters to the screen.
+Given that the fake character is inserted in exactly the same manner as a
+real keypress on the keyboard, there is no specific marker in the kernel to tell us
+that this occurred or is still occurring. Due to this lack of artifacts, we chose to
+base our detection of this abuse on the open file handle, as discussed next.
+7.3
+Volatility Support
+To detect keyloggers abusing TIOCSTI, we developed the linux tiocsti plugin.
+The plugin operates by detecting when a process has a file descriptor (handle)
+open to a terminal device that is not its own. As shown in the POC, a handle to
+the particular terminal of interest must be opened to read data from it as well as
+re-insert stolen characters. A naive approach the plugin could have taken would
+be to compare the terminal device of a process’ stdin/stdout/stderr to that of its
+other descriptors, but malicious processes often close these upon startup or dup()
+them to network sockets. This would lead to our plugin missing the malicious
+process.
+21
+To ensure that our plugin can detect the full range of TIOCSTI abuse, we
+instead compare the terminal device associated with the process’ signal structure
+to that of its open file handles. This gives us a direct map between the original
+terminal where a process was spawned compared to the one it is targeting.
+Figure 21 shows the output of linux tiocsti against a memory sample with our
+TIOCSTI-based keylogger active.
+Figure 21: Detecting Device Input Monitoring Processes
+As shown, the Python process running the keylogger (PID 7997) was spawned
+on /dev/pts/0 but its 3rd file descriptor is open to /dev/pts/1, which was the
+terminal of our victim ssh session. We also show the output of linux psaux as
+that lists the name of the script and not just the Python interpreter. With
+this new plugin, investigators can automatically discover the abuse of TIOCSTI
+within Linux memory samples.
+8
+macOS - CGEventCreate
+The most popular method for keylogging on macOS systems is through creating
+Event Taps [27].
+8.1
+Background
+macOS Event Taps allow an application to receive a callback notification whenever
+a monitored hardware device is used, such as a keystroke on a keyboard or a
+mouse click. Given the power these have on the system, they are commonly
+abused by malware for keylogging and other malicious purposes. ReiKey from
+Objective See is a free tool to detect when event taps are registered on a live
+system and is highly recommend for use on production macOS systems given
+how frequently this API is abused by malware [28].
+22
+Event taps are registered through the CGEventTapCreate API [29]. The
+API requires several arguments, but the most important are the callback lo-
+cation, which specifies the callback to activated when events of interest fire,
+and eventsOfInterest, which specifies which events the particular callback is
+interested. These include a number of methods to monitor the keyboard, mouse,
+and touchpad.
+8.2
+Internals
+The mechanism for tracking device events and monitors is much different in
+macOS than Linux and Windows. This is because the macOS the kernel, xnu,
+was originally designed as a microkernel, which puts many of the core subsystems
+that would be in the kernel on Windows/Linux into userland processes on macOS.
+It also means that the kernel performs a significant amount of time passing
+data back and forth between processes (interprocess communication, IPC) since
+processes cannot directly read/write to each other. The kernel also enforces
+security boundaries at this layer to ensure processes have the correct privileges
+to perform requested operations. While analyzing modern versions of macOS,
+we determined that the subsystem that controls event taps is the SkyLight
+Framework.
+A process that wishes to register event taps must load SkyLight into its
+address space before it can call CGEventTapCreate and related functions. This
+call first leads to SLEventTapCreate being called. The CG of CGEventTapCreate
+stands for Core Graphics as this was the predecessor framework to SkyLight and
+the original function name is kept for backwards compatibility. In our testing,
+we discovered that nearly all CG* functions have a counterpart SL* functions
+inside of SkyLight and the CG functions are now just wrappers.
+SLEventTapCreate leads to event tap create being executed, which performs
+the real work of creating the tap. To our knowledge, there is no online docu-
+mentation that explains how taps work internally, so we set out to understand
+this implementation. After sanity checking arguments, event tap create registers
+a Mach port with eventTapMessageHandler as the callback [30].
+Figure 22 shows this registration as well as the eventual call to CGSPlaceTap.
+23
+Figure 22: event tap create registering a Mach port and task
+As the figure illustrates, the callback location and other parameters to
+CGEventTapCreate are stored within a context variable. This is then passed
+to CFMachPortCreate to associate the event tap with a Mach port that can be
+referenced across processes. This Mach port plus the other tap information is
+then passed to CGSPlaceTap to actually install the event tap. Figure 23 shows
+the relevant portion of this function, in particular that it essentially exists to
+format its received parameters in the form that mach msg expects and then
+sending this data to mach msg.
+24
+Figure 23: CGSPlaceTap calling mach msg
+mach msg is a system call used to pass data between Mach ports. To continue
+investigating the internals of event taps, we needed to find the other end of this
+IPC call. Our previous knowledge of macOS combined with online searches for
+confirmation, which brought us to resources such as [31], led us to believe that
+the WindowServer application would be the final destination of these calls.
+We then examined this binary in IDA and realized that it is a thin wrapper
+to daemonize many of the capabilities of SkyLight. We then reexamined the
+list of functions contained in the SkyLight library and saw that many of the
+CG* and SL* functions had counterparts that started with X followed by the
+original function name. Further work in IDA confirmed that these are the server
+side components that handle the IPC messages from calling applications.
+Figure 24 shows a portion of XPlaceTap, which is the server side component
+of CGSPlaceTap used inside of the WindowServer process.
+25
+Figure 24:
+XPlaceTap creating a new event tap structure
+In this figure, a new data structure, of type CGXEventTap is being allocated
+to store the information passed from the previous mach msg call. Note that
+we renamed the data structure to new CGXEventTap so that it was easier to
+follow the IDA decompiler output. After the data structure is populated, it can
+be seen on the last line of the figure that the sCGXEventTapMasterList global
+variable is being set to the address of the new tap. Finding this function and
+understanding its code resulted in two benefits. First, we used this to determine
+the offsets of data structure members that our plugin would need to retrieve
+inside of CGXEventTap. Thankfully, the offsets of the members of interest did
+not change across the macOS versions we tested. The second benefit to this
+function was the discovery of the sCGXEventTapMasterList global variable, as
+we realized it was likely the data structure inside of the WindowServer process
+that stored all event taps for all processes.
+We then used IDA’s cross-referencing capabilities to see where else this
+variable was used. This led us to XGetEventTapList, which is the server side
+handler for CGGetEventTapList [32]. This was very encouraging as we knew this
+API is what allows tools, such as ReiKey, to enumerate event tap handlers on a
+system. Analysis of this function confirmed to us that the global variable is used
+26
+to track all event taps, and that it stores pointers to all handlers contiguously in
+memory. With this binary analysis effort complete, we were then able to devise
+an algorithm for a Volatility plugin that could recover all event taps registered
+on a system.
+8.3
+Volatility Support
+Before our research, Volatility had no method to enumerate event taps for macOS
+memory samples. After researching the internals of SkyLight, we developed the
+mac event taps plugin to provide this capability to memory forensic analysts.
+The plugin begins by finding the WindowServer process. It then locates the
+sCGXEventTapMasterList global variable and processes each pointer that it
+references. Each of these pointers leads to a CGXEventTap structure, and as
+mentioned previosuly, our binary analysis effort led us to discover the relevant
+offsets inside of this data structure.
+For our POC, we used the very well written keylogger project by Casey
+Scarborough [33]. This project uses CGEventTapCreate to monitor Key Down
+events on the keyboard. Figure 25 shows the portion of the keylogger that creates
+the event tap and then attaches it to the process’ run loop.
+Figure 25: Keylogger registering for Key Down events
+Figure 26 shows the output of our new plugin against a memory sample with
+this keylogger active.
+27
+Figure 26: mac event taps Detecting the Keylogger
+As shown, through analysis of SkyLight and sCGXEventTapMasterList, our
+plugin automatically discovers the keylogger’s tap and its registered events of
+interest. With this new plugin, investigators can automatically discover all event
+tapping malware present in macOS memory samples.
+9
+Conclusions
+In this paper, we have presented a significant memory analysis research effort
+that led to the creation of algorithms and Volatility plugins capable of detecting
+the most widely abused userland device monitoring techniques across the three
+most widely used operating systems. As widely documented in technical reports,
+such malware techniques have been used across the world to target journalists
+and opposition political figures as well as in espionage campaigns aimed at nation
+states and corporations. Our research effort also included updating existing
+memory forensics algorithms to support the latest Windows versions, as well as
+development of completely new detection techniques for each of the three operat-
+ing systems. Once included in the mainline Volatility Framework, investigators
+across the field will be able to automatically discover device monitoring malware
+across Windows, Linux, and macOS systems.
+References
+[1] CISA, “Mitigate Microsoft Exchange Server Vulnerabilities,” https://www.
+cisa.gov/uscert/ncas/alerts/aa21-062a, 2021.
+[2] ——, “EMERGENCY DIRECTIVE 21-01- MITIGATE SOLARWINDS
+ORION CODE COMPROMISE,” https://www.cisa.gov/emergency-directi
+ve-21-01, 2021.
+[3] Volexity, “Surge Collect Pro,” https://www.volexity.com/products-overvie
+w/surge/, 2022.
+[4] Elixir, “Elixir,” https://elixir.bootlin.com/], 2022.
+[5] Apple, “Apple Open Source,” [https://opensource.apple.com], 2022.
+[6] Volatility, “MoVP 3.1 Detecting Malware Hooks in the Windows GUI
+Subsystem,” https://volatility-labs.blogspot.com/2012/09/movp-31-detec
+ting-malware-hooks-in.html, 2012.
+28
+[7] M. H. Ligh, A. Case, J. Levy, and A. Walters, The Art of Memory Forensics:
+Detecting Malware and Threats in Windows, Linux, and Mac Memory. New
+York: Wiley, 2014.
+[8] T. M. Corporation, “Turla,” https://attack.mitre.org/groups/G0010/, 2018.
+[9] Microsoft,
+“LowLevelKeyboardProc
+callback
+function,”
+https:
+//docs.microsoft.com/en-us/previous-versions/windows/desktop/le
+gacy/ms644985(v=vs.85), 2022.
+[10] Geok Meng Ong, Chong Rong Hwa, “Pacific Ring of Fire:
+PlugX /
+Kaba,” https://www.fireeye.com/blog/threat-research/2014/07/pacific-rin
+g-of-fire-plugx-kaba.html, 2014.
+[11] H.
+K.
+Chan,
+“VB2014
+paper:
+Swipe
+away,
+we’re
+watching
+you,” https://www.virusbulletin.com/virusbulletin/2015/04/paper-swipe
+-away-we-re-watching-you, 2015.
+[12] Hod Gavriel,
+“HawkEye Malware Changes Keylogging Technique,”
+https://www.cyberbit.com/blog/endpoint-security/hawkeye-malware-key
+logging-technique/, 2019.
+[13] D. Web, “Study of the APT attacks on state institutions in Kazakhstan
+and Kyrgyzstan,” https://st.drweb.com/static/new-www/news/2020/july
+/Study of the APT attacks on state institutions in Kazakhstan and Kyr
+gyzstan en.pdf, 2020.
+[14] PTI TEAM, “OpBlueRaven: Unveiling Fin7/Carbanak - Part I : Tirion,”
+https://threatintel.blog/OPBlueRaven-Part1/, 2020.
+[15] Profero, “Apt27 turns to ransomware,” https://shared-public-reports.s3-e
+u-west-1.amazonaws.com/APT27+turns+to+ransomware.pdf, 2020.
+[16] Mike G. P.Mee, “Minimal Key Logger Using RAWINPUT,” https://www.co
+deproject.com/Articles/297312/Minimal-Key-Logger-using-RAWINPUT,
+2012.
+[17] Eye
+of
+Ra,
+“Windows
+Keylogger
+Part
+2:
+Defense
+against
+user-
+land,” https://eyeofrablog.wordpress.com/2017/06/27/windows-keylogger
+-part-2-defense-against-user-land/, 2017.
+[18] debojit, “Spying on ssh password using strace,” https://medium.com/@de
+boj88/spaying-on-ssh-password-using-strace-7465ede0a5cc, 2018.
+[19] RedHat, “4.15. DISABLING PTRACE(),” https://access.redhat.com/docu
+mentation/en-us/red hat enterprise linux/7/html/selinux users and adm
+inistrators guide/sect-security-enhanced linux-working with selinux-disab
+le ptrace, 2022.
+29
+[20] CISA, “LIMITING PTRACE ON PRODUCTION LINUX SYSTEMS,”
+https://media.defense.gov/2019/Jul/16/2002158062/-1/-1/0/CSI-LIMIT
+ING-PTRACE-ON-PRODUCTION-LINUX-SYSTEMS.PDF, 2022.
+[21] Linux, “The Linux Input Documentation,” https://www.kernel.org/doc/h
+tml/v4.14/input/index.html, 2022.
+[22] ——, “Linux Input Subsystem userspace API,” https://www.kernel.org/d
+oc/html/latest/input/input uapi.html, 2022.
+[23] kernc, “logkeys,” https://github.com/kernc/logkeys, 2022.
+[24] QNX, “TIOCSTI,” https://www.qnx.com/developers/docs/7.0.0/#com.q
+nx.doc.neutrino.devctl/topic/tioc/tiocsti.html, 2022.
+[25] Simon Ruderich, “su/sudo from root to another user allows TTY hijacking
+and arbitrary code execution,” https://ruderich.org/simon/notes/su-sudo-f
+rom-root-tty-hijacking, 2021.
+[26] brynet, “On the Insecurity of TIOCSTI,” https://undeadly.org/cgi?actio
+n=article;sid=20170701132619, 2017.
+[27] Apple, “Quartz Event Services,” https://developer.apple.com/documentat
+ion/coregraphics/quartz event services, 2022.
+[28] Patrick Wardle, “ReiKey,” https://objective-see.com/products/reikey.html,
+2022.
+[29] Apple, “CGEventTapCreate,” https://developer.apple.com/documentation/
+coregraphics/1454426-cgeventtapcreate, 2022.
+[30] ——, “CFMachPortCreate,” https://developer.apple.com/documentation/
+corefoundation/1400934-cfmachportcreate, 2022.
+[31] hoakley,
+“WindowServer:
+display
+compositor
+and
+input
+event
+router,” https://eclecticlight.co/2020/06/08/windowserver-display-compo
+sitor-and-input-event-router/, 2022.
+[32] Apple, “CGGetEventTapList,” https://developer.apple.com/documentatio
+n/coregraphics/1455395-cggeteventtaplist, 2022.
+[33] Casey Scarborough, “macOS Keylogger,” https://github.com/caseyscarbo
+rough/keylogger, 2022.
+30

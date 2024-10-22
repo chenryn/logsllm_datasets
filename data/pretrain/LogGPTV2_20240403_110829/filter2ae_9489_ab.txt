@@ -1,0 +1,263 @@
+内核维护以下几个关于规则的链表：
+    struct list_head audit_filter_list[AUDIT_NR_FILTERS]；
+    static struct list_head audit_rules_list[AUDIT_NR_FILTERS]；
+audit_filter_list数组保存的都是链表头，它们对应于不同过滤类型的链表，如之前所述的task、exit、user、exclude等审计入口用到的规则，在审计规则时用到。
+audit_rules_list数组链表保存的是全部规则节点，仅在auditd -l获取所有规则列表时使用。
+struct list_head audit_inode_hash[AUDIT_INODE_BUCKETS];
+现在的aduit子系统不仅可以对系统调用号进行审计，还可以对文件进行监控，[2]处的操作就是解析auditctl
+-w指定要监控的文件路径。audit_inode_hash为一个针对inode过滤的哈希表，前面讲过struct
+filed结构体可以对inode进行审计，同时audit_add_watch也会对文件转化为inode, 插入到audit_inode_hash哈希链表中。
+这些数据结构之间的关系图为：
+![
+](https://images.seebug.org/content/images/2021/05/d9647187-0882-4db4-85c6-305595dca84f.png-w331s)
+#### 2.3 内核审计入口
+Audit子系统的审计入口最初来自于系统调用的入口，后面在支持了对文件监控的功能后，审计入口还被加入到了文件系统某些接口里。同时在进程创建的时候也会对其进行审计。所以在linux的man手册中，auditctl有如下入口列表：
+Task - 进程创建时进行审计  
+Exit - 系统调用结束时进行审计  
+User - 来自用户态自定义的内核日志  
+Exclude - 在日志记录前进行审计
+##### 2.3.1 系统调用入口
+以x86架构为例：
+    arch/x86/entry/common.c:
+    entry_SYSCALL_64()->do_syscall_64()
+    __visible void do_syscall_64(unsigned long nr, struct pt_regs *regs)
+    {
+            if (READ_ONCE(ti->flags) & _TIF_WORK_SYSCALL_ENTRY)
+                    nr = syscall_trace_enter(regs);[1]
+                    regs->ax = sys_call_table[nr](regs);[2]
+    syscall_return_slowpath(regs);[3]
+    }
+在[1]出判断当前线程标志_TIF_WORK_SYSCALL_ENTRY是否被置位，如果是则调用
+syscall_trace_enter进行系统调用审计前的准备。它则调用do_audit_syscall_entry()以及
+__audit_syscall_entry进一步初始化：
+    kernel/auditsc.c：
+    void __audit_syscall_entry(int major, unsigned long a1, unsigned long a2,
+                               unsigned long a3, unsigned long a4)
+    {
+            context->argv[0]    = a1;
+            context->argv[1]    = a2;
+            context->argv[2]    = a3;
+            context->argv[3]    = a4;
+    }
+注意每个进程的audit
+context结构是在进程fork时创建的，在这个路径里，只保存系统调用的前4个参数的内容。这个操作比较让笔者费解，为什么只记录前四个参数内容，按照X86的调用约定并且在系统调用处理程序开始时前六个参数无论是否存在，都已经保存在内核栈里了。如果参数是指针的话，那么保存的就是指针的值，在后面的日志输出时会打印出来，这里保存的是用户态的指针，不会泄露内核指针，所以不会有安全风险。
+我们看到[1]处函数的作用只是保存了系统调用参数和设置context的一些值，
+规则判断和将日志发送到日志队列里是在[2]处的系统调用完成之后的[3]处处理的。这里充分表达了audit子系统的任务是只做审计之用，不做拦截的操作，拦截的事情可以交给secomp去做，所以audit子系统不能代替secomp做沙箱功能。但是secomp有个弊端，使用的bpf规则不能动态更改，而audit却可以使用netlink协议实时更新，后续在我的AKSP内核自保护项目中会对audit进行改进，使其具备沙箱的能力。
+[3] 处的syscall_slow_exit_work调用audit_syscall_exit做真正的过滤处理操作：
+    void __audit_syscall_exit(int success, long return_code)
+    {
+                    audit_filter_syscall(current, context,
+                                         &audit_filter_list[AUDIT_FILTER_EXIT]);
+                    audit_filter_inodes(current, context);
+    }
+可以看到audit_filter_syscall取的是audit_filter_list数组里AUDIT_FILTER_EXIT为索引的链表。
+    static enum audit_state audit_filter_syscall(struct task_struct *tsk,
+                                                 struct audit_context *ctx,
+                                                 struct list_head *list)
+    {
+            struct audit_entry *e;
+            enum audit_state state;
+            if (auditd_test_task(tsk))
+                    return AUDIT_DISABLED;
+            rcu_read_lock();
+            list_for_each_entry_rcu(e, list, list) {
+                    if (audit_in_mask(&e->rule, ctx->major) &&
+                        audit_filter_rules(tsk, &e->rule, ctx, NULL,
+                                           &state, false)) {
+                            rcu_read_unlock();
+                            ctx->current_state = state;
+                            return state;
+                    }
+            }
+            rcu_read_unlock();
+            return AUDIT_BUILD_CONTEXT;
+    }
+auditd_test_task识别当前进程是否为auditd进程，linux
+audit子系统对auditd进程不做审计的。开始遍历每个audit_entry节点，audit_in_mask判断当前系统调用号是否为需要匹配的系统调用号，命中规则后，在继续调用audit_filter_rules做更进一步的规则匹配：
+    static int audit_filter_rules(struct task_struct *tsk,
+                                  struct audit_krule *rule,
+                                  struct audit_context *ctx,
+                                  struct audit_names *name,
+                                  enum audit_state *state,
+                                  bool task_creation)
+    {
+            for (i = 0; i field_count; i++) {
+                    case AUDIT_UID:
+                            result = audit_uid_comparator(cred->uid, f->op, f->uid);
+                    case AUDIT_INODE:
+                            if (name)
+                                    result = audit_comparator(name->ino, f->op, f->val);
+                            else if (ctx) {
+                                    list_for_each_entry(n, &ctx->names_list, list) {
+                                            if (audit_comparator(n->ino, f->op, f->val)) {
+                                                    ++result;
+                                                    break;
+                                            }
+                                    }
+                            }
+                    case AUDIT_WATCH:
+                            if (name) {
+                                    result = audit_watch_compare(rule->watch,
+                                                                 name->ino,
+                                                                 name->dev);
+    }
+循环遍历rule的每个filed结构体，对其进行比较操作，比如对文件监控时，调用 audit_watch_compare进行比对：
+    int audit_watch_compare(struct audit_watch *watch, unsigned long ino, dev_t dev)
+    {
+            return (watch->ino != AUDIT_INO_UNSET) &&
+                    (watch->ino == ino) &&
+                    (watch->dev == dev);
+    }
+注意对于inode的监控，audit子系统可以通过auditctl -F
+单独对用户指定的一个inode节点做监控，也可以使用audit_filter_inodes做监控。
+    void audit_filter_inodes(struct task_struct *tsk, struct audit_context *ctx)
+    {
+    struct audit_names *n;
+            list_for_each_entry(n, &ctx->names_list, list) {
+                    if (audit_filter_inode_name(tsk, n, ctx))
+                            break;
+            }
+    }
+循环遍历一个struct audit_names类型的结构体链表。
+    struct audit_names {
+            struct list_head        list;           /* audit_context->names_list */
+            struct filename         *name;
+            int                     name_len;       /* number of chars to log */
+            bool                    hidden;         /* don't log this record */
+            unsigned long           ino;
+            dev_t                   dev;
+            umode_t                 mode;
+            kuid_t                  uid;
+            kgid_t                  gid;
+            dev_t                   rdev;
+            u32                     osid;
+            struct audit_cap_data   fcap;
+            unsigned int            fcap_ver;
+            unsigned char           type;           /* record type */
+            /*
+             * This was an allocated audit_names and not from the array of
+             * names allocated in the task audit context.  Thus this name
+             * should be freed on syscall exit.
+             */
+            bool                    should_free;
+    };
+这个结构体的创建不是来自用户态，而是通过预埋的文件系统接口动态生成的。文件系统里很多对inode的操作会调用audit_inode和audit_inode_child来进行审计。
+    void __audit_inode(struct filename *name, const struct dentry *dentry,
+                       unsigned int flags)
+    {
+            list_for_each_entry_rcu(e, list, list) {[1]
+                    for (i = 0; i rule.field_count; i++) {
+                            struct audit_field *f = &e->rule.fields[i];
+                            if (f->type == AUDIT_FSTYPE
+                                && audit_comparator(inode->i_sb->s_magic,
+                                                    f->op, f->val)
+                                && e->rule.action == AUDIT_NEVER) {
+                                    rcu_read_unlock();
+                                    return;
+                            }
+                    }
+            }
+            n = audit_alloc_name(context, AUDIT_TYPE_UNKNOWN);[2]
+    }
+    static struct audit_names *audit_alloc_name(struct audit_context *context,
+                                                    unsigned char type)
+    {
+            list_add_tail(&aname->list, &context->names_list);
+    }
+首先在[1]处遍历匹配现有的规则， 对于新生成的inode节点通过[2]分配 Struct
+audit_name结构并挂接到context->names_list链表中， 这就是前面看到对inode审计的数据来源。
+##### 2.3.2 进程建立入口
+在fork进程时，copy_process()->audit_alloc调用audit_filter_task进行一次规则过滤操作：
+    kernel/auditsc.c：
+    static enum audit_state audit_filter_task(struct task_struct *tsk, char **key)
+    {
+            list_for_each_entry_rcu(e, &audit_filter_list[AUDIT_FILTER_TASK], list) {
+                    if (audit_filter_rules(tsk, &e->rule, NULL, NULL,
+                                           &state, true)) {
+                            if (state == AUDIT_RECORD_CONTEXT)
+                                    *key = kstrdup(e->rule.filterkey, GFP_ATOMIC);
+                            rcu_read_unlock();
+                            return state;
+                    }
+            }
+    }
+可以看到内核正是从audit_filter_list数组选取的AUDIT_FILTER_TASK为索引的链表做过滤。
+##### 2.3.3 文件系统入口
+在前面讲inode规则过滤时，讲到audit子系统在文件系统很多接口中预埋了audit
+hook接口，这些包括audit_inode和audit_inode_child。因为对于文件的监控，audit子系统目前不支持系统调用参数的解析，所以只能通过文件系统接口形式进行状态获取。
+##### 2.3.4 用户自定义入口
+Audit子系统允许从用户态传递一个字符串，输出在内核日志中：
+    [root@localhost linux-5.6.7]# auditctl -m "wzt"
+    You have mail in /var/spool/mail/root
+    [root@localhost linux-5.6.7]# grep 'wzt' /var/log/audit/audit.log
+    type=USER msg=audit(1608786569.953:85791): pid=67638 uid=0 auid=0 ses=291 subj=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023 msg='wzt exe="/usr/sbin/auditctl" hostname=? addr=? terminal=pts/17 res=success'
+笔者认为这个功能没有多大用处，
+反而会带来一些潜在的安全问题，恶意软件进程可以杀死auditd进程，重新与netlink进行连接，这样可以向内核日志写入垃圾数据。
+### 3 缺陷
+#### 3.1 设计缺陷
+通过对audit子系统的全面分析，笔者发现了它的一些设计缺陷。
+##### 3.1.1 系统调用参数过滤不完整
+只能记录系统调用的前四个参数内容，且只能为整型，不支持指针或结构体及其之间的嵌套定义。
+不支持具体某个参数的过滤，比如open系统调用，只想过滤第2个参数是否为/etc/passwd，目前的audit子系统是做不到的。
+##### 3.1.2 系统调用过滤丢失
+Audit在完成过滤操作后，会把日志发送到一个队列中，在这之前还有一个日志产生频率的检查：
+    struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask,
+                                         int type)
+    {
+              if (audit_rate_check() && printk_ratelimit())
+                     pr_warn("audit_backlog=%d > audit_backlog_limit=%d\n",
+                              skb_queue_len(&audit_queue),
+                              audit_backlog_limit);
+              audit_log_lost("backlog limit exceeded");
+    }
+audit_rate_check判断一秒内日志生成的数量是否大于audit_rate_limit，
+如果大于这条日志就直接被忽略掉了，这样恶意软件可以使用一些tricky的手段绕过对关键系统调用的审计。
+##### 3.1.3 tty passwd审计
+笔者认为这是一个奇葩的功能，auditd可以向内核要求记录tty关闭回显的信息，这样passwd的操作内容就会被记录下来，这难道不是一个后门功能吗？
+    static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+    {
+            case AUDIT_TTY_SET: {
+                            t = s.enabled | (-s.log_passwd & AUDIT_TTY_LOG_PASSWD);
+                            t = xchg(¤t->signal->audit_tty, t);
+                    }
+    }
+当current->signal->audit_tty被置位后，tty_audit_add_data()将会关闭回显的信息推送给audit子系统。
+    void tty_audit_add_data(struct tty_struct *tty, const void *data, size_t size)
+    {
+            if ((~audit_tty & AUDIT_TTY_LOG_PASSWD) && icanon && !L_ECHO(tty))
+                    return;
+            do {
+                    if (buf->valid == N_TTY_BUF_SIZE)
+                            tty_audit_buf_push(buf);
+            } while (size != 0);
+    }
+下面我们来验证下这个可怕的功能:
+修改/etc/pam.d/password-auth和/etc/pam.d/system-auth文件，加入：
+    session     required      pam_tty_audit.so disable=* enable=root log_passwd
+新开启一个终端，然后输入以下命令：
+    [root@localhost ~]# passwd test
+    Changing password for user test.
+    New password:
+    [root@localhost ~]# aureport --tty
+    TTY Report
+    ===============================================
+    # date time event auid term sess comm data
+    ===============================================
+    5. 12/23/2020 21:41:42 88650 0 pts21 4405 bash "ls",
+    6. 12/23/2020 21:41:45 88659 0 ? 4405 ? "passwd test"
+    7. 12/23/2020 21:41:43 88654 0 pts21 4405 bash 
+    8. 12/23/2020 21:41:43 88656 0 pts21 4405 bash 
+    9. 12/23/2020 21:41:43 88652 0 pts21 4405 bash 
+    10. 12/23/2020 21:41:45 88658 0 pts21 4405 bash "passwd test",
+    11. 12/23/2020 21:41:45 88685 0 pts21 4405 passwd "123456",
+    12. 12/23/2020 21:41:47 88687 0 pts21 4405 passwd "123456",
+    20. 12/23/2020 21:41:51 88727 0 pts21 4405 bash 
+    21. 12/23/2020 21:41:56 88730 0 ? 4405 ? "aureport --tty"
+    22. 12/23/2020 21:41:56 88729 0 pts21 4405 bash "aure",,"--tty",
+#### 3.2 关闭audit审计功能
+对于rootkit或exploit，要想在系统中完美的规避主机HIPS的检测，需要关闭audit子系统，以下为笔者总结的方法：
+A、 Struct audit_context ctx; Ctx->current_state = AUDIT_DISABLED 或者ctx = NULL  
+B、 Struct audit_krule = rule; rule->prio = 0  
+C、 Audit_enabled = 0; audit_ever_enabled = 0  
+D、 Clear_tsk_thread_flag(tsk, TIF_SYSCALL_AUDIT)
+* * *

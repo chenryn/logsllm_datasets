@@ -1,0 +1,362 @@
+To perform a write-to-new operation for a file, ReFS must first consult the
+MAA allocator to find space for the write to go to. In a tiered configuration,
+it does so with awareness of the tiers. Upon successful completion, it updates
+the file’s stream extent table to reflect the new location of that extent and
+updates the file’s metadata. The new B+ tree is then written to the disk in the
+free space block, and the old table is converted as free space. If the write is
+tagged as a write-through, meaning that the write must be discoverable after
+a crash, ReFS writes a log record for recording the write-to-new operation.
+(See the “ReFS write-through” section later in this chapter for further
+details).
+Page table
+When Minstore updates a bucket in the B+ tree (maybe because it needs to
+move a child node or even add a row in the table), it generally needs to
+update the parent (or director) nodes. (More precisely, Minstore uses
+different links that point to a new and an old child bucket for every node.)
+This is because, as we have described earlier, every director node contains the
+checksum of its leaves. Furthermore, the leaf node could have been moved or
+could even have been deleted. This leads to synchronization problems; for
+example, imagine a thread that is reading the B+ tree while a row is being
+deleted. Locking the tree and writing every modification on the physical
+medium would be prohibitively expensive. Minstore needs a convenient and
+fast way to keep track of the information about the tree. The Minstore Page
+Table (unrelated to the CPU’s page table), is an in-memory hash table private
+to each Minstore’s root table—usually the directory and file table—which
+keeps track of which bucket is dirty, freed, or deleted. This table will never
+be stored on the disk. In Minstore, the terms bucket and page are used
+interchangeably; a page usually resides in memory, whereas a bucket is
+stored on disk, but they express exactly the same high-level concept. Trees
+and tables also are used interchangeably, which explains why the page table
+is called as it is. The rows of a page table are composed of the LCN of the
+target bucket, as a Key, and a data structure that keeps track of the page states
+and assists the synchronization of the B+ tree as a value.
+When a page is first read or created, a new entry will be inserted into the
+hash table that represents the page table. An entry into the page table can be
+deleted only if all the following conditions are met:
+■    There are no active transactions accessing the page.
+■    The page is clean and has no modifications.
+■    The page is not a copy-on-write new page of a previous one.
+Thanks to these rules, clean pages usually come into the page table and are
+deleted from it repeatedly, whereas a page that is dirty would stay in the page
+table until the B+ tree is updated and finally written to disk. The process of
+writing the tree to stable media depends heavily upon the state in the page
+table at any given time. As you can see from Figure 11-82, the page table is
+used by Minstore as an in-memory cache, producing an implicit state
+machine that describes each state of a page.
+Figure 11-82 The diagram shows the states of a dirty page (bucket) in the
+page table. A new page is produced due to copy-on-write of an old page or
+if the B+ tree is growing and needs more space for storing the bucket.
+Minstore I/O
+In Minstore, reads and writes to the B+ tree in the final physical medium are
+performed in a different way: tree reads usually happen in portions, meaning
+that the read operation might only include some leaf buckets, for example,
+and occurs as part of transactional access or as a preemptive prefetch action.
+After a bucket is read into the cache (see the “Cache manager” section earlier
+in this chapter), Minstore still can’t interpret its data because the bucket
+checksum needs to be verified. The expected checksum is stored in the parent
+node: when the ReFS driver (which resides above Minstore) intercepts the
+read data, it knows that the node still needs to be validated: the parent node is
+already in the cache (the tree has been already navigated for reaching the
+child) and contains the checksum of the child. Minstore has all the needed
+information for verifying that the bucket contains valid data. Note that there
+could be pages in the page table that have been never accessed. This is
+because their checksum still needs to be validated.
+Minstore performs tree updates by writing the entire B+ tree as a single
+transaction. The tree update process writes dirty pages of the B+ tree to the
+physical disk. There are multiple reasons behind a tree update—an
+application explicitly flushing its changes, the system running in low
+memory or similar conditions, the cache manager flushing cached data to
+disk, and so on. It’s worth mentioning that Minstore usually writes the new
+updated trees lazily with the lazy writer thread. As seen in the previous
+section, there are several triggers to kick in the lazy writer (for example,
+when the number of the dirty pages reaches a certain threshold).
+Minstore is unaware of the actual reason behind the tree update request.
+The first thing that Minstore does is make sure that no other transactions are
+modifying the tree (using complex synchronization primitives). After initial
+synchronization, it starts to write dirty pages and with old deleted pages. In a
+write-to-new implementation, a new page represents a bucket that has been
+modified and its content replaced; a freed page is an old page that needs to be
+unlinked from the parent. If a transaction wants to modify a leaf node, it
+copies (in memory) the root bucket and the leaf page; Minstore then creates
+the corresponding page table entries in the page table without modifying any
+link.
+The tree update algorithm enumerates each page in the page table.
+However, the page table has no concept of which level in the B+ tree the
+page resides, so the algorithm checks even the B+ tree by starting from the
+more external node (usually the leaf), up to the root nodes. For each page, the
+algorithm performs the following steps:
+1. 
+Checks the state of the page. If it’s a freed page, it skips the page. If
+it’s a dirty page, it updates its parent pointer and checksum and puts
+the page in an internal list of pages to write.
+2. 
+Discards the old page.
+When the algorithm reaches the root node, it updates its parent pointer and
+checksum directly in the object table and finally puts also the root bucket in
+the list of pages to write. Minstore is now able to write the new tree in the
+free space of the underlying volume, preserving the old tree in its original
+location. The old tree is only marked as freed but is still present in the
+physical medium. This is an important characteristic that summarizes the
+write-to-new strategy and allows the ReFS file system (which resides above
+Minstore) to support advanced online recovery features. Figure 11-83 shows
+an example of the tree update process for a B+ table that contains two new
+leaf pages (A’ and B’). In the figure, pages located in the page table are
+represented in a lighter shade, whereas the old pages are shown in a darker
+shade.
+Figure 11-83 Minstore tree update process.
+Maintaining exclusive access to the tree while performing the tree update
+can represent a performance issue; no one else can read or write from a B+
+tree that has been exclusively locked. In the latest versions of Windows 10,
+B+ trees in Minstore became generational—a generation number is attached
+to each B+ tree. This means that a page in the tree can be dirty with regard to
+a specific generation. If a page is originally dirty for only a specific tree
+generation, it can be directly updated, with no need to copy-on-write because
+the final tree has still not been written to disk.
+In the new model, the tree update process is usually split in two phases:
+■    Failable phase: Minstore acquires the exclusive lock on the tree,
+increments the tree’s generation number, calculates and allocates the
+needed memory for the tree update, and finally drops the lock to
+shared.
+■    Nonfailable phase: This phase is executed with a shared lock
+(meaning that other I/O can read from the tree), Minstore updates the
+links of the director nodes and all the tree’s checksums, and finally
+writes the final tree to the underlying disk. If another transaction
+wants to modify the tree while it’s being written to disk, it detects that
+the tree’s generation number is higher, so it copy-on-writes the tree
+again.
+With the new schema, Minstore holds the exclusive lock only in the
+failable phase. This means that tree updates can run in parallel with other
+Minstore transactions, significantly improving the overall performance.
+ReFS architecture
+As already introduced in previous paragraphs, ReFS (the Resilient file
+system) is a hybrid of the NTFS implementation and Minstore, where every
+file and directory is a B+ tree configured by a particular schema. The file
+system volume is a flat namespace of directories. As discussed previously,
+NTFS is composed of different components:
+■    Core FS support: Describes the interface between the file system
+and other system components, like the cache manager and the I/O
+subsystem, and exposes the concept of file create, open, read, write,
+close, and so on.
+■    High-level FS feature support: Describes the high-level features of a
+modern file system, like file compression, file links, quota tracking,
+reparse points, file encryption, recovery support, and so on.
+■    On-disk dependent components and data structures MFT and file
+records, clusters, index package, resident and nonresident attributes,
+and so on (see the “The NT file system (NTFS)” section earlier in this
+chapter for more details).
+ReFS keeps the first two parts largely unchanged and replaces the rest of
+the on-disk dependent components with Minstore, as shown in Figure 11-84.
+Figure 11-84 ReFS architecture’s scheme.
+In the “NTFS driver” section of this chapter, we introduced the entities
+that link a file handle to the file system’s on-disk structure. In the ReFS file
+system driver, those data structures (the stream control block, which
+represents the NTFS attribute that the caller is trying to read, and the file
+control block, which contains a pointer to the file record in the disk’s MFT)
+are still valid, but have a slightly different meaning in respect to their
+underlying durable storage. The changes made to these objects go through
+Minstore instead of being directly translated in changes to the on-disk MFT.
+As shown in Figure 11-85, in ReFS:
+■    A file control block (FCB) represents a single file or directory and, as
+such, contains a pointer to the Minstore B+ tree, a reference to the
+parent directory’s stream control block and key (the directory name).
+The FCB is pointed to by the file object, through the FsContext2 field.
+■    A stream control block (SCB) represents an opened stream of the file
+object. The data structure used in ReFS is a simplified version of the
+NTFS one. When the SCB represents directories, though, the SCB has
+a link to the directory’s index, which is located in the B+ tree that
+represents the directory. The SCB is pointed to by the file object,
+through the FsContext field.
+■    A volume control block (VCB) represents a currently mounted
+volume, formatted by ReFS. When a properly formatted volume has
+been identified by the ReFS driver, a VCB data structure is created,
+attached into the volume device object extension, and linked into a list
+located in a global data structure that the ReFS file system driver
+allocates at its initialization time. The VCB contains a table of all the
+directory FCBs that the volume has currently opened, indexed by their
+reference ID.
+Figure 11-85 ReFS files and directories in-memory data structures.
+In ReFS, every open file has a single FCB in memory that can be pointed
+to by different SCBs (depending on the number of streams opened). Unlike
+NTFS, where the FCB needs only to know the MFT entry of the file to
+correctly change an attribute, the FCB in ReFS needs to point to the B+ tree
+that represents the file record. Each row in the file’s B+ tree represents an
+attribute of the file, like the ID, full name, extents table, and so on. The key
+of each row is the attribute code (an integer value).
+File records are entries in the directory in which files reside. The root node
+of the B+ tree that represents a file is embedded into the directory entry’s
+value data and never appears in the object table. The file data streams, which
+are represented by the extents table, are embedded B+ trees in the file record.
+The extents table is indexed by range. This means that every row in the
+extent table has a VCN range used as the row’s key, and the LCN of the
+file’s extent used as the row’s value. In ReFS, the extents table could become
+very large (it is indeed a regular B+ tree). This allows ReFS to support huge
+files, bypassing the limitations of NTFS.
+Figure 11-86 shows the object table, files, directories, and the file extent
+table, which in ReFS are all represented through B+ trees and provide the file
+system namespace.
+Figure 11-86 Files and directories in ReFS.
+Directories are Minstore B+ trees that are responsible for the single, flat
+namespace. A ReFS directory can contain:
+■    Files
+■    Links to directories
+■    Links to other files (file IDs)
+Rows in the directory B+ tree are composed of a >
+pair, where the key is the entry’s name and the value depends on the type of
+directory entry. With the goal of supporting queries and other high-level
+semantics, Minstore also stores some internal data in invisible directory rows.
+These kinds of rows have have their key starting with a Unicode zero
+character. Another row that is worth mentioning is the directory’s file row.
+Every directory has a record, and in ReFS that file record is stored as a file
+row in the self-same directory, using a well-known zero key. This has some
+effect on the in-memory data structures that ReFS maintains for directories.
+In NTFS, a directory is really a property of a file record (through the Index
+Root and Index Allocation attributes); in ReFS, a directory is a file record
+stored in the directory itself (called directory index record). Therefore,
+whenever ReFS manipulates or inspects files in a directory, it must ensure
+that the directory index is open and resident in memory. To be able to update
+the directory, ReFS stores a pointer to the directory’s index record in the
+opened stream control block.
+The described configuration of the ReFS B+ trees does not solve an
+important problem. Every time the system wants to enumerate the files in a
+directory, it needs to open and parse the B+ tree of each file. This means that
+a lot of I/O requests to different locations in the underlying medium are
+needed. If the medium is a rotational disk, the performance would be rather
+bad.
+To solve the issue, ReFS stores a STANDARD_INFORMATION data
+structure in the root node of the file’s embedded table (instead of storing it in
+a row of the child file’s B+ table). The STANDARD _INFORMATION data
+includes all the information needed for the enumeration of a file (like the
+file’s access time, size, attributes, security descriptor ID, the update sequence
+number, and so on). A file’s embedded root node is stored in a leaf bucket of
+the parent directory’s B+ tree. By having the data structure located in the
+file’s embedded root node, when the system enumerates files in a directory, it
+only needs to parse entries in the directory B+ tree without accessing any B+
+tables describing individual files. The B+ tree that represents the directory is
+already in the page table, so the enumeration is quite fast.
+ReFS on-disk structure
+This section describes the on-disk structure of a ReFS volume, similar to the
+previous NTFS section. The section focuses on the differences between
+NTFS and ReFS and will not cover the concepts already described in the
+previous section.
+The Boot sector of a ReFS volume consists of a small data structure that,
+similar to NTFS, contains basic volume information (serial number, cluster
+size, and so on), the file system identifier (the ReFS OEM string and
+version), and the ReFS container size (more details are covered in the
+“Shingled magnetic recording (SMR) volumes” section later in the chapter).
+The most important data structure in the volume is the volume super block. It
+contains the offset of the latest volume checkpoint records and is replicated
+in three different clusters. ReFS, to be able to mount a volume, reads one of
+the volume checkpoints, verifies and parses it (the checkpoint record includes
+a checksum), and finally gets the offset of each global table.
+The volume mounting process opens the object table and gets the needed
+information for reading the root directory, which contains all of the directory
+trees that compose the volume namespace. The object table, together with the
+container table, is indeed one of the most critical data structures that is the
+starting point for all volume metadata. The container table exposes the
+virtualization namespace, so without it, ReFS would not able to correctly
+identify the final location of any cluster. Minstore optionally allows clients to
+store information within its object table rows. The object table row values, as
+shown in Figure 11-87, have two distinct parts: a portion owned by Minstore
+and a portion owned by ReFS. ReFS stores parent information as well as a
+high watermark for USN numbers within a directory (see the section
+“Security and change journal” later in this chapter for more details).
+Figure 11-87 The object table entry composed of a ReFS part (bottom
+rectangle) and Minstore part (top rectangle).
+Object IDs
+Another problem that ReFS needs to solve regards file IDs. For various
+reasons—primarily for tracking and storing metadata about files in an
+efficient way without tying information to the namespace—ReFS needs to
+support applications that open a file through their file ID (using the
+OpenFileById API, for example). NTFS accomplishes this through the
+$Extend\$ObjId file (using the $0 index root attribute; see the previous NTFS
+section for more details). In ReFS, assigning an ID to every directory is
+trivial; indeed, Minstore stores the object ID of a directory in the object table.
+The problem arises when the system needs to be able to assign an ID to a file;
+ReFS doesn’t have a central file ID repository like NTFS does. To properly
+find a file ID located in a directory tree, ReFS splits the file ID space into two
+portions: the directory and the file. The directory ID consumes the directory
+portion and is indexed into the key of an object table’s row. The file portion
+is assigned out of the directory’s internal file ID space. An ID that represents
+a directory usually has a zero in its file portion, but all files inside the
+directory share the same directory portion. ReFS supports the concept of file
+IDs by adding a separate row (composed of a  pair) in
+the directory’s B+ tree, which maps the file ID to the file name within the
+directory.
+When the system is required to open a file located in a ReFS volume using
+its file ID, ReFS satisfies the request by:
+1. 
+Opening the directory specified by the directory portion
+2. 
+Querying the FileId row in the directory B+ tree that has the key
+corresponding to the file portion
+3. 
+Querying the directory B+ tree for the file name found in the last
+lookup.
+Careful readers may have noted that the algorithm does not explain what
+happens when a file is renamed or moved. The ID of a renamed file should
+be the same as its previous location, even if the ID of the new directory is
+different in the directory portion of the file ID. ReFS solves the problem by
+replacing the original file ID entry, located in the old directory B+ tree, with
+a new “tombstone” entry, which, instead of specifying the target file name in
+its value, contains the new assigned ID of the renamed file (with both the
+directory and the file portion changed). Another new File ID entry is also
+allocated in the new directory B+ tree, which allows assigning the new local
+file ID to the renamed file. If the file is then moved to yet another directory,
+the second directory has its ID entry deleted because it’s no longer needed;
+one tombstone, at most, is present for any given file.
+Security and change journal
+The mechanics of supporting Windows object security in the file system lie
+mostly in the higher components that are implemented by the portions of the
+file system remained unchanged since NTFS. The underlying on-disk
+implementation has been changed to support the same set of semantics. In
+ReFS, object security descriptors are stored in the volume’s global security
+directory B+ table. A hash is computed for every security descriptor in the
+table (using a proprietary algorithm, which operates only on self-relative
+security descriptors), and an ID is assigned to each.
+When the system attaches a new security descriptor to a file, the ReFS
+driver calculates the security descriptor’s hash and checks whether it’s
+already present in the global security table. If the hash is present in the table,
+ReFS resolves its ID and stores it in the STANDARD_INFORMATION data
+structure located in the embedded root node of the file’s B+ tree. In case the
+hash does not already exist in the global security table, ReFS executes a
+similar procedure but first adds the new security descriptor in the global B+
+tree and generates its new ID.
+The rows of the global security table are of the format ,
+>, where the hash and the ID are as
+described earlier, the security descriptor is the raw byte payload of the
+security descriptor itself, and ref. count is a rough estimate of how many
+objects on the volume are using the security descriptor.
+As described in the previous section, NTFS implements a change journal
+feature, which provides applications and services with the ability to query
+past changes to files within a volume. ReFS implements an NTFS-
+compatible change journal implemented in a slightly different way. The
+ReFS journal stores change entries in the change journal file located in
+another volume’s global Minstore B+ tree, the metadata directory table.
+ReFS opens and parses the volume’s change journal file only once the
+volume is mounted. The maximum size of the journal is stored in the
+$USN_MAX attribute of the journal file. In ReFS, each file and directory
+contains its last USN (update sequence number) in the
+STANDARD_INFORMATION data structure stored in the embedded root
+node of the parent directory. Through the journal file and the USN number of
+each file and directory, ReFS can provide the three FSCTL used for reading
+and enumerate the volume journal file:
+■    FSCTL_READ_USN_JOURNAL: Reads the USN journal directly.
+Callers specify the journal ID they’re reading and the number of the
+USN record they expect to read.
+■    FSCTL_READ_FILE_USN_DATA: Retrieves the USN change
+journal information for the specified file or directory.
+■    FSCTL_ENUM_USN_DATA: Scans all the file records and
+enumerates only those that have last updated the USN journal with a
+USN record whose USN is within the range specified by the caller.
+ReFS can satisfy the query by scanning the object table, then scanning
+each directory referred to by the object table, and returning the files in
+those directories that fall within the timeline specified. This is slow
+because each directory needs to be opened, examined, and so on.
+(Directories’ B+ trees can be spread across the disk.) The way ReFS
+optimizes this is that it stores the highest USN of all files in a
+directory in that directory’s object table entry. This way, ReFS can
+satisfy this query by visiting only directories it knows are within the
+range specified.
+ReFS advanced features
+In this section, we describe the advanced features of ReFS, which explain
+why the ReFS file system is a better fit for large server systems like the ones

@@ -1,0 +1,160 @@
+# Windows调试艺术——断点和反调试（上）
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+《Windows调试艺术》主要是记录我自己学习的windows知识，并希望尽可能将这些东西在某些实际方面体现出来。恰好最近我在为学校的新生校赛出题，想着来个反调试的”大杂烩”，里面有几个反调试技术恰好是基于前面几篇的内容，这一次我们就将之前学习过的PEB、SEH等等的知识用到反调试的实际应用上。
+需要的知识基础：
+  * [Windows调试艺术——利用LDR寻找dll基址](https://www.anquanke.com/post/id/173586)
+  * [Windows调试艺术——从0开始的异常处理（上）](https://www.anquanke.com/post/id/175293)
+  * [Windows调试艺术——从0开始的异常处理（下）](https://www.anquanke.com/post/id/175753)
+## 基于中断、异常的反调试
+###  利用SEH和软件断点机制实现反调试
+首先简单回忆一下SEH的处理，当用户引发了一个异常时，程序会遍历当前线程的SEH链表来检查能否处理该异常，如果能，就将该异常交给异常处理例程进行处理，并在处理完成后重新执行异常代码。SEH链表的头部保存在FS:[0]中，越晚设置的SEH越早处理，我们可以用以下的代码装载自己的SEH
+    push seh                                        //将自己的SEH函数地址压栈
+    push DWORD ptr fs : [0]            //将之前的SEH头压栈
+    mov DWORD ptr fs : [0], esp    //esp指向的地方恰好构成了新的EXCEPTION_REGISTRATION_RECORD
+再来回忆一下断点的知识，我们的od下的软件断点，实际上是将下断点处的指令替换为0xCC（也就是INT
+3），当程序跑到这里，发现这是个异常，然后根据IDT（中断描述符表）去寻找相应的中断处理例程，再经过异常分发，从而实现断点的功能。
+    假设在此处下断点
+    C645 FC 00 mov byte ptr [ebp-4],0
+    53 PUSH EBX
+    断点后的指令应为
+    CC int 3
+    45 FC 00 被识别为其他指令
+    53 PUSH EBX
+但是我们会发现，在使用od下断点时，指令在我们这边并没有看到改变，另外，我们下的断点处并没有执行。如果按照之前的理论的话这条指令由于被覆盖成了0xCC所以”废”了才对，指令不应该停留在此，之后应该直接去执行45
+FC 00才对，而这又会引发一个新的问题，这个45 FC 00到底是不是个可以识别的指令，不是的话该怎么办，是的话程序逻辑错了怎么办？
+第一个问题很简单，实际上调试器给我们做了”伪装”，实际上指令已经变了，只不过展示给用户的还是C645 FC
+00，而第二、三个问题就稍微复杂一些了，为了解决这个问题，我们就需要恶补一点关于软件断点的知识了。
+当调试器遇见INT
+3时，首先会执行类似初始化的操作，在《英特尔IA-32架构软件开发手册》中我们可以找到相应的代码，为了理解方便，这里我写了效果相同的伪代码
+    if (中断向量号 not in 中断向量表)
+        General_Protection_Exception()
+    if (栈 not have sizeof(cs)+sizeof(eip))
+        Stack_Exception()
+    else 
+        IF=0
+        TF=0
+        AC=0
+        push cs
+        push eip
+        cs =对应异常处理例程的cs
+        eip=对应异常处理例程的eip
+上面的处理实际上在栈里维护了一个结构，它保存着相关寄存器的信息，也被叫做TRAP_FRAME陷阱帧，而之后就该进入中断处理例程了。我们可以用windbg来查看具体的函数，注意要在内核调试状态，命令如下
+    !idt
+    uf Trap3地址
+这里有很多操作就不再一一详细论述，但比起其他的中断处理例程，显然它多出了如下的部分
+    mov     ebx, [ebp+68h]      
+    dec     ebx                  
+    mov     ecx, 3                
+    mov     eax, 80000003h      
+    call    CommonDispatchException
+这里的ebx实际上就是之前压栈的eip了，dec令其自减1，也就是说之前本来指向45 FC 00的eip又重新指向了INT
+3了，之后当我们恢复执行时，调试器再将INT 3位置的hex填充回C6，程序也就恢复”正常”了，这就解决了我们之前的两个问题。
+但是问题就又来了，你程序恢复正常，可用户那可没取消这个断点啊！有过调试经验的人都知道，我们下了断点后，执行过去断点还在那，不会取消，可按照上面的逻辑INT
+3已经被”修复”了，之后应该没有了才对。
+这个问题也很简单，调试器会维护一个记录断点信息的文件（如VC6的文件是.opt），当我们执行过一个断点后，调试器设置一个标志位的硬件断点，当执行完下断点的指令后再次中断，这次中断就会将记录的断点信息全部设置一遍，也就解决了这个问题。
+有了上面的知识，我们就可以开始构思一个简单的反调试软件了，既然调试器是用int 3实现软件断点，那我们也完全可以用个假的int
+3来骗调试，让它误以为此处应该进行中断处理（如果在非调试器下，则会因为INT
+3指令进入异常处理），然后陷入我们提前布置好的陷阱，由于各个调试器的具体处理略有差异，所以具体调试情况可能略有出入，以下均使用VS调试器进行
+    bool anti_debug() {
+        BOOL flag = FALSE;
+        __asm {
+            push my_seh
+            push DWORD ptr fs : [0]
+            mov DWORD ptr fs : [0], esp
+            __emit(0xcc)
+            mov flag, 1
+            jmp remove_seh
+    my_seh :
+            mov eax, dword ptr ss : [esp + 0xc];
+            mov dword ptr ds : [eax + 0xb8], remove_seh
+            xor eax, eax
+            retn
+    remove_seh:
+            pop dword ptr fs : [0]
+            add esp, 4
+        }
+        return flag;
+    }
+上面代码中，__emit()函数相当于将里面的hex转换为指令，0xCC自然就是INT
+3了，首先我们将自己的SEH处理函数my_seh装载了，然后设置了假的断点。如果是在调试器内，INT3就被很平常的执行了，然后直接下一句将flag置为1，最终用remove_seh卸载了我们的seh，如图所示，在vs调试器中我们成功将flag置为了1。
+而在非调试器环境下由于INT
+3会进入我们的my_seh中，先是拿到了EXCEPTION_REGISTRATION_RECORD的地址，将我们卸载自己seh的remove_seh装载进去，现在的SEH链表的第一个处理函数就是我们的remove_seh了，再次触发断点异常时我们自己的SEH函数就被卸载了，程序也就正常执行下去了。注意，这里的esp+0xc是实际计算出来的，如果你改了代码此处也需要修改，不改或者改错的话就会导致SEH始终是之前的SEH，也就是会无限循环处理该异常。
+同样我们也可以将这个思路放到函数隐藏上，我们可以将自己的函数伪装成SEH的处理函数，然后我们在执行过程中故意设置一个异常，迫使程序进入SEH处理函数，如下图代码所示
+    bool seh()
+    {
+        bool bDebugging = false;
+        __asm
+        {
+                push getFlag
+                push DWORD ptr fs : [0]
+                mov DWORD ptr fs : [0], esp
+                __emit(0xcc)
+        }
+        return bDebugging;
+    }
+    int main()
+    {
+        scanf_s("%s", &a, 25);
+        seh();
+        printf("bye~~~~~");
+        return 0;
+    }
+其中getFlag也就是我们的关键函数，我们生成可执行文件并用ida打开
+可以看到我们的函数被隐藏了起来，不太容易被发现了，而如果用od调试的话，会因为od会“无视”INT
+3，反而导致调试者进不去关键函数了，成功提高了程序被逆向的难度。不过这里还是要注意处理无限循环的问题，因为我们的函数如果没有修复断点异常的话就会导致程序再次执行断点进行无限循环，导致程序崩溃。
+当然，我们还可以更变态一点，使用多层SEH，每一层的SEH都对应一部分的解密函数，这样调试者就很难理清里面的关系了
+    void seh3()
+    {
+        printf("this is seh3");
+        Sleep(1000000);
+    }
+    void seh2()
+    {
+        printf("this is seh2");
+        __asm
+        {
+            push seh3
+            push DWORD ptr fs : [0]
+            mov DWORD ptr fs : [0],esp
+            __emit(0xcc)
+        }
+    }
+    void seh1 ()
+    {
+        printf("this is seh1");
+        __asm
+        {
+            push seh2
+            push DWORD ptr fs : [0]
+            mov DWORD ptr fs : [0], esp
+            __emit(0xcc)
+        }
+    }
+    int main()
+    {
+        printf("welcome to skctf");
+        __asm
+        {
+            push seh1
+            push DWORD ptr fs : [0]
+            mov DWORD ptr fs : [0], esp
+            __emit(0xcc)
+            pop dword ptr fs : [0]
+            add esp, 4
+        }
+        printf("bye");
+    }
+至于会输出什么大家可以猜猜，要注意这里的多重SEH的卸载是很难操作的，所以我最后是让程序sleep，防止无限循环。
+###  利用UnhandledExceptionFilter与软件断点机制实现反调试
+UnhandledExceptionFilter我们在之前的文章中也详细说了，实际上它就是SEH的”不得已”处理例程，只有当seh链上的处理函数都无法处理异常时才会触发，我们可以把它看作是SEH的一种特殊情况，我们可以通过以下代码设定我们自定义的UnhandledExceptionFilter，至于详细的执行过程可以参考之前的文章
+    UnhandledExceptionFilter（function_name）
+思路和上面的一样，同样是利用调试器对于断点的处理机制进行构造，代码如下：
+    LONG WINAPI Exception(
+        _In_ struct _EXCEPTION_POINTERS *ExceptionInfo
+        ) {
+        ExceptionInfo->ContextRecord->Eip += 5;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    bool CheckDebug() {

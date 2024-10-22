@@ -1,0 +1,113 @@
+    (gdb) watch *0x6d0018
+    Hardware watchpoint 3: *0x6d0018
+    (gdb) x/gx       /* .got.plt entry for memmove */
+    0x6d0020:    0x0000000000436da0
+    (gdb) watch *0x6d0020
+    Hardware watchpoint 4: *0x6d0020
+    (gdb) run
+    The program being debugged has been started already.
+    Start it from the beginning? (y or n) y
+    Starting program: /home/elfmaster/git/libelfmaster/examples/static_binary
+    Hardware watchpoint 4: *0x6d0020
+    Old value = 4195078
+    New value = 4418976
+    0x0000000000404dd3 in generic_start_main ()
+    (gdb) x/i 0x436da0
+       0x436da0 :  mov    %rdi,%rax
+    (gdb) c
+Continuing.
+    Hardware watchpoint 3: 0x6d0018
+    *Old value = 4195062
+    New value = 4453888
+    0x0000000000404dd3 in generic_start_main ()
+    (gdb) x/i 0x43f600
+       0x43f600 :  mov    %rsi,%rcx
+    (gdb)
+## 4.1 .got.plt使用GDB进行检查
+在上述两种情况下，给定libc函数的GOT条目将其PLT存根地址替换为最有效的函数版本，给定CPU缓存大小由某些glibc初始化代码查找，例如，__
+cache_sysconf()。由于这是一个有点高级的概述，我不会涉及到每个函数，但重要的是.got.plt是用libc函数更新的，并且可能会中毒，因为RELRO与静态链接的可执行文件不兼容。
+这引出了几个可能的解决方案，包括我们的实验原型，RelroS（静态ELF的只读重定位），它使用一些ELF技巧来注入放置在非常特定位置的蹦床调用的代码。在调用enable_relro()例程之前，必须等到generic_start_main()完成对我们打算标记为只读的内存区域的所有写入。
+## 4.2 RelroS（静态ELF的只读重定位）解决方案
+由于时间限制，RelroS的初始（且唯一）版本被快速写入。因此，当前实现中存在若干问题，但接下来我将解释如何解决它们。目前的指令是使用注入技术将PT_NOTE程序头标记为PT_LOAD，因此我们可以有效地创建第二个文本段。此外，在generic_start_main()函数中，有一个非常特定的地方需要修补，它需要一个5字节的补丁（即，调用）。
+不幸的是，在将这个指令转移到不同的段时，立即调用是不起作用的。相反，需要一个远远超过5个字节的lcall（远程调用）。解决方法是切换到反向文本感染，这将使enable_relro()代码保持在唯一的代码段中。目前，我们正在粗略地修补调用main()的代码
+    405b46:       48 8b 74 24 10          mov    0x10(%rsp),%rsi
+      405b4b:       8b 7c 24 0c             mov    0xc(%rsp),%edi
+      405b4f:       48 8b 44 24 18          mov    0x18(%rsp),%rax /* store main() addr */
+      405b54:       ff d0                   callq  *%rax /* call main() */
+      405b56:       89 c7                   mov    %eax,%edi
+      405b58:       e8 b3 de 00 00          callq  413a10 
+在当前示例中，我们使用`push $enable_relro;
+ret`来覆盖0x405b54处的6个字节指令集。我们的enable_relro()函数将PT_RELRO表示的数据段的一部分保存为只读，然后调用main()，然后是sys_exit。这是有缺陷的，因为main()之后的代码都没有被调用，包括deinitialization例程。
+解决方案是使用反向文本扩展名或文本填充感染将enable_relro()代码保留在主程序文本段中。我们可以简单地将0x405b46处的5个字节用`call
+`覆盖到enable_relro()，并且该函数将确保我们返回将存储在％rax中的main()的地址。由于下一条指令是·callq
+*％rax`，它在RELRO启用后立即调用main()，因此没有指令被抛出对齐状态。
+到目前为止，该解决方案是理想的。但是，.tdata位于数据段的开头也是一个问题，而我们只能在PAGE_SIZE的倍数的内存区域上使用mprotect()。因此，必须采用稍微复杂的步骤来使多线程应用程序与二进制检测的RELRO一起运作（或者，我们可以通过使用链接描述文件将线程数据和bss放入其自己的数据段来解决问题）。
+在当前的原型中，我们使用push/ret序列修补从0x405b4f开始的指令字节，破坏以下指令。这是一个临时修复，需要在未来的原型中解决。
+    405b46:       48 8b 74 24 10          mov    0x10(%rsp),%rsi
+      405b4b:       8b 7c 24 0c             mov    0xc(%rsp),%edi
+      405b4f:       48 8b 44 24 18          mov    0x18(%rsp),%rax
+      405b54:       68 f4 c6 0f 0c          pushq  $0xc0fc6f4
+      405b59:       c3                      retq 
+      /*
+       * The following bad instructions are never crashed on because
+       * the previous instruction returns into enable_relro() which calls
+       * main() on behalf of this function, and then sys_exit's out.
+       */
+      405b5a:       de 00                   fiadd  (%rax)
+      405b5c:       00 39                   add    %bh,(%rcx)
+      405b5e:       c2 0f 86                retq   $0x860f
+      405b61:       fb                      sti  
+      405b62:       fe                      (bad)
+      405b63:       ff                      (bad)
+      405b64:       ff                      (bad)
+可以看到这不是一个动态链接的可执行文件
+    $ readelf -d test
+    There is no dynamic section in this file.
+可以观察到只有一个r + x文本段和一个r + w数据段，在数据段的第一部分缺乏只读存储器保护。
+    $ ./test &
+    [1] 27891
+    $ cat /proc/`pidof test`/maps
+    00400000-004cc000 r-xp 00000000 fd:01 4856460 /home/elfmaster/test
+    006cc000-006cf000 rw-p 000cc000 fd:01 4856460 /home/elfmaster/test
+使用单个命令将RelroS应用于可执行文件
+    $ ./relros ./test
+    injection size: 464
+    main(): 0x400b23
+我们可以观察到我们的补丁在强制执行只读重定位，而且我们在二进制文件中调用了名为'test'的补丁
+    $ ./test &
+    [1] 28052
+    $ cat /proc/`pidof test`/maps
+    00400000-004cc000 r-xp 00000000 fd:01 10486089 /home/elfmaster/test
+    006cc000-006cd000 r--p 000cc000 fd:01 10486089 /home/elfmaster/test
+    006cd000-006cf000 rw-p 000cd000 fd:01 10486089 /home/elfmaster/test
+    $
+请注意，在我们在./test上应用RelroS后，数据段现在有一个4096字节区域，已标记为只读。这是动态链接器为动态链接的可执行文件完成的操作。
+目前，我们正在努力改进我们的二进制检测项目[11]，以便在静态链接的可执行文件上启用RELRO。在4.3和4.4节中，我将讨论另外两个解决这个问题的方法。
+## 4.3链接器脚本和自定义函数
+在静态可执行文件上启用RELRO的一种可能可行的方法是编写一个链接器脚本，将.tbss，.tdata和.data分隔成它们自己的段，然后放置原本应该是只读的段（即，
+.init_array，.fini_array，.jcr，.dynamic，.got和.got.plt）在另一个段中..可以将每个PT_LOAD段单独标记为PF_R
+| PF_W（读取+写入），这样它们就可以作为两个单独的数据段。
+单独的段能让程序在检查argc/argv之前具有main()调用的自定义函数（非构造函数）。应该使用自定义而不是构造函数，这是因为存储在.init节中的构造函数例程在.got，.got.plt部分的写入指令之前被调用，等等。在glibc
+init代码完成执行其需要写入访问的修正之后，构造函数将尝试对第二个数据段执行mprotect()只读权限，从而无法运行。
+## 4.4 GLIBC开发人员可以修复它
+在静态可执行文件上启用RELRO的另一个解决方案是让glibc开发人员在调用main()之前添加一个由generic_start_main()调用的函数。目前，在静态链接的可执行文件中有一个_dl_protect_relro()函数，而它永远不会被调用。
+# 5 ASLR问题
+如上所述，二进制保护（如ASLR）无法应用于当前工具链的静态可执行文件。除非RANDEXEC [5]用于ET_EXEC
+ASLR，否则ASLR会采用ET_DYN作为可执行文件。静态链接的可执行文件只能链接为ET_EXEC类型的可执行文件。
+    $ gcc -static -fPIC -pie test2.c -o test2
+    /usr/bin/ld: /usr/lib/gcc/x86_64-linux-gnu/5/crtbeginT.o:
+    relocation R_X86_64_32 against `__TMC_END__' can not be used when making a shared object; recompile with -fPIC
+    /usr/lib/gcc/x86_64-linux-gnu/5/crtbeginT.o: error adding symbols: Bad value
+    collect2: error: ld returned 1 exit status
+这意味着你可以删除-pie标志并最终得到一个使用位置无关代码的可执行文件，但是没有我们所需要的以基址0开头的地址空间布局。那么该怎么办？
+## 5.1 ASLR解决方案
+我个人没有花太多的时间来用glibc链接器查看是否可以调整它来链接作为ET_DYN对象出现的静态可执行文件。值得一提的是，这样的可执行文件不应该有PT_INTERP段，因为它不是动态链接的。由于我自己的时间限制，我想把这作为读者的练习，也许有一些我不知道的解决方案。
+来自ELF内核加载器的以下代码将进一步具体化可执行类型必须为ET_DYN的事实，以便将其重定位到随机生成的地址。  
+快速查看src/linux/fs/binfmt_elf.c在第916行显示此代码
+    line 916:      } else if (loc->elf_ex.e_type == ET_DYN) {
+                   /* Try and get dynamic programs out of the way of the
+                    * default mmap base, as well as whatever program they
+                    * might try to exec.  This is because the brk will
+                    * follow the loader, and is not movable.  */
+                 load_bias = ELF_ET_DYN_BASE - vaddr;
+                 if (current->flags & PF_RANDOMIZE)

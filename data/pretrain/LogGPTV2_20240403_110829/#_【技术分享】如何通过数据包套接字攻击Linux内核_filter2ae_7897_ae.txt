@@ -1,0 +1,82 @@
+Randomization，内核地址空间布局随机化）机制会将内核文本（kernel
+text）存放到一个随机的偏移地址，使得攻击者无法通过跳转到特定的固定地址完成攻击；每当内核试图从用户空间内存执行代码时，SMEP（Supervisor
+Mode Execution
+Protection，监督模式执行保护）机制就会触发内核的oops错误；每当内核试图直接访问用户空间的内存时，SMAP（Supervisor Mode
+Access Prevention，监督模式访问防护）机制也能起到同样效果。
+**6.1 堆操作**
+漏洞的利用思路是利用堆越界写入bug，覆盖内存中与溢出内存块临近的那个函数指针。因此我们需要对堆进行精确处理，使得某些带有可触发函数指针的对象被精确放置在某个环形缓冲区之后。我选择前文提到的packet_sock结构体对象作为这类对象。我们需要找到一种办法，使得内核将一个环形缓冲区内存块和一个packet_sock对象紧紧分配在一起。
+正如我前文提到的那样，环形缓冲区内存块通过内核页面分配器进行分配。内核页面分配器可以为内存块分配2^n个连续的内存页面。对于每个n值，分配器会为这类内存块维护一个freelist表，并在请求内存块时返回freelist表头。如果某个n值对应的freelist为空，分配器就会查找第一个满足m>n且其freelist不为空的值，然后将freelist分为两半，直到所需的大小得到满足。因此，如果我们开始以2^n大小重复分配内存块，那么在某些时候，这些内存块会由某个高位内存块分裂所得，且这些内存块会彼此相邻。
+packet_sock对象通过slab分配器使用kmalloc()函数进行分配。slab分配器主要用于分配比单内存页还小的那些对象。它使用页面分配器分配一大块内存，然后切割这块内存，生成较小的对象。大的内存块称之为slabs，这也就是slab分配器的名称来源。一组slabs与它们的当前状态以及一组操作(如“分配对象”操作，以及“释放对象”操作)一起，统称为一个缓存（cache）。slab分配器会按照2^n大小，为对象创建一组通用的缓存。每当kmalloc(size)函数被调用时，slab分配器会将size调整到与2的幂最为接近的一个值，使用这个size作为缓存的大小。
+由于内核一直使用的都是kmalloc()函数，如果我们试图分配一个对象，那么这个对象很大的可能会来自于之前已经创建的一个slab中。然而，如果我们开始分配同样大小的对象，那么在某些时候，slab分配器将会将同样大小的slab全部用光，然后不得不使用页面分配器分配另一个slab。
+新创建的slab的大小取决于这个slab所用的对象大小。packet_sock结构体的大小大约为1920，而1024 xmit；
+2、packet_sock->rx_ring->prb_bdqc->retire_blk_timer->func
+每当用户尝试使用数据包套接字发送数据包时，就会调用第一个函数。提升到root权限的通常方法是在某个进程上下文中执行commit_creds(prepare_kernel_cred(0))载荷。对于第一个函数，进程上下文中会调用xmit指针，这意味着我们可以简单地将其指向一个包含载荷的可执行内存区域就能达到目的。
+因此，我使用的是retire_blk_timer字段（Philip
+Pettersson在他发现的CVE-2016-8655漏洞中也利用了这个字段）。这个字段包含一个函数指针，每当计时器超时时就会触发这个指针。在正常的数据包套接字操作过程中，retire_blk_timer->func指向的是prb_retire_rx_blk_timer_expired()，调用这个函数时会使用retire_blk_timer->data作为参数，这个参数中包含了packet_sock结构体对象的地址。由于我们可以一起覆盖函数字段和数据字段，因此我们可以获得一个非常完美的func(data)覆盖结果。
+当前CPU核心的SMEP和SMAP状态由CR4寄存器的第20和21个比特位所控制。为了禁用这两个机制，我们应该将这两个比特位清零。为了做到这一点，我们可以使用前面获得的func(data)结果调用native_write_cr4(X)函数，其中X的第20和21个比特位设置为0。具体的X值可能取决于还有哪些CPU功能被启用。在我测试漏洞利用的那台机器上，CR4寄存器的值为0x10407f0（因为CPU不支持SMAP功能，因此只有SMEP比特被启用），因此我使用的X值为0x407f0。我们可以使用sched_setaffinity系统调用，强迫漏洞利用程序在某个CPU核心上运行，由于这个我们禁用了这个核心的SMAP和SMEP功能，这样一来就能确保用户空间载荷会在同一个核心上执行。
+综合这些背景知识，我给出了如下的漏洞利用步骤：
+1、找到内核文本地址，以绕过KASLR（具体方法参考下文描述）。
+2、根据上文描述，操纵内核堆。
+3、禁用SMEP和SMAP：
+a) 在某个环形缓冲区内存块之后分配一个packet_sock对象；
+b) 将一个接收环形缓冲区附加到packet_sock对象之后，以设置一个内存块停用计时器；
+c)
+溢出这个内存块，覆盖retire_blk_timer字段。使得retire_blk_timer->func指向native_write_cr4，并且使得retire_blk_timer->data的值与所需的CR4寄存器值相等；
+d) 等待计时器执行，现在我们就可以在当前的CPU核心上禁用SMEP和SMAP了。
+4、获取root权限。
+a) 分配另一对packet_sock对象和环形缓冲区内存块。
+b) 溢出这个内存块，覆盖xmit字段。使得xmit指向用户空间中分配的一个commit_creds(prepare_kernel_cred(0))函数。
+c) 在对应的数据包套接字上发送一个数据包，xmit就会被触发，然后当前的进程就会获得root权限。
+相应的漏洞利用代码可以在这个链接中找到。
+需要注意的是，当我们覆盖packet_sock结构体中的这两个字段时，我们最终会破坏在这两个字段之前的某些字段（因为内核会将某些值写入内存块和帧头中），这可能会导致内核崩溃。然而，如果其他这些字段没有被内核使用，那么一切都还好。我发现当我们在漏洞利用结束后，尝试关闭所有的数据包套接字时，mclist这个字段会导致内核崩溃，但我们只要将其清零即可。
+**6.4 绕过KASLR**
+在这里我会介绍某些精心构造的技术，来绕过KASLR机制。由于Ubuntu默认情况下不会限制dmesg，我们可以使用grep命令，查找内核syslog日志中的“Freeing
+SMP“关键词，我们可以在结果中找到一个内核指针，看起来与内核文本地址非常相似，如下所示：
+    # Boot #1
+    $ dmesg | grep 'Freeing SMP'
+    [    0.012520] Freeing SMP alternatives memory: 32K (ffffffffa58ee000 - ffffffffa58f6000)
+    $ sudo cat /proc/kallsyms | grep 'T _text'
+    ffffffffa4800000 T _text
+    # Boot #2
+    $ dmesg | grep 'Freeing SMP'
+    [    0.017487] Freeing SMP alternatives memory: 32K (ffffffff85aee000 - ffffffff85af6000)
+    $ sudo cat /proc/kallsyms | grep 'T _text'
+    ffffffff84a00000 T _text
+在dmesg中暴露的地址的基础上，通过简单的数学运算，我们可以计算出内核文本地址。使用这种方式计算出来的内核文本地址只有在启动之后的一段时间内有效，因为syslog只存储固定行数的这类日志，然后在某些时候抹掉这些日志。
+我们可以使用几个Linux内核加固功能来避免这类信息泄露。第一个功能是dmesg_restrict，它可以限制非特权用户读取内核syslog日志。需要注意的是，即使在受限dmesg下，Ubuntu的第一个用户还是可以从“/var/log/kern.log”以及“/var/log/syslog”处读取syslog日志，因为该用户隶属于adm用户组。
+另一个功能是[ **kptr_restrict**](http://bits-please.blogspot.de/2015/08/effectively-bypassing-kptrrestrict-on.html)，这个功能不允许非特权用户查阅内核使用“%pK”格式说明符打印的指针。然而，在4.8版内核中，free_reserved_area()函数使用的是[
+**“%p”格式符**](http://lxr.free-electrons.com/source/mm/page_alloc.c?v=4.8#L6433)，因此这种情况下kptr_restrict不会发挥作用。4.10版内核中[
+**修复**](https://github.com/torvalds/linux/commit/adb1fe9ae2ee6ef6bc10f3d5a588020e7664dfa7)了free_reserved_area()函数，这个函数根本就不会打印地址范围，但这个修改没有做到向前兼容。
+**七、修复措施**
+我们来看看补丁原理。修复前的漏洞代码如下所示。请记住，用户可以完全控制tp_block_size和tp_sizeof_priv字段：
+    4207                 if (po->tp_version >= TPACKET_V3 &&
+    4208                     (int)(req->tp_block_size -    4209                           BLK_PLUS_PRIV(req_u->req3.tp_sizeof_priv)) tp_version >= TPACKET_V3 &&
+    4208                     req->tp_block_size req3.tp_sizeof_priv))
+    4210                         goto out;
+有趣的是，这个修复措施并不会奏效。原因在于当tp_sizeof_priv接近于unsigned int的最大值时，在处理[
+**BLK_PLUS_PRIV**](http://lxr.free-electrons.com/source/net/packet/af_packet.c?v=4.8#L177)时还是会出现溢出问题。
+    177 #define BLK_PLUS_PRIV(sz_of_priv) 
+    178         (BLK_HDR_LEN + ALIGN((sz_of_priv), V3_ALIGNMENT))
+修改这个溢出问题的一种办法就是在将tp_sizeof_priv传递给BLK_PLUS_PRIV之前，将其转化为uint64类型值。这就是我在上游代码中做的修复措施：
+    4207                 if (po->tp_version >= TPACKET_V3 &&
+    4208                     req->tp_block_size req3.tp_sizeof_priv))
+    4210                         goto out;
+**八、缓解措施**
+我们需要CAP_NET_RAW权限才能创建数据包套接字，非特权用户可以在用户命名空间中获取这个权限。非特权用户命名空间暴露了许多内核攻击面，这最终导致了许多可利用的漏洞（如[
+**CVE-2017-7184**](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-7184)、[
+**CVE-2016-8655**](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2016-8655)等）。我们可以通过完全禁用用户命名空间或者禁止非特权用户使用这类空间来缓解这类内核漏洞。
+要彻底禁用用户命名空间，你可以在禁用CONFIG_USER_NS的条件下，重新编译自己的内核。在基于Debian的内核中，我们可以将/proc/sys/kernel/unprivileged_userns_clone的值设为0，以限制只有特权用户才能使用用户命名空间。从4.9版内核起，上游内核中就具有类似的“/proc/sys/user/max_user_namespaces”设置。
+**九、总结**
+就目前而言，（从安全角度来看）Linux内核中存在大量没有经过完善测试的接口，其中很多接口在诸如Ubuntu等流行的Linux发行版中处于启用状态，并且向非特权用户开放。这种现象显然是不好的，我们需要好好测试或者进一步限制这些接口。
+Syzkaller是个令人惊奇的工具，允许我们对内核接口进行模糊测试。我们甚至可以为其他系统调用添加准系统（barebone）描述信息，这样通常也能发现许多bug。由于内核中还有许多地方没有覆盖到（可能会有一大堆安全漏洞存在于内核中），我们因此也需要大家一起协作，编写系统调用描述信息，对已有的问题进行修复。我们非常乐意看到读者通过发起代码的pull请求，贡献自己的一份力。
+**十、参考链接**
+相应的参考链接为：
+利用代码：
+修复代码：
+CVE编号：
+我们用来查找Linux内核错误的工具为：
+syzkaller：
+KASAN：
+KTSAN：
+KMSAN：https://github.com/google/kmsan
+已整理的Linux内核漏洞利用资料：

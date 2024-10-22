@@ -1,0 +1,278 @@
+## 索引顺序扫描引发的堆扫描IO放大背后的统计学原理与解决办法 - PostgreSQL index scan enlarge heap page scans when index and column correlation small.   
+### 作者                                
+digoal                                
+### 日期                                
+2014-04-26                               
+### 标签                                
+PostgreSQL , 优化器 , 索引扫描 , 堆扫描 , IO放大   
+----                                
+## 背景                   
+通过B-TREE索引扫描可能会带来了巨大的heap page scan数目，即IO的放大.  
+为什么呢？  
+请接下去看完本文揭晓答案。  
+IO放大的后果：  
+如果数据库的单个数据块（block_size）很大的话, 这种情况带来的负面影响也将被放大. 例如32k的block_size显然比8k的block_size扫描开销更大.  
+本文将讲解一下索引扫描引发的heap page scan放大的原因, 以及解决办法。 告诫大家注意这样的事情发生，以及如何对付。    
+## 正文  
+测试环境的成本因子如下 :   
+```  
+shared_buffers = 8192MB                 # min 128kB  
+#seq_page_cost = 1.0                    # measured on an arbitrary scale  
+random_page_cost = 1.0                  # same scale as above  
+#cpu_tuple_cost = 0.01                  # same scale as above  
+cpu_index_tuple_cost = 0.005            # same scale as above  
+#cpu_operator_cost = 0.0025             # same scale as above  
+effective_cache_size = 96GB  
+```  
+我们先创建一个测试表, 插入一些测试数据, 创建一个索引 :   
+```  
+digoal=> create table test_indexscan(id int, info text);  
+CREATE TABLE  
+digoal=> insert into test_indexscan select generate_series(1,5000000),md5(random()::text);  
+INSERT 0 5000000  
+digoal=> create index idx_test_indexscan_id on test_indexscan (id);  
+CREATE INDEX  
+```  
+我们查看这个表和索引占用了多少数据块.  
+```  
+digoal=> select relpages from pg_class where relname='test_indexscan';  
+ relpages   
+----------  
+    10396  
+(1 row)  
+digoal=> select relpages from pg_class where relname='idx_test_indexscan_id';  
+ relpages   
+----------  
+     3402  
+(1 row)  
+```  
+接下来分析以下查询, 我们看到走索引扫描, 并且扫描的数据块是13547个. (10209 +3338).  
+扫描的数据块和实际表占用的数据块和索引块相当.  
+```  
+digoal=> explain (analyze,verbose,costs,buffers,timing) select * from test_indexscan where id>90000;  
+                                                                           QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------------------------------  
+-----------------------------  
+ Index Scan using idx_test_indexscan_id on digoal.test_indexscan  (cost=0.43..99518.57 rows=4912065 width=37) (actual time=0.180..21  
+72.949 rows=4910000 loops=1)  
+   Output: id, info  
+   Index Cond: (test_indexscan.id > 90000)  
+   Buffers: shared hit=10209 read=3338  
+ Total runtime: 2674.637 ms  
+(5 rows)  
+```  
+这里使用索引扫描为什么没有带来heap page扫描的放大呢? 原因和值的顺序与物理存储顺序一致.  
+如下, 那么索引扫描的时候没有发生块的跳跃 :   
+```  
+digoal=> select correlation from pg_stats where tablename='test_indexscan' and attname='id';  
+ correlation   
+-------------  
+  1  
+(1 row)  
+digoal=> select ctid,id from test_indexscan limit 10;  
+  ctid  |   id      
+--------+---------  
+ (0,1)  | 1  
+ (0,2)  | 2  
+ (0,3)  | 3  
+ (0,4)  | 4  
+ (0,5)  | 5  
+ (0,6)  | 6  
+ (0,7)  | 7  
+ (0,8)  | 8  
+ (0,9)  | 9  
+ (0,10) | 10  
+(10 rows)  
+```  
+接下来我们插入随机数据, 使得索引扫描时发生heap page的跳跃.  
+```  
+digoal=> truncate test_indexscan ;  
+TRUNCATE TABLE  
+digoal=> insert into test_indexscan select (random()*5000000)::int,md5(random()::text) from generate_series(1,100000);  
+INSERT 0 100000  
+```  
+查询当前的ID列的顺性, 非常小, 说明这个值非常的离散.  
+```  
+digoal=> select correlation from pg_stats where tablename='test_indexscan' and attname='id';  
+ correlation   
+-------------  
+  0.00986802  
+(1 row)  
+```  
+从数据分布结果中也能看到这点.  
+```  
+digoal=> select ctid,id from test_indexscan limit 10;  
+  ctid  |   id      
+--------+---------  
+ (0,1)  | 4217216  
+ (0,2)  | 2127868  
+ (0,3)  | 2072952  
+ (0,4)  |   62641  
+ (0,5)  | 4927312  
+ (0,6)  | 3000894  
+ (0,7)  | 2799439  
+ (0,8)  | 4165217  
+ (0,9)  | 2446438  
+ (0,10) | 2835211  
+(10 rows)  
+```  
+按以下顺序扫描, 显然会出现大量的数据块的跳跃.  
+```  
+digoal=> select id,ctid from test_indexscan order by id limit 10;  
+ id  |   ctid      
+-----+-----------  
+  56 | (192,318)  
+  73 | (119,163)  
+ 218 | (189,2)  
+ 235 | (7,209)  
+ 260 | (41,427)  
+ 340 | (37,371)  
+ 548 | (118,363)  
+ 607 | (143,174)  
+ 690 | (161,38)  
+ 714 | (1,21)  
+(10 rows)  
+```  
+当前这个表和索引占用的数据块如下 :   
+```  
+digoal=> select relpages from pg_class where relname='test_indexscan';  
+ relpages   
+----------  
+      208  
+(1 row)  
+digoal=> select relpages from pg_class where relname='idx_test_indexscan_id';  
+ relpages   
+----------  
+       86  
+(1 row)  
+```  
+接下来我们执行这个SQL, 发现走索引扫描了, 但是显然shared hit变得非常的大, 原因就是每扫描一个索引条目, 对应到heap page number都是跳跃的. 造成了heap page扫描的放大. 具体放大多少行呢, 和差出来的行差不多.  
+```  
+digoal=> explain (analyze,verbose,costs,buffers,timing) select * from test_indexscan where id>90000;  
+                                                                        QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------------------------  
+----------------------  
+ Index Scan using idx_test_indexscan_id on digoal.test_indexscan  (cost=0.29..2035.38 rows=99719 width=37) (actual time=0.027..87.45  
+6 rows=98229 loops=1)  
+   Output: id, info  
+   Index Cond: (test_indexscan.id > 90000)  
+   Buffers: shared hit=97837  
+ Total runtime: 97.370 ms  
+(5 rows)  
+```  
+heap page scan放大评估和索引扫描了多少条目有关, 但至少有98229个条目 :   
+```  
+digoal=> select count(*) from test_indexscan where id>90000;  
+ count   
+-------  
+ 98229  
+(1 row)  
+```  
+如果纯随机扫描, 那么将要扫描98229次heap page. 也就不难理解这里的Buffers: shared hit=97837.  
+但是实际上, PostgreSQL的优化器似乎没有关注这些开销, 因为我们看到的成本只有2035.38  (这里和random_page_cost以及effective_cache_size 大于整个表和索引的空间有关)  
+接下来把random_page_cost设置为2和1, 两个cost相减, 看看到底优化器评估了多少个块扫描.  
+```  
+digoal=> set random_page_cost=2;  
+SET  
+digoal=> set enable_seqscan=off;  
+SET  
+digoal=> explain (analyze,verbose,costs,buffers,timing) select * from test_indexscan where id>90000;  
+                                                                        QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------------------------  
+----------------------  
+ Index Scan using idx_test_indexscan_id on digoal.test_indexscan  (cost=0.29..2305.73 rows=98255 width=37) (actual time=0.045..81.76  
+8 rows=98229 loops=1)  
+   Output: id, info  
+   Index Cond: (test_indexscan.id > 90000)  
+   Buffers: shared hit=97837  
+ Total runtime: 92.186 ms  
+(5 rows)  
+digoal=> set random_page_cost=1;  
+SET  
+digoal=> explain (analyze,verbose,costs,buffers,timing) select * from test_indexscan where id>90000;  
+                                                                        QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------------------------  
+----------------------  
+ Index Scan using idx_test_indexscan_id on digoal.test_indexscan  (cost=0.29..2012.75 rows=98255 width=37) (actual time=0.028..80.05  
+5 rows=98229 loops=1)  
+   Output: id, info  
+   Index Cond: (test_indexscan.id > 90000)  
+   Buffers: shared hit=97837  
+ Total runtime: 90.549 ms  
+(5 rows)  
+```  
+相减得到293, 即优化器认为index scan需要扫描293个数据块.  
+```  
+digoal=> select 2305-2012;  
+ ?column?   
+----------  
+      293  
+(1 row)  
+```  
+接下来我把enable_indexscan关闭, 让优化器选择bitmap scan.  
+```  
+digoal=> set enable_indexscan=off;  
+SET  
+digoal=> explain (analyze,verbose,costs,buffers,timing) select * from test_indexscan where id>90000;  
+                                                                QUERY PLAN                                                            
+------------------------------------------------------------------------------------------------------------------------------------  
+ Bitmap Heap Scan on digoal.test_indexscan  (cost=846.77..2282.96 rows=98255 width=37) (actual time=15.291..35.911 rows=98229 loops=  
+1)  
+   Output: id, info  
+   Recheck Cond: (test_indexscan.id > 90000)  
+   Buffers: shared hit=292  
+   ->  Bitmap Index Scan on idx_test_indexscan_id  (cost=0.00..822.21 rows=98255 width=0) (actual time=15.202..15.202 rows=98229 loo  
+ps=1)  
+         Index Cond: (test_indexscan.id > 90000)  
+         Buffers: shared hit=84  
+ Total runtime: 45.838 ms  
+(8 rows)  
+```  
+从bitmap scan的结果可以看到, 实际扫描的块为292个, 相比index scan少扫描了9.7万多数据块. 并且实际的执行时间也是bitmap scan要快很多.  
+本例PostgreSQL在计算index scan的random page的成本时, 评估得到的index scan成本小于bitmap index scan的成本, 然而实际上当correlation 很小时, index scan会扫描更多次的heap page, 成本远远大于bitmap scan.   
+本例发生这样的情况, 具体的原因和我们的成本因子设置有关系, 因为错误的设置了random_page_cost以及表和索引的大小小于effective_cache_size, PostgreSQL在使用这样的成本因子计算成本时, 出现了bitmap scan大于index scan成本的结果.  
+所以设置正确的成本因子非常重要, 这也是我们需要校准成本因子的原因.  
+例子 :   
+```  
+[postgres@digoal pgdata]$ psql  
+psql (9.3.4)  
+Type "help" for help.  
+```  
+默认的成本因子如下  
+```  
+digoal=# show seq_page_cost;  
+ seq_page_cost   
+---------------  
+ 1  
+(1 row)  
+digoal=# show random_page_cost;  
+ random_page_cost   
+------------------  
+ 4  
+(1 row)  
+digoal=# show cpu_tuple_cost;  
+ cpu_tuple_cost   
+----------------  
+ 0.01  
+(1 row)  
+digoal=# show cpu_index_tuple_cost;  
+ cpu_index_tuple_cost   
+----------------------  
+ 0.005  
+(1 row)  
+digoal=# show cpu_operator_cost;  
+ cpu_operator_cost   
+-------------------  
+ 0.0025  
+(1 row)  
+digoal=# show effective_cache_size;  
+ effective_cache_size   
+----------------------  
+ 128MB  
+(1 row)  
+```  
+表和索引的大小如下  
+```  
+digoal=# \dt+ tbl_cost_align   
+                         List of relations  
+ Schema |      Name      | Type  |  Owner   |  Size  | Description   

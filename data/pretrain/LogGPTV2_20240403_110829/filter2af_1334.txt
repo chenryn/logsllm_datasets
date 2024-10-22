@@ -1,0 +1,42 @@
+# 从UEFI模块的动态仿真到覆盖率导向的UEFI固件模糊测试（一）
+##### 译文声明
+本文是翻译文章，文章原作者 Assaf Carlsbad，文章来源：sentinelone.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+在本文中，我们将为读者详细介绍覆盖率导向的UEFI固件模糊测试技术。
+## 引言
+欢迎阅读我们关于UEFI安全、模糊测试和漏洞利用系列文章的第三篇。在本系列的第一篇文章中，我们简要回顾了将SPI闪存转储到磁盘并提取组成UEFI固件的二进制文件的现有工具和技术。在第二篇文章中，我们变身逆向工程，开始着手分析UEFI模块：首先利用流行的RE平台上的各种插件进行了静态分析，然后通过QLING软件模拟UEFI环境进行了相应的动态分析。
+对于本文介绍的内容来说，很大程度上是建立在前面两篇文章的基础之上的，所以，如果您还没有读过它们，或者觉得需要复习一下，请在继续阅读下文之前，请返回头来阅读前面的文章，并确保已经很好地理解了其中的核心概念。在这一篇文章中，我们将实现这几个月来一直在努力奋斗的目标：为UEFI代码打造一个覆盖率导向的Fuzzer。
+实际上，阅读本文后，您就会发现这里介绍的这款Fuzzer不仅便于使用，而且非常有效，最重要的是，它非常值得信赖。
+## 分析UEFI的攻击面
+在对UEFI模块进行模糊测试之前，我们首先要分析一下UEFI模块的攻击面。当然，进行这种分析的最终目标，就是从较低特权的上下文（理想情况下是操作系统）中找到一些影响UEFI模块执行流的“原语”。由于我们感兴趣的特定操作系统的特性会有很大差异，因此，有时候寻找这样的原语可能会变得相当棘手。例如，Windows的理念是在运行时限制对UEFI服务进行访问，而优先考虑操作系统的本地驱动程序，然后是ACPI运行时支持。然而，每个规则都有例外，这种情况也是如此。为了更好地探讨这个话题，我们首先得讲一下UEFI
+NVRAM变量。
+简单地说，NVRAM变量是UEFI模块用于在启动周期中持久化配置数据的关键机制之一。其中，一些变量（例如与安全启动有关的变量，如db、dbx、PK、KEK等）是由UEFI标准规定的，而另一些变量则没有任何预先规定的含义，它们的用途由OEM决定。
+图1 UEFI规范定义的部分变量
+从上面的截图中可以看出，每个变量都是由一个人类可读的名称和一些属性组成。这些属性决定了变量是否是易失性的（NV），是否可以在运行时访问（BS，RT），以及对变量的访问是否应进行身份验证（AT）。虽然没有明文规定，但每个变量也被链接到一个唯一的厂商GUID，以免出现潜在的名称冲突。
+实际上，NVRAM变量被存储在一些非易失性（惊不惊喜，意不意外）的内存区域，在大多数情况下，它们被存储在SPI闪存的BIOS区的一个专用卷上。
+图2 NVRAM的存储情况
+为了与NVRAM变量进行交互，UEFI标准定义了两个运行时服务：GetVariable()和SetVariable()。其中，服务GetVariable()的原型如下所示：
+    typedef EFI_STATUS(EFIAPI * EFI_GET_VARIABLE) (IN CHAR16 *VariableName, IN EFI_GUID *VendorGuid, OUT UINT32 *Attributes, OPTIONAL IN OUT UINTN *DataSize, OUT VOID *Data OPTIONAL)
+GetVariable()的工作原理是在NVRAM存储区域中搜索一个由(VariableName,
+VendorGuid)唯一标识的变量。如果找到了这样的变量，GetVariable()就会填写适当的Attributes、DataSize和Data参数；否则的话，则会向调用者返回一个错误。
+SetVariable()服务的对应的原型如下所示：
+    typedef EFI_STATUS(EFIAPI * EFI_SET_VARIABLE) (IN CHAR16 *VariableName, IN EFI_GUID *VendorGuid, IN UINT32 Attributes, IN UINTN DataSize, IN VOID *Data)
+SetVariable()的工作方式是创建或更新由(VariableName,
+VendorGuid)唯一标识的变量，然后根据参数DataSize和Data设置其内容，最后根据Attributes参数值更新其属性。
+从模糊测试的角度来看，NVRAM变量特别有吸引力，因为我们刚才列举的UEFI服务和底层操作系统公开的系统调用之间几乎存在一对一的映射。例如，Windows内核导出了ExGetFirmwareEnvironmentVariable和ExSetFirmwareEnvironmentVariable函数，供内核模式的驱动程序检索这些变量的内容，或者根据自己的需要修改它们。更令人惊讶的是，这个功能也可以提供给用户模式的应用程序(!)，只不过使用的API变成了GetFirmwareEnvironmentVariable和SetFirmwareEnvironmentVariable，并且这两个API都是从kernel32.dll导出的。
+图3
+SetFirmwareEnvironmentVariableA()的原型。请注意这个API和对应的UEFI服务SetVariable()之间的相似之处。
+需要指出的是，在这些变量中，虽然有些变量体积很小、结构简单（如布尔标志、计数器等），但有些变量则不仅体量很大，结构也非常复杂。例如，臭名昭著的Setup变量（通常用于汇总BIOS设置屏幕上的配置选项），在我们的测试系统上就是一个长度为4KB左右的二进制blob。知道这些变量的长度的变化范围后，就可以假设某些OEM对这些变量的内容进行了隐式假设，并且在尝试解析它们时可能存在安全漏洞。由于我们前面曾演示过这些变量的内容可以被运行权限较低的代码的攻击者控制（至少是部分控制），因此，这些变量就形成了一个很好的攻击面，换句话说，它们将是我们模糊测试的重点关注对象。
+图4 “Setup”变量通常是一个硕大的二进制blob，并且可以在运行时访问。这使其成为模糊测试的理想目标。
+实际上，对UEFI
+NVRAM变量进行模糊测试并不是一个全新的想法。在这一领域中，最有名的框架就是chipsec，早在2017年，该框架就实现了用于对UEFI变量进行模糊测试的模块。然而，如果您仔细检查源码的话，就会发现chipsec框架采用的方法和我们的方法之间还是有一些显著的差异的：
+  1. chipsec框架主要用于对SetVariable()本身的实现进行模糊测试。它的做法是利用经过突变处理的参数来反复调用该函数，这些突变的参数包括变量名、属性、GUID、数据、大小等。另一方面，我们对SetVariable()本身的模糊测试兴趣不大，而是更倾向于在读取、解析这些变量的内容以及以其他方式影响这些变量的UEFI模块中寻找漏洞。
+  2. chipsec框架实现了通常所说的dumb fuzzer，也就是不从被模糊测试的对象中获得任何反馈的fuzzer。反过来，该特性又阻碍了它智能地产生突变，因此，它能做的最好的事情就是随机翻转一些位，并期望某些被翻转的位能带来显著的影响。相比之下，我们的fuzzer能够利用AFL++记录的覆盖率信息，帮助引导突变过程，使其向更有前途的方向发展。
+  3. 除此之外，chipec框架的fuzzer需要在物理机器上运行，这样的话，这些机器就面临变“砖头”的风险。但是，当fuzzer运行在像Qiling这样的沙盒环境中时，这样的危险显然是不存在的。
+尽管存在上述缺点，chipec框架中的fuzzer仍然是一个非常有价值的工具；若要运行该fuzzer，只需运行如下所示的命令即可（务必要小心！）：
+    chipsec_main.py -m tools.uefi.uefivar_fuzz -a name,1,123456789,94
+图5 使用chipec对UEFI变量进行模糊测试
+## 小结
+在这里，我们对UEFI的攻击面进行了全面的分析，接下来，我们将为读者介绍内存池Sanitizer。
+**（未完待续）**

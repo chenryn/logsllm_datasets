@@ -1,0 +1,179 @@
+      slirp = 0x55dd677c6bd0,
+      resolution_requested = 0x0,
+      expiration_date = 0xffffffffffffffff,
+      m_ext = 0x0,
+      m_dat = 0x55dd67fd0460 ""
+    }
+拷贝结束，`sb_wptr`等指针都往后移动了（`sb_data`是大小为`0x2240`的堆块），但是`sb_cc`却没有变化：
+    pwndbg> print *so_rcv
+    $3 = {
+      sb_cc = 0x0,
+      sb_datalen = 0x2238,
+      sb_wptr = 0x7f46001d5230 "",
+      sb_rptr = 0x7f46001d5230 "",
+      sb_data = 0x7f46001d4d30 'A' ...
+    }
+    pwndbg> vmmap 0x7f46001d4d30
+    LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+        0x7f4600000000     0x7f46007b1000 rw-p   7b1000 0
+    pwndbg> x/6gx 0x7f46001d4d30-0x10
+    0x7f46001d4d20: 0x0000000000000000      0x0000000000002245
+    0x7f46001d4d30: 0x4141414141414141      0x4141414141414141
+    0x7f46001d4d40: 0x4141414141414141      0x4141414141414141
+多发送几次将会造成溢出，导致崩溃，漏洞分析结束。
+## 漏洞利用
+程序保护机制基本上全都开了：
+    pwndbg> checksec
+    [*] '/home/raycp/work/qemu_escape/created/qemu-system-x86_64'
+        Arch:     amd64-64-little
+        RELRO:    Full RELRO
+        Stack:    Canary found
+        NX:       NX enabled
+        PIE:      PIE enabled
+要想实现任意代码执行，首先需要信息泄露得到程序基址等信息；然后需要利用堆溢出控制程序执行流程。整个漏洞利用包含四个部分需要进行解析：
+  * malloc原语。
+  * 任意地址写。
+  * 信息泄露。
+  * 控制程序执行流程。
+### malloc原语
+因为漏洞是堆溢出，而qemu中堆的排布复杂，因此需要找到一个`malloc`的方式，将堆内存清空，使得堆的申请都是从`top
+chunk`中分配，这样堆的排布就是可控和预测的了。可以利用`IP`分片在`slirp`中的实现来构造malloc原语。
+在TCP/IP分层中，数据链路层用MTU（Maximum Transmission
+Unit，最大传输单元）来限制所能传输的数据包大小。当发送的IP数据报的大小超过了MTU时，IP层就需要对数据进行分片，否则数据将无法发送成功。
+IP数据报文格式如下所示，其中`Flags`与`Fragment Offset`字段用于满足这一需求：
+  * Zero (1 bit)，为0，不使用。
+  * Do not fragment flag (1 bit)，表示这个packet是否为分片的。
+  * More fragments following flag (1 bit)，表示这是后续还有没有包，即此包是否为分片序列中的最后一
+  * Fragmentation offset (13 bits)，表示此包数据在重组时的偏移。
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |Version|  IHL  |Type of Service|          Total Length         |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |         Identification        |Flags|      Fragment Offset    |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |  Time to Live |    Protocol   |         Header Checksum       |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                       Source Address                          |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                    Destination Address                        |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                    Options                    |    Padding    |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+去看ip切片在该模块中的相应实现，源码如下：
+    void
+    ip_input(struct mbuf *m)
+    {
+        ...
+      /*
+         * If offset or IP_MF are set, must reassemble.
+         * Otherwise, nothing need be done.
+         * (We could look in the reassembly queue to see
+         * if the packet was previously fragmented,
+         * but it's not worth the time; just let them time out.)
+         *
+         * XXX This should fail, don't fragment yet
+         */
+        if (ip->ip_off &~ IP_DF) {
+          register struct ipq *fp;
+          struct qlink *l;
+            /*
+             * Look for queue of fragments
+             * of this datagram.
+             */
+            for (l = slirp->ipq.ip_link.next; l != &slirp->ipq.ip_link;
+                 l = l->next) {
+                fp = container_of(l, struct ipq, ip_link);
+                if (ip->ip_id == fp->ipq_id &&
+                        ip->ip_src.s_addr == fp->ipq_src.s_addr &&
+                        ip->ip_dst.s_addr == fp->ipq_dst.s_addr &&
+                        ip->ip_p == fp->ipq_p)
+                goto found;
+            }
+            fp = NULL;
+        found:
+            ip->ip_len -= hlen;
+            if (ip->ip_off & IP_MF)
+              ip->ip_tos |= 1;
+            else
+              ip->ip_tos &= ~1;
+            ip->ip_off ip_tos & 1 || ip->ip_off) {
+                ip = ip_reass(slirp, ip, fp);
+                            if (ip == NULL)
+        ...
+    }
+    static struct ip *
+    ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp)
+    {
+      ...
+        /*
+         * If first fragment to arrive, create a reassembly queue.
+         */
+            if (fp == NULL) {
+          struct mbuf *t = m_get(slirp)
+            }
+        ...
+    }
+    #define SLIRP_MSIZE\
+        (offsetof(struct mbuf, m_dat) + IF_MAXLINKHDR + TCPIPHDR_DELTA + IF_MTU)
+    struct mbuf *
+    m_get(Slirp *slirp)
+    {
+        register struct mbuf *m;
+        int flags = 0;
+        DEBUG_CALL("m_get");
+        if (slirp->m_freelist.qh_link == &slirp->m_freelist) {
+                    m = g_malloc(SLIRP_MSIZE);
+        ...
+    }
+可以看到在`ip_input`函数中，当`ip->ip_off`没有`IP_DF`标志位时（表示被切片），会在当前的链表中寻找之前是否已经存在相应数据包，如果没有找到则会将`fp`置为`null`，否则则为相应的数据包的链表。接着调用`ip_reass`，当fp为`null`时，表明它是相应数据流的第一个切片数据包，会调用`m_get`函数为其分配一个`struct
+mbuf`，大小size为`SLIRP_MSIZE`（0x668)，所以最终分配出来的堆块大小为0x670并将其一直挂在链表队列中。
+    pwndbg> print m
+    $5 = (struct mbuf *) 0x55b61423f5e0
+    pwndbg> x/6gx 0x55b61423f5e0
+    0x55b61423f5e0: 0x00007f17d9bec190      0x00007f17d9bec190
+    0x55b61423f5f0: 0x000055b61423f5d0      0x000055b61423f5d0
+    0x55b61423f600: 0x0000000000000000      0x0000000000000000
+    pwndbg> x/6gx 0x55b61423f5e0-0x10
+    0x55b61423f5d0: 0x000b000b000b000b      0x0000000000000671
+    0x55b61423f5e0: 0x00007f17d9bec190      0x00007f17d9bec190
+    0x55b61423f5f0: 0x000055b61423f5d0      0x000055b61423f5d0
+因此我们可以构造数据包，使其`ip->ip_off`没有`IP_DF`标志位，则可以申请出来`0x670`大小的堆块，实现了malloc原语的构造。
+### 任意地址写
+可以利用堆溢出构造出任意地址写的功能，以为泄露地址与控制程序执行流服务。
+任意地址写的构造主要是基于堆溢出，以及`ip_reass`这个函数，关键代码如下：
+    void
+    ip_input(struct mbuf *m)
+    {
+        ...
+      /*
+         * If offset or IP_MF are set, must reassemble.
+         * Otherwise, nothing need be done.
+         * (We could look in the reassembly queue to see
+         * if the packet was previously fragmented,
+         * but it's not worth the time; just let them time out.)
+         *
+         * XXX This should fail, don't fragment yet
+         */
+        if (ip->ip_off &~ IP_DF) {
+          register struct ipq *fp;
+          struct qlink *l;
+            /*
+             * Look for queue of fragments
+             * of this datagram.
+             */
+            for (l = slirp->ipq.ip_link.next; l != &slirp->ipq.ip_link;
+                 l = l->next) {
+                fp = container_of(l, struct ipq, ip_link);
+                if (ip->ip_id == fp->ipq_id &&
+                        ip->ip_src.s_addr == fp->ipq_src.s_addr &&
+                        ip->ip_dst.s_addr == fp->ipq_dst.s_addr &&
+                        ip->ip_p == fp->ipq_p)
+                goto found;
+            }
+            fp = NULL;
+        found:
+            ip->ip_len -= hlen;
+            if (ip->ip_off & IP_MF)
+              ip->ip_tos |= 1;
+            else

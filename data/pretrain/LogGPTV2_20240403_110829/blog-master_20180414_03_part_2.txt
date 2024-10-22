@@ -1,0 +1,151 @@
+create index idx_car_pos_pc_2 on car using gist(pos) where rest_sites=2;  
+create index idx_car_pos_pc_3 on car using gist(pos) where rest_sites=3;  
+create index idx_car_pos_pc_4 on car using gist(pos) where rest_sites=4;  
+create index idx_car_pos_pc_5 on car using gist(pos) where rest_sites>4;  
+create index idx_car_pos_pc_6 on car using gist(pos) where rest_sites is null;  
+CREATE OR REPLACE FUNCTION public.f_isbulk(i_pos geometry, i_poss geometry[])
+ RETURNS int
+ LANGUAGE plpgsql
+ STRICT
+AS $function$  
+declare  
+  vspheroid spheroid := 'SPHEROID["WGS84",6378137,298.257223563]' ;  -- WGS84椭球体参数定义  
+begin  
+  -- 先使用最简单的算法，例如任意已有乘客目的地与当前请求目的地距离在2000米以内则返回TRUE，允许拼车  
+  -- 测试时，建议把允许的拼车目的地距离调大一点，否则可能很难找到合适的车辆  
+  perform 1 from unnest(i_poss) t(pos) where ST_DistanceSpheroid(i_pos, pos, vspheroid)  pos for update limit 1;               -- 根据距离排序，以上条件满足，锁定1条即可  
+      -- 如果有符合条件的车辆，则退出 case
+      if found then  
+        exit; 
+      end if;  
+    end loop;
+    -- 如果有符合条件的车辆，则退出 case
+    if not found then  
+      -- 4个座位内都没有找到符合条件的车辆, 找剩余座位大于4个的 
+      select id,pos into v_carid,v_pos from car where   
+        rest_sites > 4                                            -- 剩余座位数等于请求座位数 (或大于, loop超过i_sites时)
+        and coalesce(f_isbulk(i_pos2, order_pos),1)=1                           -- 目的地满足拼车条件        
+	and ST_DistanceSpheroid(i_pos1, pos, vspheroid)  pos for update limit 1;               -- 根据距离排序，以上条件满足，锁定1条即可  
+      -- 如果有符合条件的车辆，则退出 case 
+      if not found then  
+        -- 大于4个座位的车辆没有，则找刚注册的车辆，即rest_sites is null
+        select id,pos into v_carid,v_pos from car where   
+          rest_sites is null                                        -- 剩余座位数等于请求座位数 (或大于, loop超过i_sites时)
+	  and ST_DistanceSpheroid(i_pos1, pos, vspheroid)  pos for update limit 1;               -- 根据距离排序，以上条件满足，锁定1条即可  
+      end if;
+    end if;
+  -- 请求座位数大于4
+  else
+    -- 4个座位内都没有找到符合条件的车辆, 找剩余座位大于4个的 
+    select id,pos into v_carid,v_pos from car where   
+      rest_sites > 4                                            -- 剩余座位数等于请求座位数 (或大于, loop超过i_sites时)
+      and coalesce(f_isbulk(i_pos2, order_pos),1)=1                          -- 目的地满足拼车条件      
+      and ST_DistanceSpheroid(i_pos1, pos, vspheroid)  pos for update limit 1;               -- 根据距离排序，以上条件满足，锁定1条即可  
+    -- 如果有符合条件的车辆，则退出 case 
+    if not found then  
+      -- 大于4个座位的车辆没有，则找刚注册的车辆，即rest_sites is null
+      select id,pos into v_carid,v_pos from car where   
+        rest_sites is null                                        -- 剩余座位数等于请求座位数 (或大于, loop超过i_sites时)
+        and ST_DistanceSpheroid(i_pos1, pos, vspheroid)  pos for update limit 1;               -- 根据距离排序，以上条件满足，锁定1条即可  
+    end if;
+  end case;
+  if not found then
+    -- raise notice 'no car near your pos, the car leave you % meters', ST_DistanceSpheroid(i_pos1, v_pos, vspheroid);  
+    return -1;
+  end if;
+  -- 更新车辆状态  
+  update car set   
+    rest_sites=coalesce(rest_sites-i_sites, sites-i_sites),         -- 减少剩余座位  
+    order_pos=coalesce(order_pos||i_pos2, array[i_pos2])            -- 将目的地追加到车辆所有目的地中  
+    where id=v_carid    
+    and coalesce(rest_sites-i_sites, sites-i_sites) >= 0  
+    returning id into v_carid;         -- 返回车辆ID  
+  if found then  
+  -- 生成订单  
+  insert into orders (carid, uid, crt_time, pos1, pos2, sites, status)   
+    values(v_carid, i_uid, now(), i_pos1, i_pos2, i_sites, 2)   -- 状态为进行中  
+    returning id into v_orderid;  -- 返回订单号  
+  else  
+    return -2;  
+  end if;  
+  return v_orderid;  
+end;  
+$$ language plpgsql strict; 
+```
+5、选择不拼车的用户，使用以下函数生成订单，返回订单号，车辆ID，等  
+```  
+create or replace function getcar(  
+  i_uid int8,        -- 用户ID  
+  i_pos1 geometry,   -- 上车位置  
+  i_pos2 geometry    -- 目的地  
+) returns int8 as $$  -- 返回订单号  
+declare  
+  v_car_ctid tid;  -- car表被请求到的CAR的记录行号  
+  v_carid int;     -- carid  
+  v_orderid int8;  -- 订单号  
+  v_sites int2;    -- 座位数  
+  v_pos geometry;  -- 锁定的车辆位置  
+  vspheroid spheroid := 'SPHEROID["WGS84",6378137,298.257223563]' ;  -- WGS84椭球体参数定义  
+begin  
+  set local enable_seqscan=off;  
+  set local enable_bitmapscan=off;  
+  -- 根据条件锁定车辆ID，同时使用了try advisory lock避免行锁冲突  
+  -- 与秒杀方法类似，大幅度提高吞吐，PG中锁定单条记录的吞吐可以达到将近 30万tps  
+  select ctid,pos into v_car_ctid,v_pos from car where   
+    (rest_sites=sites or rest_sites is null)                  -- 剩余座位数等于能提供的座位数，说明没有订单在手，满足不拼车需求  
+    and pg_try_advisory_xact_lock(id)                         -- adlock，提高秒杀吞吐  
+    order by i_pos1  pos for update limit 1;               -- 根据距离排序，以上条件满足，锁定1条即可  
+  -- 如果车辆位置超出一定公里数(比如5公里)，直接返回，不生成订单  
+  -- 测试时，建议把公里数调大，便于找到车辆  
+  -- if not found or ST_DistanceSpheroid(i_pos1, v_pos, vspheroid) > 5000 then  
+  if not found or ST_DistanceSpheroid(i_pos1, v_pos, vspheroid) > 500000000 then  
+    -- raise notice 'no car near your pos, the car leave you % meters', ST_DistanceSpheroid(i_pos1, v_pos, vspheroid);  
+    return -1;  
+  end if;  
+  -- 更新车辆状态  
+  update car set   
+    rest_sites=0                      -- 剩余座位减少为0  
+    where ctid=v_car_ctid                
+    returning id,sites into v_carid,v_sites;        -- 返回车辆ID  
+  -- 生成订单  
+  insert into orders (carid, uid, crt_time, pos1, pos2, sites, status)   
+    values(v_carid, i_uid, now(), i_pos1, i_pos2, v_sites, 2)    -- 状态为进行中  
+    returning id into v_orderid;                 -- 返回订单号  
+  return v_orderid;  
+end;  
+$$ language plpgsql strict;  
+```  
+### 6、结束订单，取消订单  
+1、更新订单状态，更新车辆剩余座位，删除拼车已到达的目的地  
+```  
+create or replace function change_order(  
+  i_id int8,     -- 订单ID  
+  i_status int2  -- 状态, 进行中2，取消1，结束0   
+) returns int as $$  
+declare  
+  i_carid int;  
+  i_pos geometry;  
+  i_sites int2;  
+begin  
+  set local enable_seqscan=off;  
+  set local enable_bitmapscan=off;    
+  update orders set status=i_status where id=i_id and status<>0 returning carid, pos2, sites into i_carid, i_pos, i_sites;  
+  if found then  
+    update car set rest_sites=rest_sites+i_sites, order_pos=array_remove(order_pos, i_pos) where id=i_carid and pg_try_advisory_xact_lock(id);  
+    -- 测试时加上这段，因为不存在锁冲突  
+    if not found then  
+      raise EXCEPTION '';  
+    end if;  
+    return 1;  
+  end if;  
+  raise EXCEPTION '';  
+  exception when others then  
+    return -1;  
+end;  
+$$ language plpgsql strict;  
+```  
+### 7、压测  
+创建一个函数，生成打车时，用户上车的随机位置，用于压测  
+```  
+create or replace function gen_pos() returns geometry as $$  
+  select ST_SetSRID(ST_Point(round((random()*(120-110)+110)::numeric,6), round((random()*(30-25)+25)::numeric,6)), 4326);  

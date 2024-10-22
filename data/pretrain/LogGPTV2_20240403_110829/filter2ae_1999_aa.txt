@@ -1,0 +1,126 @@
+[CVE-2019-14378](https://access.redhat.com/security/cve/cve-2019-14378)是在QEMU网络后端中发现的一个指针计算错误漏洞，当重新组装大型IPv4分段数据包以进行处理时，就会触发该漏洞。在本文中，我们将对该漏洞的本身及其利用方法进行详细的介绍。
+## [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Vulnerability-Details "Vulnerability Details")漏洞详情
+QEMU内部网络功能分为两部分：
+  * 提供给客户机的虚拟网络设备（例如PCI网卡）。
+  * 与模拟NIC交互的网络后端（例如，将数据包推送至宿主机的网络）。
+默认情况下，QEMU会为guest虚拟机创建SLiRP用户网络后端和适当的虚拟网络设备（例如e1000 PCI卡）
+实际上，本文介绍的漏洞是在SLiRP中的数据包重组代码中发现的。
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#IP-fragmentation "IP fragmentation")IP分段
+>
+> IP协议在传输数据包时,将数据包分为若干分段进行传输,并在目标系统中进行重组,这一过程称为IP分段(Fragmentation)。这么做的好处，就是分段后的数据包可以顺利通过最大传输单元（MTU）小于原始数据包大小的链路。
+    0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |Version|  IHL  |Type of Service|          Total Length         |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |         Identification        |Flags|      Fragment Offset    |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |  Time to Live |    Protocol   |         Header Checksum       |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                       Source Address                          |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                    Destination Address                        |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                    Options                    |    Padding    |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Flags "Flags:")分段标志位 :
+标志位的长度为3 bit
+  * Bit 0: 保留未用，必须为零
+  * Bit 1: (DF) 0 = 允许进行分段，1 = 不允许分段。
+  * Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.
+  * Fragment Offset: 13 bit
+    struct mbuf {
+        /* header at beginning of each mbuf: */
+        struct mbuf *m_next; /* Linked list of mbufs */
+        struct mbuf *m_prev;
+        struct mbuf *m_nextpkt; /* Next packet in queue/record */
+        struct mbuf *m_prevpkt; /* Flags aren't used in the output queue */
+        int m_flags; /* Misc flags */
+        int m_size; /* Size of mbuf, from m_dat or m_ext */
+        struct socket *m_so;
+        char *m_data; /* Current location of data */
+        int m_len; /* Amount of data in this mbuf, from m_data */
+        ...
+        char *m_ext;
+        /* start of dynamic buffer area, must be last element */
+        char m_dat[];
+    };
+``mbuf`结构用于存储接收到的IP层信息。该结构含有两个缓冲区，其中`m_dat`缓冲区位于结构内部，如果`m_dat`无法完整保存数据包，则在堆上分配`m_ext`缓冲区。
+进行NAT转换时，如果传入的数据包是分段的，那么，在编辑和重新传输之前首先需要进行重组。这个重组过程是由`ip_reass(Slirp *slirp,
+struct ip *ip, struct ipq *fp)`
+函数完成的。其中，`ip`用于存放当前IP数据包的数据，`fp`一个存放分段数据包的链接列表。
+  * ip_reass 将执行下列步骤： 
+    * 如果第一个分段到达（fp == NULL），则创建一个重组队列并将`ip`插入该队列。
+      * 检查该分段是否与先前收到的分段重复，如果重复的话，则将其丢弃。
+      * 如果收到了所有分段数据包，则对其进行重组。然后，为生成的新IP数据包创建一个新的头部，方法是修改第一个数据包的头部； 
+    /*
+     * Take incoming datagram fragment and try to
+     * reassemble it into whole datagram.  If a chain for
+     * reassembly of this datagram already exists, then it
+     * is given as fp; otherwise have to make a chain.
+     */
+    static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp)
+    {
+        ...
+        ...
+        /*
+         * Reassembly is complete; concatenate fragments.
+         */
+        q = fp->frag_link.next;
+        m = dtom(slirp, q);
+        q = (struct ipasfrag *)q->ipf_next;
+        while (q != (struct ipasfrag *)&fp->frag_link) {
+            struct mbuf *t = dtom(slirp, q);
+            q = (struct ipasfrag *)q->ipf_next;
+            m_cat(m, t);
+        }
+        /*
+         * Create header for new ip packet by
+         * modifying header of first packet;
+         * dequeue and discard fragment reassembly header.
+         * Make header visible.
+         */
+        q = fp->frag_link.next;
+        /*
+         * If the fragments concatenated to an mbuf that's
+         * bigger than the total size of the fragment, then and
+         * m_ext buffer was alloced. But fp->ipq_next points to
+         * the old buffer (in the mbuf), so we must point ip
+         * into the new buffer.
+         */
+        if (m->m_flags & M_EXT) {
+            int delta = (char *)q - m->m_dat;
+            q = (struct ipasfrag *)(m->m_ext + delta);
+        }
+本文介绍的漏洞位于计算变量delta的代码中。这些代码假定第一个分段数据包不会被分配到外部缓冲区（m_ext）中。当数据包数据位于`mbuf->m_dat`
+中时，`q -m->dat`计算是正确的（因为q位于m_dat缓冲区内；q是一个含有分段链接列表和数据包数据的结构）。否则，如果分配了`m_ext`缓冲区，那么q将被存放到外部缓冲区中，因此关于`delta`的计算将是错误的。
+    slirp/src/ip_input.c:ip_reass
+        ip = fragtoip(q);
+        ip->ip_len = next;
+        ip->ip_tos &= ~1;
+        ip->ip_src = fp->ipq_src;
+        ip->ip_dst = fp->ipq_dst;
+后来新计算的指针`q`被转换成`ip`结构并修改了其值。由于delta的计算是错误的，所以，`ip`将指向不正确的位置，而且`ip_src`和`ip_dst`可用于将受控数据写入计算得到的位置。如果计算出的ip位于未映射的内存空间中，这就可能会导致qemu发生崩溃。
+## [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Exploitation "Exploitation")漏洞利用
+我们面对的情况是：
+  * 如果我们能够控制`delta`，我们就能向m->m_ext处的内存空间写入受控数据。为此，我们需要精确地控制堆。
+  * 需要泄漏某些东东，以绕过ASLR保护机制。
+  * 堆上没有可用于实现代码执行的函数指针。因此，我们必须获取任意写操作权限。
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Controlling-Heap "Controlling Heap")控制堆
+让我们看看slirp是如何分配堆对象的。
+    // How much room is in the mbuf, from m_data to the end of the mbuf
+    #define M_ROOM(m)\
+        ((m->m_flags & M_EXT) ? (((m)->m_ext + (m)->m_size) - (m)->m_data) :\
+                                (((m)->m_dat + (m)->m_size) - (m)->m_data))
+    // How much free room there is
+    #define M_FREEROOM(m) (M_ROOM(m) - (m)->m_len)
+    slirp/src/slirp.c:slirp_input
+          m = m_get(slirp); // m_get return mbuf object, internally calls g_malloc(0x668)
+          ...
+          /* Note: we add 2 to align the IP header on 4 bytes,
+           * and add the margin for the tcpiphdr overhead  */
+          if (M_FREEROOM(m) ip_tos & 1 || ip->ip_off) {
+            ip = ip_reass(slirp, ip, fp);
+            if (ip == NULL)
+                return;
+    slirp/src/ip_input.c:ip_reass

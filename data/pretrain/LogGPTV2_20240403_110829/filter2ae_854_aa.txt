@@ -1,0 +1,81 @@
+本文是[A cache invalidation bug in Linux memory
+management](https://googleprojectzero.blogspot.com/2018/09/a-cache-invalidation-bug-in-linux.html)的翻译文章。
+# 前言
+本文介绍了一种利用从内核版本3.16以来就存在的Linux内核漏洞（CVE-2018-17182）的方法。
+虽然这个漏洞本身在代码中从相对较强的沙盒上下文也可以访问，但本文仅介绍在使用未配置为高安全性的Linux内核的环境中利用它的方法。 （具体来说是Ubuntu
+18.04与内核linux-image-4.15.0-34-generic，版本为4.15.0-34.37）。 这将演示内核配置如何影响利用内核漏洞的难度。
+漏洞报告和漏洞利用已提交到我们的issue tracker中（[issue
+1664](https://bugs.chromium.org/p/project-zero/issues/detail?id=1664)）
+该漏洞在较新的稳定版本4.18.9,4.14.71,4.9.128,4.4.157和3.16.58中修复。
+# The bug
+每当发生用户空间页错误时，比如当必须根据需要对页面进行分页时，Linux内核必须查找包含故障地址的VMA（虚拟内存区域; struct
+vm_area_struct）以确定处理故障的措施。而查找VMA的慢路径（在find_vma()中）必须走VMA的红黑树。
+为了减少性能损失，Linux还有一个快速路径，如果最近使用过VMA，它可以绕过该树来遍历。
+快速路径的实现也一直在变化。从[版本3.15](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=615d6e8756c87149f2d4c1b93d471bca002bd849)开始，Linux使用有四个插槽的per-thread VMA缓存，在mm/vmacache.c和include/linux/vmacache.h中实现。
+每当通过慢路径执行查找成功时，vmacache_update()会在数组current->
+vmacache.vmas中存储指向VMA的指针，从而允许下一次查找使用快速路径。
+请注意，VMA缓存是按线程进行的，但VMA与整个进程相关联（更准确地说，使用结构mm_struct;从现在开始，这种区别将在很大程度上被忽略，因为它与此漏洞无关）。
+因此，当释放VMA时，必须使所有线程的VMA高速缓存无效 - 否则，下一个VMA查找将指向空指针。
+但是，由于进程可以包含许多线程，因此只需遍历所有线程的VMA缓存就会出现性能问题。
+为了解决这个问题，struct mm_struct和per-thread的struct vmacache都标有序列号;
+当VMA查找快速路径在vmacache_valid()中发现current->vmacache.seqnum和current->mm->vmacache_seqnum不匹配时，它会擦除当前线程的VMA缓存的内容并更新其序列号。
+mm_struct和VMA缓存的序列号长度只有32位，这意味着它们可能会溢出。
+为了确保当current->mm->vmacache_seqnum实际增加232次时VMA缓存不能错误地显示为有效，vmacache_invalidate()（递增current->mm->vmacache_seqnum的帮助器）有一个特殊情况：
+当current->mm->vmacache_seqnum换行为零时，它会调用vmacache_flush_all()来擦除与current->mm关联的所有VMA缓存的内容。
+执行vmacache_flush_all()非常耗时：它会遍历整个机器上的每个线程，检查它与哪个struct
+mm_struct相关联，然后在必要时刷新线程的VMA缓存。
+在版本3.16中，添加了一个[优化](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=6b4ebc3a9078c5b7b8c4cf495a0b1d2d0e0bfe7a)：如果结构mm_struct仅与单个线程相关联，则vmacache_flush_all()将不执行任何操作，具体取决于每个VMA高速缓存失效之前是否进行VMA查找;
+因此，在单线程进程中，VMA缓存的序列号始终接近mm_struct的序列号：
+    /*
+    * 单线程任务无需迭代整个进程列表。 
+    * 我们也可以避免刷新，因为mm的seqnum增加了，不必担心其他线程的seqnum。
+    * 当前的刷新将在下次查找时发生。
+    */
+    if (atomic_read(&mm->mm_users) == 1)
+    return;
+但是，这种优化是不正确的，因为它没有考虑如果先前的单线程进程在mm_struct的序列号已经置零后立即创建新线程会发生什么。
+在这种情况下，第一个线程的VMA缓存的序列号仍然是0xffffffff，第二个线程可以再次驱动mm_struct的序列号到0xffffffff。
+此时，第一个线程的VMA缓存（可以包含空指针）将再次被视为有效，允许在第一个线程的VMA缓存中使用释放的VMA指针。
+这个漏洞的[修复](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm/vmacache.c?id=7a9cdebdcc17e426fb5287e4a82db1dfe86339b2)通过将序列号更改为64位，从而使溢出不可行，并删除溢出处理逻辑来实现。
+# 可达性和影响力
+从根本上说，这个漏洞可以由任何可以运行足够长时间来溢出引用计数器的进程触发（如果MAP_FIXED可用，则大约一个小时）并且能够使用mmap()/munmap()（管理内存映射）和clone()（创建一个线程）。这些系统调用不需要任何权限，即使在seccomp-sandboxed上下文中也经常允许使用它们，例如Chrome渲染器沙箱（[mmap](https://cs.chromium.org/chromium/src/sandbox/linux/seccomp-bpf-helpers/baseline_policy.cc?l=192)，[munmap](https://cs.chromium.org/chromium/src/sandbox/linux/seccomp-bpf-helpers/syscall_sets.cc?l=498&dr=C)，[clone](https://cs.chromium.org/chromium/src/sandbox/linux/seccomp-bpf-helpers/baseline_policy.cc?l=144)），主gVisor主机组件的[沙箱](https://github.com/google/gvisor/blob/master/runsc/boot/filter/config.go)以及Docker的[seccomp策略](https://github.com/moby/moby/blob/master/profiles/seccomp/seccomp_default.go)。
+为了简单起见，我的漏洞使用了各种其他内核接口，因此不仅仅是在这些沙箱内部工作;
+特别是，它使用/dev/kmsg读取dmesg日志，并使用eBPF阵列通过用户控制的，可变的单页分配来垃圾邮件内核的页面分配器。
+如果是愿意花更多时间来进行攻击的攻击者应该避免使用此类接口。
+有趣的是，看起来[Docker在其默认配置中不会阻止容器访问主机的dmesg日志](https://github.com/moby/moby/issues/37897)，如果内核允许普通用户访问dmesg
+-而容器中不存在/dev/kmsg，由于某种原因，[seccomp策略将syslog()系统调用列入白名单](https://github.com/moby/moby/blob/47dfff68e4365668279e235bf8c7778b637f2517/profiles/seccomp/seccomp_default.go#L325)。
+# BUG_ON(), WARN_ON_ONCE(),和dmesg
+首次use-after-free访问的功能是vmacache_find()。[首次添加此函数时](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm/vmacache.c?id=615d6e8756c87149f2d4c1b93d471bca002bd849)-在引入漏洞之前-它按如下方式访问VMA缓存：
+    for (i = 0; i vmacache[i];
+                  if (vma && vma->vm_start vm_end > addr) {
+                          BUG_ON(vma->vm_mm != mm);
+                          return vma;
+                  }
+          }
+当此代码遇到缓存的VMA，其边界包含提供的地址addr时，它检查VMA的vm_mm指针是否与预期的mm_struct匹配 -除非发生内存安全问题，否则应始终如此 - 如果没有，则以BUG_ON()断言失败而终止。
+BUG_ON()旨在处理内核线程检测到严重问题的情况，这些问题无法通过从当前上下文中消失来干净地处理。在默认的上游内核配置中，BUG_ON()通常会将带有寄存器转储的回溯打印到dmesg日志缓冲区，然后强制终止当前线程。  
+这有时会阻止系统的其余部分继续正常工作 - 例如，如果崩溃的代码持有一个重要的锁，那么任何试图获取该锁的其他线程将会死锁 -但它通常能成功地使系统的其余部分保持在合理可用的状态。 只有当内核检测到崩溃处于关键环境（例如中断处理程序）时，才会导致整个系统崩溃。
+相同的处理程序代码用于处理内核代码中的意外崩溃，例如页面错误和非白名单地址的一般保护错误：默认情况下，如果可能，内核将尝试仅终止有问题的线程。
+内核崩溃的处理是可用性，可靠性和安全性之间的权衡。
+系统所有者可能希望系统尽可能长时间地运行，即使让系统的某些部分崩溃。如果发生突然的内核恐慌则会导致重要服务的数据丢失或停机。
+同样，系统所有者也许希望在没有外部调试器的情况下调试实时系统上的内核错误; 如果在触发bug后整个系统终止，则可能更难以正确调试问题。  
+另一方面，企图利用内核漏洞的攻击者可能会获得在不触发系统重启的情况下多次尝试攻击的能力;
+并且当攻击者能够读取第一次攻击产生的崩溃日志时，甚至可以利用该信息进行更复杂的二次攻击。
+内核提供了两个可用于调整此行为的sysctl，具体取决于所需的权衡：
+  * 当BUG_ON()断言触发或内核崩溃时，kernel.panic_on_oops会自动导致内核崩溃; 可以使用构建配置变量CONFIG_PANIC_ON_OOPS配置其初始值。 默认情况下它在上游内核中是关闭的 - 默认情况下在分发中启用它可能是一个坏主意 - 但它就是（比如[由Android启用](https://android.googlesource.com/platform/system/core/+/fa14d21ca44377f2c70769b6ebb2cc28a65d53d7/rootdir/init.rc#118)）
+  * kernel.dmesg_restrict控制非root用户是否可以访问dmesg日志，其中包括内核崩溃的寄存器转储和堆栈跟踪; 可以使用构建配置变量CONFIG_SECURITY_DMESG_RESTRICT配置其初始值。 它在上游内核中默认关闭，但是可以由某些分发启用，比如[Debian](https://salsa.debian.org/kernel-team/linux/raw/master/debian/config/config)。 （Android依靠SELinux阻止访问dmesg。）
+举个例子，Ubuntu就无法实现这些功能。
+我们在提交的同一个月内对之前的代码进行了[修改](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm/vmacache.c?id=50f5aa8a9b248fa4262cf379863ec9a531b49737)：
+    for (i = 0; i vmacache[i];
+    -              if (vma && vma->vm_start vm_end > addr) {
+    -                          BUG_ON(vma->vm_mm != mm);
+    +              if (!vma)
+    +                          continue;
+    +              if (WARN_ON_ONCE(vma->vm_mm != mm))
+    +                          break;
+    +              if (vma->vm_start vm_end > addr)
+                               return vma;
+    -              }
+           }
+这个修改过的代码正在随Ubuntu这样的发行版发布中。
+这里的第一个变化是空指针的健全性检查在地址比较之前。 第二个更改更有趣：BUG_ON()替换为WARN_ON_ONCE()。

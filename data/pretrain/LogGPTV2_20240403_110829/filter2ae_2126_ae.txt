@@ -1,0 +1,271 @@
+        ...
+        @Override
+        public MethodVisitor visitMethod(int access, String name, String desc,
+                                         String signature, String[] exceptions) {
+            MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
+            ModelGeneratorMethodVisitor modelGeneratorMethodVisitor = new ModelGeneratorMethodVisitor(classMap,
+                    inheritanceMap, passthroughDataflow, serializableDecider, api, mv, this.name, access, name, desc, signature, exceptions);
+            return new JSRInlinerAdapter(modelGeneratorMethodVisitor, access, name, desc, signature, exceptions);
+        }
+        ...
+    }
+ModelGeneratorMethodVisitor的实现，是这一步的重点逻辑所在，因为单单文字描述可能理解不太清楚，我这边继续以一个例子进行讲解：
+    public class Main {
+      private String name;
+      public void main(String args) throws IOException {
+        new A().method1(args, name);
+      }
+    }
+    class A {
+      public String method1(String param, String param2) {
+        return param + param2;
+      }
+    }
+可以看到上述例子中，Main的main方法中，调用了A.main1方法，并且入参是main的参数args以及Main的字段name
+ASM的实现流程：
+  * 在Main.main方法体被观察到的第一时间，ASM会调用ModelGeneratorMethodVisitor.visitCode，在这个方法中，根据参数的数量，一一形成名称arg0、arg1...，然后放入到本地变量表
+    @Override
+    public void visitCode() {
+        super.visitCode();
+        int localIndex = 0;
+        int argIndex = 0;
+        //使用arg前缀来表示方法入参，后续用于判断是否为目标调用方法的入参
+        if ((this.access & Opcodes.ACC_STATIC) == 0) {
+            setLocalTaint(localIndex, "arg" + argIndex);
+            localIndex += 1;
+            argIndex += 1;
+        }
+        for (Type argType : Type.getArgumentTypes(desc)) {
+            setLocalTaint(localIndex, "arg" + argIndex);
+            localIndex += argType.getSize();
+            argIndex += 1;
+        }
+    }
+  * 接着，因为即将要调用A.method1，ASM会调用visitVarInsn，把刚刚放入到本地变量表的arg0入栈
+    @Override
+    public void visitVarInsn(int opcode, int var) {
+        // Extend local variable state to make sure we include the variable index
+        for (int i = savedVariableState.localVars.size(); i ());
+        }
+        Set saved0;
+        switch(opcode) {
+            case Opcodes.ILOAD:
+            case Opcodes.FLOAD:
+                push();
+                break;
+            case Opcodes.LLOAD:
+            case Opcodes.DLOAD:
+                push();
+                push();
+                break;
+            case Opcodes.ALOAD:
+                push(savedVariableState.localVars.get(var));
+                break;
+            case Opcodes.ISTORE:
+            case Opcodes.FSTORE:
+                pop();
+                savedVariableState.localVars.set(var, new HashSet());
+                break;
+            case Opcodes.DSTORE:
+            case Opcodes.LSTORE:
+                pop();
+                pop();
+                savedVariableState.localVars.set(var, new HashSet());
+                break;
+            case Opcodes.ASTORE:
+                saved0 = pop();
+                savedVariableState.localVars.set(var, saved0);
+                break;
+            case Opcodes.RET:
+                // No effect on stack
+                break;
+            default:
+                throw new IllegalStateException("Unsupported opcode: " + opcode);
+        }
+        super.visitVarInsn(opcode, var);
+        sanityCheck();
+    }
+  * 然后，ASM调用visitVarInsn把当前实例对应的参数入栈，上一步visitCode已经把实例命名为arg0存在本地变量表中，因此入栈的参数名称为arg0，截止调用visitFieldInsn获取字段name，并命名为arg0.name入栈
+    @Override
+    public void visitFieldInsn(int opcode, String owner, String name, String desc) {
+        switch (opcode) {
+            case Opcodes.GETSTATIC:
+                break;
+            case Opcodes.PUTSTATIC:
+                break;
+            case Opcodes.GETFIELD://入操作栈
+                Type type = Type.getType(desc);
+                if (type.getSize() == 1) {
+                    Boolean isTransient = null;
+                    // If a field type could not possibly be serialized, it's effectively transient
+                    if (!couldBeSerialized(serializableDecider, inheritanceMap, new ClassReference.Handle(type.getInternalName()))) {
+                        isTransient = Boolean.TRUE;
+                    } else {
+                        ClassReference clazz = classMap.get(new ClassReference.Handle(owner));
+                        while (clazz != null) {
+                            for (ClassReference.Member member : clazz.getMembers()) {
+                                if (member.getName().equals(name)) {
+                                    isTransient = (member.getModifiers() & Opcodes.ACC_TRANSIENT) != 0;
+                                    break;
+                                }
+                            }
+                            if (isTransient != null) {
+                                break;
+                            }
+                            clazz = classMap.get(new ClassReference.Handle(clazz.getSuperClass()));
+                        }
+                    }
+                    Set newTaint = new HashSet<>();
+                    if (!Boolean.TRUE.equals(isTransient)) {
+                        for (String s : getStackTaint(0)) {
+                            newTaint.add(s + "." + name);
+                        }
+                    }
+                    super.visitFieldInsn(opcode, owner, name, desc);
+                    //在调用方法前，都会先入栈，作为参数
+                    setStackTaint(0, newTaint);
+                    return;
+                }
+                break;
+            case Opcodes.PUTFIELD:
+                break;
+            default:
+                throw new IllegalStateException("Unsupported opcode: " + opcode);
+        }
+        super.visitFieldInsn(opcode, owner, name, desc);
+    }
+  * 最后ASM调用visitMethodInsn，因为Main.main调用了A.method1，在这里个环境，清楚的用代码解释了为什么前面需要把参数命名为arg0、arg1、arg0.name这样，因为需要通过这样的一个字符串名称，和被调用方法的入参进行关联，并最终形成调用者和被调用者直接的参数关联
+    @Override
+    public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean itf) {
+        //获取被调用method的参数和类型，非静态方法需要把实例类型放在第一个元素
+        Type[] argTypes = Type.getArgumentTypes(desc);
+        if (opcode != Opcodes.INVOKESTATIC) {
+            Type[] extendedArgTypes = new Type[argTypes.length+1];
+            System.arraycopy(argTypes, 0, extendedArgTypes, 1, argTypes.length);
+            extendedArgTypes[0] = Type.getObjectType(owner);
+            argTypes = extendedArgTypes;
+        }
+        switch (opcode) {
+            case Opcodes.INVOKESTATIC:
+            case Opcodes.INVOKEVIRTUAL:
+            case Opcodes.INVOKESPECIAL:
+            case Opcodes.INVOKEINTERFACE:
+                int stackIndex = 0;
+                for (int i = 0; i  taint = getStackTaint(stackIndex);
+                    if (taint.size() > 0) {
+                        for (String argSrc : taint) {
+                            //取出出栈的参数，判断是否为当前方法的入参，arg前缀
+                            if (!argSrc.substring(0, 3).equals("arg")) {
+                                throw new IllegalStateException("Invalid taint arg: " + argSrc);
+                            }
+                            int dotIndex = argSrc.indexOf('.');
+                            int srcArgIndex;
+                            String srcArgPath;
+                            if (dotIndex == -1) {
+                                srcArgIndex = Integer.parseInt(argSrc.substring(3));
+                                srcArgPath = null;
+                            } else {
+                                srcArgIndex = Integer.parseInt(argSrc.substring(3, dotIndex));
+                                srcArgPath = argSrc.substring(dotIndex+1);
+                            }
+                            //记录参数流动关系
+                            //argIndex：当前方法参数索引，srcArgIndex：对应上一级方法的参数索引
+                            discoveredCalls.add(new GraphCall(
+                                    new MethodReference.Handle(new ClassReference.Handle(this.owner), this.name, this.desc),
+                                    new MethodReference.Handle(new ClassReference.Handle(owner), name, desc),
+                                    srcArgIndex,
+                                    srcArgPath,
+                                    argIndex));
+                        }
+                    }
+                    stackIndex += type.getSize();
+                }
+                break;
+            default:
+                throw new IllegalStateException("Unsupported opcode: " + opcode);
+        }
+        super.visitMethodInsn(opcode, owner, name, desc, itf);
+    }
+    }
+到此，gadgetinspector.CallGraphDiscovery#discover方法就结束了，然后执行gadgetinspector.CallGraphDiscovery#save对调用者-被调用者参数关系数据进行保存到callgraph.dat文件，其中数据的序列化输出格式，由GraphCall.Factory实现
+    public static class Factory implements DataFactory {
+        ...
+        @Override
+        public String[] serialize(GraphCall obj) {
+            return new String[]{
+                    obj.callerMethod.getClassReference().getName(), obj.callerMethod.getName(), obj.callerMethod.getDesc(),
+                    obj.targetMethod.getClassReference().getName(), obj.targetMethod.getName(), obj.targetMethod.getDesc(),
+                    Integer.toString(obj.callerArgIndex),
+                    obj.callerArgPath,
+                    Integer.toString(obj.targetArgIndex),
+            };
+        }
+    }
+数据格式：
+    调用者类名 调用者方法caller 调用者方法描述 被调用者类名 被调用者方法target 被调用者方法描述 调用者方法参数索引 调用者字段名 被调用者方法参数索引
+    Main (Ljava/lang/String;)V main A method1 (Ljava/lang/String;)Ljava/lang/String; 1 1
+### 0x06 利用链入口搜索-SourceDiscovery
+在这一个阶段中，会扫描所有的class，把符合，也就是可被反序列化并且可以在反序列化执行的方法，全部查找出来，因为没有这样的入口，就算存在执行链，也没办法通过反序列化的时候进行触发。
+因为入口的触发，不同的反序列化方式会存在不同是实现，因此，在gadgetinspector中，存在着多个SourceDiscovery的实现，有jackson的，java原生序列化的等等，我这里主要以jackson的SourceDiscovery实现开始分析。
+先看SourceDiscovery抽象类：
+    public abstract class SourceDiscovery {
+        private final List discoveredSources = new ArrayList<>();
+        protected final void addDiscoveredSource(Source source) {
+            discoveredSources.add(source);
+        }
+        public void discover() throws IOException {
+            Map classMap = DataLoader.loadClasses();
+            Map methodMap = DataLoader.loadMethods();
+            InheritanceMap inheritanceMap = InheritanceMap.load();
+            discover(classMap, methodMap, inheritanceMap);
+        }
+        public abstract void discover(Map classMap,
+                             Map methodMap,
+                             InheritanceMap inheritanceMap);
+        public void save() throws IOException {
+            DataLoader.saveData(Paths.get("sources.dat"), new Source.Factory(), discoveredSources);
+        }
+    }
+可以看到，它的discover实现中，加载了所以的类、方法、继承实现关系数据，接着调用抽象方法discover，然后，我们跟进jackson的具体实现中
+    public class JacksonSourceDiscovery extends SourceDiscovery {
+        @Override
+        public void discover(Map classMap,
+                             Map methodMap,
+                             InheritanceMap inheritanceMap) {
+            final JacksonSerializableDecider serializableDecider = new JacksonSerializableDecider(methodMap);
+            for (MethodReference.Handle method : methodMap.keySet()) {
+                if (serializableDecider.apply(method.getClassReference())) {
+                    if (method.getName().equals("") && method.getDesc().equals("()V")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                    if (method.getName().startsWith("get") && method.getDesc().startsWith("()")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                    if (method.getName().startsWith("set") && method.getDesc().matches("\\(L[^;]*;\\)V")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                }
+            }
+        }
+    }
+从上述代码可以看出，实现非常之简单，只是判断了方法：
+  1. 是否无参构造方法
+  2. 是否getter方法
+  3. 是否setter方法
+为什么对于source会做这样的判断？因为对于jackson的反序列化，在其反序列化时，必须通过无参构造方法反序列化（没有则会反序列化失败），并且会根据一定情况调用其反序列化对象的getter、setter方法
+在扫描所有的方法后，具备条件的method都会被添加到gadgetinspector.SourceDiscovery#discoveredSources中，并最后通过gadgetinspector.SourceDiscovery#save保存
+    public void save() throws IOException {
+        DataLoader.saveData(Paths.get("sources.dat"), new Source.Factory(), discoveredSources);
+    }
+保存数据的序列化实现由Source.Factory实现
+    public static class Factory implements DataFactory {
+        ...
+        @Override
+        public String[] serialize(Source obj) {
+            return new String[]{
+                    obj.sourceMethod.getClassReference().getName(), obj.sourceMethod.getName(), obj.sourceMethod.getDesc(),
+                    Integer.toString(obj.taintedArgIndex),
+            };
+        }
+    }
+最终输出到sources.dat文件的数据形式：

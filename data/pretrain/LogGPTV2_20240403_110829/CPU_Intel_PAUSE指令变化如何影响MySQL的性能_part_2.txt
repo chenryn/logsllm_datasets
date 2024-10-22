@@ -1,0 +1,62 @@
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_CPU_3e1490cf/Intel_PAUSE指令变化如何影响MySQL的性能/ed46d35161ea2835-ed46d35161ea28352acd4289a3e9ddad.png)
+## 事后思考和分析
+到这里问题得到了完美解决，但是不禁要问为什么？ut_delay 是怎么工作的？ 和 innodb_spin_wait_delay 以及自旋锁的关系？
+## 原理解析
+既然调整 innodb_spin_wait_delay 就能解决这个问题，那就要先分析一下 innodb_spin_wait_delay 的作用
+### 关于 innodb_spin_wait_delay
+innodb通过大量的自旋锁(比如 `InnoDB` [mutexes](https://dev.mysql.com/doc/refman/5.7/en/glossary.html#glos_mutex) and [rw-locks](https://dev.mysql.com/doc/refman/5.7/en/glossary.html#glos_rw_lock))来用高CPU消耗避免上下文切换，这是自旋锁的正确使用方式，在多核场景下，它们一起自旋抢同一个锁，容易造成[cache ping-pong](https://stackoverflow.com/questions/30684974/are-cache-line-ping-pong-and-false-sharing-the-same)，进而多个CPU核之间会互相使对方缓存部分无效。所以这里[innodb通过增加 innodb_spin_wait_delay 和 Pause 配合来缓解cache ping-pong](https://dev.mysql.com/doc/refman/5.7/en/innodb-performance-spin_lock_polling.html)，也就是本来通过CPU 高速自旋抢锁，换成了抢锁失败后 delay一下（Pause）但是不释放CPU，delay 时间到后继续抢锁，也就是把连续的自旋抢锁转换成了更稀疏的点状的抢锁（间隔的 delay是个随机数），这样不但避免了上下文切换也大大减少了cache ping-pong。
+### 自旋锁如何减少了cache ping-pong
+多线程竞争锁的时候，加锁失败的线程会“忙等待”，直到它拿到锁。什么叫“忙等待”呢？它并不意味着一直执行 CAS 函数，而是会与 CPU 紧密配合 ，它通过 CPU 提供的 `PAUSE` 指令，减少循环等待时的cache ping-pong和耗电量；对于单核 CPU，忙等待并没有意义，此时它会主动把线程休眠。
+### X86 PAUSE 指令
+X86设计了Pause指令，也就是调用 Pause 指令的代码会抢着 CPU 不释放，但是CPU 会打个盹，比如 10个时钟周期，相对一次上下文切换是大几千个时钟周期。
+这样应用一旦自旋抢锁失败可以先 Pause 一下，只是这个Pause 时间对于 MySQL 来说还不够久，所以需要增加参数 innodb_spin_wait_delay 来将休息时间放大一些。
+在我们的这个场景下对每个 SQL的 RT 抖动非常敏感（放大256倍），所以过高的 delay 会导致部分SQL  RT  变高。
+函数 ut_delay(ut_rnd_interval(0, srv_spin_wait_delay)) 用来执行这个delay：
+```
+/***************************MySQL代码****************************//**
+Runs an idle loop on CPU. The argument gives the desired delay
+in microseconds on 100 MHz Pentium + Visual C++.
+@return dummy value */
+UNIV_INTERN
+ulint
+ut_delay(ulint delay)  //delay 是[0,innodb_spin_wait_delay)之间的一个随机数
+{
+        ulint   i, j;
+```
+UT_LOW_PRIORITY_CPU();
+            j = 0;
+            for (i = 0; i  [The PAUSE instruction is first introduced](https://www.reddit.com/r/intel/comments/hogk2n/research_on_the_impact_of_intel_Pause_instruction/) for Intel Pentium 4 processor to improve the performance of “spin-wait loop”. The PAUSE instruction is typically used with software threads executing on two logical processors located in the same processor core, waiting for a lock to be released. Such short wait loops tend to last between tens and a few hundreds of cycles. When the wait loop is expected to last for thousands of cycles or more, it is preferable to yield to the operating system by calling one of the OS synchronization API functions, such as WaitForSingleObject on Windows OS.
+> 
+> An Intel® processor suffers a severe performance penalty when exiting the loop because it detects a possible memory order violation. The PAUSE instruction provides a hint to the processor that the code sequence is a spin-wait loop. The processor uses this hint to avoid the memory order violation in most situations. The PAUSE instruction can improve the performance of the processors supporting Intel Hyper-Threading Technology when executing “spin-wait loops”. With Pause instruction, processors are able to avoid the memory order violation and pipeline flush, and reduce power consumption through pipeline stall.
+**从intel sdm手册以及实际测试验证来看，Pause 指令在执行过程中，基本不占用流水线执行资源。**
+### Skylake 架构的8163 和 Broadwell架构 E5-2682 CPU型号的不同
+为什么用得好好的 innodb_spin_wait_delay 参数这次就不行了呢？
+这是因为以前业务一直使用的是 E5-2682 CPU，这次用的是新一代架构的 Skylake 8163，那这两款CPU在这里的核心差别是？
+在Intel 64-ia-32-architectures-optimization-manual手册中提到：
+> The latency of the PAUSE instruction in prior generation microarchitectures is about 10 cycles, whereas in Skylake microarchitecture it has been extended to as many as 140 cycles.
+> 
+> [The PAUSE instruction can improves the performance](https://xem.github.io/minix86/manual/intel-x86-and-64-manual-vol3/o_fe12b1e2a880e0ce-302.html) of processors supporting Intel Hyper-Threading Technology when executing “spin-wait loops” and other routines where one thread is accessing a shared lock or semaphore in a tight polling loop. When executing a spin-wait loop, the processor can suffer a severe performance penalty when exiting the loop because it detects a possible memory order violation and flushes the core processor’s pipeline. The PAUSE instruction provides a hint to the processor that the code sequence is a spin-wait loop. The processor uses this hint to avoid the memory order violation and prevent the pipeline flush. In addition, the PAUSE instruction de-
+> pipelines the spin-wait loop to prevent it from consuming execution resources excessively and consume power needlessly. (See[ Section 8.10.6.1, “Use the PAUSE Instruction in Spin-Wait Loops,” for more ](https://xem.github.io/minix86/manual/intel-x86-and-64-manual-vol3/o_fe12b1e2a880e0ce-305.html)information about using the PAUSE instruction with IA-32 processors supporting Intel Hyper-Threading Technology.)
+也就是**Skylake架构的CPU的PAUSE指令从之前的10 cycles 改成了 140 cycles。**这可是14倍的变化呀。
+MySQL 使用 innodb_spin_wait_delay 控制 spin lock等待时间，等待时间时间从0*50个Pause到innodb_spin_wait_delay*50个Pause。
+以前 innodb_spin_wait_delay 默认配置30，对于E5-2682 CPU，等待的最长时间为：
+30 * 50 * 10=15000 cycles，对于2.5GHz的CPU，等待时间为6us。
+对应计算 Skylake CPU的等待时间：30 *50 *140=210000 cycles，CPU主频也是2.5GHz，等待时间84us。
+E5-2682 CPU型号在不同的delay参数和不同并发压力下的写入性能数据：
+![image-20221026153750159](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_CPU_3e1490cf/Intel_PAUSE指令变化如何影响MySQL的性能/eb8dc21830973f58-image-20221026153750159.png)
+Skylake 8163 CPU型号在不同的delay参数和不同并发压力下的写入性能数据：
+![image-20221026153813774](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_CPU_3e1490cf/Intel_PAUSE指令变化如何影响MySQL的性能/678d91ac8db34d0f-image-20221026153813774.png)
+==因为8163的cycles从10改到了140，所以可以看到delay参数对性能的影响更加陡峻。==
+## 总结分析
+Intel CPU 架构不同使得 Pause 指令的CPU Cycles不同导致了 MySQL innodb_spin_wait_delay 在 spin lock 失败的时候（此时需要 Pause* innodb_spin_wait_delay*N）delay更久，使得调用方看到了MySQL更大的 RT ，进而导致 Tomcat Server上业务并发跑不起来，所以最终压力上不去。
+在长链路的排查中，细化定位是哪个节点出了问题是最难的，要盯住 RT 而不是 CPU。
+欲速则不达，做压测的时候还是要老老实实地从一个并发开始观察QPS、 RT ，然后一直增加压力到压不上去了，再看QPS、 RT 变化，然后确认瓶颈点。
+## 参考文章
+https://cloud.tencent.com/developer/article/1005284
+[mysql doc](https://dev.mysql.com/doc/refman/5.7/en/innodb-performance-spin_lock_polling.html)
+[Cache Line 伪共享发现与优化](http://oliveryang.net/2018/01/cache-false-sharing-debug)
+[intel spec](https://en.wikichip.org/w/images/e/eb/intel-ref-248966-037.pdf)
+[Intel PAUSE指令变化影响到MySQL的性能，该如何解决？](https://mp.weixin.qq.com/s/dlKC13i9Z8wjDDiU2tig6Q)
+[ARM软硬件协同设计：锁优化](https://topic.atatech.org/articles/173194), arm不同于x86，用的是yield来代替Pause
+http://cr.openjdk.java.net/~dchuyko/8186670/yield/spinwait.html
+Reference:

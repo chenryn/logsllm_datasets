@@ -1,0 +1,138 @@
+            this.intField = i;
+        }
+        public ExternalizationDemo() {}
+    }
+序列化之后得到的二进制串如下：
+    ac ed 00 05 73 72 00 13  45 78 74 65 72 6e 61 6c    ....sr.. External
+    69 7a 61 74 69 6f 6e 44  65 6d 6f d9 a9 04 75 84    izationD emo...u.
+    5d 06 8f 0c 00 00 78 70  77 0b 00 05 67 79 79 79    ].....xp w...gyyy
+    79 00 01 7d f1 78                                   y..}.x
+与`Serializable`的区别：
+  * 对象的序列化属性标志位为`0x0c`，包括`Serializable`和Block Data的标志
+  * 序列化类的字段个数固定为0
+  * 序列化调用`writeExternalData()`转给类自定义的写方法，将写入的数据包装在新的Block Data块中，第一个字节为块长度 _（不含块头尾标识）_
+  * 反序列化调用`readExternalData()`转给类自定义的读方法，再调用对象的无参构造方法 _（若不存在，则返回null）_ 进行实例化
+### 反序列化漏洞
+通过以上对Java的序列化机制的大致了解，我们可以想象一个场景 _（有基础的同学可以跳过本部分内容，当然，看一看也没坏处）_ ：
+> 当服务端允许接收远端数据进行反序列化时，客户端可以提供任意一个服务端存在的对象 _（包括依赖包中的对象）_
+> 的序列化二进制串，由服务端反序列化成相应对象。如果该对象是由攻击者‘精心构造’的恶意对象，而它自定义的`readObject()`中存在着一些‘不安全’的逻辑，那么在对它反序列化时就有可能出现安全问题。
+说到这，我提三个问题，请大家跟着我的思路去分析，先来看看第一个：
+  1. 为什么需要依赖反序列化对象的自定义`readObject()`？
+大家都知道，正常来说，反序列化只是一个对象实例化然后赋值的过程，如果之后不主动调用它的内部方法，理论上最多只能控制它字段的值而已。那么有没有什么办法能够让它执行反序列化以外的逻辑呢？毕竟做的越多中间产生问题的概率就越大。
+我们还是先以大家更熟悉的PHP来举个例。在PHP内部，保留了十多个被称为魔术方法的类方法，这些魔术方法一般会伴随着类的生命周期被PHP底层自动调用，用户可以在类中显式定义它们的逻辑。
+就拿与反序列化关系最密切的`__wakeup()`来说，我们回到最初的那个类`SerializationDemo`，给它加一点东西：
+    class SerializationDemo {
+        public function __wakeup() {
+            echo $this->stringField;
+        }
+    }
+在反序列化`SerializationDemo`这个对象时，就会调用`__wakeup()`执行里面的逻辑。示例中的逻辑只是输出一个字符串，如果改成`exec($this->stringField);`呢？
+实际当然不会这么简单，有可能它是把自己的字段作为值作为参数调用了某个类的方法，而那个方法里对参数做了某些不安全的操作，甚至有可能经过多个类多个方法调用，形成一个调用链。
+这就是默认的反序列化逻辑的一个逃逸过程。
+到这里你可能已经想到了，Java反序列化中`readObject()`的作用其实就相当于PHP反序列化中的那些魔术方法，使反序列化过程在一定程度上受控成为可能，但也只是可能而已，是否真的可控，还是需要分析每个对象的`readObject()`具体是如何实现的
+_（别急，后面有章节会有详细介绍）_ 。
+接着看第二个问题：
+  1. 反序列化对象的非`Serializable`父类无参构造方法是否能像PHP中的`__construct()`一样被利用？
+答案应该是不行的。因为前面已经提到过，我们只能够控制反序列化对象的字段值，而Java与PHP不同的是，JDK底层会先调用无参构造方法实例化，再读取序列化的字段数据赋值，所以我们没有办法将可控的字段值在实例化阶段传入构造方法中对其内部逻辑产生影响。
+最后一个：
+  2. `readResolve()`对反序列化漏洞有什么影响？
+`readResolve()`只是替换反序列化结果对象，若是结果对象本身存在安全问题，它有可能让问题中断；若是`readObject()`存在安全问题，它无法避免。
+### 经典的Apache Commons Collections
+好，有了上面的基础，我们也照一回惯例，带大家一起分析一下Java历史上最出名也是最具代表性的Apache Commons
+Collections反序列化漏洞。
+网上很多文章都是以WebLogic为漏洞环境，我们尊重开源，围绕1.637版本的Jenkins来开个头，先简单看看它的Cli组件的反序列化场景
+_（这里只以CLI-connect协议为例，CLI2-connect会多出来一个SSL加解密的过程，这也是很多公开PoC在模拟Cli握手时选择CLI-connect协议的原因）_ ：
+  1. 客户端向发送一个UTF8字符串`Protocol:CLI-connect`，前两位为字符串长度
+  2. 服务端`TcpSlaveAgentListener`在接收到数据之后，会创建一个`ConnectionHandler`对象读取一个UTF8字符串，判断协议版本，交给对应的协议进行处理
+    * `Capability.writePreamble()`响应序列化后的`Capability`对象，其中使用`Mode.TEXT.wrap()`将输出流包装为`BinarySafeStream`，它会在写时进行Base64编码
+    * 由于`ChannelBuilder`在build之前，调用了`withMode()`设置mode为`Mode.BINARY`，因此还会响应一个`0x00000000`
+    * 等待接收后续数据，判断数据内容前缀为`Capability.PREAMBLE （）`时，将`InputStream`传给`Capability.read()`
+    * `Capability`同样会对输入流做一次`BinarySafeStream`包装，保证在读数据时解码得到原始二进制数据，再扔给输入流的`readObject()`继续读
+    * `CliProtocol`响应Welcome字符串，由`ChannelBuilder`为两端创建一个包含了Connection对象 （IO流对象在里面） 的Channel通信通道，并调用`negotiate()`进行交互
+回看`Connection`中自定义的`readObject()`，是一个普普通通的`ObjectInputStream`反序列化：
+    public  T readObject() throws IOException, ClassNotFoundException {
+        ObjectInputStream ois = new ObjectInputStream(in);
+        return (T)ois.readObject();
+    }
+现在我们假设已知1.637版本的Jenkins引用了存在反序列化漏洞的Commons
+Collections的版本的Jar包，那么只需要利用它构造一个恶意对象的序列化串，在与Jenkins
+Cli完成握手之后，将其Base64编码后的字符串发送过去就行了 _（当然，千万别忘了前面那串酷酷的前缀）_ 。
+### Payload构造
+好的，现在让我们聚焦到Commons Collections内部，看看前辈们是如何利用它来让应用‘产生’问题的。
+我们先预备一个基本知识，在Java中，若想通过其原生JDK提供的接口执行系统命令，最常见的语句如下：
+    Runtime rt = Runtime.getRuntime();
+    rt.exec(cmd);
+很简单，一个单例模式的方法获取到`Runtime`的实例，再调用它的`exec()`执行命令。在表达式注入类RCE漏洞中也可以频繁看到利用各种条件特性来构造这段语句的身影，比如Struts2的OGNL：
+    @java.lang.Runtime@getRuntime().exec(cmd)
+又比如Spring的SpEL：
+    T(java.lang.Runtime).getRuntime().exec(cmd)
+这里替小白问个基础但又和接下来的内容有关的问题：为什么都要使用链式结构？
+原因其实很简单，因为无论是表达式解析执行还是反序列化时，底层通过反射技术获取对象调用函数都会存在一个上下文环境，使用链式结构的语句可以保证执行过程中这个上下文是一致的。你也可以换个方式问自己，如果你第一次请求`Runtime.getRuntime()`，那如何保证第二次请求`rt.exec()`能够拿到第一次的`Runtime`对象呢？
+了解了这个问题之后，我们就可以开始尝试用Commons Collections先来构造这个链式结构了。
+前辈们为我们在Commons Collections中找到了一个用于对象之间转换的`Transformer`接口，它有几个我们用得着的实现类：
+1.`ConstantTransformer`
+       public ConstantTransformer(Object constantToReturn) {
+           super();
+           iConstant = constantToReturn;
+       }
+       public Object transform(Object input) {
+           return iConstant;
+       }
+2.`InvokerTransformer`
+       public InvokerTransformer(String methodName, Class[] paramTypes, Object[] args) {
+           super();
+           iMethodName = methodName;
+           iParamTypes = paramTypes;
+           iArgs = args;
+       }
+       public Object transform(Object input) {
+           // omit
+           Class cls = input.getClass();
+           Method method = cls.getMethod(iMethodName, iParamTypes);
+           return method.invoke(input, iArgs);
+           // omit
+       }
+3.`ChainedTransformer`
+       public ChainedTransformer(Transformer[] transformers) {
+           super();
+           iTransformers = transformers;
+       }
+       public Object transform(Object object) {
+           for (int i = 0; i  Generally any reflection at the end of gadget-chain set up is done to “arm”
+> the chain because constructing it while armed can result in premature
+> “detonation” during set-up and cause it to be inert when serialized and
+> deserialized by the target application.
+现在，有了这条`Transformer`链，就等着谁来执行它的`transform()`了。
+网上流传的示例很多都是使用一个名为`TransformedMap`的装饰器来触发`transform()`，它在装饰时会传入原始`Map`、一个键转换器`Transformer`和一个值转换器`Transformer`，而它的父类在内部实现了一个`AbstractMapEntryDecorator`的子类，会在`setValue()`前调用`checkSetValue()`进行检查，而`TransformedMap.checkSetValue()`会调用它的值转换器的`transform()`，因此装饰任意一个有元素的`Map`就可以满足需求：
+    Map m = TransformedMap.decorate(new HashMap(){{ put("value", "anything"); }}, null, chain);
+这时，我们只需要再找一个包含可控`Map`字段，并会在反序列化时对这个`Map`进行`setValue()`或`get()`操作的公共对象。
+幸运的是，前辈们在JDK较早的版本中发现了`AnnotationInvocationHandler`这个对象
+_（较新版本的JDK可以使用BadAttributeValueExpException，在这里就不展开了）_
+，它在初始化时可以传入一个`Map`类型参数赋值给字段`memberValues`，`readObject()`过程中如果满足一定条件就会对`memberValues`中的元素进行`setValue()`：
+    private void readObject(java.io.ObjectInputStream s)
+        s.defaultReadObject();
+        AnnotationType annotationType = null;
+        try {
+            annotationType = AnnotationType.getInstance(type);
+        } catch(IllegalArgumentException e) {
+            throw new java.io.InvalidObjectException("Non-annotation type in annotation serial stream");
+        }
+        Map> memberTypes = annotationType.memberTypes();
+        for (Map.Entry memberValue : memberValues.entrySet()) {
+            String name = memberValue.getKey();
+            Class memberType = memberTypes.get(name);
+            if (memberType != null) {
+                Object value = memberValue.getValue();
+                if (!(memberType.isInstance(value) ||
+                        value instanceof ExceptionProxy)) {
+                    memberValue.setValue(
+                        new AnnotationTypeMismatchExceptionProxy(
+                            value.getClass() + "[" + value + "]").setMember(
+                                annotationType.members().get(name)));
+                }
+            }
+        }
+    }
+可以看到，在遍历`memberValues.entrySet()`时，会用键名在`memberTypes`中尝试获取一个`Class`，并判断它是否为`null`，这就是刚才说的需要满足的条件。接下来是网上很少提到过的一个结论：
+首先，`memberTypes`是`AnnotationType`的一个字段，里面存储着`Annotation`接口声明的方法信息
+_（键名为方法名，值为方法返回类型）_

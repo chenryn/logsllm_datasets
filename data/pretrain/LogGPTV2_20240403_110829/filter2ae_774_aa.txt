@@ -1,0 +1,149 @@
+Author: lz520520@深蓝攻防实验室
+# 前言
+上一次就做了一些基础优化，这次需要改造的点复杂了一点，需要对项目代码解析更透彻点，话不多说，开始动手。  
+​
+# http（失败）
+为了实现代理工具过CDN隐藏IP，先使用http封装来测试，最终失败了，这里记录下测试过程中的一些细节。  
+​
+修改protocol包，分开为client和server。  
+修改后，还有一处问题，最开始有个预认证，主要是判断双方的key是否一致。  
+share/preauth.go  
+可以看到传入key，计算md5，取前16位判断。  
+这里仔细想了想，之前frp封装失败了，本以为是会话问题，但其实可能是这个流量模式问题，有时候会从服务端主动推流量给客户端，这样可能会导致cdn不转发流量，从而客户端无法接收。  
+而cs为什么可以做到正常通信，那是因为他没有服务端主动的行为，都是通过客户端定期心跳请求服务端来拉去指令，这样就和一个正常的http请求流程是一样的。  
+而frp的websocket模式能正常运行，可能还是websocket和http有所区别，服务端能主动请求客户端。  
+补充：后续查阅资料，websocket是双工模式，可以双向主动通信，而http只是单工模式，只能由client主动往server发送请求。  
+​
+上面这些只是一些猜想，在该工具中还需进一步测试来确定。  
+通过nginx测试，服务端在建立后会返回两次响应包，第二个响应包发送回去因为ACK没变，判断为重传，导致报错。  
+这是没过nginx正常通信的数据包，确实两次  
+emmm，如果是这样，我在想是否可以使用chunked编码，让nginx以为是分段传输，后续再测试。  
+chunked测试失败。  
+http策略取消。  
+​
+# websocket
+可能也是之前cs的cdn方案影响，老是想着用http来实现，结果就拉了，像frp和stowaway都是全双工通信工具，不能使用http这种单工通信协议，但frp里通过websocket能实现过nginx等反向代理服务器，那么stowaway自然也可以。  
+​
+简单来说websocket是基于http改进的一种通信方式，只在第一次交互时携带http头部，后续通信直接传输数据就好，是一种长连接双向通信的方案，也可以说是所有双向通信工具的封装方案，现在CDN和云函数都支持websocket的，使得代理工具也能隐藏IP。  
+​
+http封装里说到第一次请求会有一个密钥交互过程，那么在这之前插入一个websocket是不是就ok了。  
+先抓包看了下frp里的效果，其实说实话frp的整理码质量比stowaway高，解耦和模块化都很好，所以后续的改动就参考frp里的代码实现了。  
+这里看到其实就是一个简单的http交互，只是多了一个key的校验。frp里调用的是golang.org/x/net/websocket库那做的，还有一个更完善的库github.com/gorilla/websocket，但因为stowaway在原始的raw已经做了不少处理了（如长连接、重连等等），就不需要这么完整的库来做，只需要简单处理下头部就好了。  
+​
+值得注意的是，stowaway是分为正向连接和反向连接，即listener和connect，在处理的时候需要考虑这两种场景。  
+这里就讲第一个节点和admin交互，其他基本类似。  
+​
+admin/initial/method.go  
+admin也分为被动监听和主动连接两种情况。  
+说个题外话，admin一般都是监听，而主动连接什么时候用呢，比如一种完全不出网的场景，通过neoreg等web正向代理工具先进行第一层代理，后续如果需要进行内网多级代理，那么就需要agent监听，而admin连接上，从而组建代理网络。  
+​
+这边先测试NormalPassive  
+在监听获取到agent发起的连接后，会通过PassivePreAuth进行密钥交互，那么在这之间就可以用来插入websocket第一次交互数据，并且套上tls。  
+这里是参考frp的，获取连接后，判断是否配置了tls，然后封装tls，接着根据协议，原先有raw/http，其实http没卵用，后续考虑删除，接着判断封装什么头部。  
+​
+tcp就默认，websocket在进一步处理，为啥这样设计，因为后续可能加入kcp等等（这里其实考虑不周，udp的监听和这个conn根本不是一回事，后续再改呗）  
+补充：修复个bug，太傻逼了，需要改动成如下
+    conn = WrapTLSServerConn(conn, tlsConfig)
+​
+WebsocketListener代码逻辑比较简单，既然接收到连接，那么进一步就是获取agent发送的websocket头部，然后判断是否合法，合法就返回一个websocket响应头，这样就建立好websocket连接了，要wss就套一层tls就好了。  
+​
+    defer conn.SetReadDeadline(time.Time{})
+        conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+        // 接收数据
+        result := bytes.Buffer{}
+        buf := make([]byte, 1024)
+        for {
+            count, err := conn.Read(buf)
+            if err != nil {
+                // 如果报错，判断错误类型，如果是超时则关闭连接返回err，如果是EOF则写入最后接收到的数据跳出循环。
+                if err == io.EOF && count > 0 {
+                    result.Write(buf[:count])
+                } else if timeoutErr, ok := err.(net.Error); ok && timeoutErr.Timeout() {
+                    conn.Close()
+                    return nil, err
+                }
+                break
+            }
+            if count > 0 {
+                result.Write(buf[:count])
+                // 因为headers最终都是以双换行结束，所以判断到这个就直接break。
+                if bytes.HasSuffix(buf[:count], []byte("\r\n\r\n")) {
+                    break
+                }
+            }
+        }
+        // 解析请求头
+        req, err := http2.ParseRequest(result.String())
+        if err != nil {
+            conn.Close()
+            return nil, err
+        }
+        // 进行websocket协议校验。
+        key := req.Header.Get("Sec-Websocket-Key")
+        if key == "" {
+            conn.Close()
+            return nil, errors.New("Sec-Websocket-Key is not in header")
+        }
+        // 生成nonce
+        expectedAccept, err := getNonceAccept([]byte(key))
+        if err != nil {
+            conn.Close()
+            return nil, err
+        }
+        // 发送响应头部。
+        respHeaders := fmt.Sprintf(`HTTP/1.1 101 Switching Protocols
+    Connection: upgrade
+    Upgrade: websocket
+    Sec-WebSocket-Accept: %s
+    `, expectedAccept)
+        respHeaders = strings.ReplaceAll(respHeaders, "\n", "\r\n")
+        conn.Write([]byte(respHeaders))
+        return conn, nil
+BTW，CDN自然少不了domain参数，参考frp里说明，那么请求客户端自然需要带上。  
+agent/initial/method.go  
+agent也是一样的思路，找到密钥交互前的部分，插入头部。  
+​
+这里就有个小坑了，conn获取后应该在第一时间判断是否封装tls，然后再交互协议头，不然tls就少封装第一次交互。  
+ConnectWebsocketServer实现代码
+    func ConnectWebsocketServer(addr string, tlsConfig *tls.Config, domainAddr string) (net.Conn, error) {
+        // 生成 nonce
+        nonce := generateNonce()
+        expectedAccept, err := getNonceAccept(nonce)
+        if err != nil {
+            return nil, err
+        }
+        addrSlice := strings.SplitN(addr, ":", 2)
+        if len(addrSlice)  0 {
+                    result.Write(buf[:count])
+                } else if timeoutErr, ok := err.(net.Error); ok && timeoutErr.Timeout() {
+                    conn.Close()
+                    return nil, err
+                }
+                break
+            }
+            if count > 0 {
+                result.Write(buf[:count])
+                if bytes.HasSuffix(buf[:count], []byte("\r\n\r\n")) {
+                    break
+                }
+            }
+        }
+        // 校验server的websocket响应头是否有效。
+         resp := result.String()
+         if !strings.Contains(resp, "Upgrade: websocket") ||
+             !strings.Contains(resp, "Connection: upgrade") ||
+            !strings.Contains(resp, "Sec-WebSocket-Accept: " + string(expectedAccept)) {
+            conn.Close()
+            return nil, errors.New("not websocket protocol")
+         }
+        return conn, nil
+    }
+最终测试效果如下  
+admin: listener 192.168.111.130:8082  
+agent: connect 192.168.111.1:8443  
+nginx: 监听ssl 192.168.111.1:8443，转发到ssl 192.168.111.130:8082  
+测试成功  
+nginx前的数据包，加密没问题  
+nginx后的数据包  
+所以实际上实现websocket，从而达到过nginx等反代服务器的目的，也是蛮简单的。  
+当然测试看起来蛮正常的，却还有一个小bug需要解决，像CDN或者nginx服务器，对于长连接肯定是会有连接空闲超时限制的，这也是为了防止过多连接生成，而stowaway在保持长连接的过程中，只要不做任何操作，是没有任何流量的，这个作者也是为了降低流量侧的动静。但这也造成如果中间有一层反代的场景，就会在空闲过程中，判断client和server中间没有通信流量，超时自动断开长连接。  

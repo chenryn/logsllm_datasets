@@ -1,0 +1,140 @@
+      Timeout: 300
+      Handler: index.handler
+  LifecycleHookFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-lifecycleHooks
+      RetentionInDays: 7    ...
+    ...
+```
+Creating a Lambda Function to Process Life Cycle Hooks
+Lambda 函数比我们到目前为止讨论的稍微复杂一点，但是它仍然是一个相对简单的函数，如果您有 Python 的经验，应该很容易理解。
+该函数首先定义所需的库，并查找名为`ECS_CLUSTER`的环境变量，该变量是必需的，以便该函数知道生命周期挂钩与哪个 ECS 集群相关，并且该环境变量值通过 Lambda 函数资源上的`Environment`属性传入。
+接下来，该函数声明三个 AWS 客户端:
+*   `ecs`:与 ECS 通信，内省 ECS 容器实例信息，根据生命周期钩子中收到的 EC2 实例 ID，排出正确的实例。
+*   `autoscaling`:当生命周期挂钩可以继续时，向 EC2 自动缩放服务发出信号。
+*   `sns`:如果 Lambda 函数即将达到最大的五分钟执行超时，并且 ECS 容器实例尚未排空，则重新发布生命周期挂钩事件。这将再次调用 Lambda 函数，直到 ECS 容器实例完全耗尽。
+`handler`方法定义了 Lambda 函数的入口点，首先从接收到的 SNS 消息中提取出一些捕获信息的变量，包括生命周期钩子事件类型(`transition`变量)、钩子名称(`hook`变量)、自动缩放组名称(`group`变量)和 EC2 实例 ID ( `ec2_instance`变量)。然后立即进行检查，以验证生命周期挂钩事件类型是否与 EC2 实例终止事件相关，如果事件类型(在转换变量中捕获)不等于值`autoscaling:EC2_INSTANCE_TERMINATING`，则函数立即返回，有效地忽略该事件。
+假设事件确实与终止的 EC2 实例相关，处理程序接下来通过`ecs`客户端查询 ECS 服务，首先描述配置集群中的所有实例，然后尝试定位与从生命周期挂钩事件中捕获的 EC2 实例标识匹配的 ECS 容器实例。如果找不到该实例，则引发`ValueError`异常，该异常将被 catch 语句捕获，导致记录错误，并且函数完成生命周期挂钩，结果为`ABANDON`。如果找到该实例，处理程序通过调用`ecs`客户端上的`update_container_instances_state()`方法来排出该实例，该方法将该实例的状态设置为`DRAINING`，这意味着 ECS 将不再向该实例调度任何新任务，并尝试将现有任务迁移到集群中的其他实例。此时，处理程序需要等待实例上运行的所有当前 ECS 任务被清空，这可以通过每五秒钟在`while`循环中轮询 ECS 任务计数直到任务计数减少到零来实现。您可以尝试无限期地这样做，但是 Lambda 在编写时有最长五分钟的执行时间限制，因此`while`循环使用`context.get_remaining_time_in_millis()`方法来检查是否即将达到 Lambda 执行超时。
+The `context` object is an object that is passed by the Lambda runtime environment to your handler method and includes information about the Lambda environment including memory, CPU, and remaining execution time. 
+如果任务计数减少到零，您可以安全地终止 ECS 容器实例，自动缩放客户端完成生命周期挂钩，结果为`CONTINUE`，这意味着 EC2 自动缩放服务将继续处理任何其他注册的挂钩并终止实例。如果在函数即将退出之前，任务计数没有减少到零，那么函数只需重新发布原始的生命周期挂钩通知，这将再次从头重新调用函数。因为函数中的所有操作都是幂等的，也就是说，更新一个已经在引流到引流状态的 ECS 容器实例的状态会导致相同的引流状态，所以这种方法是安全的，也是克服 Lambda 的执行超时限制的一种非常简单和优雅的方法。
+# 为生命周期挂钩 Lambda 函数配置权限
+Lambda 函数现在已经就位，最后的配置任务是为 Lambda 函数执行的各种 API 调用和操作添加所需的权限:
+```
+...
+...
+Resources: LifecycleHookPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LifecycleHookFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LifecycleHookTopic
+  LifecycleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: LifecycleHookPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:ListContainerInstances
+                Resource: !Sub ${ApplicationCluster.Arn}
+              - Sid: ManageContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:DescribeContainerInstances
+                  - ecs:UpdateContainerInstancesState
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !Sub ${ApplicationCluster.Arn}
+              - Sid: Publish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref LifecycleHookTopic
+              - Sid: CompleteLifecycleAction
+                Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                Resource: !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ApplicationAutoscaling}
+              - Sid: ManageLambdaLogs
+                Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: !Sub ${LifecycleHookFunctionLogGroup.Arn}    LifecycleHookFunction:
+      Type: AWS::Lambda::Function
+    ...
+    ...
+```
+Configuring Permissions for a Life Cycle Hook Lambda Function
+在前面的示例中，需要类型为`AWS::Lambda::Permission`的名为`LifecycleHookPermission`的资源，该资源授予 SNS 服务(如`Principal`属性所引用)调用 Lambda 函数(如`LambdaFunction`属性所引用)的权限，以便将通知发布到 SNS 主题(如`SourceArn`属性所引用)。每当您需要授予另一个 AWS 服务代表您调用 Lambda 函数的能力时，通常都需要这种配置权限的方法，尽管该规则也有例外(例如 cloud information 自定义资源用例，其中 cloud information 隐式拥有这样的权限)。
+您还可以为名为`LambdaFunctionRole`的 Lambda 函数创建一个 IAM 角色，该角色授予该函数执行它需要执行的各种任务和操作的能力，包括:
+*   列出、描述和更新应用群集中的 ECS 容器实例
+*   如果 Lambda 函数即将超时，则将生命周期挂钩事件重新发布到 SNS
+*   一旦 ECS 容器实例耗尽，就完成生命周期操作
+*   将日志写入 CloudWatch 日志
+# 部署和测试自动扩展生命周期挂钩
+现在，您可以使用本章前面演示的`aws cloudformation deploy`命令来部署您完整的自动缩放生命周期挂钩解决方案。
+部署完成后，为了测试生命周期管理是否按预期运行，您可以执行一个简单的更改来强制替换您的 ECS 群集中的当前 ECS 容器实例，即恢复您在本章前面所做的 AMI 更改:
+```
+ApplicationDesiredCount=1
+ApplicationImageId=ami-ec957491
+ApplicationImageTag=5fdbe62
+ApplicationSubnets=subnet-a5d3ecee,subnet-324e246f
+VpcId=vpc-f8233a80
+```
+Reverting the ECS AMI
+一旦您现在部署了此更改，再次使用`aws cloudformation deploy`命令，如前面的示例所示，接下来切换到云信息控制台，当终止现有 EC2 实例的事件引发时，快速导航到 ECS 仪表板并选择您的 ECS 集群。在“容器实例”选项卡上，您应该会看到您的一个 ECS 容器实例的状态正在排出，如下图所示，一旦所有任务都从该实例中排出，生命周期挂钩功能将向 EC2 自动扩展服务发出信号，以继续终止该实例:
+![](img/48e994f8-8700-4055-85be-dce072cd5887.png)
+ECS Container Instance Draining
+如果在 ECS 容器实例被清空和终止期间，您重复前面截图中采取的步骤来查看集群内存预留，您应该会看到一个类似于示例中的图表:
+![](img/6ce7187e-5fa4-4457-bea3-ce1220c04bb1.png)
+Cluster Memory Reservation during ECS Container Instance Draining
+在前面的截图中，请注意，在滚动更新期间，集群内存预留不会在任何时候降至 0%。在滚动升级过程中，由于集群中有两个实例，内存利用率百分比确实会发生变化，但是我们能够耗尽 ECS 容器实例，这确保了在集群上运行的应用的服务不会中断。
+作为最后一项检查，您还可以导航到生命周期挂钩功能的 CloudWatch 日志组，如下图所示:
+![](img/5a4701c4-7ce4-4900-9301-222be446dc52.png)
+Life Cycle Hooks Function Logs
+在前面的截图中，您可以看到，在容器实例清空时，函数会定期休眠，在这种情况下，大约两分钟后，所有任务都会清空，函数会向自动缩放服务发送一个`CONTINUE`信号。
+# 摘要
+在本章中，您创建了一个解决方案，用于管理您的 ECS 容器实例的生命周期，并确保在您需要终止和替换 ECS 集群中的 ECS 容器实例时，运行在您的 ECS 集群上的应用和服务不会受到影响。
+您学习了如何为您的 EC2 自动扩展组配置滚动更新，通过利用云信息更新策略，您可以控制如何以滚动方式将新实例添加到您的自动扩展组中。您看到此功能在自动扩展和 EC2 实例级别运行良好，但是您发现集群中现有 ECS 容器实例的突然终止会导致应用中断。
+为了解决这个问题，您创建了一个为`EC2_INSTANCE_TERMINATING`事件注册的 EC2 生命周期钩子，并将这个钩子配置为向 SNS 主题发布通知，这又会触发一个 Lambda 函数。此函数负责定位与即将终止的 EC2 实例相关联的 ECS 容器实例，清空容器实例，然后等待，直到 ECS 任务计数达到 0，表明实例上的所有 ECS 任务都已终止并被替换。如果 ECS 容器实例花费的时间超过了 Lambda 函数的最长五分钟执行时间，您了解到您可以简单地重新发布包含生命周期挂钩信息的 SNS 事件，这又会触发函数的新调用，并且该过程可以无限期地继续，直到实例上的 ECS 任务计数达到 0。
+在下一章中，您将了解如何动态管理 ECS 集群的容量，这对支持应用的自动扩展要求至关重要。这包括不断向您的 ECS 集群添加和删除 ECS 容器实例，因此您可以看到本章中介绍的 ECS 容器实例生命周期机制对于确保您的应用不受任何自动扩展操作的影响至关重要。
+# 问题
+1.  对/错:当您终止一个 ECS 容器实例时，该实例将自动将正在运行的 ECS 任务排到群集中的另一个实例。
+2.  您可以收到哪些类型的 EC2 自动扩展生命周期挂钩？
+3.  一旦处理完 EC2 自动缩放生命周期挂钩，您可以发送什么类型的响应？
+4.  对/错:EC2 自动缩放生命周期钩子可以将事件发布到 AWS 驱动程序。
+5.  您创建了一个 Lambda 函数，该函数处理一个生命周期钩子并排出您的 ECS 容器实例。您已经注意到，有时这需要大约 4-5 分钟，但通常需要 15 分钟。您能做些什么来解决这个问题？
+6.  您可以配置什么云信息功能来启用自动缩放组的滚动更新？
+7.  您希望执行滚动更新，并确保在更新过程中始终至少有当前所需的服务实例数。你将如何实现这一点？
+8.  当使用 CloudFormation 将 Lambda 函数订阅到 SNS 主题时，需要创建什么类型的资源来确保 SNS 服务具有调用该函数的适当权限？
+# 进一步阅读
+有关本章所涵盖主题的更多信息，您可以查看以下链接:
+*   CloudFormation UpdatePolicy 属性:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-attribute-UpdatePolicy . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-updatepolicy.html)
+*   Amazon EC2 自动缩放生命周期挂钩:[https://docs . AWS . Amazon . com/autoscaling/EC2/user guide/life cycle-hooks . html](https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html)
+*   CloudFormation 生命周期挂钩资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-resource-as-life cyclehook . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-as-lifecyclehook.html)
+*   CloudFormation SNS 主题资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-properties-SNS-topic . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-sns-topic.html)
+*   CloudFormation SNS 订阅资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-resource-SNS-subscription . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-subscription.html)
+*   CloudFormation Lambda 权限资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-resource-Lambda-permission . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html)
+*   CloudFormation ECS 任务定义资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-resource-ECS-task definition . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-taskdefinition.html)
+*   CloudFormation ECS 服务资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-resource-ECS-service . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-service.html)
+*   CloudFormation Lambda 函数资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-resource-Lambda-function . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html)
+*   CloudFormation Lambda 函数代码:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/AWS-properties-Lambda-function-code . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html)
+*   CloudFormation 自定义资源文档:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/template-custom-resources . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-custom-resources.html)
+*   CloudFormation 自定义资源参考:[https://docs . AWS . Amazon . com/AWS cloud information/latest/user guide/crpg-ref . html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref.html)*

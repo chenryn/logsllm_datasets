@@ -1,0 +1,113 @@
+## 前言
+### 环境搭建
+题目环境: `ubuntu 20.04`
+启动命令：
+    ./chrome --js-flags=--noexpose_wasm --no-sandbox
+\--js-flags=--noexpose_wasm
+用于关闭wasm，意味着不能使用wasm来填写shellcode进行利用，但可以通过漏洞利用一进行绕过
+\--no-sandbox 关闭沙箱
+题目下载地址：
+[https://github.com/De4dCr0w/Browser-pwn/blob/master/Vulnerability%20analyze/qwb2020-final-GOOexec%20%26%20Issue-799263/file.7z](https://github.com/De4dCr0w/Browser-pwn/blob/master/Vulnerability analyze/qwb2020-final-GOOexec %26
+Issue-799263/file.7z)
+### 基础知识
+**v8各个类型的转化**  
+PACKED_SMI_ELEMENTS：小整数，又称 Smi。
+PACKED_DOUBLE_ELEMENTS： 双精度浮点数，浮点数和不能表示为 Smi 的整数。
+PACKED_ELEMENTS：常规元素，不能表示为 Smi 或双精度的值。
+转化关系如下：
+元素种类转换只能从一个方向进行：从特定的（例如 PACKED_SMI_ELEMENTS）到更一般的（例如
+PACKED_ELEMENTS）。例如，一旦数组被标记为 PACKED_ELEMENTS，它就不能回到 PACKED_DOUBLE_ELEMENTS。
+demo 代码：
+    const array = [1, 2, 3];
+    // elements kind: PACKED_SMI_ELEMENTS
+    array.push(4.56);
+    // elements kind: PACKED_DOUBLE_ELEMENTS
+    array.push('x');
+    // elements kind: PACKED_ELEMENTS
+PACKED 转化到 HOLEY类型：
+demo代码：
+    const array = [1, 2, 3, 4.56, 'x'];
+    // elements kind: PACKED_ELEMENTS
+    array.length; // 5
+    array[9] = 1; // array[5] until array[8] are now holes
+    // elements kind: HOLEY_ELEMENTS
+即将密集数组转化到稀疏数组。
+## 漏洞分析
+该题目的漏洞和Issue 799263一样，引入漏洞的补丁为：
+    diff --git a/src/compiler/load-elimination.cc b/src/compiler/load-elimination.cc
+    index ff79da8c86..8effdd6e15 100644
+    --- a/src/compiler/load-elimination.cc
+    +++ b/src/compiler/load-elimination.cc
+    @@ -866,8 +866,8 @@ Reduction LoadElimination::ReduceTransitionElementsKind(Node* node) {
+         if (object_maps.contains(ZoneHandleSet(source_map))) {
+           object_maps.remove(source_map, zone());
+           object_maps.insert(target_map, zone());
+    -      AliasStateInfo alias_info(state, object, source_map);
+    -      state = state->KillMaps(alias_info, zone());
+    +      // AliasStateInfo alias_info(state, object, source_map);
+    +      // state = state->KillMaps(alias_info, zone());
+           state = state->SetMaps(object, object_maps, zone());
+         }
+       } else {
+    @@ -892,7 +892,7 @@ Reduction LoadElimination::ReduceTransitionAndStoreElement(Node* node) {
+       if (state->LookupMaps(object, &object_maps)) {
+         object_maps.insert(double_map, zone());
+         object_maps.insert(fast_map, zone());
+    -    state = state->KillMaps(object, zone());
+    +    // state = state->KillMaps(object, zone());
+         state = state->SetMaps(object, object_maps, zone());
+       }
+       // Kill the elements as well.
+该补丁主要是将state = state->KillMaps(alias_info, zone()) 这行代码删除了，少了对alias 对象map 的消除。
+state->KillMaps函数定义如下：
+    LoadElimination::AbstractState const* LoadElimination::AbstractState::KillMaps(
+        const AliasStateInfo& alias_info, Zone* zone) const {
+      if (this->maps_) {
+        AbstractMaps const* that_maps = this->maps_->Kill(alias_info, zone);
+        // 本质上就是调用maps_的Kill函数
+        if (this->maps_ != that_maps) {
+          AbstractState* that = zone->New(*this);
+          that->maps_ = that_maps;
+          return that; // 如果不一样才返回一个新的
+        }
+      }
+      return this;
+    }
+    LoadElimination::AbstractState const* LoadElimination::AbstractState::KillMaps(
+        Node* object, Zone* zone) const {
+      AliasStateInfo alias_info(this, object);
+      return KillMaps(alias_info, zone);
+    }
+    LoadElimination::AbstractMaps const* LoadElimination::AbstractMaps::Kill(
+        const AliasStateInfo& alias_info, Zone* zone) const {
+      for (auto pair : this->info_for_node_) {
+        if (alias_info.MayAlias(pair.first)) { // if one of nodes may alias
+          AbstractMaps* that = zone->New(zone);
+          for (auto pair : this->info_for_node_) {
+            if (!alias_info.MayAlias(pair.first)) that->info_for_node_.insert(pair);
+          } // keep all except the ones that may alias
+          return that;
+        }
+      }
+      return this;
+    }
+MayAlias用于比较两个节点是否为同一个对象，如果是不同对象，就返回false，就会执行that->info_for _node_.insert。
+去除KillMaps会导致本应该没有map信息的一些node仍保留着信息，如ReduceCheckMaps函数，残留着map信息，maps.contains返回true，通过Replace错误地删除CheckMaps：
+    Reduction LoadElimination::ReduceCheckMaps(Node* node) {
+      ZoneHandleSet const& maps = CheckMapsParametersOf(node->op()).maps();
+      Node* const object = NodeProperties::GetValueInput(node, 0);
+      Node* const effect = NodeProperties::GetEffectInput(node);
+      AbstractState const* state = node_states_.Get(effect);
+      if (state == nullptr) return NoChange();
+      ZoneHandleSet object_maps;
+      // 假如object_maps的Map信息并不完整，可能导致maps.contains错误地返回true
+      if (state->LookupMaps(object, &object_maps)) {
+        if (maps.contains(object_maps)) return Replace(effect);
+        // TODO(turbofan): Compute the intersection.
+      }
+      state = state->SetMaps(object, maps, zone());
+      return UpdateState(node, state);
+    }
+节点a和b可能是同一对象，在节点a发生优化，类型转化后，b节点由于没有KillMaps操作，删除了节点前的CheckMaps，导致访问b时是按照原先的类型来访问优化后的类型，形成类型混淆漏洞。
+Poc代码如下：
+    function foo(a, b) {

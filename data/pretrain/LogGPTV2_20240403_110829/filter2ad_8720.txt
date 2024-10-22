@@ -1,0 +1,156 @@
+**作者：ztz**  
+**来源：**
+这是一篇拖了很久的文
+起因是某次给 godoc.org 提交 RCE 后，突然好奇起同样机制的 go get 会不会也存在相似的洞
+于是便开始分析 go get 的内部实现，没想到意外的在另一处发现了一个有意思的洞
+## 开始
+`go get` 会根据 `import path` 获取指定依赖包到本地，对其进行编译和安装，如：
+    $ go get github.com/jmoiron/sqlx
+`go get` 大概逻辑是这样（对应代码在 `src/cmd/go/internal/get` 我懒得贴了）：
+  * 解析 `import path`，判断是否为已知托管平台（Github、Bitbucket 等）
+  * 若目标依赖位于已知平台，调用写死的规则去解析
+  * 若目标依赖位于未知站点，就动态解析
+而根据官方文档，如果 `import path` 未知，`go` 会尝试解析远程 `import path` 的 `` 标签：
+> If the import path is not a known code hosting site and also lacks a version
+> control qualifier, the go tool attempts to fetch the import over https/http
+> and looks for a tag in the document’s HTML
+合法的 `` 标签格式为：
+各字段含义如下：
+  * `import-prefix` 表示 `import path` 的仓库根地址，当页面出现多个 `go-import` 标签时 `go` 就靠这个字段选择正确的标签
+  * `vcs` 表示使用的版本控制系统如 `git`, `hg` 等
+  * `repo-root` 表示仓库地址
+`Go` 解析到正确的标签后，会做一些校验，其中一个是 `import-prefix` 必须是用户输入的 `import path`
+的前缀，这个校验使我直接打消了在 `import-prefix` 中插入 `../` 的想法（这是之前 godoc 那个洞的思路）
+然后根据 `vcs` 代表的版本控制系统生成对应的实例：
+    rr := &repoRoot{
+      vcs:  vcsByCmd(metaImport.VCS),
+      repo: metaImport.RepoRoot,
+      root: metaImport.Prefix,
+    }
+每种不同的实例都拥有统一的接口方法
+    type vcsCmd struct {
+        name string
+        cmd  string // name of binary to invoke command
+        createCmd   string // command to download a fresh copy of a repository
+        downloadCmd string // command to download updates into an existing repository
+        tagCmd         []tagCmd // commands to list tags
+        tagLookupCmd   []tagCmd // commands to lookup tags before running tagSyncCmd
+        tagSyncCmd     string   // command to sync to specific tag
+        tagSyncDefault string   // command to sync to default tag
+        scheme  []string
+        pingCmd string
+    }
+命令按照功能划分，具体执行的命令由底下的实例自己填充，如 `git`：
+    var vcsGit = &vcsCmd{
+        name: "Git",
+        cmd:  "git",
+        createCmd:   "clone {repo} {dir}",
+        downloadCmd: "fetch",
+        tagCmd: []tagCmd{
+            // tags/xxx matches a git tag named xxx
+            // origin/xxx matches a git branch named xxx on the default remote repository
+            {"show-ref", `(?:tags|origin)/(\S+)$`},
+        },
+        tagLookupCmd: []tagCmd{
+            {"show-ref tags/{tag} origin/{tag}", `((?:tags|origin)/\S+)$`},
+        },
+        tagSyncCmd:     "checkout {tag}",
+        tagSyncDefault: "checkout origin/master",
+        scheme:  []string{"git", "https", "http", "git+ssh"},
+        pingCmd: "ls-remote {scheme}://{repo}",
+    }
+拿到实例后， `Go` 将其中的 `import-prefix`, `vcs`, `repo-root` 取出后：
+    rr, err := repoRootForImportPath(p.ImportPath)
+    if err != nil {
+      return err
+    }
+    vcs, repo, rootPath = rr.vcs, rr.repo, rr.root
+直接交给实例 `vcs` 执行创建操作：
+    root := filepath.Join(p.Internal.Build.SrcRoot, filepath.FromSlash(rootPath))
+    if err = vcs.create(root, repo); err != nil {
+      return err
+    }
+    vcs.create` 的目的是将远端 `repo` 克隆到本地 `root` 中，实现方法是调用 `vcs` 的 `createCmd
+    func (v *vcsCmd) create(dir, repo string) error {
+        return v.run(".", v.createCmd, "dir", dir, "repo", repo)
+    }
+    func (v *vcsCmd) run(dir string, cmd string, keyval ...string) error {
+        _, err := v.run1(dir, cmd, keyval, true)
+        return err
+    }
+前面说了，命令是每个实例自己负责填充的，`Go`
+在这里自己实现了一套模版机制，它将命令看作模版，具体执行时，只要把模版里的变量和实际变量进行一次替换即可方便的生成命令，如 `git` 的 `clone`
+命令：
+    createCmd:   "clone {repo} {dir}",
+替换方法是简单的 `for` 遍历替换：
+    func expand(match map[string]string, s string) string {
+        for k, v := range match {
+            s = strings.Replace(s, "{"+k+"}", v, -1)
+        }
+        return s
+    }
+命令执行是用 `os.exec` 直接将参数传给可执行文件，不存在参数污染的可能。
+我只能把注意力放在表示克隆路径上，克隆的路径其实就是 `` 标签里的 `import-prefix`，前面也说了，`import-prefix`
+必须是用户输入 `import-path` 前缀，非但我不可能让用户输入 `go get http://foo.bar/../../`，`Go` 也不允许
+`import-path` 里出现非法字符，所以这里没什么操控空间。
+也就是说 `` 标签里的三个可控字段都不好利用。
+## 转机
+当我正要放弃时，突然想到了 `go` `map` 随机遍历的特性， `map` 结构在底层的实现是 `HashTable`，`key` 的存储是
+**无序** 的，所以在使用 `map` 时，`key-value` 的存入顺序和遍历顺序并不一致。
+由于担心用户过于依赖 `map` 遍历的顺序，官方特意对 `map` 的遍历做了随机化处理，每次 `map` 进行遍历操作的顺序都不一样， _Andrew
+Gerrand_ 在官方博客  里详细说明了这一点：
+> When iterating over a map with a range loop, the iteration order is not
+> specified and is not guaranteed to be the same from one iteration to the
+> next. Since the release of Go 1.0, the runtime has randomized map iteration
+> order. Programmers had begun to rely on the stable iteration order of early
+> versions of Go, which varied between implementations, leading to portability
+> bugs. If you require a stable iteration order you must maintain a separate
+> data structure that specifies that order. This example uses a separate
+> sorted slice of keys to print a `map[int]string` in key order:
+简单写一个 `map` 遍历的程序来测试：
+    package main
+    import "fmt"
+    func main() {
+      foobar := map[string]int{
+          "foo": "foo",
+          "bar": "bar",
+      }
+      for k, v := range foobar {
+          fmt.Println(k, ": ", v)
+      }
+    }
+这是一个简单的 `map` 遍历代码，如果反复运行该程序，看到的输出顺序是这样的：
+    $ go run random_map.go
+    bar :  bar
+    foo :  foo
+    $ go run random_map.go
+    foo :  foo
+    bar :  bar
+    $ go run random_map.go
+    foo :  foo
+    bar :  bar
+输出顺序是随机的，这种随机乱序遍历为我提供了绝处逢生的可能，如果命令模版在变量替换的过程中以我希望的顺序进行，我就可以配合模版变量搞一波事：
+    func expand(match map[string]string, s string) string {
+        for k, v := range match {
+            s = strings.Replace(s, "{"+k+"}", v, -1)
+        }
+        return s
+    }
+其中
+  * `match` 中的 `key` 为模版变量，`value` 为实际值，当前是 `{"dir": import-prefix, "repo": repo-root}`
+  * `s` 是命令模版 `clone {repo} {dir}`
+我若在 `import-prefix` 中放入 `{repo}`，比如 `https://foo.com/bar/{repo}`，再在 `repo`
+里插入我的字符：`https://foo.com/bar/../../../../../../../../../../tmp/pwn`，形成这样一个
+`match`：
+    {
+        "dir": "https://foo.com/bar/{repo}",
+        "repo": "https://foo.com/bar/../../tmp/pwn"
+    }
+依靠 `map` 乱序遍历特性，找机会让 `expand` 先遍历替换 `{dir}` 再替换 `{repo}`，就可以得到如下结果：
+  1. 先替换 `{dir}` 得到 `clone {repo} https://foo.com/bar/{repo}`
+  2. 再替换 `{repo}` 得到 `clone https://foo.com/bar/../../tmp/pwn https://foo.com/bar/https://foo.com/bar/../../tmp/pwn`
+这么一来 `../` 便被引入到了克隆目标路径里，一个艰难的任意目录写就出现了，利用 `../` 可以进一步扩大战果，但这不是本篇的重点，就不赘述了。
+## 利用
+在自己的 web 服务器上设置返回以下内容：
+然后多次运行 `go get ztz.me/linux/{repo}` 就可以在人品爆发时触发利用（多试几次）
+* * *

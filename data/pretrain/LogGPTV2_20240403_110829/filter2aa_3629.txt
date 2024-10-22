@@ -1,0 +1,71 @@
+### Cross-Cache Overflow介绍
+与我们此前一直关注于 slub allocator 的各种利用手法不同，**Cross-Cache Overflow** 实际上是**针对 buddy system** 的利用手法，其主要基于如下思路：
+- slub allocator 底层逻辑是向 buddy system 请求页面后再划分成特定大小 object 返还给上层调用者。
+  - 内存中用作不同 `kmem_cache` 的页面在内存上是有可能相邻的。
+- 若我们的漏洞对象存在于页面 A，溢出目标对象存在于页面 B，且 A、B两页面相邻，则我们便有可能实现跨越不同 `kmem_cache` 之间的堆溢出。
+**Cross-Cache Overflow 打破了不同 kmem\_cache 之间的阻碍，可以让我们的溢出漏洞对近乎任意的内核结构体进行覆写。**
+但这需要达成非常严苛的页级堆排布，而内核的堆页面布局对我们而言通常是未知的，因此我们需要想办法将其变为已知的内存布局，这就需要**页级堆风水**——
+### Page-level Heap Fengshui介绍
+顾名思义，**页级堆风水**即以内存页为粒度的内存排布方式，而内核内存页的排布对我们来说不仅未知且信息量巨大，因此这种利用手法实际上是让我们**手工构造一个新的已知的页级粒度内存页排布**。
+首先让我们重新审视 slub allocator 向 buddy system 请求页面的过程，当 freelist page 已经耗空且 partial 链表也为空时（或者 `kmem_cache` 刚刚创建后进行第一次分配时），其会向 buddy system 申请页面：
+![image.png](figure/slub-new-page.png)
+接下来让我们重新审视 buddy system ，其基本原理就是以 2 的 order 次幂张内存页作为分配粒度，相同 order 间空闲页面构成双向链表，当低阶 order 的页面不够用时便会从高阶 order 取一份连续内存页拆成两半，其中一半挂回当前请求 order 链表，另一半返还给上层调用者；下图为以 order 2 为例的 buddy system 页面分配基本原理：
+![page.gif](figure/buddy.gif)
+我们不难想到的是：从更高阶 order 拆分成的两份低阶 order 的连续内存页**是物理连续的**，由此我们可以：
+- 向 buddy system 请求两份连续的内存页。
+- 释放其中一份内存页，在 `vulnerable kmem_cache` 上堆喷，让其取走这份内存页。
+- 释放另一份内存页，在 `victim kmem_cache` 上堆喷，让其取走这份内存页。
+**此时我们便有可能溢出到其他的内核结构体上，从而完成 cross-cache overflow**
+### 使用 setsockopt 与 pgv 完成页级内存占位与堆风水方法
+那么我们该如何完成这样的页占位与页排布呢？笔者这里给出一个来自于 [CVE-2017-7308](https://googleprojectzero.blogspot.com/2017/05/exploiting-linux-kernel-via-packet.html) 的方案：
+当我们创建一个 protocol 为 `PF_PACKET` 的 socket 之后，先调用 `setsockopt()` 将 `PACKET_VERSION` 设为  `TPACKET_V1 `/ `TPACKET_V2`，再调用 `setsockopt()` 提交一个 `PACKET_TX_RING` ，此时便存在如下调用链：
+```c
+__sys_setsockopt()
+    sock->ops->setsockopt()
+    	packet_setsockopt() // case PACKET_TX_RING ↓
+    		packet_set_ring()
+    			alloc_pg_vec()
+```
+在 `alloc_pg_vec()` 中会创建一个 `pgv` 结构体，用以分配 `tp_block_nr` 份 2order 张内存页，其中 `order` 由 `tp_block_size` 决定：
+```c
+static struct pgv *alloc_pg_vec(struct tpacket_req *req, int order)
+{
+	unsigned int block_nr = req->tp_block_nr;
+	struct pgv *pg_vec;
+	int i;
+	pg_vec = kcalloc(block_nr, sizeof(struct pgv), GFP_KERNEL | __GFP_NOWARN);
+	if (unlikely(!pg_vec))
+		goto out;
+	for (i = 0; i < block_nr; i++) {
+		pg_vec[i].buffer = alloc_one_pg_vec_page(order);
+		if (unlikely(!pg_vec[i].buffer))
+			goto out_free_pgvec;
+	}
+out:
+	return pg_vec;
+out_free_pgvec:
+	free_pg_vec(pg_vec, order, block_nr);
+	pg_vec = NULL;
+	goto out;
+}
+```
+在 `alloc_one_pg_vec_page()` 中会直接调用 `__get_free_pages()` 向 buddy system 请求内存页，因此我们可以利用该函数进行大量的页面请求：
+```c
+static char *alloc_one_pg_vec_page(unsigned long order)
+{
+	char *buffer;
+	gfp_t gfp_flags = GFP_KERNEL | __GFP_COMP |
+			  __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY;
+	buffer = (char *) __get_free_pages(gfp_flags, order);
+	if (buffer)
+		return buffer;
+	//...
+}
+```
+相应地， `pgv` 中的页面也会在 socket 被关闭后释放：
+```c
+packet_release()
+    packet_set_ring()
+    	free_pg_vec()
+```
+ `setsockopt()`  也可以帮助我们完成**页级堆风水**，当我们耗尽 buddy system 中的 low order pages 后，我们再请求的页面便都是物理连续的，因此此时我们再进行  `setsockopt()`  便**相当于获取到了一块近乎物理连续的内存**（为什么是“近乎连续”是因为大量的 `setsockopt()` 流程中同样会分配大量我们不需要的结构体，从而消耗 buddy system 的部分页面）。

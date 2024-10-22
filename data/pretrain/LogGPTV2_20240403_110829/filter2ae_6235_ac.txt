@@ -1,0 +1,147 @@
+可以看到， _struct sock_ 引用了 _struct socket_ (filed _sk_socket_ )，而 _struct socket_
+引用了 _struct sock_ (field _sk_ )。 同样， _struct socket_ 引用 _struct file_ (field
+_file_ )，而 _struct file_ 引用 _struct socket_ (field _private_data_
+)。这种“双向机制”允许数据在网络堆栈中上下移动。
+**NOTE** ：不要弄混！ _struct sock_ 对象通常称为 _sk_ ，而 _struct socket_ 对象通常称为 _sock_ 。
+### Netlink Socket
+Netlink socket是一类套接字，类似于UNIX或INET套接字。  
+Netlink套接字(AF_NETLINK)允许内核和用户空间之间的通信。
+它可用于修改路由表(NETLINK_ROUTE协议)，接收SELinux事件通知(NETLINK_SELINUX)甚至与其他用户进程通信(NETLINK_USERSOCK)。  
+由于struct sock和struct socket是支持各种套接字的通用数据结构，因此有必要在某种程度上“实例化”。  
+从套接字的角度来看，需要定义proto_ops字段。 对于netlink系列(AF_NETLINK)，BSD样式的套接字操作是
+**netlink_ops** ：
+    // [net/netlink/af_netlink.c]
+    static const struct proto_ops netlink_ops = {
+        .bind =     netlink_bind,
+        .accept =   sock_no_accept,     // <--- calling accept() on netlink sockets leads to EOPNOTSUPP error
+        .sendmsg =  netlink_sendmsg,
+        .recvmsg =  netlink_recvmsg,
+      // ...
+    }
+从sock的角度来看，它变得有点复杂。 有人可能会将struct sock视为抽象类。 因此，sock需要实例化。
+在netlink的情况下，就是使用struct netlink_sock：
+    // [include/net/netlink_sock.h]
+    struct netlink_sock {
+        /* struct sock has to be the first member of netlink_sock */
+        struct sock     sk;
+        u32         pid;
+        u32         dst_pid;
+        u32         dst_group;
+      // ...
+    };
+换句话说，netlink_sock是具有一些附加属性(继承)的“sock”。
+上面注释处非常重要(sk是nettlink_sock的第一个属性非常重要)。 它允许内核在不知道其精确类型的情况下操作通用sock结构体。
+还有另一个好处是，＆netlink_sock.sk和＆netlink_sock地址是一样的。
+因此，释放指针＆netlink_sock.sk实际上释放了整个netlink_sock对象。
+然后，netlink_sock生命周期逻辑可以保存在通用且经过良好测试的代码中。
+### 整合
+既然已经引入了核心数据结构，现在是时候将它们全部放在图表中以可视化它们的关系：  
+**READING** ：每个箭头代表一个指针。没有线“相互交叉”。“sock”结构体嵌入在“netlink_sock”结构体中。
+### 引用计数
+为了总结内核核心概念的介绍，有必要了解Linux内核如何处理引用计数。
+为了减少内核中的内存泄漏并防止释放后重用，大多数Linux数据结构都嵌入了“ref counter”。
+refcounter本身用atomic_t类型表示，该类型基本上是整数。 refcounter只能通过原子操作来操作，例如：
+  * atomic_inc()
+  * atomic_add()
+  * atomic_dec_and_test()//减去1并测试它是否等于零
+因为没有“智能指针”(或操作符重载)，所以引用计数处理由开发人员手动完成。这意味着当一个对象被另一个对象引用时，必须明确增加其refcounter。删除此引用时，必须明确减少refcounter。当refchounter为零时，通常会释放该对象。
+**NOTE** ：增加refcounter通常称为“引用”，而减少refcounter称为“删除/释放引用”。
+但是，如果在任何时候存在不平衡(例如，引用一次并释放两次)，则存在内存损坏的风险：
+  * refcounter减少两次：释放后重用
+  * refcounter增加了两次：内存泄露或整型溢出导致释放后重用
+Linux内核有几个函数来处理具有通用接口的refcounters(kref，kobject)。但是，它并没有被系统地使用，我们将操作的对象有自己的引用计数处理过程。一般来说，主要由“*_get()”系列函数进行引用，而“*_put()”系列函数进行释放。
+在我们的例子中，每个对象都有不同的处理过程名称：
+  * struct sock：sock_hold()，sock_put()
+  * struct file：fget()，fput()
+  * struct files_struct：get_files_struct()，put_files_struct()
+  * ...
+**WARNING**
+：甚至可以更加混乱！例如，skb_put()实际上不会减少任何refcounter，它只会将数据“推送”到sk缓冲区！不要基于其名称假设函数做什么，直接看代码。
+现在已经介绍了理解错误所需的每个数据结构，让我们继续并开始分析CVE。
+## 公开信息
+在深入研究bug之前，让我们描述一下mq _notify()系统调用的主要目的。 正如man所述，“mq_
+*”代表“POSIX消息队列”，它是旧版System V消息队列的替代品：
+    POSIX message queues allow processes to exchange data in the form of messages.
+    This API is distinct from that provided by System V message  queues (msgget(2),
+    msgsnd(2), msgrcv(2), etc.), but provides similar functionality.
+mq_notify()系统调用本身用于注册/撤销异步通知。
+    mq_notify() allows the calling process to register or unregister for delivery of an
+    asynchronous notification when a new message arrives on the empty message queue
+    referred to by the descriptor mqdes.
+在研究CVE时，从描述和修正补丁开始比较好。
+4.11.9内核中的mq_notify函数在进入重试时不会将sock指针设置为NULL。在用户空间关闭Netlink套接字，它允许攻击者导致拒绝服务(释放后重用)或可能具有未知其他影响(提权？)。
+补丁可在[此处](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f991af3daabaecff34684fd51fac80319d1baad1)获得：
+    diff --git a/ipc/mqueue.c b/ipc/mqueue.c
+    index c9ff943..eb1391b 100644
+    --- a/ipc/mqueue.c
+    +++ b/ipc/mqueue.c
+    @@ -1270,8 +1270,10 @@ retry:
+          timeo = MAX_SCHEDULE_TIMEOUT;
+          ret = netlink_attachskb(sock, nc, &timeo, NULL);
+    -     if (ret == 1)
+    +     if (ret == 1) {
+    +       sock = NULL;
+            goto retry;
+    +     }
+          if (ret) {
+            sock = NULL;
+            nc = NULL;
+补丁就只有一行！够简单......
+最后，补丁说明提供了许多有用的信息来理解该漏洞：
+    mqueue: fix a use-after-free in sys_mq_notify()
+    The retry logic for netlink_attachskb() inside sys_mq_notify()
+    is nasty and vulnerable:
+    1) The sock refcnt is already released when retry is needed
+    2) The fd is controllable by user-space because we already
+       release the file refcnt
+    so we then retry but the fd has been just closed by user-space
+    during this small window, we end up calling netlink_detachskb()
+    on the error path which releases the sock again, later when
+    the user-space closes this socket a use-after-free could be
+    triggered.
+    Setting 'sock' to NULL here should be sufficient to fix it
+补丁说明中存在一个小错误： _during this small window_ 。
+虽然这个漏洞可以看作“竞态”漏洞，但我们会看到竞态的时间实际上可以以确定的方式无限延长(参见第2部分)。
+## 理解漏洞
+上面的补丁说明提供了许多有用的信息：
+  * 有漏洞的代码位于系统调用mq_notify中
+  * 重试逻辑有问题
+  * sock变量引用计数有问题，导致释放后重用
+  * 有一些与关闭fd相关的竞争条件
+### 有漏洞的代码
+让我们深入研究mq_notify()系统调用实现，尤其是重试逻辑部分(retry)，以及退出路径(out)：
+    // from [ipc/mqueue.c]
+          SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+              const struct sigevent __user *, u_notification)
+          {
+            int ret;
+            struct file *filp;
+            struct sock *sock;
+            struct sigevent notification;
+            struct sk_buff *nc;
+            // ... cut (copy userland data to kernel + skb allocation) ...
+            sock = NULL;
+        retry:
+    [0]       filp = fget(notification.sigev_signo);
+              if (!filp) {
+                ret = -EBADF;
+    [1]         goto out;
+              }
+    [2a]      sock = netlink_getsockbyfilp(filp);
+    [2b]      fput(filp);
+              if (IS_ERR(sock)) {
+                ret = PTR_ERR(sock);
+                sock = NULL;
+    [3]         goto out;
+              }
+              timeo = MAX_SCHEDULE_TIMEOUT;
+    [4]       ret = netlink_attachskb(sock, nc, &timeo, NULL);
+              if (ret == 1)
+    [5a]        goto retry;
+              if (ret) {
+                sock = NULL;
+                nc = NULL;
+    [5b]        goto out;
+              }
+    [5c]    // ... cut (normal path) ...
+          out:

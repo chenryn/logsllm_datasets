@@ -1,0 +1,209 @@
+#  Why we switched from fluent-bit to Fluentd in 2 hours
+
+### The Story:
+
+We had a hell of the week here at
+**[PrometheusKube]**. A weird outage caused it:\
+**Somehow for a single node, we completely stopped shipping application
+logs in production.**
+
+### Problem 
+
+It\'s Tuesday morning. We receive a message from Developer that we are
+missing some of the logs in production. Strangely enough, it appears
+that logs only from a single node are missing.
+
+**We use fluent-bit to ship logs**. It\'s been okay at doing that for
+more than three years:\
+We upgraded it more than once, and it\'s always been a great
+experience.
+
+Fluent-bit has many advantages:
+
+-   high performance;
+-   has a small resource footprint;
+-   the configuration format is simple.
+
+**[Who could ask for anything more?]**
+
+But we have this utterly awkward issue. And we need to fix it now.
+Investigating Fluent-bit\'s logs showed that Elasticsearch is failing to
+accept some requests. We see this weird error:
+
+> *[{\"reason\":\"]***[rejected execution of
+> processing
+> of]***[ \[1467813202\]\[indices:data/write/bulk\[s\]\[p\]\]:
+> request: BulkShardRequest \[\[index-2020.11.11\]\[0\]\] containing
+> \[2434\] requests, target allocation id: 3wVc6ZYQSPOGobyFfMFL9g,
+> primary term: 1 on EsThreadPoolExecutor\[name = name-logs/write, queue
+> capacity = 200,
+> org.elasticsearch.common.util.concurrent.EsThreadPoolExecutor@3cc64ef2\[Running,
+> pool size = 2, active threads = 2, queued tasks = 206, completed tasks
+> = 596177059\]\]\"}}}]*
+
+This error means that Elasticsearch doesn\'t have enough threads to
+handle the request. It turns out this thread queue capacity argument is
+not configurable. What we tried instead is to add more CPU power to
+virtual machines running Elasticsearch.
+
+After rolling Elasticsearch, it turns out that this was a red herring.
+But at least we didn\'t have this error anymore. We verified that this
+issue is happening by looking at fluent-bit metrics for that
+node. 
+
+![Picture that shows that fluent-bit produces no logs](https://prometheuskube.com/wp-content/uploads/2020/11/pods-rate-zero.png "pods-rate-zero")
+
+Additionally, we looked at one noisy pod, which was running on the
+affected node. Then we compared logs with Elasticsearch: most of the
+records are missing.
+
+
+### **Guessing Game** 
+
+Next came a bit of guessing what to do next. It\'s one of the most
+annoying bugs we saw. The software is entirely silent on the error, yet
+it doesn\'t do what it\'s supposed to do.\
+
+We tried various changes:
+
+-   rolling back minor versions;
+-   upgrading to the latest version;
+-   changing various configuration parameters.
+
+
+**Nothing helped.**
+We tried to look into Fluent-bit\'s metrics, but nothing stands out.
+
+The most significant aha moment for us was - **turning on debug
+logging.** After the initial sync, the affected fluent-bit instance
+would stop logging actions while other nodes would log a lot. The cause
+of the issue might be some deadlock in the code or some error wholly
+ignored. The bug seems to be in this code base for a while now.
+
+We found this [#2416 Github
+issue](https://github.com/fluent/fluent-bit/issues/2416). This issue states a
+similar situation but has no solution for it. So it wasn\'t helpful. But
+at least we know we are not alone.
+
+
+### **We need to do something** 
+
+It is now clear that we are not going to fix this bug in the fluent-bit.
+We looked at alternative log shipping solutions. There are many options,
+but we decided the **next best action is to rollout Fluentd instead.**
+
+We started to develop a Fluentd deployment configuration. After many
+iterations, we had something that didn\'t crash loop and seems to do the
+trick. **It\'s impressive how Kubernetes allows you to iterate on
+deploying new software quickly.**
+
+The next step is to deploy Fluentd. We thought of an excellent way to
+test it:
+
+The best way to deploy Fluentd is to do that only on the affected node.
+This way, we can do a slow-rolling deployment. We add Fluentd on one
+node and then remove fluent-bit. Node by node, we slowly release it
+everywhere. To do this, we used the [Kubernetes node affinity
+feature](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/). And to remove fluent-bit, we
+used the anti-affinity feature. 
+
+
+
+
+### **Fluentd struggles**
+
+After initial couple of hours, Fluentd instance started failing with
+Buffer Overflows errors:
+
+> *[\[warn\]: #0 emit transaction failed:
+> error_class=Fluent::Plugin::Buffer::BufferOverflowError
+> error=\"**buffer space has too many data**\"
+> ]*
+
+After this error happens, log shipping stopped
+completely.
+
+We quickly found [Fluentd issue
+#2411](http://%20https://github.com/fluent/fluentd/issues/2411).
+This issue advised us to increase *flush_thread_count* and optimize
+*flush_interval*. We tried that, but Fluentd would start failing with
+the same error. We also tried increasing the buffer size, but this
+didn\'t help either.
+
+Additionally, Elasticsearch was again failing some requests. Which
+means indexing is barely holding up.
+
+![Elasticsearch failure
+rate](https://prometheuskube.com/wp-content/uploads/2020/11/elastic-failure-rate-e1605099683761.png "elastic-failure-rate")
+
+It turns out that because that Fluentd is starting from scratch, we are
+pushing all the old logs again. And there are a lot of old logs on that
+node. 
+
+So instead, **what we needed to do is slow down**. We decreased
+flush_thread_count to 1 and slowed down flush_interval to 5 seconds.
+With this new configuration slowly, but surely we managed to send logs
+without errors. Additionally, we enabled the Position DB feature.
+Position DB allows us to skip already ingested data instead of starting
+from scratch every time.
+
+Then node by node, we fully rolled out the Fluentd.
+
+It was a bumpy road, but at least we managed to finally ship logs. We
+never expected this to happen, but I guess it is what it is. You never
+know how open source software will break. Sometimes you need to be able
+to switch to the new solution fast.
+
+
+### **What could have been better?** 
+
+Our monitoring needed to be better. The challenge here isn\'t
+straightforward, though:
+
+The problem is that **none of the Fluent-bit\'s Prometheus metrics
+showed any errors**. Metrics are there, but they are not increasing. It
+turns out that this is another bug, filled a while back at [issue
+#1935](https://github.com/fluent/fluent-bit/issues/1935).
+Hopefully, Fluentd won\'t have the same bug.
+
+One way you can catch this situation is to **monitor based on traffic**.
+In Prometheus, we could alert on the rate of bytes send in a 5-minute
+window. Something similar to:
+
+> *sum(rate(fluentbit_output_proc_bytes_total{k8s_app=\"fluent-bit-logging\"}\[5m\]))
+> by (pod) /1024 / 1024 \> 0.1*
+
+The issue with this approach is that things quiet down during the night
+and during the day go up. So by the nature of it, it\'s very volatile.
+So it\'s hard to come up with one threshold. Instead, what you can do is
+use two thresholds. One for the day and one for the night. Something
+like:
+
+> *sum(rate(fluentbit_output_proc_bytes_total{k8s_app=\"fluent-bit-logging\"}\[5m\]))
+> by (pod) /1024 / 1024 \> 0.1 and hour() \> 9 and hour() \< 18\
+> *
+
+> *sum(rate(fluentbit_output_proc_bytes_total{k8s_app=\"fluent-bit-logging\"}\[5m\]))
+> by (pod) /1024 / 1024 \> 0 and hour() \> 18*
+
+Another option is to use the **black box monitoring method**. You make a
+script, which continually logs something. Then it performs a check,
+whether it is in Elasticsearch or not. You use to alert if logs are not
+there.
+
+Another issue with the situation is that these **alerts are not that
+actionable.** I mean, what can you do when you are not sending those
+logs? Fix the bug in Fluent-bit? You will not make it in time. Switch to
+Fluentd? But that\'s not ideal either, and you are not sure what you are
+getting yourself.
+
+Anyway, we are going to apply some of these ideas when monitoring
+Fluentd. And we are working on this now. Good thing that Fluentd has a
+pretty well documented [Prometheus
+integration](https://docs.fluentd.org/monitoring-fluentd/monitoring-prometheus). We are using this integration
+to build our monitoring package.
+
+You don\'t want to suffer the same faith as we did? Want to have the
+same production-ready Prometheus Alerts, Grafana Dashboards, and
+Runbooks?
+

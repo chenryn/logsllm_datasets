@@ -1,0 +1,148 @@
+It is slightly annoying to release and reacquire the metapage lock
+multiple times, but it seems best to do it that way to minimize loss of
+concurrency against processes just entering the index.  We don't want
+to hold the metapage exclusive lock while reading in a bitmap page.
+(We can at least avoid repeated buffer pin/unpin here.)
+The normal path for extending the index does not require doing I/O while
+holding the metapage lock.  We do have to do I/O when the extension
+requires adding a new bitmap page as well as the required overflow page
+... but that is an infrequent case, so the loss of concurrency seems
+acceptable.
+The portion of tuple insertion that calls the above subroutine looks
+like this:
+	-- having determined that no space is free in the target bucket:
+	remember last page of bucket, drop write lock on it
+	re-write-lock last page of bucket
+	if it is not last anymore, step to the last page
+	execute free-page-acquire (obtaining an overflow page) mechanism
+      described above
+	update (former) last page to point to the new page and mark buffer dirty
+	write-lock and initialize new page, with back link to former last page
+	write WAL for addition of overflow page
+	release the locks on meta page and bitmap page acquired in
+      free-page-acquire algorithm
+	release the lock on former last page
+	release the lock on new overflow page
+	insert tuple into new page
+	-- etc.
+Notice this handles the case where two concurrent inserters try to extend
+the same bucket.  They will end up with a valid, though perhaps
+space-inefficient, configuration: two overflow pages will be added to the
+bucket, each containing one tuple.
+The last part of this violates the rule about holding write lock on two
+pages concurrently, but it should be okay to write-lock the previously
+free page; there can be no other process holding lock on it.
+Bucket splitting uses a similar algorithm if it has to extend the new
+bucket, but it need not worry about concurrent extension since it has
+buffer content lock in exclusive mode on the new bucket.
+Freeing an overflow page requires the process to hold buffer content lock in
+exclusive mode on the containing bucket, so need not worry about other
+accessors of pages in the bucket.  The algorithm is:
+	delink overflow page from bucket chain
+	(this requires read/update/write/release of fore and aft siblings)
+	pin meta page and take buffer content lock in shared mode
+	determine which bitmap page contains the free space bit for page
+	release meta page buffer content lock
+	pin bitmap page and take buffer content lock in exclusive mode
+	retake meta page buffer content lock in exclusive mode
+	move (insert) tuples that belong to the overflow page being freed
+	update bitmap bit
+	mark bitmap page dirty
+	if page number is still less than first-free-bit,
+		update first-free-bit field and mark meta page dirty
+	write WAL for delinking overflow page operation
+	release buffer content lock and pin
+	release meta page buffer content lock and pin
+We have to do it this way because we must clear the bitmap bit before
+changing the first-free-bit field (hashm_firstfree).  It is possible that
+we set first-free-bit too small (because someone has already reused the
+page we just freed), but that is okay; the only cost is the next overflow
+page acquirer will scan more bitmap bits than he needs to.  What must be
+avoided is having first-free-bit greater than the actual first free bit,
+because then that free page would never be found by searchers.
+The reason of moving tuples from overflow page while delinking the later is
+to make that as an atomic operation.  Not doing so could lead to spurious reads
+on standby.  Basically, the user might see the same tuple twice.
+WAL Considerations
+------------------
+The hash index operations like create index, insert, delete, bucket split,
+allocate overflow page, and squeeze in themselves don't guarantee hash index
+consistency after a crash.  To provide robustness, we write WAL for each of
+these operations.
+CREATE INDEX writes multiple WAL records.  First, we write a record to cover
+the initializatoin of the metapage, followed by one for each new bucket
+created, followed by one for the initial bitmap page.  It's not important for
+index creation to appear atomic, because the index isn't yet visible to any
+other transaction, and the creating transaction will roll back in the event of
+a crash.  It would be difficult to cover the whole operation with a single
+write-ahead log record anyway, because we can log only a fixed number of
+pages, as given by XLR_MAX_BLOCK_ID (32), with current XLog machinery.
+Ordinary item insertions (that don't force a page split or need a new overflow
+page) are single WAL entries.  They touch a single bucket page and the
+metapage.  The metapage is updated during replay as it is updated during
+original operation.
+If an insertion causes the addition of an overflow page, there will be one
+WAL entry for the new overflow page and second entry for insert itself.
+If an insertion causes a bucket split, there will be one WAL entry for insert
+itself, followed by a WAL entry for allocating a new bucket, followed by a WAL
+entry for each overflow bucket page in the new bucket to which the tuples are
+moved from old bucket, followed by a WAL entry to indicate that split is
+complete for both old and new buckets.  A split operation which requires
+overflow pages to complete the operation will need to write a WAL record for
+each new allocation of an overflow page.
+As splitting involves multiple atomic actions, it's possible that the system
+crashes between moving tuples from bucket pages of the old bucket to new
+bucket.  In such a case, after recovery, the old and new buckets will be
+marked with bucket-being-split and bucket-being-populated flags respectively
+which indicates that split is in progress for those buckets.  The reader
+algorithm works correctly, as it will scan both the old and new buckets when
+the split is in progress as explained in the reader algorithm section above.
+We finish the split at next insert or split operation on the old bucket as
+explained in insert and split algorithm above.  It could be done during
+searches, too, but it seems best not to put any extra updates in what would
+otherwise be a read-only operation (updating is not possible in hot standby
+mode anyway).  It would seem natural to complete the split in VACUUM, but since
+splitting a bucket might require allocating a new page, it might fail if you
+run out of disk space.  That would be bad during VACUUM - the reason for
+running VACUUM in the first place might be that you run out of disk space,
+and now VACUUM won't finish because you're out of disk space.  In contrast,
+an insertion can require enlarging the physical file anyway.
+Deletion of tuples from a bucket is performed for two reasons: to remove dead
+tuples, and to remove tuples that were moved by a bucket split.  A WAL entry
+is made for each bucket page from which tuples are removed, and then another
+WAL entry is made when we clear the needs-split-cleanup flag.  If dead tuples
+are removed, a separate WAL entry is made to update the metapage.
+As deletion involves multiple atomic operations, it is quite possible that
+system crashes after (a) removing tuples from some of the bucket pages, (b)
+before clearing the garbage flag, or (c) before updating the metapage.  If the
+system crashes before completing (b), it will again try to clean the bucket
+during next vacuum or insert after recovery which can have some performance
+impact, but it will work fine. If the system crashes before completing (c),
+after recovery there could be some additional splits until the next vacuum
+updates the metapage, but the other operations like insert, delete and scan
+will work correctly.  We can fix this problem by actually updating the
+metapage based on delete operation during replay, but it's not clear whether
+it's worth the complication.
+A squeeze operation moves tuples from one of the buckets later in the chain to
+one of the bucket earlier in chain and writes WAL record when either the
+bucket to which it is writing tuples is filled or bucket from which it
+is removing the tuples becomes empty.
+As a squeeze operation involves writing multiple atomic operations, it is
+quite possible that the system crashes before completing the operation on
+entire bucket.  After recovery, the operations will work correctly, but
+the index will remain bloated and this can impact performance of read and
+insert operations until the next vacuum squeeze the bucket completely.
+Other Notes
+-----------
+Clean up locks prevent a split from occurring while *another* process is stopped
+in a given bucket.  It also ensures that one of our *own* backend's scans is not
+stopped in the bucket.
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

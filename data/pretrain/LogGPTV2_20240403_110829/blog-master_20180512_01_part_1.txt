@@ -1,0 +1,198 @@
+## PostgreSQL, SQL Server 逻辑增量 (通过逻辑标记update,delete) 同步到 Greenplum, PostgreSQL  
+### 作者                                                           
+digoal                                                           
+### 日期                                                           
+2018-05-12                                                         
+### 标签                                                           
+PostgreSQL , Greenplum , trigger , rule , 逻辑更新 , 逻辑删除 , 增量复制       
+----                                                           
+## 背景      
+异构数据的增量同步是比较繁琐的事情，需要考虑很多事情，比如：  
+1、同步延迟  
+2、DDL的同步  
+3、同步时对上游性能的影响  
+4、上下游数据一致性  
+5、上游事务原子性在目标端是否能保证原子性  
+6、上下游数据类型兼容性  
+7、上下游字符集一致性  
+8、同步时对下游性能的影响  
+9、可以同步哪些操作（INSERT, UPDATE, DELETE, TRUNCATE, DDL）  
+10、同步操作的幂等性  
+11、同步的效率  
+12、下游的回放速度  
+13、是否支持批量操作  
+通常有一些比较专业的同步软件，比如cdc, goldengate, kettle等。  
+又比如阿里云开源的rds_dbsync，又比如阿里云的服务datax，又比如PostgreSQL内置的逻辑订阅功能，又比如PostgreSQL内置的FDW功能。  
+等等：  
+[《debezium - 数据实时捕获和传输管道(CDC)》](../201710/20171026_01.md)    
+[《ETL for Oracle to Greenplum (bulk) - Pentaho Data Integrator (PDI, kettle)》](../201805/20180505_04.md)    
+[《ETL for Oracle to PostgreSQL 3 - DATAX》](../201805/20180505_03.md)    
+[《ETL for Oracle to PostgreSQL 2 - Pentaho Data Integrator (PDI, kettle)》](../201805/20180505_02.md)    
+[《ETL for Oracle to PostgreSQL 1 - Oracle Data Integrator (ODI)》](../201805/20180505_01.md)    
+[《MySQL准实时同步到PostgreSQL, Greenplum的方案之一 - rds_dbsync》](../201710/20171027_02.md)    
+[《MySQL,Oracle,SQL Server等准实时同步到PostgreSQL的方案之一 - FDW外部访问接口》](../201710/20171027_01.md)    
+[《[未完待续] MySQL Oracle PostgreSQL PPAS Greenplum 的异构迁移和同步实现和场景介绍》](../201710/20171016_01.md)    
+[《MySQL 增量同步到 PostgreSQL》](../201610/20161020_01.md)    
+[《使用Londiste3 增量同步 线下PostgreSQL 到 阿里云RDS PG》](../201605/20160525_01.md)    
+[《使用alidecode将RDS PG同步到线下, 或者将MySQL同步到PG》](../201605/20160525_03.md)    
+[《PostgreSQL 分区表的逻辑复制（逻辑订阅）》](../201804/20180420_02.md)    
+[《PostgreSQL 逻辑订阅 - DDL 订阅 实现方法》](../201712/20171204_04.md)    
+[《Greenplum, PostgreSQL 数据实时订阅的几种方式》](../201710/20171018_04.md)    
+[《使用PostgreSQL逻辑订阅实现multi-master》](../201706/20170624_01.md)    
+[《PostgreSQL 逻辑订阅 - 给业务架构带来了什么希望？》](../201704/20170413_01.md)    
+[《PostgreSQL 10.0 preview 逻辑订阅 - 原理与最佳实践》](../201702/20170227_01.md)    
+[《GoldenGate - Oracle 实时复制到 PostgreSQL或EnterpriseDB》](../201604/20160401_02.md)    
+越来越多的数据库内置了逻辑订阅的能力（通过解析WAL日志，产生流式的变更行为，在目标端回放）。  
+本文介绍一下另类的方法，或者说更为传统的方法，所以它适用于几乎所有的数据库产品同步。  
+## 要求  
+1、源端需要对update, delete使用逻辑更新或删除标记和时间戳，可以使用触发器和RULE实现  
+2、目标端需要具备MERGE INSERT的能力  
+3、如果目标端没有MERGE能力，则可以通过临时表，使用两步操作来实现MERGE  
+4、源端和目标端的表，都必须具有PK  
+## 一、源PostgreSQL, 目标Greenplum, PostgreSQL, 增量复制delete,insert,update  
+### 源端  
+1、创建源表  
+```  
+create table t_src (  
+  id int primary key,   
+  info text not null,   
+  is_del boolean default null,   -- 删除标记，NULL表示未删除，非空表示已删除  
+  mod_time timestamp not null default clock_timestamp()  -- 插入、删除、修改的时间戳  
+);  
+```  
+2、创建索引，加速同步  
+```  
+create index idx_t_src_1 on t_src(mod_time);  
+```  
+3、创建触发器函数，更新、删除数据时，更新时间戳，同时修改删除标记位  
+当被删除的记录重新被插入时，把删除标记改成未删除。  
+```  
+create or replace function tg1_t_src() returns trigger as $$  
+declare  
+begin  
+  NEW.mod_time := clock_timestamp();  
+  select case when OLD.is_del is null and NEW.is_del = true then true else null end into NEW.is_del;     -- 如果以前这个ID被删除过，则插入，并将is_del重新置为未删除   
+  return NEW;  
+end;  
+$$ language plpgsql strict;   
+```  
+4、创建触发器，更新时触发  
+```  
+create trigger tg1 before update on t_src for each row execute procedure tg1_t_src();  
+```  
+5、创建规则，当删除记录时，使用UPDATE代替DELETE  
+```  
+create rule r1 as on delete to t_src do instead update t_src set is_del=true where t_src.id=OLD.id and t_src.is_del is null;     -- 未标记为删除的记录is_del=null，标记为删除.    
+```  
+6、查看插入、更新、删除是否符合预期  
+```  
+postgres=# insert into t_src values (1, md5(random()::text)) on conflict (id) do update set info=excluded.info;  
+INSERT 0 1  
+postgres=# select * from t_src where id=1;  
+ id |               info               | is_del |          mod_time            
+----+----------------------------------+--------+----------------------------  
+  1 | 56c21963342997fd8bf80a5b542abde9 |        | 2018-05-12 08:54:19.393532  
+(1 row)  
+postgres=# insert into t_src values (1, md5(random()::text)) on conflict (id) do update set info=excluded.info;  
+INSERT 0 1  
+postgres=# select * from t_src where id=1;  
+ id |               info               | is_del |          mod_time            
+----+----------------------------------+--------+----------------------------  
+  1 | 5bca407559081d6cfc1154fd0f17b6a9 |        | 2018-05-12 08:54:23.465005  
+(1 row)  
+postgres=# delete from t_src where id=1;  
+DELETE 0  
+postgres=# select * from t_src;  
+ id |               info               | is_del |          mod_time            
+----+----------------------------------+--------+----------------------------  
+  1 | 5bca407559081d6cfc1154fd0f17b6a9 | t      | 2018-05-12 08:54:43.158809  
+(1 row)  
+```  
+7、创建压测脚本  
+```  
+vi test.sql  
+\set id1 random(1,10000000)  
+\set id2 random(1,20000000)  
+insert into t_src values (:id1, md5(random()::text)) on conflict (id) do update set info=excluded.info;  
+delete from t_src where id=:id2;  
+```  
+8、压测，高压插入、更新、删除动作，每秒处理13.8万行。  
+```  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 64 -j 64 -T 120  
+transaction type: ./test.sql  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 64  
+number of threads: 64  
+duration: 120 s  
+number of transactions actually processed: 16634225  
+latency average = 0.462 ms  
+latency stddev = 0.506 ms  
+tps = 138437.925513 (including connections establishing)  
+tps = 138445.093708 (excluding connections establishing)  
+statement latencies in milliseconds:  
+         0.002  \set id1 random(1,10000000)  
+         0.000  \set id2 random(1,20000000)  
+         0.298  insert into t_src values (:id1, md5(random()::text)) on conflict (id) do update set info=excluded.info;  
+         0.163  delete from t_src where id=:id2;  
+```  
+### 目标端  
+1、创建目标表  
+```  
+create table t_dst (  
+  id int primary key,   
+  info text not null,   
+  is_del boolean default null,   
+  mod_time timestamp not null default clock_timestamp()  
+);  
+```  
+2、创建索引  
+```  
+create index idx_t_dst_1 on t_dst(mod_time);  
+```  
+### 数据同步  
+1、源端数据增量同步到目标端  
+(在同一DB中模拟，后面有例子讲源和目标在不同集群的DEMO)  
+```  
+do language plpgsql $$  
+declare  
+  pos timestamp;           -- 位点  
+  pre interval := '10 s';  -- 缓冲10秒，防止空洞，根据业务层设置  
+begin  
+  -- 已同步位点  
+  select max(mod_time) into pos from t_dst;  
+  -- NULL表示目标端没有数据  
+  if pos is null then  
+    -- 缓冲上限   
+    pos := now()::timestamp;  
+    insert into t_dst select * from t_src where mod_time  pos and mod_time  pos and mod_time < (now()::timestamp - pre) on conflict (id) do update set   
+    info=excluded.info, mod_time=excluded.mod_time  
+    where tbl_dst.info is distinct from excluded.info or  
+    tbl_dst.mod_time is distinct from excluded.mod_time;  
+  return;  
+end;  
+$$;  
+```  
+2、一边压测，一边调用以上过程同步数据，最后检查一致性  
+```  
+select sum(hashtext((t.*)::text)),count(*) from tbl_src t;  
+      sum      |  count    
+---------------+---------  
+ 2739329060132 | 6725930  
+(1 row)  
+select sum(hashtext((t.*)::text)),count(*) from tbl_dst t;  
+      sum      |  count    
+---------------+---------  
+ 2739329060132 | 6725930  
+(1 row)  
+```  
+## 四、源PostgreSQL, 目标Greenplum, 增量复制insert,update  
+同样，不包括DELETE的复制。只复制insert和update。  
+由于greenplum 没有 insert into on conflict  的功能，所以需要采用临时表，分步实现MERGE。  
+### 同步方法  
+1\. 目标端，HDB PG, 获取max(mod_time)  
+2\. 源端，PG, 拉取增量  
+3\. 目标端，增量数据，导入HDB PG 临时表  
+4\. 目标端，HDB PG ，DELETE from 目标表 using 临时表  
+5\. 目标端，HDB PG ，insert into 目标表 select * from 临时表  
+6\. 目标端，清空临时表   

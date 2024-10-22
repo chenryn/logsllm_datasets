@@ -1,0 +1,155 @@
+**作者：rook1e@知道创宇404实验室  
+时间：2021年11月3日**
+前段时间学习了 0x7F 师傅的“[dll 劫持和应用](https://paper.seebug.org/1713/)”，其中提到通过 dll
+劫持来劫持编译器实现供应链攻击，不由想到 Go 中的一些机制也可以方便地实现编译劫持，于是做了一些研究和测试。
+## 编译过程
+首先我们了解一下 `go build` 做了什么。
+    package main
+    func main() {
+        print("i'm testapp!")
+    }
+以这个简单的程序为例，`go build -x main.go` 编译并输出编译过程（篇幅有限所以没有强制重新编译最基础的依赖）：
+上述命令可以将编译过程概括为：
+  1. 创建临时目录
+  2. 生成 compile 需要的配置文件，运行 compile 编译出[目标文件](https://zh.wikipedia.org/wiki/%E7%9B%AE%E6%A0%87%E4%BB%A3%E7%A0%81) `***.a`（还有其他编译工具执行类似的操作）
+  3. 写入 build id
+  4. 重复 2、3 步编译所有依赖
+  5. 生成 link 需要的配置文件，运行 link 将上述目标文件连接成可执行文件
+  6. 写入 build id
+  7. 将链接好的可执行文件移动到当前目录，删除临时目录
+观察这段命令能够发现一些有趣的地方。
+每个编译阶段都有单独的[工具程序](https://pkg.go.dev/cmd)负责，例如 compile、link、asm，这些工具程序可以通过 `go
+tool` 获得，其中用于编译的暂且称之为编译工具。
+命令中有大段形如 `packagefile xxx/xxx=xxx.a` 的内容，用于指明代码中依赖和目标文件的对应关系，这些对应关系将写入
+`importcfg/importcfg.link` 作为 compile/link 的配置文件。
+另外，还可以发现创建了形如 `$WORK/b001` 的临时目录。`go build`
+在运行编译工具前会解析出全部的依赖关系，根据依赖关系对每个包创建相应的 action，最终构成 action graph，按序执行即可完成编译，每个
+action 对应一个临时目录。例如使用 `go build -a -work`（`-a` 表示强制重新编译，`-work`
+表示保留临时目录）编译一个程序：
+由图可以看到各个 action 使用的临时目录，如 b062 存放了编译配置文件 `importcfg` 和编译出的目标文件 `_pkg_.a`，而最后一个
+action 对应的 b001 目录，除了编译的临时文件，还有链接配置 `importcfg.link` 和链接结果 `exe/a.out`。
+综上，我们可以总结出几个关键信息：
+  * `go build` 的主要工作：分析依赖，把源代码编译成目标文件，把目标文件链接成可执行文件
+  * 目标文件、配置文件存放在临时目录中（b001 是最后一个，也是可执行文件的诞生地），临时目录可以通过 `-work` 参数保留
+  * 调用编译工具实现不同阶段的编译工作
+  * 后 action 需要依赖前 action 的结果
+可以感受到编译过程是较为“分散”的，这给我们创造了机会：
+  1. 编译工具是[开源](https://github.com/golang/go/tree/master/src/cmd)的，可以对其修改并替换进 `go env GOTOOLDIR` 目录
+  2. 利用 `go build -toolexec` 机制
+这两种方法的思路大致相同，本文尝试了第二种思路。
+## 劫持编译
+前段时间研究[代码混淆](https://paper.seebug.org/1586/)时学习到了 `go build` 的 `-toolexec`
+机制，这里粘贴一下相关内容：
+> 细心的读者可能会发现一个有趣的问题：拼接的命令中真正的运行对象并不是编译工具，而是 `cfg.BuildToolexec`。跟进到定义处可知它是由
+> `go build -toolexec` 参数设置的，官方释义为：
+>
+> `bash -toolexec 'cmd args' a program to use to invoke toolchain programs
+> like vet and asm. For example, instead of running asm, the go command will
+> run 'cmd args /path/to/asm '.`
+>
+> 即用 `-toolexec` 指定的程序来运行编译工具。这其实可以看作是一个 hook
+> 机制，利用这个参数来指定一个我们的程序，在编译时用这个程序调用编译工具，从而介入编译过程
+所以我们的目标是实现一个类似 garble 的工具，暂且称之为 wrapper，在项目的编译脚本或其他存在编译命令的地方插入 `-toolexec
+"/path/to/wrapper"`，运行编译命令时 wrapper 要找到一个合适的位置（暂定为 `main.main()` 的顶部）插入
+paylaod。
+首先要定位到目标代码文件。
+    /path/to/wrapper /opt/homebrew/Cellar/go/1.17.2/libexec/pkg/tool/darwin_arm64/compile -o $WORK/b042/_pkg_.a -trimpath "$WORK/b042=>" -shared -p strings -std -complete -buildid ygbMG98G6g0UHH5pai26/ygbMG98G6g0UHH5pai26 -goversion go1.17.2 -importcfg $WORK/b042/importcfg -pack /opt/homebrew/Cellar/go/1.17.2/libexec/src/strings/builder.go /opt/homebrew/Cellar/go/1.17.2/libexec/src/strings/compare.go 
+    ...（省略）
+这是一条 `go build -toolexec "/path/to/wrapper"` 执行的命令，compile
+的目标代码文件路径拼接在最后。提取出文件路径后，根据文件内容判断是否是 `main.main()` 所在文件，方法有很多，例如直接匹配是否以
+`package main` 开头且存在 `func main(){` ，更严谨一点可以解析出 AST，通过下图几个特征来判断：
+因为一条编译命令包含的文件都属于一个包，所以只要有一个文件不符合要求就可以放弃后续筛选了。
+综上，第一步可以通过如下条件筛选：
+  1. 调用的工具是 compile
+  2. 文件是 `.go` 后缀
+  3. AST 中包名是 main，且 Decls 中存在名为 main 的 `ast.FuncDecl`
+定位到了目标代码文件，下一步通过修改 AST 来插入 payload。
+根据上一步中的 AST 图，`main()` 中的每条语句解析成 AST 节点是 `ast.Stmt` 接口类型，存放于 `Body.List`
+中，所以参照具体 stmt 的格式构造 AST 节点，如：
+    var cmd = `exec.Command("open", "/System/Applications/Calculator.app").Run()`   
+    payloadExpr, err := parser.ParseExpr(cmd)
+    // handle err
+    payloadExprStmt := &ast.ExprStmt{
+      X: payloadExpr,
+    }
+向 `main()` 的 `Body.List` 插入 payload 的节点：
+    // 方式1
+    ast.Inspect(f, func(n ast.Node) bool {
+      switch x := n.(type) {
+      case *ast.FuncDecl:
+        if x.Name.Name == "main" && x.Recv == nil {
+          stmts := make([]ast.Stmt, 0, len(x.Body.List)+1)
+          stmts = append(stmts, payloadExprStmt)
+          stmts = append(stmts, x.Body.List...)
+          x.Body.List = stmts
+          return false
+        }
+      }
+      return true
+    })
+    // 方式2
+    pre := func(cursor *astutil.Cursor) bool {
+      switch cursor.Node().(type) {
+      case *ast.FuncDecl:
+        if fd := cursor.Node().(*ast.FuncDecl); fd.Name.Name == "main" && fd.Recv == nil {
+          return true
+        }
+        return false
+      case *ast.BlockStmt:
+        return true
+      case ast.Stmt:
+        if _, ok := cursor.Parent().(*ast.BlockStmt); ok {
+          cursor.InsertBefore(payloadExprStmt)
+        }
+      }
+      return true
+    }
+    post := func(cursor *astutil.Cursor) bool {
+      if _, ok := cursor.Parent().(*ast.BlockStmt); ok {
+        return false
+      }
+      return true
+    }
+    f = astutil.Apply(f, pre, post).(*ast.File)
+最后将修改好的 AST 保存为文件，替换原始编译命令中的文件地址，执行命令。
+简简单单，到这里似乎顺利完成，但测试一下会出现报错无法找到 `os/exec`：
+    /var/folders/z5/1_qfr0f55x97c63p412hprzw0000gn/T/gobuild_cache_1747406166/main.go:5:2: could not import "os/exec": open : no such file or directory
+回想一下前文“编译过程”部分的内容，在编译和链接阶段都需要使用其依赖包在先前编译出的目标文件，并且依赖分析和 action graph 的构建是 `go
+build` 在运行编译工具前完成的，无法通过 `-toolexec` 劫持。所以向 AST 中 的 import 节点插入依赖并不会修改已有的依赖关系和
+action graph，导致没有 `os/exec` 的目标文件可用。
+既然 action graph 中缺少 `os/exec` 及其依赖，那我们可以自行完成缺少的 action，即编译出相应的目标文件并添加到
+importcfg。
+对比 importctg 发现间接依赖比想象中的多，但好在都记录在 importcfg 中，所以我们创建一个新的 `go build` 编译一段简化的
+payload：
+    package main
+    import "os/exec"
+    func main() {
+        exec.Command("xxx").Run()
+    }
+添加 `-work` 参数保留这次编译的临时目录，读取临时目录 b001 中的 importcfg 获得 `os/exec`
+的依赖的目标文件路径，将这些配置项按需追加到原 importcfg。
+再次尝试，可以看到 payload 成功插入。
+另外，可以看到上述测试都使用了 `-a` 参数，是由于 `go build` 存在缓存和增量编译机制，正常 `go build`
+可能因命中缓存而不会调用工具，所以要添加 `-a` 参数强制编译所有依赖，或者编译前 `go clean -cache` 清除缓存，或是修改环境变量
+GOCACHE 到一个新的目录。
+最后，梳理一下上述步骤：
+**compile 时：**  
+1\. 定位目标文件  
+2\. 编译一个简化的 payload 得到 importcfg 和其依赖的中间文件  
+3\. 补充 `importcfg`  
+4\. 在 AST 中插入 payload，保存到临时文件  
+5\. 修改原编译命令中的文件路径，执行编译命令
+**link 时：**  
+1\. 定位目标文件  
+2\. 补充 `importcfg.link`  
+3\. 执行链接命令
+## 总结
+本文实践的方案利用了 `go build` 的 `-toolexec` 机制让工具介入编译过程，在临时文件中插入 payload。
+从实际应用的角度来说还存在很多问题，例如如何隐蔽地在编译脚本中插入 `-toolexec` 和 `-a`
+参数。在没有合适的伪装手段时，按照本文思路修改并替换编译工具 compile 和 link 或许是更好的选择。
+本文相关代码存放在 [go-build-hijacking](https://github.com/0x2E/go-build-hijacking)，后续有好的思路会继续补充，欢迎师傅们通过 issue 或邮件交流。
+## Ref
+  * [How “go build” Works](https://maori.geek.nz/how-go-build-works-750bb2ba6d8e)
+  * [golang编译器漫谈（1）编译器和连接器](https://hao.io/2020/01/golang%E7%BC%96%E8%AF%91%E5%99%A8%E6%BC%AB%E8%B0%88%EF%BC%881%EF%BC%89%E7%BC%96%E8%AF%91%E5%99%A8%E5%92%8C%E8%BF%9E%E6%8E%A5%E5%99%A8)
+  * [走进Golang之编译器原理](https://xiaomi-info.github.io/2019/11/13/golang-compiler-principle/)
+* * *

@@ -1,0 +1,348 @@
+ "C:\Windows\System32\rundll32.exe ieadvpack.dll,RegisterOCX payload.exe"
+Listing 3-8: Retrieving parameters from the PEB with WinDbg
+In this example, we extract the parameters from the current process’s 
+PEB by directly accessing the buffer member of the UNICODE_STRING, which 
+makes up the CommandLine member of the ProcessParameters field.
+However, because the PEB resides in the process’s user-mode memory 
+space and not in the kernel, a process can change attributes of its own PEB. 
+Adam Chester’s “How to Argue like Cobalt Strike” blog post details how to 
+modify the command line arguments for a process. Before we cover this tech-
+nique, you should understand what it looks like when a normal program cre-
+ates a child process. Listing 3-9 contains a simple example of this behavior.
+void main()
+{
+STARTUPINFOW si;
+ZeroMemory(&si, sizeof(si));
+si.cb = sizeof(si);
+PROCESS_INFORMATION pi;
+ZeroMemory(&pi, sizeof(pi));
+if (!CreateProcessW(
+  L"C:\\Windows\\System32\\cmd.exe",
+  L"These are my sensitive arguments",
+  NULL, NULL, FALSE, 0,
+  NULL, NULL, &si, &pi))
+{
+  WaitForSingleObject(pi.hProcess, INFINITE);
+}
+return;
+}
+Listing 3-9: Typical child-process creation
+This basic implementation spawns a child process of cmd.exe with the 
+arguments “These are my sensitive arguments.” When the process is exe-
+cuted, any standard process-monitoring tool should see this child process 
+and its unmodified arguments by reading them from the PEB. For example, 
+in Figure 3-3, we use a tool called Process Hacker to extract command line 
+parameters.
+As expected, cmd.exe was spawned with our string of five arguments 
+passed to it. Let’s keep this example in mind; it will serve as our benign 
+baseline as we start trying to hide our malware.
+Evading EDR (Early Access) © 2023 by Matt Hand
+Process- and Thread-Creation Notifications   43
+Chester’s blog post describes the following process for modifying 
+the command line arguments used to invoke a process. First, you create 
+the child process in a suspended state using your malicious arguments. 
+Next, you use ntdll!NtQueryInformationProcess() to get the address of the 
+child process’s PEB, and you copy it by calling kernel32!ReadProcessMemory(). 
+You retrieve its ProcessParameters field and overwrite the UNICODE_STRING rep-
+resented by the CommandLine member pointed to by ProcessParameters with 
+spoofed arguments. Lastly, you resume the child process.
+Let’s overwrite the original arguments from Listing 3-9 with the argu-
+ment string “Spoofed arguments passed instead.” Listing 3-10 shows this 
+behavior in action, with the updates in bold.
+void main()
+{
+--snip--
+if (CreateProcessW(
+L"C:\\Windows\\System32\\cmd.exe",
+L"These are my sensitive arguments",
+NULL, NULL, FALSE,
+CREATE_SUSPENDED,
+NULL, NULL, &si, &pi))
+{
+--snip--
+LPCWSTR szNewArguments = L"Spoofed arguments passed instead";
+SIZE_T ulArgumentLength = wcslen(szNewArguments) * sizeof(WCHAR);
+if (WriteProcessMemory(
+pi.hProcess,
+pParameters.CommandLine.Buffer,
+(PVOID)szNewArguments,
+ulArgumentLength,
+&ulSize))
+{
+ResumeThread(pi.hThread);
+}
+  }
+--snip--
+}
+Listing 3-10: Overwriting command line arguments
+Figure 3-3: Command line arguments  
+retrieved from the PEB
+Evading EDR (Early Access) © 2023 by Matt Hand
+44   Chapter 3
+When we create our process, we pass the CREATE_SUSPENDED flag to the func-
+tion to start it in a suspended state. Next, we need to get the address of the 
+process’s parameters in the PEB. We’ve omitted this code from Listing 3-10 
+for brevity, but the way to do this is to use ntdll!NtQueryInformationProcess(), 
+passing in the ProcessBasicInformation information class. This should return a 
+PROCESS_BASIC_INFORMATION structure that contains a PebBaseAddress member.
+We can then read our child process’s PEB into a buffer that we allocate 
+locally. Using this buffer, we extract the parameters and pass in the address 
+of the PEB. Then we use ProcessParameters to copy it into another local buf-
+fer. In our code, this final buffer is called pParameters and is cast as a pointer 
+to an RTL_USER_PROCESS_PARAMETERS structure. We overwrite the existing param-
+eters with a new string via a call to kernel32!WriteProcessMemory(). Assuming 
+that this all completed without error, we call kernel32!ResumeThread() to allow 
+our suspended child process to finish initialization and begin executing.
+Process Hacker now shows the spoofed argument values, as you can see 
+in Figure 3-4.
+Figure 3-4: Command line arguments  
+overwritten with spoofed values
+While this technique remains one of the more effective ways to evade 
+detection based on suspicious command line arguments, it has a handful of 
+limitations. One such limitation is that a process can’t change its own com-
+mand line arguments. This means that if we don’t have control of the parent 
+process, as in the case of an initial access payload, the process must execute 
+with the original arguments. Additionally, the value used to overwrite the 
+suspicious arguments in the PEB must be longer than the original value. If 
+it is shorter, the overwrite will be incomplete, and portions of the suspicious 
+arguments will remain. Figure 3-5 shows this limitation in action.
+Figure 3-5: Command line arguments  
+partially overwritten
+Here, we’ve shortened our arguments to the value “Spoofed argu-
+ments.” As you can see, it replaced only part of the original arguments. The 
+inverse is also true: if the length of the spoofed value is greater than that of 
+the original arguments, the spoofed arguments will be truncated.
+Evading EDR (Early Access) © 2023 by Matt Hand
+Process- and Thread-Creation Notifications   45
+Parent Process ID Spoofing
+Nearly every EDR has some way of correlating parent–child processes on 
+the system. This allows the agent to identify suspicious process relation-
+ships, such as Microsoft Word spawning rundll32.exe, which could indicate 
+an attacker’s initial access or their successful exploitation of a service.
+Thus, in order to hide malicious behavior on the host, attackers often 
+wish to spoof their current process’s parent. If we can trick an EDR into 
+believing that our malicious process creation is actually normal, we’re sub-
+stantially less likely to be detected. The most common way to accomplish 
+this is by modifying the child’s process and thread attribute list, a tech-
+nique popularized by Didier Stevens in 2009. This evasion relies on the fact 
+that, on Windows, children inherit certain attributes from parent processes, 
+such as the current working directory and environment variables. No 
+dependencies exist between parent and child processes; therefore, we can 
+specify a parent process somewhat arbitrarily, as this section will cover.
+To better understand this strategy, let’s dig into process creation 
+on Windows. The primary API used for this purpose is the aptly named 
+kernel32!CreateProcess() API. This function is defined in Listing 3-11.
+BOOL CreateProcessW(
+ LPCWSTR  
+ lpApplicationName,
+ LPWSTR  
+ lpCommandLine,
+ LPSECURITY_ATTRIBUTES lpProcessAttributes,
+ LPSECURITY_ATTRIBUTES lpThreadAttributes,
+ BOOL  
+ bInheritHandles,
+ DWORD  
+ dwCreationFlags,
+ LPVOID  
+ lpEnvironment,
+ LPCWSTR  
+ lpCurrentDirectory,
+ LPSTARTUPINFOW  
+ lpStartupInfo,
+ LPPROCESS_INFORMATION lpProcessInformation
+);
+Listing 3-11: The kernel32!CreateProcess() API definition
+The ninth parameter passed to this function is a pointer to a STARTUPINFO 
+or STARTUPINFOEX structure. The STARTUPINFOEX structure, defined in  
+Listing 3-12, extends the basic startup information structure by adding a 
+pointer to a PROC_THREAD_ATTRIBUTE_LIST structure.
+typedef struct _STARTUPINFOEXA {
+ STARTUPINFOA  
+StartupInfo;
+ LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList;
+} STARTUPINFOEXA, *LPSTARTUPINFOEXA;
+Listing 3-12: The STARTUPINFOEX structure definition
+When creating our process, we can make a call to kernel32!Initialize 
+ProcThreadAttributeList() to initialize the attribute list and then to kernel32
+!UpdateProcThreadAttribute() to modify it. This allows us to set custom attri-
+butes of the process to be created. When spoofing the parent process, we’re 
+Evading EDR (Early Access) © 2023 by Matt Hand
+46   Chapter 3
+interested in the PROC_THREAD_ATTRIBUTE_PARENT_PROCESS attribute, which indi-
+cates that a handle to the desired parent process is being passed. To get this 
+handle, we must obtain a handle to the target process, by either opening a 
+new one or leveraging an existing one.
+Listing 3-13 shows an example of process spoofing to tie all these pieces 
+together. We’ll modify the attributes of the Notepad utility so that VMware 
+Tools appears to be its parent process.
+Void SpoofParent() {
+PCHAR szChildProcess = "notepad";
+DWORD dwParentProcessId = 1 7648;
+HANDLE hParentProcess = NULL;
+STARTUPINFOEXA si;
+PROCESS_INFORMATION pi;
+SIZE_T ulSize;
+memset(&si, 0, sizeof(STARTUPINFOEXA));
+si.StartupInfo.cb = sizeof(STARTUPINFOEXA);
+ 2 hParentProcess = OpenProcess(
+PROCESS_CREATE_PROCESS,
+FALSE,
+dwParentProcessId);
+ 3 InitializeProcThreadAttributeList(NULL, 1, 0, &ulSize);
+  si.lpAttributeList =
+4 (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+GetProcessHeap(),
+0, ulSize);
+  InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &ulSize);
+ 5 UpdateProcThreadAttribute(
+si.lpAttributeList,
+0,
+PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+&hParentProcess,
+sizeof(HANDLE),
+NULL, NULL);
+  CreateProcessA(NULL,
+szChildProcess,
+NULL, NULL, FALSE,
+EXTENDED_STARTUPINFO_PRESENT,
+NULL, NULL,
+&si.StartupInfo, &pi);
+  CloseHandle(hParentProcess);
+  DeleteProcThreadAttributeList(si.lpAttributeList);
+}
+Listing 3-13: An example of spoofing a parent process
+We first hardcode the process ID 1 of vmtoolsd.exe, our desired par-
+ent. In the real world, we might instead use logic to find the ID of the 
+Evading EDR (Early Access) © 2023 by Matt Hand
+Process- and Thread-Creation Notifications   47
+parent we’d like to spoof, but I’ve opted not to include this code in the 
+example for the sake of brevity. Next, the SpoofParent() function makes a 
+call to kernel32!OpenProcess() 2. This function is responsible for opening a 
+new handle to an existing process with the access rights requested by the 
+developer. In most offensive tools, you may be used to seeing this function 
+used with arguments like PROCESS_VM_READ, to read the process’s memory, or 
+PROCESS_ALL_ACCESS, which gives us full control over the process. In this exam-
+ple, however, we request PROCESS_CREATE_PROCESS. We’ll need this access right 
+in order to use the target process as a parent with our externed startup 
+information structure. When the function completes, we’ll have a handle to 
+vmtoolsd.exe with the appropriate rights.
+The next thing we need to do is create and populate the PROC_THREAD 
+_ATTRIBUTE_LIST structure. To do this, we use a pretty common Windows 
+programming trick to get the size of a structure and allocate the correct 
+amount of memory to it. We call the function to initialize the attribute 
+list 3, passing in a null pointer instead of the address of the real attribute 
+list. However, we still pass in a pointer to a DWORD, which will hold the size 
+required after completion. We then use the size stored in this variable to 
+allocate memory on the heap with kernel32!HeapAlloc() 4. Now we can call 
+the attribute list initialization function again, passing in a pointer to the 
+heap allocation we just created.
+At this point, we’re ready to start spoofing. We do this by first calling 
+the function for modifying the attribute list and passing in the attribute 
+list itself, the flag indicating a handle to the parent process, and the handle 
+we opened to vmtoolsd.exe 5. This sets vmtoolsd.exe as the parent process of 
+whatever we create using this attribute list. The last thing we need to do 
+with our attribute list is pass it as input to the process-creation function, 
+specifying the child process to create and the EXTENDED_STARTUPINFO_PRESENT 
+flag. When this function is executed, notepad.exe will appear to be a child  
+of vmtoolsd.exe in Process Hacker rather than a child of its true parent,  
+ppid-spoof.exe (Figure 3-6).
+Figure 3-6: A spoofed parent process in Process Hacker
+Unfortunately for adversaries, this evasion technique is relatively simple 
+to detect in a few ways. The first is by using the driver. Remember that the 
+structure passed to the driver on a process-creation event contains two sep-
+arate fields related to parent processes: ParentProcessId and CreatingThreadId. 
+While these two fields will point to the same process in most normal cir-
+cumstances, when the parent process ID (PPID) of a new process is spoofed, 
+the CreatingThreadId.UniqueProcess field will contain the PID of the process 
+that made the call to the process-creation function. Listing 3-14 shows the 
+output from a mock EDR driver captured by DbgView, a tool used to cap-
+ture debug print messages.
+Evading EDR (Early Access) © 2023 by Matt Hand
+48   Chapter 3
+12.67045498 Process Name: notepad.exe
+12.67045593 Process ID: 7892
+12.67045593 Parent Process Name: vmtoolsd.exe
+12.67045593 Parent Process ID: 7028
+12.67045689 Creator Process Name: ppid-spoof.exe
+12.67045784 Creator Process ID: 7708
+Listing 3-14: Capturing parent and creator process information from a driver
+You can see here that the spoofed vmtoolsd.exe shows up as the parent 
+process, but the creator (the true process that launched notepad.exe) is iden-
+tified as ppid-spoof.exe.
+Another approach to detecting PPID spoofing uses ETW (a topic we’ll 
+explore further in Chapter 8). F-Secure has extensively documented this 
+technique in its “Detecting Parent PID Spoofing” blog post. This detection 
+strategy relies on the fact that the process ID specified in the ETW event 
+header is the creator of the process, rather than the parent process speci-
+fied in the event data. Thus, in our example, defenders could use an ETW 
+trace to capture process-creation events on the host whenever notepad.exe is 
+spawned. Figure 3-7 shows the resulting event data.
+Figure 3-7: A spoofed parent process in ETW  
+event data
+Highlighted in Figure 3-7 is the process ID of vmtoolsd.exe, the spoofed 
+parent. If you compare this to the event header, shown in Figure 3-8, you 
+can see the discrepancy.
+Figure 3-8: A creator process ID captured in an  
+ETW event header
+Note the difference in the two process IDs. While the event data had the 
+ID of vmtoolsd.exe, the header contains the ID of ppid-spoof.exe, the true creator.
+Evading EDR (Early Access) © 2023 by Matt Hand
+Process- and Thread-Creation Notifications   49
+The information from this ETW provider isn’t quite as detailed as the 
+information provided to us by the mock EDR driver in Listing 3-14. For 
+example, we’re missing the image name for both the parent and creator 
+processes. This is because the ETW provider doesn’t derive that informa-
+tion for us, like the driver does. In the real world, we’d likely need to add 
+a step to retrieve that information, by either querying the process or pull-
+ing it from another data source. Regardless, we can still use this technique 
+as a way to detect PPID spoofing, as we have the core piece of information 
+needed for the strategy: mismatched parent and creator process IDs.
+Process-Image Modification
+In many cases, malware wishes to evade image-based detection, or detections 
+built on the name of the file being used to create the process. While there 
+are many ways to accomplish this, one tactic, which we’ll call process-image mod-
+ification, has gained substantial traction since 2017, although prolific threat 
+groups have used it since at least 2014. In addition to hiding the execution of 
+the malware or tooling, this tactic could allow attackers to bypass application 
+whitelisting, evade per-application host firewall rules, or pass security checks 
+against the calling image before a server allows a sensitive operation to occur.
+This section covers four process-image modification techniques, 
+namely hollowing, doppelgänging, herpaderping, and ghosting, all of 
+which achieve their goal in roughly the same way: by remapping the host 
+process’s original image with its own. These techniques also all rely on the 
+same design decision made by Microsoft while implementing the logic for 
+notifying registered callbacks of a process being created.
+The design decision is this: process creation on Windows involves a 
+complex set of steps, many of which occur before the kernel notifies any 
+drivers. As a result, attackers have an opportunity to modify the process’s 
+attributes in some way during those early steps. Here is the entire process-
+creation workflow, with the notification step shown in bold:
+ 1. Validate parameters passed to the process-creation API.
+ 2. Open a handle to the target image.
+ 3. Create a section object from the target image.
+ 4. Create and initialize a process object.
+ 5. Allocate the PEB.
+ 6. Create and initialize the thread object.
+ 7. Send the process-creation notification to the registered callbacks.
+ 8. Perform Windows subsystem-specific operations to finish initialization.
+ 9. Start execution of the primary thread.
+ 10. Finalize process initialization.
+ 11. Start execution at the image entry point.
+ 12. Return to the caller of the process-creation API.
+Evading EDR (Early Access) © 2023 by Matt Hand
+50   Chapter 3
+The techniques outlined in this section take advantage of step 3, in 
+which the kernel creates a section object from the process image. The 
+memory manager caches this image section once it is created, meaning that 
+the section can deviate from the corresponding target image. Thus, when 
+the driver receives its notification from the kernel process manager, the 
+FileObject member of the PS_CREATE_NOTIFY_INFO structure it processes may 
+not point to the file truly being executed. Beyond exploiting this fact, each 
+of the following techniques has slight variations.
+Hollowing
+Hollowing is one of the oldest ways of leveraging section modification, dating 
+back to at least 2011. Figure 3-9 shows the execution flow of this technique.
+Suspended process
+Hollowed process 
+running attacker code
+ResumeThread()

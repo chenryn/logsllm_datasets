@@ -1,0 +1,218 @@
+这里总结会从 musl 基本数据结构 ，到源码分析，比赛总结，比赛总结放在Two 里了
+## 启动musl 程序
+**提示:**
+这里不要用patchelf的形式来把musl 的libc.so patch到 bin 程序上
+无论把libc.so 当作ld 或者libc 来patch 都会出现内存布局与实际远程内存布局不同的情况
+    patchelf --set-interpreter libc.so ./bin
+or
+    patchelf --replace-needed libc.so ./libc.so ./bin
+如果原本没patch, 先申请的chunk在libc 段
+而patch 后 先申请的chunk 会被放在mmap 的地址上
+> add('1,0xc,'b'*0xc)
+### 三种运行方式的差别
+#### patchelf后:
+申请的0xc size的chunk 是被mmap 出来的一片区域
+#### 没patch
+直接用如下方式启动
+    ./libc.so ./bin
+可以看见同样是申请0xc 大小的chunk ，与patch后相比内存空间布局会出现不同
+这样可能导致在打远程的时候失败。这种方式 mmap 出的地址 和 libc 基址的偏移和远程一样
+#### 源码调试
+下载编译好了源码 在运行程序的时候会自动加载本地编译好的musl libc
+这时候内存布局和远程类似 申请到的chunk也是在libc 地址后面
+但是 这里mmap出的地址 和libc 基地址的偏移和远程是不一样的(所以还是差别)
+### **这里建议的启动方法** :
+#### 方式1
+  * 自己编译一份源码 可以直接运行程序(运行程序时会自动找到musl libc.so 不用patchelf)
+  * 然后用本地有符号libc 调试最后换掉偏移(比较麻烦)
+自己编译源码具体可以参考下面这篇文档
+[blog.fpliu.com/it/software/musl-libc](http://blog.fpliu.com/it/software/musl-libc)
+  * 可以看见下面我没patch 运行时自动搜索到musl libc.so 路径
+**优点:调试时可以完整看源码**
+**缺点:打远程要把偏移换一遍**
+#### 方式2
+**(最好的方式 因为这样和远程环境大致一样 若要源码调试 在gdb中直接dir /源码路径即可)**
+直接利用题目给的libc 文件，利用如下方式启动
+    ./libc.so ./bin
+在脚本里就为
+    io = process(["./libc.so",'./bin'])
+## 从小到大 源码分析
+### 0x00 基本数据结构
+先从musl 的基本数据结构 这里我选择从小到大来理解，因为在源码里它就是从小到大索引的
+从chunk 一路索引到 meta。
+首先介绍chunk
+#### chunk：
+    struct chunk{
+     char prev_user_data[];
+        uint8_t idx;  //第5bit为idx第几个chunk
+        uint16_t offset; //与group的偏移
+        char data[];
+    };
+每个chunk 都有个4 字节的chunk头记录 idx 和 offset
+(第一个chunk 比较特殊，因为它上面是 group结构 + chunk 头=0x10 )
+在释放后 chunk 头的 idx会变成0xff offset 会清零
+这里 offset 和 idx 比较重要
+**细节** :和glibc 的chunk 类似 glibc chunk 可以占用下一个chunk 的prev_size 空间
+而musl 可以使用 下一个chunk 头的低4B 来储存数据
+#### group:
+    #define UNIT 16
+    #define IB 4
+    struct group {
+        struct meta *meta;
+        unsigned char active_idx:5;
+        char pad[UNIT - sizeof(struct meta *) - 1];//padding=0x10B
+        unsigned char storage[];// chunks
+    };
+  * 在musl 中同一类大小的chunk 都是被分配到 同一个group 中进行管理
+  * musl 是通过 chunk addr 和chunk 头对应的 offset 来索引到 group 地址的
+  * 整体作为一个 group，其中开头的0x10我们当作group 头，这里的group头 涵盖了第一个chunk的头数据
+  * 如这里的第一个chunk是0x7f242f97fd20开始
+  * group开头的8个字节存的 meta 的地址，后面8个字节存了第一个chunk 的头数据 和 active_idx
+  * 这里active_idx 代表能存下的多少个 可以用的同类型chunk
+  * 如图这里可以存下的chunk [0,0x1d] 共 0x1e 个
+**从chunk 索引到 group:**
+源码:
+    #musl-1.2.2\src\malloc\mallocng\meta.h line129
+    static inline struct meta *get_meta(const unsigned char *p)
+    {
+        assert(!((uintptr_t)p & 15));
+        int offset = *(const uint16_t *)(p - 2);
+        int index = get_slot_index(p);
+        if (p[-4]) {
+            assert(!offset);
+            offset = *(uint32_t *)(p - 8);
+            assert(offset > 0xffff);
+        }
+        const struct group *base = (const void *)(p - UNIT*offset - UNIT);// base 指向的就是group 地址
+      ............
+    }
+根据源码我们可以知道 从chunk 索引到group 起始地址的计算式子为
+group_addr = chunk_addr - 0x10 * offset - 0x10
+**补充**
+offset = p[-2] (这里的p 就是代指chunk)
+index 从 get_slot_index(p)中得到
+    static inline int get_slot_index(const unsigned char *p)
+    {
+        return p[-3] & 31;
+    }
+#### meta
+    struct meta {
+        struct meta *prev, *next;//双向链表
+        struct group *mem;// 这里指向管理的group 地址
+        volatile int avail_mask, freed_mask;
+        uintptr_t last_idx:5;
+        uintptr_t freeable:1;
+        uintptr_t sizeclass:6;
+        uintptr_t maplen:8*sizeof(uintptr_t)-12;
+    };
+其中如果这个meta 前后都没有，那么它的prev next 就指向它自己
+**avail_mask，free_mask** 是bitmap 的形式体现 chunk 的状态
+这里例子是我申请了3个 0x30的chunk1、2、3， 然后free 掉chunk2
+avail_mask == 120 ==b"01111000" (最前面那个0 不算只是为了对齐)
+在 avail_mask 中 2 进制的 0 表示不可分配 1表示可分配，顺序是从后到前
+如01111000 中最后的 3个0 ， 表示第1、2、3个 chunk 是不可分配的 前面4个chunk 是可以分配的
+free_mask == 2 =0010 中的 1 表示第二个chunk2已经被释放
+last_idx 可以表示最多可用堆块的数量 最多数量=last_idx+1(因为是从0 - last_idx)
+**freeable=1** 根据源码 代表meta否可以被回收 freeable=0 代表不可以 =1 代表可以
+    #musl-1.2.2\src\malloc\mallocng\free.c line 38
+    static int okay_to_free(struct meta *g)
+    {
+        int sc = g->sizeclass;
+        if (!g->freeable) return 0;
+        ...........
+    }
+**sizeclass** =3 表示由`0x3`这个group进行管理这一类的大小的chunk
+    const uint16_t size_classes[] = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 12, 15,
+        18, 20, 25, 31,
+        36, 42, 50, 63,
+        72, 84, 102, 127,
+        146, 170, 204, 255,
+        292, 340, 409, 511,
+        584, 682, 818, 1023,
+        1169, 1364, 1637, 2047,
+        2340, 2730, 3276, 4095,
+        4680, 5460, 6552, 8191,
+    };
+**maplen**
+maplen >= 1表示这个meta里的group 是新mmap出来的,长度为多少
+> meta->maplen = (needed+4095)/4096;
+并且这个group 不在size_classes里
+maplen =0 表示group 不是新mmap 出来的在size_classes里
+**细节** :
+  * **meta 一般申请的是堆空间brk 分配的，有可能是mmap 映射的，而group 都是使用的mmap 的空间**
+  * **由于bitmap的限制, 因此一个group中最多只能有32个chunk**
+#### meta_area
+    struct meta_area {
+        uint64_t check;
+        struct meta_area *next;
+        int nslots;
+        struct meta slots[];
+    };
+meta_area 是管理meta的合集 meta_area 以页为单位分配 所以计算地址如下
+meta_area_addr = meta & ( -4096 )
+> const struct meta_area _area = (void_ )((uintptr_t)meta & -4096)
+**check** :是个校验数字 保护meta_area 里的meta，防止meta被 伪造
+**meta_area *next** 指向下一个meta_area 如果没有 就默认为0
+**nslots** : meta 槽的数量
+**细节** :在这个meta_area 页被使用的时候 上一个临近的页 会被设置为不可写
+是为了防止 使用者覆盖check 校验值
+#### __malloc_context
+是musl libc 记录结构状态的表，记录各个meta 和 secret 队列信息等
+    struct malloc_context {
+        uint64_t secret;// 和meta_area 头的check 是同一个值 就是校验值
+    #ifndef PAGESIZE
+        size_t pagesize;
+    #endif
+        int init_done;//是否初始化标记
+        unsigned mmap_counter;// 记录有多少mmap 的内存的数量
+        struct meta *free_meta_head;// 被free 的meta 头 这里meta 管理使用了队列和双向循环链表
+        struct meta *avail_meta;//指向可用meta数组
+        size_t avail_meta_count, avail_meta_area_count, meta_alloc_shift;
+        struct meta_area *meta_area_head, *meta_area_tail;
+        unsigned char *avail_meta_areas;
+        struct meta *active[48];// 记录着可用的meta
+        size_t u sage_by_class[48];
+        uint8_t unmap_seq[32], bounces[32];
+        uint8_t seq;
+        uintptr_t brk;
+    };
+**小总结一下**
+  * musl 中堆的管理由meta 管理 group ，group 管理 chunk
+  * 在free 或者 malloc chunk 的时候又是从 chunk 到group 再到meta 从小到大索引
+  * meta 间 通过meta 中prev next 结构形成循环链表连接
+### 0x01 释放与分配
+(如果不想看源码 可以跳下面看总结)
+#### malloc
+源码路径
+> /src/malloc/mallocng/malloc.c
+**源码：**
+    void *malloc(size_t n)
+    {
+        if (size_overflows(n)) return 0;// 最大申请空间限制
+        struct meta *g;
+        uint32_t mask, first;
+        int sc;
+        int idx;
+        int ctr;
+        if (n >= MMAP_THRESHOLD) {// size >= 阈值 会直接通过mmap 申请空间
+            size_t needed = n + IB + UNIT; //UNIT 0x10 IB 4 定义在meta.h 里 这里UNIT + IB 是一个基本头的大小
+            void *p = mmap(0, needed, PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON, -1, 0);//新mmap group 空间
+            if (p==MAP_FAILED) return 0;
+            wrlock();
+            step_seq();
+            g = alloc_meta();
+            if (!g) { // 如果申请meta 失败 会把刚刚mmap 出来的group 回收
+                unlock();
+                munmap(p, needed);// 回收group
+                return 0;
+            }
+            g->mem = p;// mem = group 地址 
+            g->mem->meta = g; //group 头部 指向meta (g 为 meta)
+            g->last_idx = 0;//mmap的group last_idx默认值=0
+            g->freeable = 1;
+            g->sizeclass = 63; // mmap 的申请的 sizeclass 都为63
+            g->maplen = (needed+4095)/4096;
+            g->avail_mask = g->freed_mask = 0;
+            ctx.mmap_counter++;// mmap 内存记载数量++

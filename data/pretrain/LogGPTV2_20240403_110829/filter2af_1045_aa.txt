@@ -1,0 +1,192 @@
+**作者：蚂蚁安全非攻实验室  
+公众号：[蚂蚁安全实验室](https://mp.weixin.qq.com/s/AsqFQAVotXbEAlHsBl-UqA)**
+## 背景
+上一篇中我们初步分享了 CORBA 通信过程以及各种名词去了解这个协议，并且搭建了一个 demo，接下来会使用这个 demo 进行分析 CORBA
+中的一些风险点。
+## Client
+### 一、思路分析
+安全分析方向有两个：
+  1. 在解析 server 返回的 response 时，可能存在 jdk 原生反序列化
+  2. 在 client 端生成 stub 类时，很有可能存在类加载逻辑，甚至是加载远程类
+### 二、反序列化分析
+发生在 stub 的使用阶段，在 client 发起 dii request 后，恶意服务器可以精心构造返回数据，进而控制 client 端对
+response 的反序列化操作流程，其中存在 JDK 原生反序列化，由此触发 java 反序列化 rce。
+#### 1、原理分析
+漏洞触发代码如下：
+    Request request = hello._request("sayHello");
+    request.invoke();
+    System.out.println(request.result().value());
+request.invoke(); 调用处理流程如下：
+由上图可见，在使用 dii request 发起 rpc 请求时，能够触发 ObjectInputStream#readObject ，引发 JDK
+原生反序列化。
+其中 IDLJavaSerializationInputStream 不是 CORBA 通信过程中默认的反序列化工具，默认的是
+CDRInputStream_x_x (x_x 根据版本决定)，那么我们接下来深入分析下如何创建
+IDLJavaSerializationInputStream 对象作为反序列工具的，流程如下：
+整个 IDLJavaSerializationInputStream
+对象生成流程如上所述，最关键的地方只有一处调用：MessageBase#readGIOPHeader
+这一处调用主要功能是处理 server 端的返回信息，是 **根据 server 端的返回数据生成 message header**
+，依次控制后续对数据的拆包、解析操作。其流程中，requestEncodingVersion 变量就是控制通信实现方式，默认是 CDR 的形式，最后会生成
+CDRInputStream_x_x 来进行解析操作（例如，调用 impl.read_wstring() 的时候，就会调用
+CDRInputStream_X_X）。
+此处的流程能观察到，requestEncodingVersion 是可以由 server 端返回流进行控制的，即 server 端可以控制 client
+端的拆包解析方式。
+经过深入分析，就算 server 端可以控制一部分 client 端的行为，要想触发到 JDK 反序列化代码，还必须要求 client
+端含有如下配置，以此开启 JDK 序列化功能支持：
+    props.put("com.sun.CORBA.encoding.ORBEnableJavaSerialization", "true");
+    ORB orb = ORB.init(args, props);
+#### 2、风险前置条件
+两个前置条件：
+  1. client 端需要开启 JDK 序列化功能支持
+  2. client 端需要发起 dii 请求，并且需要预先指定：调用返回结果类型 or 调用参数类型
+第一个条件，需要在初始化 ORB 时，需要开启 iiop 协议的 jdk 序列化技术支持。
+注：实际上就是从 CDR 支持转为 jdk 序列化支持，默认情况下是 CDR 支持 。
+第二个条件，需要 client 端在 dii 请求发起前，手动设置调用返回结果类型或是调用参数类型，才会在 response 处理时，触发到 JDK
+反序列化。
+原因在于如下图（com.sun.corba.se.impl.corba.RequestImpl#unmarshalReply）：
+如上图，该流程是在 server 端返回 response 后的 client 端对数据进行解包的流程，默认情况下 _result 、 _arguments
+都是为 null 的。需要在初始化创建时候，传入相关配置才能在解析返回结果时触发 read_value 调用，最终能够触发 JDK 反序列化。
+附上存在反序列化风险的 client 端代码：
+    public void run(String[] args) throws Exception {
+            Properties props = new Properties();
+            // 生成一个ORB，并初始化，这个和Server端一样
+            props .put("org.omg.CORBA.ORBInitialPort", "1050");
+            props.put("org.omg.CORBA.ORBInitialHost", "127.0.0.1");
+            // allowed java serial
+            props.put("com.sun.CORBA.encoding.ORBEnableJavaSerialization", "true");
+            final ORB orb = ORB.init(args, props);
+            // 获得根命名上下文
+            org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
+            // 用NamingContextExt代替NamingContext.
+            NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
+            // 通过名称获取服务器端的对象引用
+            String name = "Hello";
+            Hello hello = HelloHelper.narrow(ncRef.resolve_str(name));
+            //调用远程对象
+            Request req = hello._create_request(null, "sayHello", null, new NamedValue() {
+                @Override
+                public String name() {
+                    return null;
+                }
+                @Override
+                public Any value() {
+                    Any any = new AnyImpl((com.sun.corba.se.spi.orb.ORB) orb);
+                    any.insert_wstring("1");
+                    return any;
+                }
+                @Override
+                public int flags() {
+                    return 0;
+                }
+            });
+            req.invoke();
+        }
+### 三、远程类加载分析
+发生在 stub 的生成阶段，恶意服务器可以指定 codebase ，client 端会从 codebase 指定地址进行远程类加载。
+#### 1、原理分析
+我们可以去查看下 _HelloStub#readObject 函数，源码如下：
+      private void readObject (java.io.ObjectInputStream s) throws java.io.IOException
+      {
+         String str = s.readUTF ();
+         String[] args = null;
+         java.util.Properties props = null;
+         org.omg.CORBA.ORB orb = org.omg.CORBA.ORB.init (args, props);
+       try {
+         org.omg.CORBA.Object obj = orb.string_to_object (str);
+         org.omg.CORBA.portable.Delegate delegate = ((org.omg.CORBA.portable.ObjectImpl) obj)._get_delegate ();
+         _set_delegate (delegate);
+       } finally {
+         orb.destroy() ;
+       }
+      }
+如上，根据规定 readObject 函数会还原一个 _HelloStub 对象 ，那么上述代码块中：
+org.omg.CORBA.Object obj = orb.string_to_object (str);
+这一句代码就是将协议串转换为 client stub 的操作，协议串可以是 IOR: /corbaname:/ corbaloc: 开头
+经过分析， orb.string_to_object (str); 调用整个处理过程如下：
+如上图，最主要的是 _NamingContextExtStub#resolve_str 这一步调用，大致功能是由 NamingContext 从 orbd
+中获取 stub 类，其中涉及到了类加载的过程。
+从 _NamingContextExtStub#resolve_str 往后的调用过程，和正常的 client 端从 NamingServer
+获取对象引用的操作是一样的，如下：
+    // 通过名称获取服务器端的对象引用
+    String name = "Hello";
+    Hello hello = HelloHelper.narrow(ncRef.resolve_str(name));  // 调用 resolve_str
+由此可见，无论是 stub 类的 readObject 函数，还是正常的 client rpc 调用，都可能会触发到远程类加载流程。
+#### 2、风险前置条件
+需要 client 端允许 RMI 上下文环境访问远程 codebase。
+StubFactoryFactoryStaticImpl#createStubFactory 中的类加载使用的是 RMIClassLoader ，虽然
+useCodebaseOnly 为 false ，但是在反序列化 stub 上下文中，没有允许访问 codebase，会导致 SecurityManager
+权限校验不通过
+#### 3、分析小结
+· Message：
+每一次 request 和 reponse 的运载物都是它。在 corba 通信过程中，CorbaMessageMediatorImpl
+就是它们的代表，其中包含 requestHeader, replyHeader, messageHeader，这三者分别管控 request
+包的序列化/反序列化，replay(response)包的序列化/反序列化，message的序列化/反序列化，主要作用是控制通信数据格式。
+· request & response:
+request 和 response 都可能是 CDRInputObject 或者 CDROutputObject，站在分析者的角度，主要关注
+CDRInputObject。在根据 requestHeader, replyHeader, messageHeader 反序列化时，都是使用
+CDRInputObject 作为操作对象对数据进行处理的
+数据底层处理类：
+  1. CDROutputObject
+  2. CDRInputObject
+实际在序列化/反序列化数据时，是由它们的 impl 属性实现的，可以分为 IDLJavaSerializationX 和 CDRX 系列，如下图关系：
+## Corba Server 端
+### 一、思路分析
+server 端是先绑定 rpc 实现（ 注册 servant ），然后会和 client 端进行交互。
+经过分析没有发现远程类加载的情况，但是存在和 client 端的反序列化风险类似的问题，因为本质上都会有底层数据经过
+CorbaMessageMediator 的处理过程，不过触发 JDK 反序列化的入口点不一样。
+### 二、反序列化分析
+该风险发生在 client 端发起 rpc 请求时产生，在 server 端调用实际 rpc 服务函数实现前触发。
+#### 1、原理分析
+过程在分派请求时发生，我们重写 hello.idl 如下：
+    module com {
+        interface Hello{
+            string sayHello (in wstring name);
+        };
+    };
+如上代码，定义 sayHello 入参类型为 wstring ，接着查看 HelloPOA#_invoke ，源码如下
+     public org.omg.CORBA.portable.OutputStream _invoke (String $method,
+                                    org.omg.CORBA.portable.InputStream in,
+                                    org.omg.CORBA.portable.ResponseHandler $rh)
+      {
+        org.omg.CORBA.portable.OutputStream out = null;
+        java.lang.Integer __method = (java.lang.Integer)_methods.get ($method);
+        if (__method == null)
+          throw new org.omg.CORBA.BAD_OPERATION (0, org.omg.CORBA.CompletionStatus.COMPLETED_MAYBE);
+        switch (__method.intValue ())
+        {
+           case 0:  // com/Hello/sayHello
+           {
+             String name = in.read_wstring ();
+             String $result = null;
+             $result = this.sayHello (name);
+             out = $rh.createReply();
+             out.write_string ($result);
+             break;
+           }
+           default:
+             throw new org.omg.CORBA.BAD_OPERATION (0, org.omg.CORBA.CompletionStatus.COMPLETED_MAYBE);
+        }
+        return out;
+      } // _invoke
+如上，在调用真正的 sayHello 函数服务之前，_invoke 函数先还原了入参 name ，调用的是
+CDRInputStream#read_wstring ，后续的处理流程于 Client 反序列化分析中流程相同。
+#### 2、风险前置条件
+server 端要存在入参，且参数类型可以触发到 JDK 反序列化流程，例如 any 、wstring 等
+#### 3、注意
+以上所述都是通过 Oracle JDK 搭建的最简单 Corba 通信环境分析出来的，在其他大型中间件/容器等对 Corba 的扩展实现中可能会存在更多的
+JDK 反序列化风险点，其调用链路可能也有所不同，但是漏洞原理大多是一致的。
+例如 read_any 函数调用也会触发到反序列化，这是今年 weblogic 和 websphere 被刷的 IIOP 反序列化漏洞入口。
+## ORBD
+全称：The Object Request Broker Daemon
+orbd 是用于产生 NameService 的服务，在 server 端进行 corba 服务实现注册的之前，首先需要运行 orbd。
+简介见：
+### 一、前置知识
+orbd 其实在 jdk 中有所实现，见 com.sun.corba.se.impl.activation.ORBD 。
+注：需要调试的话，在 idea Configuration 中配置好 Program arguments ：
+-port 1050 -ORBInitialPort 1049 -ORBInitialHost 127.0.0.1
+orbd 主要是为 server 端提供长期存储服务/存储上下文/计数等功能。client 端也是首先通过它取得 server 端的信息，在最后的 rpc
+调用时，才会直接和 server 端通信，在查找 name service / 查找 corba servce 时，都是与 orbd 通信的。
+orbd 中进行数据的采集和整理也是使用的 CorbaMessageMediatorImpl#handleInput，通过
+CorbaServerReqeustDispatcherImpl#dispath 进行请求分派。
+在直接使用 orbd 时，会在工作目录下创建 orb.db 目录，该目录下存储了 server / 上下文（NamingContextImpl）
+等信息，目的是为了保持 corba 服务相关对象的持续保存，如下图：
+### 二、反序列化分析

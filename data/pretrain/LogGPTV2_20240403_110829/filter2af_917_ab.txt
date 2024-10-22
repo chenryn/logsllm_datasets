@@ -1,0 +1,74 @@
+如果不想在文件系统留下痕迹，手工模拟动态链接、重定位 ELF，可在内存中直接加载可执行文件。BadKernel 是一个利用了 V8
+上游已经修补，但未及时同步到第三方 fork 中的漏洞，攻击某知名即时聊天应用的案例。在 [BadKernel
+的利用代码](https://github.com/secmob/BadKernel/blob/master/exploit.html#L282) 中，调用
+JNI 查询 ContentProvider 获取短信的逻辑是单独编译到一个 so 中的。
+在作者公开的利用代码中，首先通过 javascript 任意地址读写，搜索一行调用 dlsym 的机器码，从中解析出 dlopen@plt
+的地址，再加上三条指令的长度获得 dlsym@plt 的地址。触发任意代码执行时将这两个函数指针传入
+shellcode，以进一步解析所需的各种符号。最后进入 shellcode 中实现的简化版 linker，直接将 ELF 文件内容放在 RWX
+内存中重定位处理后，执行其 so_main 导出函数。
+###### JNI 基础
+Android 中 JVM 和 C/C++ 开发的本地代码互相调用，可以使用 JNI（Java Native Interface）。在
+System.loadLibrary 载入一个动态链接库之后，JVM 会调用 ELF 中导出的 `JNI_OnLoad(JavaVM *jvm, void
+*reserved)` 函数，在这里可以做一些初始化的工作，以及使用 JNIEnv 的 RegisterNatives 方法动态将 Java
+方法与本地代码绑定。
+本地代码为 JNI 提供的方法的第一个参数是 JNIEnv 的指针，通过这个上下文可以访问 JVM 当前加载的类，通过反射机制调用 Java
+层的功能。例如如下 Java 代码：
+    ObjectInputStream ois = new ObjectInputStream(new FileInputStream("MicroMsg/CompatibleInfo.cfg"));
+    HashMap hashMap = (HashMap)ois.readObject();
+    String deviceId = hashMap.get(Integer.valueOf(258));
+使用 JNI 实现如下：
+    char *id = malloc(64);
+    jstring filename = (*env)->NewStringUTF(env, "MicroMsg/CompatibleInfo.cfg");
+    jclass clsFileInputStream = (*env)->FindClass(env, "java/io/FileInputStream");
+    jclass clsObjectInputStream = (*env)->FindClass(env, "java/io/ObjectInputStream");
+    jclass clsHashMap = (*env)->FindClass(env, "java/util/HashMap");
+    jmethodID constructor = (*env)->GetMethodID(env, clsFileInputStream, "", "(Ljava/lang/String;)V");
+    jobject fileInputStream = (*env)->NewObject(env, clsFileInputStream, constructor, filename);
+    constructor = (*env)->GetMethodID(env, clsObjectInputStream, "", "(Ljava/io/InputStream;)V");
+    jobject objInputStream = (*env)->NewObject(env, clsObjectInputStream, constructor, fileInputStream);
+    jmethodID readObject = (*env)->GetMethodID(env, clsObjectInputStream, "readObject", "()Ljava/lang/Object;");
+    jobject hashmap = (*env)->CallObjectMethod(env, objInputStream, readObject);
+    // cast to hash map
+    jmethodID get = (*env)->GetMethodID(env, clsHashMap, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID toString = (*env)->GetMethodID(env, (*env)->FindClass(env, "java/lang/Object"), "toString", "()Ljava/lang/String;");
+    jclass clsInteger = (*env)->FindClass(env, "java/lang/Integer");
+    jmethodID valueOf = (*env)->GetStaticMethodID(env, clsInteger, "valueOf", "(I)Ljava/lang/Integer;");
+    jobject key = (*env)->CallStaticObjectMethod(env, clsInteger, valueOf, 258);
+    jstring val = (*env)->CallObjectMethod(env, hashmap, get, key);
+    strncpy(id, (*env)->GetStringUTFChars(env, val, 0), len);
+正常情况下，JNIEnv 是系统初始化并传给 native 方法的。但在开发利用载荷的时候不是使用标准的方式加载链接库，因此需要使用一些私有
+API。如果代码直接运行在 App 进程中，可通过 `android::AndroidRuntime::getJNIEnv` 直接获取，或者
+`JNI_GetCreatedJavaVMs` 获得当前进程的唯一 JVM 实例后调用其 GetEnv 方法。如果使用独立的可执行文件，可通过
+`JNI_CreateJavaVM` 创建一个新的 JVM。
+###### Android 调用 JVM 的一些问题
+[Android N 对 NDK
+链接的行为做了变更](http://link.zhihu.com/?target=https%3A//developer.android.com/about/versions/nougat/android-7.0-changes.html%3Fhl%3Dzh-cn%23ndk)，禁止链接到私有 API，包括上文提到的 JVM 相关函数。一个非常简单的绕过方式是向 dlopen 传入空指针作为的文件名，dlsym
+将会在所有已加载的共享对象中查找符号。
+    typedef jint (JNICALL *GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
+    void *handle = dlopen(NULL, RTLD_NOW);
+    GetCreatedJavaVMs JNI_GetCreatedJavaVMs =
+        (GetCreatedJavaVMs) dlsym(handle, "JNI_GetCreatedJavaVMs");
+另外一个坑是，在 ART 下，一个可执行文件如果要调用 JNI_CreateJavaVM 创建 JVM，那么它必须导出
+`InitializeSignalChain`、`ClaimSignalChain`、`UnclaimSignalChain`、`InvokeUserSignalHandler`、`EnsureFrontOfChain`
+这几个回调函数，否则会在 logcat 里看到大量类似 `"InitializeSignalChain is not exported by the
+main executable."` 的提示，然后 SIGABRT。
+AOSP 对应的代码如下，可以看到在输出这行日志之后就会调用 abort()：
+https://android.googlesource.com/platform/art/+/master/sigchainlib/sigchain_dummy.cc
+解决方案非常简单，只要在源文件里创建这几个对应的函数，代码留空，然后加上 JNIEXPORT 宏设置为导出符号即可：
+    JNIEXPORT void InitializeSignalChain() { }
+    JNIEXPORT void ClaimSignalChain() { }
+    JNIEXPORT void UnclaimSignalChain() { }
+    JNIEXPORT void InvokeUserSignalHandler() { }
+    JNIEXPORT void EnsureFrontOfChain() { }
+#### 小结
+WebView 在 Android
+应用开发中应用广泛，功能复杂，是颇为理想的攻击面。点开一个链接或者扫描一个二维码就会执行恶意代码并不仅仅是都市传说。开发者在使用 WebView
+的时候不仅要注意老生常谈的各种 getSettings()、javascriptInterface 点，还要注意防范通过扩展接口暴露的攻击面和安全问题。
+#### 参考资料
+  * https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Disposition
+  * https://www.nowsecure.com/blog/2015/06/15/a-pattern-for-remote-code-execution-using-arbitrary-file-writes-and-multidex-applications/
+  * http://d3adend.org/blog/?p=851
+  * https://docs.oracle.com/javase/6/docs/technotes/guides/jni/spec/functions.html
+  * https://github.com/secmob/BadKernel
+  * https://android.googlesource.com/
+* * *

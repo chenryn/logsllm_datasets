@@ -1,0 +1,180 @@
+所以需要做一个心跳包，让反代服务器判断长连接一直在工作，而不会因空闲而断开连接。
+**遗留问题：**
+  1. 长连接要保持，是必须要有心跳包的，所以这里没有心跳包，存在超时断开的问题，待解决。
+​
+# 心跳包
+基本心跳功能已实现，测试nginx反代场景不再存在超时断开问题。  
+这里心跳包目前设计是由admin定期发送给agent，也无需响应，emmm至于为啥这么设计，其实方法很多，这个也只是其中一个测试方法，后续待商榷。  
+admin/process/process_win.go的Run方法里添加一个新的消息处理函数，并且只有在开启了ws之后才使用。  
+for循环，默认每个10秒发送一次，判断conn有效，然后封装到Message结构体里，最后发送。  
+这里其实可以看出来通信协议的格式，header部分是固定的格式，而消息部分可以自定义任意结构体或者[]byte，这里先随便写个结构体，后续考虑是否扩展。  
+​
+PS: isPass用于判断是否跳过结构体解析以及加密，直接以[]byte来传输。  
+绝大部分情况是false，表示不跳过处理。  
+如果不跳过，就会根据header.MessageType判断怎么序列化数据，在这里由于我没写Keeep的序列化方式，所以虽然传进来了data，但实际并没有传输，也就是说只传输了头部。  
+最后通过sMessage.SendMessage()发送数据  
+​
+​
+agent部分接收  
+agent/process/process.go  
+protocol.DestructMessage这里其实除了反序列化数据，还会进行数据接收，也就是将接收和反序列化一起处理了。  
+通过header.MessageType判断消息类型，选择怎么处理数据，比如SHELLCOMMAND就是将数据发送到channel里，给manager以及消息处理函数进行下一步操作。  
+而Keep这是暂时没做任何处理，只做接收。  
+并且这里可以看到判断header.MessageType之前，会先判断UUID是否和当前节点UUID一致，如果不一致则发送给其他节点。  
+如果是发送给其他节点，这里直接message.([]byte)，转换成[]byte，emmm，上面不是解析成message结构体了吗，这边不会报错吗。  
+实际跟进DestructMessage，这里在根据DataLen读取到dataBuf后，会判断数据是否是发送给该节点的，如果不是则直接返回dataBuf，而不需要做解析。  
+心跳包目前实现就做了这些。  
+​
+​
+这里通过心跳包的实现总结下其他数据结构的协议交互逻辑。
+  1. 发送方通过Dispatch消息处理函数序列化数据（protocol.ConstructMessage）发送消息（message.SendMessage），接收方通过handleDataFromUpstream或handleDataFromDownstream进行监听接收，调用protocol.DestructMessage进行接收和反序列化处理，然后判断消息类型，写入channel，由相应的接收方消息处理函数进行处理并响应。
+​
+# 实战测试
+vps上admin监听444 wss端口
+    ./linux_x64_admin -l 444 -tls -down ws
+agent发送wss请求到CDN提供的域名
+    windows_x64_agent.exe -c xxxxxx.com:443 -tls -up ws
+效果如下，admin可以正常管理agent了，并测试shell、socks功能均正常，后续多投入一些实战项目中测试下。  
+# 多个startnode
+原先作者只允许admin有一个startnode，其他agent是挂在第一个agent下，而不能实现同时有多个agent直连到admin，因为上面做了代理穿透CDN，所以必然会有多个startnode连接到admin，不然也不可能每一个startnode都单独设置一个CDN，那成本就太大了。  
+​
+这个问题起初感觉很麻烦，因为和现在的设计逻辑不一样，现在是admin先监听等待，直到接收到连接，才会启动后续的各种处理函数。  
+重新梳理了一下现在的逻辑
+  1. 监听agent连接
+  2. 接收后将conn存储到全局
+  3. 通过goroutine启动处理函数和console
+​
+那么修改的话，就需要将第一步的监听放到goroutine里循环接收，并且conn不能再存放全局了，得在Admin或Manager结构体里存储，否则多个startnode会冲突。  
+最后处理函数，如果在多startnode情况下，要处理各个startnode之间的消息，担心会冲突，因为原始的设计只考虑一个startnode，那么就把处理函数也放到监听的goroutine里，每次收到一个新的链接，单独启动这一个startnode的处理函数，每个startnode之间的处理函数都是完成独立的，就不用担心会出现问题了。  
+​
+admin里增加一个admin监听函数，做个for循环，每次接收到连接后和之前一个startnode操作一样，并且把conn、uuid、token等放到当前startnode的manager对象里，方便调用。
+    func (admin *Admin) DispatchAdminListenMess() {
+        var listener net.Listener
+        switch admin.options.Mode {
+        case initial.NORMAL_PASSIVE:
+            printer.Warning("[*] Waiting for new connection...\r\n")
+            listenAddr, _, err := utils.CheckIPPort(admin.options.Listen)
+            if err != nil {
+                printer.Fail("[*] Error occured: %s", err.Error())
+                os.Exit(0)
+            }
+            listener, err = net.Listen("tcp", listenAddr)
+            if err != nil {
+                printer.Fail("[*] Error occured: %s", err.Error())
+                os.Exit(0)
+            }
+            defer func() {
+                listener.Close() // don't forget close the listener
+            }()
+        }
+        for {
+            var conn = new(net.Conn)
+            var uuid string
+            // 判断连接模式，发起认证请求
+            // TODO: 其他链接模式优化
+            switch admin.options.Mode {
+            case initial.NORMAL_ACTIVE:
+                initial.NormalActive(admin.options, admin.Topology, nil)
+            case initial.NORMAL_PASSIVE:
+                *conn, uuid = initial.NormalPassive(listener, admin.options, admin.Topology)
+            case initial.PROXY_ACTIVE:
+                proxy := share.NewProxy(admin.options.Connect, admin.options.Proxy, admin.options.ProxyU, admin.options.ProxyP)
+                initial.NormalActive(admin.options, admin.Topology, proxy)
+            default:
+                printer.Fail("[*] Unknown Mode")
+            }
+            // TODO: mgr销毁
+            mgr := manager.NewManager(share.NewFile(conn, admin.options.Secret, uuid))
+            mgr.InitComponent(conn, admin.options.Secret, uuid, admin.options.Token)
+            admin.Managers[uuid] = mgr
+            go admin.handleMessFromDownstream(mgr)
+            if admin.options.Downstream == "ws" {
+                go handler.DispatchKeepMess(mgr, admin.options)
+            }
+            //go handler.DispatchAdminListenMess(admin.mgr, admin.options, admin.Topology)
+            // run a dispatcher to dispatch different kinds of message
+            go mgr.Run()
+            go handler.DispatchListenMess(mgr, admin.Topology)
+            go handler.DispatchConnectMess(mgr)
+            go handler.DispathSocksMess(mgr, admin.Topology)
+            go handler.DispatchForwardMess(mgr)
+            go handler.DispatchBackwardMess(mgr, admin.Topology)
+            go handler.DispatchFileMess(mgr)
+            go handler.DispatchSSHMess(mgr)
+            go handler.DispatchSSHTunnelMess(mgr)
+            go handler.DispatchShellMess(mgr)
+            go handler.DispatchInfoMess(mgr, admin.Topology)
+            go DispatchChildrenMess(mgr, admin.Topology)
+        }
+    }
+Run里注释掉之前的处理函数，只留一个admin监听方法，当然console还是全局的，需要留给用户来交互操作。  
+由于每个处理函数的管理函数都是放在manager里的  
+所以manager也需要每个startnode独立，这里用map存储，uuid来区分保证唯一。  
+上述大致就完成了多startnode，就是mgr都得调整下成独立的，以前调用全局GComponent的地方，都得改成调用manager里存储的。  
+​
+然后还有一个问题，监听函数每次接收到连接后用goroutine启动的处理函数，如果网络波动等原因和agent断开连接了，这个时候怎么退出这些函数来回收资源。  
+PS:
+有个重点需要注意，UUID，managers（map）里的key是UUID，这个UUID是startnode的UUID而不是原来的ADMIN_UUID，并且mgr.GComponent.UUID也是startnode，需要区分一下，startnode的父节点UUID都是ADMIN_UUID，可以以此来区分该节点是否是startnode。
+先定位到退出的位置，handleMessFromDownstream，把原来的os.Exit注释掉，然后原来在nodeoff后，会调用admin/process/children.go里的nodeOffline，handler和manager之间都是通过channel通信的，这里也是  
+这个函数会删除节点和子节点，并强制关闭每个节点的连接。  
+这里还增加了一个mgr.Clear()  
+为每个模块的管理函数都增加了一个Clear(),用于退出他们各自对应的处理函数  
+处理函数基本上都是一个for死循环，然后等待接收消息channel，那么我们只需要关闭这个消息channel，然后就不再等待阻塞直接返回nil，只需要判断message是否为nil，然后直接退出就行了，如下消息处理函数就是，其他基本一样。  
+那么Clear()只需要关闭channel即可退出。  
+最后就是在managers里删除该mgr。  
+​
+这里应该是12的。  
+连接后  
+断开连接后，恢复到原始的goroutine，说明都释放了。  
+多测试了几次一样的结果。  
+emmm，做到这里，我想到另外一个点子，既然已经把listener做成多startnode，那么可否进一步做成热启动的方式来开启监听端口，在shell界面里通过指令开启多个端口监听或connect，来对接agent，反正都是相互隔离的，只有console是共享的，console再做成result
+api，通过web来交互就更方便了，其实感觉像cs了，但马的功能是不会扩展了。
+# 非交互式shell
+有一个半交互式shell命令了，为啥还扩展一个非交互式shell，主要是因为原来的shell命令有太多问题，容易导致卡死，而且作为一个代理工具，shell命令的存在是不可取的，从以上两点，我就砍掉这个功能了，那么遇到一些特殊情况还是需要执行命令，以备不时之需，所以做了一个非交互式run指令
+，当然也是了二次校验，用于提示操作存在风险。  
+​
+在新增这个扩展指令的同时，算是把stowaway的指令处理逻辑搞清楚，跳过中间繁琐的代码分析过程，我把分析的结果整理了下，最终流程如下  
+​
+添加一个新的指令，需要改动的动地方比较多
+## admin
+  1. 新增收发结构体
+protocol/protocol.go  
+protocol/proto/run.go  
+  1. 结构体的序列化和反序列化。
+protocol/raw.go  
+PS:
+这一块作者实现其实太冗余了，每个数据结构体都单独实现这个过程，我看了他通信的数据结构，其实格式都比较固定，写一个通用的序列化和反序列化函数，通过反射获取结构体中的tags即可，这个在protobuf里也是差不多的操作，1000多行的代码最终优化到200行了。
+  1. 添加管理结构体
+admin/handler/run.go  
+  1. 添加到主manager里，注意clear也得添加
+admin/manager/manager.go  
+  1. 消息处理函数编写
+上面是发送函数，下面是接收处理函数  
+发送函数可能通过接收函数调用或者console调用  
+接收函数一般是for循环，等待管理函数里的channel分发消息  
+handler/run.go  
+  1. 分发result消息到channel里
+admin/process/process.go  
+  1. 调用收发函数
+admin/process/process.go  
+消息发送函数这里是发在指令里调用。  
+admin/cli/interactive.go  
+  1. 注册指令
+admin/cli/cli.go  
+## agent
+同理，但结构体已经写好，跳过这一步，从管理函数开始
+  1. 创建管理函数
+agent/manager/run.go  
+  1. 主manager里添加
+agent/manager/manager.go  
+  1. 添加消息处理函数，这里的发送函数就是在分发函数里调用的
+agent/handler/run.go  
+接收服务端指令  
+agent/process/process.go  
+  1. 调用分发函数
+agent/process/process.go  
+最终测试如下  
+# 总结
+这次改造实现了代理穿透CDN，并将原来的单startnode改造成多startnode，并尝试新增了一个指令，通过本次改造也是对http和websocket有了了解，并且对stowaway的指令处理流程也清晰了，而如果需要增加其他指令，也可以效仿这次的扩展，包括内联指令、强制重连等等操作。  
+这两次改造看下来可能觉得篇幅很长，这个主要出于个人习惯记录测试分析过程，所以看起来较长，但一些细节还是值得记录的，不然回头可能就不知道这个地方为什么这样改了。而且这些改造过程中涉及大量代码分析，虽然我说起来简单，但实际上像这种代理工具的代码逻辑还是需要花时间才能理清楚的，如果有师傅也觉得这个工具很nice，推荐自己动手改一改，然后可以参考下我这两篇文章，不然我感觉换一个没接触过这个工具的，看完这两篇文章也是一脸懵逼。这就和漏洞分析类似，没有自己动手分析过或者没有类似分析经验，是很难get到一些点，产生共鸣。当然如果大家觉得这些改造有什么新的思路，可以一起讨论讨论。
+说个题外话，这次挑选了一款代理工具做改造，其实市面上有各种各样的代理工具，要寻找到一款趁手的工具，其实不太容易，所以就很需要自己做一些二开改造，有人可能觉得重复造轮子浪费时间，这个嘛，主要看工作需要，看你的方向，如果仅仅需要一个能用就行的代理工具，那其实有很多，而需要一个好用的工具，那么就需要根据自身需求做一些开发，一方面对工具的实现更透彻，另一方面不也是为了提升工作效率嘛，没有最好的，只有更适合自己的，这不仅仅局限于代理工具。在渗透整个攻击链上，其实各个环节，总有一个环节需要你去打造自己的工具的。关注漏洞利用，你自己编写一个脚本或者利用工具，会对漏洞成因更理解，并且能更深入优化漏洞的利用链，否则拿一个现成脚本跑一下，可能明明有漏洞而你却利用不成功，就像shiro被大家玩出花来了，而weblogic流传的一些工具其实也是有蛮多问题，诸如此类的太多了；又或者专门做漏洞挖掘，那你肯定会需要打造一个属于自己的审计工具，市面上的，不管是商用的还是开源的，总有不如人意的地方，总会需要编写自己的"codeql脚本"（这里具象举例而已），合入自己经验上的sink、source。一个合格的安全研究者应该也要是一个合格的开发。

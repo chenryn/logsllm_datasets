@@ -1,0 +1,225 @@
+ *	 you can use "CONST2 test_op CONST1" as a test.  If this test returns true,    
+ *	 then the target expression must be true; if the test returns false, then    
+ *	 the target expression may be false.    
+ *    
+ * For example, if clause is "Quantity > 10" and pred is "Quantity > 5"    
+ * then we test "5  10" and pred is "Quantity 100 无法推断 a>? 一定为假， 只能推断 a>? 一定为真。    
+通过100, ?, 以及 test_op 来推断，而test_op就是从BT_implic_table表中取出的BTLE即? 一定为真。    
+PostgreSQL通过get_btree_test_op 获得test_op，代码如下：    
+```    
+get_btree_test_op    
+			/*    
+			 * Look up the "test" strategy number in the implication table    
+			 */    
+			if (refute_it)    
+				test_strategy = BT_refute_table[clause_strategy - 1][pred_strategy - 1];    
+			else    
+				test_strategy = BT_implic_table[clause_strategy - 1][pred_strategy - 1];    
+			if (test_strategy == 0)    
+			{    
+				/* Can't determine implication using this interpretation */    
+				continue;    
+			}    
+			/*    
+			 * See if opfamily has an operator for the test strategy and the    
+			 * datatypes.    
+			 */    
+			if (test_strategy == BTNE)    
+			{    
+				test_op = get_opfamily_member(opfamily_id,    
+											  pred_op_info->oprighttype,    
+											  clause_op_info->oprighttype,    
+											  BTEqualStrategyNumber);    
+				if (OidIsValid(test_op))    
+					test_op = get_negator(test_op);    
+			}    
+			else    
+			{    
+				test_op = get_opfamily_member(opfamily_id,    
+											  pred_op_info->oprighttype,    
+											  clause_op_info->oprighttype,    
+											  test_strategy);    
+			}    
+			if (!OidIsValid(test_op))    
+				continue;    
+...    
+	return test_op;    
+```    
+那么PostgreSQL可以利用这些逻辑推理来做什么呢？    
+通过推断 "一定为假" 来排除哪些表不需要参与到执行计划。直接排除掉。    
+![_1](20160225_01_pic_001.png)  
+通过推断 “一定对真” ，可以用在建立执行计划的过程中。    
+![_](20160225_01_pic_002.png)  
+以一定为假为例，我们看看PostgreSQL优化器如何排除哪些表是不需要参与执行计划的。    
+constraint_exclusion参数控制的逻辑推理应用，可以看到调用栈如下：    
+relation_excluded_by_constraints 返回 true 表示不需要扫描这个表，返回 false 表示需要扫描这个表。    
+简单分析一下这个函数的代码：    
+未开启constraint_exclusion时，不进行逻辑推理。    
+```    
+	/* Skip the test if constraint exclusion is disabled for the rel */    
+	if (constraint_exclusion == CONSTRAINT_EXCLUSION_OFF ||    
+		(constraint_exclusion == CONSTRAINT_EXCLUSION_PARTITION &&    
+		 !(rel->reloptkind == RELOPT_OTHER_MEMBER_REL ||    
+		   (root->hasInheritedTarget &&    
+			rel->reloptkind == RELOPT_BASEREL &&    
+			rel->relid == root->parse->resultRelation))))    
+		return false;    
+```    
+在检查表自身的约束和SQL提供的where条件前，先检查where 条件是否有自相矛盾的。例如：    
+```    
+ id <> mod(4,3) and id = mod(4,3)    
+postgres=# \d+ tt11    
+                         Table "public.tt11"    
+ Column |  Type   | Modifiers | Storage | Stats target | Description     
+--------+---------+-----------+---------+--------------+-------------    
+ id     | integer |           | plain   |              |     
+postgres=# explain (analyze,verbose) select * from tt11 where id<>mod(4,3) and id=mod(4,3);    
+                                     QUERY PLAN                                         
+------------------------------------------------------------------------------------    
+ Result  (cost=0.00..0.01 rows=1 width=0) (actual time=0.001..0.001 rows=0 loops=1)    
+   Output: id    
+   One-Time Filter: false    
+ Planning time: 0.051 ms    
+ Execution time: 0.012 ms    
+(5 rows)    
+```    
+代码如下    
+```    
+	/*    
+	 * Check for self-contradictory restriction clauses.  We dare not make    
+	 * deductions with non-immutable functions, but any immutable clauses that    
+	 * are self-contradictory allow us to conclude the scan is unnecessary.    
+	 *    
+	 * Note: strip off RestrictInfo because predicate_refuted_by() isn't    
+	 * expecting to see any in its predicate argument.    
+	 */    
+	safe_restrictions = NIL;    
+	foreach(lc, rel->baserestrictinfo)    
+	{    
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);    
+		if (!contain_mutable_functions((Node *) rinfo->clause))    
+			safe_restrictions = lappend(safe_restrictions, rinfo->clause);    
+	}    
+	if (predicate_refuted_by(safe_restrictions, safe_restrictions))    
+		return true;    
+        // 从SQL涉及的表，以及继承表中获取约束    
+	/* Only plain relations have constraints */    
+	if (rte->rtekind != RTE_RELATION || rte->inh)    
+		return false;    
+	/*    
+	 * OK to fetch the constraint expressions.  Include "col IS NOT NULL"    
+	 * expressions for attnotnull columns, in case we can refute those.    
+	 */    
+	constraint_pred = get_relation_constraints(root, rte->relid, rel, true);    
+	/*    
+	 * We do not currently enforce that CHECK constraints contain only    
+	 * immutable functions, so it's necessary to check here. We daren't draw    
+	 * conclusions from plan-time evaluation of non-immutable functions. Since    
+	 * they're ANDed, we can just ignore any mutable constraints in the list,    
+	 * and reason about the rest.    
+	 */    
+	safe_constraints = NIL;    
+	foreach(lc, constraint_pred)    
+	{    
+		Node	   *pred = (Node *) lfirst(lc);    
+                         // 包含非immutable函数的表达式不加入推理判断，因为非immutable函数存在变数，不能转常量    
+		if (!contain_mutable_functions(pred))      
+			safe_constraints = lappend(safe_constraints, pred);    
+	}    
+	/*    
+	 * The constraints are effectively ANDed together, so we can just try to    
+	 * refute the entire collection at once.  This may allow us to make proofs    
+	 * that would fail if we took them individually.    
+	 *    
+	 * Note: we use rel->baserestrictinfo, not safe_restrictions as might seem    
+	 * an obvious optimization.  Some of the clauses might be OR clauses that    
+	 * have volatile and nonvolatile subclauses, and it's OK to make    
+	 * deductions with the nonvolatile parts.    
+	 */           
+                        //   检测是否一定为假，如果一定为假，则不需要扫描这个表。    
+	if (predicate_refuted_by(safe_constraints, rel->baserestrictinfo))    
+		return true;    
+```    
+调用栈如下：    
+```    
+predicate_refuted_by    
+predicate_refuted_by_recurse    
+predicate_refuted_by_simple_clause    
+       return btree_predicate_proof(predicate, clause, true)    
+btree_predicate_proof@src/backend/optimizer/util/predtest.c    
+	/*    
+	 * Lookup the comparison operator using the system catalogs and the    
+	 * operator implication tables.    
+	 */    
+	test_op = get_btree_test_op(pred_op, clause_op, refute_it);    
+```    
+目前PostgreSQL仅仅支持有限操作符的逻辑推理，这些操作符必须是btree-indexable operator    
+```    
+postgres=# select oprname,oprcode from pg_operator where oid in (select amopopr from pg_amop where amopmethod=(select oid from pg_am where amname='btree'));    
+ oprname |         oprcode              
+---------+--------------------------    
+ =       | int48eq    
+        | int48gt    
+ =      | int48ge    
+        | boolgt    
+ =       | booleq    
+ =      | boolge    
+ =       | chareq    
+ =       | nameeq    
+ =       | int2eq    
+        | tidgt    
+ =      | tidge    
+ =       | int8eq    
+        | int8gt    
+ =      | int8ge    
+ =       | int84eq    
+        | int84gt    
+ =      | int84ge    
+ >       | int2gt    
+ >       | int4gt    
+ =      | int2ge    
+ >=      | int4ge    
+ =       | int24eq    
+ =       | int42eq    
+        | int24gt    
+ >       | int42gt    
+ =      | int24ge    
+ >=      | int42ge    
+ =       | abstimeeq    
+        | abstimegt    
+ =      | abstimege    
+ =       | reltimeeq    
+        | reltimegt    
+ =      | reltimege    
+ =       | oideq    
+        | oidgt    
+ =      | oidge    
+        | oidvectorgt    
+ =      | oidvectorge    
+ =       | oidvectoreq    
+ =       | float4eq    
+        | float4gt    
+ =      | float4ge    
+        | chargt    
+ >=      | charge    
+        | namegt    
+ >=      | namege    
+        | text_gt    
+ >=      | text_ge    
+ =       | float8eq    
+        | float8gt    
+ >=      | float8ge    
+ =       | tintervaleq    
+        | tintervalgt    
+ =      | tintervalge    
+ =       | cash_eq    
+        | cash_gt    
+ =      | cash_ge    
+ =       | bpchareq    
+        | bpchargt    
+ >=      | bpcharge    
+ =       | array_eq    
+        | array_gt    
+ =      | array_ge    
+ =       | date_eq    
+        | date_gt    

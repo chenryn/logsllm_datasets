@@ -1,0 +1,134 @@
+本文为第二部分，第一部分见链接。
+本系列的第一部分介绍了`Semmle
+QL`与`Microsoft`安全响应中心（MSRC）如何使用它来调查威胁漏洞。本文讨论了如何利用此工具进行细节演示，其中包括如何使用其实例，并且演示中还包括Azure固件组件的安全审核模块。
+这是Azure服务进行安全审查防御的一部分，我们从渗透的边界部分来考虑，并站在攻击者的角度进行攻击假象。之后我们将在后端服务中进行环境操作。
+这次审查的目标之一是基于Linux的嵌入式设备，它与服务后端和管理后端连接并在两者之间传递操作数据。 该设备的主要攻击是面向两个接口使用管理协议。
+之后我们对其硬件进行手动审查，之后发现其管理协议是基于消息的，其存在超过四百种不同的消息类型，每种类型具有其自己的处理功能。然而手动审计函数很容易产生错误，因此使用Semmle扩展我们的代码审查能降低我们的审计难度。我们使用本文中讨论的静态分析技术总共找到了33个易受攻击的消息处理函数。
+### 攻击定义
+我们的第一步是编写一些QL来模拟攻击者的数据。 管理协议在请求
+响应的基础上工作，其中每个消息请求的类型都用类别和命令来进行编号标识，并在源代码中使用结构数组定义，例如：
+    MessageCategoryTable g_MessageCategoryTable[] =
+    {
+        { CMD_CATEGORY_BASE,  g_CommandHandlers_Base },
+        { CMD_CATEGORY_APP0,  g_CommandHandlers_App0 },
+        …
+        { NULL,               NULL                   }
+    };
+    CommandHandlerTable g_CommandHandlers_Base [] =
+    {
+        { CMD_GET_COMPONENT_VER,  sizeof(ComponentVerReq),  GetComponentVer,  … },
+        { CMD_GET_GLOBAL_CONFIG,  -1,                       GetGlobalConfig,  … },    
+        …
+        { NULL,                   NULL,                     NULL,             … }
+    };
+在上面的示例中，类别类型为`CMD_CATEGORY_BASE`且命令类型为`CMD_GET_COMPONENT_VER`的消息将路由到`GetComponentVer`函数。
+命令处理程序表还具有有关请求消息的预期大小信息，该信息在调用处理函数之前将得到验证。
+我们使用以下QL定义了消息处理程序表：
+    class CommandHandlerTable extends Variable { 
+      CommandHandlerTable() { 
+        exists(Variable v | v.hasName("g_MessageCategoryTable")
+          and this.getAnAccess() = v.getInitializer().getExpr().getAChild().getChild(1)
+        ) 
+      } 
+    }
+这将获取名为`g_MessageCategoryTable`的变量，查找其初始化表达式并匹配此表达式的所有子项。而每个子表达式对应于消息类别表的一行。
+对于每一行，它采用第二列（因为getChild谓词的参数是零索引的，所以使用`getChild(1)`），每个列都是对命令处理程序表的引用，并匹配引用的变量。
+在上面的示例中是`g_CommandHandlers_Base`和`g_CommandHandlers_App0`。
+我们使用类似的方法定义了消息处理函数集：
+    class MessageHandlerFunction extends Function { 
+      Expr tableEntry; 
+      MessageHandlerFunction() { 
+        exists(CommandHandlerTable table |
+          tableEntry = table.getInitializer().getExpr().getAChild()
+          )
+        and this = tableEntry.getChild(2).(FunctionAccess).getTarget()
+      }
+      int getExpectedRequestLength() { 
+        result = tableEntry.getChild(1).getValue().toInt() 
+      } 
+      …
+    }
+此QL类使用成员变量`tableEntry`来保存所有用于处理程序表中的所有行的命令。这样就可以在特征谓词（`MessageHandlerFunction(){...}`）和`getExpectedRequestLength()`并引用它，而不重复定义。
+所有这些都映射到上面的代码结构，如下所示：
+每个消息处理函数都具有相同的签名：
+    typedef unsigned char UINT8;
+    int ExampleMessageHandler(UINT8 *pRequest, int RequestLength, UINT8 *pResponse);
+此处遵循一般模式，其中请求数据被强制转换为表示消息布局的结构，并并通过其字段访问：
+    int ExampleMessageHandler(UINT8 *pRequest, int RequestLength, UINT8 *pResponse)
+    {
+        ExampleMessageRequest* pMsgReq = (ExampleMessageRequest *)pRequest;
+        …
+        someFunction(pMsgReq->aaa.bbb)
+        …
+    }
+在此分析中，我们只对请求数据感兴趣。 我们在`MessageHandlerFunction QL`类中定义了两个额外的谓词来请求数据及其长度：
+    class MessageHandlerFunction extends Function {
+      Expr tableEntry;
+      …
+      Parameter getRequestDataPointer() {
+        result = this.getParameter(0)
+      }
+      Parameter getRequestLength() {
+        result = this.getParameter(1)
+      }
+    }
+在这里我们抽象出消息处理函数，因为它可以像任何其他QL类一样使用。 例如，此查询按其复杂度的降序列出所有消息处理函数：
+    from MessageHandlerFunction mhf
+    select
+      mhf, 
+      mhf.getADeclarationEntry().getCyclomaticComplexity() as cc
+    order by cc desc
+### 数据流分析
+现在我们为不受信任的数据定义了一组入口点，下一步我们需要找到漏洞利用的位置。为此我们需要通过代码库来跟踪此类数据的流动。
+QL提供了一个功能强大的全局数据流库，它可以抽象出语言的特定细节。
+`DataFlow`库带入查询范围，包括：
+    import semmle.code.cpp.dataflow.DataFlow
+它通过将`DataFlow::Configuration`设置为子类并覆盖其谓词来定义数据流，因为它应用于QL类`DataFlow::Node`以便表示数据可以流经的任何程序伪像：
+大多数数据流查询如下所示：
+    class RequestDataFlowConfiguration extends DataFlow::Configuration { 
+      RequestDataFlowConfiguration() { this = "RequestDataFlowConfiguration" } 
+      override predicate isSource(DataFlow::Node source) { 
+        …
+      }
+      override predicate isSink(DataFlow::Node sink) { 
+        …
+      }
+      override predicate isAdditionalFlowStep(DataFlow::Node node1, DataFlow::Node node2) { 
+        …
+      }
+      override predicate isBarrier(DataFlow::Node node) { 
+        …
+      }
+    }
+    from DataFlow::Node source, DataFlow::Node sink 
+    where any(RequestDataFlowConfiguration c).hasFlow(source, sink) 
+    select 
+      "Data flow from $@ to $@", 
+      source, sink
+请注意，在QL数据流库执行过程中，除了检查函数本地的数据流之外还将包括流经函数调用参数的数据。
+这是我们的安全审查的一个基本功能。尽管下面讨论的漏洞代码模式在简单的示例函数中显示以便于演示，但在我们的目标的实际源代码中，大多数结果都有跨越多个复杂函数的数据流。
+### 内存安全漏洞
+由于此组件是纯C代码，我们首先决定搜索与内存安全相关的代码模式。
+引起这种错误的一个常见原因是数组索引不执行边界检查。 单独搜索此模式将提供很大的帮助，这些结果很可能不是安全漏洞。
+因此，在这种情况下，我们正在寻找数据流中的接收器是数组索引表达式，数据源是消息处理程序函数的请求数据，并且在由相关边界检查保护的数据流节点上存在障碍。
+例如，我们想要找到匹配代码的数据流，如下所示：
+    int ExampleMessageHandler(UINT8 *pRequest(1:source), int RequestLength, UINT8 *pResponse)
+    {
+        ExampleMessageRequest* pMsgReq(3) = (ExampleMessageRequest *) pRequest(2);
+        int index1(6) = pMsgReq(4)->index1(5);
+        pTable1[index1(7:sink)].field1 = pMsgReq->value1;
+    }
+但我们也希望排除代码的数据流，如下所示：
+    int ExampleMessageHandler(UINT8 *pRequest(1:source), int RequestLength, UINT8 *pResponse)
+    {
+        ExampleMessageRequest* pMsgReq(3) = (ExampleMessageRequest *) pRequest(2);
+        int index2(6) = pMsgReq(4)->index2(5);
+        if (index2 >= 0 && index2 value2;
+        }
+    }
+使用前面讨论的`MessageHandlerFunction`类定义源代码，我们可以使用`ArrayExpr`的`getArrayOffset`谓词来定义合适的接收器：
+    override predicate isSource(DataFlow::Node source) {
+        any(MessageHandlerFunction mhf).getRequestDataPointer() = source.asParameter()
+      }
+      override predicate isSink(DataFlow::Node sink) { 
+        exists(ArrayExpr ae | ae.getArrayOffset() = sink.asExpr())  

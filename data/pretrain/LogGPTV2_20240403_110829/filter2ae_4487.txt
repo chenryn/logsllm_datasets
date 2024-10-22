@@ -1,0 +1,96 @@
+# drupal .开头文件名 文件上传
+## 前言
+通过diff 8.8.1的补丁，很容易发现修复点，位于`core\modules\file\file.module`
+补丁在文件名两侧进行了trim(..., '.')，结合漏洞通告可以知道应该是文件名过滤不严导致.开头的文件上传。
+## 原生模块分析
+漏洞点位于`_file_save_upload_single`函数
+    function _file_save_upload_single(\SplFileInfo $file_info, $form_field_name, $validators = [], $destination = FALSE, $replace = FileSystemInterface::EXISTS_REPLACE) {
+      ...
+      // Begin building file entity.
+      $values = [
+        'uid' => $user->id(),
+        'status' => 0,
+        'filename' => $file_info->getClientOriginalName(),//
+        'uri' => $file_info->getRealPath(),
+        'filesize' => $file_info->getSize(),
+      ];
+      $values['filemime'] = \Drupal::service('file.mime_type.guesser')->guess($values['filename']);
+      $file = File::create($values);
+      ...
+      // If we made it this far it's safe to record this file in the database.
+      $file->save();
+      ...
+      return $file;
+    }
+全局搜索调用本函数的地方，发现只在`core/modules/file/file.module:file_save_upload()`中被调用。
+由于此处不是控制器，无法直接调用，因此继续反向追踪调用此函数的位置。在多处找到调用，比如位于`core/modules/update/src/Form/UpdateManagerInstall.php:submitForm()`，这是update模块的updatemanagerinstall表单。
+    public function submitForm(array &$form, FormStateInterface $form_state) {
+      $local_cache = NULL;
+      $all_files = $this->getRequest()->files->get('files', []);
+      if ($form_state->getValue('project_url')) {
+        ...
+      }
+      elseif (!empty($all_files['project_upload'])) {
+        $validators = ['file_validate_extensions' => [$this->archiverManager->getExtensions()]];
+        if (!($finfo = file_save_upload('project_upload', $validators, NULL, 0, FileSystemInterface::EXISTS_REPLACE))) {
+          // Failed to upload the file. file_save_upload() calls
+          // \Drupal\Core\Messenger\MessengerInterface::addError() on failure.
+          return;
+        }
+        $local_cache = $finfo->getFileUri();
+      }
+这里的$validators通过`$this->archiverManager->getExtensions()`调用archiver管理器进行取值，由于这里设计很多内部成员变量，因此通过调试的方式来分析会快一些。下面就开始尝试构造路由到这个update模块。
+通过在update模块根目录下的`update.routing.yml`路由文件可以发现相应的路由：
+尝试上传.htaccess
+果然受到了限制，下面调试跟进这个$validators是如何取值的。最终跟进`core/lib/Drupal/Component/Annotation/Plugin/Discovery/AnnotatedClassDiscovery.php:getDefinitions()`方法，这里通过遍历所有module目录下的`src/plugin/archiver/`下的所有php文件，然后解析这个php文件的annotation。调试后发现只有system模块下存在这个目录：
+可以看到这里的annotation中限定了后缀名为`{"tar", "tgz", "tar.gz", "tar.bz2"}`
+到这里就可以停止调试了，这个update模块由于限制了后缀名，无法满足我们的条件。下面再找一些$validators的值不是`$this->archiverManager->getExtensions()`的模块。
+发现`core/modules/image/src/Controller/QuickEditImageController.php:upload()`
+    public function upload(EntityInterface $entity, $field_name, $langcode, $view_mode_id) {
+        $field = $this->getField($entity, $field_name, $langcode);
+        $field_validators = $field->getUploadValidators();
+        $field_settings = $field->getFieldDefinition()->getSettings();
+        $destination = $field->getUploadLocation();
+        // Add upload resolution validation.
+        if ($field_settings['max_resolution'] || $field_settings['min_resolution']) {
+          $field_validators['file_validate_image_resolution'] = [$field_settings['max_resolution'], $field_settings['min_resolution']];
+        }
+        // Create the destination directory if it does not already exist.
+        if (isset($destination) && !$this->fileSystem->prepareDirectory($destination, FileSystemInterface::CREATE_DIRECTORY)) {
+          return new JsonResponse(['main_error' => $this->t('The destination directory could not be created.'), 'errors' => '']);
+        }
+        // Attempt to save the image given the field's constraints.
+        $result = file_save_upload('image', $field_validators, $destination);
+        ...
+这里的$validators是通过`$field->getUploadValidators()`来取值的，跟之前的module同样的思路，先构造路由然后进行调试跟进。
+访问`quickedit/image/upload/node/1/field_image/en/full`映射到本控制器，然后跟进getUploadValidators()。经过一系列跟进之后发现配置在config表中，sql语句大概是`SELECT
+name, data FROM config WHERE collection = '' AND name
+='field.field.node.article.field_image';`
+剩下的调用`file_save_upload`的地方也都做了验证，没有可以利用的地方，都限制了文件后缀名。
+## 第三方模块分析
+看完所有调用点之后有点怀疑人生，会不会是类似于CVE-2018-7600那样，durpal6中虽然有漏洞，但是没找到错误的写法从而无法利用？通过再次阅读官方通告之后发现也许真是这样，但是幸运的是...
+意思大概是通过第三方contributed模块可能导致.htaccess文件上传？
+然后我尝试在第三方模块中寻找与文件上传相关的模块，找到了一个名为imce的文件/图片管理模块
+> IMCE is an image/file uploader and browser that supports personal
+> directories and quota.
+安装完毕之后直接访问路径`/imce/public`即可获得一个管理界面（后台）。
+上传.php文件会自动在后面加上.txt后缀。尝试上传.htaccess
+然而这只是个前端过滤而已，通过抓包修改文件名即可成功上传。
+通过阅读源码发现`opUpload()`方法调用了`file_save_upload()`进行文件上传。
+    public function opUpload(ImceFM $fm) {
+        ...
+        $validators = [];
+        // Extension validator
+        $exts = $fm->getConf('extensions', '');
+        $validators['file_validate_extensions'] = [$exts === '*' ? NULL : $exts];
+        ...
+        // Save files
+        if ($files = file_save_upload('imce', $validators, $destination, NULL, $replace)) {
+其中后缀名$validators从`$fm->getConf('extensions','')`获取。跟踪源码后发现，也是从config表中找到imce
+模块的一些配置
+由于$validators是*，即为不限制后缀名，从而造成.htaccess文件上传。
+## 补丁
+通过diff 8.8.1的补丁，很容易发现修复点，位于`core\modules\file\file.module`
+补丁在文件名两侧进行了trim(..., '.')。
+上传之后变成
+## 参考

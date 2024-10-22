@@ -1,0 +1,113 @@
+return 0;  
+}  
+timed_out:  
+list_del(&waiter.list);  
+return   
+-ETIME;  
+interrupted:  
+list_del(&waiter.list);  
+return   
+-EINTR;  
+}  
+```
+相对mutex对slow path的处理，semaphore要简单多了，它的主要流程是设置当前进程状态为TASK_INTERRUPTIBLE，然后睡眠到一个等待队列中。  
+所以semaphore如果第一时间没有获得信号量，那么它接下来就会sleep。  
+但是mutex的slow path呢，所有关于性能优化的代码都集中在该条路径中，所有它看起来比semaphore复杂许多...    
+#### mutex_lock的slow path的调用链
+mutex_lock --> __mutex_lock_slowpath --> __mutex_lock_common，  
+所有的性能优化的代码又都集中在__mutex_lock_common中，这个函数有点长，等下我们不妨肢解来慢慢看。。。    
+mutex_lock在slow path当中优化的基本原理是：  
+拥有mutex lock的进程总是会在尽可能短的时间里释放。  
+基于此，mutex_lock的slow path部分会尽量避免进入睡眠状态，它试图通过短暂的spin来等待拥有互斥锁的进程释放它。  
+__mutex_lock_common的主体结构是两个for循环，中间加入对能否再次获得锁的判断逻辑。   
+```
+/*  
+* Lock a mutex (possibly interruptible), slowpath:  
+*/  
+static inline int __sched  
+__mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,  
+struct lockdep_map *nest_lock, unsigned long ip)  
+{  
+struct task_struct *task = current;  
+```
+首先，我们能够达到这里，表明当前进程在一次争夺互斥锁的战争中失败了，此时几方争夺的互斥锁mutex中的owner即为成功获得该锁的task_struct对象...    
+先关闭内核可抢占性，是因为在后续的处理中，我们不希望被别的进程抢占出处理器，因为对当前进程而言，1st priority的事情是获得锁。高优先级进程在此时出现也不用抢占当前进程，因为当前进程接下来要么睡眠(那么就无需被抢占了)，要么获得锁而再次打开可抢占性。  
+```
+preempt_disable();  
+```
+内核配置选项，目前是内核默认的配置  
+```
+#ifdef CONFIG_MUTEX_SPIN_ON_OWNER   
+```
+源码中下面是一段很重要的注释，核心要点是mutex优化所基于的现实基础：  
+一个获得互斥锁的进程极大的可能会在很短的时间内释放掉它。  
+所以不同于semaphore的实现，mutex在第一次没获得锁的情形下，如果发现拥有该锁的进程正在别的处理器上运行且锁上没有其他等待者 (也即只有当前进程在等待该锁)，那么当前进程试图spin (说白了就是忙等待)，  
+这样有极大的概率是可以免去两次进程切换的开销，而重新获得之前竞争但未能成功的互斥锁----性能提升处。  
+**理论上，为了获得锁而进行的spin，其时间长短不应该超过两次进程切换的时间开销，否则此处优化将没有意义。**   
+下面是第一个for循环, 循环中有两个break，一个直接return 0    
+```
+for (;;) {  
+struct task_struct *owner;  
+/*  
+* If there's an owner, wait for it to either  
+* release the lock or go to sleep.  
+*/  
+owner = ACCESS_ONCE(lock->owner);  
+if (owner && !mutex_spin_on_owner(lock, owner))  
+break;  
+if (atomic_cmpxchg(&lock->count, 1, 0) == 1) {  
+lock_acquired(&lock->dep_map, ip);  
+mutex_set_owner(lock);  
+preempt_enable();  
+return 0;  
+}  
+/*  
+* When there's no owner, we might have preempted between the  
+* owner acquiring the lock and setting the owner field. If  
+* we're an RT task that will live-lock because we won't let  
+* the owner complete.  
+*/  
+if (!owner && (need_resched() || rt_task(task)))  
+break;  
+/*  
+* The cpu_relax() call is a compiler barrier which forces  
+* everything in this loop to be re-loaded. We don't need  
+* memory barriers as we'll eventually observe the right  
+* values at the cost of a few extra spins.  
+*/  
+arch_mutex_cpu_relax();  
+} //the first for loop  
+```
+先看第一个break，if条件里owner基本上都会满足，如果owner=NULL则说明当前拥有锁的进程可能已经释放了锁，所以可以立刻退出该循环。  
+if条件中的mutex_spin_on_owner()是个非常有意思的函数，它通过per-jiffies的方式来确保可以在极短的时间里break那个while循环。  
+这段代码设计是如此地富有想象力，它通过if (need_resched())使得函数能在jiffies级别上跳出while循环，但是代码优化的性能提升则体现在owner_running中，  
+因为拥有锁的进程在极短的时间(肯定是低于jiffies这个级别的，可能在us级甚至更低)释放锁，如果通过if (need_resched())退出循环，则基本说明了本次优化的失败，  
+事实上还导致了性能的倒退(因为即便在HZ=1000的系统中，jiffies的级别也是非常粗糙的，现代处理器的进程切换的开销可能只在几个us或者几十个us，  
+如果让一个进程为了获得mutex lock而去spin几个jiffies，那么这简直就是暴敛天物了，如果这个时间让当前进程睡眠，那么其他进程就可以获得CPU资源，  
+而1个jiffies可以抵得上几十上百个进程切换的时间开销，根本就不需要在乎两次进程切换的时间开销。  
+但是IBM的Paul同学认为，如果让一个进程在获得mutex lock的情形下运行几个jiffies再释放lock，那么这可能是个bug。  
+我不认为这是对的，mutex lock不同于spin lock，不应该对mutex_lock与mutex_unlock之间的代码执行时间做什么限定)。  
+代码在mutex_spin_on_owner()中通过while循环来密切关注拥有锁的进程运行情况，一旦从while中跳出来，说明当前进程已经释放锁(通过owner_running)，或者当前拥有锁的进程运行的时间够长(可能为几个jiffies)，  
+最后返回前检查lock->owner，如果是NULL，源码注释中也讲得很清楚，"which is a sign for heavy contention"，在当前进程还没来得及下手前，lock已经被他人横刀夺爱了，  
+此种情形下最好去sleep了，否则spin的时间就足以抵得上一次进程切换的代价。。。  
+中间的return 0是个非常理想的情况，当前进程spin的过程中，锁的拥有者已经释放了锁，这个最简单，二次获得锁成功而直接返回。  
+接下来的break是当前进程在对方先行抢占到了锁但是还没来得及设定owner的时候抢占了它，或者当前进程是个实时进程，此时需要进入后半段处理。  
+在第二个for循环之前，从代码明显看到设计者已经在为当前进程进入sleep状态做最后的准备  
+(如果代码进入到第二个for循环，实际上意味着本次优化的失败，从性能的角度，这条路径上的性能肯定没有semaphore来得高，至少是没什么优势，因为你前面毕竟spin了一下，最后才sleep，  
+但是semaphore根本就不spin，第一次没拿到锁的话直接就sleep了)，  
+不过它在进入第二个for循环之前还是要做了个atomic_xchg动作，主要是对第一个for循环中的两个break进行处理，看看是否足够幸运能再次获得锁。    
+第二个for循环的代码已经和semaphore的slow path实现基本一样了，所以我们看到对mutex的优化集中在第一个for循环之中，而且有很大的概率在那里会重新获得锁。   
+## 小结
+我们看到对mutex的优化其实遵循了代码优化的一般原则，即集中优化整个代码执行中出现的hot-spot(引申到高概率spot)。  
+因为在实际使用当中，大多数情况下，mutex_lock与mutex_unlock之间的代码都比较简短，使得获得锁的进程可以很快释放锁(因此，从性能优化的角度，这个也可以作为使用mutex的一条一般原则)。  
+如果系统中大部分拥有互斥锁的进程在mutex_lock与unlock之间执行时间比较长，那么相对于使用semaphore，我相信使用mutex会使得系统性能降低：    
+因为很大的概率，mutex都经过一段spin(虽然这段时间极短)之后最终还是进入sleep，而semaphore则直接进入sleep，没有了spin的过程。    
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

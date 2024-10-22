@@ -1,0 +1,153 @@
+# 前言
+大家好，我是灰豆。《灰豆聊 Bug》系列文章的目的是解释漏洞的产生原因，并向你展示这些漏洞如何影响 V8 的正确性。本系列文章分析 PoC 在 V8
+中的执行细节，讲解为什么 PoC 要这样设计。  
+本系列文章主要讲解  的内容，每篇文章讲解一个 issue。如果你有想学习的
+issue 也可以告诉我，我会优先分析讲解。
+# 1 介绍
+本文讲解 CVE-2021-38003，Chrome issues
+地址：  
+受影响版本：Google Chrome 95.0.4638.54 (Official Build) (x86_64)。
+# 2 漏洞分析
+测试用例代码如下：
+    1.  function trigger() {
+    2.  let a = [], b = [];
+    3.  let s = '"'.repeat(0x800000);
+    4.  a[20000] = s;
+    5.  for (let i = 0; i  __result__;
+    6.      Isolate* __isolate__ = (isolate);
+    7.      if (!(JsonStringify(isolate, object, replacer, indent))
+    8.               .ToHandle(&__result__)) {
+    9.        DCHECK(__isolate__->has_pending_exception());//这里！！！！
+    10.        return ReadOnlyRoots(__isolate__).exception();
+    11.      } 
+    12.      DCHECK(!__isolate__->has_pending_exception());
+    13.      return *__result__;
+    14.    } while (false);
+上述代码第 7 行 .ToHandle()的结果为 False，执行第 10 行代码，返回 exception()，也就是 HoleValue，它是 V8
+的内部变量，用于表示空值。注意：第 8 行在 Debug 模式下才有效，本例中该行代码不执行。  
+在测试用例代码中， **用户使用 try catch 拿到了 HoleValue。**  
+测试用例代码第 15-17 行创建 Map()，并添加 1 和 hole 两个 key。map.delete 是发生堆损坏的现场，源码如下：
+    1.  TF_BUILTIN(MapPrototypeDelete, CollectionsBuiltinsAssembler) {
+    2.    const auto receiver = Parameter(Descriptor::kReceiver);
+    3.    const auto key = Parameter(Descriptor::kKey);
+    4.    const auto context = Parameter(Descriptor::kContext);
+    5.    ThrowIfNotInstanceType(context, receiver, JS_MAP_TYPE,
+    6.                           "Map.prototype.delete");
+    7.    const TNode table =
+    8.        LoadObjectField(CAST(receiver), JSMap::kTableOffset);
+    9.    TVARIABLE(IntPtrT, entry_start_position_or_hash, IntPtrConstant(0));
+    10.    Label entry_found(this), not_found(this);
+    11.    TryLookupOrderedHashTableIndex(
+    12.        table, key, &entry_start_position_or_hash, &entry_found, &not_found);
+    13.    BIND(&not_found);
+    14.    Return(FalseConstant());
+    15.    BIND(&entry_found);
+    16.    // If we found the entry, mark the entry as deleted.
+    17.    StoreFixedArrayElement(table, entry_start_position_or_hash.value(),
+    18.                           TheHoleConstant(), UPDATE_WRITE_BARRIER,
+    19.                           kTaggedSize * OrderedHashMap::HashTableStartIndex());
+    20.    StoreFixedArrayElement(table, entry_start_position_or_hash.value(),
+    21.                           TheHoleConstant(), UPDATE_WRITE_BARRIER,
+    22.                           kTaggedSize * (OrderedHashMap::HashTableStartIndex() +
+    23.                                          OrderedHashMap::kValueOffset));
+    24.    // Decrement the number of elements, increment the number of deleted elements.
+    25.    const TNode number_of_elements = SmiSub(
+    26.        CAST(LoadObjectField(table, OrderedHashMap::NumberOfElementsOffset())),
+    27.        SmiConstant(1));
+    28.    StoreObjectFieldNoWriteBarrier(
+    29.        table, OrderedHashMap::NumberOfElementsOffset(), number_of_elements);
+    30.    const TNode number_of_deleted =
+    31.        SmiAdd(CAST(LoadObjectField(
+    32.                   table, OrderedHashMap::NumberOfDeletedElementsOffset())),
+    33.               SmiConstant(1));
+    34.    StoreObjectFieldNoWriteBarrier(
+    35.        table, OrderedHashMap::NumberOfDeletedElementsOffset(),
+    36.        number_of_deleted);
+    37.    const TNode number_of_buckets = CAST(
+    38.        LoadFixedArrayElement(table, OrderedHashMap::NumberOfBucketsIndex()));
+    39.    // If there fewer elements than #buckets / 2, shrink the table.
+    40.    Label shrink(this);
+    41.    GotoIf(SmiLessThan(SmiAdd(number_of_elements, number_of_elements),
+    42.                       number_of_buckets),
+    43.           &shrink);
+    44.    Return(TrueConstant());
+    45.    BIND(&shrink);
+    46.    CallRuntime(Runtime::kMapShrink, context, receiver);
+    47.    Return(TrueConstant());
+    48.  }
+上述代码第 17-23 行分别删除 key 和对应的 value； **注意：** 删除方法是把原来key 和 value的值重写为 hole 值。  
+第 25-29 行更新 map.size = map.size -1；  
+第 41-16 根据 map.size 的数值来判断是否清理 hole 值；如果 map 中的 hole 太多了，使用
+Runtime::kMapShrink 清理 hole 值，稍后讲解 Runtime::kMapShrink。  
+测试用例第 16 行 map.set(1, 1) 很重要，稍后讲解。  
+执行测试用例第 18 行代码删除 key 为 hole 的键值。这次删除是正常操作，原来的key 本就是 hole，再改写为 hole，map.size
+-1 也是正常操作。  
+**很重要：** 因为第 41 行代码不满足条件，这次没有触发 Runtime::kMapShrink 清理 hole 值。  
+执行测试用例第 19 行代码再次删除 key 为 hold 的键值。因为前面用 hole 填充了被删除位置，所以这次删除依旧可以找到一个待删除的
+key，然后执行了 **map.size-1** ，现在的map 中还有 (1,1)，但 size 为0。  
+我们看到这次删除触发 Runtime::kMapShrink 清理 hole 值。  
+执行测试用例第 20 代码，这是正常操作，但结果是 map.size = -1。  
+**注意:** 再向这个 map 中添加数据时可以覆盖 V8 的内部值，造成堆损坏。
+# 3 触发漏洞的关键条件是 map.set(1, 1)
+TF_BUILTIN(MapPrototypeDelete, CollectionsBuiltinsAssembler) 的第 41 行代码如下：
+    41.    GotoIf(SmiLessThan(SmiAdd(number_of_elements, number_of_elements),
+    42.                       number_of_buckets),
+    43.           &shrink);
+该代码是触发 Runtime::kMapShrink 的条件，当 number_of_elements*2 小于 number_of_buckets 时执行
+Runtime::kMapShrink，该函数内部调用了 Rehash 方法，源码如下：
+    1.  MaybeHandle OrderedHashTable::Rehash(
+    2.      IsolateT* isolate, Handle table, int new_capacity) {
+    3.    DCHECK(!table->IsObsolete());
+    4.    MaybeHandle new_table_candidate =
+    5.        Derived::Allocate(isolate, new_capacity,
+    6.                          Heap::InYoungGeneration(*table) ? AllocationType::kYoung
+    7.                                                          : AllocationType::kOld);
+    8.    Handle new_table;
+    9.    if (!new_table_candidate.ToHandle(&new_table)) {
+    10.      return new_table_candidate;
+    11.    }
+    12.    int new_buckets = new_table->NumberOfBuckets();
+    13.    int new_entry = 0;
+    14.    int removed_holes_index = 0;
+    15.    DisallowGarbageCollection no_gc;
+    16.    for (InternalIndex old_entry : table->IterateEntries()) {
+    17.      int old_entry_raw = old_entry.as_int();
+    18.      Object key = table->KeyAt(old_entry);
+    19.      if (key.IsTheHole(isolate)) {
+    20.        table->SetRemovedIndexAt(removed_holes_index++, old_entry_raw);
+    21.        continue;
+    22.      }
+    23.      Object hash = key.GetHash();
+    24.      int bucket = Smi::ToInt(hash) & (new_buckets - 1);
+    25.      Object chain_entry = new_table->get(HashTableStartIndex() + bucket);
+    26.      new_table->set(HashTableStartIndex() + bucket, Smi::FromInt(new_entry));
+    27.      int new_index = new_table->EntryToIndexRaw(new_entry);
+    28.      int old_index = table->EntryToIndexRaw(old_entry_raw);
+    29.      for (int i = 0; i get(old_index + i);
+    31.        new_table->set(new_index + i, value);
+    32.      }
+    33.      new_table->set(new_index + kChainOffset, chain_entry);
+    34.      ++new_entry;
+    35.    }
+    36.  //省略.............................
+    37.    return new_table_candidate;
+    38.  }
+注重看上述代码第 19-21 行， **清理了 map 中的 hole** 。  
+在测试用例中，一共执行了两次 hole 删除操作，如果第一次删除后触发了 Rehash 方法，那么第二次 hole
+删除就会报错，导致崩溃，达不到利用的效果。  
+如何不崩溃？  
+答：要保证第二次 hole 删除操作之前不能触发 Rehash。  
+如何不触发 Rehash？  
+答：要保证 GotoIf 的结果为 false。  
+**所以，** set(1,1) 是用来凑数的，保证 GotoIf 为 false。
+**技术总结**  
+**（1）** 用户使用 try catch 拿到了 HoleValue；  
+**（2）** map.delete 使用 HoleValue 填充原位置；  
+**（3）** 在map中填充数据成员用来凑数，保证不触发 Rehash。
+# 4 参考文献
+[1].   
+[2]. [《Chrome V8 源码》52.
+解密JSON序列化、stringify源码分析](https://zhuanlan.zhihu.com/p/489109147)
+好了，今天到这里，下次见。  
+**个人能力有限，有不足与纰漏，欢迎批评指正**  
+**微信：qq9123013 备注：v8交流 知乎：**

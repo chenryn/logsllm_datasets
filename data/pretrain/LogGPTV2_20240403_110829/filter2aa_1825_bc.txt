@@ -1,0 +1,317 @@
+chapter.
+Chapter 9: Process and Thread
+Notifications
+One of the powerful mechanisms available for kernel drivers is the ability to be notified when certain
+important events occur. In this chapter, we’ll look into some of these events, namely process creation and
+destruction, thread creation and destruction, and image loads.
+In this chapter:
+• Process Notifications
+• Implementing Process Notifications
+• Providing Data to User Mode
+• Thread Notifications
+• Image Load Notifications
+• Remote Thread Detection
+Process Notifications
+Whenever a process is created or destroyed, interested drivers can be notified by the kernel of that fact.
+This allows drivers to keep track of processes, possibly associating some data with these processes. At the
+very minimum, these allow drivers to monitor process creation/destruction in real-time. By “real-time”
+I mean that the notifications are sent “in-line”, as part of process creation; the driver cannot miss any
+processes that may be created and destroyed quickly.
+For process creation, drivers also have the power to stop the process from being fully created, returning
+an error to the caller that initiated process creation. This kind of power can only be directly achieved in
+kernel mode.
+Windows provides other mechanisms for being notified when processes are created or destroyed. For
+example, using Event Tracing for Windows (ETW), such notifications can be received by a user-mode
+process (running with elevated privileges). However, there is no way to prevent a process from being
+created. Furthermore, ETW has an inherent notification delay of about 1-3 seconds (it uses internal
+buffers for performance reasons), so a short-lived process may exit before the creation notification arrives.
+Opening a handle to the created process at that time would no longer be possible.
+Chapter 9: Process and Thread Notifications
+263
+The main API for registering for process notifications is PsSetCreateProcessNotifyRoutineEx,
+defined like so:
+NTSTATUS PsSetCreateProcessNotifyRoutineEx (
+_In_ PCREATE_PROCESS_NOTIFY_ROUTINE_EX NotifyRoutine,
+_In_ BOOLEAN Remove);
+There is currently a system-wide limit of 64 registrations, so it’s theoretically possible for the
+registration function to fail.
+The first argument is the driver’s callback routine, having the following prototype:
+void ProcessNotifyCallback(
+_Inout_
+PEPROCESS Process,
+_In_
+HANDLE ProcessId,
+_Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
+The second argument to PsSetCreateProcessNotifyRoutineEx indicates whether the driver is
+registering or unregistering the callback (FALSE indicates the former). Typically, a driver will call this
+API with FALSE in its DriverEntry routine and call the same API with TRUE in its Unload routine.
+The parameters to the process notification routine are as follows:
+• Process - the process object of the newly created process, or the process being destroyed.
+• Process Id - the unique process ID of the process. Although it’s declared with type HANDLE, it’s in
+fact an ID.
+• CreateInfo - a structure that contains detailed information on the process being created. If the process
+is being destroyed, this argument is NULL.
+For process creation, the driver’s callback routine is executed by the creating thread (running as part of
+the creating process). For process exit, the callback is executed by the last thread to exit the process. In
+both cases, the callback is called inside a critical region (where normal kernel APCs are disabled).
+Starting with Windows 10 version 1607, there is another function for process notifications:PsSetCreateProcessNotify
+This “extended” function sets up a callback similar to the previous one, but the callback is also invoked
+for Pico processes. Pico processes are those used to host Linux processes for the Windows Subsystem for
+Linux (WSL) version 1. If a driver is interested in such processes, it must register with the extended
+function.
+Chapter 9: Process and Thread Notifications
+264
+A driver using these callbacks must have the IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY flag
+in its Portable Executable (PE) image header. Without it, the call to the registration function returns
+STATUS_ACCESS_DENIED (unrelated to driver test signing mode). Currently, Visual Studio does not
+provide UI for setting this flag. It must be set in the linker command-line options with /integritycheck.
+Figure 9-1 shows the project properties where this setting is specified.
+Figure 9-1: /integritycheck linker switch in Visual Studio
+The data structure provided for process creation is defined like so:
+typedef struct _PS_CREATE_NOTIFY_INFO {
+_In_ SIZE_T Size;
+union {
+_In_ ULONG Flags;
+struct {
+_In_ ULONG FileOpenNameAvailable : 1;
+_In_ ULONG IsSubsystemProcess : 1;
+_In_ ULONG Reserved : 30;
+};
+Chapter 9: Process and Thread Notifications
+265
+};
+_In_ HANDLE ParentProcessId;
+_In_ CLIENT_ID CreatingThreadId;
+_Inout_ struct _FILE_OBJECT *FileObject;
+_In_ PCUNICODE_STRING ImageFileName;
+_In_opt_ PCUNICODE_STRING CommandLine;
+_Inout_ NTSTATUS CreationStatus;
+} PS_CREATE_NOTIFY_INFO, *PPS_CREATE_NOTIFY_INFO;
+Here is a description of the important fields in this structure:
+• CreatingThreadId - a combination of thread and process Id of the creator of the process.
+• ParentProcessId - the parent process ID (not a handle). This process is usually the same as provided
+by CreateThreadId.UniqueProcess, but may be different, as it’s possible, as part of process
+creation, to pass in a different parent process to inherit certain properties from. See the user-mode
+documentation for UpdateProcThreadAttribute with the PROC_THREAD_ATTRIBUTE_PAR-
+ENT_PROCESS attribute.
+• ImageFileName - the image file name of the executable, available if the flag FileOpenNameAvail-
+able is set.
+• CommandLine - the full command line used to create the process. Note that in some cases it may
+be NULL.
+• IsSubsystemProcess - this flag is set if this process is a Pico process. This can only happen if the
+driver registered using PsSetCreateProcessNotifyRoutineEx2.
+• CreationStatus - this is the status that would return to the caller. It’s set to STATUS_SUCCESS when
+the callback is invoked. This is where the driver can stop the process from being created by placing
+some failure status in this member (e.g. STATUS_ACCESS_DENIED). if the driver fails the creation,
+subsequent drivers that may have set up their own callbacks will not be called.
+Implementing Process Notifications
+To demonstrate process notifications, we’ll build a driver that gathers information on process creation
+and destruction and allow this information to be consumed by a user-mode client. This is similar to tools
+such as Process Monitor and SysMon from Sysinternals, which use process and thread notifications for
+reporting process and thread activity. During the course of implementing this driver, we’ll leverage some
+of the techniques we learned in previous chapters.
+Our driver name is going to be SysMon (unrelated to the SysMon tool). It will store all process
+creation/destruction information in a linked list. Since this linked list may be accessed concurrently by
+multiple threads, we need to protect it with a mutex or a fast mutex; we’ll go with fast mutex, as it’s
+slightly more efficient.
+The data we gather will eventually find its way to user mode, so we should declare common structures
+that the driver produces and a user-mode client consumes. We’ll add a common header file named
+SysMonPublic.h to the driver project and define a few structures. We start with a common header for
+all information structures we need to collect:
+Chapter 9: Process and Thread Notifications
+266
+enum class ItemType : short {
+None,
+ProcessCreate,
+ProcessExit
+};
+struct ItemHeader {
+ItemType Type;
+USHORT Size;
+LARGE_INTEGER Time;
+};
+The ItemType enum defined above uses the C++ 11 scoped enum feature, where enum values
+have a scope (ItemType in this case). These enums can also have a non-int size - short in
+the example. If you’re using C, you can use classic enums, or even #defines if you prefer.
+The ItemHeader structure holds information common to all event types: the type of the event, the time
+of the event (expressed as a 64-bit integer), and the size of the payload. The size is important, as each event
+has its own information. If we later wish to pack an array of these events and (say) provide them to a
+user-mode client, the client needs to know where each event ends and the next one begins.
+Once we have this common header, we can derive other data structures for particular events. Let’s start
+with the simplest - process exit:
+struct ProcessExitInfo : ItemHeader {
+ULONG ProcessId;
+ULONG ExitCode;
+};
+For process exit event, there is just one interesting piece of information (besides the header and the thread
+ID) - the exit status (code) of the process. This is normally the value returned from a user-mode main
+function.
+If you’re using C, then inheritance is not available to you. However, you can simulate it by
+having the first member be of type ItemHeader and then adding the specific members; The
+memory layout is the same.
+struct ProcessExitInfo {
+ItemHeader Header;
+ULONG ProcessId;
+};
+Chapter 9: Process and Thread Notifications
+267
+The type used for a process ID is ULONG - process IDs (and thread IDs) cannot be larger than 32-bit.
+HANDLE is not a good idea, as user mode may be confused by it. Also, HANDLE has a different size in a
+32-bit process as opposed to a 64-bit process, so it’s best to avoid “bitness”-affected members. If you’re
+familiar with user-mode programming, DWORD is a common typedef for a 32-bit unsigned integer. It’s
+not used here because DWORD is not defined in the WDK headers. Although it’s pretty easy to define it
+explicitly, it’s simpler just to use ULONG, which means the same thing and is defined in user-mode and
+kernel-mode headers.
+Since we need to store every such structure as part of a linked list, each data structure must contain a
+LIST_ENTRY instance that points to the next and previous items. Since these LIST_ENTRY objects should
+not be exposed to user-mode, we will define extended structures containing these entries in a different file,
+that is not shared with user-mode.
+There are several ways to define a “bigger” structure to hold the LIST_ENTRY. One way is to create
+templated type that has a LIST_ENTRY at the beginning (or end) like so:
+template
+struct FullItem {
+LIST_ENTRY Entry;
+T Data;
+};
+The layout of FullItem is shown in figure 9-2.
+Figure 9-2: FullItem layout
+A templated class is used to avoid creating a multitude of types, one for each specific event type. For
+example, we could create the following structure specifically for a process exit event:
+Chapter 9: Process and Thread Notifications
+268
+struct FullProcessExitInfo {
+LIST_ENTRY Entry;
+ProcessExitInfo Data;
+};
+We could even inherit from LIST_ENTRY and then just add the ProcessExitInfo structure. But this
+is not elegant, as our data has nothing to do with LIST_ENTRY, so inheriting from it is artificial and
+should be avoided.
+The FullItem type saves the hassle of creating these individual types.
+IF you’re using C, then templates are not available, and you must use the above structure
+approach. I’m not going to mention C again in this chapter - there is always a workaround that
+can be used if you have to.
+Another way to accomplish something similar, without using templates is by using a union to hold on to
+all the possible variants. For example:
+struct ItemData : ItemHeader {
+union {
+ProcessCreateInfo ProcessCreate;
+// TBD
+ProcessExitInfo ProcessExit;
+};
+};
+Then we just extend the list of data members in the union. The full item would be just a simple extension:
+struct FullItem {
+LIST_ENTRY Entry;
+ItemData Data;
+};
+The rest of the code uses the first option (with the template). The reader is encouraged to try the second
+option.
+The head of our linked list must be stored somewhere. We’ll create a data structure that will hold all
+the global state of the driver, instead of creating separate global variables. Here is the definition of our
+structure (in Globals.h in the smaple code for this chapter):
+Chapter 9: Process and Thread Notifications
+269
+#include "FastMutex.h"
+struct Globals {
+void Init(ULONG maxItems);
+bool AddItem(LIST_ENTRY* entry);
+LIST_ENTRY* RemoveItem();
+private:
+LIST_ENTRY m_ItemsHead;
+ULONG m_Count;
+ULONG m_MaxCount;
+FastMutex m_Lock;
+};
+The FastMutex type used is the same one we developed in chapter 6.
+Init is used to initialize the data members of the structure. Here is its implementation (in Globals.cpp):
+void Globals::Init(ULONG maxCount) {
+InitializeListHead(&m_ItemsHead);
+m_Lock.Init();
+m_Count = 0;
+m_MaxCount = maxCount;
+}
+m_MaxCount holds the maximum number of elements in the linked list. This will be used to prevent
+the list from growing arbitrarily large if a client does not request data for a while. m_Count holds the
+current number of items in the list. The list itself is initialized with the normal InitializeListHead
+API. Finally, the fast mutex is initialized by invoking its own Init method as implemented in chapter 6.
+The DriverEntry Routine
+The DriverEntry for the SysMon driver is similar to the one in the Zero driver from chapter 7. We have
+to add process notification registration and proper initialization of our Globals object:
+// in SysMon.cpp
+Globals g_State;
+extern "C"
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
+auto status = STATUS_SUCCESS;
+PDEVICE_OBJECT DeviceObject = nullptr;
+UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\sysmon");
+Chapter 9: Process and Thread Notifications
+270
+bool symLinkCreated = false;
+do {
+UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\sysmon");
+status = IoCreateDevice(DriverObject, 0, &devName,
+FILE_DEVICE_UNKNOWN, 0, TRUE, &DeviceObject);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to create device (0x%08X)\n",
+status));
+break;
+}
+DeviceObject->Flags |= DO_DIRECT_IO;
+status = IoCreateSymbolicLink(&symLink, &devName);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX "failed to create sym link (0x%08X)\n",
+status));
+break;
+}
+symLinkCreated = true;
+status = PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
+if (!NT_SUCCESS(status)) {
+KdPrint((DRIVER_PREFIX
+"failed to register process callback (0x%08X)\n",
+status));
+break;
+}
+} while (false);
+if (!NT_SUCCESS(status)) {
+if (symLinkCreated)
+IoDeleteSymbolicLink(&symLink);
+if (DeviceObject)
+IoDeleteDevice(DeviceObject);
+return status;
+}
+g_State.Init(10000);
+// hard-coded limit for now
+DriverObject->DriverUnload = SysMonUnload;
+DriverObject->MajorFunction[IRP_MJ_CREATE] =
+DriverObject->MajorFunction[IRP_MJ_CLOSE] = SysMonCreateClose;
+Chapter 9: Process and Thread Notifications
+271
+DriverObject->MajorFunction[IRP_MJ_READ] = SysMonRead;
+return status;
+}
+The device object’s flags are adjusted to use Direct I/O for read/write operations (DO_DIRECT_IO). The
+device is created as exclusive, so that only a single client can exist to the device. This makes sense, otherwise
+multiple clients might be getting data from the device, which would mean each client getting parts of the
+data. In this case, I decided to prevent that by creating the device as exclusive (TRUE value in the second
+to last argument). We’ll use the read dispatch routine to return event information to a client.
+The create and close dispatch routines are handled in the simplest possible way - just completing them
+successfully, with the help of CompleteRequest we have encountered before:
+NTSTATUS CompleteRequest(PIRP Irp,
+NTSTATUS status = STATUS_SUCCESS, ULONG_PTR info = 0) {
+Irp->IoStatus.Status = status;
+Irp->IoStatus.Information = info;
+IoCompleteRequest(Irp, IO_NO_INCREMENT);
+return status;
+}
+NTSTATUS SysMonCreateClose(PDEVICE_OBJECT, PIRP Irp) {
+return CompleteRequest(Irp);
+}
+Handling Process Exit Notifications
+The process notification function in the code above is OnProcessNotify and has the prototype outlined
+earlier in this chapter. This callback handles process creation and exit. Let’s start with process exit, as it’s
+much simpler than process creation (as we shall soon see). The basic outline of the callback is as follows:
+void OnProcessNotify(PEPROCESS Process, HANDLE ProcessId,
+PPS_CREATE_NOTIFY_INFO CreateInfo) {
+if (CreateInfo) {
+// process create
+}

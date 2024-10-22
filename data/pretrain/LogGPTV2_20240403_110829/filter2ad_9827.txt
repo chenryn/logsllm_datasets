@@ -1,0 +1,127 @@
+**作者： wzt  
+原文链接：**
+# 1 简介
+今天继续分析下Freebsd进程的栈、堆、代码段的地址随机化实现。
+## 1.1 不可思议的栈随机化
+可能读者朋友会比较诧异，freebsd内核没有提供进程栈的地址随机化功能。 进程栈的地址是execve加载磁盘上的二进制文件时初始化的：
+    kern/kern_exec.c：
+    kern_execve()->do_execve()->exec_copyout_strings()
+    register_t *
+    exec_copyout_strings(struct image_params *imgp)
+    {
+            arginfo = (struct ps_strings *)p->p_sysent->sv_psstrings;[1]
+            destp = (uintptr_t)arginfo;[2]
+    }
+exec_copyout_strings用来拷贝当前进程的二进制信息，这些信息会被动态连接器使用。
+[1] 处p->p_sysent->sv_psstrings保存的是当前进程的二进制信息，它位于栈基地址的附近。
+看下init进程的sysentvec信息：
+    struct sysentvec null_sysvec = {
+            .sv_usrstack    = USRSTACK,
+            .sv_psstrings   = PS_STRINGS,
+    }
+    #define PS_STRINGS      (USRSTACK - sizeof(struct ps_strings))
+sv_psstrings紧挨着栈的开始地址。
+    amd64/include/vmparam.h
+    #define VM_MAXUSER_ADDRESS      UVADDR(NUPML4E, 0, 0, 0)
+    #define SHAREDPAGE              (VM_MAXUSER_ADDRESS - PAGE_SIZE)
+    #define USRSTACK                SHAREDPAGE
+以amd64架构为例，USRSTACK为进程空间最大的用户态地址减去一个PAGE_SIZE。
+通过代码路径的溯源，可以看到freebsd的内核并没有对栈的地址有随机化的动作！
+## 1.2 BRK地址随机化
+Libc的brk函数用来控制进程的heap大小，但是从内核源码来看， freebsd并没有提供brk的系统调用。
+    vm/vm_mmap.c：
+    int
+    sys_sbrk(struct thread *td, struct sbrk_args *uap)
+    {
+            /* Not yet implemented */
+            return (EOPNOTSUPP);
+    }
+事实上，freebsd的进程空间结构与linux的有所不同，
+内核对进程空间的管理并没有明确的brk和mmap概念，linux的mm_struct结构体会有brk和mmap的开始地址标记。
+    include/linux/mm_types.h：
+    struct mm_struct {
+                    unsigned long mmap_base;// mmap区域的基地址
+                    unsigned long start_brk, brk, start_stack;// brk区域的及地址
+    }
+Linux对brk和mmap区域都有明显的界限划分，并且都提供了它们的地址随机化能力。
+在来看下freebsd的定义：
+    vm/vm_map.h：
+    struct vmspace {
+            caddr_t vm_taddr; // 代码段基地址     
+            caddr_t vm_daddr;// 数据段基地址       
+    }
+Freebsd的进程空间区域只包含代码段和数据段，
+动态生成的heap区域就在data段的后面。虽然libc库有包装了brk，但是内核没有提供此架构与功能。用户态的内存分配器比如jemalloc，它会优先选择使用mmap来分配内存。
+## 1.3 mmap地址随机化
+接下来继续分析mmap的地址随机化实现, 我们以mmap建立一个匿名映射的路径来分析：
+    vm/vm_mmap.c:
+    sys_mmap()->kern_mmap()->vm_mmap_object():
+    int
+    vm_mmap_object(vm_map_t map, vm_offset_t *addr, vm_size_t size, vm_prot_t prot,
+        vm_prot_t maxprot, int flags, vm_object_t object, vm_ooffset_t foff,
+        boolean_t writecounted, struct thread *td)
+    {
+                    if (curmap) {
+                            rv = vm_map_find_min(map, object, foff, addr, size,[1]
+                                round_page((vm_offset_t)td->td_proc->p_vmspace->
+                                vm_daddr + lim_max(td, RLIMIT_DATA)), max_addr,[2]
+                                findspace, prot, maxprot, docow);
+    }
+[1] 处用来寻找进程空间是否存在一个合适的地址范围，注意看[2]处的参数为地址范围的最小值，它被设置为vm_daddr + lim_max(td,
+RLIMIT_DATA))， 也就是数据段的最后地址，所以说freebsd的mmap是从紧挨着数据段后面开始的。
+    vm_map_find_min()->vm_map_find():
+    int
+    vm_map_find(vm_map_t map, vm_object_t object, vm_ooffset_t offset,
+                vm_offset_t *addr,  /* IN/OUT */
+                vm_size_t length, vm_offset_t max_addr, int find_space,
+                vm_prot_t prot, vm_prot_t max, int cow)
+    {
+                    if (try == 1 && en_aslr && !cluster) {
+                            pidx = MAXPAGESIZES > 1 && pagesizes[1] != 0 &&[1]
+                                (find_space == VMFS_SUPER_SPACE || find_space ==
+                                VMFS_OPTIMAL_SPACE) ? 1 : 0;
+                            gap = vm_map_max(map) > MAP_32BIT_MAX_ADDR &&[2]
+                                (max_addr == 0 || max_addr > MAP_32BIT_MAX_ADDR) ?
+                                aslr_pages_rnd_64[pidx] : aslr_pages_rnd_32[pidx];
+                            if (vm_map_findspace(map, curr_min_addr, length +
+                                gap * pagesizes[pidx], addr) ||
+                                (max_addr != 0 && *addr + length > max_addr))
+                                    goto again;
+                            /* And randomize the start address. */
+                            *addr += (arc4random() % gap) * pagesizes[pidx];[3]
+    }
+[1]处Pidx用来选择page size的小大， [2]处gap用来选择随机化的page数目。[3]处通过arc4random()生成一个随机数,
+并计算最后的随机地址。以amd64架构为例：
+    static const int aslr_pages_rnd_64[2] = {0x1000, 0x10};
+    u_long pagesizes[MAXPAGESIZES] = { PAGE_SIZE };
+可以看到mmap的最大地址随机范围不超过：0x1000*4096=0x1000000, 也就10M的地址范围，随机范围并不大。
+## 1.4 代码段地址随机化
+代码段指的是text代码段，包含共享库，它们的基地址，freebsd都做了随机化的能力。
+    kern/imgact_elf.c：
+    static int
+    __CONCAT(exec_, __elfN(imgact))(struct image_params *imgp)
+    {
+            if (hdr->e_type == ET_DYN) {
+                    if (baddr == 0) {
+                            if ((sv->sv_flags & SV_ASLR) == 0 ||
+                                (fctl0 & NT_FREEBSD_FCTL_ASLR_DISABLE) != 0)
+                                    et_dyn_addr = ET_DYN_LOAD_ADDR;
+                            else if ((__elfN(pie_aslr_enabled) &&
+                                (imgp->proc->p_flag2 & P2_ASLR_DISABLE) == 0) ||
+                                (imgp->proc->p_flag2 & P2_ASLR_ENABLE) != 0)
+                                    et_dyn_addr = ET_DYN_ADDR_RAND;
+                            else
+                                    et_dyn_addr = ET_DYN_LOAD_ADDR;
+                    }
+    }
+对于使用pie编译为地址无关代码的程序，或者共享库文件，elf文件头都设置为ET_DYN，
+elf的第一个load段内存地址都设置为0。如果没有开启地址随机化，那么et_dyn_addr被设置为0x01021000(64位)。如果设置随机化，则执行如下路径：
+`maxv = vm_map_max(map) - lim_max(td, RLIMIT_STACK);`
+    if (et_dyn_addr == ET_DYN_ADDR_RAND) {
+                    et_dyn_addr = __CONCAT(rnd_, __elfN(base))(map,
+                        vm_map_min(map) + mapsz + lim_max(td, RLIMIT_DATA),
+                        /* reserve half of the address space to interpreter */
+                        maxv / 2, 1UL = maxv)
+                    res -= align;
+    }
+* * *

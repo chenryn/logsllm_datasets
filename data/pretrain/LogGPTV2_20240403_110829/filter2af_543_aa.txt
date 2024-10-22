@@ -1,0 +1,181 @@
+原文：
+译者注：原作者的文风比较活泼，所以，上车前，请各位做好相应的心理准备。
+**免责声明**
+* * *
+请读者注意，这里讨论的安全问题并不是通用的Android漏洞，而是只影响某种型号的设备，所以，这些漏洞的危害程度都是有限的。另外，本文旨在为读者介绍如何亲自编写一个简陋的Android
+fuzzer，然后设法加以改进，而不是为了严肃地讨论Android的安全性问题。
+**代码下载地址**
+* * *
+[Slime Tree Repo ](https://github.com/gamozolabs/slime_tree "Slime Tree Repo
+")
+**简介**
+* * *
+在本文中，我们首先会动手打造一款简陋的Android fuzzer，然后进行改进，从而享受不断进步的喜悦之情。
+在进行Android设备模糊测试时，我们需要做的第一件事就是获取手机上的设备列表，从而找出可以访问的设备。这很简单，对吧？为此，我们可以进入/dev目录，并运行ls
+-l命令，然后，从中查找所有用户都具有读或写权限的设备即可。嗯...对于selinux，情况并非如此，因为它还要求我们对selinux的策略有所了解才行。
+为了解决这个问题，让我们先从最简单的地方下手：编写一个程序，只要求它能够在要挖掘漏洞的上下文中运行即可。该程序的功能非常简单，列出手机上的所有文件，并尝试打开它们，以进行读写操作。这样，我们就能得到一个列表，其中包含了我们在手机上有权打开的所有文件/设备。在本文中，我们将使用adb
+shell，因此，我们是在`u:r:shell:s0`上下文中运行。
+**遍历所有文件**
+* * *
+好吧，我想要快速遍历手机上的所有文件，并判断自己是否对其具有读写权限。这件事情并不太难，完全可以通过Rust来实现。
+    /// Recursively list all files starting at the path specified by `dir`, saving
+    /// all files to `output_list`
+    fn listdirs(dir: &Path, output_list: &mut Vec) {
+        // List the directory
+        let list = std::fs::read_dir(dir);
+        if let Ok(list) = list {
+            // Go through each entry in the directory, if we were able to list the
+            // directory safely
+            for entry in list {
+                if let Ok(entry) = entry {
+                    // Get the path representing the directory entry
+                    let path = entry.path();
+                    // Get the metadata and discard errors
+                    if let Ok(metadata) = path.symlink_metadata() {
+                        // Skip this file if it's a symlink
+                        if metadata.file_type().is_symlink() {
+                            continue;
+                        }
+                        // Recurse if this is a directory
+                        if metadata.file_type().is_dir() {
+                            listdirs(&path, output_list);
+                        }
+                        // Add this to the directory listing if it's a file
+                        if metadata.file_type().is_file() {
+                            let can_read =
+                                OpenOptions::new().read(true).open(&path).is_ok();
+                            let can_write =
+                                OpenOptions::new().write(true).open(&path).is_ok();
+                            output_list.push((path, can_read, can_write));
+                        }
+                    }
+                }
+            }
+        }
+    }
+对吧，这的确很简单。为了得到手机中完整的目录列表，我们可以借助下列代码:
+    // List all files on the system
+    let mut dirlisting = Vec::new();
+    listdirs(Path::new("/"), &mut dirlisting);
+**模糊测试**
+* * *
+现在，我们已经能够获得包含所有文件的列表了。接下来，我们就可以通过手动方式来考察列表，并进行相应的源代码审核了。这种方法当然可以挖掘出手机中的安全漏洞，但问题是，我们能否让这个过程实现自动化呢？
+如果我们想要直接对文件进行读写尝试的话，该怎么办呢？由于我们这些文件一无所知，所以，我们不妨直接写入一些合理大小的随机数据。
+    // List all files on the system
+    let mut listing = Vec::new();
+    listdirs(Path::new("/"), &mut listing);
+    // Fuzz buffer
+    let mut buf = [0x41u8; 8192];
+    // Fuzz forever
+    loop {
+        // Pick a random file
+        let rand_file = rand::random::() % listing.len();
+        let (path, can_read, can_write) = &listing[rand_file];
+        print!("{:?}\n", path);
+        if *can_read {
+            // Fuzz by reading
+            let fd = OpenOptions::new().read(true).open(path);
+            if let Ok(mut fd) = fd {
+                let fuzz_size = rand::random::() % buf.len();
+                let _ = fd.read(&mut buf[..fuzz_size]);
+            }
+        }
+        if *can_write {
+            // Fuzz by writing
+            let fd = OpenOptions::new().write(true).open(path);
+            if let Ok(mut fd) = fd {
+                let fuzz_size = rand::random::() % buf.len();
+                let _ = fd.write(&buf[..fuzz_size]);
+            }
+        }
+    }
+当运行上述代码时，它几乎会立即停止，并且通常是“挂在”/sys/kernel/debug/tracing/per_cpu/cpu1/trace_pipe之类的东西上。一般情况下，手机上会有许多sysfs和procfs文件，当代码试图读取它们时，就会被永远挂起。由于这会阻止“fuzzer”继续运行，所以，我们需要设法绕过这个障碍。
+但是，如果我们有128个线程的话，结果会如何呢？当然，某些线程肯定会被挂起，但是，至少有些线程还能多坚持一会，对吧？以下是完整的程序:
+    extern crate rand;
+    use std::sync::Arc;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    /// Maximum number of threads to fuzz with
+    const MAX_THREADS: u32 = 128;
+    /// Recursively list all files starting at the path specified by `dir`, saving
+    /// all files to `output_list`
+    fn listdirs(dir: &Path, output_list: &mut Vec) {
+        // List the directory
+        let list = std::fs::read_dir(dir);
+        if let Ok(list) = list {
+            // Go through each entry in the directory, if we were able to list the
+            // directory safely
+            for entry in list {
+                if let Ok(entry) = entry {
+                    // Get the path representing the directory entry
+                    let path = entry.path();
+                    // Get the metadata and discard errors
+                    if let Ok(metadata) = path.symlink_metadata() {
+                        // Skip this file if it's a symlink
+                        if metadata.file_type().is_symlink() {
+                            continue;
+                        }
+                        // Recurse if this is a directory
+                        if metadata.file_type().is_dir() {
+                            listdirs(&path, output_list);
+                        }
+                        // Add this to the directory listing if it's a file
+                        if metadata.file_type().is_file() {
+                            let can_read =
+                                OpenOptions::new().read(true).open(&path).is_ok();
+                            let can_write =
+                                OpenOptions::new().write(true).open(&path).is_ok();
+                            output_list.push((path, can_read, can_write));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// Fuzz thread worker
+    fn worker(listing: Arc>) {
+        // Fuzz buffer
+        let mut buf = [0x41u8; 8192];
+        // Fuzz forever
+        loop {
+            let rand_file = rand::random::() % listing.len();
+            let (path, can_read, can_write) = &listing[rand_file];
+            //print!("{:?}\n", path);
+            if *can_read {
+                // Fuzz by reading
+                let fd = OpenOptions::new().read(true).open(path);
+                if let Ok(mut fd) = fd {
+                    let fuzz_size = rand::random::() % buf.len();
+                    let _ = fd.read(&mut buf[..fuzz_size]);
+                }
+            }
+            if *can_write {
+                // Fuzz by writing
+                let fd = OpenOptions::new().write(true).open(path);
+                if let Ok(mut fd) = fd {
+                    let fuzz_size = rand::random::() % buf.len();
+                    let _ = fd.write(&buf[..fuzz_size]);
+                }
+            }
+        }
+    }
+    fn main() {
+        // Optionally daemonize so we can swap from an ADB USB cable to a UART
+        // cable and let this continue to run
+        //daemonize();
+        // List all files on the system
+        let mut dirlisting = Vec::new();
+        listdirs(Path::new("/"), &mut dirlisting);
+        print!("Created listing of {} files\n", dirlisting.len());
+        // We wouldn't do anything without any files
+        assert!(dirlisting.len() > 0, "Directory listing was empty");
+        // Wrap it in an `Arc`
+        let dirlisting = Arc::new(dirlisting);
+        // Spawn fuzz threads
+        let mut threads = Vec::new();
+        for _ in 0..MAX_THREADS {
+            // Create a unique arc reference for this thread and spawn the thread
+            let dirlisting = dirlisting.clone();
+            threads.push(std::thread::spawn(move || worker(dirlisting)));
+        }

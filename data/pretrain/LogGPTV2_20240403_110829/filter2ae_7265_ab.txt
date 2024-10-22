@@ -1,0 +1,71 @@
+           NtClose(handle);
+       }
+       if (enable_impersonation) { ④
+           CsrRevertToSelf();
+       }
+       // Create the symbolic link.
+       UNICODE_STRING target_name_ustr;
+       RtlInitUnicodeString(&target_name_ustr, lpTargetPath);
+       status = NtCreateSymbolicLinkObject(&handle, MAXIMUM_ALLOWED,
+                                   objattr, target_name_ustr); ⑤
+       if (enable_impersonation) { ⑥
+           CsrRevertToSelf();
+       }
+       if (NT_SUCCESS(status)) {
+           status = NtMakePermanentObject(handle); ⑦
+           NtClose(handle);
+       }
+       return status;
+    }
+我们可以看到代码所做的第一件事就是构建设备名路径，然后尝试打开DELETE访问①的符号链接对象。
+这是因为API支持重新定义现有的符号链接，因此必须先尝试删除旧链接。如果我们遵循链接不存在的默认路径，我们将看到代码模拟调用者（在这种情况下为低权限用户）④，然后创建符号链接对象⑤，恢复模拟⑥并在返回操作状态之前使对象永久化⑦。
+没有什么太令人惊讶的，至于为什么我们可以创建任意符号链接，是因为所有代码都是在传递的设备名称前加上“\??”。
+由于代码在执行任何重要操作时模拟调用者，因此我们只能在用户可以写入的位置创建链接。
+更有趣的是中间条件，其中为DELETE访问打开目标符号链接，这是调用NtMakeTemporaryObject所必需的。
+打开的句柄传递给另一个函数②，IsGlobalSymbolicLink，并根据该函数的结果设置禁用模拟的标志，然后使用全局DOS设备位置\GLOBAL再次重新创建设备名称？
+对于前缀③，什么是IsGlobalSymbolicLink呢？ 我们再一次可以重新启动该功能并进行检查。
+    void IsGlobalSymbolicLink(HANDLE handle, BOOLEAN* is_global) {
+       BYTE buffer[0x1000];
+       NtQueryObject(handle, ObjectNameInformation, buffer, sizeof(buffer));
+       UNICODE_STRING prefix;
+       RtlInitUnicodeString(&prefix, L"\\GLOBAL??\\");
+       // Check if object name starts with \GLOBAL?? 
+       *is_global = RtlPrefixUnicodeString(&prefix, (PUNICODE_STRING)buffer);
+    }
+此代码会检查打开的对象的名称是否以\GLOBAL
+??\开头。如果是，它将is_global标志设置为TRUE。使该标志模拟被清除并设备名称被重写。这意味着如果调用者具有对全局DOS设备目录内的符号链接的DELETE访问权限，则将重新创建符号链接而不进行任何模拟，也就是它会被创建为SYSTEM用户。这并不是很有趣，因为默认情况下只有管理员可以打开DELETE访问的全局符号链接之一。但是，如果我们能在全局DOS设备目录下创建一个可由低权限用户写入的子目录，该怎么办？可以打开该目录中的任何符号链接以进行DELETE访问，因为低权限用户可以指定他们喜欢的任何访问权限，代码会将链接标记为全局，而实际情况并非如此，禁用模拟并将其重新创建为SYSTEM
+。猜猜看，我们有一个漏洞可以让我们在全局DOS设备目录下创建一个任意对象目录。
+如果不是为了重写路径，这并不是非常可利用的。 我们可以利用路径“\??\ABC”与“\GLOBAL
+??\ABC”不同的特点，以构造在对象管理器命名空间中作为SYSTEM创建任意符号链接的机制。 这对我们有什么帮助？
+如果你编写了一个指向KnownDlls的符号链接，那么在打开DLL加载程序请求的部分时，内核将会跟随它。
+因此，即使我们无法在KnownDlls中直接创建新的节对象，我们也可以创建一个符号链接，该链接指向该目录之外的低权限用户可以创建节对象的位置。
+我们现在可以利用劫持将任意DLL加载到特权进程内的内存中，并实现提权。
+把这些全总结在一起，我们可以使用下面的步骤来利用漏洞：
+  1. 使用此漏洞创建目录“\GLOBAL ??\KnownDlls”
+  2. 在新目录中创建一个符号链接，其中包含要劫持的DLL的名称，例如TAPI32.DLL。 此链接的目标无关紧要。
+  3. 在用户的DOS设备目录中创建一个名为“GLOBALROOT”的新符号链接，指向“\GLOBAL ??”。 当调用者通过用户的DOS设备目录访问它时，将覆盖真正的GLOBALROOT符号链接对象。
+  4. 调用DefineDosDevice，指定设备名称“GLOBALROOT\KnownDlls\TAPI32.DLL”以及用户可以在其中创建节对象的位置的目标路径。 这将导致以下情况：  
+a. CSRSS打开符号链接“\??\GLOBALROOT\KnownDlls\TAPI32.DLL”，然后打开“\GLOBAL
+??\KnownDlls\TAPI32.DLL”。 由于这是由用户控制的，所以能成功打开，并且该链接被视为全局，禁用模拟。  
+b. CSRSS将路径重写为“\GLOBAL
+??\GLOBALROOT\KnownDlls\TAPI32.DLL”，然后调用NtCreateSymbolicLinkObject而不进行模拟。
+这使得之后真正的GLOBALROOT被链接，并创建具有任意目标路径的符号链接“\KnownDlls\TAPI32.DLL”。
+  5. 在目标位置为任意DLL创建映像节对象，然后通过获取服务来使用TAPI32.DLL的路径调用LoadLibrary，强制将其加载到特权服务（如诊断中心）中。
+  6. 实现提权
+这实际上是第二次使用DefineDosDevice API进行利用，它是Protected Process Light （PPL）旁路管理员。
+PPL进程仍然使用KnownDlls，因此如果你能添加新条目，那么也可以将代码注入受保护进程。
+为了防止该定向攻击，Windows使用进程信任标签标记KnownDlls目录，该进程信任标签阻止除最高级别PPL进程以外的所有进程写入，如下所示。  
+那么我们的漏洞利用如何运作？ CSRSS实际上作为最高级别的PPL运行，因此允许写入KnownDlls目录。
+一旦模拟被删除，就能使用进程的身份，这样就能获取完全访问权限。
+如果你想测试这个漏洞我已经在[这里](https://bugs.chromium.org/p/project-zero/issues/detail?id=1550#c5)将新的PoC附加到问题tracker。
+# 总结
+你可能想知道我是否向Node报告了DefineDosDevice的行为？ 我没有，主要是因为它本身并不是一个漏洞。
+即使在PPL管理员的情况下，MSRC也不会考虑可用的安全边界（比如这个[例子](https://bugs.chromium.org/p/project-zero/issues/detail?id=1336)）。 当然，Windows开发人员可能会尝试在将来更改此行为，假设它不会导致兼容性的重大回归。
+这个功能自Windows早期就已存在，至少从Windows XP开始，因此可能存在依赖它的东西。
+通过详细描述这个漏洞，我想给MS提供尽可能多的信息，以便在将来解决这种开发技术。
+我确实向MSRC报告了这个漏洞，并在2018年6月的补丁中得到修复。 Microsoft如何修复此漏洞？
+开发人员添加了一个新的API，CreateAppContainerTokenForUser，它在创建新的AppContainer令牌期间模拟令牌。
+通过在令牌创建期间模拟，代码可确保仅使用用户的权限创建所有对象。
+由于它是一个新的API，因此必须更改现有代码才能使用它，因此你仍然可以在旧的CreateAppContainerToken的代码中找到可利用的漏洞。
+在利用任何平台上的漏洞时，有时也需要深入了解不同组件的交互方式。 在这种情况下，虽然最初的漏洞显然是一个安全问题，但目前尚不清楚如何进行全面利用。
+在逆向工程中遇到的有趣行为的日志总是值得记录下来的，即使某些东西本身不是安全漏洞，但它有可能对利用另一个漏洞有用。

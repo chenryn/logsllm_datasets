@@ -1,0 +1,180 @@
+            err = l2cap_information_req(conn, cmd, cmd_len, data);
+            break;
+        case L2CAP_INFO_RSP:
+            l2cap_information_rsp(conn, cmd, cmd_len, data);
+            break;
+        ...
+        }
+        return err;
+    }
+好了，接下来终于可以分析漏洞了。我们的漏洞发生在对L2CAP_CONFIGRSP（config
+response）这个cmd的处理上。其实漏洞分析armis的paper已经写的很详尽了，我这里也就权当翻译了吧，然后再加点自己的理解。那么来看l2capconfigrsp:
+    static inline int l2cap_config_rsp(struct l2cap_conn *conn,
+                       struct l2cap_cmd_hdr *cmd, u16 cmd_len,
+                       u8 *data)
+    {
+        struct l2cap_conf_rsp *rsp = (struct l2cap_conf_rsp *)data;
+        ...
+        scid   = __le16_to_cpu(rsp->scid);   //从包中剥离出scid
+        flags  = __le16_to_cpu(rsp->flags);  //从包中剥离出flag
+        result = __le16_to_cpu(rsp->result); //从包中剥离出result
+        switch (result) {
+        case L2CAP_CONF_SUCCESS:
+            l2cap_conf_rfc_get(chan, rsp->data, len);
+            clear_bit(CONF_REM_CONF_PEND, &chan->conf_state);
+            break;
+        case L2CAP_CONF_PENDING:
+            set_bit(CONF_REM_CONF_PEND, &chan->conf_state);
+            if (test_bit(CONF_LOC_CONF_PEND, &chan->conf_state)) {  //判断conf_state是否是CONF_LOC_CONF_PEND
+                char buf[64]; //buf数组大小64字节
+                len = l2cap_parse_conf_rsp(chan, rsp->data, len,
+                               buf, &result);   //data仍然是包中数据，len也是包中数据。
+                ...
+            }
+            goto done;
+        ...
+当收到的数据包里，满足result == L2CAP_CONF_PENDING，且自身的连接状态conf_state ==
+CONF_LOC_CONF_PEND的时候，会走到 `l2cap_parse_conf_rsp`函数里，而且传过去的buf是个长度为64的数据，参数len
+，参数rsp->data都是由包中的内容来任意确定。那么在`l2cap_parse_conf_rsp`函数里：
+    static int l2cap_parse_conf_rsp(struct l2cap_chan *chan, void *rsp, int len,
+                    void *data, u16 *result)
+    {
+        struct l2cap_conf_req *req = data;
+        void *ptr = req->data;
+        int type, olen;
+        unsigned long val;
+        while (len >= L2CAP_CONF_OPT_SIZE) { //len没有被检查，由接收到的包内容控制
+            len -= l2cap_get_conf_opt(&rsp, &type, &olen, &val);
+            switch (type) {
+            case L2CAP_CONF_MTU:
+                if (val imtu = L2CAP_DEFAULT_MIN_MTU;
+                } else
+                    chan->imtu = val;
+                l2cap_add_conf_opt(&ptr, L2CAP_CONF_MTU, 2, chan->imtu);
+                break;
+            case ...
+            }
+        }
+    }
+    static void l2cap_add_conf_opt(void **ptr, u8 type, u8 len, unsigned long val)
+    {
+        struct l2cap_conf_opt *opt = *ptr;
+        opt->type = type;
+        opt->len  = len;
+        switch (len) {
+        case 1:
+            *((u8 *) opt->val)  = val;
+            break;
+        case 2:
+            put_unaligned_le16(val, opt->val);
+            break;
+        case 4:
+            put_unaligned_le32(val, opt->val);
+            break;
+        default:
+            memcpy(opt->val, (void *) val, len);
+            break;
+        }
+        *ptr += L2CAP_CONF_OPT_SIZE + len;
+    }
+仔细阅读这个函数的代码可以知道，这个函数的功能就是根据传进来的包，来构造将要发出去的包。而数据的出口就是传进去的64字节大小的buf。但是对传入的包的数据的长度并没有做检验，那么当len很大时，就会一直往出口buf里写数据，比如有64个`L2CAP_CONF_MTU`类型的opt，那么就会往buf里写上64*(L2CAP_CONF_OPT_SIZE
++ 2)个字节，那么显然这里就发生了溢出。由于buf是栈上定义的数据结构，那么这里就是一个栈溢出。 不过值得注意的是，代码要走进去，需要conf_state
+== CONF_LOC_CONF_PEND，这个状态是在处理`L2CAP_CONF_REQ`数据包的时候设置的：
+    static int l2cap_parse_conf_req(struct l2cap_chan *chan, void *data)
+    {
+        ...
+        u8 remote_efs = 0;
+        u16 result = L2CAP_CONF_SUCCESS;
+        ...
+        while (len >= L2CAP_CONF_OPT_SIZE) {
+            len -= l2cap_get_conf_opt(&req, &type, &olen, &val);  
+            hint  = type & L2CAP_CONF_HINT;
+            type &= L2CAP_CONF_MASK;
+            switch (type) {
+            ...
+            case L2CAP_CONF_EFS:
+                remote_efs = 1;  //【1】
+                if (olen == sizeof(efs))
+                    memcpy(&efs, (void *) val, olen);
+                break;
+            ...
+        }
+    done:
+        ...
+        if (result == L2CAP_CONF_SUCCESS) {
+            ...
+            if (remote_efs) {
+                if (chan->local_stype != L2CAP_SERV_NOTRAFIC &&   
+                    efs.stype != L2CAP_SERV_NOTRAFIC &&   //【2】
+                    efs.stype != chan->local_stype) {
+                    ...
+                } else {
+                    /* Send PENDING Conf Rsp */
+                    result = L2CAP_CONF_PENDING;
+                    set_bit(CONF_LOC_CONF_PEND, &chan->conf_state);  //这里设置CONF_LOC_CONF_PEND
+                }
+            }
+    }
+当收到L2CAPCONFREQ的包中包含有L2CAPCONFEFS类型的数据【1】，而且L2CAPCONFEFS数据的stype ==
+L2CAPSERVNOTRAFIC【2】的时候，confstate会被置CONFLOCCONFPEND
+到这里，这个漏洞触发的思路也就清楚了：
+1，建立和目标机器的L2CAP
+连接，这里注意socktype的选择要是SOCKRAW，如果不是，内核会自动帮我们完成sentinfomationrequest ,
+sendconnectionrequest, sendconfigurerequest这些操作，也就无法触发目标机器的漏洞了。
+2，建立SOCKRAW连接，connect的时候，会自动完成sentinfomationrequest的操作，不过这个不影响。
+3，接下来我们需要完成sendconnectionrequest操作，来确定SCID,DCID。完成这个操作的过程是发送合法的
+L2CAPCONNREQ数据包。
+4，接下来需要发送包含有L2CAPCONFEFS类型的数据，而且L2CAPCONFEFS数据的stype ==
+L2CAPSERVNOTRAFIC的L2CAPCONFREQ包，这一步是为了让目标机器的confstate变成CONFLOCCONFPEND。
+5，这里就到了发送cmdlen很长的L2CAPCONNRSP包了。这个包的result字段需要是L2CAPCONFPENDING。那么这个包发过去之后，目标机器就内核栈溢出了，要么重启了，要么死机了。
+这个漏洞是这几个漏洞里，触发最难的。
+##### CVE-2017-1000250
+这个漏洞是BlueZ的SDP服务里的信息泄露漏洞。这个不像L2CAP层的连接那么复杂，主要就是上层服务，收到数据就进行处理。那么我们也只需要关注处理的函数。
+之前说过，BlueZ的SDP收到数据是从iosessionevent开始。之后，数据的流向是：
+    iosessionevent-->handlerequest-->processrequest
+有必要介绍一下SDP协议的数据结构： 它有一个sdppudhdr的头部，头部数据里定义了PUD命令的类型，tid，以及pdu
+parameter的长度，然后就是具体的parameter。最后一个字段是continuation
+state，当一个包发不完所要发送的数据的时候，这个字段就会有效。对与这个字段，BlueZ给了它一个定义：
+    typedef struct {
+        uint32_t timestamp;
+        union {
+            uint16_t maxBytesSent;
+            uint16_t lastIndexSent;
+        } cStateValue;
+    } sdp_cont_state_t;
+对于远程的连接，PDU命令类型只能是这三个：SDPSVCSEARCHREQ, SDPSVCATTRREQ,
+SDPSVCSEARCHATTRREQ。这个漏洞呢，出现在对SDP_SVCSEARCHATTRREQ命令的处理函数里面
+servicesearchattrreq 。这个函数有点长，就直接说它干了啥，不贴代码了：
+1， extractdes(pdata, dataleft, &pattern, &dtd, SDPTYPEUUID); 解析service search
+pattern（对应SDP协议数据结构图）
+2，max = getbe16(pdata); 获得Maximu Attribute Byte
+3，scanned = extractdes(pdata, dataleft, &seq, &dtd, SDPTYPEATTRID);解析Attribute
+ID list
+4，if (sdpcstateget(pdata, dataleft, &cstate) data_size - cstate->cStateValue.maxBytesSent);
+                pResponse = pCache->data;
+                memcpy(buf->data, pResponse + cstate->cStateValue.maxBytesSent, sent); //【1】    
+                buf->data_size += sent;
+                cstate->cStateValue.maxBytesSent += sent;
+                if (cstate->cStateValue.maxBytesSent == pCache->data_size)
+                    cstate_size = sdp_set_cstate_pdu(buf, NULL);
+                else
+                    cstate_size = sdp_set_cstate_pdu(buf, cstate);
+sdpgetcachedrsp函数其实是对cstate的timestamp值的检验，如何过这个检验之后再说。当代码走到【1】处的memcpy时，由于cstate->maxBytesSent就是由数据包里的数据所控制，而且没有做任何检验，所以这里可以为任意的uint16t值。那么很明显，这里就出现了一个对pResponse的越界读的操作。而越界读的数据还会通过SDP
+RESPONSE发送给攻击方，那么一个信息泄露就发生了。
+写这个poc需要注意sdpgetcachedrsp的检验的绕过，那么首先需要得到一个timestamp。当一次发送的包不足以发送完所有的数据的时候，会设置cstate状态，所以如果我们发给服务端的包里，max字段非常小，那么服务端就会给我们回应一个带cstate状态的包，这里面会有timestamp:
+    if (cstate == NULL) {
+            ...
+            if (buf->data_size > max) {  //max 可由接收到的包数据指定
+                sdp_cont_state_t newState;
+                memset((char *)&newState, 0, sizeof(sdp_cont_state_t));
+                newState.timestamp = sdp_cstate_alloc_buf(buf); //这里得到一个timestamp
+                buf->data_size = max;
+                newState.cStateValue.maxBytesSent = max;
+                cstate_size = sdp_set_cstate_pdu(buf, &newState); //回应的包中，写上cstate状态。
+            } else
+                cstate_size = sdp_set_cstate_pdu(buf, NULL);
+所以，我们的poc应该是这个步骤：
+1，建立SDP连接。这里我们的socket需要是SOCK_STREAM类型，而且connet的时候，addr的psm字段要是0x0001。关于连接的PSM：
+2，发送一个不带cstate状态的数据包，而且指定Maximu Attribute
+Byte的值非常小。这一步是为了让服务端给我们返回一个带timestamp的包。
+3，接收这个带timestamp的包，并将timestamp提取。

@@ -1,0 +1,274 @@
+# Why we spent the last month eliminating PostgreSQL subtransactions
+
+How a mysterious stall in database queries uncovered a performance
+limitation with PostgreSQL.
+
+[Stan Hu and Grzegorz Bizon](/blog/authors/stanhu-and-grzesiek/)
+
+Since last June, we noticed the database on GitLab.com would
+mysteriously stall for minutes, which would lead to users seeing 500
+errors during this time. Through a painstaking investigation over
+several weeks, we finally uncovered the cause of this: initiating a
+subtransaction via the [`SAVEPOINT` SQL
+query](https://www.postgresql.org/docs/current/sql-savepoint.html) while
+a long transaction is in progress can wreak havoc on database replicas.
+Thus launched a race, which we recently completed, to eliminate all
+`SAVEPOINT` queries from our code. Here\'s what happened, how we
+discovered the problem, and what we did to fix it.
+
+
+On June 24th, we noticed that our CI/CD runners service reported a high
+error rate:
+
+![runners
+errors](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/ci-runners-errors.png)
+
+A quick investigation revealed that database queries used to retrieve
+CI/CD builds data were timing out and that the unprocessed builds
+backlog grew at a high rate:
+
+![builds
+queue](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/builds-queue.png)
+
+Our monitoring also showed that some of the SQL queries were waiting for
+PostgreSQL lightweight locks (`LWLocks`):
+
+![aggregated
+lwlocks](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/aggregated-lwlocks.png)
+
+In the following weeks we had experienced a few incidents like this. We
+were surprised to see how sudden these performance degradations were,
+and how quickly things could go back to normal:
+
+![ci queries
+latency](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/ci-queries-latency.png)
+
+
+In order to learn more, we extended our observability tooling [to sample
+more data from
+`pg_stat_activity`](https://gitlab.com/gitlab-cookbooks/gitlab-exporters/-/merge_requests/231).
+In PostgreSQL, the `pg_stat_activity` virtual table contains the list of
+all database connections in the system as well as what they are waiting
+for, such as a SQL query from the client. We observed a consistent
+pattern: the queries were waiting on `SubtransControlLock`. Below shows
+a graph of the URLs or jobs that were stalled:
+
+![endpoints
+locked](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/endpoints-locked.png)
+
+The purple line shows the sampled number of transactions locked by
+`SubtransControlLock` for the `POST /api/v4/jobs/request` endpoint that
+we use for internal communication between GitLab and GitLab Runners
+processing CI/CD jobs.
+
+Although this endpoint was impacted the most, the whole database cluster
+appeared to be affected as many other, unrelated queries timed out.
+
+This same pattern would rear its head on random days. A week would pass
+by without incident, and then it would show up for 15 minutes and
+disappear for days. Were we chasing the Loch Ness Monster?
+
+Let\'s call these stalled queries Nessie for fun and profit.
+
+
+To understand `SubtransControlLock` ([PostgreSQL
+13](https://www.postgresql.org/docs/13/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW)
+renamed this to `SubtransSLRU`), we first must understand how
+subtransactions work in PostgreSQL. In PostgreSQL, a transaction can
+start via a `BEGIN` statement, and a subtransaction can be started with
+a subsequent `SAVEPOINT` query. PostgreSQL assigns each of these a
+transaction ID (XID for short) [when a transaction or a subtransaction
+needs one, usually before a client modifies
+data](https://gitlab.com/postgres/postgres/blob/a00c138b78521b9bc68b480490a8d601ecdeb816/src/backend/access/transam/README#L193-L198).
+
+
+For example, let\'s say you were running an online store and a customer
+placed an order. Before the order is fullfilled, the system needs to
+ensure a credit card account exists for that user. In Rails, a common
+pattern is to start a transaction for the order and call
+[`find_or_create_by`](https://apidock.com/rails/v5.2.3/ActiveRecord/Relation/find_or_create_by).
+For example:
+
+``` ruby
+Order.transaction do
+  begin
+    CreditAccount.transaction(requires_new: true) do
+      CreditAccount.find_or_create_by(customer_id: customer.id)
+  rescue ActiveRecord::RecordNotUnique
+    retry
+  end
+  # Fulfill the order
+  # ...
+end
+```
+
+If two orders were placed around the same time, you wouldn\'t want the
+creation of a duplicate account to fail one of the orders. Instead, you
+would want the system to say, \"Oh, an account was just created; let me
+use that.\"
+
+That\'s where subtransactions come in handy: the `requires_new: true`
+tells Rails to start a new subtransaction if the application already is
+in a transaction. The code above translates into several SQL calls that
+look something like:
+
+``` sql
+--- Start a transaction
+BEGIN
+SAVEPOINT active_record_1
+--- Look up the account
+SELECT * FROM credit_accounts WHERE customer_id = 1
+--- Insert the account; this may fail due to a duplicate constraint
+INSERT INTO credit_accounts (customer_id) VALUES (1)
+--- Abort this by rolling back
+ROLLBACK TO active_record_1
+--- Retry here: Start a new subtransaction
+SAVEPOINT active_record_2
+--- Find the newly-created account
+SELECT * FROM credit_accounts WHERE customer_id = 1
+--- Save the data
+RELEASE SAVEPOINT active_record_2
+COMMIT
+```
+
+On line 7 above, the `INSERT` might fail if the customer account was
+already created, and the database unique constraint would prevent a
+duplicate entry. Without the first `SAVEPOINT` and `ROLLBACK` block, the
+whole transaction would have failed. With that subtransaction, the
+transaction can retry gracefully and look up the existing account.
+
+
+As we mentioned earlier, Nessie returned at random times with queries
+waiting for `SubtransControlLock`. `SubtransControlLock` indicates that
+the query is waiting for PostgreSQL to load subtransaction data from
+disk into shared memory.
+
+Why is this data needed? When a client runs a `SELECT`, for example,
+PostgreSQL needs to decide whether each version of a row, known as a
+tuple, is actually visible within the current transaction. It\'s
+possible that a tuple has been deleted or has yet to be committed by
+another transaction. Since only a top-level transaction can actually
+commit data, PostgreSQL needs to map a subtransaction ID (subXID) to its
+parent XID.
+
+This mapping of subXID to parent XID is stored on disk in the
+`pg_subtrans` directory. Since reading from disk is slow, PostgreSQL
+adds a simple least-recently used (SLRU) cache in front for each backend
+process. The lookup is fast if the desired page is already cached.
+However, as [Laurenz Albe discussed in his blog
+post](https://www.cybertec-postgresql.com/en/subtransactions-and-performance-in-postgresql/),
+PostgreSQL may need to read from disk if the number of active
+subtransactions exceeds 64 in a given transaction, a condition
+PostgreSQL terms `suboverflow`. Think of it as the feeling you might get
+if you ate too many Subway sandwiches.
+
+Suboverflowing (is that a word?) can bog down performance because as
+Laurenz said, \"Other transactions have to update `pg_subtrans` to
+register subtransactions, and you can see in the perf output how they
+vie for lightweight locks with the readers.\"
+
+
+Laurenz\'s blog post suggested that we might be using too many
+subtransactions in one transaction. At first, we suspected we might be
+doing this in some of our expensive background jobs, such as project
+export or import. However, while we did see numerous `SAVEPOINT` calls
+in these jobs, we didn\'t see an unusual degree of nesting in local
+testing.
+
+To isolate the cause, we started by [adding Prometheus metrics to track
+subtransactions as a Prometheus metric by
+model](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/66477).
+This led to nice graphs as the following:
+
+![subtransactions
+plot](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/subtransactions-plot.png)
+
+While this was helpful in seeing the rate of subtransactions over time,
+we didn\'t see any obvious spikes that occurred around the time of the
+database stalls. Still, it was possible that suboverflow was happening.
+
+To see if that was happening, we [instrumented our application to track
+subtransactions and log a message whenever we detected more than 32
+`SAVEPOINT` calls in a given
+transaction](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/67918).
+Rails makes it possible for the application to subscribe to all of its
+SQL queries via `ActiveSupport` notifications. Our instrumentation
+looked something like this, simplified for the purposes of discussion:
+
+``` ruby
+ActiveSupport::Notifications.subscribe('sql.active_record') do |event|
+  sql = event.payload.dig(:sql).to_s
+  connection = event.payload[:connection]
+  manager = connection&.transaction_manager
+
+  context = manager.transaction_context
+  return if context.nil?
+
+  if sql.start_with?('BEGIN')
+    context.set_depth(0)
+  elsif cmd.start_with?('SAVEPOINT', 'EXCEPTION')
+    context.increment_savepoints
+  elsif cmd.start_with?('ROLLBACK TO SAVEPOINT')
+    context.increment_rollbacks
+  elsif cmd.start_with?('RELEASE SAVEPOINT')
+    context.increment_releases
+  elsif sql.start_with?('COMMIT', 'ROLLBACK')
+    context.finish_transaction
+  end
+end
+```
+
+This code looks for the key SQL commands that initiate transactions and
+subtransactions and increments counters when they occurred. After a
+`COMMIT,` we log a JSON message that contained the backtrace and the
+number of `SAVEPOINT` and `RELEASES` calls. For example:
+
+``` json
+{
+  "sql": "/*application:web,correlation_id:01FEBFH1YTMSFEEHS57FA8C6JX,endpoint_id:POST /api/:version/projects/:id/merge_requests/:merge_request_iid/approve*/ BEGIN",
+  "savepoints_count": 1,
+  "savepoint_backtraces": [
+    [
+      "app/models/application_record.rb:75:in `block in safe_find_or_create_by'",
+      "app/models/application_record.rb:75:in `safe_find_or_create_by'",
+      "app/models/merge_request.rb:1859:in `ensure_metrics'",
+      "ee/lib/analytics/merge_request_metrics_refresh.rb:11:in `block in execute'",
+      "ee/lib/analytics/merge_request_metrics_refresh.rb:10:in `each'",
+      "ee/lib/analytics/merge_request_metrics_refresh.rb:10:in `execute'",
+      "ee/app/services/ee/merge_requests/approval_service.rb:57:in `calculate_approvals_metrics'",
+      "ee/app/services/ee/merge_requests/approval_service.rb:45:in `block in create_event'",
+      "ee/app/services/ee/merge_requests/approval_service.rb:43:in `create_event'",
+      "app/services/merge_requests/approval_service.rb:13:in `execute'",
+      "ee/app/services/ee/merge_requests/approval_service.rb:14:in `execute'",
+      "lib/api/merge_request_approvals.rb:58:in `block (3 levels) in <class:MergeRequestApprovals>'",
+    ]
+  "rollbacks_count": 0,
+  "releases_count": 1
+}
+```
+
+This log message contains not only the number of subtransactions via
+`savepoints_count`, but it also contains a handy backtrace that
+identifies the exact source of the problem. The `sql` field also
+contains [Marginalia comments](https://github.com/basecamp/marginalia)
+that we tack onto every SQL query. These comments make it possible to
+identify what HTTP request initiated the SQL query.
+
+
+The new instrumentation showed that while the application regularly used
+subtransactions, it never exceeded 10 nested `SAVEPOINT` calls.
+
+Meanwhile, [Nikolay Samokhvalov](https://gitlab.com/NikolayS), founder
+of [Postgres.ai](https://postgres.ai/), performed a battery of tests
+[trying to replicate the
+problem](https://gitlab.com/postgres-ai/postgresql-consulting/tests-and-benchmarks/-/issues/20).
+He replicated Laurenz\'s results when a single transaction exceeded 64
+subtransactions, but that wasn\'t happening here.
+
+When the database stalls occurred, we observed a number of patterns:
+
+1.  Only the replicas were affected; the primary remained unaffected.
+2.  There was a long-running transaction, usually relating to
+    PostgreSQL\'s autovacuuming, during the time. The stalls stopped
+    quickly after the transaction ended.
+

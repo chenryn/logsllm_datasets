@@ -1,0 +1,100 @@
+ * do_pg_start_backup is the workhorse of the user-visible pg_start_backup()  
+ * function. It creates the necessary starting checkpoint and constructs the  
+ * backup label file.  
+ *  
+ * There are two kind of backups: exclusive and non-exclusive. An exclusive  
+ * backup is started with pg_start_backup(), and there can be only one active  
+ * at a time. The backup label file of an exclusive backup is written to  
+ * $PGDATA/backup_label, and it is removed by pg_stop_backup().  
+ *  
+ * A non-exclusive backup is used for the streaming base backups (see  
+ * src/backend/replication/basebackup.c). The difference to exclusive backups  
+ * is that the backup label file is not written to disk. Instead, its would-be  
+ * contents are returned in *labelfile, and the caller is responsible for  
+ * including it in the backup archive as 'backup_label'. There can be many  
+ * non-exclusive backups active at the same time, and they don't conflict  
+ * with an exclusive backup either.  
+ *  
+ * Returns the minimum WAL position that must be present to restore from this  
+ * backup, and the corresponding timeline ID in *starttli_p.  
+ *  
+ * Every successfully started non-exclusive backup must be stopped by calling  
+ * do_pg_stop_backup() or do_pg_abort_backup().  
+ *  
+ * It is the responsibility of the caller of this function to verify the  
+ * permissions of the calling user!  
+ */  
+XLogRecPtr  
+do_pg_start_backup(const char *backupidstr, bool fast, TimeLineID *starttli_p,  
+                                   char **labelfile)  
+{  
+......  
+        XLogCtl->Insert.forcePageWrites = true;  
+.....  
+}  
+```
+因此，我最后做一个测试来验证一下，开始备份后，性能应该会受到wal write full page影响而下降：  
+```
+full_page_writes = off  
+wal_level = hot_standby  
+archive_mode = on  
+archive_command = '/bin/date'  
+```
+准备热备:  
+```
+digoal=# select pg_start_backup('now()');  
+```
+由于备份会强制开启fpw, 影响又出现了  
+```
+progress: 38.0 s, 60170.0 tps, lat 0.463 ms stddev 0.339  
+progress: 39.0 s, 48121.9 tps, lat 0.580 ms stddev 1.518  
+progress: 40.0 s, 15061.9 tps, lat 1.839 ms stddev 4.240  
+progress: 41.0 s, 17799.1 tps, lat 1.585 ms stddev 3.630  
+progress: 42.0 s, 20799.1 tps, lat 1.337 ms stddev 3.151  
+progress: 43.0 s, 24623.8 tps, lat 1.143 ms stddev 2.766  
+progress: 44.0 s, 28381.1 tps, lat 0.976 ms stddev 2.944  
+progress: 45.0 s, 38196.2 tps, lat 0.737 ms stddev 1.874  
+progress: 46.0 s, 45302.8 tps, lat 0.608 ms stddev 1.484  
+progress: 47.0 s, 64550.1 tps, lat 0.438 ms stddev 0.653  
+```
+最后提供一些优化建议：  
+1\. 配置合理的shared buffer，1/4内存，但是不建议超过热数据大小。  
+2\. 如果开启了异步提交，修改一下on schedule checkpoint算法，参考我前面的文章。  
+3\. 配置合理的checkpoint_segments, checkpoint_timeout, checkpoint_completion_target。  
+```
+checkpoint_segments建议和shared buffer一样大，例如shared buffer=8G, wal segment=16MB,checkpoint_segments=8G/16MB=512  
+checkpoint_timeout设置为大于生成checkpoint_segments即512个xlog的时间周期。  
+```
+4\. checkpoint_completion_target根据IO能力进行调整，调整到checkpoint不影响业务为宜。  
+```
+checkpoint_completion_target越大，对IO影响越小，但是checkpoint周期越长，需用户自己权衡。  
+```
+5\. 如果你不能容忍检查点给wal 带来的full page write。建议采购可以实现原子写的硬件设备，或者使用支持full page write的文件系统。  
+    如果你的数据库对数据一致性要求不是那么高，也可以冒险直接关闭full page writes，仅仅当检查点后第一次变脏的数据块出现partial write时才会导致这个数据块的数据不一致。  
+6\. 对于内存较大场景，建议使用32KB的block size。  
+7\. initdb -k这个参数只是打开数据块的校验，不是来防止partial write的，而是用来检查数据块是否出现了partial write或其他异常的。还可以用来做检测块级别的纂改等。一般不建议打开，因为对性能影响较大。  
+8\. full page writes带来的性能影响如何计算呢？实际是和连续写几个wal block size大小的能力有关，如果block_size=32K, wal_block_size=8K, 那么一个脏块的full page write需要写4个wal_block_size，假设wal fsync能力是每秒写10000个8K的块，那么检查点后的写操作如果全部都发生在不同的数据块上面(就比如我前面的update测试用例)，写WAL能力下降可能导致tps降到2500以下。如果开启了异步wal的话，这个时候就是检验内存的写4个wal_block_size能力。  
+[参考]  
+1\. http://blog.163.com/digoal@126/blog/static/163877040201542103933969/  
+2\. http://blog.163.com/digoal@126/blog/static/1638770402015463252387/  
+3\. http://blog.163.com/digoal@126/blog/static/16387704020154651655783/  
+4\. http://blog.163.com/digoal@126/blog/static/16387704020154653422892/  
+5\. http://blog.163.com/digoal@126/blog/static/16387704020154811421484/  
+6\. http://blog.163.com/digoal@126/blog/static/163877040201541134842882/  
+7\. src/backend/access/transam/xlog.c  
+8\. http://wenku.it168.com/d_001613581.shtml  
+9\. http://www.postgresql.org/docs/9.4/static/runtime-config-wal.html#GUC-FULL-PAGE-WRITES  
+10\. http://en.wikipedia.org/wiki/Journaling_file_system  
+11\. http://dba.stackexchange.com/questions/98515/is-it-safe-to-disable-innodb-doublewrite-buffering-when-setting-innodb-page-size/98603  
+12\. http://lwn.net/Articles/552095/  
+13\. http://www.pgcon.org/2012/schedule/attachments/258_212_Internals%20Of%20PostgreSQL%20Wal.pdf  
+14\. http://en.wikipedia.org/wiki/Data_corruption  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

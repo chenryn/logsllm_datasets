@@ -1,0 +1,46 @@
+另一方面，通过搜索相关资料，我们发现在LibFuzzer中还神奇地提供了这样一个机制，__libfuzzer_extra_counters：
+可见，类似于AFL，通过一个记录跳转发生次数的数组，就可以作为代码覆盖率的信息。作为用户，我们只需要按照格式，声明这样一个数组，并在每次跳转时，更新相应下标处的内容，就可以轻松地将覆盖率信息反馈给LibFuzzer了。
+综合以上信息，我们得出了下面的方案：
+  1. 按照extra counters的要求，声明一个uint8_t类型的数组
+  2. 设置Unicorn对基本块的hook，获取到当前基本块的入口地址，并对应生成一个随机数
+  3. 参考AFL的方式更新数组，将此次跳转的次数加一
+其中第2点，为基本块（即分支）生成一个随机数，AFL是在编译插桩时就生成这样的随机数并硬编码的。对于Unicorn来说，如果要实现这样的效果，必须修改Unicorn的源码，在基本块翻译时加入相应的TCG指令。但这样做对Unicorn本身的改动比较大，所以最终我们还是选择通过hook的方式，而尽量不去魔改Unicorn破坏通用性。具体地，我们是将基本块的入口地址计算CRC16哈希，作为其对应的随机数。
+### 2.3 准备环境
+现在，目标已经加载到Unicorn中，代码覆盖率反馈也已经实现，接下来就只需要准备运行环境了。通过Unicorn的接口，我们可以映射出栈、堆、数据等不同的内存区域，并根据目标代码的需求，设置好相应的寄存器值。
+另外，如之前所说，我们移植的ld.so支持通过PRELOAD的方式，覆盖掉要模拟执行的库函数。比如说，目标代码中调用的某些库函数是不必要的，而且由于Unicorn不支持系统调用，所以像printf()这类IO输出的库函数，就可以通过PRELOAD的方式忽略掉，而不影响代码的正常运行。当然，编译的preload库，需要确保其和目标ELF是同一架构、同一符号哈希方式，才能被正确地加载到Unicorn中。
+### 2.4 运行fuzzing
+准备工作到这里已经完成，接下来就可以fuzzing了。使用LibFuzzer，需要用户实现LLVMFuzzerTestOneInput(const
+uint8_t *data, size_t
+len)这个函数，在其中调用要fuzzing的函数，在这里即就是目标代码的Unicorn模拟。根据LibFuzzer生成的输入和其他环境信息，Unicorn开始模拟运行指定的代码片段，并将代码覆盖率通过extra
+counters数组反馈给LibFuzzer，从而变异生成下一个输入，再次开始下一轮模拟运行。
+由于fuzzing时所模拟运行的目标代码片段恒定不变，因此QEMU的JIT机制可以有效地提升运行效率。然而，起初我们测试时，却发现并不是这样：每一轮的模拟执行，都会重新翻译一遍目标代码。经过分析代码，我们发现这是Unicorn的一个坑：为了解决基本块中单步执行遇到的[某个问题](https://github.com/unicorn-engine/unicorn/issues/263)，Unicorn引入了一个[临时解决方案](https://github.com/unicorn-engine/unicorn/commit/9099755ca15814a252463bf8f5d087ab75f89854)，即在模拟执行停止后，清空QEMU的TB缓存。因此，第二轮模拟执行时，即使是同一段代码，由于缓存被清空，还是需要再重头开始翻译。为了恢复性能，我们需要再注释掉这个临时方案，重新编译安装Unicorn。
+## 示例
+我们整理了上述研究结果，实现了一套概念验证代码：https://github.com/rk700/uniFuzzer，其中包含了一个demo。下面我们就以这个demo为例，再次介绍整个fuzzing的运行流程。
+demo-vuln.c是要进行fuzzing的目标，其中包含了名为vuln()的函数，存在栈溢出和堆溢出：
+可以看到，输入的内容未检查长度，就直接strcpy()到堆上；另外，输入内容的第一个字节作为长度，memcpy()到栈上。
+接下来，我们将这段代码编译成32位小端序的MIPS架构ELF。首先我们需要mipsel的交叉编译工具，在Debian上可以安装gcc-mipsel-linux-gnu这个包。接下来运行
+mipsel-linux-gnu-gcc demo-vuln.c -Xlinker –hash-style=sysv -no-pie -o demo-vuln
+将其编译得到ELF文件demo-vuln。我们要fuzzing的目标，就是其中的vuln()函数。
+由于demo-vuln提供了源代码，所以我们看到在vuln()函数中，还调用了printf(), malloc(), strcpy(), memcpy(),
+free()这些标准库函数。其中printf()如之前所说，可以通过PRELOAD的机制来忽略掉；strcpy()和memcpy()，可以继续模拟执行mipsel架构的libc中的实现；比较复杂的是malloc()和free()，因为一般来说malloc()需要brk()的系统调用，而Unicorn还不支持系统调用。所以，我们也重新写了一个非常简单的堆分配器，并通过PRELOAD的方式替换掉标准库中的实现：
+我们需要在Unicorn中分配一片内存作为堆，然后每次malloc()调用，就直接从这片内存中切一块出来。而为了检测可能发生的堆溢出漏洞，我们参考栈溢出检测的机制，在malloc()分配的内存末尾加上一个固定的canary，并在头部写入这块内存的大小，以便后续检查。free()也被简化为空，因此不需要进行内存回收、合并等复杂操作。
+接下来，我们将包含上述preload函数的demo-libcpreload.c，也编译成与demo-vuln同样架构的ELF动态库：
+mipsel-linux-gnu-gcc -shared -fPIC -nostdlib -Xlinker –hash-style=sysv demo-libcpreload.c -o demo-libcpreload.so
+现在，目标ELF和preload库都已经准备完成，接下来就需要编写相关代码，设置好模拟执行的环境。uniFuzzer提供了以下几个回调接口：
+  * void onLibLoad(const char *libName, void *baseAddr, void *ucBaseAddr): 在每个ELF被加载到Unicorn时回调
+  * int uniFuzzerInit(uc_engine *uc): 在目标被加载到Unicorn之后回调，可以在这里进行环境的初始化，例如设置堆、栈、寄存器
+  * int uniFuzzerBeforeExec(uc_engine *uc, const uint8_t *data, size_t len): 每轮fuzzing执行前回调
+  * int uniFuzzerAfterExec(uc_engine *uc): 每轮fuzzing执行完成后回调
+用户通过在目录callback/中编写.c代码，实现上述回调函数，进行fuzzing。针对demo-vuln，我们也编写了一个callback/demo-callback.c文件作为参考。
+最终，在代码根目录下运行make，即可编译得到最终的fuzzing程序uf。运行以下命令，开始fuzzing：
+UF_TARGET= UF_PRELOAD=
+UF_LIBPATH= ./uf
+相关的参数是通过环境变量传递的。UF_TARGET是要fuzzing的目标ELF文件，UF_PRELOAD是要preload加载的自定义ELF动态库，UF_LIBPATH是依赖库的搜索路径。在Debian上安装libc6-mipsel-cross这个包，应该就会安装所需的mipsel库，此时依赖库的搜索路径就在/usr/mipsel-linux-gnu/lib/。
+下图是一个fuzzing触发的崩溃：
+可以看到，uniFuzzer检测到了堆溢出。触发漏洞的，是长度68 bytes的字符串，当其被strcpy()到长度为60
+bytes的堆时，canary的值被修改，最终被检测发现。
+下图是另一个fuzzing触发的崩溃：
+这次的输入只有1个字符，\xef。其被作为memcpy()的参数，复制了超长的内容到128
+bytes的栈变量上，从而修改了vuln()函数返回地址，触发了内存访问错误。
+## 总结
+通过结合Unicorn和LibFuzzer的功能，我们实现了对闭源代码的fuzzing。上述开源的uniFuzzer代码其实还属于概念验证阶段，许多功能例如系统调用的支持、其他架构/二进制格式的支持等等，还需要后续进一步完善。也欢迎在这方面有研究的小伙伴多提建议和PR，进一步完善功能。

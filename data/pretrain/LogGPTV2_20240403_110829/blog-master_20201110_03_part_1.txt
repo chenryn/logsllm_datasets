@@ -1,0 +1,120 @@
+## PostgreSQL 14 preview - automatic analyze: readahead - add "IO read time" log message        
+### 作者            
+digoal            
+### 日期            
+2020-11-10            
+### 标签            
+PostgreSQL , analyze , 资源消耗统计 , IO 统计         
+----            
+## 背景         
+automatic analyze: readahead - add "IO read time" log message     
+https://commitfest.postgresql.org/30/2799/    
+https://www.postgresql.org/message-id/flat/PI:EMAIL    
+```    
+Greetings,    
+* Jakub Wartak (Jakub(dot)Wartak(at)tomtom(dot)com) wrote:    
+> I have I hope interesting observation (and nano patch proposal) on system where statistics freshness is a critical factor. Autovacuum/autogathering statistics was tuned to be pretty very aggressive:    
+> autovacuum_vacuum_cost_delay=0 (makes autovacuum_vacuum_cost_limit irrelevant)    
+> autovacuum_naptime=1s    
+> autovacuum_max_workers=4    
+>     
+> Some critical table partitions are configured with:  autovacuum_analyze_scale_factor=0.001, autovacuum_analyze_threshold=50000 to force auto-analyze jobs pretty often. The interesting logs are like this:    
+> automatic analyze of table "t1" system usage: CPU: user: 37.52 s, system: 23.01 s, elapsed: 252.14 s    
+> automatic analyze of table "t2" system usage: CPU: user: 38.70 s, system: 22.63 s, elapsed: 317.33 s    
+> automatic analyze of table "t2" system usage: CPU: user: 39.38 s, system: 21.43 s, elapsed: 213.58 s    
+> automatic analyze of table "t1" system usage: CPU: user: 37.91 s, system: 24.49 s, elapsed: 229.45 s    
+That's certainly pretty aggressive. :)    
+> and this is root-cause of my question.  As you can see there is huge 3x-4x time discrepancy between "elapsed" and user+system which is strange at least for me as there should be no waiting (autovacuum_vacuum_cost_delay=0). According to various tools it is true: Time was wasted somewhere else, but not in the PostgreSQL analyze. The ps(1) and pidstat(1) also report the same for the worker:    
+The user/system time there is time-on-CPU (hence the 'CPU: ' prefix).    
+> 06:56:12 AM       PID    %usr %system  %guest    %CPU   CPU  Command    
+> 06:56:13 AM    114774    8.00   10.00    0.00   18.00    18  postgres    
+> 06:56:14 AM    114774    8.00   11.00    0.00   19.00    15  postgres    
+> 06:56:15 AM    114774    5.00   13.00    0.00   18.00    18  postgres    
+>     
+> 06:56:17 AM       PID   kB_rd/s   kB_wr/s kB_ccwr/s  Command    
+> 06:56:18 AM    114774  63746.53      0.00      0.00  postgres    
+> 06:56:19 AM    114774  62896.00      0.00      0.00  postgres    
+> 06:56:20 AM    114774  62920.00      0.00      0.00  postgres    
+>     
+> One could argue that such autoanalyze worker could perform 5x more of work (%CPU -> 100%) here. The I/O system is not performing a lot (total = 242MB/s reads(at)22k IOPS, 7MB/s writes(at)7k IOPS, with service time 0.04ms), although reporting high utilization I'm pretty sure it could push much more. There can be up to 3x-4x of such 70-80MB/s analyzes in parallel (let's say 300MB/s for statistics collection alone).    
+The analyze is doing more-or-less random i/o since it's skipping through    
+the table picking out select blocks, not doing regular sequential i/o.    
+> According to various gdb backtraces, a lot of time is spent here:    
+> #0  0x00007f98cdfc9f73 in __pread_nocancel () from /lib64/libpthread.so.0    
+> #1  0x0000000000741a16 in pread (__offset=811253760, __nbytes=8192, __buf=0x7f9413ab7280, __fd=) at /usr/include/bits/unistd.h:84    
+> #2  FileRead (file=, buffer=0x7f9413ab7280 "\037\005", amount=8192, offset=811253760, wait_event_info=167772173) at fd.c:1883    
+> #3  0x0000000000764b8f in mdread (reln=, forknum=, blocknum=19890902, buffer=0x7f9413ab7280 "\037\005") at md.c:596    
+> #4  0x000000000073d69b in ReadBuffer_common (smgr=, relpersistence=112 'p', forkNum=MAIN_FORKNUM, blockNum=19890902, mode=RBM_NORMAL, strategy=0x1102278, hit=0x7fffba7e2d4f)    
+>     at bufmgr.c:897    
+> #5  0x000000000073e27e in ReadBufferExtended (reln=0x7f98c0c9ded0, forkNum=MAIN_FORKNUM, blockNum=19890902, mode=, strategy=) at bufmgr.c:665    
+> #6  0x00000000004c2e2f in heapam_scan_analyze_next_block (scan=, blockno=, bstrategy=) at heapam_handler.c:998    
+> #7  0x0000000000597de1 in table_scan_analyze_next_block (bstrategy=, blockno=, scan=0x10c8098) at ../../../src/include/access/tableam.h:1462    
+> #8  acquire_sample_rows (onerel=0x7f98c0c9ded0, elevel=13, rows=0x1342e08, targrows=1500000, totalrows=0x7fffba7e3160, totaldeadrows=0x7fffba7e3158) at analyze.c:1048    
+> #9  0x0000000000596a50 in do_analyze_rel (onerel=0x7f98c0c9ded0, params=0x10744e4, va_cols=0x0, acquirefunc=0x597ca0 , relpages=26763525, inh=false,    
+>     in_outer_xact=false, elevel=13) at analyze.c:502    
+> [..]    
+> #12 0x00000000006e76b4 in autovacuum_do_vac_analyze (bstrategy=0x1102278, tab=) at autovacuum.c:3118    
+> [..]    
+Sure, we're blocked on a read call trying to get the next block.    
+> The interesting thing that targrows=1.5mlns and that blocks are accessed (as expected) in sorted order:    
+>     
+> Breakpoint 1, heapam_scan_analyze_next_block (scan=0x10c8098, blockno=19890910, bstrategy=0x1102278) at heapam_handler.c:984    
+> Breakpoint 1, heapam_scan_analyze_next_block (scan=0x10c8098, blockno=19890912, bstrategy=0x1102278) at heapam_handler.c:984    
+> Breakpoint 1, heapam_scan_analyze_next_block (scan=0x10c8098, blockno=19890922, bstrategy=0x1102278) at heapam_handler.c:984    
+> Breakpoint 1, heapam_scan_analyze_next_block (scan=0x10c8098, blockno=19890935, bstrategy=0x1102278) at heapam_handler.c:984    
+> Breakpoint 1, heapam_scan_analyze_next_block (scan=0x10c8098, blockno=19890996, bstrategy=0x1102278) at heapam_handler.c:984    
+Not really sure what's interesting here, but it does look like we're    
+skipping through the table as expected.    
+> And probably this explains the discrepancy, perf with CPU usage reporting shows a lot of frames waiting on I/O on readaheads done by ext4, trimmed for clarity:    
+>     
+> # Children      Self       sys       usr  Command   Shared Object       Symbol    
+>     63.64%     0.00%     0.00%     0.00%  postgres  [kernel.kallsyms]   [k] entry_SYSCALL_64_after_hwframe    
+>             ---entry_SYSCALL_64_after_hwframe    
+>                do_syscall_64    
+>                |--59.66%--sys_pread64    
+>                |          vfs_read    
+>                |           --59.09%--__vfs_read    
+>                |                      --58.24%--generic_file_read_iter    
+>                |                                |--47.44%--ondemand_readahead    
+>                |                                |           --46.88%--__do_page_cache_readahead    
+>                |                                |                     |--32.67%--ext4_mpage_readpages    
+>                |                                |                     |          |--16.76%--submit_bio    
+>                |                                |                     |--10.23%--blk_finish_plug    
+> [..]    
+>     63.64%     1.99%     1.99%     0.00%  postgres  [kernel.kallsyms]   [k] do_syscall_64    
+>             |--61.65%--do_syscall_64    
+>             |          |--59.66%--sys_pread64    
+>             |          |          vfs_read    
+>             |          |           --59.09%--__vfs_read    
+>             |          |                      --58.24%--generic_file_read_iter    
+>             |          |                                |--47.44%--ondemand_readahead    
+>             |          |                                |           --46.88%--__do_page_cache_readahead    
+>     
+>     61.36%     0.00%     0.00%     0.00%  postgres  postgres            [.] FileRead     
+>             ---FileRead    
+>                __pread_nocancel    
+>                 --60.51%--entry_SYSCALL_64_after_hwframe    
+>                           do_syscall_64    
+>                            --59.66%--sys_pread64    
+>                                      vfs_read    
+>                                       --59.09%--__vfs_read    
+>                                                  --58.24%--generic_file_read_iter    
+>                                                            |--47.44%--ondemand_readahead    
+>                                                            |           --46.88%--__do_page_cache_readahead    
+>     
+>     61.36%     0.85%     0.00%     0.85%  postgres  libpthread-2.17.so  [.] __pread_nocancel    
+>             |--60.51%--__pread_nocancel    
+>             |          entry_SYSCALL_64_after_hwframe    
+>             |          do_syscall_64    
+>             |           --59.66%--sys_pread64    
+>             |                     vfs_read    
+>             |                      --59.09%--__vfs_read    
+>             |                                 --58.24%--generic_file_read_iter    
+>             |                                           |--47.44%--ondemand_readahead    
+>             |                                           |           --46.88%--__do_page_cache_readahead    
+>     
+>     
+>     59.66%     0.00%     0.00%     0.00%  postgres  [kernel.kallsyms]   [k] sys_pread64    
+>             ---sys_pread64    
+>                vfs_read    
+>                 --59.09%--__vfs_read    

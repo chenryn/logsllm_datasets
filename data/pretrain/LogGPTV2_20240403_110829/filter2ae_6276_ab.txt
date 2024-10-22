@@ -1,0 +1,64 @@
+`start`和`enqueueFrame`。在按照顺序调用之后最终触发有漏洞的`enqueueFrame`函数。
+    android::RefBase *__fastcall android::FrameManager::enqueueFrame(__int64 someptr, __int64 imemory)
+    {
+    //...
+     v4 = (android::FrameManager::Frame *)operator new(0x38uLL);
+     android::FrameManager::Frame::Frame(v4, v5, *(_DWORD *)(v2 + 0x88), *(_DWORD *)(v2 + 140), 17, *(_DWORD *)(v2 + 144));
+     v16 = v4;
+     android::RefBase::incStrong(v4, &v16);
+     (*(void (**)(void))(**(_QWORD **)v3 + 0x20LL))(); //offset and size is retrived
+     v6 = (*(__int64 (**)(void))(*(_QWORD *)v16 + 88LL))(); //v6 = Frame->imemory->base();
+     v7 = (*(__int64 (__fastcall **)(__int64))(*(_QWORD *)imemoryheap + 40LL))(imemoryheap); //v7 = imemoryheap->base();
+     memcpy(v6, v7 + v15, v14);//memcpy(frame->imemory->base(), imemoryheap->base() + offset, imemoryheap->size());//overflow here
+    //...
+     if ( imemoryheap )
+       android::RefBase::decStrong(
+         (android::RefBase *)(imemoryheap + *(_QWORD *)(*(_QWORD *)imemoryheap - 24LL)),
+         &imemoryheap);
+     result = v16;
+     if ( v16 )
+       result = (android::RefBase *)android::RefBase::decStrong(v16, &v16);
+     return result;
+    }
+可以看到，传入的IMemory在被mmap后并没有对长度做任何的检查，直接memcpy进入了Frame的IMemory中，而后者的预定义size是`2*1024*1024`,即超过2M的映射，即会引发overflow。
+整体的触发步骤如下：
+  * 向`media.air`发送一个code=1 的transaction以获取`BnAir`的handle，以下步骤的调用对象均为该handle
+  * 发送一个code=3 的transaction以触发 `android::AIRService::Client::configure(int)`。该函数会完成对应对象的参数初始化
+  * 发送一个code=4的transaction以创建一个AIRService Client, 并调用`android::AIRService::Client::start()`启动
+  * 最后一个code=7的transaction最终传入攻击者可控内容和长度的IMemory，触发`android::AIRService::Client::enqueueFrame(int, android::sp const&)`中的溢出
+        fpsr 00000000  fpcr 00000000
+    backtrace:
+        #00 pc 000000000001b014  /system/lib64/libc.so (memcpy+332)
+        #01 pc 0000000000029b5c  /system/lib64/libairservice.so (_ZN7android12FrameManager12enqueueFrameERKNS_2spINS_7IMemoryEEE+188)
+        #02 pc 0000000000030c8c  /system/lib64/libairservice.so (_ZN7android10AIRService6Client12enqueueFrameEiRKNS_2spINS_7IMemoryEEE+72)
+        #03 pc 000000000000fbf8  /system/lib64/libair.so (_ZN7android5BnAIR10onTransactEjRKNS_6ParcelEPS1_j+732)
+        #04 pc 000000000004a340  /system/lib64/libbinder.so (_ZN7android7BBinder8transactEjRKNS_6ParcelEPS1_j+132)
+        #05 pc 00000000000564f0  /system/lib64/libbinder.so (_ZN7android14IPCThreadState14executeCommandEi+1032)
+        #06 pc 000000000005602c  /system/lib64/libbinder.so (_ZN7android14IPCThreadState20getAndExecuteCommandEv+156)
+        #07 pc 0000000000056744  /system/lib64/libbinder.so (_ZN7android14IPCThreadState14joinThreadPoolEb+128)
+        #08 pc 0000000000074b70  /system/lib64/libbinder.so
+        #09 pc 00000000000127f0  /system/lib64/libutils.so (_ZN7android6Thread11_threadLoopEPv+336)
+        #10 pc 00000000000770f4  /system/lib64/libc.so (_ZL15__pthread_startPv+204)
+        #11 pc 000000000001e7d0  /system/lib64/libc.so (__start_thread+16)
+## 如何利用？
+这是一个类似于Project
+Zero之前公布的bitunmap案例的漏洞，两者的溢出都发生在mmap过的区域。由于mmap分配的内存区域相对较大，位置不同于常规的堆管理器管理区域，其利用方式不同于传统的堆溢出。读者应该会回忆到Project
+Zero是通过特定函数分配thread，然后溢出thread的control
+structre的方式来实现控制流劫持。同样地，在我们的目标中，`android::AIRService::Client::configure`被调用时，它会创建一个新的thread。通过风水Frame对象，我们构造内存空洞并在空洞中创建thread，触发溢出后劫持thread中的回调指针来最终控制PC。
+但这还远远没有结束。虽然该进程是system-uid，但SELinux对其有严格的限制，例如no execmem, no executable file
+loading,
+甚至无法向ServiceManager查询大部分系统服务。即使控制了PC，接下来又该何去何从，例如如何利用提升的权限来安装恶意应用，如果根本无法lookup
+PackageManagerService？
+这里需要注意的是，虽然SELinux禁止了visiond去lookup
+service，但实际上并没有限制调用service自身的transaction，这依赖于service自身的实现，例如ActivityManagerService的相关函数是通过enforceNotIsolated标注来禁止isolated进程调用。所以只要能成功地将PMS的binder
+handle传递给visiond，攻击者依然可以以visiond的身份调用PMS来安装恶意应用，相关步骤如下：
+  * Attacking app (untrusted_app context) 获得PMS的StrongBinder handle
+  * Attacking app 将handle传递给visiond. 任何接收StrongBinder的服务端函数均可，例如`BnAirServiceProxy`中的第一个transaction
+  * Attacking app 触发上述漏洞获取PC控制后，payload在内存中搜索上一步传入的PMS handle
+  * Payload通过该handle调用PMS，完成恶意应用安装
+## 总结
+以上即为CVE-2018-9143，一个典型的binder
+service漏洞的故事。Samsung已经发布了advisory和补丁，并通过firmeware
+OTA修复了该漏洞。在下一篇文章中，我会介绍CVE-2018-9139，sensorhubservice中的一个堆溢出，以及如何通过fuzzing发现的该漏洞和它的利用（包括一个控制PC的poc）。
+本文所描述的相关poc和有漏洞的服务binary均可以在  中找到。
+* * *

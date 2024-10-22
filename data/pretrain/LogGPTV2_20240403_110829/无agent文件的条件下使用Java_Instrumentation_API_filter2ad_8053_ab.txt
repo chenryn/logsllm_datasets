@@ -1,0 +1,242 @@
+    ...
+    jvmtiError err = (*jvmti)->GetLoadedClasses(jvmti, &class_count, &classes);
+jvmtiEnv也同样提供了RedefineClasses函数，Java Instrumentation API同样功能就是封装于此之上。
+    jvmtiError RedefineClasses(jint class_count,
+            const jvmtiClassDefinition* class_definitions) {
+    return functions->RedefineClasses(this, class_count, class_definitions);
+    }
+那么问题进一步的变为：怎样得到jvmtiEnv指针。
+## JPLISAgent实例是如何创建的？
+继续查看Hotspot代码
+    /*
+     *  Creates a new JPLISAgent.
+     *  Returns error if the agent cannot be created and initialized.
+     *  The JPLISAgent* pointed to by agent_ptr is set to the new broker,
+     *  or NULL if an error has occurred.
+     */
+    JPLISInitializationError
+    createNewJPLISAgent(JavaVM * vm, JPLISAgent **agent_ptr) {
+        JPLISInitializationError initerror       = JPLIS_INIT_ERROR_NONE;
+        jvmtiEnv *               jvmtienv        = NULL;
+        jint                     jnierror        = JNI_OK;
+        *agent_ptr = NULL;
+        jnierror = (*vm)->GetEnv(  vm,
+                                   (void **) &jvmtienv,
+                                   JVMTI_VERSION_1_1);
+        if ( jnierror != JNI_OK ) {
+            initerror = JPLIS_INIT_ERROR_CANNOT_CREATE_NATIVE_AGENT;
+        } else {
+            JPLISAgent * agent = allocateJPLISAgent(jvmtienv);
+            if ( agent == NULL ) {
+                initerror = JPLIS_INIT_ERROR_ALLOCATION_FAILURE;
+            } else {
+                initerror = initializeJPLISAgent(  agent,
+                                                   vm,
+                                                   jvmtienv);
+                if ( initerror == JPLIS_INIT_ERROR_NONE ) {
+                    *agent_ptr = agent;
+                } else {
+                    deallocateJPLISAgent(jvmtienv, agent);
+                }
+            }
+            /* don't leak envs */
+            if ( initerror != JPLIS_INIT_ERROR_NONE ) {
+                jvmtiError jvmtierror = (*jvmtienv)->DisposeEnvironment(jvmtienv);
+                /* can be called from any phase */
+                jplis_assert(jvmtierror == JVMTI_ERROR_NONE);
+            }
+        }
+        return initerror;
+    }
+    JPLISInitializationError
+    initializeJPLISAgent(   JPLISAgent *    agent,
+                            JavaVM *        vm,
+                            jvmtiEnv *      jvmtienv) {
+        jvmtiError      jvmtierror = JVMTI_ERROR_NONE;
+        jvmtiPhase      phase;
+        agent->mJVM                                      = vm;
+        agent->mNormalEnvironment.mJVMTIEnv              = jvmtienv;
+        agent->mNormalEnvironment.mAgent                 = agent;
+        agent->mNormalEnvironment.mIsRetransformer       = JNI_FALSE;
+        agent->mRetransformEnvironment.mJVMTIEnv         = NULL;        /* NULL until needed */
+        agent->mRetransformEnvironment.mAgent            = agent;
+        agent->mRetransformEnvironment.mIsRetransformer  = JNI_FALSE;   /* JNI_FALSE until mJVMTIEnv is set */
+        agent->mAgentmainCaller                          = NULL;
+        agent->mInstrumentationImpl                      = NULL;
+        agent->mPremainCaller                            = NULL;
+        agent->mTransform                                = NULL;
+        agent->mRedefineAvailable                        = JNI_FALSE;   /* assume no for now */
+        agent->mRedefineAdded                            = JNI_FALSE;
+        agent->mNativeMethodPrefixAvailable              = JNI_FALSE;   /* assume no for now */
+        agent->mNativeMethodPrefixAdded                  = JNI_FALSE;
+        agent->mAgentClassName                           = NULL;
+        agent->mOptionsString                            = NULL;
+        ...
+    }
+agent实例是通过native函数createNewJPLISAgent创建的，该函数是内部函数，没有从动态库中导出，Java层也没办法直接调用。那么思路还得回到jvmtiEnv指针上去。
+    *agent_ptr = NULL;
+        jnierror = (*vm)->GetEnv(  vm,
+                                   (void **) &jvmtienv,
+                                   JVMTI_VERSION_1_1);
+从以上代码我们可知，jvmtiEnv可以通过JavaVM对象获得。而关于JavaVM对象，在JDK的jni.h中，有定义导出方法:
+    _JNI_IMPORT_OR_EXPORT_ jint JNICALL JNI_GetCreatedJavaVMs(JavaVM **, jsize, jsize *);
+该方法由libjvm.so中导出，即使so经过strip，符号也一定是存在的。因此我们可以通过此API获得JavaVM对象，通过JavaVM对象就能获得jvmtiEnv指针。
+## 伪造JPLISAgent实例
+JPLISAgent结构中虽然有很多成员，但分析Instrumentation对象中我们需要使用的redefineClasses等方法的native实现
+    public class InstrumentationImpl implements Instrumentation {
+        private native void
+        redefineClasses0(long nativeAgent, ClassDefinition[]  definitions)
+            throws  ClassNotFoundException;
+        @SuppressWarnings("rawtypes")
+        private native Class[]
+        getAllLoadedClasses0(long nativeAgent);
+        ...
+    }
+它们都只是从agent中获取jvmtiEnv指针，之后都没有再使用agent的其他成员
+    jobjectArray
+    commonGetClassList( JNIEnv *            jnienv,
+                        JPLISAgent *        agent,
+                        jobject             classLoader,
+                        ClassListFetcher    fetcher) {
+        jvmtiEnv *      jvmtienv        = jvmti(agent);
+    ...
+    void
+    redefineClasses(JNIEnv * jnienv, JPLISAgent * agent, jobjectArray classDefinitions) {
+        jvmtiEnv*   jvmtienv                        = jvmti(agent);
+    ...
+那么我们只需要使用unsafe方法，申请一段内存，并在对应的偏移上放置jvmtiEnv指针值，就完成了JPLISAgent实例的构造。关键问题还是要解决获取jvmtiEnv指针。
+## 如何在Java层调用native接口？
+获取jvmtienv指针，可以采用暴力搜索内存的方式，但是这种方法很难做到通用。jvmtienv实例中有固定不变的4字节魔术字0x71EE，this指针就是jvmtiEnv指针。
+    //JVMTI_MAGIC    = 0x71EE,
+    bool __fastcall JvmtiEnvBase::is_valid(JvmtiEnvBase *this)
+    {
+      return *((_DWORD *)this + 2) == 0x71EE;
+    }
+稳定的办法就是上文分析的，通过JavaVM对象来获取。
+    struct JavaVM_ {
+        const struct JNIInvokeInterface_ *functions;
+    #ifdef __cplusplus
+        jint DestroyJavaVM() {
+            return functions->DestroyJavaVM(this);
+        }
+        jint AttachCurrentThread(void **penv, void *args) {
+            return functions->AttachCurrentThread(this, penv, args);
+        }
+        jint DetachCurrentThread() {
+            return functions->DetachCurrentThread(this);
+        }
+        jint GetEnv(void **penv, jint version) {
+            return functions->GetEnv(this, penv, version);
+        }
+        jint AttachCurrentThreadAsDaemon(void **penv, void *args) {
+            return functions->AttachCurrentThreadAsDaemon(this, penv, args);
+        }
+    #endif
+    };
+JavaVM对象其实也只是一个函数指针数组，不存在固定不变的魔术字。如果要通过JNI_GetCreatedJavaVMs方法获得，在Java层怎么调用它呢？  
+Java层想要调用native方法，常规做法是通过JNI，这种办法仍然需要提供一个so文件，然后通过dlopen的方式加载，这显然与本文初衷不符。不通过JNI能不能做到？至少在Linux是能做到的。  
+参考如下代码
+    #include 
+    #include 
+    #include 
+    /* Write @len bytes at @ptr to @addr in this address space using
+     * /proc/self/mem.
+     */
+    void memwrite(void *addr, char *ptr, size_t len) {
+      std::ofstream ff("/proc/self/mem");
+      ff.seekp(reinterpret_cast(addr));
+      ff.write(ptr, len);
+      ff.flush();
+    }
+    int main(int argc, char **argv) {
+      // Map an unwritable page. (read-only)
+      auto mymap =
+          (int *)mmap(NULL, 0x9000,
+                      PROT_READ, // <<<<<<<<<<<<<<<<<<<<< READ ONLY <<<<<<<<
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (mymap == MAP_FAILED) {
+        std::cout << "FAILED\n";
+        return 1;
+      }
+      std::cout << "Allocated PROT_READ only memory: " << mymap << "\n";
+      getchar();
+      // Try to write to the unwritable page.
+      memwrite(mymap, "\x40\x41\x41\x41", 4);
+      std::cout << "did mymap[0] = 0x41414140 via proc self mem..";
+      getchar();
+      std::cout << "mymap[0] = 0x" << std::hex << mymap[0] << "\n";
+      getchar();
+      // Try to writ to the text segment (executable code) of libc.
+      auto getchar_ptr = (char *)getchar;
+      memwrite(getchar_ptr, "\xcc", 1);
+      // Run the libc function whose code we modified. If the write worked,
+      // we will get a SIGTRAP when the 0xcc executes.
+      getchar();
+    }
+编译执行后，得到结果
+    root@ecs-16:~# ./proc_mem_poc 
+    Allocated PROT_READ only memory: 0x7f4390429000
+    did mymap[0] = 0x41414140 via proc self mem..
+    mymap[0] = 0x41414140
+    Trace/breakpoint trap (core dumped)
+以上代码示例说明，Linux下进程可以通过/proc/self/mem修改自身内存，即使是只读内存也可以修改。示例代码修改了getchar函数的开头为int3，结果真的执行了。  
+使用Java代码读写/proc/self/mem是完全没问题的，而Java原生就有很多JNI的native方法，比如libjava.so中的Java_java_lang_ClassLoader_registerNatives等等很多。  
+如果先修改Java_java_lang_ClassLoader_registerNatives的代码为我想要的，然后再主动调用ClassLoader.registerNatives，就实现了native层的任意代码执行。然后再还原代码，一切好像从未发生过！  
+那么关键问题就变为：如何获取Java_java_lang_ClassLoader_registerNatives地址
+## Java查找ELF导出符号
+再次得益于LINUX下的/proc文件系统，我们可以从/proc/self/maps轻易的获取所有已加载ELF对象的基址及文件路径
+    7fcbb8c0d000-7fcbb9a95000 r-xp 00000000 fc:01 1179725                    /CloudResetPwdUpdateAgent/depend/jre1.8.0_232/lib/amd64/server/libjvm.so
+    7fcbb9a95000-7fcbb9c95000 ---p 00e88000 fc:01 1179725                    /CloudResetPwdUpdateAgent/depend/jre1.8.0_232/lib/amd64/server/libjvm.so
+    7fcbb9c95000-7fcbb9d33000 r--p 00e88000 fc:01 1179725                    /CloudResetPwdUpdateAgent/depend/jre1.8.0_232/lib/amd64/server/libjvm.so
+    7fcbb9d33000-7fcbb9d5c000 rw-p 00f26000 fc:01 1179725                    /CloudResetPwdUpdateAgent/depend/jre1.8.0_232/lib/amd64/server/libjvm.so
+那么获取导出符号就变得非常简单，直接打开ELF文件解析得到对应符号地址，然后再加上库基址即可。对于x64 ELF的实例代码如下：
+    static long find_symbol(String elfpath, String sym, long libbase) throws IOException{
+        long func_ptr = 0;
+        RandomAccessFile fin = new RandomAccessFile(elfpath, "r");
+        byte[] e_ident = new byte[16];
+        fin.read(e_ident);
+        short e_type = Short.reverseBytes(fin.readShort());
+        short e_machine = Short.reverseBytes(fin.readShort());
+        int e_version = Integer.reverseBytes(fin.readInt());
+        long e_entry = Long.reverseBytes(fin.readLong());
+        long e_phoff = Long.reverseBytes(fin.readLong());
+        long e_shoff = Long.reverseBytes(fin.readLong());
+        int e_flags = Integer.reverseBytes(fin.readInt());
+        short e_ehsize = Short.reverseBytes(fin.readShort());
+        short e_phentsize = Short.reverseBytes(fin.readShort());
+        short e_phnum = Short.reverseBytes(fin.readShort());
+        short e_shentsize = Short.reverseBytes(fin.readShort());
+        short e_shnum = Short.reverseBytes(fin.readShort());
+        short e_shstrndx = Short.reverseBytes(fin.readShort());
+        int sh_name = 0;
+        int sh_type = 0;
+        long sh_flags = 0;
+        long sh_addr = 0;
+        long sh_offset = 0;
+        long sh_size = 0;
+        int sh_link = 0;
+        int sh_info = 0;
+        long sh_addralign = 0;
+        long sh_entsize = 0;
+        for(int i = 0; i < e_shnum; ++i) {
+            fin.seek(e_shoff + i*64);
+            sh_name = Integer.reverseBytes(fin.readInt());
+            sh_type = Integer.reverseBytes(fin.readInt());
+            sh_flags = Long.reverseBytes(fin.readLong());
+            sh_addr = Long.reverseBytes(fin.readLong());
+            sh_offset = Long.reverseBytes(fin.readLong());
+            sh_size = Long.reverseBytes(fin.readLong());
+            sh_link = Integer.reverseBytes(fin.readInt());
+            sh_info = Integer.reverseBytes(fin.readInt());
+            sh_addralign = Long.reverseBytes(fin.readLong());
+            sh_entsize = Long.reverseBytes(fin.readLong());
+            if(sh_type == SHT_DYNSYM) {
+                break;
+            }
+        }
+        int symtab_shdr_sh_link = sh_link;
+        long symtab_shdr_sh_size = sh_size;
+        long symtab_shdr_sh_entsize = sh_entsize;
+        long symtab_shdr_sh_offset = sh_offset;
+        fin.seek(e_shoff + symtab_shdr_sh_link * e_shentsize);
+        sh_name = Integer.reverseBytes(fin.readInt());

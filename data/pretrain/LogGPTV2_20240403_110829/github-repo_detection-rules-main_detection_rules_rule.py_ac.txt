@@ -1,0 +1,331 @@
+        min_version = get_min_supported_stack_version()
+        if stack_version is None:
+            return min_version
+        return max(Version.parse(stack_version, optional_minor_and_patch=True), min_version)
+    def get_supported_version(self) -> str:
+        """Get the lowest stack version for the rule that is currently supported in the form major.minor."""
+        rule_min_stack = self.metadata.get('min_stack_version')
+        min_stack = self.convert_supported_version(rule_min_stack)
+        return f"{min_stack.major}.{min_stack.minor}"
+    def _post_dict_conversion(self, obj: dict) -> dict:
+        """Transform the converted API in place before sending to Kibana."""
+        # cleanup the whitespace in the rule
+        obj = nested_normalize(obj)
+        # fill in threat.technique so it's never missing
+        for threat_entry in obj.get("threat", []):
+            threat_entry.setdefault("technique", [])
+        return obj
+    @abstractmethod
+    def to_api_format(self, include_version: bool = True) -> dict:
+        """Convert the rule to the API format."""
+    @cached
+    def sha256(self, include_version=False) -> str:
+        # get the hash of the API dict without the version by default, otherwise it'll always be dirty.
+        hashable_contents = self.to_api_format(include_version=include_version)
+        return utils.dict_hash(hashable_contents)
+@dataclass(frozen=True)
+class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
+    """Rule object which maps directly to the TOML layout."""
+    metadata: RuleMeta
+    transform: Optional[RuleTransform]
+    data: AnyRuleData = field(metadata=dict(data_key="rule"))
+    @cached_property
+    def version_lock(self):
+        # VersionLock
+        from .version_lock import default_version_lock
+        return getattr(self, '_version_lock', None) or default_version_lock
+    def set_version_lock(self, value):
+        from .version_lock import VersionLock
+        if value and not isinstance(value, VersionLock):
+            raise TypeError(f'version lock property must be set with VersionLock objects only. Got {type(value)}')
+        # circumvent frozen class
+        self.__dict__['_version_lock'] = value
+    @classmethod
+    def all_rule_types(cls) -> set:
+        types = set()
+        for subclass in typing.get_args(AnyRuleData):
+            field = next(field for field in dataclasses.fields(subclass) if field.name == "type")
+            types.update(typing.get_args(field.type))
+        return types
+    @classmethod
+    def get_data_subclass(cls, rule_type: str) -> typing.Type[BaseRuleData]:
+        """Get the proper subclass depending on the rule type"""
+        for subclass in typing.get_args(AnyRuleData):
+            field = next(field for field in dataclasses.fields(subclass) if field.name == "type")
+            if (rule_type, ) == typing.get_args(field.type):
+                return subclass
+        raise ValueError(f"Unknown rule type {rule_type}")
+    @property
+    def id(self) -> definitions.UUIDString:
+        return self.data.rule_id
+    @property
+    def name(self) -> str:
+        return self.data.name
+    @property
+    def type(self) -> str:
+        return self.data.type
+    def _post_dict_conversion(self, obj: dict) -> dict:
+        """Transform the converted API in place before sending to Kibana."""
+        super()._post_dict_conversion(obj)
+        # build time fields
+        self._convert_add_related_integrations(obj)
+        self._convert_add_required_fields(obj)
+        self._convert_add_setup(obj)
+        # validate new fields against the schema
+        rule_type = obj['type']
+        subclass = self.get_data_subclass(rule_type)
+        subclass.from_dict(obj)
+        # rule type transforms
+        self.data.transform(obj) if hasattr(self.data, 'transform') else False
+        return obj
+    def _convert_add_related_integrations(self, obj: dict) -> None:
+        """Add restricted field related_integrations to the obj."""
+        field_name = "related_integrations"
+        package_integrations = obj.get(field_name, [])
+        if not package_integrations and self.metadata.integration:
+            packages_manifest = load_integrations_manifests()
+            current_stack_version = load_current_package_version()
+            if self.check_restricted_field_version(field_name):
+                if isinstance(self.data, QueryRuleData) and self.data.language != 'lucene':
+                    package_integrations = self.get_packaged_integrations(self.data, self.metadata, packages_manifest)
+                    if not package_integrations:
+                        return
+                    for package in package_integrations:
+                        package["version"] = find_least_compatible_version(
+                            package=package["package"],
+                            integration=package["integration"],
+                            current_stack_version=current_stack_version,
+                            packages_manifest=packages_manifest)
+                        # if integration is not a policy template remove
+                        if package["version"]:
+                            policy_templates = packages_manifest[
+                                package["package"]][package["version"].strip("^")]["policy_templates"]
+                            if package["integration"] not in policy_templates:
+                                del package["integration"]
+                # remove duplicate entries
+                package_integrations = list({json.dumps(d, sort_keys=True):
+                                            d for d in package_integrations}.values())
+                obj.setdefault("related_integrations", package_integrations)
+    def _convert_add_required_fields(self, obj: dict) -> None:
+        """Add restricted field required_fields to the obj, derived from the query AST."""
+        if isinstance(self.data, QueryRuleData) and self.data.language != 'lucene':
+            index = obj.get('index') or []
+            required_fields = self.data.get_required_fields(index)
+        else:
+            required_fields = []
+        field_name = "required_fields"
+        if required_fields and self.check_restricted_field_version(field_name=field_name):
+            obj.setdefault(field_name, required_fields)
+    def _convert_add_setup(self, obj: dict) -> None:
+        """Add restricted field setup to the obj."""
+        rule_note = obj.get("note", "")
+        field_name = "setup"
+        field_value = obj.get(field_name)
+        if not self.check_explicit_restricted_field_version(field_name):
+            return
+        data_validator = self.data.data_validator
+        if not data_validator.skip_validate_note and data_validator.setup_in_note and not field_value:
+            parsed_note = self.data.parsed_note
+            # parse note tree
+            for i, child in enumerate(parsed_note.children):
+                if child.get_type() == "Heading" and "Setup" in gfm.render(child):
+                    field_value = self._convert_get_setup_content(parsed_note.children[i + 1:])
+                    # clean up old note field
+                    investigation_guide = rule_note.replace("## Setup\n\n", "")
+                    investigation_guide = investigation_guide.replace(field_value, "").strip()
+                    obj["note"] = investigation_guide
+                    obj[field_name] = field_value
+                    break
+    @cached
+    def _convert_get_setup_content(self, note_tree: list) -> str:
+        """Get note paragraph starting from the setup header."""
+        setup = []
+        for child in note_tree:
+            if child.get_type() == "BlankLine" or child.get_type() == "LineBreak":
+                setup.append("\n")
+            elif child.get_type() == "CodeSpan":
+                setup.append(f"`{gfm.renderer.render_raw_text(child)}`")
+            elif child.get_type() == "Paragraph":
+                setup.append(self._convert_get_setup_content(child.children))
+                setup.append("\n")
+            elif child.get_type() == "FencedCode":
+                setup.append(f"```\n{self._convert_get_setup_content(child.children)}\n```")
+                setup.append("\n")
+            elif child.get_type() == "RawText":
+                setup.append(child.children)
+            elif child.get_type() == "Heading" and child.level >= 2:
+                break
+            else:
+                setup.append(self._convert_get_setup_content(child.children))
+        return "".join(setup).strip()
+    def check_explicit_restricted_field_version(self, field_name: str) -> bool:
+        """Explicitly check restricted fields against global min and max versions."""
+        min_stack, max_stack = BUILD_FIELD_VERSIONS[field_name]
+        return self.compare_field_versions(min_stack, max_stack)
+    def check_restricted_field_version(self, field_name: str) -> bool:
+        """Check restricted fields against schema min and max versions."""
+        min_stack, max_stack = self.data.get_restricted_fields.get(field_name)
+        return self.compare_field_versions(min_stack, max_stack)
+    @staticmethod
+    def compare_field_versions(min_stack: Version, max_stack: Version) -> bool:
+        """Check current rule version is within min and max stack versions."""
+        current_version = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
+        max_stack = max_stack or current_version
+        return min_stack = max_stack
+    @classmethod
+    def get_packaged_integrations(cls, data: QueryRuleData, meta: RuleMeta,
+                                  package_manifest: dict) -> Optional[List[dict]]:
+        packaged_integrations = []
+        datasets = set()
+        for node in data.get('ast', []):
+            if isinstance(node, eql.ast.Comparison) and str(node.left) == 'event.dataset':
+                datasets.update(set(n.value for n in node if isinstance(n, eql.ast.Literal)))
+            elif isinstance(node, FieldComparison) and str(node.field) == 'event.dataset':
+                datasets.update(set(str(n) for n in node if isinstance(n, kql.ast.Value)))
+        if not datasets:
+            # windows and endpoint integration do not have event.dataset fields in queries
+            # integration is None to remove duplicate references upstream in Kibana
+            rule_integrations = meta.get("integration", [])
+            if rule_integrations:
+                for integration in rule_integrations:
+                    if integration in definitions.NON_DATASET_PACKAGES:
+                        packaged_integrations.append({"package": integration, "integration": None})
+        for value in sorted(datasets):
+            integration = 'Unknown'
+            if '.' in value:
+                package, integration = value.split('.', 1)
+            else:
+                package = value
+            if package in list(package_manifest):
+                packaged_integrations.append({"package": package, "integration": integration})
+        return packaged_integrations
+    @validates_schema
+    def post_conversion_validation(self, value: dict, **kwargs):
+        """Additional validations beyond base marshmallow schemas."""
+        data: AnyRuleData = value["data"]
+        metadata: RuleMeta = value["metadata"]
+        data.validate_query(metadata)
+        data.data_validator.validate_note()
+        data.data_validator.validate_bbr(metadata.get('bypass_bbr_timing'))
+        data.validate(metadata) if hasattr(data, 'validate') else False
+    def to_dict(self, strip_none_values=True) -> dict:
+        # Load schemas directly from the data and metadata classes to avoid schema ambiguity which can
+        # result from union fields which contain classes and related subclasses (AnyRuleData). See issue #1141
+        metadata = self.metadata.to_dict(strip_none_values=strip_none_values)
+        data = self.data.to_dict(strip_none_values=strip_none_values)
+        self.data.process_transforms(self.transform, data)
+        dict_obj = dict(metadata=metadata, rule=data)
+        return nested_normalize(dict_obj)
+    def flattened_dict(self) -> dict:
+        flattened = dict()
+        flattened.update(self.data.to_dict())
+        flattened.update(self.metadata.to_dict())
+        return flattened
+    def to_api_format(self, include_version=True) -> dict:
+        """Convert the TOML rule to the API format."""
+        converted_data = self.to_dict()['rule']
+        converted = self._post_dict_conversion(converted_data)
+        if include_version:
+            converted["version"] = self.autobumped_version
+        return converted
+    def check_restricted_fields_compatibility(self) -> Dict[str, dict]:
+        """Check for compatibility between restricted fields and the min_stack_version of the rule."""
+        default_min_stack = get_min_supported_stack_version()
+        if self.metadata.min_stack_version is not None:
+            min_stack = Version.parse(self.metadata.min_stack_version, optional_minor_and_patch=True)
+        else:
+            min_stack = default_min_stack
+        restricted = self.data.get_restricted_fields
+        invalid = {}
+        for _field, values in restricted.items():
+            if self.data.get(_field) is not None:
+                min_allowed, _ = values
+                if min_stack  dict:
+        """Generate the relevant fleet compatible asset."""
+        return {"id": self.id, "attributes": self.contents.to_api_format(), "type": definitions.SAVED_OBJECT_TYPE}
+    def save_toml(self):
+        assert self.path is not None, f"Can't save rule {self.name} (self.id) without a path"
+        converted = dict(metadata=self.contents.metadata.to_dict(), rule=self.contents.data.to_dict())
+        if self.contents.transform:
+            converted['transform'] = self.contents.transform.to_dict()
+        toml_write(converted, str(self.path.absolute()))
+    def save_json(self, path: Path, include_version: bool = True):
+        path = path.with_suffix('.json')
+        with open(str(path.absolute()), 'w', newline='\n') as f:
+            json.dump(self.contents.to_api_format(include_version=include_version), f, sort_keys=True, indent=2)
+            f.write('\n')
+@dataclass(frozen=True)
+class DeprecatedRuleContents(BaseRuleContents):
+    metadata: dict
+    data: dict
+    transform: Optional[dict]
+    @cached_property
+    def version_lock(self):
+        # VersionLock
+        from .version_lock import default_version_lock
+        return getattr(self, '_version_lock', None) or default_version_lock
+    def set_version_lock(self, value):
+        from .version_lock import VersionLock
+        if value and not isinstance(value, VersionLock):
+            raise TypeError(f'version lock property must be set with VersionLock objects only. Got {type(value)}')
+        # circumvent frozen class
+        self.__dict__['_version_lock'] = value
+    @property
+    def id(self) -> str:
+        return self.data.get('rule_id')
+    @property
+    def name(self) -> str:
+        return self.data.get('name')
+    @property
+    def type(self) -> str:
+        return self.data.get('type')
+    @classmethod
+    def from_dict(cls, obj: dict):
+        kwargs = dict(metadata=obj['metadata'], data=obj['rule'])
+        kwargs['transform'] = obj['transform'] if 'transform' in obj else None
+        return cls(**kwargs)
+    def to_api_format(self, include_version=True) -> dict:
+        """Convert the TOML rule to the API format."""
+        data = copy.deepcopy(self.data)
+        if self.transform:
+            transform = RuleTransform.from_dict(self.transform)
+            BaseRuleData.process_transforms(transform, data)
+        converted = data
+        if include_version:
+            converted["version"] = self.autobumped_version
+        converted = self._post_dict_conversion(converted)
+        return converted
+class DeprecatedRule(dict):
+    """Minimal dict object for deprecated rule."""
+    def __init__(self, path: Path, contents: DeprecatedRuleContents, *args, **kwargs):
+        super(DeprecatedRule, self).__init__(*args, **kwargs)
+        self.path = path
+        self.contents = contents
+    def __repr__(self):
+        return f'{type(self).__name__}(contents={self.contents}, path={self.path})'
+    @property
+    def id(self) -> str:
+        return self.contents.id
+    @property
+    def name(self) -> str:
+        return self.contents.name
+def downgrade_contents_from_rule(rule: TOMLRule, target_version: str) -> dict:
+    """Generate the downgraded contents from a rule."""
+    payload = rule.contents.to_api_format()
+    meta = payload.setdefault("meta", {})
+    meta["original"] = dict(id=rule.id, **rule.contents.metadata.to_dict())
+    payload["rule_id"] = str(uuid4())
+    payload = downgrade(payload, target_version)
+    return payload
+def get_unique_query_fields(rule: TOMLRule) -> List[str]:
+    """Get a list of unique fields used in a rule query from rule contents."""
+    contents = rule.contents.to_api_format()
+    language = contents.get('language')
+    query = contents.get('query')
+    if language in ('kuery', 'eql'):
+        # TODO: remove once py-eql supports ipv6 for cidrmatch
+        with eql.parser.elasticsearch_syntax, eql.parser.ignore_missing_functions:
+            parsed = kql.parse(query) if language == 'kuery' else eql.parse_query(query)
+        return sorted(set(str(f) for f in parsed if isinstance(f, (eql.ast.Field, kql.ast.Field))))
+# avoid a circular import
+from .rule_validators import EQLValidator, KQLValidator  # noqa: E402

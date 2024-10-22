@@ -1,0 +1,157 @@
+## PostgreSQL 秒杀场景优化  
+### 作者                                                                                      
+digoal                                                                                      
+### 日期                                                                                       
+2015-09-14                                                                            
+### 标签                                                                                      
+PostgreSQL , 秒杀 , skip locked , advisory lock          
+----                                                                                                  
+## 背景                           
+秒杀场景的典型瓶颈在于对同一条记录的多次更新请求，然后只有一个或者少量请求是成功的，其他请求是以失败或更新不到告终。  
+例如，Iphone的1元秒杀，如果我只放出1台Iphone，我们把它看成一条记录，秒杀开始后，谁先抢到（更新这条记录的锁），谁就算秒杀成功。  
+例如：  
+使用一个标记位来表示这条记录是否已经被更新，或者记录更新的次数（几台Iphone）。  
+```  
+update tbl set xxx=xxx,upd_cnt=upd_cnt+1 where id=pk and upd_cnt+1 cat test1.sql  
+\setrandom id 1 1  
+select f1(:id);  
+```  
+压测advisory lock的方式：  
+```  
+postgres@digoal-> cat test.sql  
+\setrandom id 1 1  
+update t1 set info=now()::text where id=:id and pg_try_advisory_xact_lock(:id);  
+```  
+清除压测统计数据：  
+```  
+postgres=# select pg_stat_reset();  
+ pg_stat_reset   
+---------------  
+(1 row)  
+postgres=# select * from pg_stat_all_tables where relname='t1';  
+-[ RECORD 1 ]-------+-------  
+relid               | 184731  
+schemaname          | public  
+relname             | t1  
+seq_scan            | 0  
+seq_tup_read        | 0  
+idx_scan            | 0  
+idx_tup_fetch       | 0  
+n_tup_ins           | 0  
+n_tup_upd           | 0  
+n_tup_del           | 0  
+n_tup_hot_upd       | 0  
+n_live_tup          | 0  
+n_dead_tup          | 0  
+n_mod_since_analyze | 0  
+last_vacuum         |   
+last_autovacuum     |   
+last_analyze        |   
+last_autoanalyze    |   
+vacuum_count        | 0  
+autovacuum_count    | 0  
+analyze_count       | 0  
+autoanalyze_count   | 0  
+```  
+压测结果：  
+```  
+postgres@digoal-> pgbench -M prepared -n -r -P 1 -f ./test1.sql -c 20 -j 20 -T 60  
+......  
+transaction type: Custom query  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 20  
+number of threads: 20  
+duration: 60 s  
+number of transactions actually processed: 792029  
+latency average: 1.505 ms  
+latency stddev: 4.275 ms  
+tps = 13196.542846 (including connections establishing)  
+tps = 13257.270709 (excluding connections establishing)  
+statement latencies in milliseconds:  
+        0.002625        \setrandom id 1 1  
+        1.502420        select f1(:id);  
+postgres=# select * from pg_stat_all_tables where relname='t1';  
+-[ RECORD 1 ]-------+-------  
+relid               | 184731  
+schemaname          | public  
+relname             | t1  
+seq_scan            | 0  
+seq_tup_read        | 0  
+idx_scan            | 896963   //  大多数是无用功  
+idx_tup_fetch       | 896963   //  大多数是无用功  
+n_tup_ins           | 0  
+n_tup_upd           | 41775  
+n_tup_del           | 0  
+n_tup_hot_upd       | 41400  
+n_live_tup          | 0  
+n_dead_tup          | 928  
+n_mod_since_analyze | 41774  
+last_vacuum         |   
+last_autovacuum     |   
+last_analyze        |   
+last_autoanalyze    |   
+vacuum_count        | 0  
+autovacuum_count    | 0  
+analyze_count       | 0  
+autoanalyze_count   | 0  
+postgres@digoal-> pgbench -M prepared -n -r -P 1 -f ./test.sql -c 20 -j 20 -T 60  
+......  
+transaction type: Custom query  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 20  
+number of threads: 20  
+duration: 60 s  
+number of transactions actually processed: 1392372  
+latency average: 0.851 ms  
+latency stddev: 2.475 ms  
+tps = 23194.831054 (including connections establishing)  
+tps = 23400.411501 (excluding connections establishing)  
+statement latencies in milliseconds:  
+        0.002594        \setrandom id 1 1  
+        0.848536        update t1 set info=now()::text where id=:id and pg_try_advisory_xact_lock(:id);  
+postgres=# select * from pg_stat_all_tables where relname='t1';  
+-[ RECORD 1 ]-------+--------  
+relid               | 184731  
+schemaname          | public  
+relname             | t1  
+seq_scan            | 0  
+seq_tup_read        | 0  
+idx_scan            | 1368933  //  大多数是无用功  
+idx_tup_fetch       | 1368933   //  大多数是无用功  
+n_tup_ins           | 0  
+n_tup_upd           | 54957  
+n_tup_del           | 0  
+n_tup_hot_upd       | 54489  
+n_live_tup          | 0  
+n_dead_tup          | 1048  
+n_mod_since_analyze | 54957  
+last_vacuum         |   
+last_autovacuum     |   
+last_analyze        |   
+last_autoanalyze    |   
+vacuum_count        | 0  
+autovacuum_count    | 0  
+analyze_count       | 0  
+autoanalyze_count   | 0  
+```  
+我们注意到，不管用哪种方法，都会浪费掉很多次的无用功扫描。  
+为了解决无用扫描的问题，可以使用以下函数。（当然，还有更好的方法是对用户透明。）  
+```  
+CREATE OR REPLACE FUNCTION public.f(i_id integer)    
+ RETURNS void    
+ LANGUAGE plpgsql    
+AS $function$   
+declare   
+  a_lock boolean := false;  
+begin   
+  select pg_try_advisory_xact_lock(i_id) into a_lock;  
+  if a_lock then  
+    update t1 set info=now()::text where id=i_id;   
+  end if;  
+  exception when others then    
+  return;   
+end;   
+$function$;    
+transaction type: Custom query  

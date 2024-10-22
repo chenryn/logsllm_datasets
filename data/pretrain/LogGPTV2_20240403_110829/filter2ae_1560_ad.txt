@@ -1,0 +1,165 @@
+首先，`memberTypes`是`AnnotationType`的一个字段，里面存储着`Annotation`接口声明的方法信息
+_（键名为方法名，值为方法返回类型）_
+。因此，我们在获取`AnnotationInvocationHandler`实例时，需要传入一个方法个数大于0的`Annotation`子类
+_（一般来说，若方法个数大于0，都会包含一个名为`value`的方法）_
+，并且原始`Map`中必须存在任意以这些方法名为键名的元素，且元素值不是该方法返回类型的实例，才能顺利进入`setValue()`的流程：
+    Class cls = Class.forName("sun.reflect.annotation.AnnotationInvocationHandler");
+    Constructor ctor = cls.getDeclaredConstructors()[0];
+    ctor.setAccessible(true);
+    Object o = ctor.newInstance(Target.class, m);
+以上是`TransformedMap`的利用构造过程。而ysoserial官方更倾向于使用`LazyMap`作为装饰器，它在装饰时会传入原始`Map`和一个`Transformer`作为工厂，当`get()`获取值时，若键不存在，就会调用工厂的`transform()`创建一个新值放入`Map`中，因此装饰任意一个空`Map`也可以满足需求：
+    Map m = LazyMap.decorate(new HashMap(), chain);
+但与`TransformedMap`不同的是，`AnnotationInvocationHandler.readObject()`中并没有直接的对`memberTypes`执行`get()`操作，反而是在它的`invoke()`中存在`get()`，但又对方法名有一定的要求：
+    public Object invoke(Object proxy, Method method, Object[] args) {
+        String member = method.getName();
+        Class[] paramTypes = method.getParameterTypes();
+        if (member.equals("equals") && paramTypes.length == 1 &&
+            paramTypes[0] == Object.class)
+            return equalsImpl(args[0]);
+        assert paramTypes.length == 0;
+        if (member.equals("toString"))
+            return toStringImpl();
+        if (member.equals("hashCode"))
+            return hashCodeImpl();
+        if (member.equals("annotationType"))
+            return type;
+        Object result = memberValues.get(member);
+        // omit
+    }
+所以，ysoserial使用Java动态代理的方式处理了`LazyMap`，使`readObject()`在调用`memberValues.entrySet()`时代理进入`AnnotationInvocationHandler.invoke()`阶段，刚好方法名`entrySet`也可以顺利的跳过前面的几个判断条件，最终达到目的。这也是为什么Payload中会包含两个`AnnotationInvocationHandler`的原因。
+### 修复方案
+Jenkins在1.638版本的`Connection.readObject()`中，将默认的`ObjectInputStream`改为了其自定义的子类`ObjectInputStreamEx`，并传入`ClassFilter.DEFAULT`校验过滤：
+    public  T readObject() throws IOException, ClassNotFoundException {
+        ObjectInputStream ois = new ObjectInputStreamEx(in,
+                getClass().getClassLoader(), ClassFilter.DEFAULT);
+        return (T)ois.readObject();
+    }
+`ClassFilter.DEFAULT`长这样：
+    public static final ClassFilter DEFAULT = new ClassFilter() {
+        protected boolean isBlacklisted(String name) {
+            if (name.startsWith("org.codehaus.groovy.runtime.")) {
+                return true;
+            } else if (name.startsWith("org.apache.commons.collections.functors.")) {
+                return true;
+            } else {
+                return name.contains("org.apache.xalan");
+            }
+        }
+    };
+还是一个简简单单的黑名单。
+## POP的艺术
+既然反序列化漏洞常见的修复方案是黑名单，就存在被绕过的风险，一旦出现新的POP链，原来的防御也就直接宣告无效了。
+所以在反序列化漏洞的对抗史中，除了有大佬不断的挖掘新的反序列化漏洞点，更有大牛不断的探寻新的POP链。
+POP已经成为反序列化区别于其他常规Web安全漏洞的一门特殊艺术。
+既然如此，我们就用ysoserial这个项目，来好好探究一下现在常用的这些RCE类POP中到底有什么乾坤：
+  * BeanShell1
+    * 命令执行载体：`bsh.Interpreter`
+    * 反序列化载体：`PriorityQueue`
+    * `PriorityQueue.readObject()`反序列化所有元素后，通过`comparator.compare()`进行排序，该`comparator`被代理给`XThis.Handler`处理，其`invoke()`会调用`This.invokeMethod()`从`Interpreter`解释器中解析包含恶意代码的`compare`方法并执行
+  * C3P0
+    * 命令执行载体：`bsh.Interpreter`
+    * 反序列化载体：`com.mchange.v2.c3p0.PoolBackedDataSource`
+    * `PoolBackedDataSource.readObject()`进行到父类`PoolBackedDataSourceBase.readObject()`阶段，会调用`ReferenceIndirector$ReferenceSerialized.getObject()`获取对象，其中`InitialContext.lookup()`会去加载远程恶意对象并初始化，导致命令执行，有些同学可能不太清楚远程恶意对象的长相，举个简单的例子：
+                public class Malicious {
+              public Malicious() {
+                  java.lang.Runtime.getRuntime().exec("calc.exe");
+              }
+          }
+  * Clojure
+    * 命令执行载体：`clojure.core$comp$fn__4727`
+    * 反序列化载体：`HashMap`
+    * `HashMap.readObject()`反序列化各元素时，通过它的`hashCode()`得到hash值，而`AbstractTableModel$ff19274a.hashCode()`会从`IPersistentMap`中取`hashCode`键的值对象调用其`invoke()`，最终导致Clojure Shell命令字符串执行
+  * CommonsBeanutils1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`PriorityQueue`
+    * `PriorityQueue.readObject()`执行排序时，`BeanComparator.compare()`会根据`BeanComparator.property` _（值为`outputProperties`）_ 调用`TemplatesImpl.getOutputProperties()`，它在`newTransformer()`时会创建`AbstractTranslet`实例，导致精心构造的Java字节码被执行
+  * CommonsCollections1
+    * 命令执行载体：`org.apache.commons.collections.functors.ChainedTransformer`
+    * 反序列化载体：`AnnotationInvocationHandler`
+    * 见前文
+  * CommonsCollections2
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`PriorityQueue`
+    * `PriorityQueue.readObject()`执行排序时，`TransformingComparator.compare()`会调用`InvokerTransformer.transform()`转换元素，进而获取第一个元素`TemplatesImpl`的`newTransformer()`并调用，最终导致命令执行
+  * CommonsCollections3
+    * 命令执行载体：`org.apache.commons.collections.functors.ChainedTransformer`
+    * 反序列化载体：`AnnotationInvocationHandler`
+    * 除`Transformer`数组元素组成不同外，与CommonsCollections1基本一致
+  * CommonsCollections4
+    * 命令执行载体：`org.apache.commons.collections.functors.ChainedTransformer`
+    * 反序列化载体：`PriorityQueue`
+    * `PriorityQueue.readObject()`执行排序时，`TransformingComparator.compare()`会调用`ChainedTransformer.transform()`转换元素，进而遍历执行`Transformer`数组中的每个元素，最终导致命令执行
+  * CommonsCollections5
+    * 命令执行载体：`org.apache.commons.collections.functors.ChainedTransformer`
+    * 反序列化载体：`BadAttributeValueExpException`
+    * `BadAttributeValueExpException.readObject()`当`System.getSecurityManager()`为`null`时，会调用`TiedMapEntry.toString()`，它在`getValue()`时会通过`LazyMap.get()`取值，最终导致命令执行
+  * CommonsCollections6
+    * 命令执行载体：`org.apache.commons.collections.functors.ChainedTransformer`
+    * 反序列化载体：`HashSet`
+    * `HashSet.readObject()`反序列化各元素后，会调用`HashMap.put()`将结果放进去，而它通过`TiedMapEntry.hashCode()`计算hash时，会调用`getValue()`触发`LazyMap.get()`导致命令执行
+  * Groovy1
+    * 命令执行载体：`org.codehaus.groovy.runtime.MethodClosure`
+    * 反序列化载体：`AnnotationInvocationHandler`
+    * `AnnotationInvocationHandler.readObject()`在通过`memberValues.entrySet()`获取`Entry`集合，该`memberValues`被代理给`ConvertedClosure`拦截`entrySet`方法，根据`MethodClosure`的构造最终会由`ProcessGroovyMethods.execute()`执行系统命令
+  * Hibernate1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`HashMap`
+    * `HashMap.readObject()`通过`TypedValue.hashCode()`计算hash时，`ComponentType.getPropertyValue()`会调用`PojoComponentTuplizer.getPropertyValue()`获取到`TemplatesImpl.getOutputProperties`方法并调用导致命令执行
+  * Hibernate2
+    * 命令执行载体：`com.sun.rowset.JdbcRowSetImpl`
+    * 反序列化载体：`HashMap`
+    * 执行过程与Hibernate1一致，但Hibernate2并不是传入`TemplatesImpl`执行系统命令，而是利用`JdbcRowSetImpl.getDatabaseMetaData()`调用`connect()`连接到远程RMI
+  * JBossInterceptors1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`org.jboss.interceptor.proxy.InterceptorMethodHandler`
+    * `InterceptorMethodHandler.readObject()`在`executeInterception()`时，会根据`SimpleInterceptorMetadata`拿到`TemplatesImpl`放进`ArrayList`中，并传入`SimpleInterceptionChain`进行初始化，它在调用`invokeNextInterceptor()`时会导致命令执行
+  * JSON1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`HashMap`
+    * `HashMap.readObject()`将各元素放进`HashMap`时，会调用`TabularDataSupport.equals()`进行比较，它的`JSONObject.containsValue()`获取对象后在`PropertyUtils.getProperty()`内动态调用`getOutputProperties`方法，它被代理给`CompositeInvocationHandlerImpl`，其中转交给`JdkDynamicAopProxy.invoke()`，在`AopUtils.invokeJoinpointUsingReflection()`时会传入从`AdvisedSupport.target`字段中取出来的`TemplatesImpl`，最终导致命令执行
+  * JavassistWeld1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`org.jboss.weld.interceptor.proxy.InterceptorMethodHandler`
+    * 除JBoss部分包名存在差异外，与JBossInterceptors1基本一致
+  * Jdk7u21
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`LinkedHashSet`
+    * `LinkedHashSet.readObject()`将各元素放进`HashMap`时，第二个元素会调用`equals()`与第一个元素进行比较，它被代理给`AnnotationInvocationHandler`进入`equalsImpl()`，在`getMemberMethods()`遍历`TemplatesImpl`的方法遇到`getOutputProperties`进行调用时，导致命令执行
+  * MozillaRhino1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`BadAttributeValueExpException`
+    * `BadAttributeValueExpException.readObject()`调用`NativeError.toString()`时，会在`ScriptableObject.getProperty()`中进入`getImpl()`，`ScriptableObject$Slot`根据`name`获取到封装了`Context.enter`方法的`MemberBox`，并通过它的`invoke()`完成调用，而之后根据`message`调用`TemplatesImpl.newTransformer()`则会导致命令执行
+  * Myfaces1
+    * 命令执行载体：`org.apache.myfaces.view.facelets.el.ValueExpressionMethodExpression`
+    * 反序列化载体：`HashMap`
+    * `HashMap.readObject()`通过`ValueExpressionMethodExpression.hashCode()`计算hash时，会由`getMethodExpression()`调用`ValueExpression.getValue()`，最终导致EL表达式执行
+  * Myfaces2
+    * 命令执行载体：`org.apache.myfaces.view.facelets.el.ValueExpressionMethodExpression`
+    * 反序列化载体：`HashMap`
+    * 执行过程与Myfaces1一致，但Myfaces2的EL表达式并不是由使用者传入的，而是预制了一串加载远程恶意对象的表达式
+  * ROME
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`HashMap`
+    * `HashMap.readObject()`通过`ObjectBean.hashCode()`计算hash时，会在`ToStringBean.toString()`阶段遍历`TemplatesImpl`所有字段的Setter和Getter并调用，当调用到`getOutputProperties()`时将导致命令执行
+  * Spring1
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`org.springframework.core.SerializableTypeWrapper$MethodInvokeTypeProvider`
+    * `SerializableTypeWrapper$MethodInvokeTypeProvider.readObject()`在调用`TypeProvider.getType()`时被代理给`AnnotationInvocationHandler`得到另一个Handler为`AutowireUtils$ObjectFactoryDelegatingInvocationHandler`的代理，之后传给`ReflectionUtils.invokeMethod()`动态调用`newTransformer`方法时被第二个代理拦截，它的`objectFactory`字段是第三个代理，因此`objectFactory.getObject()`会获得`TemplatesImpl`，最终导致命令执行
+  * Spring2
+    * 命令执行载体：`org.apache.xalan.xsltc.trax.TemplatesImpl`
+    * 反序列化载体：`org.springframework.core.SerializableTypeWrapper$MethodInvokeTypeProvider`
+    * `SerializableTypeWrapper$MethodInvokeTypeProvider.readObject()`在动态调用`newTransformer`方法时，被第二个代理拦截交给`JdkDynamicAopProxy`，它在`AopUtils.invokeJoinpointUsingReflection()`时会传入从`AdvisedSupport.targetSource`字段中取出来的`TemplatesImpl`，最终导致命令执行
+根据上面这些内容，我们可以得到几条简单的POP构造法则：
+  1. 当依赖中不存在可以执行命令的方法时，可以选择使用`TemplatesImpl`作为命令执行载体，并想办法去触发它的`newTransformer`或`getOutputProperties`方法
+  2. 可以作为入口的通用反序列化载体是`HashMap`、`AnnotationInvocationHandler`、`BadAttributeValueExpException`和`PriorityQueue`，它们都是依赖较少的JDK底层对象，区别如下：
+    * `HashMap`，可以主动触发元素的`hashCode`和`equals`方法
+    * `AnnotationInvocationHandler`，可以主动触发`memberValues`字段的`setValue`方法，本身也可以作为动态代理的Handler拦截如`Map.entrySet`等方法进入自己的`invoke`方法
+    * `BadAttributeValueExpException`，可以主动触发`val`字段的`toString`方法
+    * `PriorityQueue`，可以主动触发`comparator`字段的`compare`方法
+## 总结
+历年来，很多流行的Java组件框架都被爆出过反序列化漏洞，这已经有好多大牛们都进行过分析总结了，本文的主要目的也不在此，而是为了去深挖反序列化漏洞底层一些可能还没有被唤醒的地方。
+不过有一点要切记，反序列化不止RCE。
+## 参考
+  1. [JavaSE Document](https://docs.oracle.com/javase/8/docs/)
+  2. [Java OpenJDK Source Code](http://hg.openjdk.java.net/)
+  3. [Java OpenJDK Github Mirror](https://github.com/unofficial-openjdk/openjdk/)

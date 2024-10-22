@@ -1,0 +1,162 @@
+        bool            compress_data;  
+        bool            full_backup_on_error;  
+        /* Status - one of BACKUP_STATUS_xxx */  
+        BackupStatus    status;  
+        /* Timestamp, etc. */  
+        TimeLineID      tli;  
+        XLogRecPtr      start_lsn;  
+        XLogRecPtr      stop_lsn;  
+        time_t          start_time;  
+        time_t          end_time;  
+        time_t          recovery_time;  
+        uint32          recovery_xid;  
+        /* Size (-1 means not-backup'ed) */  
+        int64           total_data_bytes;  
+        int64           read_data_bytes;  
+        int64           read_arclog_bytes;  
+        int64           read_srvlog_bytes;  
+        int64           write_bytes;  
+        /* data/wal block size for compatibility check */  
+        uint32          block_size;  
+        uint32          wal_block_size;  
+        /* if backup from standby or not */  
+        bool            is_from_standby;  
+} pgBackup;  
+```
+备份开始时记录pg_start_backup调用返回的lsn，写入backup->start_lsn  
+```
+/*  
+ * Notify start of backup to PostgreSQL server.  
+ */  
+static void  
+pg_start_backup(const char *label, bool smooth, pgBackup *backup)  
+{  
+        PGresult           *res;  
+        const char         *params[2];  
+        params[0] = label;  
+        elog(DEBUG, "executing pg_start_backup()");  
+        reconnect();  
+        /* Assumes PG version >= 8.4 */  
+        /* 2nd argument is 'fast' (IOW, !smooth) */  
+        params[1] = smooth ? "false" : "true";  
+        res = execute("SELECT * from pg_xlogfile_name_offset(pg_start_backup($1, $2))", 2, params);  
+        if (backup != NULL)  
+                get_lsn(res, &backup->tli, &backup->start_lsn);  
+        elog(DEBUG, "backup start point is (WAL file: %s, xrecoff: %s)",  
+                        PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1));  
+        PQclear(res);  
+        disconnect();  
+}  
+```
+备份停止，调用pg_stop_backup，从返回结果中取出LSN，写入backup->stop_lsn  
+```
+/*  
+ * Notify end of backup to PostgreSQL server.  
+ */  
+static void  
+pg_stop_backup(pgBackup *backup)  
+{  
+        elog(DEBUG, "executing pg_stop_backup()");  
+        wait_for_archive(backup,  
+                "SELECT * FROM pg_xlogfile_name_offset(pg_stop_backup())");  
+}  
+static void  
+wait_for_archive(pgBackup *backup, const char *sql)  
+{  
+        PGresult           *res;  
+        char                    ready_path[MAXPGPATH];  
+        int                             try_count;  
+        reconnect();  
+        res = execute(sql, 0, NULL);  
+        if (backup != NULL)  
+        {  
+                get_lsn(res, &backup->tli, &backup->stop_lsn);  
+                elog(DEBUG, "backup end point is (WAL file: %s, xrecoff: %s)",  
+                                PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1));  
+        }  
+        /* get filename from the result of pg_xlogfile_name_offset() */  
+        elog(DEBUG, "waiting for %s is archived", PQgetvalue(res, 0, 0));  
+        snprintf(ready_path, lengthof(ready_path),  
+                "%s/pg_xlog/archive_status/%s.ready", pgdata, PQgetvalue(res, 0, 0));  
+        PQclear(res);  
+        res = execute(TXID_CURRENT_SQL, 0, NULL);  
+        if(backup != NULL)  
+        {  
+                get_xid(res, &backup->recovery_xid);  
+                backup->recovery_time = time(NULL);  
+        }  
+        disconnect();  
+        /* wait until switched WAL is archived */  
+        try_count = 0;  
+        while (fileExists(ready_path))  
+        {  
+                sleep(1);  
+                if (interrupted)  
+                        ereport(FATAL,  
+                                (errcode(ERROR_INTERRUPTED),  
+                                 errmsg("interrupted during waiting for WAL archiving")));  
+                try_count++;  
+                if (try_count > TIMEOUT_ARCHIVE)  
+                        ereport(ERROR,  
+                                (errcode(ERROR_ARCHIVE_FAILED),  
+                                 errmsg("switched WAL could not be archived in %d seconds",  
+                                        TIMEOUT_ARCHIVE)));  
+        }  
+        elog(DEBUG, "WAL file contains backup end point is archived after %d seconds waiting",  
+                        try_count);  
+}  
+```
+validate 时，改backup.ini的STATUS字段  
+```
+validate.c  
+        for (i = 0; i status == BACKUP_STATUS_RUNNING ||  
+                        backup->status == BACKUP_STATUS_DELETING))  
+                {  
+                        backup->status = BACKUP_STATUS_ERROR;  
+                        pgBackupWriteIni(backup);  
+                }  
+                /* Validate completed backups only. */  
+                if (backup->status != BACKUP_STATUS_DONE)  
+                        continue;  
+                /* validate with CRC value and update status to OK */  
+                pgBackupValidate(backup, false, false, (HAVE_DATABASE(backup)));  
+        }  
+...  
+                /* update status to OK */  
+                if (corrupted)  
+                        backup->status = BACKUP_STATUS_CORRUPT;  
+                else  
+                        backup->status = BACKUP_STATUS_OK;  
+                pgBackupWriteIni(backup);  
+```
+## 注意  
+1\.   
+备份参数 -C 表示无缝checkpoint, 所以可能很慢，视checkpoint_completion_target和segment_size的配置。   
+如果你发现pg_rman开始很慢，可以把-C去掉，速度就快了，但是可能在高峰时，造成冲击。    
+建议高峰是不要备份。  
+2\.   
+BUG  
+unix socket 是$PGDATA时, validate会报错    
+```
+pg_rman validate  
+INFO: validate: "2016-08-26 16:19:25" backup, archive log files and server log files by CRC  
+ERROR: invalid type '?' found in "/data05/digoal/pgbak/20160826/161925/file_database.txt"  
+vi /data05/digoal/pgbak/20160826/161925/file_database.txt  
+.s.PGSQL.1921 ? 0 0 0777 2016-08-26 15:35:05  
+```
+修改一下dir.c的代码即可修复这个问题，修改如下  
+```
+                if (strncmp(path, ".s.PGSQL", 7) != 0 && type != 'f' && type != 'F' && type != 'd' && type != 'l')
+                        ereport(ERROR,
+                                (errcode(ERROR_CORRUPTED),
+                                 errmsg("invalid type '%c' found in \"%s\"", type, file_txt)));
+```
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

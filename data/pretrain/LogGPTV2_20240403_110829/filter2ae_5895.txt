@@ -1,0 +1,42 @@
+**作者：启明星辰ADLab  
+原文链接：**
+### 01 漏洞详情
+近日，研究人员披露了一个Linux内核本地权限提升漏洞，发现在copy_page_to_iter_pipe和
+push_pipe函数中，新分配的pipe_buffer结构体成员“flags”未被正确地初始化，可能包含旧值PIPE_BUF_FLAG_CAN_MERGE。攻击者可利用此漏洞向由只读文件支持的页面缓存中的页面写入数据，从而提升权限。该漏洞编号为CVE-2022-0847，因漏洞类型和“DirtyCow”（脏牛）类似，亦称为“DirtyPipe”。
+### 02 相关系统调用实现
+#### 2.1 pipe系统调用实现
+调用pipe()创建一个管道，返回两个文件描述符，fd[1]为读，fd[2]为写。这里以linux-5.16.10内核代码为例，调用到__do_pipe_flags()函数，该函数代码实现如下：
+首先调用create_pipe_files()，然后调用get_unused_fd_flags()分别获取未使用的文件描述符fdr和fdw，并写入到指针fd中。create_pipe_files()函数调用get_pipe_inode()函数获取一个inode，并初始化相关数据结构。get_pipe_inode()函数又调用alloc_pipe_info()函数分配一个pipe_inode_info，该结构体是一个内核pipe结构体，用于管道的管理和操作。具体看下alloc_pipe_info()函数，该函数实现代码如下：
+首先初始化pipe_bufs为PIPE_DEF_BUFFERS，该值为16，然后分配pipe，接着判断pipe_bufs*PAGE_SIZE的大小，pipe_bufs最大值为128，最小值为2。
+然后开始分配pipe->bufs，正常一次性分配16个pipe_buffer，然后初始化pipe的相关成员，这里并不会初始化pipe_bufs中的pipe_buffer。piper_buffer结构体定义如下：
+其中page用于存放数据，大小为一个页面，ops为对应内存页面操作集，成员flags为buffer类型。这16个pipe_buffer构成一个管道缓冲区的循环数组，pipe->head指向缓冲区生产点，pipe->tail指向消费点，在pipe的管理下，循环地用于数据的读取和写入。
+当向管道中写入数据时，会调用pipe_write()函数，该函数部分实现代码如下：
+首先从pipe->head开始，判断pipe是否为满的。不满的情况下，拿出一个pipe_buffer，判断page是否已分配，未分配随即分配一个新page，然后初始化这个pipe_buffer相关成员，实现代码如下：
+行527，将buf->flags设置为PIPE_BUF_FLAG_CAN_MERGE，表示该buffer是可以合并的。最后调用copy_page_from_iter()函数将数据拷贝到新分配的page中。当从管道中读取数据时，就是逆过程，其间并不改变既定buffer的页面类型，不再赘述。
+#### 2.2 splice系统调用实现
+splice是Linux
+2.6.17新加入的系统调用，用于在两个文件间移动数据，而无需内核态和用户态的内存拷贝，但需要借助管道（pipe）实现。大概原理就是通过pipe
+buffer实现一组内核内存页（pages of kernel memory）的引用计数指针（reference-countedpointers），数据拷贝过程中并不真正拷贝数据，而是创建一个新的指向内存页的指针。也就是说拷贝过程实质是指针的拷贝，称为零拷贝技术。
+调用splice系统调用时，内核中会调用do_splice()函数，该函数实现代码如下：
+分三种情况，第一种为in/out均为pipe类型，第二种是in为pipe类型，第三种是out为pipe类型，这里我们分析第三种情况。调用spilce_file_tp_pipe()函数将数据写入pipe中，具体会调用到generic_file_splice_read()函数，这里以linux-2.6.17内核版本为例，更容易理解零拷贝过程。该函数实现如下：
+然后调用到__generic_file_splice_read()函数，该函数实现代码如下：
+![
+](https://images.seebug.org/content/images/2022/03/5a1b3ec3-3c11-44ba-a194-e3121be8e525.png-w331s)
+映射到内存的页面(structpage)，其实就是每个file都有这么一个结构，将文件系统中这个file对应的数据与这个file对应的内存绑定到一起。然后定义一个splice_pipe_desc结构体，该结构体用于中转file对应的内存页。接下来就是将file对应的内存页面整理放在spd中，过程比较复杂，略过。最后调用splice_to_pipe()函数操作pipe和spd，该函数实现关键代码如下所示：
+依次循环地从spd->pages中取出内存页放在对应的buf->page中。可以看出这里仅仅是对内存页面进行转移，而没有进行任何内存拷贝。
+### 03 漏洞原理与补丁
+#### 3.1 漏洞原理
+在linux-5.16.10内核中，调用splice()函数将数据写入管道时，调用路径如下所示：
+比linux-2.6.17内核版本的复杂，最终会调用copy_page_to_iter_pipe()函数操作内存页面，该函数实现代码如下：
+如前文所述，从pipe中取出buf，只是替换了ops，page，offset和len，并没有修改buf->flags，因此该buffer所包含的页面是可以合并的。当再次向管道中写入数据时，因为pipe非初次使用，首先判断要写入的buffer类型，如果buf->flags为PIPE_BUF_FLAG_CAN_MERGE，行466，直接调用copy_page_from_iter()函数进行内存拷贝，而目的地址为buf->page，这个buf->page实际上就是来自file中对应的内存页面。
+#### 3.2 补丁
+该漏洞补丁在copy_page_to_iter_pipe()函数和push_pipe()函数中，将buf->flags置零。其中push_pipe()函数可在其他路径中触发，不再赘述。
+### 04 利用分析
+首先，调用pipe创建管道并通过写读操作将管道中的buffer类型设置为PIPE_BUF_FLAG_CAN_MERGE。
+然后，将要覆盖的文件通过splice写入到pipe中，公开的利用中被覆盖的文件为/usr/bin/pkexec，因为该程序具备suid能力。
+触发漏洞后，此时pipe中buf所包含的内存页面均是指向/usr/bin/pkexec文件所属的内存页面，而且内存页面都是可以合并的。最后再次调用write()函数将提权payload写入pipe中，即写入/usr/bin/pkexec文件中，然后运行/usr/bin/pkexec提升权限。
+### 参考链接：
+[1]
+[2]
+[3]
+* * *

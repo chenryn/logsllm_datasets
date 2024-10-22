@@ -1,0 +1,138 @@
+            len -= l2cap_get_conf_opt(&req, &type, &olen, &val);  
+            hint  = type & L2CAP_CONF_HINT;
+            type &= L2CAP_CONF_MASK;
+            switch (type) {
+            ...
+            case L2CAP_CONF_EFS:
+                remote_efs = 1;  //【1】
+                if (olen == sizeof(efs))
+                    memcpy(&efs, (void *) val, olen);
+                break;
+            ...
+        }
+    done:
+        ...
+        if (result == L2CAP_CONF_SUCCESS) {
+            ...
+            if (remote_efs) {
+                if (chan->local_stype != L2CAP_SERV_NOTRAFIC &&   
+                    efs.stype != L2CAP_SERV_NOTRAFIC &&   //【2】
+                    efs.stype != chan->local_stype) {
+                    ...
+                } else {
+                    /* Send PENDING Conf Rsp */
+                    result = L2CAP_CONF_PENDING;
+                    set_bit(CONF_LOC_CONF_PEND, &chan->conf_state);  //这里设置CONF_LOC_CONF_PEND
+                }
+            }
+    }
+当收到L2CAP_CONF_REQ的包中包含有L2CAP_CONF_EFS类型的数据【1】，而且L2CAP_CONF_EFS数据的 **stype ==
+L2CAP_SERV_NOTRAFIC** 【2】的时候，conf_state会被置CONF_LOC_CONF_PEND
+到这里，这个漏洞触发的思路也就清楚了：
+1，建立和目标机器的L2CAP
+连接，这里注意sock_type的选择要是SOCK_RAW，如果不是，内核会自动帮我们完成sent_infomation_request,
+send_connection_request, send_configure_request这些操作，也就无法触发目标机器的漏洞了。
+2，建立SOCK_RAW连接，connect的时候，会自动完成sent_infomation_request的操作，不过这个不影响。
+3，接下来我们需要完成send_connection_request操作，来确定SCID,DCID。完成这个操作的过程是发送合法的
+L2CAP_CONN_REQ数据包。
+4，接下来需要发送包含有L2CAP_CONF_EFS类型的数据，而且L2CAP_CONF_EFS数据的stype
+==L2CAP_SERV_NOTRAFIC的L2CAP_CONF_REQ包，这一步是为了让目标机器的conf_state变成CONF_LOC_CONF_PEND。
+5，这里就到了发送cmd_len很长的L2CAP_CONN_RSP包了。这个包的result字段需要是L2CAP_CONF_PENDING。那么这个包发过去之后，目标机器就内核栈溢出了，要么重启了，要么死机了。
+这个漏洞是这几个漏洞里，触发最难的。
+**CVE-2017-1000250**
+这个漏洞是BlueZ的SDP服务里的信息泄露漏洞。这个不像L2CAP层的连接那么复杂，主要就是上层服务，收到数据就进行处理。那么我们也只需要关注处理的函数。
+之前说过，BlueZ的SDP收到数据是从io_session_event开始。之后，数据的流向是：
+    iosessionevent-->handlerequest-->processrequest
+有必要介绍一下SDP协议的数据结构： 它有一个sdp_pud_hdr的头部，头部数据里定义了PUD命令的类型，tid，以及pdu
+parameter的长度，然后就是具体的parameter。最后一个字段是continuation
+state，当一个包发不完所要发送的数据的时候，这个字段就会有效。对与这个字段，BlueZ给了它一个定义：
+    typedef struct {
+        uint32_t timestamp;
+        union {
+            uint16_t maxBytesSent;
+            uint16_t lastIndexSent;
+        } cStateValue;
+    } sdp_cont_state_t;
+对于远程的连接，PDU命令类型只能是这三个：SDP_SVC_SEARCH_REQ, SDP_SVC_ATTR_REQ,
+SDP_SVC_SEARCH_ATTR_REQ。这个漏洞呢，出现在对SDP_SVC_SEARCH_ATTR_REQ命令的处理函数里面
+service_search_attr_req 。这个函数有点长，就直接说它干了啥，不贴代码了：
+1， extract_des(pdata, data_left, &pattern, &dtd, SDP_TYPE_UUID); 解析service
+search pattern（对应SDP协议数据结构图）
+2，max = getbe16(pdata); 获得Maximu Attribute Byte
+3，scanned = extract_des(pdata, data_left, &seq, &dtd,
+SDP_TYPE_ATTRID);解析Attribute ID list
+4，if (sdp_cstate_get(pdata, data_left, &cstate) data_size - cstate->cStateValue.maxBytesSent);
+                pResponse = pCache->data;
+                memcpy(buf->data, pResponse + cstate->cStateValue.maxBytesSent, sent); //【1】    
+                buf->data_size += sent;
+                cstate->cStateValue.maxBytesSent += sent;
+                if (cstate->cStateValue.maxBytesSent == pCache->data_size)
+                    cstate_size = sdp_set_cstate_pdu(buf, NULL);
+                else
+                    cstate_size = sdp_set_cstate_pdu(buf, cstate);
+sdp_get_cached_rsp函数其实是对cstate的timestamp值的检验，如何过这个检验之后再说。当代码走到【1】处的memcpy时，由于
+**cstate->maxBytesSent**就是由数据包里的数据所控制，而且没有做任何检验，所以这里可以为任意的uint16t值。那么很明显，这里就出现了一个对pResponse的越界读的操作。而越界读的数据还会通过SDP
+RESPONSE发送给攻击方，那么一个信息泄露就发生了。
+写这个poc需要注意sdp_get_cached_rsp的检验的绕过，那么首先需要得到一个timestamp。当一次发送的包不足以发送完所有的数据的时候，会设置cstate状态，所以如果我们发给服务端的包里，max字段非常小，那么服务端就会给我们回应一个带cstate状态的包，这里面会有timestamp:
+    if (cstate == NULL) {
+            ...
+            if (buf->data_size > max) {  //max 可由接收到的包数据指定
+                sdp_cont_state_t newState;
+                memset((char *)&newState, 0, sizeof(sdp_cont_state_t));
+                newState.timestamp = sdp_cstate_alloc_buf(buf); //这里得到一个timestamp
+                buf->data_size = max;
+                newState.cStateValue.maxBytesSent = max;
+                cstate_size = sdp_set_cstate_pdu(buf, &newState); //回应的包中，写上cstate状态。
+            } else
+                cstate_size = sdp_set_cstate_pdu(buf, NULL);
+所以，我们的poc应该是这个步骤：
+1，建立SDP连接。这里我们的socket需要是SOCK_STREAM类型，而且connet的时候，addr的psm字段要是0x0001。关于连接的PSM：
+2，发送一个不带cstate状态的数据包，而且指定Maximu Attribute
+Byte的值非常小。这一步是为了让服务端给我们返回一个带timestamp的包。
+3，接收这个带timestamp的包，并将timestamp提取。
+4，发送一个带cstate状态的数据包，cstate的timestamp是指定为提取出来的值，服务端memcpy的时候，则就会把pResponse+maxBytesSent的内容发送给我们，读取这个数据包，则就获取了泄露的数据。
+**CVE-2017-0785**
+这个漏洞也是SDP的信息泄露漏洞，不过是BlueDroid的。与BlueZ的那个是有些类似的。我们也从对SDP数据包的处理函数说起。
+SDP数据包会通过sdp_data_ind函数送给sdp_server_handle_client_req。与BlueZ一样，这个函数也会根据包中的pud_id来确定具体的处理函数。这个漏洞发生在对SDP_PDU_SERVICE_SEARCH_REQ命令的处理，对包内数据的解析与上文BlueZ中的大同小异，不过注意在BlueDroid中，cstate结构与BlueZ中有些不同：
+    typedef struct {
+        uint16_t cont_offset;
+    } sdp_cont_state_t;
+这里主要看漏洞：
+    ①, BE_STREAM_TO_UINT16 (max_replies, p_req);从包中解析出Maximu Attribute Byte
+    ②， for (num_rsp_handles = 0; num_rsp_handles record_handle;
+            else
+                break;
+        }
+    ③, /* Check if this is a continuation request */
+        if (*p_req)
+        {
+            if (*p_req++ != SDP_CONTINUATION_LEN || (p_req >= p_req_end))
+            {
+                sdpu_build_n_send_error (p_ccb, trans_num, SDP_INVALID_CONT_STATE,
+                                         SDP_TEXT_BAD_CONT_LEN);
+                return;
+            }
+            BE_STREAM_TO_UINT16 (cont_offset, p_req);  //从包中得到cont_offset
+            if (cont_offset != p_ccb->cont_offset)  //对cont_offset的检验
+            {
+                sdpu_build_n_send_error (p_ccb, trans_num, SDP_INVALID_CONT_STATE,
+                                         SDP_TEXT_BAD_CONT_INX);
+                return;
+            }
+            rem_handles = num_rsp_handles - cont_offset;    /* extract the remaining handles */
+        }
+       else
+        { 
+            rem_handles = num_rsp_handles;
+            cont_offset = 0;
+            p_ccb->cont_offset = 0;
+        }
+    ④， cur_handles = (UINT16)((p_ccb->rem_mtu_size - SDP_MAX_SERVICE_RSPHDR_LEN) / 4);
+        if (rem_handles cont_offset += cur_handles;
+            is_cont = TRUE;
+        }
+    ⑤， for (xx = cont_offset; xx < cont_offset + cur_handles; xx++)
+            UINT32_TO_BE_STREAM (p_rsp, rsp_handles[xx]);
+①，②中代码可以看出，变量num_rsp_handles的值，一定程度上可以由包中的Maximu Attribute Byte字段控制。
+③中代码是对带cstate的包的处理，第一步是对大小的检查，第二步是获得cont_offset，然后对cont_offset进行检查，第三步就到了
+**rem_handles = num_rsp_handles – cont_offset** 可以思考一种情况，如果num_rsp_handles <

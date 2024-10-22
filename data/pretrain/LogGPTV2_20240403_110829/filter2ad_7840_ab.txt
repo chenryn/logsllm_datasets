@@ -1,0 +1,197 @@
+"inet_bind")）。
+考虑到bind函数基本上就是一个“修改器”函数，从某种意义上说，它的用途就是改变socket结构中的某些内部字段，所以，在考察这些修改是如何进行的之前，先让我们来弄清楚修改的是哪些字段。
+    /**
+     * Higher-level interface for any type of sockets
+     * that we end up creating through `sockfs`.
+     */
+    struct socket {
+            // The state of the socket (not to confuse with
+            // the transport state).
+            // 
+            // Note.: this is an enumeration of five possible
+            // states: 
+            // - SS_FREE = 0        not allocated
+            // - SS_UNCONNECTED,    unconnected to any socket
+            // - SS_CONNECTING, in process of connecting
+            // - SS_CONNECTED,  connected to socket
+            // - SS_DISCONNECTING   in process of disconnecting
+            //
+            // Given that we have already called `socket(2)`, at
+            // this point, we're clearly not in the `SS_FREE` state.
+        socket_state        state;
+            // File description (kernelspace) associated with 
+            // the file descriptor (userspace).
+        struct file     *file;
+             // Family-specific implementation of a
+             // network socket.
+        struct sock     *sk;
+            // ...
+    };
+    /** 
+     * AF_INET specialized representation of network sockets.sockets.
+     *
+     * struct inet_sock - representation of INET sockets
+     *
+     * @sk - ancestor class
+     * @inet_daddr          - Foreign IPv4 addr
+     * @inet_rcv_saddr      - Bound local IPv4 addr
+     * @inet_dport          - Destination port
+     * @inet_num            - Local port
+     * @inet_saddr          - Sending source
+     * @inet_sport          - Source port
+     * @saddr               - Sending source
+     */
+     struct inet_sock {
+        struct sock     sk;
+    #define inet_daddr      sk.__sk_common.skc_daddr
+    #define inet_rcv_saddr      sk.__sk_common.skc_rcv_saddr
+    #define inet_dport      sk.__sk_common.skc_dport
+    #define inet_num        sk.__sk_common.skc_num
+        __be32          inet_saddr;
+        // ...
+    };
+根据这些定义，我们可以推断出哪些字段需要进行修改：与源地址和源端口相关的字段。
+一旦开始进行检查并调用各种安全相关的hook，bind函数就会开始修改sock中的相关字段。
+通过阅读下面的代码，我们可以明白倒底进行了哪些修改（详见[net/ipv4/af_inet.c](https://elixir.bootlin.com/linux/v4.15/source/net/ipv4/af_inet.c#L432
+"net/ipv4/af_inet.c")文件）：
+    // `AF_INET` specific implementation of the
+    // `bind` operation (called by `sys_bind` after
+    // retrieving the underlying `struct socket`
+    // associated with the file descriptor supplied
+    // by the user from `userspace`).
+    int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+    {
+        struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
+            // Retrieves the `struct sock` associated with the non-family
+            // specific representation of a socket (`struct socket`).
+        struct sock *sk = sock->sk;
+            // Cast the socket to the `inet-specific` definition 
+            // of a socket.
+        struct inet_sock *inet = inet_sk(sk);
+        struct net *net = sock_net(sk);
+        unsigned short snum;
+            // ...
+        // Make sure that the address supplied is
+        // indeed of the size of a `sockaddr_in`
+        err = -EINVAL;
+        if (addr_len sin_family != AF_INET) {
+            err = -EAFNOSUPPORT;
+            if (addr->sin_family != AF_UNSPEC || addr->sin_addr.s_addr != htonl(INADDR_ANY))
+                goto out;
+        }
+            // ...
+            // Grab the service port as set in the address 
+            // struct supplied from userspace.
+        snum = ntohs(addr->sin_port);
+        err = -EACCES;
+        // Here is where we perform the check to make sure 
+            // that the user has the necessary privileges to
+        // bind to a privileged port.
+        if (snum && snum user_ns, CAP_NET_BIND_SERVICE))
+            goto out;
+        // Can't bind after the socket is already active,
+        // of if it's already bound.
+        err = -EINVAL;
+        if (sk->sk_state != TCP_CLOSE || inet->inet_num)
+            goto out_release_sock;
+        // Set the source address of the socket to the
+        // one that we've supplied.
+        inet->inet_rcv_saddr = inet->inet_saddr = addr->sin_addr.s_addr;
+        if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
+            inet->inet_saddr = 0;
+        /* Make sure we are allowed to bind here. */
+        // CC: this is where you can retrieve a "random" port
+        //     if you don't specify one.
+        if (
+                    (snum || !inet->bind_address_no_port) && // has a port set?
+                sk->sk_prot->get_port(sk, snum)          // was able to grab the port
+            ) {
+            inet->inet_saddr = inet->inet_rcv_saddr = 0;
+            err = -EADDRINUSE;
+            goto out_release_sock;
+        }
+            // ...
+            // Set the source port to the one that we've
+            // specified in the address supplied.
+        inet->inet_sport = htons(inet->inet_num);
+        inet->inet_daddr = 0;
+        inet->inet_dport = 0;
+            // ...
+        return err;
+    }
+搞定！
+至此，bind(2)就完成了它的使命：为内核中的底层套接字结构提供了一个地址（在用户空间指定）。
+注意，目前我们仍然没有在/proc/net/tcp中看到任何套接字。关于这一点，我们稍后再详细介绍!
+**让套接字进入被动状态**
+* * *
+一旦我们为套接字设置了地址，接下来就是让它扮演服务器或客户端的角色。
+也就是说，它需要将自己设置为侦听传入的连接，或者启动与正在侦听的其他人的连接。
+在这里，我们通过[listen(2)](http://man7.org/linux/man-pages/man2/listen.2.html
+"listen\(2\)")来扮演服务器角色，即让自己来监听客户端连接。
+    // "listen for connections on a socket."
+    int listen(
+            // File descriptor refering to a
+            // socket of type SOCK_STREAM or
+            // SOCK_SEQPACKET.
+            int sockfd, 
+            // Maximum length to which the queue
+            // of pending connections for `sockfd`
+            // can grow.
+            int backlog);
+至于我们是如何在用户空间完成这一任务的，具体见下列代码：
+    int
+    server_listen(int listen_fd)
+    {
+            int err = 0;
+        err = listen(listen_fd, BACKLOG);
+        if (err == -1) {
+            perror("listen");
+            return err;
+        }
+    }
+根据[手册页](http://man7.org/linux/man-pages/man2/listen.2.html "手册页")的说法：
+    listen()将sockfd引用的套接字标记为被动套接字，即使用accept(2)接受传入的连接请求的套接字。
+那么，“标记”究竟意味着什么呢？
+此外，如果传入“backlog”参数的话，会出现什么情况呢？
+**解开系统调用listen的神秘面纱**
+* * *
+与bind(2)非常相似，系统调用listen(2)的实现代码的作用是，找出与用户空间文件描述符相关联的套接字（与调用该系统调用的进程相关联），进行一些必要的检查，然后让协议族的实现代码来处理相关的语义。
+该系统调用的实现代码，详见[net/socket.c](https://elixir.bootlin.com/linux/v4.15/source/net/socket.c#L1471
+"net/socket.c")文件：
+    SYSCALL_DEFINE2(listen, 
+            int, fd, 
+            int, backlog)
+    {
+        struct socket *sock;
+        int err, fput_needed, somaxconn;
+            // Retrieve the underlying socket from
+            // the userspace file descriptor associated
+            // with the process.
+        sock = sockfd_lookup_light(fd, &err, &fput_needed);
+        if (sock) {
+                    // Gather the `somaxconn` paremeter globally set
+                    // (/proc/sys/net/ipv4/somaxconn) and make use of it
+                    // so limit the size of the backlog that can be
+                    // specified.
+                    //
+                    // See https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt
+            somaxconn = sock_net(sock->sk)->core.sysctl_somaxconn;
+            if ((unsigned int)backlog > somaxconn)
+                backlog = somaxconn;
+                    // Run the security hook associated with `listen`.
+            err = security_socket_listen(sock, backlog);
+            if (!err) {
+                            // Call the ipv4 implementation of 
+                            // `listen` that has been registered
+                            // before at `socket(2)` time.
+                err = sock->ops->listen(sock, backlog);
+                    }
+            fput_light(sock->file, fput_needed);
+        }
+        return err;
+    }
+非常有趣的是，我发现backlog只会受到网络命名空间的SOMAXCONN参数集的限制，而不是整个系统的限制。
+我们能验证一下吗？当然！
+小结
+在本文中，我们为读者介绍套接字在准备接受连接之前，系统在幕后做了哪些工作，以及“准备好接受连接”倒底意味着什么
+。由于篇幅较长，这里分为两个部分进行翻译，更多精彩内容，将在下篇中继续为读者介绍。

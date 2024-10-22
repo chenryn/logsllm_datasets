@@ -1,0 +1,286 @@
+        const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
+        struct page *page = NULL;
+        unsigned int alloc_flags;
+        unsigned long did_some_progress;
+        enum compact_priority compact_priority;
+        enum compact_result compact_result;
+        int compaction_retries;
+        int no_progress_loops;
+        unsigned int cpuset_mems_cookie;
+        int reserve_flags;
+        // 如果内存分配标志包含__GFP_ATOMIC(来自不能阻塞或延迟和失败没有回调的原子上下文的请求), __GFP_DIRECT_RECLAIM(可以直接回收, 表示有回收需要时会阻塞请求), 明显二者冲突, 此处做一个校验
+        if (WARN_ON_ONCE((gfp_mask & (__GFP_ATOMIC|__GFP_DIRECT_RECLAIM)) ==
+                    (__GFP_ATOMIC|__GFP_DIRECT_RECLAIM)))
+            gfp_mask &= ~__GFP_ATOMIC;
+    retry_cpuset:
+        compaction_retries = 0;
+        no_progress_loops = 0;
+        compact_priority = DEF_COMPACT_PRIORITY;
+        cpuset_mems_cookie = read_mems_allowed_begin();
+        // 降低要求, 重新构建标志位
+        alloc_flags = gfp_to_alloc_flags(gfp_mask);
+        ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
+                        ac->high_zoneidx, ac->nodemask);
+        if (!ac->preferred_zoneref->zone)
+            goto nopage;
+        // 如果设置了ALLOC_KSWAPD, 则唤醒交换进程
+        if (alloc_flags & ALLOC_KSWAPD)
+            wake_all_kswapds(order, gfp_mask, ac);
+        // 内存调整后再次分配
+        page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
+        if (page)
+            goto got_pg;
+        // 如果满足以下条件则尝试进行内存压缩
+        // 1. 如果标识__GFP_DIRECT_RECLAIM&ALLOC_NO_WATERMARK且order>3(costly_order=1)则进入__alloc_pages_direct_compact
+        // 2. 如果标识__GFP_DIRECT_RECLAIM&ALLOC_NO_WATERMARK且order 0 && ac->migratetype != MIGRATE_MOVABLE))
+                && !gfp_pfmemalloc_allowed(gfp_mask)) {
+            page = __alloc_pages_direct_compact(gfp_mask, order,
+                            alloc_flags, ac,
+                            INIT_COMPACT_PRIORITY,
+                            &compact_result);
+            if (page)
+                goto got_pg;
+            // 设置压缩参数, 后面会专门讲解这部分
+            if (order >= pageblock_order && (gfp_mask & __GFP_IO) &&
+                 !(gfp_mask & __GFP_RETRY_MAYFAIL)) {
+                if (compact_result == COMPACT_SKIPPED ||
+                    compact_result == COMPACT_DEFERRED)
+                    goto nopage;
+            }
+            if (costly_order && (gfp_mask & __GFP_NORETRY)) {
+                if (compact_result == COMPACT_DEFERRED)
+                    goto nopage;
+                compact_priority = INIT_COMPACT_PRIORITY;
+            }
+        }
+    retry:
+        // 再次唤醒交换进程
+        if (alloc_flags & ALLOC_KSWAPD)
+            wake_all_kswapds(order, gfp_mask, ac);
+        reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
+        if (reserve_flags)
+            alloc_flags = reserve_flags;
+        // 如果cpu不允许在zone所在node中分配内存且可以进行no_water_mark分配则通过ac->nodemask = NULL降低内存分配标准, 再次分配
+        if (!(alloc_flags & ALLOC_CPUSET) || reserve_flags) {
+            ac->nodemask = NULL;
+            ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
+                        ac->high_zoneidx, ac->nodemask);
+        }
+        page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
+        if (page)
+            goto got_pg;
+        if (!can_direct_reclaim)
+            goto nopage;
+        if (current->flags & PF_MEMALLOC)
+            goto nopage;
+        // 内存回收后分配内存
+        page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
+                                &did_some_progress);
+        if (page)
+            goto got_pg;
+        // 内存压缩后分配内存
+        page = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,
+                        compact_priority, &compact_result);
+        if (page)
+            goto got_pg;
+        if (gfp_mask & __GFP_NORETRY)
+            goto nopage;
+        if (costly_order && !(gfp_mask & __GFP_RETRY_MAYFAIL))
+            goto nopage;
+        // 分析是否应该再次内存回收
+        if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
+                     did_some_progress > 0, &no_progress_loops))
+            goto retry;
+        // 分析是否应该再次内存压缩
+        if (did_some_progress > 0 &&
+                should_compact_retry(ac, order, alloc_flags,
+                    compact_result, &compact_priority,
+                    &compaction_retries))
+            goto retry;
+        if (check_retry_cpuset(cpuset_mems_cookie, ac))
+            goto retry_cpuset;
+        // 杀死一些进程以获得内存
+        page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
+        if (page)
+            goto got_pg;
+        if (tsk_is_oom_victim(current) &&
+            (alloc_flags == ALLOC_OOM ||
+             (gfp_mask & __GFP_NOMEMALLOC)))
+            goto nopage;
+        if (did_some_progress) {
+            no_progress_loops = 0;
+            goto retry;
+        }
+    nopage:
+        if (check_retry_cpuset(cpuset_mems_cookie, ac))
+            goto retry_cpuset;
+        if (gfp_mask & __GFP_NOFAIL) {
+            if (WARN_ON_ONCE(!can_direct_reclaim))
+                goto fail;
+            WARN_ON_ONCE(current->flags & PF_MEMALLOC);
+            WARN_ON_ONCE(order > PAGE_ALLOC_COSTLY_ORDER);
+            // 使用ALLOC_HARDER标志进行内存分配
+            page = __alloc_pages_cpuset_fallback(gfp_mask, order, ALLOC_HARDER, ac);
+            if (page)
+                goto got_pg;
+            cond_resched();
+            goto retry;
+        }
+    fail:
+        warn_alloc(gfp_mask, ac->nodemask,
+                "page allocation failure: order:%u", order);
+    got_pg:
+        return page;
+    }
+## _free_pages源码分析
+    void __free_pages(struct page *page, unsigned int order)
+    {
+        // 检查并更新(-1)page->_refcount, 当page->_refcount=0时, return true
+        if (put_page_testzero(page))
+            // 如果order=0 --> free_unref_page
+            // 如果order>0 --> __free_pages_ok 
+            free_the_page(page, order);
+    }
+###  free_unref_page
+  * free_unref_page -> free_unref_page_commit 
+        static void free_unref_page_commit(struct page *page, unsigned long pfn)
+    {
+      struct zone *zone = page_zone(page);
+      struct per_cpu_pages *pcp;
+      int migratetype;
+      // 获得迁移类型
+      migratetype = get_pcppage_migratetype(page);
+      __count_vm_event(PGFREE);
+      // pcp_list 只放置unmovable, reclaimable, movable类型page
+      // 大于等于MIGRATE_PCPTYPES的迁移类型中MIGRATE_ISOLATE不能被放入pcp
+      if (migratetype >= MIGRATE_PCPTYPES) {
+          if (unlikely(is_migrate_isolate(migratetype))) {
+              // 放入伙伴系统
+              free_one_page(zone, page, pfn, 0, migratetype);
+              return;
+          }
+          migratetype = MIGRATE_MOVABLE;
+      }
+      pcp = &this_cpu_ptr(zone->pageset)->pcp;
+      // 将page放入pcp->lists[migratetype]链表表头
+      list_add(&page->lru, &pcp->lists[migratetype]);
+      pcp->count++;
+      // 如果pcp->count(pcp中页数目) >= pcp->high(pcp中最大页数目), 则将多余的page放入伙伴系统
+      if (pcp->count >= pcp->high) {
+          unsigned long batch = READ_ONCE(pcp->batch);
+          free_pcppages_bulk(zone, batch, pcp);
+      }
+    }
+####  free_pcppages_bulk
+    static void free_pcppages_bulk(struct zone *zone, int count,
+                        struct per_cpu_pages *pcp)
+    {
+        int migratetype = 0;
+        int batch_free = 0;
+        int prefetch_nr = 0;
+        bool isolated_pageblocks;
+        struct page *page, *tmp;
+        LIST_HEAD(head);
+        count = min(pcp->count, count);
+        // 通过循环遍历迁移类型列表, 依次递增删除页数(batch_free)
+        while (count) {
+            struct list_head *list;
+            do {
+                batch_free++;
+                // 循环查询pcp->lists[migratetype]
+                if (++migratetype == MIGRATE_PCPTYPES)
+                    migratetype = 0;
+                list = &pcp->lists[migratetype];
+            } while (list_empty(list));
+            // 只有一个迁移类型非空, 在这里释放全部count
+            if (batch_free == MIGRATE_PCPTYPES)
+                batch_free = count;
+            do {
+                // 从列表尾部获得page
+                page = list_last_entry(list, struct page, lru);
+                list_del(&page->lru);
+                pcp->count--;
+                if (bulkfree_pcp_prepare(page))
+                    continue;
+                // 将取出的page全部放入以head为头的链表中
+                list_add_tail(&page->lru, &head);
+                // 数据预取可以加快速度
+                if (prefetch_nr++ batch)
+                    prefetch_buddy(page);
+            } while (--count && --batch_free && !list_empty(list));
+        }
+        spin_lock(&zone->lock);
+        isolated_pageblocks = has_isolate_pageblock(zone);
+        list_for_each_entry_safe(page, tmp, &head, lru) {
+            // 获得迁移类型
+            int mt = get_pcppage_migratetype(page);
+            // 迁移类型不能是isolated
+            VM_BUG_ON_PAGE(is_migrate_isolate(mt), page);
+            if (unlikely(isolated_pageblocks))
+                mt = get_pageblock_migratetype(page);
+            // 释放page进入伙伴算法
+            __free_one_page(page, page_to_pfn(page), zone, 0, mt);
+            trace_mm_page_pcpu_drain(page, 0, mt);
+        }
+        spin_unlock(&zone->lock);
+    }
+###  __free_pages_ok
+  * __free_pages_ok -> free_one_page
+    static void free_one_page(struct zone *zone,
+                    struct page *page, unsigned long pfn,
+                    unsigned int order,
+                    int migratetype)
+    {
+        spin_lock(&zone->lock);
+        // 判断zone是否存在isolate迁移类型, page是否是isolate迁移类型(一般没有这个配置)
+         if (unlikely(has_isolate_pageblock(zone) ||
+            is_migrate_isolate(migratetype))) {
+            migratetype = get_pfnblock_migratetype(page, pfn);
+        }
+        __free_one_page(page, pfn, zone, order, migratetype);
+        spin_unlock(&zone->lock);
+    }
+####  __free_one_page
+    static inline void __free_one_page(struct page *page,
+            unsigned long pfn,
+            struct zone *zone, unsigned int order,
+            int migratetype)
+    {
+        unsigned long combined_pfn;
+        unsigned long uninitialized_var(buddy_pfn);
+        struct page *buddy;
+        unsigned int max_order;
+        struct capture_control *capc = task_capc(zone);
+        max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
+        VM_BUG_ON(!zone_is_initialized(zone));
+        VM_BUG_ON_PAGE(page->flags & PAGE_FLAGS_CHECK_AT_PREP, page);
+        VM_BUG_ON(migratetype == -1);
+        if (likely(!is_migrate_isolate(migratetype)))
+            // 更新zone状态
+            __mod_zone_freepage_state(zone, 1 _refcount == 0
+            // 若满足以上条件则buddy可合并
+            if (!page_is_buddy(page, buddy, order))
+                goto done_merging;
+            // it is CONFIG_DEBUG_PAGEALLOC guard page
+            if (page_is_guard(buddy))
+                clear_page_guard(zone, buddy, order, migratetype);
+            else
+                // 将buddy从对应free_area[order]中删除
+                del_page_from_free_area(buddy, &zone->free_area[order]);
+            // 设置合并页的struct page以及pfn
+            combined_pfn = buddy_pfn & pfn;
+            page = page + (combined_pfn - pfn);
+            pfn = combined_pfn;
+            order++;
+        }
+        if (max_order = pageblock_order.
+             * We want to prevent merge between freepages on isolate
+             * pageblock and normal pageblock. Without this, pageblock
+             * isolation could cause incorrect freepage or CMA accounting.
+             *
+             * We don't want to hit this code for the more frequent
+             * low-order merging.
+             */
+            if (unlikely(has_isolate_pageblock(zone))) {
+                int buddy_mt;
+                buddy_pfn = __find_buddy_pfn(pfn, order);

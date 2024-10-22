@@ -1,0 +1,89 @@
+ **Apache Airflow version** : 2.1.2 and also previous versions  
+I find this relevant for investigation: `apache-airflow-providers-apache-
+spark==1.0.3`
+**Kubernetes version (if you are using kubernetes)** (use `kubectl version`):
+NA
+**Environment** : linux
+  * **Cloud provider or hardware configuration** : NA
+  * **OS** (e.g. from /etc/os-release): NA
+  * **Kernel** (e.g. `uname -a`): NA
+  * **Install tools** : systemd to manage worker lifecycle
+  * **Others** :
+**What happened** :  
+We launch all our spark processes in cluster mode on YARN. This helps us in
+keeping resource hungry driver processes on YARN and airflow workers usually
+stay with deterministic workloads. During maintenance, we need to restart
+workers. Our users reported to have duplicate data in some instances and the
+time period for the respective job runs coincides with worker restarts. On
+investigation, I found out that airflow jobs are marked as failed due to
+SIGTERM during worker restart but spark job kept running on cluster. Due to
+retry policy, airflow launched another instance of exactly same spark job.
+**What you expected to happen** :  
+Spark job should have been killed before worker exit. The implementation is
+there but it seems to be not doing the trick.
+**How to reproduce it** :
+  * Use spark connection with yarn cluster mode.
+  * With spark operator, submit a spark job. It can even be a sleep of significant time. Keep number of retries for this task more than 1.
+  * Restart worker.
+  * You should see airflow launching another task
+  * Check yarn, there should be two instances of spark job instead of one.
+**Anything else we need to know** :  
+TLDR; There are couple of odd things with `on_kill` in spark hook.
+  * Same airflow task runner seems to be getting multiple SIGTERMs.
+  * `subprocess.wait` can not complete. It might be due to multiple SIGTERMs.
+  * Not executing renewer block and removing wait from subsequent subprocess call successfully kills the spark process from YARN.
+I did some investigation on the issue. The issue is around multiple
+`subprocess.wait` calls in `on_kill` calls of the spark submit hook. I had to
+bypass the kerberos renewer block to get following exception while in `wait`:
+    Traceback (most recent call last):
+      File "/xxx/lib64/python3.6/site-packages/airflow/providers/apache/spark/hooks/spark_submit.py", line 675, in on_kill
+        self.log.info("YARN app killed with return code: %s", yarn_kill.wait())
+      File "/usr/lib64/python3.6/subprocess.py", line 1477, in wait
+        (pid, sts) = self._try_wait(0)
+      File "/usr/lib64/python3.6/subprocess.py", line 1424, in _try_wait
+        (pid, sts) = os.waitpid(self.pid, wait_flags)
+      File "/xxx/lib64/python3.6/site-packages/airflow/models/taskinstance.py", line 1286, in signal_handler
+        raise AirflowException("Task received SIGTERM signal")
+    airflow.exceptions.AirflowException: Task received SIGTERM signal
+It seems like kerberos renewer block is silently swallowing that exception
+_and_ at the same time not letting yarn kill block get invoked.  
+Continuing on this path, removing wait from the yarn_kill command, invoked
+yarn kill successfully. I also added `trap '' SIGTERM;` for yarn_kill just to
+be sure that `SIGTERM` is not propagated to yarn_kill command. [Essentially we
+do want to kill running spark job at any cost]
+How often does this problem occur?  
+Pretty much on each worker restart.
+Any relevant logs to include? Put them here in side a detail tag:
+What happens
+    [2021-08-04 22:41:06,515] {local_task_job.py:77} ERROR - Received SIGTERM. Terminating subprocesses
+    [2021-08-04 22:41:06,521] {process_utils.py:100} INFO - Sending Signals.SIGTERM to GPID 24135
+    [2021-08-04 22:41:06,522] {taskinstance.py:1284} ERROR - Received SIGTERM. Terminating subprocesses.
+    [2021-08-04 22:41:06,523] {spark_submit.py:657} INFO - Sending kill signal to spark-submit
+    [2021-08-04 22:41:06,523] {spark_submit.py:660} INFO - Yarn application id: application_1627904414005_0022
+    [2021-08-04 22:41:06,523] {kerberos.py:74} INFO - Re-initialising kerberos from keytab: kinit -r 3600m -k -t /xxx/airflow.keytab -c /xxx/krb5cc_airflow airflow
+    [2021-08-04 22:41:07,034] {process_utils.py:66} INFO - Process psutil.Process(pid=26346, status='terminated') (26346) terminated with exit code None
+    [2021-08-04 22:41:07,221] {local_task_job.py:77} ERROR - Received SIGTERM. Terminating subprocesses
+    [2021-08-04 22:41:07,222] {taskinstance.py:1284} ERROR - Received SIGTERM. Terminating subprocesses.
+    [2021-08-04 22:41:07,228] {process_utils.py:100} INFO - Sending Signals.SIGTERM to GPID 24135
+    [2021-08-04 22:41:07,228] {taskinstance.py:1284} ERROR - Received SIGTERM. Terminating subprocesses.
+    [2021-08-04 22:41:07,235] {process_utils.py:66} INFO - Process psutil.Process(pid=26433, status='terminated') (26433) terminated with exit code None
+    [2021-08-04 22:41:07,235] {process_utils.py:66} INFO - Process psutil.Process(pid=24135, status='terminated') (24135) terminated with exit code 1
+Essentially, we don't see following block:
+    [2021-08-04 22:45:51,092] {kerberos.py:74} INFO - Re-initialising kerberos from keytab: kinit -r 3600m -k -t /xxx/airflow.keytab -c /xxx/krb5cc_airflow airflow
+    [2021-08-04 22:45:51,596] {process_utils.py:66} INFO - Process psutil.Process(pid=32619, status='terminated') (32619) terminated with exit code None
+    [2021-08-04 22:45:52,604] {kerberos.py:126} INFO - Renewing kerberos ticket to work around kerberos 1.8.1: kinit -c /xxx/krb5cc_airflow -R
+    [2021-08-04 22:45:53,975] {spark_submit.py:681} INFO - YARN app killed with return code: 0
+What works:
+                if self._yarn_application_id:
+                    yarn_trap_kill_cmd = f"trap '' SIGTERM; yarn application -kill {self._yarn_application_id}"
+                    kill_cmd = ["bash", "-c", yarn_trap_kill_cmd]
+                    env = {**os.environ, **(self._env or {})}
+                    # self._skip_renew_keytab is set to False for backward compat.
+                    if not self._skip_renew_keytab and self._keytab is not None and self._principal is not None:
+                        # we are ignoring renewal failures from renew_from_kt
+                        # here as the failure could just be due to a non-renewable ticket,
+                        # we still attempt to kill the yarn application
+                        renew_from_kt(self._principal, self._keytab, exit_on_fail=False)
+                        env = os.environ.copy()
+                        env["KRB5CCNAME"] = airflow_conf.get('kerberos', 'ccache')
+                    subprocess.Popen(kill_cmd, env=env, start_new_session=True)

@@ -1,0 +1,112 @@
+# 前言
+本文主要介绍如果使用 `qemu` 和 `unicorn` 来搜集程序执行的覆盖率信息以及如何把搜集到的覆盖率信息反馈到 `fuzzer` 中辅助
+`fuzz` 的进行。
+# AFL Fork Server
+为了后面介绍 `afl` 的 `qemu` 模式和 `unicorn` 模式， 首先大概讲一下 `afl` 的 `fork server`
+的实现机制。`afl` 与 `fork server` 的通信流程如图所示
+  1. 首先 `afl-fuzz` 调用 `init_forkserver` 函数 `fork` 出一个新进程作为 `fork server` ， 然后等待 `fork server` 发送 `4` 个字节的数据, 如果能够正常接收到数据则表示 `fork server` 启动正常。
+  2. `fork server` 起来后会使用 `read` 阻塞住， 等待 `afl-fuzz` 发送命令来启动一个测试进程。
+  3. 当需要进行一次测试时，`afl-fuzz` 会调用 `run_target` ， 首先往管道发送 4 个字节通知 `fork server` 去 `fork` 一个进程来测试。
+  4. `fork server` 新建进程后，会通过管道发送刚刚 `fork` 出的进程的 `pid` 给 `fork server`.
+  5. `afl-fuzz` 根据接收到的 `pid` 等待测试进程结束，然后根据测试生成的覆盖率信息来引导后续的测试。
+# AFL qemu 模式
+`AFL` 的 `qemu` 模式的实现和 `winafl` 使用 `dynamorio` 来插桩的实现方式比较类似，`winafl` 的实现细节如下
+    https://xz.aliyun.com/t/5108
+## 原始版本
+**源码地址**
+    https://github.com/google/AFL/tree/master/qemu_mode/patches
+`qemu` 在执行一个程序时，从被执行程序的入口点开始对基本块翻译并执行，为了提升效率，`qemu`会把翻译出来的基本块存放到 `cache` 中，当
+`qemu` 要执行一个基本块时首先判断基本块是否在 `cache` 中，如果在 `cache` 中则直接执行基本块，否则会翻译基本块并执行。
+`AFL` 的 `qemu` 模式就是通过在准备执行基本块的和准备翻译基本块的前面增加一些代码来实现的。首先会在每次执行一个基本块前调用
+`AFL_QEMU_CPU_SNIPPET2` 来和 `afl` 通信。
+    #define AFL_QEMU_CPU_SNIPPET2 do { \
+        if(itb->pc == afl_entry_point) { \
+          afl_setup(); \
+          afl_forkserver(cpu); \
+        } \
+        afl_maybe_log(itb->pc); \
+      } while (0)
+如果当前执行的基本块是 `afl_entry_point` （即目标程序的入口点），就设置好与 `afl` 通信的命名管道和共享内存并初始化 `fork
+server` ，然后通过 `afl_maybe_log` 往共享内存中设置覆盖率信息。统计覆盖率的方式和 `afl` 的方式一样。
+    cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8);
+      cur_loc &= MAP_SIZE - 1;
+      afl_area_ptr[cur_loc ^ prev_loc]++;  // 和 afl 一样 统计 edge 覆盖率
+`fork server` 的代码如下
+    static void afl_forkserver(CPUState *cpu) {
+      // 通知 afl-fuzz fork server 启动正常
+      if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+      // fork server 的主循环，不断地 fork 新进程
+      while (1) {
+        // 阻塞地等待 afl-fuzz 发送命令，fork 新进程
+        if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
+        child_pid = fork(); // fork 新进程
+        if (!child_pid) {
+          // 子进程会进入这，关闭通信管道描述符，然后从 afl_forkserver 返回继续往下执行被测试程序
+          afl_fork_child = 1;
+          close(FORKSRV_FD);
+          close(FORKSRV_FD + 1);
+          close(t_fd[0]);
+          return;
+        }
+        // fork server 进程，发送 fork 出来的测试进程的 pid 给 afl-fuzz
+        if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
+        // 不断等待处理 测试进程的 翻译基本块的请求
+        afl_wait_tsl(cpu, t_fd[0]);
+        // 等待子进程结束
+        if (waitpid(child_pid, &status, 0) < 0) exit(6);
+        if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
+      }
+    }
+`forkserver` 的代码流程如下
+  1. 首先发送数据给 `afl-fuzz`, 表示 `fork server` 启动正常，通知完之后会进入循环阻塞在 read ，直到 afl-fuzz 端发送消息。
+  2. 接收到数据后，`fork server` 会 `fork` 出新进程，此时子进程会关闭所有与 `afl-fuzz` 通信的文件描述符并从 `afl_forkserver` 返回继续往下执行被测试程序。而父进程则把刚刚 `fork`出的测试进程的 `pid` 通过管道发送给 `afl-fuzz`。
+  3. 之后 `fork server` 进程进入 `afl_wait_tsl` ，不断循环处理子进程翻译基本块的请求。
+下面分析 `afl_wait_tsl` 的原理， 首先 `afl` 会在 翻译基本块后插入一段代码
+    tb = tb_gen_code(cpu, pc, cs_base, flags, 0); // 翻译基本块
+                     AFL_QEMU_CPU_SNIPPET1;  // 通知父进程 (fork server进程) 刚刚翻译了一个基本块
+    #define AFL_QEMU_CPU_SNIPPET1 do { \
+        afl_request_tsl(pc, cs_base, flags); \
+      } while (0)
+`afl_request_tsl` 就是把测试进程刚刚翻译的基本块的信息发送给父进程（`fork server` 进程)
+    static void afl_request_tsl(target_ulong pc, target_ulong cb, uint64_t flags) {
+      struct afl_tsl t;
+      if (!afl_fork_child) return;
+      t.pc      = pc;
+      t.cs_base = cb;
+      t.flags   = flags;
+      // 通过管道发送信息给 父进程 （fork server 进程)
+      if (write(TSL_FD, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
+        return;
+    }
+下面看看 `afl_wait_tsl` 的代码
+    static void afl_wait_tsl(CPUState *cpu, int fd) {
+      while (1) {
+        // 死循环不断接收子进程的翻译基本块请求
+        if (read(fd, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
+          break;
+        // 去fork server进程的 tb cache 中搜索
+        tb = tb_htable_lookup(cpu, t.pc, t.cs_base, t.flags);
+        // 如果该基本块不在在 cache 中就使用 tb_gen_code 翻译基本块并放到 cache 中 
+        if(!tb) {
+          mmap_lock();
+          tb_lock();
+          tb_gen_code(cpu, t.pc, t.cs_base, t.flags, 0);
+          mmap_unlock();
+          tb_unlock();
+        }
+      }
+      close(fd);
+    }
+代码流程如下
+  1. 这个函数里面就是一个死循环，不断地接收测试进程翻译基本块的请求。
+  2. 接收到请求后会使用 `tb_htable_lookup` 在 `fork server` 进程的 `cache` 中搜索，如果基本块不在 `cache` 中的话就使用 `tb_gen_code` 翻译基本块并放置到 `fork server` 进程的 `cache` 中。
+这个函数有两个 `tips` 。
+  1. 首先函数里面是死循环，只有当 `read` 失败了才会退出循环，`read` 又是阻塞的，所以只有 `fd` 管道的另一端关闭了才会 `read` 失败退出函数，所以当子进程执行结束或者由于进程超时被 `afl-fuzz` 杀死后， `afl_wait_tsl` 就会因为 `read` 失败而退出该函数，等待接下来的 `fork` 请求。
+  2. 子进程向父进程( `fork server` 进程)发送基本块翻译请求的原因是让 `fork server` 进程把子进程刚刚翻译的基本块在 `fork server` 进程也翻译一遍并放入 `cache`，这样在后续测试中 `fork` 出的新进程就会由于 `fork` 的特性继承 `fork server` 的 `tb cache`，从而避免重复翻译之前子进程翻译过的基本块。
+## 改进版本
+**源码地址**
+    https://github.com/vanhauser-thc/AFLplusplus
+在原始的 `AFL qemu` 版本中获取覆盖率的方式是在每次翻译基本块前调用 `afl_maybe_log` 往 `afl-fuzz`
+同步覆盖率信息，这种方式有一个问题就是由于 `qemu` 会把顺序执行的基本块 `chain`
+一起，这样可以提升执行速度。但是在这种方式下有的基本块就会由于 `chain` 的原因导致追踪不到基本块的执行， `afl` 的处理方式是禁用 `qemu`
+的 `chain` 功能，这样则会削减 `qemu` 的性能。

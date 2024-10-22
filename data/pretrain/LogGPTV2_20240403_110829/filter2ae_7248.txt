@@ -1,0 +1,96 @@
+这是内核漏洞挖掘技术系列的第一篇。
+## 前言
+提到linux内核fuzz目前最流行的工具是syzkaller，不过在syzkaller出现之前(github上首次commit是2015年10月)linux内核fuzz用到最多的工具是trinity(github上首次commit是2006年3月，1.0版本发布于2012年8月)，并且就在2019年1月刚刚发布了1.9版本()。trinity网上也有各种二次开发的版本，有各种修改后在android下面跑的()，有用来fuzz
+perf_event_open系统调用的perf_fuzzer()等等。比起来trinity算得上是元老级的fuzz工具了。本文会详细分析trinity目前最新的1.9版本的实现。
+## 整体架构
+下面是《LCA: The Trinity fuzz tester》这篇文章中给的一张图。  
+trinity-main执行各种初始化，然后创建执行系统调用的子进程。trinity-main创建的共享内存区域用于记录各种全局信息(打开文件描述符号、执行的系统调用总数以及成功和失败的系统调用数等等)和每个子进程的各种信息(pid和执行的系统调用信息等等)。  
+trinity-watchdog确保系统正常工作。它会检查子进程是否正在运行(可能会在系统调用中被暂停)，如果没有运行，则会将其杀死。当主进程检测到其中一个子进程已终止时(因为trinity-watchdog将其终止或出于其它原因)会启动一个新的子进程来替换它。trinity-watchdog还监视共享内存区域的完整性。  
+(PS:《LCA: The Trinity fuzz tester》这篇文章是几年以前的了，根据后文的源码分析目前trinity-watchdog的功能已经被整合到trinity-main中)  
+在trinity文件夹下除了子目录，还有下面这些源代码文件。
+  * blockdevs.c：块设备相关(目前没有用到)  
+  * child.c：执行fuzz的子进程
+  * debug.c：调试功能
+  * devices.c：解析/proc/devices和/proc/misc以对ioctl进行fuzz
+  * ftrace.c：ftrace功能，记录到/boot/trace.txt文件
+  * generate-args.c：系统调用参数的生成释放等处理
+  * kcov.c：代码覆盖率功能(目前没有用到)
+  * locks.c：锁功能，根据前面的叙述我们知道有多个进程操作共享内存区域，所以需要加锁
+  * log-files.c：将日志记录到本地文件
+  * udp.c：将日志记录到远程服务器
+  * log.c：对udp.c和log-files.c的封装  
+可以通过命令行参数选择将日志记录到远程服务器或者本地文件，也可以禁用日志功能。默认将日志记录到本地文件。将日志记录到服务器相关实现在server文件夹中。  
+这里我们只看将日志记录到本地文件中的情况。主进程的日志记录到trinity.log。  
+每个子进程都将它执行的系统调用信息写入一个单独的日志文件trinity-child1.log\trinity-child2.log……。  
+  * arg-decoder.c：子进程在执行系统调用前后会调用到其中的函数记录信息到syscallrecord结构体中的prebuffer(子进程child编号/pid/每次执行系统调用依次递增的编号/是否是32位/系统调用名和参数)和postbuffer(返回值/错误代码)中，然后写入到trinity-childx.log(如上图中所示)  
+  * main.c：被trinity.c通过main_loop函数调用，执行主要功能
+  * objects.c：管理系统调用中用到的文件描述符，每一种文件描述符具体的操作在fds文件夹中  
+  * output.c：打印信息
+  * params.c：命令行参数处理
+  * pathnames.c：系统调用参数如果是路径名提供相关参数
+  * pids.c：pid管理
+  * post-mortem.c：检测到taint之后向trinity-post-mortem.log写入每个子进程最后一个系统调用信息
+  * results.c：系统调用执行成功之后的处理
+  * shm.c：共享内存区域的初始化和创建
+  * signals.c：信号功能
+  * stats.c：打印系统调用执行总数，成功的数目，失败的数目和错误代码
+  * syscall.c：执行系统调用
+  * sysv-shm.c：初始化时创建供系统调用使用的共享内存(是用shmget函数创建的共享内存，不是前面说的shm.c中用mmap函数创建的用来记录各种全局信息的模拟的共享内存，后面没有特殊说明提到共享内存指的是后者)
+  * tables-biarch.c：同时使用64位和32位两种架构的系统调用
+  * tables-uniarch.c：只使用一种架构的系统调用
+  * tables.c：对tables-biarch.c和tables-uniarch.c的封装  
+可以通过命令行参数指定一种架构。  
+  * taint.c：taint功能
+  * trinity.c：执行一些初始化操作并调用main.c中的main_loop函数
+  * uid.c：uid的初始化和检查等功能
+  * utils.c：一些辅助函数
+trinity文件夹下含有源代码文件的子目录如下。
+  * childops：该目录下有四个文件，目前用到的只有random-syscall.c这一个文件，其它的在child.c中被注释掉了。random_syscall函数当然就是随机进行系统调用了，后面再详细介绍  
+  * fds：前面已经介绍
+  * include：用到的头文件
+  * ioctls：ioctl相关fuzz。每组ioctl都用ioctl_group结构体表示，ioctls中的ioctls.c提供get_random_ioctl_group等函数，通过syscalls中的ioctl.c中的syscallentry结构体进行调用  
+syscallentry结构体中的sanitise函数用来在生成系统调用参数之后对参数进行调整。这里就是调用的sanitise_ioctl函数，sanitise_ioctl函数会调用ioctl_group结构体中的sanitise函数，对于sgx_grp调用的是pick_random_ioctl函数从这一组ioctl中随机选择一个。  
+  * mm：该目录下有四个文件，maps-initial.c创建初始的内存映射，每个子进程随后会将它们复制为自己的私有副本  
+fault-write.c和fault-read.c分别提供random_map_writefn函数和random_map_readfn函数供dirty_mapping函数随机对映射做一些操作。前面可以看到创建子进程调用init_child_mappings函数之后就会调用dirty_mapping函数，此外在mmap和mmap2系统调用返回之后也会随机调用dirty_mapping函数。  
+syscallentry结构体中的post函数在系统调用返回之后被调用。  
+maps.c提供了前面所说的dirty_mapping函数和init_child_mappings函数，还有其它一些相关函数。
+  * net：net相关fuzz。和ioctls差不多，在syscalls中的send.c/setsockopt.c/socket.c中调用
+  * rand：生成随机数，随机长度，随机地址等
+  * server：前面已经介绍
+  * syscalls：被fuzz的系统调用，使用syscallentry结构体描述
+  * tools：只有一个analyze-sockets.c源代码文件，用来分析socket文件
+## trinity-main
+下面我们从trinity.c的main函数开始分析。  
+首先设置最大子进程数max_children为CPU核心数的4倍。然后处理参数，除了前面说到的还有几个比较有用的选项，比如-c表示fuzz指定的系统调用；-N表示指定fuzz的系统调用数量；-V接受目录参数，程序随机打开该目录中的文件，并将生成的文件描述符传递给系统调用，有助于发现特定文件系统类型中的漏洞等等。  
+接下来创建并初始化共享内存区域。共享内存区域shm_s结构体定义在include\shm.h中，该结构体中的children是一个二维数组，数组中的每一个元素都是指向子进程使用的childdata结构体的指针。  
+初始化系统调用，整体架构中已经提到了系统调用是通过include\syscallentry.h中的syscallentry结构体定义的，syscalltable结构体中的entry是一个指向syscallentry结构体的指针，所以通过指向syscalltable结构体的指针table通过table[i].entry可以取到所有的syscallentry。在include目录下arch-xxx.h定义了不同架构的syscalltable。  
+比如当前操作系统是__x86_64__，那么include的是arch-x86-64.h。  
+在arch-x86-64.h里面定义了当前同时使用64位和32位两种架构的系统调用。  
+在syscallentry结构体中可以看到每个系统调用中包含系统调用名、参数个数、返回值类型和每一个参数的参数名、类型、取值范围等等。  
+在初始化系统调用的过程中会调用它们的init函数。只有perf_event_open这个系统调用定义了相应的init函数。  
+初始化文件描述符，整体架构中已经提到了objects.c管理系统调用中用到的文件描述符，每一种文件描述符具体的操作在fds文件夹中，都用fd_provider结构体表示，初始化时调用它们的open函数。  
+还有其它的一些初始化操作，之后重点就在于main_loop函数，从main_loop函数退出以后执行一些清理善后的操作。在main_loop函数中首先记录下main函数已经开始，然后调用fork_children函数创建执行系统调用的子进程。在while循环中，只要子进程还在运行，就一直执行下面这些操作：  
+1.首先在handle_children函数中等待子进程停止的信号。如果1秒之后没有接收到则返回。如果接收到则找到相应的子进程然后调用handle_child函数处理。  
+在handle_child函数中如果子进程是正常终止则记录该子进程已经退出，删除它的所有有关引用，重新创建子进程；如果子进程是异常终止或者暂停则调用相应的处理函数handle_childsig，handle_childsig函数除了做一些记录，其它的处理和handle_child函数大致相同。  
+2.检查内核是否taint，是则调用stop_ftrace函数停止ftrace并调用post-mortem.c中的tainted_postmortem函数，整体架构中已经提到了其功能是检测到taint之后向trinity-post-mortem.log写入每个子进程最后一个系统调用信息。  
+3.检查共享内存区域是否损坏，是否持有共享内存区域的锁和每一个子进程使用的childdata结构体中的syscallrecord的锁。  
+4.如果通过-N参数设定了fuzz系统调用的数量那么检查是否达到该数量。  
+5.检查每一个子进程在进行最后一次系统调用之前记录的时间戳，记录进程是否处于僵尸状态。如果已经过去了30秒或者40秒及以上则发送SIGKILL信号杀死进程。  
+如果所有的进程都处于僵尸状态，随机发送SIGKILL信号杀死进程。  
+6.打印当前状态，如果正在运行的进程少于max_children则再创建进程。  
+退出while循环之后如果共享内存区域没有损坏继续调用handle_children函数。如果还有子进程运行则杀死并记录下main函数已经结束。  
+## 子进程
+下面我们重点来看子进程中的操作。前面我们已经知道了子进程是由fork_children函数创建的。在fork_children函数中调用了spawn_child函数。spawn_child函数中fork成功以后调用了child_process函数。在经过一些初始化操作以后，如果uid不为0，会调用到random_syscall函数。整体架构中已经提到了childops目录下的random-syscall.c中的random_syscall函数。  
+random_syscall函数中首先随机选择一个系统调用。如果同时启用了64位的系统调用和32位的系统调用则有10%的几率选择32位的系统调用。如果该系统调用设置了AVOID_SYSCALL或者NI_SYSCALL标志的话还需要将其从active_syscall表中删除并重新选择。  
+接下来生成函数参数。如果函数参数类型为ARG_UNDEFINED则随机生成一个数作为参数，对于其余的参数类型在generic_sanitise函数中调用fill_arg函数生成。在fill_arg函数中根据参数类型调用不同的函数生成对应的参数。  
+比如参数是ARG_NON_NULL_ADDRESS类型(比如write函数的第二个参数)，从初始化时sysv-shm.c创建的共享内存中找一块。  
+再比如参数是ARG_SOCKETINFO类型(比如getsockname函数的第一个参数)，从初始化文件描述符时创建的OBJ_FD_SOCKET中找一个。  
+如果设置了EXTRA_FORK标志，在一个fork出的进程中执行系统调用。目前只有execveat和execve系统调用设置了这个标志，因为它们会将子进程替换掉。  
+执行系统调用之后立即进行taint检测。  
+如果系统调用返回值为-1说明调用失败，错误代码是ENOSYS(函数没有实现)则将其从active_syscall表中删除，对于其它的错误代码进行记录。  
+否则说明调用成功，对于ARG_FD类型和ARG_LEN类型的参数进行记录。  
+之后就是一些清理的工作。  
+本文的分析就到此为止了。总的来说trinity还比较原始，不能自动生成复现的POC，函数参数类型有限，不支持代码覆盖率……如果有兴趣，也可以像前言中提到的那样做二次开发。以后会分享更多内核漏洞挖掘技术，争取写成一个系列。
+## 参考资料
+1.[LCA: The Trinity fuzz tester](https://lwn.net/Articles/536173/ "LCA: The
+Trinity fuzz tester")

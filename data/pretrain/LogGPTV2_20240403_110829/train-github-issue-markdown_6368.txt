@@ -1,0 +1,85 @@
+This is 100% a duplicate of #9984, however it's pretty old and nobody will
+likely notice that a comment was made on it, so I figure I'd recreate it to
+give it some attention.
+I'd be more than happy to implement this feature, as I found myself wishing it
+existed for the same reason the OP did all those months ago, however, I'm
+stuck at a bit of a crossroads when it comes the actual implementation.
+Here's a rundown of my understanding of the situation and work involved in
+this feature. I'd love some feedback on whether I'm right or wrong on some
+points, completely talking out of my ass, etc.; as well as some advice on what
+the ES team would consider the preferred approach:
+When a snapshot of an index is taken, it dumps blobs of the data of each
+shard, along with the entirety of an index's metadata (mappings, aliases,
+etc.) to a blobstore (s3, azure storage, etc.)
+Later, when restoring, the restoration process effectively:
+  1. Replaces an existing index's metadata with that which is in the snapshot if the index already exists in the cluster; if not, it creates a new index with the same name and metadata in the snapshot. (or uses other name/metadata/etc. if the operator specified it in the restore request)
+  2. Allocates new shards, and fills them with the data in the snapshot's blobs, and sets the index's shard routing table to these "new" restored shards. The old shards, if they existed, somehow get reaped.
+In essence, if an index already existed and gets restored from a snapshot, it
+effectively gets completely replaced with a completely different index
+containing the snapshot's data, just one that happens to have all the same
+metadata and naming, etc. of the snapshotted one.
+This means that fundamentally, to restore specific shard(s), I just need to
+create "new" shards for the shards I want to restore, and then update the
+routing for the index to use those new shards and keep the shards that I'm not
+restoring untouched.
+The RestoreService is very intimately coupled with all of conveniences that
+the snapshot restore feature gives you such as renaming the index, changing
+the number of replicas, etc. that (IMO) do not apply to the operation of
+restoring specific shards. Furthermore, some of these conveniences are only
+possible because of the fact that a restored index is really just a brand new
+index.
+In the scenarios that I can imagine for restoring specific shards, one would
+just want a no-bullshit, replacement of (a) corrupt shard(s), ASAP, without
+affecting the rest of the index properties.
+Inside o.e.s.RestoreService.restoreSnapshot$ClusterStateUpdateTask.execute (at
+lines 266-268) (see also, lines 341-347) there's an `ignoredShards` Set that
+gets generated during the restore operation which is used when the `partial`
+flag is enabled for a snapshot restore. The `partial` flag tells ES, "if you
+have any trouble restoring a shard from snapshot for this restore operation,
+just create an empty one instead of failing the restore". These "troublesome"
+shards are put into `ignoredShards`.
+This means that I am left with two choices:
+### 1)
+Modify RestoreService, RestoreRequest, RestoreSnapshotRequest,
+TransportRestoreSnapshotAction, and probably others to take an
+`"only_restore_shards": [int]` field.  
+If this new field is given, it prohibits you from performing metadata changes
+(by giving the operator a stern talking to if they try to do metadata updates
+in a shard-only restore via an error message), which should hopefully simplify
+the implementation a little bit.  
+Furthermore, an `only_restore_shards` implies a `partial` restore, **with the
+major caveat being** ,  
+the meaning of a `partial` restore gets changed (see the point under 50/50).
+After this change, in a `partial` restore, if the index already existed and
+there are shards in `ignoredShards`, they're actually ignored as opposed to
+replaced with blanks. i.e., shards IDs that are listed in `ignoreShards` and
+exist in the index get reused. (keep reading and this will all make sense)
+Benefits:
+  * The `ignoredShards` Set actually works as expected, and you can fill it with the difference of the set of all shards numbers in the index and the set of the shard numbers you want to restore (i.e., in `only_restore_shards`; meaning it ignores [reuses] the existing [unaffected] ones) and the code makes a bit more intuitive sense.
+  * Compared to option 2, there's a lot less boilerplate code to be written, and minimal modifications to the API.
+  * If the snapshot you're restoring from has bad shards, and you've opted for a "partial" restore, instead of you potentially losing the data in those shards, at least some data gets kept. This is great for PoLA in the intuitive sense of "partial". Additionally, an `only_restore_shards` operation implies a "partial" restore in the intuitive sense, which ties into the next point:
+50/50:
+  * The semantics of a `partial` restore get inverted, rather than you getting a "partially complete" index restored, you're "partially restoring" the index. (I want to say that this leans a bit towards a drawback, given that ES has had this semantic for a while now, _buuuuuuuuut_ it's certainly more in line with what you would intuitively expect a "partial" restore to mean)
+Drawbacks:
+  * Due to the previously mentioned intimate coupling, this will make the RestoreService even more complicated than it already is.
+  * It creates the need for a bunch of additional validations and potential edge cases that will need to be considered inside the Requests and their builders.
+  * This is my first deep foray into patching ES, and I'm more than confident that I'll probably break something that tests might not catch and nobody would have even thought possible :P
+  * More room for potentially odd bugs in RestoreService due to its increased complexity.
+### 2)
+Create a RestoreShardsService/RestoreShardsRequest/etc./etc./etc. along with a
+new REST endpoint such as /_snapshots/etc/etc/_restore_shards as well as a
+corresponding TransportAction.
+Benefits:
+  * Cleaner implementation and separation of concerns by starting from a clean slate and not further complicating RestoreService.
+  * Less likely to break anything as all the logic is separated out into its own module
+  * No weird short circuits or retrofits around the whole "an `ignoredShard` is really just replaced with an empty shard" logic.
+  * Full backwards compatibility (assuming someone uses the current `partial` semantics to their advantage somehow?).
+  * No need for particularly crazy validations, as the _restore_shards action really just takes a snapshot, a single index and a list of shards to restore from it. As long as the snapshot can satisfy the shards to be restored, there's no reason for it to fail.
+50/50:
+  * You don't get to invert the semantics of a `partial` restore to be more intuitive. On the other hand, this might not be necessary since you can now always cherry pick the shards to restore, meaning a full index restore (which is the only way to do it as is), would only get used in the worst case that your index is totally fucked. In which case, if the shards in the snapshot are bad, you're proper fucked anyway.
+  * An entire `ClusterService` seems kinda heavy for something that should really be an extension of the RestoreService anyway, but on the other hand RestoreService is a pretty damn big chunk of code.
+Drawbacks:
+  * Tons of boilerplate code that bloats up the codebase for request objects, builders, actions, transport, etc.
+  * I'd be effectively duplicating a lot of logic that's in RestoreService to perform a very specific operation, which is invariably a code smell.
+Thanks for taking the time to read this wall of text, and apologies if it's in
+poor form to self-bump by making a new issue!

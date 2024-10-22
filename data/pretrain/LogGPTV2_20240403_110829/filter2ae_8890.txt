@@ -1,0 +1,95 @@
+Android内核漏洞学习——CVE-2014-3153分析（1）[]
+上篇文章主要介绍了漏洞原理及漏洞相关知识，本篇主要介绍漏洞利用手法
+### 漏洞利用
+利用requeue和relock导致的结果是在pi_state->pi_mutex残留了一个在线程2栈上的rt_waiter
+我们可以 ** _重用栈空间_** 来控制rt_waiter
+我们先分析下栈空间，我们用[checkstack.pl](https://github.com/spotify/linux/blob/master/scripts/checkstack.pl)脚本分析下
+    arm-linux-androideabi-objdump -d vmlinux | ./checkstack.pl arm
+rt_waiter并不是栈空间最后，所以我们要覆盖并不需要达到196栈深度，towelroot选择了用__sys_sendmmsg去操作rt_waiter
+我们先看下rt_waiter的struct
+图（图源自天融信阿尔法实验室分析文章）为___sys_sendmsg函数栈上数据与rt_waiter的重叠部分
+其中一部分数据是iovstack（*（msgvec.msg_iov））的部分内容，一部分是msgvec.msg_name的部分内容。所以很明显，
+通过写入特定的msgvec.msg_name和msgvec.msg_iov，就可以改写rt_waiter节点的内容，使之按照我们的路径去执行。
+所以我们应该怎样修改，漏洞利用中，我们要做的是通过修改链表，往特定地址写入值，下面我们可以看一个小例子
+    void node_remove(struct node *n)
+    {
+        //lets skip handling for first and last element,
+        //assume that we only delete something in the middle
+        struct node *prevnode = n->prev;
+        struct node *nextnode = n->next;
+        nextnode->prev = prevnode;
+        prevnode->next = nextnode;
+    }
+如果我们可以控制n的内容，就可以将值写入任意地址
+X为我们想写入的地址，fakenode是我们构造的假结构体
+    n->prev = X-8;
+    n->next = fakenode;
+然后我们call node_remove可以造成以下效果，往X里写入fakenode的地址
+    (n->next)->prev = n->prev;
+    (n->prev)->next = n->next;
+    (fakenode)->prev = n->prev;
+    (X-8)->next = fakenode;
+这里需要利用到plist链表。在plist链表中有两个链，一个是prio链，一个是节点链。那么一个节点，
+为什么要两个链？因为他们具有不同的视图，用途不一样。链表中的每个节点都不同，但是他们的prio值是可以相同的（具有相同的优先级），所以
+node_list链接了所有节点，而prio_list仅链接了prio不同的节点，具体情况如下图（源于天融信阿尔法实验室分析文章）:
+我们利用内核锁的唤醒在内核中插入链表，这个插入的位置可以根据prio参数来选择，因为程序会按顺序排，我们只要适当的修改prio参数即可
+这时候我们在用户空间mma一块内存，按照rt_waiter的结构初始化指针，创建一个fake_node
+然后将fake_node链在rt_waiter后面，通过fake_node.list_entry.prio_list.next我们可以拿到rt_waiter内核态的栈地址
+我们现在有了内核态的栈地址，也可以往任意地址写此值，那么怎么才能够对内核的任意地址进行写入任意值？我们需要修改thread_info ->
+addr_limit，这个变量规定了特定线程的用户空间地址最大值，超过这个值的地址，用户空间代码不能访问，这里有个小技巧，$sp(任意内核栈的地址) &
+0xffffe000 == thread_info
+addr，我们现在有了addr_limit的地址，可以将addr_limit改大，但是这时我们修改addr_limit的值不可控，由于不同线程的rt_waiter的addr不同，且无法预测，所以我们可以不断往addr_limit写入rt_waiter的地址，直到此地址>addr_limit的地址，然后往addr_limit写入0xffffffff，从而达到内核栈任意写的目的
+下面是改写addr_limit的具体流程
+0x71是栈上遗留的rt_waiter，0x81和0x85是用户态创建的fake_node，这时候我们将0x85的prev指向addr_limit，然后我们用调用futex_lock_pi插入新节点0x84，并按prio优先级排序，这样我们可以向addr_limit写入0x84的next指针
+下面是多线程循环写入addr_limit具体流程
+A起到了监听效果，循环读取addr_limit的值，可以了就往addr_limit写入0xfffffff，B起到了循环写入的效果
+我们拿到内核栈任意写的权限之后我们可以修改thread->task_struct->cred，修改uid、gid、suid为0，从而实现root提权
+    cred->uid = 0;
+      cred->gid = 0;
+      cred->suid = 0;
+      cred->sgid = 0;
+      cred->euid = 0;
+      cred->egid = 0;
+      cred->fsuid = 0;
+      cred->fsgid = 0;
+      cred->cap_inheritable.cap[0] = 0xffffffff;
+      cred->cap_inheritable.cap[1] = 0xffffffff;
+      cred->cap_permitted.cap[0] = 0xffffffff;
+      cred->cap_permitted.cap[1] = 0xffffffff;
+      cred->cap_effective.cap[0] = 0xffffffff;
+      cred->cap_effective.cap[1] = 0xffffffff;
+      cred->cap_bset.cap[0] = 0xffffffff;
+      cred->cap_bset.cap[1] = 0xffffffff;
+      security = cred->security;
+      if (security) {
+        if (security->osid != 0
+         && security->sid != 0
+         && security->exec_sid == 0
+         && security->create_sid == 0
+         && security->keycreate_sid == 0
+         && security->sockcreate_sid == 0) {
+          security->osid = 1;
+          security->sid = 1;
+        }
+      }
+利用步骤总结如下：
+  1. 在用户态调用mmap开辟一块空间，按照rt_waiter的结构初始化指针，创建一个fake_node
+  2. 将将fake_node链在rt_waiter后面，拿到thread_info地址
+  3. 利用prio的指针链表实现可控地址写不可控值
+  4. 多线程改写addr_limit，实现内核栈地址任意写
+  5. 修改thread_info->task_struct->cred实现root提权
+### 官方补丁
+cve-2014-3153打的补丁，
+    struct futex_q *this, *next;
+        if (requeue_pi) {
+            /*
+             * Requeue PI only works on two distinct uaddrs. This
+             * check is only valid for private futexes. See below.
+             */
+            if (uaddr1 == uaddr2)
+                return -EINVAL;
+补丁要求两个futexes地址不同，修补了requeue bug
+### 总结
+内核漏洞的利用要对内核漏洞相关的数据结构十分清晰，这时候源码很重要，此漏洞本质上是uaf的利用，精妙的构思使得两个不起眼的漏洞拥有了巨大的威力，十分佩服写出来exp的大牛及漏洞发现者，同时也感谢网上各篇分析文章的作者
+### reference
+《漏洞战争》CVE-2014-3153Android内核Futex提取漏洞

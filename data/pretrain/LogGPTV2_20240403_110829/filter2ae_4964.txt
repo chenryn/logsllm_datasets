@@ -1,0 +1,158 @@
+**作者：字节跳动无恒实验室  
+原文链接：**
+**本文为404星链计划项目 Appshark 实战操作，分享使用 Appshark 挖掘到 2 个 CVE 漏洞的案例。**
+**项目地址：  
+404星链计划： **
+### 一、背景
+LaunchAnywhere是安卓最为经典的漏洞类型之一，现在被Google称为Intent
+Redirection：https://support.google.com/faqs/answer/9267555?hl=en。无恒实验室一直对该类型漏洞有研究，我们把这一类问题比作“安卓上的SSRF”，其中Intent就像一个HTTP请求，而未经验证完全转发了这个请求在安卓上会导致严重的安全问题。关于这类漏洞的逻辑与利用，推荐阅读：这篇文章。
+本文将介绍使用appshark引擎挖掘AOSP中Intent
+Redirection漏洞的一个实际例子，发现的问题被Google评为高危并授予了CVE-2021-39707 &
+CVE-2022-20223。appshark为无恒实验室自研的自动化漏洞及隐私合规检测工具，当前工具已开源，欢迎感兴趣的朋友试用，开源地址：。
+### 二、appshark规则编写
+为了简化问题，我们使用一个非常基础的规则IntentRedirectionBabyVersion：
+    {
+        "IntentRedirectionNoSan": {
+          "enable": true,
+          "SliceMode": true,
+          "traceDepth": 6,
+          "desc": {
+            "name": "IntentRedirectionBabyVersion",
+            "category": "IntentRedirection",
+            "detail": "Intent redirection, but a very basic version",
+            "wiki": "",
+            "possibility": "2",
+            "model": "high"
+          },
+          "entry": {},
+          "source": {
+            "Return": [
+              "",
+              ""
+            ]
+          },
+          "sink": {
+            "": {
+              "LibraryOnly": true,
+              "TaintParamType": [
+                "android.content.Intent",
+                "android.content.Intent[]"
+              ],
+              "TaintCheck": [
+                "p*"
+              ]
+            }
+          }
+        }
+      }
+可以看到这个规则仅仅考虑从getParcelable到startActivity的数据流，且不考虑sanitizer。这和我们实际使用的规则有一些差别，但足够说明问题。
+这里我们扫描的目标是com.android.settings，也就是“Settings”应用。作为一个具有system
+uid的高权限应用，Settings是AOSP漏洞挖掘的常见目标。
+### 三、人工排查与漏洞原理
+#### 3.1 漏洞原理
+扫描出的结果较多，并不是全都可用的，尤其是我们并没有设置任何的sanitizer。经过人工逐个检查，我们发现这一条扫描结果看上去可利用性很高：
+    {
+        "details": {
+            "position": "",
+            "Sink": [
+                "->$r2_1"
+            ],
+            "entryMethod": "",
+            "Source": [
+                "->$r5"
+            ],
+            "url": "/Users/admin/submodules/appshark/out/vulnerability/17-IntentRedirectionBabyVersion.html",
+            "target": [
+                "->$r5",
+                "->$r2_1"
+            ]
+        },
+        "hash": "9bfcf0665601df186b025859e4f4c2df4e5f9cb2",
+        "possibility": "2"
+    }
+其对应的代码在AOSP中的位置为
+            public void onReceive(Context context, Intent intent) {
+                Bundle results = getResultExtras(true);
+                final ArrayList restrictions = results.getParcelableArrayList(
+                        Intent.EXTRA_RESTRICTIONS_LIST);
+                Intent restrictionsIntent = results.getParcelable(CUSTOM_RESTRICTIONS_INTENT);
+                if (restrictions != null && restrictionsIntent == null) {
+                    onRestrictionsReceived(preference, restrictions);
+                    if (mRestrictedProfile) {
+                        mUserManager.setApplicationRestrictions(packageName,
+                                RestrictionsManager.convertRestrictionsToBundle(restrictions), mUser);
+                    }
+                } else if (restrictionsIntent != null) {
+                    preference.setRestrictions(restrictions);
+                    if (invokeIfCustom && AppRestrictionsFragment.this.isResumed()) {
+                        assertSafeToStartCustomActivity(restrictionsIntent);
+                        int requestCode = generateCustomActivityRequestCode(
+                                RestrictionsResultReceiver.this.preference);
+                        AppRestrictionsFragment.this.startActivityForResult(
+                                restrictionsIntent, requestCode);
+                    }
+                }
+            }
+注意到Google考虑了这个地方有可能存在Intent
+Redirection导致的越权，因此添加了一个assertSafeToStartCustomActivity作为安全检查：
+            private void assertSafeToStartCustomActivity(Intent intent) {
+                // Activity can be started if it belongs to the same app
+                if (intent.getPackage() != null && intent.getPackage().equals(packageName)) {
+                    return;
+                }
+                // Activity can be started if intent resolves to multiple activities
+                List resolveInfos = AppRestrictionsFragment.this.mPackageManager
+                        .queryIntentActivities(intent, 0 /* no flags */);
+                if (resolveInfos.size() != 1) {
+                    return;
+                }
+                // Prevent potential privilege escalation
+                ActivityInfo activityInfo = resolveInfos.get(0).activityInfo;
+                if (!packageName.equals(activityInfo.packageName)) {
+                    throw new SecurityException("Application " + packageName
+                            + " is not allowed to start activity " + intent);
+                }
+            }
+        }
+然而，这个十几行的检查函数远远不够安全，现在我们知道其中实际上隐藏了两个可以被绕过的逻辑。最开始被注意到的是第7-11行的代码，假如有多个Activity符合这个Intent，则这个检查会直接通过：
+                // Activity can be started if intent resolves to multiple activities
+                List resolveInfos = AppRestrictionsFragment.this.mPackageManager
+                        .queryIntentActivities(intent, 0 /* no flags */);
+                if (resolveInfos.size() != 1) {
+                    return;
+                }
+Intent假如有多个符合的Activity，会触发用户选择的逻辑。即便我们假设这个选择过程中用户不会因为操作产生安全问题，仅仅依靠resolveInfos.size()
+!= 1 也不能保证选择流程会出现，原因是Activity在Manifest中有一个配置叫做android:priority
+，即优先级。这个配置在AOSP的系统应用中很常见，当Intent可以resolve到多个Activity时，如果其中存在高优先级的Activity则会被直接选择，并不会触发用户选择的流程。因此，假如我们能找到某个存在priority
+> 0 且本身具有利用价值的Activity，则可以直接通过Intent
+Redirection进行利用。很不巧的是，最常见的可利用Activity正好满足这一条件：
+PrivilegedCallActivity需要CALL_PRIVILEGED权限才能被调用，这一权限仅仅赋予系统应用，第三方应用无法获得。通过这个Activity我们可以直接让手机拨打任意电话（包括紧急电话），合适的利用可以造成“窃听”的效果。
+#### 3.2 威胁场景
+要触发这个漏洞，我们需要先了解AppRestrictionsFragment是用来做什么的。实际上，安卓提供一种叫做“Restricted
+Profile”的受限用户类型，通常在安卓平板上使用。这类用户能够使用的APP以及能看到的内容都可以被主用户控制。在安卓手机上，我们可以通过adb命令添加这类用户：
+    adb shell pm create-user --restricted restricted-user
+之后在多用户的设置界面就可以看到受限用户，而AppRestrictionsFragment就是用来控制该用户能使用哪些APP的。除了设置APP启用与否，还能对APP进行单独的设置（注意PwnRestricted旁边的齿轮）：
+当我们点击这个设置选项时，一个action为android.intent.action.GET_RESTRICTION_ENTRIES
+的Intent会发送给对应APP，因此我们的PoC中需要定义一个满足条件的Receiver来接收Intent。在这个Receiver里，我们需要把恶意Intent放在result的EXTRA_RESTRICTIONS_INTENT中。同时，为了满足前文提到的“多个Activity符合Intent”的条件，我们还需要自定义一个Activity，它的filter和PrivilegedCallActivity一样：
+这个Activity并不会被start，原因是PrivilegedCallActivity的优先级更高。
+至此，点击AppRestrictionsFragment界面的PoC应用设置图标，就会直接启动PrivilegedCallActivity拨打电话，整个利用就完成了。这就是CVE-2021-39707，一个完全可控的Intent
+Redirection，但需要用户交互才能触发。注意它已经被修复了，因此在最新版本的安卓上无法复现。
+#### 3.3 One More Bug
+当上文的漏洞被修复之后，我在回顾时发现，assertSafeToStartCustomActivity还存在另一个问题，就在第一个if：
+                // Activity can be started if it belongs to the same app
+                if (intent.getPackage() != null && intent.getPackage().equals(packageName)) {
+                    return;
+                }
+这一段的逻辑是，假如intent的package和PoC相同，说明是打开PoC自己的Activity，那就可以通过检查。简单看上去同样没问题，然而Intent有个非常特殊的地方，即Component和Package是两个互不相关的变量
+()：
+        private String mPackage;
+        private ComponentName mComponent;
+而在resolve一个Intent时，Component的优先级是最高的，当它被设置时，mPackage会被直接忽略。因此，假如我们有一个同时设置了Package和Component的Intent，就可以直接满足assertSafeToStartCustomActivity的检查，甚至不需要一个高优先级的Activity。这样我们发现了第二个高危漏洞，也就是CVE-2022-20223。
+### 四、总结
+通过这篇文章我们看到，即便仅有一条非常简单的漏洞规则，appshark也能帮助我们发现AOSP的高危漏洞。当然，扫描器不是万能的，后续的绕过及利用都需要人工分析；但如果没有appshark，我们从一开始就不会注意到这个地方。
+在扫描规则上，我们仅仅考虑了从getParcelable到startActivity的数据流，实际上Intent
+Redirection的sink可以是其他组件，例如startService或是sendBroadcast，而source也未必是getParcelable。这些更多的可能就留给读者尝试，希望你也能借助appshark发现安卓应用的安全问题，或是取得自己的安卓CVE。
+最后，直接使用外部的Intent来startActivity（或是启动其他类型的组件如Service）是非常危险的，开发者应当尽量避免这类行为。即便是Google，在注意到需要进行安全检查的前提下，仍然在一个十几行的函数中写出了两个高危漏洞。
+### 五、关于无恒实验室
+无恒实验室是由字节跳动资深安全研究人员组成的专业攻防研究实验室，致力于为字节跳动旗下产品与业务保驾护航。通过漏洞挖掘、实战演练、黑产打击、应急响应等手段，不断提升公司基础安全、业务安全水位，极力降低安全事件对业务和公司的影响程度。无恒实验室希望持续与业界共享研究成果，协助企业避免遭受安全风险，亦望能与业内同行共同合作，为网络安全行业的发展做出贡献。
+* * *

@@ -1,0 +1,156 @@
+## AIO (asynchronous IO) and DIO (direct IO) support for PostgreSQL  
+### 作者        
+digoal        
+### 日期        
+2021-02-24        
+### 标签        
+PostgreSQL , AIO , DirectIO     
+----        
+## 背景     
+https://github.com/anarazel/postgres/tree/aio  
+https://www.mail-archive.com/PI:EMAIL/msg81695.html     
+Hi,  
+over the last ~year I spent a lot of time trying to figure out how we could  
+add AIO (asynchronous IO) and DIO (direct IO) support to postgres. While  
+there's still a *lot* of open questions, I think I now have a decent handle on  
+most of the bigger architectural questions.  Thus this long email.  
+Just to be clear: I don't expect the current to design to survive as-is. If  
+there's a few sentences below that sound a bit like describing the new world,  
+that's because they're from the README.md in the patch series...  
+## Why Direct / unbuffered IO?  
+The main reason to want to use Direct IO are:  
+- Lower CPU usage / higher throughput. Particularly on modern storage  
+  buffered writes are bottlenecked by the operating system having to  
+  copy data from the kernel's page cache to postgres buffer pool using  
+  the CPU. Whereas direct IO can often move the data directly between  
+  the storage devices and postgres' buffer cache, using DMA. While  
+  that transfer is ongoing, the CPU is free to perform other work,  
+  with little impact. 更低的cpu开销和更高的IO读写吞吐, 因为不需要从os cache拷贝到pg shared buffer  
+- Avoiding double buffering between operating system cache and  
+  postgres' shared\_buffers. 避免双份缓存  
+- Better control over the timing and pace of dirty data writeback. 数据库进程自主控制flush持久化回写操作  
+- Potential for concurrent WAL writes (via O\_DIRECT | O\_DSYNC writes) 可以支持 wal 并行写, 再次提升数据库写能力吞吐  
+The main reason *not* to use Direct IO are:  
+- Without AIO, Direct IO is unusably slow for most purposes.  必须依赖aio来支持dio, 否则性能无法被提升  
+- Even with AIO, many parts of postgres need to be modified to perform  
+  explicit prefetching.  需要改造PG内核IO操作, 支持预读能力  
+- In situations where shared\_buffers cannot be set appropriately  
+  large, e.g. because there are many different postgres instances  
+  hosted on shared hardware, performance will often be worse then when  
+  using buffered IO.  如果PG shared buffer不能设置为一个较大值, 也没有必要使用dio, 因为性能可能不如当前的OS buffer io, 如一个主机上跑很多个PG实例时.    
+## Why Asynchronous IO  
+- Without AIO we cannot use DIO  
+- Without asynchronous IO (AIO) PG has to rely on the operating system  
+  to hide the cost of synchronous IO from Postgres. While this works  
+  surprisingly well in a lot of workloads, it does not do as good a job  
+  on prefetching and controlled writeback as we would like.  
+- There are important expensive operations like fdatasync() where the  
+  operating system cannot hide the storage latency. This is particularly  
+  important for WAL writes, where the ability to asynchronously issue  
+  fdatasync() or O\_DSYNC writes can yield significantly higher  
+  throughput.  
+- Fetching data into shared buffers asynchronously and concurrently with query  
+  execution means there is more CPU time for query execution.  
+## High level difficulties adding AIO/DIO support  
+- Optionally using AIO leads to convoluted and / or duplicated code.  
+- Platform dependency: The common AIO APIs are typically specific to one  
+  platform (linux AIO, linux io\_uring, windows IOCP, windows overlapped IO) or  
+  a few platforms (posix AIO, but there's many differences).  
+- There are a lot of separate places doing IO in PG. Moving all of these to  
+  use efficiently use AIO is an, um, large undertaking.  
+- Nothing in the buffer management APIs expects there to be more than one IO  
+  to be in progress at the same time - which is required to do AIO.  
+## Portability & Duplication  
+To avoid the issue of needing non-AIO codepaths to support platforms without  
+native AIO support a worker process based AIO implementation exists (and is  
+currently the default). This also is convenient to check if a problem is  
+related to the native IO implementation or not.  
+Thanks to Thomas Munro for helping a *lot* around this area. He wrote  
+the worker mode, the posix aio mode, added CI, did a lot of other  
+testing, listened to me...  
+## Deadlock and Starvation Dangers due to AIO  
+Using AIO in a naive way can easily lead to deadlocks in an environment where  
+the source/target of AIO are shared resources, like pages in postgres'  
+shared\_buffers.  
+Consider one backend performing readahead on a table, initiating IO for a  
+number of buffers ahead of the current "scan position". If that backend then  
+performs some operation that blocks, or even just is slow, the IO completion  
+for the asynchronously initiated read may not be processed.  
+This AIO implementation solves this problem by requiring that AIO methods  
+either allow AIO completions to be processed by any backend in the system  
+(e.g. io\_uring, and indirectly posix, via signal handlers), or to guarantee  
+that AIO processing will happen even when the issuing backend is blocked  
+(e.g. worker mode, which offloads completion processing to the AIO workers).  
+## AIO API overview  
+The main steps to use AIO (without higher level helpers) are:  
+1) acquire an "unused" AIO: pgaio\_io\_get()  
+2) start some IO, this is done by functions like  
+   pgaio\_io\_start\_(read|write|fsync|flush\_range)\_(smgr|sb|raw|wal)  
+   The (read|write|fsync|flush\_range) indicates the operation, whereas  
+   (smgr|sb|raw|wal) determines how IO completions, errors, ... are handled.  
+   (see below for more details about this design choice - it might or not be  
+   right)  
+3) optionally: assign a backend-local completion callback to the IO  
+   (pgaio\_io\_on\_completion\_local())  
+4) 2) alone does *not* cause the IO to be submitted to the kernel, but to be  
+   put on a per-backend list of pending IOs. The pending IOs can be explicitly  
+   be flushed pgaio\_submit\_pending(), but will also be submitted if the  
+   pending list gets to be too large, or if the current backend waits for the  
+   IO.  
+   The are two main reasons not to submit the IO immediately:  
+   - If adjacent, we can merge several IOs into one "kernel level" IO during  
+     submission. Larger IOs are considerably more efficient.  
+   - Several AIO APIs allow to submit a batch of IOs in one system call.  
+5) wait for the IO: pgaio\_io\_wait() waits for an IO "owned" by the current  
+   backend. When other backends may need to wait for an IO to finish,  
+   pgaio\_io\_ref() can put a reference to that AIO in shared memory (e.g. a  
+   BufferDesc), which can be waited for using pgaio\_io\_wait\_ref().  
+6) Process the results of the request. If a callback was registered in 3),  
+   this isn't always necessary. The results of AIO can be accessed using  
+   pgaio\_io\_result() which returns an integer where negative numbers are  
+   -errno, and positive numbers are the [partial] success conditions  
+   (e.g. potentially indicating a short read).  
+7) release ownership of the io (pgaio\_io\_release()) or reuse the IO for  
+   another operation (pgaio\_io\_recycle())  
+Most places that want to use AIO shouldn't themselves need to care about  
+managing the number of writes in flight, or the readahead distance. To help  
+with that there are two helper utilities, a "streaming read" and a "streaming  
+write".  
+The "streaming read" helper uses a callback to determine which blocks to  
+prefetch - that allows to do readahead in a sequential fashion but importantly  
+also allows to asynchronously "read ahead" non-sequential blocks.  
+E.g. for vacuum, lazy\_scan\_heap() has a callback that uses the visibility map  
+to figure out which block needs to be read next. Similarly lazy\_vacuum\_heap()  
+uses the tids in LVDeadTuples to figure out which blocks are going to be  
+needed. Here's the latter as an example:  
+https://github.com/anarazel/postgres/commit/a244baa36bfb252d451a017a273a6da1c09f15a3#diff-3198152613d9a28963266427b380e3d4fbbfabe96a221039c6b1f37bc575b965R1906  
+## IO initialization layering  
+One difficulty I had in this process was how to initialize IOs in light of the  
+layering (from bufmgr.c over smgr.c and md.c to fd.c and back, but also  
+e.g. xlog.c). Sometimes AIO needs to be initialized on the bufmgr.c level,  
+sometimes on the md.c level, sometimes on the level of fd.c. But to be able to  
+react to the completion of any such IO metadata about the operation is needed.  
+Early on fd.c initialized IOs, and the context information was just passed  
+through to fd.c. But that seems quite wrong - fd.c shouldn't have to know  
+about which Buffer an IO is about. But higher levels shouldn't know about  
+which files an operation resides in either, so they can't do all the work  
+either...  
+To avoid that, I ended up splitting the "start an AIO" operation into a higher  
+level part, e.g. pgaio\_io\_start\_read\_smgr() - which doesn't know about which  
+smgr implementation is in use and thus also not what file/offset we're dealing  
+with, which calls into smgr->md->fd to actually "prepare" the IO (i.e. figure  
+out file / offset).  This currently looks like:  
+```  
+void  
+pgaio\_io\_start\_read\_smgr(PgAioInProgress *io, struct SMgrRelationData* smgr,   
+ForkNumber forknum,  
+                                                 BlockNumber blocknum, char   
+*bufdata)  
+{  
+        pgaio\_io\_prepare(io, PGAIO\_OP\_READ);  
+        smgrstartread(io, smgr, forknum, blocknum, bufdata);  
+        io->scb\_data.read\_smgr.tag = (AioBufferTag){  
+                .rnode = smgr->smgr\_rnode,  
+                .forkNum = forknum,  
+                .blockNum = blocknum  
+        };  

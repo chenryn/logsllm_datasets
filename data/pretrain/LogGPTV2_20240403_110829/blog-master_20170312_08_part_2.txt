@@ -1,0 +1,188 @@
+opportunity to make use of 'unified' BufFile concepts from Peter  
+Geoghegan's work, or create some new reusable shared tuple spilling  
+infrastructure.  
+3.  COSTING  
+For now, I have introduced a GUC called cpu_shared_tuple_cost which  
+provides a straw-man model of the overhead of exchanging tuples via a  
+shared hash table, and the extra process coordination required.  If  
+it's zero then a non-shared hash plan (ie multiple copies) has the  
+same cost as a shared hash plan, even though the non-shared hash plan  
+wastefully runs P copies of the plan.  If cost represents runtime and  
+and we assume perfectly spherical cows running without interference  
+from each other, that makes some kind of sense, but it doesn't account  
+for the wasted resources and contention caused by running the same  
+plan in parallel.  I don't know what to do about that yet.  If  
+cpu_shared_tuple_cost is a positive number, as it probably should be  
+(more on that later), then shared hash tables look more expensive than  
+non-shared ones, which is technically true (CPU cache sharing etc) but  
+unhelpful because what you lose there you tend to gain by not running  
+all those plans in parallel.  In other words cpu_shared_tuple_cost  
+doesn't really model the cost situation at all well, but it's a useful  
+GUC for development purposes for now as positive and negative numbers  
+can be used to turn the feature on and off for testing...  As for  
+work_mem, it seems to me that 9.6 already established that work_mem is  
+a per participant limit, and it would be only fair to let a shared  
+plan use a total of work_mem * P too.  I am still working on work_mem  
+accounting and reporting.  Accounting for the parallelism in parallel  
+shared hash plans is easy though: their estimated tuple count is  
+already divided by P in the underlying partial path, and that is a  
+fairly accurate characterisation of what's going to happen at  
+execution time:  it's often going to go a lot faster, and those plans  
+are the real goal of this work.  
+STATUS  
+Obviously this is a work in progress.  I am actively working on the following:  
+* rescan  
+* batch number increases  
+* skew buckets  
+* costing model and policy/accounting for work_mem  
+* shared batch file reading  
+* preloading next batch  
+* debugging and testing  
+* tidying and refactoring  
+The basic approach is visible and simple cases are working though, so  
+I am submitting this WIP work for a round of review in the current  
+commitfest and hoping to get some feedback and ideas.  I will post the  
+patch in a follow-up email shortly...  Thanks for reading!  
+[1] https://www.postgresql.org/message-id/flat/CAEepm=1z5WLuNoJ80PaCvz6EtG9dN0j-KuHcHtU6QEfcPP5-qA(at)mail(dot)gmail(dot)com#CAEepm=PI:EMAIL  
+[2] https://www.postgresql.org/message-id/flat/CAEepm%3D0HmRefi1%2BxDJ99Gj5APHr8Qr05KZtAxrMj8b%2Bay3o6sA%40mail.gmail.com  
+[3] https://www.postgresql.org/message-id/flat/CAEepm%3D2_y7oi01OjA_wLvYcWMc9_d%3DLaoxrY3eiROCZkB_qakA%40mail.gmail.com  
+--   
+Thomas Munro  
+http://www.enterprisedb.com  
+```  
+例子  
+原始情况，并行构建哈希表实际上外表是每个WORKER工作进程都是全量读取的，并没有拆分。        
+```  
+postgres=# create table tbla(id int8 primary key, c1 int8);  
+CREATE TABLE  
+postgres=# create table tblb(id int8 primary key, c1 int8);  
+CREATE TABLE  
+postgres=# insert into tbla select generate_series(1,5000000), random()*10000;  
+INSERT 0 5000000  
+postgres=# insert into tblb select generate_series(1,5000000), random()*100000;  
+INSERT 0 5000000  
+postgres=# set min_parallel_table_scan_size =0;  
+SET  
+postgres=# set min_parallel_index_scan_size =0;  
+SET  
+postgres=# set parallel_setup_cost =0;  
+SET  
+postgres=# set parallel_tuple_cost =0;  
+SET  
+postgres=# set max_parallel_workers=128;  
+SET  
+postgres=# set force_parallel_mode =on;  
+SET  
+postgres=# set max_parallel_workers_per_gather =4;  
+SET  
+postgres=# alter table tbla set (parallel_workers =32);  
+ALTER TABLE  
+postgres=# alter table tblb set (parallel_workers =32);  
+ALTER TABLE  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select tbla.c1,count(*),sum(tblb.c1),avg(tblb.c1) from tbla join tblb using (id) group by tbla.c1;  
+                                                                       QUERY PLAN                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------  
+ Finalize HashAggregate  (cost=208083.65..208232.93 rows=9952 width=80) (actual time=2865.351..2871.004 rows=10001 loops=1)  
+   Output: tbla.c1, count(*), sum(tblb.c1), avg(tblb.c1)  
+   Group Key: tbla.c1  
+   Buffers: shared hit=162876  
+   ->  Gather  (cost=207337.25..207486.53 rows=39808 width=80) (actual time=2766.289..2831.069 rows=50005 loops=1)  
+         Output: tbla.c1, (PARTIAL count(*)), (PARTIAL sum(tblb.c1)), (PARTIAL avg(tblb.c1))  
+         Workers Planned: 4  
+         Workers Launched: 4  
+         Buffers: shared hit=162876  
+         ->  Partial HashAggregate  (cost=207337.25..207486.53 rows=9952 width=80) (actual time=2763.021..2769.581 rows=10001 loops=5)  
+               Output: tbla.c1, PARTIAL count(*), PARTIAL sum(tblb.c1), PARTIAL avg(tblb.c1)  
+               Group Key: tbla.c1  
+               Buffers: shared hit=162180  
+               Worker 0: actual time=2761.708..2768.271 rows=10001 loops=1  
+                 Buffers: shared hit=32220  
+               Worker 1: actual time=2761.978..2768.377 rows=10001 loops=1  
+                 Buffers: shared hit=32512  
+               Worker 2: actual time=2762.589..2769.099 rows=10001 loops=1  
+                 Buffers: shared hit=32185  
+               Worker 3: actual time=2762.840..2769.427 rows=10001 loops=1  
+                 Buffers: shared hit=32185  
+               ->  Hash Join  (cost=139528.00..194837.25 rows=1250000 width=16) (actual time=2012.875..2540.816 rows=1000000 loops=5)  
+                     Output: tbla.c1, tblb.c1  
+                     Inner Unique: true  
+                     Hash Cond: (tbla.id = tblb.id)  
+                     Buffers: shared hit=162180  
+                     Worker 0: actual time=2038.831..2550.300 rows=959965 loops=1  
+                       Buffers: shared hit=32220  
+                     Worker 1: actual time=2000.501..2540.438 rows=1013985 loops=1  
+                       Buffers: shared hit=32512  
+                     Worker 2: actual time=2039.682..2547.897 rows=953490 loops=1  
+                       Buffers: shared hit=32185  
+                     Worker 3: actual time=2039.998..2548.110 rows=953310 loops=1  
+                       Buffers: shared hit=32185  
+                     ->  Parallel Seq Scan on public.tbla  (cost=0.00..39528.00 rows=1250000 width=16) (actual time=0.012..107.563 rows=1000000 loops=5)  
+                           Output: tbla.id, tbla.c1  
+                           Buffers: shared hit=27028  
+                           Worker 0: actual time=0.014..107.047 rows=959965 loops=1  
+                             Buffers: shared hit=5189  
+                           Worker 1: actual time=0.011..113.478 rows=1013985 loops=1  
+                             Buffers: shared hit=5481  
+                           Worker 2: actual time=0.014..106.765 rows=953490 loops=1  
+                             Buffers: shared hit=5154  
+                           Worker 3: actual time=0.016..106.519 rows=953310 loops=1  
+                             Buffers: shared hit=5154  
+                     -- -- 注意，下面的是并行，但是每个worker进程全量读取数据。  
+                     ->  Hash  (cost=77028.00..77028.00 rows=5000000 width=16) (actual time=1987.927..1987.927 rows=5000000 loops=5)  
+                           Output: tblb.c1, tblb.id  
+                           Buckets: 8388608  Batches: 1  Memory Usage: 299911kB  
+                           Buffers: shared hit=135140  
+                           Worker 0: actual time=2014.261..2014.261 rows=5000000 loops=1  
+                             Buffers: shared hit=27028  
+                           Worker 1: actual time=1975.721..1975.721 rows=5000000 loops=1  
+                             Buffers: shared hit=27028  
+                           Worker 2: actual time=2014.507..2014.507 rows=5000000 loops=1  
+                             Buffers: shared hit=27028  
+                           Worker 3: actual time=2015.002..2015.002 rows=5000000 loops=1  
+                             Buffers: shared hit=27028  
+                           ->  Seq Scan on public.tblb  (cost=0.00..77028.00 rows=5000000 width=16) (actual time=0.018..702.727 rows=5000000 loops=5)  
+                                 Output: tblb.c1, tblb.id  
+                                 Buffers: shared hit=135140  
+                                 Worker 0: actual time=0.020..722.961 rows=5000000 loops=1  
+                                   Buffers: shared hit=27028  
+                                 Worker 1: actual time=0.021..705.710 rows=5000000 loops=1  
+                                   Buffers: shared hit=27028  
+                                 Worker 2: actual time=0.020..714.658 rows=5000000 loops=1  
+                                   Buffers: shared hit=27028  
+                                 Worker 3: actual time=0.025..717.066 rows=5000000 loops=1  
+                                   Buffers: shared hit=27028  
+ Planning time: 0.576 ms  
+ Execution time: 2874.424 ms  
+(70 rows)  
+postgres=# explain  select tbla.c1,count(*),sum(tblb.c1),avg(tblb.c1) from tbla join tblb using (id) group by tbla.c1;  
+                                           QUERY PLAN                                             
+------------------------------------------------------------------------------------------------  
+ Finalize HashAggregate  (cost=208083.65..208232.93 rows=9952 width=80)  
+   Group Key: tbla.c1  
+   ->  Gather  (cost=207337.25..207486.53 rows=39808 width=80)  
+         Workers Planned: 4  
+         ->  Partial HashAggregate  (cost=207337.25..207486.53 rows=9952 width=80)  
+               Group Key: tbla.c1  
+               ->  Hash Join  (cost=139528.00..194837.25 rows=1250000 width=16)  
+                     Hash Cond: (tbla.id = tblb.id)  
+                     ->  Parallel Seq Scan on tbla  (cost=0.00..39528.00 rows=1250000 width=16)  
+                     ->  Hash  (cost=77028.00..77028.00 rows=5000000 width=16)  
+                           ->  Seq Scan on tblb  (cost=0.00..77028.00 rows=5000000 width=16)  
+(11 rows)  
+```  
+patch 如下  
+https://commitfest.postgresql.org/14/871/  
+```  
+$tar -zxvf parallel-shared-hash-v15.patchset.tgz  
+$cd postgresql-10beta2/  
+$patch -p1 < ../parallel-shared-hash-v15.patchset/0001-hj-refactor-memory-accounting-v15.patch   
+...  
+$patch -p1 < ../parallel-shared-hash-v15.patchset/0010-hj-parallel-v15.patch   
+LIBS=-lpthread  CFLAGS="-O3" ./configure --prefix=/home/digoal/pgsql10  
+LIBS=-lpthread  CFLAGS="-O3" make world -j 64  
+LIBS=-lpthread  CFLAGS="-O3" make install-world  
+```  
+更新后，我们看到hash table的构建并行，并且每个WORKER只读取部分数据  
+```  
+postgres=# set max_parallel_workers_per_gather =7;  
+SET  

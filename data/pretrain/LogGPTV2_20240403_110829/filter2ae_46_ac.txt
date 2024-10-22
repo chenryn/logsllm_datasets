@@ -1,0 +1,203 @@
+    fuzzer=""
+    # 检查程序的.bc文件是否存在，否则无法生成CG
+    if [ $# -eq 3 ]; then
+      fuzzer=$(find $BINARIES -name "$3.0.0.*.bc" | rev | cut -d. -f5- | rev)
+      if [ $(echo "$fuzzer" | wc -l) -ne 1 ]; then
+        echo "Couldn't find bytecode for fuzzer $3 in folder $BINARIES."
+        exit 1
+      fi
+    fi
+    SCRIPT=$0
+    ARGS=$@
+    #SANITY CHECKS
+    if [ -z "$BINARIES" ]; then echo "Couldn't find binaries folder ($1)."; exit 1; fi
+    if ! [ -d "$BINARIES" ]; then echo "No directory: $BINARIES."; exit 1; fi
+    if [ -z "$TMPDIR" ]; then echo "Couldn't find temporary directory ($3)."; exit 1; fi
+    binaries=$(find $BINARIES -name "*.0.0.*.bc" | rev | cut -d. -f5- | rev)
+    if [ -z "$binaries" ]; then echo "Couldn't find any binaries in folder $BINARIES."; exit; fi
+    if [ -z $(which python) ] && [ -z $(which python3) ]; then echo "Please install Python"; exit 1; fi
+    #if python -c "import pydotplus"; then echo "Install python package: pydotplus (sudo pip install pydotplus)"; exit 1; fi
+    #if python -c "import pydotplus; import networkx"; then echo "Install python package: networkx (sudo pip install networkx)"; exit 1; fi
+    FAIL=0
+    STEP=1
+    # 该变量是为了在脚本因为其他原因断掉后，可以直接接着上次结果运行，断点存在state文件中
+    RESUME=$(if [ -f $TMPDIR/state ]; then cat $TMPDIR/state; else echo 0; fi)
+    # 该函数记录脚本运行到哪个阶段，方便断掉后下次可以接着断开前继续运行
+    function next_step {
+      echo $STEP > $TMPDIR/state
+      if [ $FAIL -ne 0 ]; then
+        tail -n30 $TMPDIR/step${STEP}.log
+        echo "-- Problem in Step $STEP of generating $OUT!"
+        echo "-- You can resume by executing:"
+        echo "$ $SCRIPT $ARGS $TMPDIR"
+        exit 1
+      fi
+      STEP=$((STEP + 1))
+    }
+上一步得到的图其实只有 CFG，CG 需要调用 llvm 自带的 pass 来生成。
+    #-------------------------------------------------------------------------------    # Construct control flow graph and call graph
+    #-------------------------------------------------------------------------------    if [ $RESUME -le $STEP ]; then
+      cd $TMPDIR/dot-files
+      # 如果声明的fuzzer程序不存在，则需要对binary目录下的所有程序都生成CG，否则只需要对声明的fuzzer生成CG。
+      if [ -z "$fuzzer" ]; then
+        for binary in $(echo "$binaries"); do
+          echo "($STEP) Constructing CG for $binary.."
+          prefix="$TMPDIR/dot-files/$(basename $binary)"
+           # 调用opt-11的-dot-callgraph pass来生成对应程序的CG
+          while ! opt-11 -dot-callgraph $binary.0.0.*.bc -callgraph-dot-filename-prefix $prefix >/dev/null 2> $TMPDIR/step${STEP}.log ; do
+            echo -e "\e[93;1m[!]\e[0m Could not generate call graph. Repeating.."
+          done
+          #Remove repeated lines and rename
+          awk '!a[$0]++' $(basename $binary).callgraph.dot > callgraph.$(basename $binary).dot
+          rm $(basename $binary).callgraph.dot
+        done
+        # 由于这里对所有的程序都生成了CG，需要合并为一张图
+        #Integrate several call graphs into one
+        $AFLGO/merge_callgraphs.py -o callgraph.dot $(ls callgraph.*)
+        echo "($STEP) Integrating several call graphs into one."
+      else
+        # 一般只会进入到这里
+        echo "($STEP) Constructing CG for $fuzzer.."
+        prefix="$TMPDIR/dot-files/$(basename $fuzzer)"
+        # 调用opt-11的-dot-callgraph pass来生成对应程序的CG
+        while ! opt-11 -dot-callgraph $fuzzer.0.0.*.bc -callgraph-dot-filename-prefix $prefix >/dev/null 2> $TMPDIR/step${STEP}.log ; do
+          echo -e "\e[93;1m[!]\e[0m Could not generate call graph. Repeating.."
+        done
+        #Remove repeated lines and rename
+        awk '!a[$0]++' $(basename $fuzzer).callgraph.dot > callgraph.dot
+        rm $(basename $fuzzer).callgraph.dot
+      fi
+    fi
+    next_step
+生成了 CG 后，就可以计算距离了，按照 AFLGo 的设计，距离分为 function-level 和 basicblock-level
+的距离，先计算函数维度的距离，再计算基本块维度的距离，最后得到每一个可以到达目标点的基本块到目标点的距离。
+    #-------------------------------------------------------------------------------    # Generate config file keeping distance information for code instrumentation
+    #-------------------------------------------------------------------------------    if [ $RESUME -le $STEP ]; then
+      echo "($STEP) Computing distance for call graph .."
+      # 首先计算函数维度的距离
+      $AFLGO/distance.py -d $TMPDIR/dot-files/callgraph.dot -t $TMPDIR/Ftargets.txt -n $TMPDIR/Fnames.txt -o $TMPDIR/distance.callgraph.txt > $TMPDIR/step${STEP}.log 2>&1 || FAIL=1
+      if [ $(cat $TMPDIR/distance.callgraph.txt | wc -l) -eq 0 ]; then
+        FAIL=1
+        next_step
+      fi
+      printf "($STEP) Computing distance for control-flow graphs "
+      for f in $(ls -1d $TMPDIR/dot-files/cfg.*.dot); do
+        # 有一些函数没有在CG中出现，即没有被调用，则忽略这些函数
+        # Skip CFGs of functions we are not calling
+        if ! grep "$(basename $f | cut -d. -f2)" $TMPDIR/dot-files/callgraph.dot >/dev/null; then
+          printf "\nSkipping $f..\n"
+          continue
+        fi
+        #Clean up duplicate lines and \" in labels (bug in Pydotplus)
+        awk '!a[$0]++' $f > ${f}.smaller.dot
+        mv $f $f.bigger.dot
+        mv $f.smaller.dot $f
+        sed -i s/\\\\\"//g $f
+        sed -i 's/\[.\"]//g' $f
+        sed -i 's/\(^\s*[0-9a-zA-Z_]*\):[a-zA-Z0-9]*\( -> \)/\1\2/g' $f
+        # 再计算基本块维度的距离
+        #Compute distance
+        printf "\nComputing distance for $f..\n"
+        $AFLGO/distance.py -d $f -t $TMPDIR/BBtargets.txt -n $TMPDIR/BBnames.txt -s $TMPDIR/BBcalls.txt -c $TMPDIR/distance.callgraph.txt -o ${f}.distances.txt >> $TMPDIR/step${STEP}.log 2>&1 #|| FAIL=1
+        if [ $? -ne 0 ]; then
+          echo -e "\e[93;1m[!]\e[0m Could not calculate distance for $f."
+        fi
+        #if [ $FAIL -eq 1 ]; then
+        #  next_step #Fail asap.
+        #fi
+      done
+      echo ""
+      # 最后将所有的距离合并在distance.cfg.txt文件中，等待第二次编译时插桩
+      cat $TMPDIR/dot-files/*.distances.txt > $TMPDIR/distance.cfg.txt
+    fi
+    next_step
+* * *
+计算的逻辑都在`scripts/distance.py`脚本中。
+    ##################################
+    # Main function
+    ##################################
+    if __name__ == '__main__':
+      parser = argparse.ArgumentParser ()
+      parser.add_argument ('-d', '--dot', type=str, required=True, help="Path to dot-file representing the graph.")
+      parser.add_argument ('-t', '--targets', type=str, required=True, help="Path to file specifying Target nodes.")
+      parser.add_argument ('-o', '--out', type=str, required=True, help="Path to output file containing distance for each node.")
+      parser.add_argument ('-n', '--names', type=str, required=True, help="Path to file containing name for each node.")
+      parser.add_argument ('-c', '--cg_distance', type=str, help="Path to file containing call graph distance.")
+      parser.add_argument ('-s', '--cg_callsites', type=str, help="Path to file containing mapping between basic blocks and called functions.")
+      args = parser.parse_args ()
+      # 读取graph
+      print ("\nParsing %s .." % args.dot)
+      G = nx.DiGraph(nx.drawing.nx_pydot.read_dot(args.dot))
+      print (nx.info(G))
+      # 判断当前读取的图是CG还是CFG
+      is_cg = "Name: Call graph" in nx.info(G)
+      print ("\nWorking in %s mode.." % ("CG" if is_cg else "CFG"))
+因为首先要计算函数维度的距离，先看CG的处理逻辑
+      # Process as CallGraph
+      else:
+        # 这里的target是Ftargets文件，即目标点所在的函数
+        print ("Loading targets..")
+        with open(args.targets, "r") as f:
+          targets = []
+          for line in f.readlines ():
+            line = line.strip ()
+            for target in find_nodes(line):
+              targets.append (target)
+        if (not targets and is_cg):
+          print ("No targets available")
+          exit(0)
+      print ("Calculating distance..")
+      with open(args.out, "w") as out, open(args.names, "r") as f:
+        for line in f.readlines():
+          distance (line.strip()) # 调用distance函数计算距离
+`distance`函数就是计算的关键函数
+    ##################################
+    # Calculate Distance
+    ##################################
+    def distance (name): # 这里传入的是每一个函数名
+      distance = -1
+      # find_node函数返回graph中该名字对应的节点，即传入函数名的函数所有节点
+      for n in find_nodes (name): 
+        d = 0.0
+        i = 0
+        if is_cg:
+          for t in targets:
+            try:
+              shortest = nx.dijkstra_path_length (G, n, t) # dijkastr最短路径算法，计算从n到t经过的最短路径
+              d += 1.0 / (1.0 + shortest) # 这里计算采用的是调和平均数，取倒数相加最后平均
+              i += 1
+            except nx.NetworkXNoPath:
+              pass
+        else:
+            ....
+        # 如果在迭代后，发现有更短的路径，则更新为最短的距离
+        if d != 0 and (distance == -1 or distance > i / d) :
+          distance = i / d
+      # 将距离写入到文件中
+      if distance != -1:
+        out.write (name)
+        out.write (",")
+        out.write (str (distance))
+        out.write ("\n")
+函数维度的距离是 CG
+上，能够通过调用链调用到目标函数的那些函数，到达目标函数的距离，因为目标点可能不止一个，可能在不同的函数上，这个时候就需要对不同的目标函数的距离做综合，方法就是将到达不同的目标函数的距离取调和平均数。
+然后得到函数维度的距离后，计算基本块维度的距离。
+      # Process as ControlFlowGraph
+      caller = ""
+      cg_distance = {}
+      bb_distance = {}
+      if not is_cg :
+        # 首先需要函数维度的距离
+        if args.cg_distance is None:
+          print ("Specify file containing CG-level distance (-c).")
+          exit(1)
+        # 以及基本块的callsite，即哪些基本块调用了哪些函数
+        elif args.cg_callsites is None:
+          print ("Specify file containing mapping between basic blocks and called functions (-s).")
+          exit(1)
+        else:
+          caller = args.dot.split(".")
+          caller = caller[len(caller)-2]
+          print ("Loading cg_distance for function '%s'.." % caller)
+          # 加载函数维度距离
+          with open(args.cg_distance, 'r') as f:

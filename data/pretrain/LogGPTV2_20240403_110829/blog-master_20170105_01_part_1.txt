@@ -1,0 +1,221 @@
+## PostgreSQL 流式数据处理(聚合、过滤、转换...)系列 - 1  
+### 作者                                                         
+digoal                                                          
+### 日期                                                         
+2017-01-05                                                              
+### 标签                                                        
+PostgreSQL , 流式 , 函数 , 流式处理 , 异步统计 , count , group , agg , 触发器 , xid , 事务隔离 , 异步气泡 , gap , function , 串行处理  
+----                                                        
+## 背景     
+2013年帮朋友做的方案。写了一些列文档来解决当时某个大数据BI平台的异步流式数据处理的功能。  
+逐步优化，化繁为简。     
+在业务层面，统计，数据的过滤，数据的清洗，数据的事件触发等。是比较常见的需求。      
+比如以COUNT就是一个很典型的例子。  
+在9.2以前全表的count只能通过扫描全表来得到, 即使有pk也必须扫描全表.  
+9.2版本增加了index only scan的功能, count(*)可以通过仅仅扫描pk就可以得到.  
+但是如果是一个比较大的表, pk也是很大的, 扫描pk也是个不小的开销.  
+到了9.6，开始支持并行查询，通过并行，一张1亿的表，COUNT可能只需要几百毫秒。这是一个质的飞跃。（但是还有很多时候用并行并不是最好的）  
+另外社区也除了一个流式处理的数据库，pipelineDB，但是它的社区版本限制了一个DATABASE只能使用1024个流视图，在编码的地方使用了1BYTE存储CV。  
+那么回到postgresql数据库本身，有没有办法来优化count全表的操作呢, 如果你的场景真的有必要频繁的count全表, 那么可以尝试一下使用以下方法来优化你的场景.  
+## 正文  
+方法1， 比如给表建立几个触发器, 每次插入, 删除, truncate表时触发, 将表的记录数更新到一个记录表中.  
+但是问题也很多，比如: 触发器是串行的，如果统计维度多，会导致数据操作的RT变高。 另外，并发的插入和删除操作, 如果仅仅使用1条记录来存储表的count(*)值的话, 会有严重的锁冲突的问题.  
+例如两个session, 同时插入1条记录, 在触发触发器时, 由于都要更新count表的同一条记录, 那么会发生行锁等待.  
+因此, 可以使用多条记录来缓解行锁冲突的问题, 如下 :   
+一、插入测试  
+1\. 创建测试表, a, 假设要经常count(*) from a.  
+```  
+pg92@digoal-PowerEdge-R610-> psql  
+psql (9.2.4)  
+Type "help" for help.  
+postgres=# drop table a;  
+DROP TABLE  
+postgres=# create table a(id serial4 primary key, info text, crt_time timestamp(0) default now());  
+NOTICE:  CREATE TABLE will create implicit sequence "a_id_seq" for serial column "a.id"  
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "a_pkey" for table "a"  
+CREATE TABLE  
+```  
+2\. 创建记录a表记录数的表  
+```  
+postgres=# create table cnt_a(id int primary key, cnt int);  
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "cnt_a_pkey" for table "cnt_a"  
+CREATE TABLE  
+```  
+为了缓解行锁冲突, 这里使用了1001条记录来存储count(*) from a的值.  
+在计算count(*) a时, 使用sum(cnt) from cnt_a就可以了. 因此只需要扫描1001行.  
+后面会看到当a表的记录数越多, 性能提升约明显.  
+```  
+postgres=# insert into cnt_a select generate_series(0,1000),0;  
+INSERT 0 1001  
+```  
+3\. 创建插入触发器函数  
+```  
+CREATE OR REPLACE FUNCTION public.tg_insert_a()  
+ RETURNS trigger  
+ LANGUAGE plpgsql  
+AS $function$  
+declare  
+  m_id int;  
+  rm numeric;  
+begin  
+  select max(id),random() into m_id,rm from cnt_a;  
+  update cnt_a set cnt=cnt+1 where id=(rm*m_id)::int;  
+  return null;  
+end;  
+$function$;  
+```  
+4\. 创建删除触发器函数  
+```  
+CREATE OR REPLACE FUNCTION public.tg_delete_a()  
+ RETURNS trigger  
+ LANGUAGE plpgsql  
+AS $function$  
+declare  
+  m_id int;  
+  rm numeric;  
+begin  
+  select max(id),random() into m_id,rm from cnt_a;  
+  update cnt_a set cnt=cnt-1 where id=(rm*m_id)::int;  
+  return null;  
+end;  
+$function$;  
+```  
+5\. 创建truncate触发器函数  
+```  
+CREATE OR REPLACE FUNCTION public.tg_truncate_a()  
+ RETURNS trigger  
+ LANGUAGE plpgsql  
+AS $function$  
+declare  
+begin  
+  update cnt_a set cnt=0 where not cnt=0;  
+  return null;  
+end;  
+$function$;  
+```  
+6\. 创建触发器  
+```  
+create trigger tg1 after insert on a for each row execute procedure tg_insert_a();  
+create trigger tg2 after delete on a for each row execute procedure tg_delete_a();  
+create trigger tg3 after truncate on a for each statement execute procedure tg_truncate_a();  
+```  
+7\. 创建pgbench 使用的插入脚本  
+```  
+pg92@digoal-PowerEdge-R610-> cat insert.sql   
+insert into a (info) values ('test');  
+```  
+8\. pgbench做插入测试  
+```  
+pg92@digoal-PowerEdge-R610-> pgbench -M prepared -r -n -f ./insert.sql -h $PGDATA -p 1919 -U postgres -T 60 -c 16 -j 4 postgres  
+transaction type: Custom query  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 16  
+number of threads: 4  
+duration: 60 s  
+number of transactions actually processed: 1831418  
+tps = 30514.831839 (including connections establishing)  
+tps = 30522.057886 (excluding connections establishing)  
+statement latencies in milliseconds:  
+        0.522411        insert into a (info) values ('test');  
+```  
+9\. 测试完后通过count(*) 和sum(cnt)比对数据是否一致  
+```  
+postgres=# select count(*) from a;  
+  count    
+---------  
+ 1755964  
+(1 row)  
+Time: 285.491 ms  
+postgres=# select sum(cnt) from cnt_a ;  
+   sum     
+---------  
+ 1755964  
+(1 row)  
+Time: 0.689 ms  
+```  
+性能提升非常明显.  
+二、删除测试  
+1\. 创建pgbench用于删除a表记录的测试脚本  
+```  
+vi delete.sql  
+\setrandom id 1 1000000  
+delete from a where id=:id;  
+```  
+2\. 进行测试  
+```  
+pg92@digoal-PowerEdge-R610-> pgbench -M prepared -r -n -f ./delete.sql -h $PGDATA -p 1919 -U postgres -T 60 -c 16 -j 4 postgres  
+transaction type: Custom query  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 16  
+number of threads: 4  
+duration: 60 s  
+number of transactions actually processed: 3353233  
+tps = 55865.635772 (including connections establishing)  
+tps = 55878.855793 (excluding connections establishing)  
+statement latencies in milliseconds:  
+        0.002594        \setrandom id 1 1000000  
+        0.282123        delete from a where id=:id;  
+```  
+3\. 测试完删除操作后, 比对count(*)和sum(cnt)是否一致  
+```  
+postgres=# select count(*) from a;  
+  count    
+---------  
+ 9687739  
+(1 row)  
+Time: 1550.239 ms  
+postgres=# select sum(cnt) from cnt_a ;  
+   sum     
+---------  
+ 9687739  
+(1 row)  
+Time: 0.817 ms  
+```  
+当记录数到达千万级别后, 性能以及提升几千倍了.  
+三、创建同时进行删除和插入操作的测试脚本  
+```  
+vi id.sql  
+\setrandom id 1 20000000  
+delete from a where id=:id;  
+insert into a (info) values ('test');  
+```  
+测试  
+```  
+pg92@digoal-PowerEdge-R610-> pgbench -M prepared -r -n -f ./id.sql -h $PGDATA -p 1919 -U postgres -T 60 -c 16 -j 4 postgres  
+transaction type: Custom query  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 16  
+number of threads: 4  
+duration: 60 s  
+number of transactions actually processed: 1061090  
+tps = 17680.045577 (including connections establishing)  
+tps = 17684.251890 (excluding connections establishing)  
+statement latencies in milliseconds:  
+        0.003181        \setrandom id 1 20000000  
+        0.381986        delete from a where id=:id;  
+        0.516256        insert into a (info) values ('test');  
+```  
+测试完后比对count(*)和sum(cnt)的结果是否一致  
+```  
+postgres=# select count(*) from a;  
+  count     
+----------  
+ 10219555  
+(1 row)  
+Time: 1648.371 ms  
+postgres=# select sum(cnt) from cnt_a ;  
+   sum      
+----------  
+ 10219555  
+(1 row)  
+Time: 1.339 ms  
+```  
+四、最后要测试的是truncate表.  
+```  
+postgres=# truncate a;  
+TRUNCATE TABLE  
+Time: 434.581 ms  
+postgres=# select count(*) from a;  

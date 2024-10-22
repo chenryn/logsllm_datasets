@@ -1,0 +1,255 @@
+             */
+            __pipe_unlock(pipe);
+            if (was_empty)
+                wake_up_interruptible_sync_poll(&pipe->rd_wait, EPOLLIN | EPOLLRDNORM);
+            kill_fasync(&pipe->fasync_readers, SIGIO, POLL_IN);
+            wait_event_interruptible_exclusive(pipe->wr_wait, pipe_writable(pipe));
+            __pipe_lock(pipe);
+            was_empty = pipe_empty(pipe->head, pipe->tail);
+            wake_next_writer = true;
+        }
+    out:
+        if (pipe_full(pipe->head, pipe->tail, pipe->max_usage))
+            wake_next_writer = false;
+        __pipe_unlock(pipe);
+        /*
+         * 若我们进行了一次唤醒事件，我们做一个“同步”唤醒，
+         * 因为相比起让数据仍旧等待，我们想要让读者去尽快
+         * 处理事情
+         *
+         * 尤其是，这对小的写操作重要，这是因为（例如）GNU 让
+         * jobserver 使用小的写操作来唤醒等待的工作
+         *
+         * Epoll 则没有意义地想要一个唤醒，
+         * 无论管道是否已经空了
+         */
+        if (was_empty || pipe->poll_usage)
+            wake_up_interruptible_sync_poll(&pipe->rd_wait, EPOLLIN | EPOLLRDNORM);
+        kill_fasync(&pipe->fasync_readers, SIGIO, POLL_IN);
+        if (wake_next_writer)
+            wake_up_interruptible_sync_poll(&pipe->wr_wait, EPOLLOUT | EPOLLWRNORM);
+        if (ret > 0 && sb_start_write_trylock(file_inode(filp)->i_sb)) {
+            int err = file_update_time(filp);
+            if (err)
+                ret = err;
+            sb_end_write(file_inode(filp)->i_sb);
+        }
+        return ret;
+    }
+### 管道的读出过程
+从管道中读出数据则是通过 `pipe_read`，主要是读取 buffer 对应 page 上的数据，若一个 buffer 被读完了则将其出列
+原理还是比较简单的，这里就不深入分析了
+    static ssize_t
+    pipe_read(struct kiocb *iocb, struct iov_iter *to)
+    {
+        size_t total_len = iov_iter_count(to);
+        struct file *filp = iocb->ki_filp;
+        struct pipe_inode_info *pipe = filp->private_data;
+        bool was_full, wake_next_reader = false;
+        ssize_t ret;
+        /* Null read succeeds. */
+        if (unlikely(total_len == 0))
+            return 0;
+        ret = 0;
+        __pipe_lock(pipe);
+        /*
+         * 若管道满了，我们只在开始读取时唤醒写者
+         * 以避免没有必要的唤醒
+         *
+         * 但当我们唤醒写者时，我们使用一个同步唤醒(WF_SYNC)
+         * 因为我们想要他们行动起来并为我们生成更多数据
+         */
+        was_full = pipe_full(pipe->head, pipe->tail, pipe->max_usage);
+        for (;;) {
+            unsigned int head = pipe->head;
+            unsigned int tail = pipe->tail;
+            unsigned int mask = pipe->ring_size - 1;
+    #ifdef CONFIG_WATCH_QUEUE
+            if (pipe->note_loss) {
+                struct watch_notification n;
+                if (total_len note_loss = false;
+            }
+    #endif
+            if (!pipe_empty(head, tail)) {  // 管道非空，逐 buffer 读出数据
+                struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+                size_t chars = buf->len;
+                size_t written;
+                int error;
+                if (chars > total_len) {
+                    if (buf->flags & PIPE_BUF_FLAG_WHOLE) {
+                        if (ret == 0)
+                            ret = -ENOBUFS;
+                        break;
+                    }
+                    chars = total_len;
+                }
+                error = pipe_buf_confirm(pipe, buf);
+                if (error) {
+                    if (!ret)
+                        ret = error;
+                    break;
+                }
+                // 将 buffer 对应 page 数据拷贝出来
+                written = copy_page_to_iter(buf->page, buf->offset, chars, to); 
+                if (unlikely(written offset += chars;
+                buf->len -= chars;
+                /* 这是一个 packet buffer？清理并退出 */
+                if (buf->flags & PIPE_BUF_FLAG_PACKET) {
+                    total_len = chars;
+                    buf->len = 0;
+                }
+                if (!buf->len) {    // buffer 空了，释放
+                    pipe_buf_release(pipe, buf);
+                    spin_lock_irq(&pipe->rd_wait.lock);
+    #ifdef CONFIG_WATCH_QUEUE
+                    if (buf->flags & PIPE_BUF_FLAG_LOSS)
+                        pipe->note_loss = true;
+    #endif
+                    tail++; // 被读的 buffer 出队
+                    pipe->tail = tail;  
+                    spin_unlock_irq(&pipe->rd_wait.lock);
+                }
+                total_len -= chars;
+                if (!total_len)
+                    break;  /* 常规路径：读取成功 */
+                if (!pipe_empty(head, tail))    /* More to do? */
+                    continue;   // 没读完，还有数据，接着读
+            }
+            if (!pipe->writers)
+                break;
+            if (ret)
+                break;
+            if (filp->f_flags & O_NONBLOCK) {
+                ret = -EAGAIN;
+                break;
+            }
+            __pipe_unlock(pipe);
+            /*
+             * 我们只有在确实没读到东西时到达这里
+             *
+             * 然而，我们或许已看到（并移除） 一个 size 为 0 的 buffer，
+             * 这可能会在 buffers 中创造空间
+             *
+             * 你无法通过一个空写入来制造 size 为 0 的 pipe buffers（packet mode 也不行）
+             * 但若写者在尝试填充一个已经分配并插入到 buffer 数组中
+             * 的 buffer 时获得了一个 EFAULT，则这是有可能发生的
+             *
+             * 故我们仍需在【非常】不太可能发生的情况：
+             * “管道满了，但我们没有获得数据”下
+             * 唤醒任何等待的写者
+             */
+            if (unlikely(was_full))
+                wake_up_interruptible_sync_poll(&pipe->wr_wait, EPOLLOUT | EPOLLWRNORM);
+            kill_fasync(&pipe->fasync_writers, SIGIO, POLL_OUT);
+            /*
+             * 但因为我们没有读到任何东西，若我们打断了，则这时候我们可以直接
+             * 返回一个-ERESTARTSYS，
+             * 因为我们已经完成了任何所需的环境，没有必要标记任何可访问. 
+             * 且我们已释放了锁。
+             */
+            if (wait_event_interruptible_exclusive(pipe->rd_wait, pipe_readable(pipe)) head, pipe->tail, pipe->max_usage);
+            wake_next_reader = true;
+        }
+        if (pipe_empty(pipe->head, pipe->tail))
+            wake_next_reader = false;
+        __pipe_unlock(pipe);
+        if (was_full)
+            wake_up_interruptible_sync_poll(&pipe->wr_wait, EPOLLOUT | EPOLLWRNORM);
+        if (wake_next_reader)
+            wake_up_interruptible_sync_poll(&pipe->rd_wait, EPOLLIN | EPOLLRDNORM);
+        kill_fasync(&pipe->fasync_writers, SIGIO, POLL_OUT);
+        if (ret > 0)
+            file_accessed(filp);
+        return ret;
+    }
+这里我们可以总结：对于一个刚刚建立的管道，其 buffer 数组其实并没有分配对应的页面空间，也没有设置标志位；在我们向管道内写入数据时会通过 buddy
+system 为对应 buffer 分配新的页框， **并设置 PIPE_BUF_FLAG_CAN_MERGE 标志位，标志该 buffer
+可以进行写入** ；而当我们从管道中读出数据之后，纵使一个 buffer 对应的 page 上的数据被读完了，我们也不会释放该
+page，而可以也会直接投入到下一次使用中， **因此会保留 PIPE_BUF_FLAG_CAN_MERGE 标志位**
+## splice：文件与管道间数据拷贝
+当我们想要将一个文件的数据拷贝到另一个文件时，比较朴素的一种想法是打开两个文件后将源文件数据读入后再写入目标文件，但这样的做法需要在用户空间与内核空间之间来回进行数据拷贝，
+**具有可观的开销**
+因此为了减少这样的开销， `splice`这一个非常独特的系统调用应运而生，其作用是 **在文件与管道之间进行数据拷贝** ，以此
+**将内核空间与用户空间之间的数据拷贝转变为内核空间内的数据拷贝，从而避免了数据在用户空间与内核空间之间的拷贝造成的开销**
+glibc 中的 wrapper 如下：
+    #define _GNU_SOURCE         /* See feature_test_macros(7) */
+           #include 
+           ssize_t splice(int fd_in, loff_t *off_in, int fd_out,
+                          loff_t *off_out, size_t len, unsigned int flags);
+splice 系统调用 **本质上是利用管道在内核空间中进行数据拷贝** ，毫无疑问的是，管道是一个十分好用的内核缓冲区，于是 splice
+系统调用选择使用管道作为中间的数据缓冲区
+当你想要将数据从一个文件描述符拷贝到另一个文件描述符中，只需要先创建一个管道，之后使用 splice 系统调用将数据从源文件描述符拷贝到管道中、再使用
+splice 系统调用将数据从管道中拷贝到目的文件描述符即可。这样的设计使得我们只需要两次系统调用便能完成数据在不同文件描述符间的拷贝工作，且
+**数据的拷贝都在内核空间中完成，极大地减少了开销**
+splice 系统调用正式操作前都是一些基础的检查工作，这一块不深入分析，存在如下调用链：
+    SYS_splice()    // 检查文件描述符是否可用
+        __do_splice()   // 检查是否入设置了偏移或出设置了偏移（任一则返回）
+            do_splice()     // 分流
+最终文件与管道间的分流发生在 `do_splice()` 函数：
+  * 从管道读取到管道，调用 `splice_pipe_to_pipe()`
+  * 从文件读取到管道，调用 `splice_file_to_pipe()`
+  * 从管道读取到文件，调用 `do_splice_from()`
+### 从文件读取到管道
+从文件读取数据到管道的核心原理是： **将 pipe_buffer 对应的 page 设置为文件映射的 page**
+存在如下调用链：
+    splice_file_to_pipe()
+        do_splice_to()
+在 `do_splice_to` 中最终会调用到内核文件结构体函数表的 `splice_read` 指针，对于不同的文件系统而言该函数指针不同，以 ext4
+文件系统为例，查表 `ext4_file_operations`，对应调用的函数应为 `generic_file_splice_read`，存在如下调用链：
+    generic_file_splice_read()
+        call_read_iter()
+该函数是文件函数表中 `read_iter()` 的 wrapper，对 ext4 而言对应调用
+`ext4_file_read_iter`，源码比较多，这里只贴出核心调用链，最终调用到核心函数是 `filemap_read()`：
+    ext4_file_read_iter()
+        generic_file_read_iter()
+            filemap_read()
+                filemap_get_pages() // 获取到文件对应映射的页面集
+                copy_page_to_iter() // 进行页面拷贝（单位为单个页面）
+                    __copy_page_to_iter()
+                        copy_page_to_iter_pipe()    // 我们是管道，所以走入该分支
+最终在 `copy_page_to_iter_pipe()` 中，将对应的 `pipe_buffer->page` 设为 **文件映射的页面集的对应页框**
+，将页框引用计数 + 1（`get_page()`），这样就完成了一个 **从文件读取数据到管道的过程** ，因为是直接建立页面的映射，所以每次操作后都会将
+head +1
+    static size_t copy_page_to_iter_pipe(struct page *page, size_t offset, size_t bytes,
+                 struct iov_iter *i)
+    {
+        struct pipe_inode_info *pipe = i->pipe;
+        struct pipe_buffer *buf;
+        unsigned int p_tail = pipe->tail;
+        unsigned int p_mask = pipe->ring_size - 1;
+        unsigned int i_head = i->head;
+        size_t off;
+        if (unlikely(bytes > i->count))
+            bytes = i->count;
+        if (unlikely(!bytes))
+            return 0;
+        if (!sanity(i))
+            return 0;
+        off = i->iov_offset;
+        buf = &pipe->bufs[i_head & p_mask];
+        if (off) {
+            if (offset == off && buf->page == page) {
+                /* merge with the last one */
+                buf->len += bytes;
+                i->iov_offset += bytes;
+                goto out;
+            }
+            i_head++;
+            buf = &pipe->bufs[i_head & p_mask];
+        }
+        if (pipe_full(i_head, p_tail, pipe->max_usage))
+            return 0;
+        buf->ops = &page_cache_pipe_buf_ops;
+        get_page(page);
+        buf->page = page;
+        buf->offset = offset;
+        buf->len = bytes;
+        pipe->head = i_head + 1;
+        i->iov_offset = offset + bytes;
+        i->head = i_head;
+    out:
+        i->count -= bytes;
+        return bytes;
+    }
+这里我们注意到——该操作 **缺失了对 pipe_buffer- >flags 的重新赋值操作**
+### 从管道读取到文件

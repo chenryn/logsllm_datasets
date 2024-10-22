@@ -1,0 +1,91 @@
+            ((bprm->unsafe & ~LSM_UNSAFE_PTRACE) ||
+             !ptracer_capable(current, new->user_ns))) {
+            /* downgrade; they get no more than they had, and maybe less */
+            if (!ns_capable(new->user_ns, CAP_SETUID) ||
+                (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS)) {
+                new->euid = new->uid;
+                new->egid = new->gid;
+            }
+            new->cap_permitted = cap_intersect(new->cap_permitted,    // new->cap_permitted是execve后的进程允许能力集，当前的值是dumpcap文件的允许能力集
+                               old->cap_permitted);   // old->cap_permitted是当前进程的允许能力集，也就是strace fork后子进程的能力集
+        }
+      ...
+    }
+那strace进程的能力集是怎么来的呢？
+## strace进程的能力集是怎么来的呢？
+strace进程能力是根据bash进程能力和strace文件能力，按照计算规则得来的，如下
+那普通用户的bash进程能力集又是啥呢？它是怎么计算出来的呢？ 这就是我的第二个疑问
+# 普通用户的bash进程能力集是啥？
+如下，可以看到普通用户的bash进程除了`限制能力集`其他能力集都是0
+    [root@instance-h9w7mlyv ~]# su - test
+    [test@instance-h9w7mlyv ~]$ ps
+      PID TTY          TIME CMD
+    18042 pts/4    00:00:00 bash
+    [test@instance-h9w7mlyv ~]$ cat /proc/18042/status|grep -i cap
+    CapInh: 0000000000000000
+    CapPrm: 0000000000000000
+    CapEff: 0000000000000000
+    CapBnd: 000001ffffffffff
+    CapAmb: 0000000000000000
+> test用户是`useradd test`创建的普通用户
+对比可以发现: root用户切换test用户后，能力变少了。
+    [root@instance-h9w7mlyv ~]# ps
+      PID TTY          TIME CMD
+    52739 pts/0    00:00:00 bash
+    [root@instance-h9w7mlyv ~]# cat /proc/52739/status|grep -i cap
+    CapInh: 0000000000000000
+    CapPrm: 000001ffffffffff
+    CapEff: 000001ffffffffff
+    CapBnd: 000001ffffffffff
+    CapAmb: 0000000000000000
+root用户通过`su - test`切换新用户后，为什么能力会变少呢？
+## 为什么root用户切换到新用户后能力变少？
+《Linux
+内核安全模块深入剖析》6.4.2节中提到capset、capget、prctl三个系统调用都能改变进程的能力集，但是从下面可以看出来，su并没有用这三个系统调用
+    [root@instance-h9w7mlyv ~]# strace -f su - test 2>&1|grep -i cap
+    [root@instance-h9w7mlyv ~]# strace -f su - test 2>&1|grep -i -E '\bprctl'
+在《Linux系统编程手册》39.6节中提到这种情况
+    为了与用户 ID 在 0 与非 0 之间切换的传统含义保持兼容，在改变进程的用户 ID(使用 setuid()等)时，内核会完成下列操作。
+    1. 如果真实用户ID、有效用户ID或saved set-user-ID之前的值为0，那么修改了用户 ID 之后，所有这三个 ID 的值都会变成非 0，并且进程的许可和有效能力集会被清除 (即所有的能力都被永久地删除了)。
+    2. 如果有效用户 ID 从 0 变成了非 0，那么有效能力集会被清除(即有效能力被删除了，但那些位于许可集中的能力会被再次提升)。
+也就是说，当用户调用setuid系统调用从特权用户变成非特权用户时，允许能力集和有效能力集会被清除。
+下面来验证一下，看看su程序是不是用到了setuid系统调用、setuid系统调用是不是真的可能清空能力集。
+## 验证setuid和能力的关系
+通过strace可以观察到su程序确实调用了setuid
+    [root@instance-h9w7mlyv ~]# strace -f su - test 2>&1|grep setuid
+    [pid 23628] setuid(1000 
+    [pid 23628] )       = 0
+阅读内核代码后，也可以看到在cap_emulate_setxuid函数中内核清除了进程的能力集。
+代码位置在：
+    static inline void cap_emulate_setxuid(struct cred *new, const struct cred *old)
+    {
+        ...
+                cap_clear(new->cap_permitted);
+                cap_clear(new->cap_effective);
+        ...
+            cap_clear(new->cap_ambient);
+        }
+        ...
+    }
+cap_emulate_setxuid函数因为inline被内敛优化，所以没有办法被bpftrace观察到，但我们可以观察它的调用者cap_task_fix_setuid函数。
+在`su - test`时，可以观察到执行了cap_task_fix_setuid函数，并且有效能力集从0x1ffffffffff变成0。如下
+    [root@instance-h9w7mlyv ~]# bpftrace -e 'kfunc:cap_task_fix_setuid /comm=="su"/ {printf("%x,%x\n", ((struct cred*)args->new)->cap_effective.cap[0], ((struct cred*)args->new)->cap_effective.cap[1]);}'
+    ...
+    ffffffff,1ff
+    [root@instance-h9w7mlyv ~]# bpftrace -e 'kretfunc:cap_task_fix_setuid /comm=="su"/ {printf("%x,%x\n", ((struct cred*)args->new)->cap_effective.cap[0], ((struct cred*)args->new)->cap_effective.cap[1]);}'
+    ...
+    0,0
+从setuid到cap_task_fix_setuid，函数调用栈如下
+    [root@instance-h9w7mlyv ~]# bpftrace -e 'kprobe:cap_task_fix_setuid /comm=="su"/ {printf("%s\n", kstack)}'
+    Attaching 1 probe...
+      cap_task_fix_setuid+1
+      security_task_fix_setuid+48
+      __sys_setuid+151    // setuid系统调用入口
+      do_syscall_64+91
+      entry_SYSCALL_64_after_hwframe+101
+所以，setuid时root用户变成非root用户时，允许能力集和有效能力集会被清零。
+# 总结
+能力的计算机制感觉很复杂。
+普通用户在执行`strace xxx`后，xxx进程的有效能力集可以认为是strace文件和xxx文件的允许能力集的交集。
+调用setuid系统调用从特权用户变成非特权用户时，允许能力集和有效能力集会被清除。
+通过阅读代码和bpftrace工具，可以定位到内核中处理能力的代码位置，进一步验证结论。

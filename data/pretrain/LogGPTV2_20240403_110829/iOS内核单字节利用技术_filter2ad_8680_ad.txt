@@ -1,0 +1,89 @@
+            panic("Unsupported xPRR perm ...");
+        pte = pte_perm_bits | pte & ~0x600000000000C0uLL;
+    }
+    pmap_enter_pte(pmap, pte_p, pte, vaddr);
+因此，只有清除了wimg字段中的0x4000位，我们才能将DART的I/O地址映射到我们的进程中。不幸的是，快速查看一下devicetree中的“pmap-io-ranges”属性，可以确认为每个DART设置了0x4000位:
+        addr         len        wimg     signature
+    0x620000000, 0x40000000,       0x27, 'PCIe'
+    0x2412C0000,     0x4000,     0x4007, 'DART' ; dart-sep
+    0x235004000,     0x4000,     0x4007, 'DART' ; dart-sio
+    0x24AC00000,     0x4000,     0x4007, 'DART' ; dart-aop
+    0x23B300000,     0x4000,     0x4007, 'DART' ; dart-pmp
+    0x239024000,     0x4000,     0x4007, 'DART' ; dart-usb
+    0x239028000,     0x4000,     0x4007, 'DART' ; dart-usb
+    0x267030000,     0x4000,     0x4007, 'DART' ; dart-ave
+因此，我们无法将DART映射到用户空间以禁用它。
+即使PPL阻止我们映射页表和DART
+I/O地址，其他硬件组件的物理I/O地址仍然是可映射的。因此，仍然可以映射和读取某些系统组件的硬件寄存器来尝试定位内核。
+我最初的尝试是从IORVBAR读取，通过MMIO可访问ResetVector基地址寄存器。ResetVector是复位后在CPU上执行的第一段代码。因此，读取IORVBAR
+将为我们提供XNU ResetVector的物理地址，该地址将精确定位物理内存中的内核缓存（kernelcache）。
+IORVBAR映射在devicetree中每个CPU的“reg-private”地址后的偏移0x40000处;例如，在A13 CPU
+0上，它位于物理地址0x210050000。它包含同一组CoreSight和DBGWRAP
+的寄存器集的一部分，以前是用来绕过KTRR的，但是，我发现IORVBAR在A13上是不可访问的:尝试从中读取将导致panic。
+我花了一些时间在A13的SecureROM上搜索有意思的物理地址，后来Jann
+Horn建议我把KTRR锁定寄存器映射到苹果的内存控制器AMCC上。这些寄存器存储KTRR区域的物理内存边界，强制KTRR只读，以防止来自协处理器的攻击。
+在物理地址0x200000680处映射和读取AMCC的RORGNBASEADDR寄存器，可以轻松地生成物理内存中包含kernelcache锁定区域的起始地址。使用安全缓解机制来破坏其他安全缓解机制是非常有意思的。
+在找到使用AMCC的正确方法之后，我研究了最后一种可能性，然后放弃绕过PPL。
+iOS配置了40位物理地址和16K pages
+(14位)。同时，传递给pmap_enter_options_internal()的任意物理页码是32位，当插入到级别3的转换表条目(L3
+TTE)时，它被移动14位，并用0xFFFF_FFFF_C000屏蔽。也就是说我们可以控制TTE的第45-14
+位，即使根据编程中TCR_EL1.IPS的物理地址大小，45-40位应该始终为零。
+如果硬件忽略了超出支持的最大物理地址大小的位，那么我们可以通过提供一个与DART
+I/O地址或页表完全匹配的物理页码来绕过PPL，但设置了一个高位。设置高位将导致映射地址无法匹配“pmap io
+ranges”中的任何地址，即使TTE将映射相同的物理地址。这样做很巧妙，因为它可以让我们绕过PPL作为内核读/写/执行的前提。
+不幸的是，实践证明，硬件实际上会检查超出支持的物理地址大小的TTE位是否为零。因此，我继续使用AMCC技巧来定位kernelcache。
+###  控制 sysctl
+此时，我们有了一个用于非ppl物理地址的物理读/写原语，并且知道了物理内存中的kernelcache的地址。下一步是构建一个虚拟的读/写原语。
+对于这一部分，我决定坚持使用已知的技术:利用sysctl()
+syscall使用的sysctl_oid树存储在kernelcache的可写内存中这一事实来操作它，并将app 沙盒允许的sysctl转换为内核读/写原语。
+XNU从FreeBSD继承了sysctls;它们提供对用户空间的某些内核变量的访问。例如，”hw.l1dcachesize”
+只读sysctl允许进程确定L1数据高速缓存线的大小。而“
+kern.securelevel”读/写sysctl控制“系统安全级别”，用于BSD内核部分的操作。
+sysctl被组织成树层次结构，树中的每个节点由sysctl_oid结构体表示。构建内核读取原语非常简单，只需为app沙盒中可读的sysctl映射sysctl_oid结构，并将目标变量指针(oid_arg1)更改为指向我们想要读取的虚拟地址。然后调用sysctl读取该地址。
+使用sysctls构建写原语有点复杂，因为在容器沙箱配置文件中没有列出可写的sysctls。iOS 10.3.1的ziVA
+exploit通过将sysctl的oid_handler字段更改为调用copyin()来解决这个问题。但是，在像A13这样启用PAC的设备上，oid_handler是由PAC保护的，也就是说我们无法更改它的值。
+但是，在逆向hook_system_check_sysctlbyname()函数时，我注意到一个没有文档记录的行为:
+    // Sandbox check sysctl-read
+    ret = sb_evaluate(sandbox, 116u, &context);
+    if ( !ret )
+    {
+        // Sandbox check sysctl-write
+        if ( newlen | newptr && (namelen != 2 || name[0] != 0 || name[1] != 3) )
+            ret = sb_evaluate(sandbox, 117u, &context);
+        else
+            ret = 0;
+    }
+出于某些原因，如果在沙箱中认为sysctl节点是可读的，那么就不会在特定的sysctl节点{0,3}上执行写检查!也就是说{0,3}在每个可读的沙箱中都是可写的，而不管沙箱配置文件是否允许对sysctl进行写操作。
+结果是，sysctl{0,3}的名称是“sysctl.name2mib”，这是一个可写的sysctl，用于将sysctl的字符串名转换为数字形式，这样查找起来更快。它用于实现sysctlnametomib()。因此，这个sysctl通常应该是可写的。
+## 0x04 回到主题
+###  pmap fields 之战
+我们已经研究了很久，但是还没有结束：我们必须打破僵局。就目前情况而言，vm_map_copyout_internal（）在“完成”的vm_map_entry
+上进行无限循环，它的vme_next指针指向自己。我们必须引导这一功能的安全返回，以保持系统的稳定。
+有两个问题阻碍了这一点。首先，因为我们在pmap层将条目插入到页表中，而没有在vm_map层创建相应的虚拟条目，所以当前地址空间的pmap和vm_map视图之间存在冲突。如果没有解决这一问题，将导致进程退出时出现panic。其次，一旦循环中断，vm_map_copyout_internal()将调用vm_map_copy_insert()，这会在将破坏的vm_map_copy释放到错误区域时产生panic。
+我们将首先处理pmap/vm_map冲突。假设我们能够跳出for循环并允许vm_map_copyout_internal()返回。对vm_map_copy_insert()的调用发生在for循环遍历vm_map_copy中的所有条目之后，将它们从vm_map_copy的条目列表中unlinks，并将它们链接到vm_map的条目列表中。
+    static void
+    vm_map_copy_insert(
+        vm_map_t        map,
+        vm_map_entry_t  after_where,
+        vm_map_copy_t   copy)
+    {
+        vm_map_entry_t  entry;
+        while (vm_map_copy_first_entry(copy) !=
+                   vm_map_copy_to_entry(copy)) {
+            entry = vm_map_copy_first_entry(copy);
+            vm_map_copy_entry_unlink(copy, entry);
+            vm_map_store_entry_link(map, after_where, entry,
+                VM_MAP_KERNEL_FLAGS_NONE);
+            after_where = entry;
+        }
+        zfree(vm_map_copy_zone, copy);
+    }
+由于vm_map_copy的vm_map_entrys都是驻留在共享内存中的伪造对象，因此我们确实不希望将它们链接到 vm_map
+的条目列表中，在进程退出时将其释放。因此，最简单的解决方案是更新破坏的vm_map_copy 的条目列表，使其看起来为空。
+强制vm_map_copy
+的条目列表显示为空无疑使我们可以安全地从vm_map_copyout_internal（）返回，但是一旦进程退出，我们仍然会造成panic：
+    panic（cpu 3 caller 0xfffffff01f4b1c50）：“ pmap_tte_deallocate（）：pmap = 0xfffffff06cd8fd10 ttep = 0xfffffff0a90d0408 ptd = 0xfffffff132fc3ca0 refcnt = 0x2 \ n”
+问题在于，在利用过程中，我们的映射原语强制pmap_enter_options()将3级转换表条目(L3
+TTEs)插入到流程的页表中，但在vm_map上层的相应计算从未产生。pmap和vm_map视图之间的区别很重要，因为pmap层要求在销毁pmap之前显式地删除所有物理映射，如果
+vm_map_entry 没有描述相应的虚拟映射，则vm_map层将不知道删除物理映射。
+由于PPL的原因，我们不能直接更新pmap，因此最简单的解决方法是获取一个指向带有错误页面的合法vm_map_entry的指针，并将其覆盖在pmap_enter_options()建立物理映射的虚拟地址范围之上。因此，我们将更新破坏的vm_map_copy条目列表，使其指向这个单一的“overlay”条目。

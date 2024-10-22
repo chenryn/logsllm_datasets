@@ -1,0 +1,165 @@
+ * we cleanup old slots at some point after it got disabled.  
+ */  
+void  
+CheckPointSnapBuild(void)  
+{  
+        XLogRecPtr      cutoff;  
+        XLogRecPtr      redo;  
+        DIR                *snap_dir;  
+        struct dirent *snap_de;  
+        char            path[MAXPGPATH];  
+        /*  
+         * We start of with a minimum of the last redo pointer. No new replication  
+         * slot will start before that, so that's a safe upper bound for removal.  
+         */  
+        redo = GetRedoRecPtr();  
+        /* now check for the restart ptrs from existing slots */  
+        cutoff = ReplicationSlotsComputeLogicalRestartLSN();  
+        /* don't start earlier than the restart lsn */  
+        if (redo d_name, ".") == 0 ||  
+                        strcmp(snap_de->d_name, "..") == 0)  
+                        continue;  
+                snprintf(path, MAXPGPATH, "pg_logical/snapshots/%s", snap_de->d_name);  
+                if (lstat(path, &statbuf) == 0 && !S_ISREG(statbuf.st_mode))  
+                {  
+                        elog(DEBUG1, "only regular files expected: %s", path);  
+                        continue;  
+                }  
+                /*  
+                 * temporary filenames from SnapBuildSerialize() include the LSN and  
+                 * everything but are postfixed by .$pid.tmp. We can just remove them  
+                 * the same as other files because there can be none that are  
+                 * currently being written that are older than cutoff.  
+                 *  
+                 * We just log a message if a file doesn't fit the pattern, it's  
+                 * probably some editors lock/state file or similar...  
+                 */  
+                if (sscanf(snap_de->d_name, "%X-%X.snap", &hi, &lo) != 2)  
+                {  
+                        ereport(LOG,  
+                                        (errmsg("could not parse file name \"%s\"", path)));  
+                        continue;  
+                }  
+                lsn = ((uint64) hi) d_name, ".") == 0 ||  
+                        strcmp(mapping_de->d_name, "..") == 0)  
+                        continue;  
+                snprintf(path, MAXPGPATH, "pg_logical/mappings/%s", mapping_de->d_name);  
+                if (lstat(path, &statbuf) == 0 && !S_ISREG(statbuf.st_mode))  
+                        continue;  
+                /* Skip over files that cannot be ours. */  
+                if (strncmp(mapping_de->d_name, "map-", 4) != 0)  
+                        continue;  
+                if (sscanf(mapping_de->d_name, LOGICAL_REWRITE_FORMAT,  
+                                   &dboid, &relid, &hi, &lo, &rewrite_xid, &create_xid) != 6)  
+                        elog(ERROR, "could not parse filename \"%s\"", mapping_de->d_name);  
+                lsn = ((uint64) hi) << 32 | lo;  
+                if (lsn < cutoff || cutoff == InvalidXLogRecPtr)  
+                {  
+                        elog(DEBUG1, "removing logical rewrite file \"%s\"", path);  
+                        if (unlink(path) < 0)  
+                                ereport(ERROR,  
+                                                (errcode_for_file_access(),  
+                                                 errmsg("could not remove file \"%s\": %m", path)));  
+                }  
+                else  
+                {  
+                        int                     fd = OpenTransientFile(path, O_RDONLY | PG_BINARY, 0);  
+                        /*  
+                         * The file cannot vanish due to concurrency since this function  
+                         * is the only one removing logical mappings and it's run while  
+                         * CheckpointLock is held exclusively.  
+                         */  
+                        if (fd < 0)  
+                                ereport(ERROR,  
+                                                (errcode_for_file_access(),  
+                                                 errmsg("could not open file \"%s\": %m", path)));  
+                        /*  
+                         * We could try to avoid fsyncing files that either haven't  
+                         * changed or have only been created since the checkpoint's start,  
+                         * but it's currently not deemed worth the effort.  
+                         */  
+                        else if (pg_fsync(fd) != 0)  
+                                ereport(ERROR,  
+                                                (errcode_for_file_access(),  
+                                                 errmsg("could not fsync file \"%s\": %m", path)));  
+                        CloseTransientFile(fd);  
+                }  
+        }  
+        FreeDir(mappings_dir);  
+}  
+```
+9\. 将预提交（2PC）事务状态相关脏数据刷入pg_twophase目录下对应的文件。  
+如果没有开启2PC（#max_prepared_transactions = 0），这里不需要操作。  
+CheckPointTwoPhase(checkPointRedo)@src/backend/access/transam/twophase.c  
+```
+/*  
+ * CheckPointTwoPhase -- handle 2PC component of checkpointing.  
+ *  
+ * We must fsync the state file of any GXACT that is valid and has a PREPARE  
+ * LSN <= the checkpoint's redo horizon.  (If the gxact isn't valid yet or  
+ * has a later LSN, this checkpoint is not responsible for fsyncing it.)  
+ *  
+ * This is deliberately run as late as possible in the checkpoint sequence,  
+ * because GXACTs ordinarily have short lifespans, and so it is quite  
+ * possible that GXACTs that were valid at checkpoint start will no longer  
+ * exist if we wait a little bit.  
+ *  
+ * If a GXACT remains valid across multiple checkpoints, it'll be fsynced  
+ * each time.  This is considered unusual enough that we don't bother to  
+ * expend any extra code to avoid the redundant fsyncs.  (They should be  
+ * reasonably cheap anyway, since they won't cause I/O.)  
+ */  
+void  
+CheckPointTwoPhase(XLogRecPtr redo_horizon)  
+{  
+        TransactionId *xids;  
+        int                     nxids;  
+        char            path[MAXPGPATH];  
+        int                     i;  
+......  
+        if (max_prepared_xacts <= 0)  
+                return;                                 /* nothing to do */  
+......  
+```
+10\. 将shared buffer中的在检查点之前(这个说法并不严谨，也可能包含检查点开始后某一个时间差内产生的脏数据，见BufferSync@src/backend/storage/buffer/bufmgr.c)产生的脏数据块刷入缓存，但是同样可能需要全扫描整个缓存内存区。  
+原因下一篇再讲。  
+CheckPointBuffers(flags)@src/backend/storage/buffer/bufmgr.c  
+```
+/*  
+ * CheckPointBuffers  
+ *  
+ * Flush all dirty blocks in buffer pool to disk at checkpoint time.  
+ *  
+ * Note: temporary relations do not participate in checkpoints, so they don't  
+ * need to be flushed.  
+ */  
+void  
+CheckPointBuffers(int flags)  
+{  
+        TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);  
+        CheckpointStats.ckpt_write_t = GetCurrentTimestamp();  
+        BufferSync(flags);  
+        CheckpointStats.ckpt_sync_t = GetCurrentTimestamp();  
+        TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();  
+        smgrsync();  
+        CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();  
+        TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();  
+}  
+```
+## 小结
+1\. 从锁冲突角度来分析，可能会带来较大影响的有刷commit log，刷buffer。  
+2\. 从数量级和IO层面分析，主观判断除了CheckPointBuffers(flags)@src/backend/storage/buffer/bufmgr.c，其他几个刷缓存的动作应该都很快，不会有太大的冲突或影响。  
+但是这些都只是主观判断，还需要有测试数据来提供支撑。   
+跟踪锁冲突的次数和耗时，跟踪每个刷缓存函数的耗时。  
+跟踪的内容将留到后面的篇幅来讲。  
+## 参考
+1\. http://blog.163.com/digoal@126/blog/static/163877040201542103933969/  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

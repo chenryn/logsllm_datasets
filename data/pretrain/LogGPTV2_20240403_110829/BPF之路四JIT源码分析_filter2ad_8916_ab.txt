@@ -1,0 +1,202 @@
+            prog = tmp;
+        }
+        ...;
+        //addrs[i]表示编译完第i条eBPF指令后, x86指令的总长度. addrs[i]-addrs[i-1]=第i条eBPF指令编译为x86指令的长度
+        //由于x86指令是变长的, 因此eBPF在相对跳转时需要根据addrs修改偏移量
+        addrs = kmalloc_array(prog->len + 1, sizeof(*addrs), GFP_KERNEL);
+        //在首次pass之前, 对于addrs[]进行一个大概的估计. 每一个BPF指令翻译成x86指令后都小于64字节, 因此就都按64计算
+        for (proglen = 0, i = 0; i len; i++) {
+            proglen += 64;
+            addrs[i] = proglen;
+        }
+        ctx.cleanup_addr = proglen; //清理函数的地址, 也就是函数序言的地址, 位于eBPF最后一条指令翻译为x86指令的后面 
+    skip_init_addrs:
+        //每次pass之后JIT镜像都会缩小, 迭代会持续到JIT镜像停止缩小位置
+        //非常大的BPF程序可能在最后一次pass还在收敛. 这种情况下再多一次pass来产最终的JIT镜像
+        for (pass = 0; pass aux->num_exentries * sizeof(struct exception_table_entry);
+                /* 为x86指令和异常表分配可执行内存, image为JIT后执行写入的地址, 返回的bpf_binary_header对象后面会介绍 */
+                header = bpf_jit_binary_alloc(roundup(proglen, align) + extable_size, &image, align, jit_fill_hole);
+                ...;
+                prog->aux->extable = (void*)image + roundup(proglen, align); //异常函数表
+            }
+            oldproglen = proglen;
+            cond_resched();
+        }
+        if (bpf_jit_enable > 1) //在内核日志中输出JIT之后的程序
+            bpf_jit_dump(prog->len, proglen, pass + 1, image);
+        if (image) { //JIT成功会生成一个镜像
+            ...;
+            prog->bpf_func = (void*)image; //image为函数指针
+            prog->jited = 1; //已进行过jit
+            prog->jited_len = proglen; //程序长度
+        } else { //失败, 则解释运行原程序
+            prog = orig_prog;
+        }
+        ...;
+        return prog;
+    }
+## 常数致盲: bpf_jit_blind_constants()
+JIT的内存可以让攻击者放置任意gadget. 一种流行的技术是把所需的指令序列编码为立即数的一部分.
+因为x86的CISC架构提供了一种把长字节编码为一条指令的方法. 常量盲区, 也称之为常量折叠, 是一种打破立即数值得到方法,
+避免在可执行内存中使用攻击者提供了常量.
+值得注意的是还有许多其他计数(例如, 控制直接分支的恒定偏移量), 但是用户空间中的大多数众所周知的攻击在内核空间中可能不太有效,
+因为BPF只提供了较小的内核和可利用的指令集. 常数致盲法的实现很简单, 在使用常数前把选择的立即数与随机常数进行异或
+`bpf_jit_blind_constants()`会遍历每一条指令, 并对其调用`bpf_jit_blind_insn()`插入能致盲立即数的指令,
+插入的结果放在insn_buf中, 然后调用`bpf_patch_insn_single()`修改eBPF程序.
+    //致盲立即数
+    struct bpf_prog* bpf_jit_blind_constants(struct bpf_prog* prog)
+    {
+        struct bpf_insn insn_buff[16], aux[2];
+        struct bpf_prog *clone, *tmp;
+        int insn_delta, insn_cnt;
+        struct bpf_insn* insn;
+        int i, rewritten;
+        if (!bpf_jit_blinding_enabled(prog) || prog->blinded) //未启用立即数致盲 || 已经被致盲过
+            return prog;
+        clone = bpf_prog_clone_create(prog, GFP_USER); //复制一个bpf_prog对象
+        if (!clone)
+            return ERR_PTR(-ENOMEM);
+        insn_cnt = clone->len; //多少个指令
+        insn = clone->insnsi; //指向指令数组
+        for (i = 0; i aux->verifier_zext);
+            if (!rewritten)
+                continue;
+            //根据insn_buff去修改clone中的eBPF程序, 保护两部分工作: 插入insn_buff中的指令, 调整跳转指令的偏移
+            //i为第几条指令, rewritten为写入了多少条指令
+            tmp = bpf_patch_insn_single(clone, i, insn_buff, rewritten);
+            ...;
+            clone = tmp;    //clone=patch过的程序
+            insn_delta = rewritten - 1; //插入了多少条指令
+            /* 遍历新程序, 跳过刚刚插入的指令  */
+            insn = clone->insnsi + i + insn_delta;
+            insn_cnt += insn_delta;
+            i += insn_delta;
+        }
+        clone->blinded = 1; //已经完成立即数致盲
+        return clone;
+    }
+致盲的过程如下, 基本思路是把指令中的立即数imm转换为imm^随机数. 然后再xor随机数, 从而避免指令中出现原立即数
+    //致盲某条指令
+    static int bpf_jit_blind_insn(const struct bpf_insn* from,
+        const struct bpf_insn* aux,
+        struct bpf_insn* to_buff,
+        bool emit_zext)
+    {
+        struct bpf_insn* to = to_buff;
+        u32 imm_rnd = get_random_int(); //获取一个32位随机数
+        s16 off;
+        if (from->dst_reg == BPF_REG_AX || from->src_reg == BPF_REG_AX) //如果源或者目标寄存器是AX就不致盲
+            goto out;
+        // mov32 reg, 0; 与 mov64 reg, 0; 指直接优化为: xor64 reg, reg; 也能避免立即数的出现
+        if (from->imm == 0 && (from->code == (BPF_ALU | BPF_MOV | BPF_K) || from->code == (BPF_ALU64 | BPF_MOV | BPF_K))) {
+            *to++ = BPF_ALU64_REG(BPF_XOR, from->dst_reg, from->dst_reg);
+            goto out;
+        }
+        //改写指令, 达到不出现用户给的常数(imm)的效果
+        switch (from->code) {
+        //改写32位的ALU运算
+        case BPF_ALU | BPF_ADD | BPF_K: //add32 reg, imm;
+        case BPF_ALU | BPF_SUB | BPF_K: //sub32 reg, imm;
+        case BPF_ALU | BPF_AND | BPF_K: //and32 reg, imm;
+        case BPF_ALU | BPF_OR | BPF_K: //or32 reg, imm;
+        case BPF_ALU | BPF_XOR | BPF_K: //xor32 reg, imm;
+        case BPF_ALU | BPF_MUL | BPF_K: //mul32 reg, imm;
+        case BPF_ALU | BPF_MOV | BPF_K: //mov32 reg, imm;
+        case BPF_ALU | BPF_DIV | BPF_K: //div32 reg, imm;
+        case BPF_ALU | BPF_MOD | BPF_K: //mod32 reg, imm;
+            *to++ = BPF_ALU32_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm); //编码原imm: mov32 AX, imm_rnd^imm;
+            *to++ = BPF_ALU32_IMM(BPF_XOR, BPF_REG_AX, imm_rnd); //解码原imm: xor32 AX, imm_rnd
+            *to++ = BPF_ALU32_REG(from->code, from->dst_reg, BPF_REG_AX); //执行原算术运算, 但是数据源变成了AX: ALU32 reg, AX;
+            break;
+        //同上, 这边是64位算术运算
+        case BPF_ALU64 | BPF_ADD | BPF_K:
+        case BPF_ALU64 | BPF_SUB | BPF_K:
+        case BPF_ALU64 | BPF_AND | BPF_K:
+        case BPF_ALU64 | BPF_OR | BPF_K:
+        case BPF_ALU64 | BPF_XOR | BPF_K:
+        case BPF_ALU64 | BPF_MUL | BPF_K:
+        case BPF_ALU64 | BPF_MOV | BPF_K:
+        case BPF_ALU64 | BPF_DIV | BPF_K:
+        case BPF_ALU64 | BPF_MOD | BPF_K:
+            *to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
+            *to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
+            *to++ = BPF_ALU64_REG(from->code, from->dst_reg, BPF_REG_AX);
+            break;
+        //跳转指令
+        case BPF_JMP | BPF_JEQ | BPF_K: //jeq dst, imm, +off, 含义: if dst==imm then PC+=off;
+        case BPF_JMP | BPF_JNE | BPF_K: //jne dst, imm, +off
+        case BPF_JMP | BPF_JGT | BPF_K: //jgt dst, imm, +off
+        case BPF_JMP | BPF_JLT | BPF_K: //同理
+        case BPF_JMP | BPF_JGE | BPF_K:
+        case BPF_JMP | BPF_JLE | BPF_K:
+        case BPF_JMP | BPF_JSGT | BPF_K:
+        case BPF_JMP | BPF_JSLT | BPF_K:
+        case BPF_JMP | BPF_JSGE | BPF_K:
+        case BPF_JMP | BPF_JSLE | BPF_K:
+        case BPF_JMP | BPF_JSET | BPF_K:
+            /* 
+                如果off>=0, 说明是相对原PC往后跳, 偏移不受影响
+                如果offoff;
+            if (off imm); //编码imm: mov64 AX, imm_rnd^imm;
+            *to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd); //解码imm: xor64 AX, imm_rnd
+            *to++ = BPF_JMP_REG(from->code, from->dst_reg, BPF_REG_AX, off); //条件跳转, 比较dst与AX: j[..] dst, AX, +off
+            break;
+        //32位的条件相对跳转指令, 同上
+        case BPF_JMP32 | BPF_JEQ | BPF_K:
+        case BPF_JMP32 | BPF_JNE | BPF_K:
+        case BPF_JMP32 | BPF_JGT | BPF_K:
+        case BPF_JMP32 | BPF_JLT | BPF_K:
+        case BPF_JMP32 | BPF_JGE | BPF_K:
+        case BPF_JMP32 | BPF_JLE | BPF_K:
+        case BPF_JMP32 | BPF_JSGT | BPF_K:
+        case BPF_JMP32 | BPF_JSLT | BPF_K:
+        case BPF_JMP32 | BPF_JSGE | BPF_K:
+        case BPF_JMP32 | BPF_JSLE | BPF_K:
+        case BPF_JMP32 | BPF_JSET | BPF_K:
+            /* 同上, 往前的话要多跳两条指令 */
+            off = from->off;
+            if (off imm);
+            *to++ = BPF_ALU32_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
+            *to++ = BPF_JMP32_REG(from->code, from->dst_reg, BPF_REG_AX, off);
+            break;
+        //这个case属于 lddw reg, imm; 前8B指令保存了imm的低32位imm0, 后8B指令保存了imm的高32为imm1
+        case BPF_LD | BPF_IMM | BPF_DW:
+            *to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ aux[1].imm); //编码imm1: mov64 AX, imm_rnd^imm1;
+            *to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd); //解码imm1: xor64 AX, imm_rnd
+            *to++ = BPF_ALU64_IMM(BPF_LSH, BPF_REG_AX, 32); //左移32位: lsh64 AX, 32;
+            *to++ = BPF_ALU64_REG(BPF_MOV, aux[0].dst_reg, BPF_REG_AX); //放入指定寄存器: mov64 dst0, AX;
+            break;
+        case 0: /* lddw reg, imm; 的后半部分: 0 0, imm1 */
+            *to++ = BPF_ALU32_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ aux[0].imm); //编码imm0: mov32 AX, imm_rnd^imm0;
+            *to++ = BPF_ALU32_IMM(BPF_XOR, BPF_REG_AX, imm_rnd); //解码imm0: xor32 AX, imm_rnd
+            if (emit_zext)
+                *to++ = BPF_ZEXT_REG(BPF_REG_AX);
+            *to++ = BPF_ALU64_REG(BPF_OR, aux[0].dst_reg, BPF_REG_AX); //写入寄存器低3位: or64 dst0, AX;
+            break;
+        //写入内存指令
+        case BPF_ST | BPF_MEM | BPF_DW: //stdw [dst+off], imm
+        case BPF_ST | BPF_MEM | BPF_W: //stw [dst+off], imm
+        case BPF_ST | BPF_MEM | BPF_H: //sth [dst+off], imm
+        case BPF_ST | BPF_MEM | BPF_B: //stb [dst+off], imm
+            *to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm); //编码imm: mov64 AX, imm_rnd^imm;
+            *to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd); //解码imm: xor64 AX, imm_rnd;
+            *to++ = BPF_STX_MEM(from->code, from->dst_reg, BPF_REG_AX, from->off); //写入内存: st[..] [ds+off], AX;
+            break;
+        }
+    out:
+        return to - to_buff; //返回插入了多少条指令
+    }
+## bpf_jit_binary_alloc()
+所有JIT之后的程序都保存在`struct bpf_binary_header`中
+    struct bpf_binary_header {
+        u32 pages;      //包含多少页
+        u8 image[] __aligned(BPF_IMAGE_ALIGNMENT);  //伪数组, 剩余部分保存JIT编译出的x86程序镜像, 其实就是指令了
+    };
+`bpf_jit_binary_alloc()`计算出所需空间后,
+通过`bpf_jit_alloc_exec()=>vmalloc()`分配一片可执行内存作为hdr, 然后添加一个随机偏移作为JITed程序所在的位置.
+    struct bpf_binary_header* bpf_jit_binary_alloc(unsigned int proglen, u8** image_ptr, unsigned int alignment, bpf_jit_fill_hole_t bpf_fill_ill_insns)
+    {
+        struct bpf_binary_header* hdr;
+        u32 size, hole, start, pages;
+        //大多数BPF过滤器很小, 但是如果能填充满一页,只要留128字节额外空间来插入随机的的不合法指令
+        size = round_up(proglen + sizeof(*hdr) + 128, PAGE_SIZE);   //所需空间

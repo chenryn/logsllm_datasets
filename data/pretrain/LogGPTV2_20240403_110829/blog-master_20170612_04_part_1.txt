@@ -1,0 +1,129 @@
+## 懒人推动社会进步 - 多列聚合, gin与数据分布(选择性)  
+### 作者      
+digoal      
+### 日期      
+2017-06-12      
+### 标签      
+PostgreSQL , 多列聚合 , gin , btree , n_distinct , 选择性 , 如何选择索引方法(hash,btree,gin,gist,brin) , 如何优化索引 , 相关性           
+----      
+## 背景   
+在广告行业，精准营销是一个较热的话题，之前写过一个案例，如何使用PostgreSQL的array类型和GIN索引实时圈人的场景。  
+[《万亿级营销(圈人)迈入毫秒时代 - 万亿user_tags级实时推荐系统数据库设计》](../201612/20161225_01.md)    
+使用以上方法，程序需要作出一些调整（当然，如果用户原本就是PostgreSQL技术栈，改动量会很少），改动量举例  
+假设用户使用了多个列来表示不同的属性，每个属性对应一些TAG取值空间。  
+```  
+create table user_tags(uid int8 primary key, lab1 int, lab2 text, lab3 timestamp, lab4 text, lab5 interval, lab6 json);  
+```  
+用户原有的圈人、维度统计查询可能是这样的  
+```  
+select * from user_tags where lab1 ? xxx and lab2 ? xxx or lab4 ? xxx;  
+select xx, count(*) from user_tags where lab1 ? xxx and lab2 ? xxx or lab4 ? xxx group by xxx;  
+```  
+由于属性取值空间可能连续，使用[《万亿级营销(圈人)迈入毫秒时代 - 万亿user_tags级实时推荐系统数据库设计》](../201612/20161225_01.md)提到的方法，需要建立标签库，将数据阶梯化，查询也要进行转换。  
+例如between and这种连续查询需要转换为in的散列查询。使得程序设计更加复杂，（虽然这样也许可以将性能最大化）。  
+那么PostgreSQL有没有什么折中的办法呢？  
+当然有，一切办法都是为懒人准备的，懒人推动了社会的进步。  
+如果你阅读一下这些文档，你会发现PG里面办法还是蛮多的。  
+1、使用bitmapand, bitmapor+任意索引，解决圈人问题。  
+[《多字段，任意组合条件查询(0建模) - 毫秒级实时圈人 最佳实践》](../201706/20170607_02.md)    
+2、使用varbitx插件，解决圈人问题。  
+[《阿里云RDS for PostgreSQL varbitx插件与实时画像应用场景介绍》](../201705/20170502_01.md)    
+接下来针对有连续查询，等值查询多种组合查询的圈人场景，我们来看看如何解决。  
+## 建模和测试  
+构建一张TAG表  
+```  
+postgres=# create table tbl_label(uid int primary key, c1 int, c2 text, c3 numeric, c4 timestamp, c5 interval, c6 int);  
+CREATE TABLE  
+Time: 31.145 ms  
+```  
+插入一批数据  
+```  
+postgres=# insert into tbl_label select id,   
+random()*10000, md5(random()::text),   
+10000*random(), clock_timestamp(),   
+(random()*1000::int||' hour')::interval,   
+random()*99999   
+from generate_series(1,10000000) t(id);  
+INSERT 0 10000000  
+```  
+数据样式  
+```  
+postgres=# select * from tbl_label limit 10;  
+ uid |  c1  |                c2                |        c3        |             c4             |        c5        |  c6     
+-----+------+----------------------------------+------------------+----------------------------+------------------+-------  
+   1 | 1692 | 505662aa4a6b33e1775cea660063ba58 | 9761.26249413937 | 2017-06-12 18:38:57.515097 | 322:06:55.266882 | 67699  
+   2 | 8611 | a60d564b7f4d58029dfd5e16f0457305 | 1003.07232700288 | 2017-06-12 18:38:57.515282 | 780:59:39.081975 | 89283  
+   3 |  290 | f226358e08372d4b79c8ecdd27172244 | 8240.20517989993 | 2017-06-12 18:38:57.515296 | 261:29:59.658099 | 87975  
+   4 | 7829 | 32bc5d97731ddaf2c1630218e43d1e85 | 9061.87939457595 | 2017-06-12 18:38:57.515303 | 760:47:18.267513 | 76409  
+   5 | 7735 | 3813b4bcdaadc21a55da143f6aceeac9 | 6651.74870751798 | 2017-06-12 18:38:57.515309 | 512:45:50.116217 | 11252  
+   6 | 9945 | ff72917169cdea9225e429e438f22586 | 2114.50539063662 | 2017-06-12 18:38:57.515316 | 63:30:34.15014   | 33288  
+   7 | 9144 | 7cf4067f22c5edbb1fc4e08ecee7242c | 5662.74457611144 | 2017-06-12 18:38:57.515322 | 890:30:28.360096 | 55484  
+   8 | 2433 | 8ac9732bec2b1c175483c16e82467653 | 9184.17258188128 | 2017-06-12 18:38:57.515328 | 343:34:40.88581  | 53265  
+   9 | 8113 | 2dd724e82dc7c2a15dfda45f6a41cd53 | 5094.92502082139 | 2017-06-12 18:38:57.515334 | 635:16:39.096908 | 63410  
+  10 | 3893 | b8abdb00228f09efb04c1e2a8a022c22 | 6397.02362008393 | 2017-06-12 18:38:57.51534  | 295:26:24.752753 | 17894  
+(10 rows)  
+```  
+分析表的统计信息  
+```  
+postgres=# analyze tbl_label ;  
+ANALYZE  
+```  
+查看每列的散列程度  
+```  
+n_distinct解释  
+-1表示唯一，也就是说这个列的每一行都不一样.  
+>=1时，表示这个列有多少唯一值.  
+= 1) AND (tbl_label.c1   Bitmap Index Scan on idx_tbl_label_1  (cost=0.00..123.24 rows=10074 width=0) (actual time=39.773..39.773 rows=9922 loops=1)  
+         Index Cond: ((tbl_label.c1 >= 1) AND (tbl_label.c1 = 1) AND (tbl_label.c1   BitmapOr  (cost=134.36..134.36 rows=10085 width=0) (actual time=40.045..40.045 rows=0 loops=1)  
+         Buffers: shared hit=764  
+         ->  Bitmap Index Scan on idx_tbl_label_1  (cost=0.00..123.24 rows=10074 width=0) (actual time=40.031..40.031 rows=9922 loops=1)  
+               Index Cond: ((tbl_label.c1 >= 1) AND (tbl_label.c1   Bitmap Index Scan on idx_tbl_label_1  (cost=0.00..6.08 rows=11 width=0) (actual time=0.012..0.012 rows=10 loops=1)  
+               Index Cond: (tbl_label.c6 = 100)  
+               Buffers: shared hit=4  
+ Planning time: 0.125 ms  
+ Execution time: 50.758 ms  
+(15 rows)  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from tbl_label where c1 between 1 and 100 and c6=100;  
+                                                        QUERY PLAN                                                           
+---------------------------------------------------------------------------------------------------------------------------  
+ Bitmap Heap Scan on public.tbl_label  (cost=22.50..24.02 rows=1 width=80) (actual time=36.193..36.193 rows=0 loops=1)  
+   Output: uid, c1, c2, c3, c4, c5, c6  
+   Recheck Cond: ((tbl_label.c1 >= 1) AND (tbl_label.c1   Bitmap Index Scan on idx_tbl_label_1  (cost=0.00..22.50 rows=1 width=0) (actual time=36.190..36.190 rows=0 loops=1)  
+         Index Cond: ((tbl_label.c1 >= 1) AND (tbl_label.c1 = 1) AND (tbl_label.c1 <= 100) AND (tbl_label.c6 = 100))  
+   Buffers: shared read=3  
+ Planning time: 0.248 ms  
+ Execution time: 0.056 ms  
+(7 rows)  
+```  
+多个索引通过bitmapAnd, bitmapOr对数据进行过滤，大幅提升任意条件查询的性能。原理如下     
+[《多字段，任意组合条件查询(0建模) - 毫秒级实时圈人 最佳实践》](../201706/20170607_02.md)     
+那么应该如何选择索引呢？后面会讲到。  
+## 赠送彩蛋  
+实际上前面用到的是GIN多列复合索引，还有一种方法，将多列转换为数组，然后建立数组索引(PostgreSQL 表达式索引。)。  
+1、如何将多列转换为数组？  
+```  
+postgres=# create or replace function to_array(VARIADIC anyarray) returns anyarray as $$  
+  select $1;                        
+$$ language sql strict immutable;  
+CREATE FUNCTION  
+```  
+例子  
+```  
+postgres=# select to_array('a'::text,'b','c');  
+ to_array   
+----------  
+ {a,b,c}  
+(1 row)  
+postgres=# select to_array(now(),clock_timestamp());  
+                             to_array                                
+-------------------------------------------------------------------  
+ {"2017-06-12 17:50:47.992274+08","2017-06-12 17:50:47.992489+08"}  
+(1 row)  
+postgres=# select to_array(1,2,3);  
+ to_array   
+----------  
+ {1,2,3}  
+(1 row)  
+```  
+2、数组表达式索引  
+例子  

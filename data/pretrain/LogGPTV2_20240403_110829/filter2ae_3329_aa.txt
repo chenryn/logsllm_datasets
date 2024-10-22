@@ -1,0 +1,250 @@
+# slub堆溢出的利用
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+由于slub分配器在`kmem_cache_cpu`中使用`freelist`管理空闲对象, 类似于glibc中的fastbin,
+因此本文就是探究怎么通过堆溢出漏洞劫持freelist链表, 从而实现任意写
+建议先看一遍slub整体过程在看本文: 
+内核版本: linux-5.5.6
+## 测试代码
+  * vuln_driver驱动主要代码:
+    struct Arg{
+        int idx;
+        int size;
+        void *ptr;
+    };
+    void *Arr[0x10]; //ptr array
+    static long do_ioctl(struct file *filp, unsigned int cmd, unsigned long arg_p)
+    {
+        int ret;
+         ret = 0;
+        struct Arg arg;
+        copy_from_user(&arg, arg_p, sizeof(struct Arg));
+        switch(cmd) {
+            case 0xff01: //Add
+                Arr[arg.idx]=kmalloc(arg.size, GFP_KERNEL);
+                break;
+            case 0xff02: //Show
+                copy_to_user(arg.ptr, Arr[arg.idx], arg.size);
+                break;
+            case 0xff03: //Free
+                kfree(Arr[arg.idx]);
+                            Arr[arg.idx]=0;
+                break;
+            case 0xff04: //Edit
+                copy_from_user(Arr[arg.idx], arg.ptr, arg.size);
+                break;
+        }
+        return ret;
+    }
+## 相关数据结构
+  * `struct kmem_cache`：用于管理`SLAB缓存`，包括该缓存中对象的信息描述，per-CPU/Node管理slab页面等
+    struct kmem_cache {
+        struct kmem_cache_cpu __percpu *cpu_slab;       //每个CPU slab页面
+        /* Used for retriving partial slabs etc */
+        unsigned long flags;
+        unsigned long min_partial;
+        int size;        /* The size of an object including meta data */
+        int object_size;    /* The size of an object without meta data */
+        int offset;        /* Free pointer offset. */
+    #ifdef CONFIG_SLUB_CPU_PARTIAL
+        /* Number of per cpu partial objects to keep around */
+        unsigned int cpu_partial;
+    #endif
+        struct kmem_cache_order_objects oo;     //该结构体会描述申请页面的order值，以及object的个数
+        /* Allocation and freeing of slabs */
+        struct kmem_cache_order_objects max;
+        struct kmem_cache_order_objects min;
+        gfp_t allocflags;    /* gfp flags to use on each alloc */
+        int refcount;        /* Refcount for slab cache destroy */
+        void (*ctor)(void *);           // 对象构造函数
+        int inuse;        /* Offset to metadata */
+        int align;        /* Alignment */
+        int reserved;        /* Reserved bytes at the end of slabs */
+        int red_left_pad;    /* Left redzone padding size */
+        const char *name;    /* Name (only for display!) */
+        struct list_head list;    /* List of slab caches */       //kmem_cache最终会链接在一个全局链表中
+        struct kmem_cache_node *node[MAX_NUMNODES];     //Node管理slab页面
+    };
+  * `struct kmem_cache_cpu`：用于管理每个CPU的`slab页面`，可以使用 **无锁访问** ，提高缓存对象分配速度；
+    struct kmem_cache_cpu {
+        void **freelist;    /* Pointer to next available object */                  //指向空闲对象的指针
+        unsigned long tid;    /* Globally unique transaction id */          
+        struct page *page;    /* The slab from which we are allocating */     //slab缓存页面
+    #ifdef CONFIG_SLUB_CPU_PARTIAL
+        struct page *partial;    /* Partially allocated frozen slabs */
+    #endif
+    #ifdef CONFIG_SLUB_STATS
+        unsigned stat[NR_SLUB_STAT_ITEMS];
+    #endif
+    };
+  * `struct kmem_cache_node`：用于管理每个Node的`slab页面`，由于每个Node的访问速度不一致，`slab`页面由Node来管理；
+    /*
+     * The slab lists for all objects.
+     */
+    struct kmem_cache_node {
+        spinlock_t list_lock;
+    #ifdef CONFIG_SLUB
+        unsigned long nr_partial;    //slab页表数量
+        struct list_head partial;       //slab页面链表
+    #ifdef CONFIG_SLUB_DEBUG
+        atomic_long_t nr_slabs;
+        atomic_long_t total_objects;
+        struct list_head full;
+    #endif
+    #endif
+    };
+  * `struct page`：用于描述`slab页面`，`struct page`结构体中很多字段都是通过`union`联合体进行复用的。`struct page`结构中，用于`slub`的成员如下：
+    struct page {
+        union {
+           ...
+            void *s_mem;            /* slab first object */
+           ...
+        };
+         /* Second double word */
+        union {
+           ...
+            void *freelist;        /* sl[aou]b first free object */
+           ...
+        };
+        union {
+           ...
+            struct {
+                union {
+                  ...
+                    struct {            /* SLUB */
+                        unsigned inuse:16;
+                        unsigned objects:15;
+                        unsigned frozen:1;
+                    };
+                    ...
+                };
+           ...
+            };   
+        };   
+         /*
+         * Third double word block
+         */
+        union {
+           ...
+            struct {        /* slub per cpu partial pages */
+                struct page *next;    /* Next partial slab */
+    #ifdef CONFIG_64BIT
+                int pages;    /* Nr of partial slabs left */
+                int pobjects;    /* Approximate # of objects */
+    #else
+                short int pages;
+                short int pobjects;
+    #endif
+            };
+            struct rcu_head rcu_head;    /* Used by SLAB
+                             * when destroying via RCU
+                             */
+        };
+        ...
+            struct kmem_cache *slab_cache;    /* SL[AU]B: Pointer to slab */  
+        ...
+    }
+## kmalloc过程
+我们只关注与freelist相关的fastpath部分
+###  kmalloc()
+  * kmalloc()先根据size找到对应的`struct kmem_cache`, 然后调用`slab_alloc()`从中分配对象
+    void *__kmalloc(size_t size, gfp_t flags)
+    {
+        struct kmem_cache *s;
+        void *ret;
+        if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
+            return kmalloc_large(size, flags);
+        s = kmalloc_slab(size, flags); //根据size找到对应的kmem_cache对象
+        if (unlikely(ZERO_OR_NULL_PTR(s)))
+            return s;
+        ret = slab_alloc(s, flags, _RET_IP_); //从s中分配出一个对象
+        trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+        kasan_kmalloc(s, ret, size, flags);
+        return ret;
+    }
+    EXPORT_SYMBOL(__kmalloc);
+###  slab_alloc()
+  * `slab_alloc()`转而调用`slab_alloc_node()`
+    static __always_inline void *slab_alloc(struct kmem_cache *s,
+            gfp_t gfpflags, unsigned long addr)
+    {
+        return slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr);
+    }
+###  slab_alloc_node()
+  * 对于fastpath就是一个简单的单链表取出过程, 但是`get_freepointer_safe();`会根据配置对空闲指针进行一些保护编码
+    static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+            gfp_t gfpflags, int node, unsigned long addr)
+    {
+        void *object;
+        struct kmem_cache_cpu *c;
+        struct page *page;
+        unsigned long tid;
+        s = slab_pre_alloc_hook(s, gfpflags); //空的
+        if (!s)
+            return NULL;
+    redo:
+        /*
+            必须通过本cpu指针去读kmem_cache中的cpu相关数据, 
+            当读一个CPU区域内的数据时有可能在cpu直接来回切换
+            只要我们在执行 cmpxchg 时再次使用原始 cpu，这并不重要
+            必须保证tid和kmem_cache都是通过同一个CPU获取的
+            如果开启了CONFIG_PREEMPT(内核抢占), 那么有可能获取tid之后被换出, 导致tid与c不对应, 所以这里需要一个检查
+        */
+        do {
+            tid = this_cpu_read(s->cpu_slab->tid); //kmem_cache中各cpu缓存的tid, tid是用于同步一个CPU上多个slub请求的序列号
+            c = raw_cpu_ptr(s->cpu_slab); //kmem_cache中各cpu缓存
+        } while (IS_ENABLED(CONFIG_PREEMPT) && unlikely(tid != READ_ONCE(c->tid)));
+        barrier(); //编译屏障, 防止指令乱序
+        object = c->freelist; //获取空闲链表中的对象
+        page = c->page; //正在被用来分配对象的页
+        if (unlikely(!object || !node_match(page, node))) { //如果空闲链表为空或者page不属于要求的节点, 那么就进入slowpath部分
+            object = __slab_alloc(s, gfpflags, node, addr, c);
+            stat(s, ALLOC_SLOWPATH);
+        } else {    //否则进入fastpath, 通过CPU缓存中的freelist进行分配
+            void *next_object = get_freepointer_safe(s, object); //计算要写入的指针
+            /*
+                这里要执行链表的取出操作, this_cpu_cmpxchg_double()作用为:
+                    如果s->cpu_slab->freelist==object, 那么s->cpu_slab->freelist=next_object
+                    如果s->cpu_slab->tid==tid, 那么s->cpu_slab->tid=next_tid(tid), next_tid(tid)
+                如果执行到一半s->cpu_slab被其他slub拿去使用, 那么compare失败, 不执行写入, 返回redo重新试一下
+            */
+            if (unlikely(!this_cpu_cmpxchg_double(
+                    s->cpu_slab->freelist, s->cpu_slab->tid,
+                    object, tid,
+                    next_object, next_tid(tid)))) { //next_tid(tid)相当于tid+1
+                note_cmpxchg_failure("slab_alloc", s, tid);
+                goto redo;
+            }
+            prefetch_freepointer(s, next_object); //把预读进缓存
+            stat(s, ALLOC_FASTPATH); //记录状态
+        }
+        maybe_wipe_obj_freeptr(s, object);
+        if (unlikely(gfpflags & __GFP_ZERO) && object) //如果flag要求清0
+            memset(object, 0, s->object_size);
+        slab_post_alloc_hook(s, gfpflags, 1, &object); //空操作
+        return object;
+    }
+###  get_freepointer_safe()
+  * 如果开启了CONFIG_SLAB_FREELIST_HARDENE, 那么就会用`s->random`与`指针所在地址`去加密原空闲指针.
+    static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr, unsigned long ptr_addr)
+    {
+    #ifdef CONFIG_SLAB_FREELIST_HARDENED
+        /*
+            kasan_reset_tag(ptr_addr)会直接返回ptr_addr
+            如果配置中开启了CONFIG_SLAB_FREELIST_HARDENED
+            那么写入的空闲指针 = ptr XOR s->random XOR ptr所在地址
+        */
+        return (void *)((unsigned long)ptr ^ s->random ^ (unsigned long)kasan_reset_tag((void *)ptr_addr));
+    #else
+        return ptr; //如果没有保护, 那么原样返回
+    #endif
+    } 
+    static inline void *freelist_dereference(const struct kmem_cache *s, void *ptr_addr)
+    {
+        //返回记录在ptr_addr中的freelist指针
+        return freelist_ptr(s, (void *)*(unsigned long *)(ptr_addr), (unsigned long)ptr_addr); 
+    }
+    //获取object对象中的空闲指针
+    static inline void *get_freepointer_safe(struct kmem_cache *s, void *object) 

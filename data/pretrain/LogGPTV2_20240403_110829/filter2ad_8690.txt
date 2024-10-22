@@ -1,0 +1,150 @@
+## 前言
+前阵子看有师傅在公众号上发表了`Resin解析漏洞分析`，我们也知道有个常用的OA用的就是`Resin`，因此我认为了解它的漏洞是十分必要的。
+## 原理分析
+这个漏洞和`IIS`解析漏洞比较像，可以通过创建一个`xxx.jsp`的文件夹，并在其中放置一个`txt`文件,文件的内容将会被当作`JSP`解析。
+我认为要分析这个漏洞原理，首先得先了解访问`jsp`文件时`Resin`是如何处理我们请求的。
+首先看下`*.jsp`是被哪个`Servlet`处理的,从配置`app-default.xml`中可以看出，我们的请求会被`com.caucho.jsp.JspServlet`处理。
+          false
+          1024
+本来以为在`JspServlet`下断点可以看到请求调用栈，但是在实际操作的过程中发现并没有执行到`JspServlet`中的方法就返回了，确实比较奇怪。
+在`Resin`中发起HTTP请求一定会经过`HttpRequest#handleRequest`方法处理，可以在这个方法中打断点排查问题，经过排查发现在`PageFilterChain#doFilter`中就完成了`JSP`的"编译"和执行工作，这点比较奇怪，因为之前分析Tomcat中"编译JSP"的操作是在`servlet`中完成的。所以其实针对`Resin`对`JSP`文件处理的分析重点就在`PageFilterChain#doFilter`中。
+  * `JSP`编译后会被封装到`Page`对象中，而`Page`对象的引用被保存以`pageRef`属性中，因此首先检测`pageRef`是否为空，如果是则直接通过`page.pageservice(req, res);`执行请求，不经过后面编译的逻辑。
+  * 如果缓存中没有`page`对象，则通过`compilePage`编译`JSP`并封装为`Page`对象返回，`new SoftReference`创建引用对象，再通过`pageservice`执行请求。
+    public void doFilter(ServletRequest request, ServletResponse response)
+        throws ServletException, IOException
+      {
+        HttpServletRequest req = (HttpServletRequest) request;
+        HttpServletResponse res = (HttpServletResponse) response;
+        FileNotFoundException notFound = null;
+        SoftReference pageRef = _pageRef;
+        Page page;
+        //首先从换从中获取Page对象的引用，如果有就不再编译。
+        if (pageRef != null)
+          page = pageRef.get();
+        else
+          page = null;
+         //如果缓存为空或者page对象被修改过则编译
+        if (page == null || page._caucho_isModified()) {
+          try {
+            _pageRef = null;
+            page = compilePage(page, req, res);
+            //得到page的引用并保存
+            if (page != null) {
+              _pageRef = new SoftReference(page);
+              _isSingleThread = page instanceof SingleThreadModel;
+            }
+          } catch (FileNotFoundException e) {
+            page = null;
+            notFound = e;
+          }
+        }
+        if (page == null) {
+          // jsp/01cg
+          if (notFound == null)
+            return;
+          String errorUri = (String) req.getAttribute(RequestDispatcher.ERROR_REQUEST_URI);
+          String uri = (String) req.getAttribute(RequestDispatcher.INCLUDE_REQUEST_URI);
+          String forward = (String) req.getAttribute(RequestDispatcher.FORWARD_REQUEST_URI);
+          // jsp/01ch
+          if (uri != null) {
+            //throw new FileNotFoundException(uri);
+            throw notFound;
+          }
+          else if (forward != null) {
+            //throw new FileNotFoundException(req.getRequestURI());
+            throw notFound;
+          }
+          else if (errorUri != null) {
+            //throw new FileNotFoundException(errorUri);
+            throw notFound;
+          }
+          else {
+            log.log(Level.FINER, notFound.toString(), notFound);
+          }
+          ((HttpServletResponse) res).sendError(HttpServletResponse.SC_NOT_FOUND);
+        }
+        else if (req instanceof HttpServletRequest) {
+          try {
+            if (_isSingleThread) {
+              synchronized (page) {
+               //执行请求
+                page.pageservice(req, res);
+              }
+            }
+            else
+              page.pageservice(req, res);
+          } catch (ServletException e) {
+          ...
+      }
+`Page#pageService-->JavaPage#service-->_aaa#_jspService`,最后通过`JSP`生成类的`_jspService`方法完成请求。
+### 如何进入PageFilterChain?
+通过上面的分析我们可以知道，在`PageFilterChain`中完成了对JSP的编译和执行，所以我们分析的重点就在于如何才能进入`PageFilterChain`中？
+追踪创建`PageFilterChain`的过程，在`WebApp#buildInvocation`中，完成了`PageFilterChain`的创建，我摘了部分代码分析。
+  * 首先从缓存中获取`FilterChains`,如果有的话则直接获取`chains`，缓存中保存的`Chains`和URL有关。
+  * 如果缓存没有，则通过`_servletMapper.mapServlet(invocation);`获取Chains。
+    public Invocation buildInvocation(Invocation invocation, boolean isTop)
+      {
+          ...
+        else {
+            FilterChainEntry entry = null;
+            // jsp/1910 - can't cache jsp_precompile
+            String query = invocation.getQueryString();
+            boolean isCache = true;
+            if (query != null && query.indexOf("jsp_precompile") >= 0)
+              isCache = false;
+            else if (_requestRewriteDispatch != null)
+              isCache = false;
+            if (isCache)
+              entry = _filterChainCache.get(invocation.getContextURI());
+            if (entry != null && ! entry.isModified()) {
+              chain = entry.getFilterChain();
+              invocation.setServletName(entry.getServletName());
+              if (! entry.isAsyncSupported())
+                invocation.clearAsyncSupported();
+              invocation.setMultipartConfig(entry.getMultipartConfig());
+            } else {
+              chain = _servletMapper.mapServlet(invocation);
+             ...   
+            }
+在`mapServlet`中，主要做了下面的操作
+  * 从`ServletInvocation`中获取URL并去除`;xxx`的内容
+    String contextURI = invocation.getContextURI();
+     try {
+                cleanUri = Invocation.stripPathParameters(contextURI);
+          } catch (Exception e) {
+            log.warning(L.l("Invalid URI {0}", contextURI));
+            return new ErrorFilterChain(404);
+          }
+  * 根据URL匹配获取`ServletMapping`
+    ServletMapping servletMap = _servletMap.map(cleanUri, vars);
+  * 如果根据URL没有匹配到`Servlet`处理则根据URL获取资源内容，并设置使用`_defaultServlet`处理。
+    servletName = servletMap.getServletName();
+    if (servletName == null) {
+          try {
+            InputStream is;
+            is = _webApp.getResourceAsStream(contextURI);
+            if (is != null) {
+              is.close();
+              servletName = _defaultServlet;
+            }
+          } catch (Exception e) {
+          }
+  * 如果URL以`j_security_check`结尾则使用`j_security_check`作为`Servlet`
+    if (matchResult == null && contextURI.endsWith("j_security_check")) {
+          servletName = "j_security_check";
+        }
+  * 如果匹配成功则设置`servletPath`和`servletName`等属性到`invocation`对象中，根据`Servletname`从`_servletManager`获取`ServletConfigImpl`对象，创建FilterChains
+    ArrayList vars = new ArrayList();
+    vars.add(contextURI);
+    String servletPath = vars.get(0);
+    invocation.setServletPath(servletPath);
+    invocation.setServletName(servletName);
+    ServletConfigImpl newConfig = _servletManager.getServlet(servletName);
+    FilterChain chain= _servletManager.createServletChain(servletName, config, invocation);
+所以这个漏洞的重点在于为什么`/test.jsp/xxx.txt`可以被`_servletMap.map(cleanUri, vars);`匹配到。
+进入到`UrlMap#map`中，发现默认情况下`*.jsp`会交给`^.*\.jsp(?=/)|^.*\.jsp\z`正则处理。
+主要出问题的是`^.*\.jsp(?=/)`部分，这个正则的逻辑是匹配`xxxx.jsp/xxxx`所以我们传入的路径会被匹配到,这也是这个漏洞的本质原因。
+## 总结
+其实我认为`Resin`这么写可能对作者来说这本身是个正常功能，因为之前`Resin`也实现了`Invoker`的功能，可以直接根据路径加载任意类。
+## 参考
+  * [Resin容器文件解析漏洞深入分析](https://mp.weixin.qq.com/s/eZAG3Ze0ytd5l7ci1nb-qg)

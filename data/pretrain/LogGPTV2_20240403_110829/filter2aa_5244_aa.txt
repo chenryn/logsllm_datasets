@@ -1,0 +1,157 @@
+# kernel UAF
+UAF 即 Use After Free，通常指的是**对于释放后未重置的垂悬指针的利用**，此前在用户态下的 heap 阶段对于 ptmalloc 的利用很多都是基于UAF漏洞进行进一步的利用。
+在 CTF 当中，内核的“堆内存”主要指的是直接映射区（direct mapping area），常用的分配函数 kmalloc 从此处分配内存，常用的分配器为 slub，若是在 kernel 中存在着垂悬指针，我们同样可以以此完成对 slab/slub 内存分配器的利用，通过 Kernel UAF 完成提权。
+## 内核堆利用与绑核
+slub allocator 会优先从当前核心的 `kmem_cache_cpu` 中进行内存分配，在多核架构下存在多个 `kmem_cache_cpu` ，由于进程调度算法会保持核心间的负载均衡，因此我们的 exp 进程可能会被在不同的核心上运行，这也就导致了利用过程中 kernel object 的分配有可能会来自不同的 `kmem_cache_cpu` ，这使得利用模型变得复杂，也降低了漏洞利用的成功率。
+> 比如说你在 core 0 上整了个 double free，准备下一步利用时 exp 跑到 core 1去了，那就很容易让人摸不着头脑 :（
+因此为了保证漏洞利用的稳定，**我们需要将我们的进程绑定到特定的某个 CPU 核心上**，这样 slub allocator 的模型对我们而言便简化成了 `kmem_cache_node + kmem_cache_cpu` ，我们也能更加方便地进行漏洞利用。
+现笔者给出如下将 exp 进程绑定至指定核心的模板：
+```c
+#include 
+/* to run the exp on the specific core only */
+void bind_cpu(int core)
+{
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(core, &cpu_set);
+    sched_setaffinity(getpid(), sizeof(cpu_set), &cpu_set);
+}
+```
+## 通用 kmalloc flag
+`GFP_KERNEL` 与 `GFP_KERNEL_ACCOUNT`  是内核中最为常见与通用的分配 flag，常规情况下他们的分配都来自同一个 `kmem_cache` ——即通用的 `kmalloc-xx` 。
+这两种 flag 的区别主要在于 `GFP_KERNEL_ACCOUNT` 比 `GFP_KERNEL` 多了一个属性——**表示该对象与来自用户空间的数据相关联**，因此我们可以看到诸如 `msg_msg` 、`pipe_buffer`、`sk_buff的数据包` 的分配使用的都是 `GFP_KERNEL_ACCOUNT` ，而 `ldt_struct` 、`packet_socket` 等与用户空间数据没有直接关联的结构体则使用 `GFP_KERNEL`。
+在5.9 版本之前`GFP_KERNEL` 与 `GFP_KERNEL_ACCOUNT` 存在隔离机制，在 [这个 commit](https://github.com/torvalds/linux/commit/10befea91b61c4e2c2d1df06a2e978d182fcf792) 中取消了隔离机制，自内核版本 5.14 起，在 [这个 commit](https://github.com/torvalds/linux/commit/494c1dfe855ec1f70f89552fce5eadf4a1717552) 当中又重新引入：
+- 对于开启了 `CONFIG_MEMCG_KMEM` 编译选项的 kernel 而言（通常都是默认开启），其会为使用 `GFP_KERNEL_ACCOUNT` 进行分配的通用对象**创建一组独立的 `kmem_cache` ——名为 `kmalloc-cg-*`** ，从而导致使用这两种 flag 的 object 之间的隔离。
+## slub 合并 & 隔离
+slab alias 机制是一种对同等/相近大小 object 的 `kmem_cache` 进行**复用**的一种机制：
+- 当一个 `kmem_cache` 在创建时，若已经存在能分配相等/近似大小的 object 的 `kmem_cache` ，则**不会创建新的 kmem\_cache，而是为原有的 kmem\_cache 起一个 alias，作为“新的” kmem\_cache 返回**。
+举个🌰，`cred_jar` 是专门用以分配 `cred` 结构体的 `kmem_cache`，在 Linux 4.4 之前的版本中，其为 `kmalloc-192` 的 alias，即 cred 结构体与其他的 192 大小的 object 都会从同一个 `kmem_cache`——`kmalloc-192` 中分配。
+对于初始化时设置了 `SLAB_ACCOUNT` 这一 flag 的 `kmem_cache` 而言，则会新建一个新的 `kmem_cache` 而非为原有的建立 alias，🌰如在新版的内核当中 `cred_jar` 与 `kmalloc-192` 便是两个独立的 `kmem_cache`，**彼此之间互不干扰**。
+## 例题：CISCN2017 - babydriver
+[attachment here](https://github.com/ctf-wiki/ctf-challenges/tree/master/pwn/kernel/CISCN2017-babydriver)
+### 分析
+先解压 rootfs.cpio 看一下有什么文件
+```bash
+CISCN2017_babydriver [master●] mkdir core
+CISCN2017_babydriver [master●] cd core 
+core [master●] mv ../rootfs.cpio rootfs.cpio.gz
+core [master●●] gunzip ./rootfs.cpio.gz 
+core [master●] ls
+rootfs.cpio
+core [master●] cpio -idmv /dev/console
+  10   │ exec 2>/dev/console
+  11   │
+  12   │ insmod /lib/modules/4.4.72/babydriver.ko
+  13   │ chmod 777 /dev/babydev
+  14   │ echo -e "\nBoot took $(cut -d' ' -f1 /proc/uptime) seconds\n"
+  15   │ setsid cttyhack setuidgid 1000 sh
+  16   │
+  17   │ umount /proc
+  18   │ umount /sys
+  19   │ poweroff -d 0  -f
+  20   │
+───────┴────────────────────────────────────────────────────────────
+```
+根据 init 的内容，12 行加载了 `babydriver.ko` 这个驱动，根据 pwn 的一般套路，这个就是有漏洞的 LKM 了。init 的其他命令都是 linux 常用的命令，就不再解释了。
+把这个驱动文件拿出来。
+```bash
+core [master●] cp ./lib/modules/4.4.72/babydriver.ko ..
+core [master●] cd ..
+CISCN2017_babydriver [master●] check ./babydriver.ko
+./babydriver.ko: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), BuildID[sha1]=8ec63f63d3d3b4214950edacf9e65ad76e0e00e7, with debug_info, not stripped
+[*] '/home/m4x/pwn_repo/CISCN2017_babydriver/babydriver.ko'
+    Arch:     amd64-64-little
+    RELRO:    No RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x0)
+```
+没有开 PIE，无 canary 保护，没有去除符号表，很 nice。
+用 IDA 打开分析，既然没有去除符号表，shift + F9 先看一下有什么结构体，可以发现如下的结构体：
+```asm
+00000000 babydevice_t    struc ; (sizeof=0x10, align=0x8, copyof_429)
+00000000                                         ; XREF: .bss:babydev_struct/r
+00000000 device_buf      dq ?                    ; XREF: babyrelease+6/r
+00000000                                         ; babyopen+26/w ... ; offset
+00000008 device_buf_len  dq ?                    ; XREF: babyopen+2D/w
+00000008                                         ; babyioctl+3C/w ...
+00000010 babydevice_t    ends
+00000010
+```
+再看一下主要函数
+**babyioctl:** 定义了 0x10001 的命令，可以释放全局变量 babydev\_struct 中的 device\_buf，再根据用户传递的 size 重新申请一块内存，并设置 device\_buf\_len。
+```C
+// local variable allocation has failed, the output may be wrong!
+void __fastcall babyioctl(file *filp, unsigned int command, unsigned __int64 arg)
+{
+  size_t v3; // rdx
+  size_t v4; // rbx
+  __int64 v5; // rdx
+  _fentry__(filp, *(_QWORD *)&command);
+  v4 = v3;
+  if ( command == 0x10001 )
+  {
+    kfree(babydev_struct.device_buf);
+    babydev_struct.device_buf = (char *)_kmalloc(v4, 0x24000C0LL);
+    babydev_struct.device_buf_len = v4;
+    printk("alloc done\n", 0x24000C0LL, v5);
+  }
+  else
+  {
+    printk("\x013defalut:arg is %ld\n", v3, v3);
+  }
+}
+```
+**babyopen:** 申请一块空间，大小为 0x40 字节，地址存储在全局变量 babydev\_struct.device\_buf 上，并更新 babydev\_struct.device\_buf\_len
+```C
+int __fastcall babyopen(inode *inode, file *filp)
+{
+  __int64 v2; // rdx
+  _fentry__(inode, filp);
+  babydev_struct.device_buf = (char *)kmem_cache_alloc_trace(kmalloc_caches[6], 0x24000C0LL, 0x40LL);
+  babydev_struct.device_buf_len = 64LL;
+  printk("device open\n", 0x24000C0LL, v2);
+  return 0;
+}
+```
+**babyread:** 先检查长度是否小于 babydev\_struct.device\_buf\_len，然后把 babydev\_struct.device\_buf 中的数据拷贝到 buffer 中，buffer 和长度都是用户传递的参数
+```C
+void __fastcall babyread(file *filp, char *buffer, size_t length, loff_t *offset)
+{
+  size_t v4; // rdx
+  _fentry__(filp, buffer);
+  if ( babydev_struct.device_buf )
+  {
+    if ( babydev_struct.device_buf_len > v4 )
+      copy_to_user(buffer, babydev_struct.device_buf, v4);
+  }
+}
+```
+**babywrite:** 类似 babyread，不同的是从 buffer 拷贝到全局变量中
+```C
+void __fastcall babywrite(file *filp, const char *buffer, size_t length, loff_t *offset)
+{
+  size_t v4; // rdx
+  _fentry__(filp, buffer);
+  if ( babydev_struct.device_buf )
+  {
+    if ( babydev_struct.device_buf_len > v4 )
+      copy_from_user(babydev_struct.device_buf, buffer, v4);
+  }
+}
+```
+**babyrelease:** 释放空间，没什么好说的
+```C
+int __fastcall babyrelease(inode *inode, file *filp)
+{
+  __int64 v2; // rdx
+  _fentry__(inode, filp);
+  kfree(babydev_struct.device_buf);
+  printk("device release\n", filp, v2);
+  return 0;
+}
+```
+还有 babydriver\_init() 和 babydriver\_exit() 两个函数分别完成了 **/dev/babydev** 设备的初始化和清理，查一下函数的用法即可，不再分析。
+### 思路
+没有用户态传统的溢出等漏洞，但存在一个伪条件竞争引发的 UAF 漏洞：
+- 如果我们同时打开两个设备，第二次会覆盖第一次分配的空间，因为 babydev\_struct 是全局的。同样，如果释放第一个，那么第二个其实是被是释放过的，这样就造成了一个 UAF。

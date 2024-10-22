@@ -1,0 +1,327 @@
+    free(user); 
+    close(fd); 
+    printf("bye!\n"); 
+    return 0; 
+} 
+int process_file(int fd) 
+{ 
+    char buffer[1024]; 
+    ... read from file into buffer ... 
+    user = malloc(strlen(buffer)+1); 
+    strcpy(user, buffer); 
+    ... do stuff ... 
+    return 0; 
+} 
+The problem with this code is that cleanup() can be called at any time after it's 
+installed to handle the SIGTERM and SIGINT signals. If either signal is sent to the 
+process before process_file() is called, the user variable isn't initialized. This isn't 
+much of a problem because the initial value is NULL. However, what if a signal is 
+delivered after free(user) and before the program exits? The user variable is 
+deallocated with the free() function twice! That's definitely not good. You would be in 
+even more trouble if the signal handler didn't exit the program because a signal could 
+be sent during the strcpy() operation to free the buffer being copied into. The 
+function would continue to copy data into a free heap chunk, which can lead to 
+memory corruption and possibly arbitrary code execution. 
+In order to see how a bug of this nature might look in production code, take a look at 
+a real-world example: OpenSSH. The following signal-handling routine is installed in 
+OpenSSH in the main() function. It is called when OpenSSH receives an alarm signal 
+(SIGALRM), the intention being to limit the amount of time a connecting client has to 
+complete a successful login: 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+807 
+grace_alarm_handler(int sig) 
+{ 
+    /* XXX no idea how fix this signal handler */ 
+    if (use_privsep && pmonitor != NULL && pmonitor->m_pid > 0) 
+        kill(pmonitor->m_pid, SIGALRM); 
+    /* Log error and exit. */ 
+    fatal("Timeout before authentication for %s", get_remote_ipaddr()); 
+} 
+Most of this code is not that interesting, except for the call to fatal(). If you examine 
+the implementation of fatal() in the OpenSSH source code, you can see it calls the 
+cleanup_exit() function, which in turn calls do_cleanup() to deallocate global 
+structures and exit the process. The do_cleanup() implementation is shown. 
+void 
+do_cleanup(Authctxt *authctxt) 
+{ 
+    static int called = 0; 
+    debug("do_cleanup"); 
+    /* no cleanup if you're in the child for login shell */ 
+    if (is_child) 
+        return; 
+    /* avoid double cleanup */ 
+    if (called) 
+        return; 
+    called = 1; 
+    if (authctxt == NULL) 
+        return; 
+#ifdef KRB5 
+    if (options.kerberos_ticket_cleanup && 
+        authctxt->krb5_ctx) 
+        krb5_cleanup_proc(authctxt); 
+#endif 
+    ... more stuff ... 
+    /* 
+     * Cleanup ptys/utmp only if privsep is disabled 
+     * or if running in monitor. 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+808 
+     */ 
+    if (!use_privsep || mm_is_monitor()) 
+        session_destroy_all(session_pty_cleanup2); 
+} 
+As you can see, the do_cleanup() function is somewhat reentrant, because it checks 
+whether it has already been called, and if it has, it just returns immediately. This 
+prevents fatal() from calling itself, or being interrupting by a signal that results in a 
+call to fatal(), such as the grace_alarm_handler() function. However, any functions 
+called in do_cleanup() are also required to be reentrant if they're called elsewhere in 
+the program. If any called function is not reentrant, then it would be possible for the 
+vulnerable function to be interrupted by the SIGALRM signal, which will eventually 
+lead to the same non-reentrant function being invoked again. Now take a look at the 
+krb5_cleanup_proc() function: 
+void 
+krb5_cleanup_proc(Authctxt *authctxt) 
+{ 
+    debug("krb5_cleanup_proc called"); 
+    if (authctxt->krb5_fwd_ccache) { 
+        krb5_cc_destroy(authctxt->krb5_ctx, authctxt->krb5_fwd_ccache); 
+        authctxt->krb5_fwd_ccache = NULL; 
+    } 
+    if (authctxt->krb5_user) { 
+        krb5_free_principal(authctxt->krb5_ctx, 
+            authctxt->krb5_user); 
+        authctxt->krb5_user = NULL; 
+    } 
+    if (authctxt->krb5_ctx) { 
+        krb5_free_context(authctxt->krb5_ctx); 
+        authctxt->krb5_ctx = NULL; 
+    } 
+} 
+This function simply frees a series of elements and sets them to NULL, thus 
+preventing potential double-free scenarios. However, the krb5_user element is a 
+structure composed of a number of pointers to strings designated by the client and 
+limited by how much input OpenSSH accepts, which is quite a lot. The Kerberos 
+library essentially frees these pointers one by one in a loop. After the krb5_user 
+element is cleaned up, the authctxt->krb5_user element is set to NULL. Although this 
+makes the function less susceptible to reentrancy problems, it is still not entirely safe. 
+If this function were to be interrupted while deallocating the individual strings 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+809 
+contained within krb5_user, then it is possible that krb5_user could be accessed when 
+it is in an inconsistent state. 
+The krb5_user variable is filled out by krb5_parse_name(), which is called by 
+auth_krb5_password() when authenticating clients using Kerberos authentication. The 
+auth_krb5_password() implementation is shown: 
+int 
+auth_krb5_password(Authctxt *authctxt, const char *password) 
+{ 
+    krb5_error_code problem; 
+    krb5_ccache ccache = NULL; 
+    int len; 
+    temporarily_use_uid(authctxt->pw); 
+    problem = krb5_init(authctxt); 
+    if (problem) 
+        goto out; 
+    problem = krb5_parse_name(authctxt->krb5_ctx, 
+        authctxt->pw->pw_name, 
+            &authctxt->krb5_user); 
+    if (problem) 
+        goto out; 
+#ifdef HEIMDAL 
+    problem = krb5_cc_gen_new(authctxt->krb5_ctx, 
+        &krb5_mcc_ops, &ccache); 
+    if (problem) 
+        goto out; 
+    problem = krb5_cc_initialize(authctxt->krb5_ctx, ccache, 
+        authctxt->krb5_user); 
+    if (problem) 
+        goto out; 
+    restore_uid(); 
+    problem = krb5_verify_user(authctxt->krb5_ctx, 
+        authctxt->krb5_user, ccache, password, 1, NULL); 
+    ... more stuff ... 
+ out: 
+    restore_uid(); 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+810 
+    if (problem) { 
+        if (ccache) 
+            krb5_cc_destroy(authctxt->krb5_ctx, ccache); 
+        ... more stuff ... 
+        krb5_cleanup_proc(authctxt); 
+        if (options.kerberos_or_local_passwd) 
+            return (-1); 
+        else 
+            return (0); 
+    } 
+    return (authctxt->valid ? 1 : 0); 
+} 
+When an error occurs at any point during the auth_krb5_password() function, 
+krb5_cleanup_proc() is called. This error normally occurs when krb5_verify_user() is 
+called for a user lacking valid credentials. So, what would happen if 
+krb5_cleanup_proc() is in the process of freeing thousands of strings when the signal 
+timeout occurs? The signal handler is called, which in turn calls krb5_cleanup_proc() 
+again. This second call to krb5_cleanup_proc() receives the krb5_user element, which 
+is not NULL because it's already in the middle of processing; so krb5_cleanup_proc() 
+once again starts deallocating all of the already deallocated string elements in this 
+structure, which could lead to exploitable memory corruption. 
+Non-Returning Signal Handlers 
+Non-returning signal handlers are those that never return execution control back to 
+the interrupted function. There are two ways this can happenthe signal handler can 
+explicitly terminate the process by calling exit(), or the signal handler can return to 
+another part of the application using longjmp(). It's generally safe for a longjmp() to 
+simply terminate the program. However, a signal handler that uses longjmp() to 
+return to another part of the application is very unlikely to be completely 
+asynchronous-safe, because any of the code reachable via the signal handler must be 
+asynchronous-safe as well. This section will focus on the various problems that can 
+arise from attempting to restart execution using the longjmp() function. 
+To see this in action, consider the Sendmail SMTP server signal race vulnerability. It 
+occurs when reading e-mail messages from a client. The collect() function 
+responsible for reading e-mail messages is shown in part: 
+void 
+collect(fp, smtpmode, hdrp, e, rsetsize) 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+811 
+    SM_FILE_T *fp; 
+    bool smtpmode; 
+    HDR **hdrp; 
+    register ENVELOPE *e; 
+    bool rsetsize; 
+{ 
+    ... other declarations ... 
+    volatile time_t dbto; 
+    ... 
+    dbto = smtpmode ? TimeOuts.to_datablock : 0; 
+    /* 
+    **  Read the message. 
+    ** 
+    **    This is done using two interleaved state machines. 
+    **    The input state machine is looking for things like 
+    **    hidden dots; the message state machine is handling 
+    **    the larger picture (e.g., header versus body). 
+    */ 
+    if (dbto != 0) 
+    { 
+        /* handle possible input timeout */ 
+        if (setjmp(CtxCollectTimeout) != 0) 
+        { 
+            if (LogLevel > 2) 
+                sm_syslog(LOG_NOTICE, e->e_id, 
+                      "timeout waiting for input from %s 
+                          during message collect", 
+                      CURHOSTNAME); 
+            errno = 0; 
+            if (smtpmode) 
+            { 
+                /* 
+                **  Override e_message in usrerr() as this 
+                **  is the reason for failure that should 
+                **  be logged for undelivered recipients. 
+                */ 
+                e->e_message = NULL; 
+            } 
+            usrerr("451 4.4.1 timeout waiting for input 
+                during message collect"); 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+812 
+            goto readerr; 
+        } 
+        CollectTimeout = sm_setevent(dbto, collecttimeout, 
+            dbto); 
+    } 
+This block of code essentially sets up a handler for the SIGALRM signal, which is called 
+when dbto seconds has elapsed. Sendmail uses an event abstraction instead of just 
+using signals, but the call to sm_setevent() instructs Sendmail to call the 
+collecttimeout() function when the time dbto indicates has expired. Notice the 
+setjmp() call, indicating that you return to this function later. When the corresponding 
+longjmp() occurs, you can see that you log some kind of message and then jump to 
+readerr, which logs some sender information and then returns to the main Sendmail 
+SMTP processing code. Now look at how collecttimeout() works: 
+static void 
+collecttimeout(timeout) 
+    time_t timeout; 
+{ 
+    int save_errno = errno; 
+    /* 
+    **  NOTE: THIS CAN BE CALLED FROM A SIGNAL HANDLER. DO NOT ADD 
+    **    ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE 
+    **    DOING. 
+    */ 
+    if (CollectProgress) 
+    { 
+        /* reset the timeout */ 
+        CollectTimeout = sm_sigsafe_setevent(timeout, 
+             collecttimeout, timeout); 
+        CollectProgress = false; 
+    } 
+    else 
+    { 
+        /* event is done */ 
+        CollectTimeout = NULL; 
+    } 
+    /* if no progress was made or problem resetting event, 
+       die now */ 
+    if (CollectTimeout == NULL) 
+    { 
+        errno = ETIMEDOUT; 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+813 
+        longjmp(CtxCollectTimeout, 1); 
+    } 
+    errno = save_errno; 
+} 
+In certain cases, the collecttimeout() function can issue a call to longjmp(), which 
+will return back into collect(). This alone should be setting off alarm bells in your 
+head; the presence of this longjmp() call virtually guarantees that this function isn't 
+asynchronous-safe because you already know that the target of the jump winds up 
+back in the main SMTP processing code. So if this signal-handling routine is called 
+when any non-asynchronous-safe operation is being conducted, and you can reach 
+that code again from the SMTP processing code, you have a bug. As it turns out, there 
+are a few non-asynchronous-safe operations; the most dangerous is the logging 
+function sm_syslog(): 
+sm_syslog(level, id, fmt, va_alist) 
+    int level; 
+    const char *id; 
+    const char *fmt; 
+    va_dcl 
+#endif /* __STDC__ */ 
+{ 
+    static char *buf = NULL; 
+    static size_t bufsize; 
+    char *begin, *end; 
+    int save_errno; 
+    int seq = 1; 
+    int idlen; 
+    char buf0[MAXLINE]; 
+    char *newstring; 
+    extern int SyslogPrefixLen; 
+    SM_VA_LOCAL_DECL 
+    ... initialization ... 
+    if (buf == NULL) 
+    { 
+        buf = buf0; 
+        bufsize = sizeof buf0; 
+    } 
+    ... try to fit log message in buf, else reallocate it 
+        on the heap 
+The Art of Software Security Assessment - Identifying and Preventing Software Vulnerabilities 
+814 
+    if (buf == buf0) 
+        buf = NULL; 
+    errno = save_errno; 
+} 
+This code might need a little explanation because it has been edited to fit the page. 
+The sm_syslog() function has a static character pointer buf, which is initialized to 
+NULL. On function entry, it is immediately set to point to a stack buffer. If the 
+message being logged is too large, a bigger buffer on the heap is allocated to hold the 
+log message. In this case, the heap buffer is retained for successive calls to 
+sm_syslog(), since buf is static. Otherwise, buf is just set back to NULL and uses a 
+stack buffer again next time. So, what would happen if you interrupt this function with 
+collecttimeout()? The call to longjmp() in collecttimeout() would invalidate part of 
+the stack (remember, longjmp() resets program stack and frame pointers to what 
+they were when setjmp() was called), but the static buf variable isn't reset to NULLit 
+points to an invalidated region of the stack. Therefore, the next time sm_syslog() is 
+called, buf is not NULL (indicating that a heap buffer has been allocated, although in 
+this case buf is really pointing to a stack location), so the log message is written to the 
+wrong part of the stack! 
+When you are attempting to evaluate whether code is asynchronous-safe, you must 

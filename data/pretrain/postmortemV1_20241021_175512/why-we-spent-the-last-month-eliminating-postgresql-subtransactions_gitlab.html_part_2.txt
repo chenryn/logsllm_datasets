@@ -1,0 +1,274 @@
+Why would this matter? Analyzing the PostgreSQL source code, Senior
+Support Engineer [Catalin Irimie](https://gitlab.com/cat) [posed an
+intriguing question that led to a breakthrough in our
+understanding](https://gitlab.com/gitlab-org/gitlab/-/issues/338410#note_652056284):
+
+> Does this mean that, having subtransactions spanning more than 32
+> cache pages, concurrently, would trigger the exclusive
+> SubtransControlLock because we still end up reading them from the
+> disk?
+
+
+To answer this, Nikolay immediately modified his test [to involve
+replicas and long-running
+transactions](https://gitlab.com/postgres-ai/postgresql-consulting/tests-and-benchmarks/-/issues/21#note_653453774).
+Within a day, he reproduced the problem:
+
+![Nikolay
+experiment](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/nikolay-experiment.png)
+
+The image above shows that transaction rates remain steady around
+360,000 transactions per second (TPS). Everything was proceeding fine
+until the long-running transaction started on the primary. Then suddenly
+the transaction rates plummeted to 50,000 TPS on the replicas. Canceling
+the long transaction immediately caused the transaction rate to return.
+
+
+In his blog post, Nikolay called the problem [Subtrans SLRU
+overflow](https://v2.postgres.ai/blog/20210831-postgresql-subtransactions-considered-harmful#problem-4-subtrans-slru-overflow).
+In a busy database, it\'s possible for the size of the subtransaction
+log to grow so large that the working set no longer fits into memory.
+This results in a lot of cache misses, which in turn causes a high
+amount of disk I/O and CPU as PostgreSQL furiously tries to load data
+from disk to keep up with all the lookups.
+
+As mentioned earlier, the subtransaction cache holds a mapping of the
+subXID to the parent XID. When PostgreSQL needs to look up the subXID,
+it calculates in which memory page this ID would live, and then does a
+linear search to find in the memory page. If the page is not in the
+cache, it evicts one page and loads the desired one into memory. The
+diagram below shows the memory layout of the subtransaction SLRU.
+
+![Subtrans
+SLRU](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/subtrans-slru.png)
+
+By default, each SLRU page is an 8K buffer holding 4-byte parent XIDs.
+This means 8192/4 = 2048 transaction IDs can be stored in each page.
+
+Note that there may be gaps in each page. PostgreSQL will cache XIDs as
+needed, so a single XID can occupy an entire page.
+
+There are 32 (`NUM_SUBTRANS_BUFFERS`) pages, which means up to 65K
+transaction IDs can be stored in memory. Nikolay demonstrated that in a
+busy system, it took about 18 seconds to fill up all 65K entries. Then
+performance dropped off a cliff, making the database replicas unusable.
+
+To our surprise, our experiments also demonstrated that a single
+`SAVEPOINT` during a long-transaction [could initiate this problem if
+many writes also occurred
+simultaneously](https://gitlab.com/gitlab-org/gitlab/-/issues/338865#note_655312474).
+That is, it wasn\'t enough just to reduce the frequency of `SAVEPOINT`;
+we had to eliminate them completely.
+
+
+To answer this question, we need to understand what happens when a
+`SAVEPOINT` occurs in one query while a long-running transaction is
+running.
+
+We mentioned earlier that PostgreSQL needs to decide whether a given row
+is visible to support a feature called [multi-version concurrency
+control](https://www.postgresql.org/docs/current/mvcc.html), or MVCC for
+short. It does this by storing hidden columns, `xmin` and `xmax`, in
+each tuple.
+
+`xmin` holds the XID of when the tuple was created, and `xmax` holds the
+XID when it was marked as dead (0 if the row is still present). In
+addition, at the beginning of a transaction, PostgreSQL records metadata
+in a database snapshot. Among other items, this snapshot records the
+oldest XID and the newest XID in its own `xmin` and `xmax` values.
+
+This metadata helps [PostgreSQL determine whether a tuple is
+visible](https://www.interdb.jp/pg/pgsql05.html). For example, a
+committed XID that started before `xmin` is definitely visible, while
+anything after `xmax` is invisible.
+
+
+Long transactions are bad in general because they can tie up
+connections, but they can cause a subtly different problem on a replica.
+On the replica, a single `SAVEPOINT` during a long transaction causes a
+snapshot to suboverflow. Remember that dragged down performance in the
+case where we had more than 64 subtransactions.
+
+Fundamentally, the problem happens because a replica behaves differently
+from a primary when creating snapshots and checking for tuple
+visibility. The diagram below illustrates an example with some of the
+data structures used in PostgreSQL:
+
+![Diagram of subtransaction handling in
+replicas](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/pg-replica-subtransaction-diagram.png)
+
+On the top of this diagram, we can see the XIDs increase at the
+beginning of a subtransaction: the `INSERT` after the `BEGIN` gets 1,
+and the subsequent `INSERT` in `SAVEPOINT` gets 2. Another client comes
+along and performs a `INSERT` and `SELECT` at XID 3.
+
+On the primary, PostgreSQL stores the transactions in progress in a
+shared memory segment. The process array (`procarray`) stores XID 1 with
+the first connection, and the database also writes that information to
+the `pg_xact` directory. XID 2 gets stored in the `pg_subtrans`
+directory, mapped to its parent, XID 1.
+
+If a read happens on the primary, the snapshot generated contains `xmin`
+as 1, and `xmax` as 3. `txip` holds a list of transactions in progress,
+and `subxip` holds a list of subtransactions in progress.
+
+However, neither the `procarray` nor the snapshot are shared directly
+with the replica. The replica receives all the data it needs from the
+write-ahead log (WAL).
+
+Playing the WAL back one entry at time, the replica populates a shared
+data structure called `KnownAssignedIds`. It contains all the
+transactions in progress on the primary. Since this structure can only
+hold a limited number of IDs, a busy database with a lot of active
+subtransactions could easily fill this buffer. PostgreSQL made a design
+choice to kick out all subXIDs from this list and store them in the
+`pg_subtrans` directory.
+
+When a snapshot is generated on the replica, notice how `txip` is blank.
+A PostgreSQL replica treats **all** XIDs as though they are
+subtransactions and throws them into the `subxip` bucket. That works
+because if a XID has a parent XID, then it\'s a subtransaction.
+Otherwise, it\'s a normal transaction. [The code comments explain the
+rationale](https://gitlab.com/postgres/postgres/blob/9f540f840665936132dd30bd8e58e9a67e648f22/src/backend/storage/ipc/procarray.c#L1665-L1681).
+
+However, this means the snapshot is missing subXIDs, and that could be
+bad for MVCC. To deal with that, the [replica also updates
+`lastOverflowedXID`](https://gitlab.com/postgres/postgres/blob/9f540f840665936132dd30bd8e58e9a67e648f22/src/backend/storage/ipc/procarray.c#L3176-L3182):
+
+``` c
+ * When we throw away subXIDs from KnownAssignedXids, we need to keep track of
+ * that, similarly to tracking overflow of a PGPROC's subxids array.  We do
+ * that by remembering the lastOverflowedXID, ie the last thrown-away subXID.
+ * As long as that is within the range of interesting XIDs, we have to assume
+ * that subXIDs are missing from snapshots.  (Note that subXID overflow occurs
+ * on primary when 65th subXID arrives, whereas on standby it occurs when 64th
+ * subXID arrives - that is not an error.)
+```
+
+What is this \"range of interesting XIDs\"? We can see this in [the code
+below](https://gitlab.com/postgres/postgres/blob/4bf0bce161097869be5a56706b31388ba15e0113/src/backend/storage/ipc/procarray.c#L1702-L1703):
+
+``` c
+if (TransactionIdPrecedesOrEquals(xmin, procArray->lastOverflowedXid))
+    suboverflowed = true;
+```
+
+If `lastOverflowedXid` is smaller than our snapshot\'s `xmin`, it means
+that all subtransactions have completed, so we don\'t need to check for
+subtransactions. However, in our example:
+
+1.  `xmin` is 1 because of the transaction.
+2.  `lastOverflowXid` is 2 because of the `SAVEPOINT`.
+
+This means `suboverflowed` is set to `true` here, which tells PostgreSQL
+that whenever a XID needs to be checked, check to see if it has a parent
+XID. Remember that this causes PostgreSQL to:
+
+1.  Look up the subXID for the parent XID in the SLRU cache.
+2.  If this doesn\'t exist in the cache, fetch the data from `pg_trans`.
+
+In a busy system, the requested XIDs could span an ever-growing range of
+values, which could easily exhaust the 64K entries in the SLRU cache.
+This range will continue to grow as long as the transaction runs; the
+rate of increase depends on how many updates are happening on the
+prmary. As soon as the transaction terminates, the `suboverflowed` state
+gets set to `false`.
+
+In other words, we\'ve replicated the same conditions as we saw with 64
+subtransactions, only with a single `SAVEPOINT` and a long transaction.
+
+
+There are three options:
+
+1.  Eliminate `SAVEPOINT` calls completely.
+2.  Eliminate all long-running transactions.
+3.  Apply [Andrey Borodin\'s patches to PostgreSQL and increase the
+    subtransaction
+    cache](https://www.postgresql.org/message-id/flat/494C5E7F-E410-48FA-A93E-F7723D859561%40yandex-team.ru#18c79477bf7fc44a3ac3d1ce55e4c169).
+
+We chose the first option because most uses of subtransaction could be
+removed fairly easily. There were a [number of
+approaches](https://gitlab.com/groups/gitlab-org/-/epics/6540) we took:
+
+1.  Perform updates outside of a subtransaction. Examples:
+    [1](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/68471),
+    [2](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/68690)
+2.  Rewrite a query to use a `INSERT` or an `UPDATE` with an
+    `ON CONFLICT` clause to deal with duplicate constraint violations.
+    Examples:
+    [1](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/68433),
+    [2](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/69240),
+    [3](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/68509)
+3.  Live with a non-atomic `find_or_create_by`. We used this approach
+    sparingly. Example:
+    [1](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/68649)
+
+In addition, we added [an alert whenever the application used a a single
+`SAVEPOINT`](https://gitlab.com/gitlab-com/runbooks/-/merge_requests/3881):
+
+![subtransaction
+alert](https://about.gitlab.com/images/blogimages/postgresql-subtransactions/subtransactions-alert-example.png)
+
+This had the side benefit of flagging a [minor
+bug](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/70889).
+
+
+In our database, it wasn\'t practical to eliminate all long-running
+transactions because we think many of them happened via [database
+autovacuuming](https://www.postgresql.org/docs/current/runtime-config-autovacuum.html),
+but [we\'re not able to reproduce this
+yet](https://gitlab.com/postgres-ai/postgresql-consulting/tests-and-benchmarks/-/issues/21#note_669698320).
+We are working on partitioning the tables and sharding the database, but
+this is a much more time-consuming problem than removing all
+subtransactions.
+
+
+Although we tested Andrey\'s PostgreSQL patches, we did not feel
+comfortable deviating from the official PostgreSQL releases. Plus,
+maintaining a custom patched release over upgrades would add a
+significant maintenance burden for our infrastructure team. Our
+self-managed customers would also not benefit unless they used a patched
+database.
+
+Andrey\'s patches do two main things:
+
+1.  Allow administrators to change the SLRU size to any value.
+2.  Adds an [associative
+    cache](https://www.youtube.com/watch?v=A0vR-ks3hsQ). to make it
+    performant to use a large cache value.
+
+Remember that the SLRU cache does a linear search for the desired page.
+That works fine when there are only 32 pages to search, but if you
+increase the cache size to 100 MB the search becomes much more
+expensive. The associative cache makes the lookup fast by indexing pages
+with a bitmask and looking up the entry with offsets from the remaining
+bits. This mitigates the problem because a transaction would need to be
+several magnitudes longer to cause a problem.
+
+Nikolay demonstrated that the `SAVEPOINT` problem disappeared as soon as
+we increased the SLRU size to 100 MB with those patches. With a 100 MB
+cache, PostgreSQL can cache 26.2 million IDs (104857600/4), far more
+than the measely 65K.
+
+These [patches are currently awaiting
+review](https://postgres.ai/blog/20210831-postgresql-subtransactions-considered-harmful#ideas-for-postgresql-development),
+but in our opinion they should be given high priority for PostgreSQL 15.
+
+
+Since removing all `SAVEPOINT` queries, we have not seen Nessie rear her
+head again. If you are running PostgreSQL with read replicas, we
+strongly recommend that you also remove *all* subtransactions until
+further notice.
+
+PostgreSQL is a fantastic database, and its well-commented code makes it
+possible to understand its limitations under different configurations.
+
+We would like to thank the GitLab community for bearing with us while we
+iron out this production issue.
+
+We are also grateful for the support from [Nikolay
+Samokhvalov](https://gitlab.com/NikolayS) and [Catalin
+Irimie](https://gitlab.com/cat), who contributed to understanding where
+our Loch Ness Monster was hiding.
+
+

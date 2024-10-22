@@ -1,0 +1,76 @@
+原文：[Exploiting SMBGhost (CVE-2020-0796) for a Local Privilege Escalation:
+Writeup + POC](https://blog.zecops.com/vulnerabilities/exploiting-smbghost-cve-2020-0796-for-a-local-privilege-escalation-writeup-and-poc/)
+作者：[ZECOPS安全团队](https://blog.zecops.com/author/admin/)
+* * *
+## 介绍
+CVE-2020-0796是SMBv3.1.1的压缩机制中的一个漏洞，也叫做“SMBGhost”。这个漏洞会影响Windows
+10的1903和1909版本，在三周前由微软[发布](https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/adv200005)并修复。得知此消息后，我们快速阅读了这个漏洞的细节并编写了一个简单的[PoC](https://blog.zecops.com/vulnerabilities/vulnerability-reproduction-cve-2020-0796-poc/)，这个PoC说明了如何在未验证的情况下，通过引发死亡蓝屏在远程触发该漏洞。几天前，我们再一次研究该漏洞，想看看除了DoS之外，这个漏洞还能产生什么影响。微软的安全公告将该漏洞描述为远程命令执行(RCE)漏洞，但目前还没有公开的PoC实现这一点。
+## 初步分析
+该漏洞是一个整数溢出漏洞，发生在SMB服务器驱动程序srv2.sys的`Srv2DecompressData`函数中。下面给出该函数的一个简化版本，省略了一些无关信息：
+    typedef struct _COMPRESSION_TRANSFORM_HEADER
+    {
+        ULONG ProtocolId;
+        ULONG OriginalCompressedSegmentSize;
+        USHORT CompressionAlgorithm;
+        USHORT Flags;
+        ULONG Offset;
+    } COMPRESSION_TRANSFORM_HEADER, *PCOMPRESSION_TRANSFORM_HEADER;
+    typedef struct _ALLOCATION_HEADER
+    {
+        // ...
+        PVOID UserBuffer;
+        // ...
+    } ALLOCATION_HEADER, *PALLOCATION_HEADER;
+    NTSTATUS Srv2DecompressData(PCOMPRESSION_TRANSFORM_HEADER Header, SIZE_T TotalSize)
+    {
+        PALLOCATION_HEADER Alloc = SrvNetAllocateBuffer(
+            (ULONG)(Header->OriginalCompressedSegmentSize + Header->Offset),
+            NULL);
+        If (!Alloc) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        ULONG FinalCompressedSize = 0;
+        NTSTATUS Status = SmbCompressionDecompress(
+            Header->CompressionAlgorithm,
+            (PUCHAR)Header + sizeof(COMPRESSION_TRANSFORM_HEADER) + Header->Offset,
+            (ULONG)(TotalSize - sizeof(COMPRESSION_TRANSFORM_HEADER) - Header->Offset),
+            (PUCHAR)Alloc->UserBuffer + Header->Offset,
+            Header->OriginalCompressedSegmentSize,
+            &FinalCompressedSize);
+        if (Status OriginalCompressedSegmentSize) {
+            SrvNetFreeBuffer(Alloc);
+            return STATUS_BAD_DATA;
+        }
+        if (Header->Offset > 0) {
+            memcpy(
+                Alloc->UserBuffer,
+                (PUCHAR)Header + sizeof(COMPRESSION_TRANSFORM_HEADER),
+                Header->Offset);
+        }
+        Srv2ReplaceReceiveBuffer(some_session_handle, Alloc);
+        return STATUS_SUCCESS;
+    }
+从代码中可以看出，`Srv2DecompressData`函数接收从客户端发来的压缩信息，分配所需内存，解压缩信息，之后，如果`Offset`字段不为0，函数会将放置在压缩数据前的数据原样复制到分配的缓冲区开头。
+如果仔细观察，可以发现错误的输入可能会导致代码的第20行和第31行发生整数溢出。例如，许多漏洞发布后不久给出的导致系统崩溃的PoC都使用`0xFFFFFFFF`作为`Offset`字段的值，这个值会导致代码的第20行发生整数溢出，从而使分配的缓冲区变小。
+它同样会在之后的第31行引发另一个整数溢出，代码第30行计算出的地址与接收到的消息位置相距甚远，系统崩溃的原因就是访问了这个地址。如果代码在第31行对计算结果进行了验证，由于结果为负数，程序将提前结束，这样第30行的地址也就没有用了。
+## 选择溢出的位置
+只有两个我们可以控制的字段能够造成整数溢出：`OriginalCompressedSegmentSize`和`Offset`，所以选择并不多。我们实验了几种组合，其中的一种引起了我们的注意：有效的`Offset`值和极大的`OriginalCompressedSegmentSize`值。下面看一下在这种情况下，代码执行过程中的三个主要步骤分别会发生什么：
+  1. **分配** ：由于整数溢出，缓冲区分配的字节数要小于两个字段值之和。
+  2. **解压缩** ：由于`OriginalCompressedSegmentSize`过大，函数会认为目标缓冲区几乎为无限大，但是因为解压缩函数中的其他参数不受影响，这一步将按照预期工作。
+  3. **复制** ：如果真的可以执行到这里的话，复制RawData操作也会按预期工作。
+无论是否能执行到第三步，事情已经开始变得有趣了——我们可以在 **解压缩** 阶段触发越界写操作，因为在 **分配** 阶段分配的缓冲区小了。
+从上图可以看出，我们可以使用这种方法触发任意大小和内容的溢出，但是缓冲区之外的数据究竟是什么呢？
+## 深入SrvNetAllocateBuffer函数
+要想回答上面的问题，就要看一下实现分配功能的函数了，即`SrvNetAllocateBuffer`，下面是这个函数中一段有意思的代码：
+    PALLOCATION_HEADER SrvNetAllocateBuffer(SIZE_T AllocSize, PALLOCATION_HEADER SourceBuffer)
+    {
+        // ...
+        if (SrvDisableNetBufferLookAsideList || AllocSize > 0x100100) {
+            if (AllocSize > 0x1000100) {
+                return NULL;
+            }
+            Result = SrvNetAllocateBufferFromPool(AllocSize, AllocSize);
+        } else {
+            int LookasideListIndex = 0;
+            if (AllocSize > 0x1100) {
+                LookasideListIndex = /* some calculation based on AllocSize */;

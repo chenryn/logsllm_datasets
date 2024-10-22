@@ -1,0 +1,79 @@
+。这一过程在内核模式下完成，借助这一功能，当调用`OpenProcess`函数以及当`OpenProcess`函数返回时，驱动程序可以获得相关通知信息。
+但为什么这个函数可以阻止调试器访问AV进程呢？想要阻止程序成功调用`DebugActiveProcess`的一种方法就是过滤掉在`NtOpenProcess`调用期间所请求的访问权限。阻止调试器请求目标进程的`PROCESS_ALL_ACCESS`权限后，我们自然就失去调试该进程的能力。这一方法也顺便解释了我们之前在WinDBG中看到的错误现象。
+但是我们还需要确定这是否就是我们当前问题的症结所在。现在让我们使用内核调试器，看一下Ring-0状态下系统如何处理已注册的回调函数。
+（我不会在本文中介绍如何设置内核调试器，大家可以查看我之前发表的[文章](https://blog.xpnsec.com/windows-warbird-privesc/)了解具体细节）。
+## 六、ObRegisterCallback内部流程
+建立内核调试器连接后，首先我们可以使用`nt!ProcessType`来获得一些信息：
+    kd> dt nt!_OBJECT_TYPE poi(nt!PsProcessType)
+    +0x000 TypeList         : _LIST_ENTRY [ 0xffffcb82`dee6cf20 - 0xffffcb82`dee6cf20 ]
+    +0x010 Name             : _UNICODE_STRING "Process"
+    +0x020 DefaultObject    : (null) 
+    +0x028 Index            : 0x7 ''
+    +0x02c TotalNumberOfObjects : 0x26
+    +0x030 TotalNumberOfHandles : 0xe8
+    +0x034 HighWaterNumberOfObjects : 0x26
+    +0x038 HighWaterNumberOfHandles : 0xea
+    +0x040 TypeInfo         : _OBJECT_TYPE_INITIALIZER
+    +0x0b8 TypeLock         : _EX_PUSH_LOCK
+    +0x0c0 Key              : 0x636f7250
+    +0x0c8 CallbackList     : _LIST_ENTRY [ 0xffffa002`d31bacd0 - 0xffffa002`d35d2450 ]
+该符号提供了指向`_OBJECT_TYPE`对象的一个指针，该对象定义了“Process”类型，其中我们最感兴趣的是`CallbackList`属性。这个属性定义了由[ObRegisterCallbacks](https://msdn.microsoft.com/en-us/library/windows/hardware/ff558692\(v=vs.85).aspx)注册的一系列回调函数，随后，当有程序尝试获取进程句柄时内核就会调用这些回调函数。知道这些信息后，我们可以遍历回调函数列表，查找有哪些已注册的回调会干扰我们调用`OpenProcess`。
+`CallbackList`是指向`CALLBACK_ENTRY_ITEM`结构的一个`LIST_ENTRY`。微软文档中并没有公开这个结构，感谢“DOUGGEM’S
+GAME HACKING AND REVERSING
+NOTES”这个[网站](https://douggemhax.wordpress.com/2015/05/27/obregistercallbacks-and-countermeasures/)，我们最终可以得知该结构的具体定义，如下所示：
+    typedef struct _CALLBACK_ENTRY_ITEM {
+    LIST_ENTRY EntryItemList;
+    OB_OPERATION Operations;
+    CALLBACK_ENTRY* CallbackEntry;
+    POBJECT_TYPE ObjectType;
+    POB_PRE_OPERATION_CALLBACK PreOperation;
+    POB_POST_OPERATION_CALLBACK PostOperation;
+    __int64 unk;
+    }CALLBACK_ENTRY_ITEM, *PCALLBACK_ENTRY_ITEM;
+这里我们关心的是该结构中的`PreOperation`属性。
+我们可以使用如下WinDBG命令来遍历`CALLBACK_ENTRY_ITEM`列表：
+    !list -x ".if (poi(@$extret+0x28) != 0) { u poi(@$extret+0x28); }" (poi(nt!PsProcessType)+0xc8)
+在我的测试环境中，我总共发现了4个驱动使用`ObRegisterCallbacks`注册了`PreOperation`回调函数。我们可以使用WinDBG获得驱动名称，以便后续分析：
+    !list -x ".if (poi(@$extret+0x28) != 0) { lmv a (poi(@$extret+0x28)) }" (poi(nt!PsProcessType)+0xc8)
+上面列出的4个驱动中，有一个非常值得怀疑，那就是`avgSP.sys`：
+“AVG自我保护模块（AVG self protection
+module）”这个驱动会限制我们使用调试器来附加到相关进程（其实该驱动最大的作用很有可能是防止恶意软件篡改反病毒引擎）。让我们深入分析这个驱动，看是否有任何蛛丝马迹表明该驱动的确会修改我们的`OpenProcess`调用。
+首先，搜索`ObRegisterCallbacks`后，我们可以找到某个处理程序的注册过程，如下所示：
+如果我们检查已注册的处理程序，我们很快就能看到如下类似信息：
+上图显示的汇编代码中，`A0121410`这个魔术值实际上对应的是如下权限：
+  * PROCESS_VM_READ
+  * PROCESS_QUERY_INFORMATION
+  * PROCESS_QUERY_LIMITED_INFORMATION
+  * READ_CONTROL
+  * SYNCHRONIZE
+如果只设置了这些权限，那么驱动就不会执行后续检查过程，因而就不会过滤`OpenProcess`调用。然而，除了这几个白名单权限以外，如果程序请求其他权限，驱动会进一步执行一些检查过程，最终在调用返回前过滤掉相应的权限：
+这里我不会详细介绍驱动的工作细节，因为本文的目的是介绍如何识别并移除各种产品所使用的这种hook的通用方法，根据前面已知的这些信息，我们已经找到了干扰并修改`OpenProcess`调用的那个驱动。
+找到幕后黑手后，现在我们可以从内核中去掉已绑定的这个处理程序。
+## 七、解开OpenProcess过滤器
+如果想解开`OpenProcess`过滤器，我们首先需要找到与过滤器函数对应的`PreOperation`属性的地址。我们可以使用如下WinDBG命令完成这一任务：
+    !list -x ".if (poi(@$extret+0x28) != 0) { .echo handler at; ?? @$extret+0x28; u poi(@$extret+0x28); }" (poi(nt!PsProcessType)+0xc8)
+识别出正确的地址后，我们可以清空这个指针，禁用掉处理函数，具体命令如下：
+    eq 0xffffa002`d31bacf8 0
+此时，如果我们重新attach调试器，我们可以看到如下画面：
+非常好，看上去我们已经打败了这个反调试技术！
+好吧，其实结果并不完美。经过一些交互操作后，我们注意到调试器中会出现一些错误信息，事情并没有那么顺利。即使是在上一张图中，我们也可以发现寄存器的值全部为0，并且出现了访问冲突（access
+violation）问题，肯定还有一些细节我们没有注意到。
+## 八、解开线程过滤器
+根据前文描述，我们已经知道`ObRegisterCallbacks`可以用来hook
+`OpenProcess`，但这个函数还有其他用途吗？如果我们回头查一下[官方文档](https://msdn.microsoft.com/en-us/library/windows/hardware/ff558718\(v=vs.85).aspx)，就会知道该函数也可以用来hook
+`OpenThread`调用：
+幸运的是，最难的那一部分工作我们已经完成了，现在我们所需要做的就是找到线程回调函数所存储的具体位置，该位置对应的是`nt!PsThreadType`。
+我们可以修改前面用过的那条WinDBG命令，查看这个驱动是否hook了`OpenThread`：
+    !list -x ".if (poi(@$extret+0x28) != 0) { .echo handler at; ?? @$extret+0x28; u poi(@$extret+0x28); }" (poi(nt!PsThreadType)+0xc8)
+果不其然，我们找到了这个hook。与进程hook类似，我们可以使用类似的`eq`命令解开这个过滤器：
+    eq 0xffffc581`89df32e8 0
+再次启动调试器：
+现在，我们终于得到了完美的调试器会话。
+## 九、总结
+许多安全产品会使用这种反调试方法，希望阅读本文后，大家对这种方法有所了解。如果大家对此感兴趣，可以探索一下相关的漏洞奖励项目，比如bugcrowd上有一些安全产品的漏洞奖励计划，这些产品包括[AVG](https://bugcrowd.com/avgtechnologies)、[Cylance](https://bugcrowd.com/cylance)、[Sophos](https://bugcrowd.com/sophos)等（但我并没有将本文介绍的这种方法以漏洞内容提交，因为DKOM（Direct
+Kernel Object Manipulation，直接操作内核对象）技术很有可能不属于漏洞奖励范畴）。
+## 十、参考资料
+  * [TitanEngine](https://www.reversinglabs.com/open-source/titanengine.html)
+  * [DOUGGEM’S GAME HACKING AND REVERSING NOTES](https://douggemhax.wordpress.com/2015/05/27/obregistercallbacks-and-countermeasures/)
+  * [AVG Bug Bounty](https://bugcrowd.com/avgtechnologies)
+  * [x64Dbg GitHub](https://github.com/x64dbg/x64dbg)

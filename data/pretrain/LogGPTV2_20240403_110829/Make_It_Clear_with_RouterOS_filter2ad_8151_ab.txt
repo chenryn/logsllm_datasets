@@ -1,0 +1,52 @@
+mproxy 直接监听的是8291端口，虽然没有 loader
+分发命令的过程，但其处理消息的流程和其他后端程序类似。这里依旧使用CVE-2018-14847的[PoC](https://github.com/tenable/routeros/tree/master/poc/cve_2018_14847)构建调用命令，查看[解密](https://github.com/tenable/routeros/tree/master/winbox_pcap_parser)后传递的message：
+然后在PPT中提到的漏洞触发点下断点，进行栈回溯即可快速看到整个的调用链：
+跟踪可知在函数 sub_8055048 处判断system number是否为2：
+与 nv::Looper::addHandler 的逻辑相似，在 nv::Looper::dispatchMessage 中处理正确的handler后调用
+nv::Handler::handle ，其中涉及到的 bff0005 字段代表 nv::isReplyExpected ：
+nv::Handler::handle 函数中间接调用了 nv::policies::is_allowed 来判断command是否具有相应的policy：
+在 set_policy 对应command为0时确实不需要任何认证即可调用：
+真正去处理command的函数 nv::Handler::handleCmd 实则是个大的switch-case，其把未知的命令传递给
+nv::Handler::cmdUnknown 处理：
+对于handler 2其偏移76对应函数 sub_8052934 ，也是个小型的switch-case处理未知的命令，由此可探索更多的攻击面，下一小节会分析未知命令中存在的漏洞原理。
+## 0x04 漏洞分析
+本小节以6.38.4为例，结合PPT中两个提及的漏洞，主要逆向分析message所需字段的原因。
+### CVE-2018-1156
+[CVE-2018-1156](https://github.com/tenable/routeros/tree/master/poc/cve_2018_1156)是一个需要认证的
+/nova/bin/licupgr 文件的溢出，对应的System Number为55，其初始化过程中没有 nv::Looper::addHandler
+的操作，直接在对应偏移处找到覆盖的 nv::Handler::cmdUnknown 来处理不同的command：
+跟进可知command 1和4均能到达目标的溢出函数 sub_804AC9E ，同时还需要传递 bool_id_7 参数：
+剩下 string_id_1 username 和 string_id_2 password 参数导致sprintf的溢出就显而易见了：
+### CVE-2018-14847
+[CVE-2018-14847](https://github.com/tenable/routeros/tree/master/poc/cve_2018_14847)是一个无需认证利用目录穿越实现任意文件读取的漏洞，在拿到用户凭据user.dat文件后，使用写文件操作开启系统后门。对应的
+/nova/bin/mproxy 文件在初始化过程中有和前文照应的 nv::Looper::addHandler 和
+nv::policies::set_policy 操作：
+System number和handler均为2，在处理command 7中将文件路径和 /home/web/webfig/ 拼接传递至
+nv::findFile 函数，就算是没有找到文件，其还会返回原始拼接的文件路径：
+随后其打开文件路径，并设置 u32_id_2 为文件的大小：
+函数返回前还有对 0xFE0001 sessionid的设置：
+在处理完command返回消息调用 nv::Handler::replyMessage 的过程中，也有对 0xFF0006 RequestId的处理：
+在处理command 4时首先会验证sessionid的合法性：
+最终根据 u32_id_2 的大小从session打开的fd中读取文件数据：
+## 0x05 对比修复
+### CVE-2018-1156
+根据官方的[公告](https://blog.mikrotik.com/security/security-issues-discovered-by-tenable.html)可知这个溢出漏洞在[6.42.7](https://download.mikrotik.com/routeros/6.42.7/routeros-x86-6.42.7.npk)版本中完成修复，其使用
+snprintf 函数来限制过长的用户输入：
+### CVE-2018-14847
+我们还是聚焦于CVE-2018-14847这个利用目录穿越读取任意文件的漏洞，因为读取得到账号密码才能进行后一步的[BTW](https://github.com/tenable/routeros/tree/master/poc/bytheway)攻击。从官方的[公告](https://blog.mikrotik.com/security/winbox-vulnerability.html)可知6.29 至
+6.42的current版本在6.42.1中完成修复，我这里就使用6.42.4和6.38.4进行对比。
+使用[PoC](https://github.com/tenable/routeros/tree/master/poc/cve_2018_14847)直接去打
+6.42.4 得到 File size is 0 的返回，初步推断在第一步获取文件大小时可能被直接返回了。通过对 /nova/bin/mproxy
+的调试和bindiff分析，发现 6.42.4 在抵达handler 2 command 7的结构虽有改动但逻辑没有变化：
+调试可知 string_id_1 在经过 tokenize 函数的处理后，没能通过 sub_8051B80 的校验最终报错返回了。 tokenize
+函数主要是把字符串 //./.././.././../etc/passwd 分解为 {“.”, “..”, “.”, “..”, “.”, “..”,
+“etc”, “passwd”} 这样的vector string。对于 6.42.4 patch的关键就在于 sub_8051B80 函数了：
+大致的逻辑就是遇到 “.” 就删除，遇到 “larry”, “..” 就一起删除这两项，但在删除后的遍历操作中如果遇到 “..”
+打头，则认为是存在目录穿越的利用，无法通过校验。
+反观 6.38.4 中的对应逻辑，也是不允许 “..” 打头，但没有照顾到 “.” ，就产生了作者使用 ./../ 的绕过方式：
+由于command 4的读取任意文件需要command 7打开文件的fd和返回的session
+id，一旦读取的文件路径无法通过校验，后续操作自然无法成功利用了。
+## 0x06 总结哈子
+  1. 全文看下来虽说是逆向分析但难免有些钻牛角尖，局部的逆向是为了快速分析理解漏洞，全局的逆向分析则为了理解程序后端逻辑和寻找攻击面，也不可能锱铢必较。
+  2. 大体可以看出两点攻击面，一是自定义消息的处理解析，而是后端程序未知命令的处理逻辑。
+  3. 最近也有一篇RouterOS SMB服务溢出利用的[Write Up](https://medium.com/@maxi./finding-and-exploiting-cve-2018-7445-f3103f163cc1)，其将注意力放在了不是默认开启的SMB服务上，并快速使用dumb fuzz出crash也是个不错的尝试思路。

@@ -1,0 +1,273 @@
+in an in-memory cache rather than the full on-disk database or use a less-accurate
+(but faster) ranking algorithm when overloaded.
+When evaluating load shedding or graceful degradation options for your service,
+consider the following:
+• Which metrics should you use to determine when load shedding or graceful deg‐
+radation should kick in (e.g,. CPU usage, latency, queue length, number of
+threads used, whether your service enters degraded mode automatically or if
+manual intervention is necessary)?
+Preventing Server Overload | 267
+• What actions should be taken when the server is in degraded mode?
+• At what layer should load shedding and graceful degradation be implemented?
+Does it make sense to implement these strategies at every layer in the stack, or is
+it sufficient to have a high-level choke-point?
+As you evaluate options and deploy, keep the following in mind:
+• Graceful degradation shouldn’t trigger very often—usually in cases of a capacity
+planning failure or unexpected load shift. Keep the system simple and under‐
+standable, particularly if it isn’t used often.
+• Remember that the code path you never use is the code path that (often) doesn’t
+work. In steady-state operation, graceful degradation mode won’t be used, imply‐
+ing that you’ll have much less operational experience with this mode and any of
+its quirks, which increases the level of risk. You can make sure that graceful deg‐
+radation stays working by regularly running a small subset of servers near over‐
+load in order to exercise this code path.
+• Monitor and alert when too many servers enter these modes.
+• Complex load shedding and graceful degradation can cause problems themselves
+—excessive complexity may cause the server to trip into a degraded mode when
+it is not desired, or enter feedback cycles at undesired times. Design a way to
+quickly turn off complex graceful degradation or tune parameters if needed.
+Storing this configuration in a consistent system that each server can watch for
+changes, such as Chubby, can increase deployment speed, but also introduces its
+own risks of synchronized failure.
+Retries
+Suppose the code in the frontend that talks to the backend implements retries naively.
+It retries after encountering a failure and caps the number of backend RPCs per logi‐
+cal request to 10. Consider this code in the frontend, using gRPC in Go:
+func exampleRpcCall(client pb.ExampleClient, request pb.Request) *pb.Response {
+// Set RPC timeout to 5 seconds.
+opts := grpc.WithTimeout(5 * time.Second)
+// Try up to 20 times to make the RPC call.
+attempts := 20
+for attempts > 0 {
+conn, err := grpc.Dial(*serverAddr, opts...)
+if err != nil {
+// Something went wrong in setting up the connection. Try again.
+attempts--
+continue
+268 | Chapter 22: Addressing Cascading Failures
+}
+defer conn.Close()
+// Create a client stub and make the RPC call.
+client := pb.NewBackendClient(conn)
+response, err := client.MakeRequest(context.Background, request)
+if err != nil {
+// Something went wrong in making the call. Try again.
+attempts--
+continue
+}
+return response
+}
+grpclog.Fatalf("ran out of attempts")
+}
+This system can cascade in the following way:
+1. Assume our backend has a known limit of 10,000 QPS per task, after which point
+all further requests are rejected in an attempt at graceful degradation.
+2. The frontend calls MakeRequest at a constant rate of 10,100 QPS and overloads
+the backend by 100 QPS, which the backend rejects.
+3. Those 100 failed QPS are retried in MakeRequest every 1,000 ms, and probably
+succeed. But the retries are themselves adding to the requests sent to the back‐
+end, which now receives 10,200 QPS—200 QPS of which are failing due to
+overload.
+4. The volume of retries grows: 100 QPS of retries in the first second leads to 200
+QPS, then to 300 QPS, and so on. Fewer and fewer requests are able to succeed
+on their first attempt, so less useful work is being performed as a fraction of
+requests to the backend.
+5. If the backend task is unable to handle the increase in load—which is consuming
+file descriptors, memory, and CPU time on the backend—it can melt down and
+crash under the sheer load of requests and retries. This crash then redistributes
+the requests it was receiving across the remaining backend tasks, in turn further
+overloading those tasks.
+Some simplifying assumptions were made here to illustrate this scenario,4 but the
+point remains that retries can destabilize a system. Note that both temporary load
+spikes and slow increases in usage can cause this effect.
+4 An instructive exercise, left for the reader: write a simple simulator and see how the amount of useful work
+the backend can do varies with how much it’s overloaded and how many retries are permitted.
+Preventing Server Overload | 269
+Even if the rate of calls to MakeRequest decreases to pre-meltdown levels (9,000 QPS,
+for example), depending on how much returning a failure costs the backend, the
+problem might not go away. Two factors are at play here:
+• If the backend spends a significant amount of resources processing requests that
+will ultimately fail due to overload, then the retries themselves may be keeping
+the backend in an overloaded mode.
+• The backend servers themselves may not be stable. Retries can amplify the effects
+seen in “Server Overload” on page 260.
+If either of these conditions is true, in order to dig out of this outage, you must dra‐
+matically reduce or eliminate the load on the frontends until the retries stop and the
+backends stabilize.
+This pattern has contributed to several cascading failures, whether the frontends and
+backends communicate via RPC messages, the “frontend” is client JavaScript code
+issuing XmlHttpRequest calls to an endpoint and retries on failure, or the retries orig‐
+inate from an offline sync protocol that retries aggressively when it encounters a fail‐
+ure.
+When issuing automatic retries, keep in mind the following considerations:
+• Most of the backend protection strategies described in “Preventing Server Over‐
+load” on page 265 apply. In particular, testing the system can highlight problems,
+and graceful degradation can reduce the effect of the retries on the backend.
+• Always use randomized exponential backoff when scheduling retries. See also
+“Exponential Backoff and Jitter” in the AWS Architecture Blog [Bro15]. If retries
+aren’t randomly distributed over the retry window, a small perturbation (e.g., a
+network blip) can cause retry ripples to schedule at the same time, which can
+then amplify themselves [Flo94].
+• Limit retries per request. Don’t retry a given request indefinitely.
+• Consider having a server-wide retry budget. For example, only allow 60 retries
+per minute in a process, and if the retry budget is exceeded, don’t retry; just fail
+the request. This strategy can contain the retry effect and be the difference
+between a capacity planning failure that leads to some dropped queries and a
+global cascading failure.
+• Think about the service holistically and decide if you really need to perform
+retries at a given level. In particular, avoid amplifying retries by issuing retries at
+multiple levels: a single request at the highest layer may produce a number of
+attempts as large as the product of the number of attempts at each layer to the
+lowest layer. If the database can’t service requests because it’s overloaded, and the
+backend, frontend, and JavaScript layers all issue 3 retries (4 attempts), then a
+270 | Chapter 22: Addressing Cascading Failures
+single user action may create 64 attempts (43) on the database. This behavior is
+undesirable when the database is returning those errors because it’s overloaded.
+• Use clear response codes and consider how different failure modes should be
+handled. For example, separate retriable and nonretriable error conditions. Don’t
+retry permanent errors or malformed requests in a client, because neither will
+ever succeed. Return a specific status when overloaded so that clients and other
+layers back off and do not retry.
+In an emergency, it may not be obvious that an outage is due to bad retry behavior.
+Graphs of retry rates can be an indication of bad retry behavior, but may be confused
+as a symptom instead of a compounding cause. In terms of mitigation, this is a special
+case of the insufficient capacity problem, with the additional caveat that you must
+either fix the retry behavior (usually requiring a code push), reduce load significantly,
+or cut requests off entirely.
+Latency and Deadlines
+When a frontend sends an RPC to a backend server, the frontend consumes resources
+waiting for a reply. RPC deadlines define how long a request can wait before the
+frontend gives up, limiting the time that the backend may consume the frontend’s
+resources.
+Picking a deadline
+It’s usually wise to set a deadline. Setting either no deadline or an extremely high
+deadline may cause short-term problems that have long since passed to continue to
+consume server resources until the server restarts.
+High deadlines can result in resource consumption in higher levels of the stack when
+lower levels of the stack are having problems. Short deadlines can cause some more
+expensive requests to fail consistently. Balancing these constraints to pick a good
+deadline can be something of an art.
+Missing deadlines
+A common theme in many cascading outages is that servers spend resources han‐
+dling requests that will exceed their deadlines on the client. As a result, resources are
+spent while no progress is made: you don’t get credit for late assignments with RPCs.
+Suppose an RPC has a 10-second deadline, as set by the client. The server is very
+overloaded, and as a result, it takes 11 seconds to move from a queue to a thread pool.
+At this point, the client has already given up on the request. Under most circumstan‐
+ces, it would be unwise for the server to attempt to handle this request, because it
+would be doing work for which no credit will be granted—the client doesn’t care what
+Preventing Server Overload | 271
+work the server does after the deadline has passed, because it’s given up on the
+request already.
+If handling a request is performed over multiple stages (e.g., there are a few callbacks
+and RPC calls), the server should check the deadline left at each stage before attempt‐
+ing to perform any more work on the request. For example, if a request is split into
+parsing, backend request, and processing stages, it may make sense to check that
+there is enough time left to handle the request before each stage.
+Deadline propagation
+Rather than inventing a deadline when sending RPCs to backends, servers should
+employ deadline propagation and cancellation propagation.
+With deadline propagation, a deadline is set high in the stack (e.g., in the frontend).
+The tree of RPCs emanating from an initial request will all have the same absolute
+deadline. For example, if server A selects a 30-second deadline, and processes the
+request for 7 seconds before sending an RPC to server B, the RPC from A to B will
+have a 23-second deadline. If server B takes 4 seconds to handle the request and sends
+an RPC to server C, the RPC from B to C will have a 19-second deadline, and so on.
+Ideally, each server in the request tree implements deadline propagation.
+Without deadline propagation, the following scenario may occur:
+1. Server A sends an RPC to server B with a 10-second deadline.
+2. Server B takes 8 seconds to start processing the request and then sends an RPC to
+server C.
+3. If server B uses deadline propagation, it should set a 2-second deadline, but sup‐
+pose it instead uses a hardcoded 20-second deadline for the RPC to server C.
+4. Server C pulls the request off its queue after 5 seconds.
+Had server B used deadline propagation, server C could immediately give up on the
+request because the 2-second deadline was exceeded. However, in this scenario,
+server C processes the request thinking it has 15 seconds to spare, but is not doing
+useful work, since the request from server A to server B has already exceeded its
+deadline.
+You may want to reduce the outgoing deadline a bit (e.g., a few hundred millisec‐
+onds) to account for network transit times and post-processing in the client.
+Also consider setting an upper bound for outgoing deadlines. You may want to limit
+how long the server waits for outgoing RPCs to noncritical backends, or for RPCs to
+backends that typically complete in a short duration. However, be sure to understand
+your traffic mix, because you might otherwise inadvertently make particular types of
+272 | Chapter 22: Addressing Cascading Failures
+requests fail all the time (e.g., requests with large payloads, or requests that require
+responding to a lot of computation).
+There are some exceptions for which servers may wish to continue processing a
+request after the deadline has elapsed. For example, if a server receives a request that
+involves performing some expensive catchup operation and periodically checkpoints
+the progress of the catchup, it would be a good idea to check the deadline only after
+writing the checkpoint, instead of after the expensive operation.
+Propagating cancellations avoids the potential RPC leakage that occurs if an initial
+RPC has a long deadline, but RPCs between deeper layers of the stack have short
+deadlines and time out. Using simple deadline propagation, the initial RPC continues
+to use server resources until it eventually times out, despite being unable to make
+progress.
+Bimodal latency
+Suppose that the frontend from the preceding example consists of 10 servers, each
+with 100 worker threads. This means that the frontend has a total of 1,000 threads of
+capacity. During usual operation, the frontends perform 1,000 QPS and requests
+complete in 100 ms. This means that the frontends usually have 100 worker threads
+occupied out of the 1,000 configured worker threads (1,000 QPS * 0.1 seconds).
+Suppose an event causes 5% of the requests to never complete. This could be the
+result of the unavailability of some Bigtable row ranges, which renders the requests
+corresponding to that Bigtable keyspace unservable. As a result, 5% of the requests hit
+the deadline, while the remaining 95% of the requests take the usual 100 ms.
+With a 100-second deadline, 5% of requests would consume 5,000 threads (50 QPS *
+100 seconds), but the frontend doesn’t have that many threads available. Assuming no
+other secondary effects, the frontend will only be able to handle 19.6% of the requests
+(1,000 threads available / (5,000 + 95) threads’ worth of work), resulting in an 80.4%
+error rate.
+Therefore, instead of only 5% of requests receiving an error (those that didn’t com‐
+plete due to keyspace unavailability), most requests receive an error.
+The following guidelines can help address this class of problems:
+• Detecting this problem can be very hard. In particular, it may not be clear that
+bimodal latency is the cause of an outage when you are looking at mean latency.
+When you see a latency increase, try to look at the distribution of latencies in
+addition to the averages.
+• This problem can be avoided if the requests that don’t complete return with an
+error early, rather than waiting the full deadline. For example, if a backend is
+unavailable, it’s usually best to immediately return an error for that backend,
+Preventing Server Overload | 273
+rather than consuming resources until it the backend available. If your RPC layer
+supports a fail-fast option, use it.
+• Having deadlines several orders of magnitude longer than the mean request
+latency is usually bad. In the preceding example, a small number of requests ini‐
+tially hit the deadline, but the deadline was three orders of magnitude larger than
+the normal mean latency, leading to thread exhaustion.
+• When using shared resources that can be exhausted by some keyspace, consider
+either limiting in-flight requests by that keyspace or using other kinds of abuse
+tracking. Suppose your backend processes requests for different clients that have
+wildly different performance and request characteristics. You might consider
+only allowing 25% of your threads to be occupied by any one client in order to
+provide fairness in the face of heavy load by any single client misbehaving.
+Slow Startup and Cold Caching
+Processes are often slower at responding to requests immediately after starting than
+they will be in steady state. This slowness can be caused by either or both of the fol‐
+lowing:
+Required initialization
+Setting up connections upon receiving the first request that needs a given
+backend
+Runtime performance improvements in some languages, particularly Java
+Just-In-Time compilation, hotspot optimization, and deferred class loading
+Similarly, some binaries are less efficient when caches aren’t filled. For example, in the
+case of some of Google’s services, most requests are served out of caches, so requests
+that miss the cache are significantly more expensive. In steady-state operation with a
+warm cache, only a few cache misses occur, but when the cache is completely empty,
+100% of requests are costly. Other services might employ caches to keep a user’s state
+in RAM. This might be accomplished through hard or soft stickiness between reverse
+proxies and service frontends.
+If the service is not provisioned to handle requests under a cold cache, it’s at greater
+risk of outages and should take steps to avoid them.
+The following scenarios can lead to a cold cache:
+Turning up a new cluster
+A recently added cluster will have an empty cache.
+Returning a cluster to service after maintenance
+The cache may be stale.
+274 | Chapter 22: Addressing Cascading Failures
+Restarts
+If a task with a cache has recently restarted, filling its cache will take some time. It
+may be worthwhile to move caching from a server to a separate binary like
+memcache, which also allows cache sharing between many servers, albeit at the

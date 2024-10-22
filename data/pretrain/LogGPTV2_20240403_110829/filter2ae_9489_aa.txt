@@ -1,0 +1,258 @@
+**作者：wzt  
+原文链接：**
+### 1 简介
+以linux kernel 5.6.7内核代码为例，阐述内核的audit子系统是如何实现的，以及它的一些设计缺陷和绕过方法。
+### 2 架构
+#### 2.1 总体架构
+Linux
+audit系统分为用户层和内核层两部分，用户层通过auditctl工具生成rule规则，发送给auditd守护进程，后者通过netlink协议与内核进行交互，包括规则下发等功能。
+内核在启动阶段初始化audit子系统时，创建一个netlink
+socket，启动audit_receive内核线程处理来自用户层的请求，包括解析rule规则，使能audit开关等工作。
+内核维护一个日志队列，通过kaudit_thread内核线程来操作，当队列长度大于audit_backlog_limit时进行休眠，否则从队列里取下一个节点进行日志格式化处理，然后写入到printk子系统里。
+对于rule规则的审计有以下几个入口点，后面章节会详细介绍：
+  * system call系统调用阶段
+  * fork进程时
+  * 文件系统状态改变
+这几个入口点都可以触发对rule规则的检查，然后写入内核日志队列，最后通过上述的kaudit_thread内核线程处理。
+![
+](https://images.seebug.org/content/images/2021/05/a65d001a-f016-4017-8505-dc6ab53fa203.png-w331s)
+#### 2.2 内核与用户通讯接口
+##### 2.2.1 协议接口
+内核使用数字9代表audit子系统使用的netlink协议：
+    include/uapi/linux/netlink.h
+    #define NETLINK_AUDIT           9       /* auditing */
+    kernel/audit.c
+    static int __net_init audit_net_init(struct net *net)
+    {
+            struct netlink_kernel_cfg cfg = {
+                    .input  = audit_receive,
+                    .bind   = audit_bind,
+                    .flags  = NL_CFG_F_NONROOT_RECV,
+                    .groups = AUDIT_NLGRP_MAX,
+            };
+    ...
+            aunet->sk = netlink_kernel_create(net, NETLINK_AUDIT, &cfg);
+    ...
+    }
+Audit_receive函数处理接受来自用户层的数据协议：
+    audit_receive()->audit_receive_msg:
+    static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+    {
+    ...
+            switch (msg_type) {
+            case AUDIT_GET:
+    case AUDIT_SET:
+    case AUDIT_GET_FEATURE:
+    case AUDIT_SET_FEATURE:
+            case AUDIT_USER:
+            case AUDIT_FIRST_USER_MSG ... AUDIT_LAST_USER_MSG:
+            case AUDIT_FIRST_USER_MSG2 ... AUDIT_LAST_USER_MSG2:
+            case AUDIT_ADD_RULE:
+            case AUDIT_DEL_RULE:
+    case AUDIT_LIST_RULES:
+    case AUDIT_TRIM:
+    case AUDIT_MAKE_EQUIV:
+    case AUDIT_SIGNAL_INFO:
+    case AUDIT_TTY_GET:
+    case AUDIT_TTY_SET:
+    ...
+    }
+Nlh为用户态auditd进程使用netlink协议包装的数据，其中msg_type代表auditd能使用的功能里列表：
+  * AUDIT_GET  
+获取audit子系统的状态信息，使用auditctl -s进行获取。
+  * AUDIT_SET  
+设置audit子系统状态，包括audit功能是否开启，注册和销毁来自用户态auditd进程的请求。Linux
+audit子系统每次只允许一个auditd进程注册，并且auditd进程只能来自init_namespace,
+也就是说来自docker等其他容器的进程是不扮演auditd进程与内核通讯的。
+  * AUDIT_GET_FEATURE  
+AUDIT_SET_FEATURE  
+获取和设置功能列表
+  * AUDIT_USER  
+AUDIT_FIRST_USER_MSG ... AUDIT_LAST_USER_MSG  
+AUDIT_FIRST_USER_MSG2 ... AUDIT_LAST_USER_MSG2  
+处理来自用户态自定义的audit日志内容
+  * AUDIT_ADD_RULE  
+AUDIT_DEL_RULE  
+AUDIT_LIST_RULES  
+获取和设置rule规则
+  * AUDIT_TRIM  
+销毁之前被监控的目录树
+  * AUDIT_MAKE_EQUIV  
+附加到之前被监控的目录树
+  * AUDIT_SIGNAL_INFO  
+获取发送给auditd信号的进程信息
+  * AUDIT_TTY_GET  
+AUDIT_TTY_SET  
+获取和设置tty监控信息，这是个神奇的功能，后面会有详细分析。
+##### 2.2.2 规则添加
+下面以添加一条规则为例，看下audit子系统是如何在内核操作的。
+    kernel/auditfilter.c:
+    int audit_rule_change(int type, int seq, void *data, size_t datasz)
+    {
+            switch (type) {
+            case AUDIT_ADD_RULE:
+                    entry = audit_data_to_entry(data, datasz);
+                    if (IS_ERR(entry))
+                            return PTR_ERR(entry);
+                    err = audit_add_rule(entry);
+    }
+audit_data_to_entry用来将用户态的规则转为内核态的规则，来自用户态的规则数据结构体为：
+    include/uapi/linux/audit.h：
+    struct audit_rule_data {
+            __u32           flags;  /* AUDIT_PER_{TASK,CALL}, AUDIT_PREPEND */
+            __u32           action; /* AUDIT_NEVER, AUDIT_POSSIBLE, AUDIT_ALWAYS */
+            __u32           field_count;
+            __u32           mask[AUDIT_BITMASK_SIZE]; /* syscall(s) affected */
+            __u32           fields[AUDIT_MAX_FIELDS];
+            __u32           values[AUDIT_MAX_FIELDS];
+            __u32           fieldflags[AUDIT_MAX_FIELDS];
+            __u32           buflen; /* total length of string fields */
+            char            buf[0]; /* string fields buffer */
+    };
+这个结构其实就是由auditctl的参数负责填充的，mask数组就是audit -S 指定要过滤的系统调用表，fields数组为audit -F
+指定的操作表，格式为type op value。
+内核态的规则结构体为：
+    struct audit_krule {
+            u32                     pflags;
+            u32                     flags;
+            u32                     listnr;
+            u32                     action;
+            u32                     mask[AUDIT_BITMASK_SIZE];
+            u32                     buflen; /* for data alloc on list rules */
+            u32                     field_count;
+            char                    *filterkey; /* ties events to rules */
+            struct audit_field      *fields;
+            struct audit_field      *arch_f; /* quick access to arch field */
+            struct audit_field      *inode_f; /* quick access to an inode field */
+            struct audit_watch      *watch; /* associated watch */
+            struct audit_tree       *tree;  /* associated watched tree */
+            struct audit_fsnotify_mark      *exe;
+            struct list_head        rlist;  /* entry in audit_{watch,tree}.rules list */
+            struct list_head        list;   /* for AUDIT_LIST* purposes only */
+            u64                     prio;
+    };
+field在内核中的结构体为：
+    struct audit_field {
+            u32                             type;
+            union {
+                    u32                     val;
+                    kuid_t                  uid;
+                    kgid_t                  gid;
+                    struct {
+                            char            *lsm_str;
+                            void            *lsm_rule;
+                    };
+            };
+            u32                             op;
+    };
+Type的类型可以为：
+    include/uapi/linux/audit.h：
+    #define AUDIT_PID       0
+    #define AUDIT_UID       1
+    #define AUDIT_EUID      2
+    #define AUDIT_SUID      3
+    #define AUDIT_FSUID     4
+    #define AUDIT_GID       5
+    #define AUDIT_EGID      6
+    #define AUDIT_SGID      7
+    #define AUDIT_FSGID     8
+    #define AUDIT_LOGINUID  9
+    #define AUDIT_PERS      10
+    #define AUDIT_ARCH      11
+    #define AUDIT_MSGTYPE   12
+    #define AUDIT_SUBJ_USER 13      /* security label user */
+    #define AUDIT_SUBJ_ROLE 14      /* security label role */
+    #define AUDIT_SUBJ_TYPE 15      /* security label type */
+    #define AUDIT_SUBJ_SEN  16      /* security label sensitivity label */
+    #define AUDIT_SUBJ_CLR  17      /* security label clearance label */
+    #define AUDIT_PPID      18
+    #define AUDIT_OBJ_USER  19
+    #define AUDIT_OBJ_ROLE  20
+    #define AUDIT_OBJ_TYPE  21
+    #define AUDIT_OBJ_LEV_LOW       22
+    #define AUDIT_OBJ_LEV_HIGH      23
+    #define AUDIT_LOGINUID_SET      24
+    #define AUDIT_SESSIONID 25      /* Session ID */
+    #define AUDIT_FSTYPE    26      /* FileSystem Type */
+    #define AUDIT_DEVMAJOR  100
+    #define AUDIT_DEVMINOR  101
+    #define AUDIT_INODE     102
+    #define AUDIT_EXIT      103
+    #define AUDIT_SUCCESS   104     /* exit >= 0; value ignored */
+    #define AUDIT_WATCH     105
+    #define AUDIT_PERM      106
+    #define AUDIT_DIR       107
+    #define AUDIT_FILETYPE  108
+    #define AUDIT_OBJ_UID   109
+    #define AUDIT_OBJ_GID   110
+    #define AUDIT_FIELD_COMPARE     111
+    #define AUDIT_EXE       112
+    #define AUDIT_SADDR_FAM 113
+    #define AUDIT_ARG0      200
+    #define AUDIT_ARG1      (AUDIT_ARG0+1)
+    #define AUDIT_ARG2      (AUDIT_ARG0+2)
+    #define AUDIT_ARG3      (AUDIT_ARG0+3)
+    #define AUDIT_FILTERKEY 210
+Op的操作可以为：
+    /* These are the supported operators.
+     *      4  2  1  8
+     *      =  >  
+     *      0  1  1  0      30      !=
+     *      1  0  0  0      40      =
+     *      1  0  0  1      48      &=  bit test
+     *      1  0  1  0      50      =
+     *      1  1  1  1      78      all operators
+     */
+    #define AUDIT_BIT_MASK                  0x08000000
+    #define AUDIT_LESS_THAN                 0x10000000
+    #define AUDIT_GREATER_THAN              0x20000000
+    #define AUDIT_NOT_EQUAL                 0x30000000
+    #define AUDIT_EQUAL                     0x40000000
+    #define AUDIT_BIT_TEST                  (AUDIT_BIT_MASK|AUDIT_EQUAL)
+    #define AUDIT_LESS_THAN_OR_EQUAL        (AUDIT_LESS_THAN|AUDIT_EQUAL)
+    #define AUDIT_GREATER_THAN_OR_EQUAL     (AUDIT_GREATER_THAN|AUDIT_EQUAL)
+    #define AUDIT_OPERATORS                 (AUDIT_EQUAL|AUDIT_NOT_EQUAL|AUDIT_BIT_MASK)
+就是说audit子系统可以对以上的type类型做一些简单的逻辑操作，
+这对于审计作用已经足够了。比如它可以让audit子系统只针对一个uid或一个group组进行审计；可以对系统调用的前四个参数进行审计，
+但是目前只支持整型的参数，指针或数据结构则没有支持，因为这要设计更复杂的数据结构， 指针可以包含更多级指针，
+数据结构可以嵌套数据结构，数据结构又可以嵌套指针等等。虽然目前功能有限，但这个filed结构体的操作可以说是linux audit子系统的一个重大改进了。
+audit_data_to_entry->audit_to_entry_common解析用户态的struct
+audit_rule_data数据为struct audit_krule：
+    struct audit_krule {
+            u32                     pflags;
+            u32                     flags;
+            u32                     listnr;
+            u32                     action;
+            u32                     mask[AUDIT_BITMASK_SIZE];
+            u32                     buflen; /* for data alloc on list rules */
+            u32                     field_count;
+            char                    *filterkey; /* ties events to rules */
+            struct audit_field      *fields;
+            struct audit_field      *arch_f; /* quick access to arch field */
+            struct audit_field      *inode_f; /* quick access to an inode field */
+            struct audit_watch      *watch; /* associated watch */
+            struct audit_tree       *tree;  /* associated watched tree */
+            struct audit_fsnotify_mark      *exe;
+            struct list_head        rlist;  /* entry in audit_{watch,tree}.rules list */
+            struct list_head        list;   /* for AUDIT_LIST* purposes only */
+            u64                     prio;
+    };
+audit_rule_change->audit_add_rule将新生成的krule挂接到对应的规则链表里：
+    static inline int audit_add_rule(struct audit_entry *entry)
+    {
+    e = audit_find_rule(entry, &list);[1]
+            if (watch) {[2]
+                    err = audit_add_watch(&entry->rule, &list);
+            if (tree) {
+                    err = audit_add_tree_rule(&entry->rule);[3]
+            if (entry->rule.flags & AUDIT_FILTER_PREPEND) {[4]
+                    list_add(&entry->rule.list,[5]
+                             &audit_rules_list[entry->rule.listnr]);
+                    list_add_rcu(&entry->list, list);
+                    entry->rule.flags &= ~AUDIT_FILTER_PREPEND;
+            } else {
+                    list_add_tail(&entry->rule.list,
+                                  &audit_rules_list[entry->rule.listnr]);
+                    list_add_tail_rcu(&entry->list, list);
+            }
+    }

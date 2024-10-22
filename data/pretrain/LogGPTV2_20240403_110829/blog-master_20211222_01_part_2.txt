@@ -1,0 +1,138 @@
+To perform deadlock checking, we use the standard method of viewing the  
+various processes as nodes in a directed graph (the waits-for graph or  
+WFG).  There is a graph edge leading from process A to process B if A  
+waits for B, ie, A is waiting for some lock and B holds a conflicting  
+lock.  There is a deadlock condition if and only if the WFG contains a  
+cycle.  We detect cycles by searching outward along waits-for edges to  
+see if we return to our starting point.  There are three possible  
+outcomes:  
+1. All outgoing paths terminate at a running process (which has no  
+outgoing edge).  
+2. A deadlock is detected by looping back to the start point.  We  
+resolve such a deadlock by canceling the start point's lock request and  
+reporting an error in that transaction, which normally leads to  
+transaction abort and release of that transaction's held locks.  Note  
+that it's sufficient to cancel one request to remove the cycle; we don't  
+need to kill all the transactions involved.  
+3. Some path(s) loop back to a node other than the start point.  This  
+indicates a deadlock, but one that does not involve our starting  
+process. We ignore this condition on the grounds that resolving such a  
+deadlock is the responsibility of the processes involved --- killing our  
+start-point process would not resolve the deadlock.  So, cases 1 and 3  
+both report "no deadlock".  
+Postgres' situation is a little more complex than the standard discussion  
+of deadlock detection, for two reasons:  
+1. A process can be waiting for more than one other process, since there  
+might be multiple PROCLOCKs of (non-conflicting) lock types that all  
+conflict with the waiter's request.  This creates no real difficulty  
+however; we simply need to be prepared to trace more than one outgoing  
+edge.  
+2. If a process A is behind a process B in some lock's wait queue, and  
+their requested locks conflict, then we must say that A waits for B, since  
+ProcLockWakeup will never awaken A before B.  This creates additional  
+edges in the WFG.  We call these "soft" edges, as opposed to the "hard"  
+edges induced by locks already held.  Note that if B already holds any  
+locks conflicting with A's request, then their relationship is a hard edge  
+not a soft edge.  
+A "soft" block, or wait-priority block, has the same potential for  
+inducing deadlock as a hard block.  However, we may be able to resolve  
+a soft block without aborting the transactions involved: we can instead  
+rearrange the order of the wait queue.  This rearrangement reverses the  
+direction of the soft edge between two processes with conflicting requests  
+whose queue order is reversed.  If we can find a rearrangement that  
+eliminates a cycle without creating new ones, then we can avoid an abort.  
+Checking for such possible rearrangements is the trickiest part of the  
+algorithm.  
+The workhorse of the deadlock detector is a routine FindLockCycle() which  
+is given a starting point process (which must be a waiting process).  
+It recursively scans outward across waits-for edges as discussed above.  
+If it finds no cycle involving the start point, it returns "false".  
+(As discussed above, we can ignore cycles not involving the start point.)  
+When such a cycle is found, FindLockCycle() returns "true", and as it  
+unwinds it also builds a list of any "soft" edges involved in the cycle.  
+If the resulting list is empty then there is a hard deadlock and the  
+configuration cannot succeed.  However, if the list is not empty, then  
+reversing any one of the listed edges through wait-queue rearrangement  
+will eliminate that cycle.  Since such a reversal might create cycles  
+elsewhere, we may need to try every possibility.  Therefore, we need to  
+be able to invoke FindLockCycle() on hypothetical configurations (wait  
+orders) as well as the current real order.  
+The easiest way to handle this seems to be to have a lookaside table that  
+shows the proposed new queue order for each wait queue that we are  
+considering rearranging.  This table is checked by FindLockCycle, and it  
+believes the proposed queue order rather than the real order for each lock  
+that has an entry in the lookaside table.  
+We build a proposed new queue order by doing a "topological sort" of the  
+existing entries.  Each soft edge that we are currently considering  
+reversing creates a property of the partial order that the topological sort  
+has to enforce.  We must use a sort method that preserves the input  
+ordering as much as possible, so as not to gratuitously break arrival  
+order for processes not involved in a deadlock.  (This is not true of the  
+tsort method shown in Knuth, for example, but it's easily done by a simple  
+doubly-nested-loop method that emits the first legal candidate at each  
+step.  Fortunately, we don't need a highly efficient sort algorithm, since  
+the number of partial order constraints is not likely to be large.)  Note  
+that failure of the topological sort tells us we have conflicting ordering  
+constraints, and therefore that the last-added soft edge reversal  
+conflicts with a prior edge reversal.  We need to detect this case to  
+avoid an infinite loop in the case where no possible rearrangement will  
+work: otherwise, we might try a reversal, find that it still leads to  
+a cycle, then try to un-reverse the reversal while trying to get rid of  
+that cycle, etc etc.  Topological sort failure tells us the un-reversal  
+is not a legitimate move in this context.  
+So, the basic step in our rearrangement method is to take a list of  
+soft edges in a cycle (as returned by FindLockCycle()) and successively  
+try the reversal of each one as a topological-sort constraint added to  
+whatever constraints we are already considering.  We recursively search  
+through all such sets of constraints to see if any one eliminates all  
+the deadlock cycles at once.  Although this might seem impossibly  
+inefficient, it shouldn't be a big problem in practice, because there  
+will normally be very few, and not very large, deadlock cycles --- if  
+any at all.  So the combinatorial inefficiency isn't going to hurt us.  
+Besides, it's better to spend some time to guarantee that we've checked  
+all possible escape routes than to abort a transaction when we didn't  
+really have to.  
+Each edge reversal constraint can be viewed as requesting that the waiting  
+process A be moved to before the blocking process B in the wait queue they  
+are both in.  This action will reverse the desired soft edge, as well as  
+any other soft edges between A and other processes it is advanced over.  
+No other edges will be affected (note this is actually a constraint on our  
+topological sort method to not re-order the queue more than necessary.)  
+Therefore, we can be sure we have not created any new deadlock cycles if  
+neither FindLockCycle(A) nor FindLockCycle(B) discovers any cycle.  Given  
+the above-defined behavior of FindLockCycle, each of these searches is  
+necessary as well as sufficient, since FindLockCycle starting at the  
+original start point will not complain about cycles that include A or B  
+but not the original start point.  
+In short then, a proposed rearrangement of the wait queue(s) is determined  
+by one or more broken soft edges A->B, fully specified by the output of  
+topological sorts of each wait queue involved, and then tested by invoking  
+FindLockCycle() starting at the original start point as well as each of  
+the mentioned processes (A's and B's).  If none of the tests detect a  
+cycle, then we have a valid configuration and can implement it by  
+reordering the wait queues per the sort outputs (and then applying  
+ProcLockWakeup on each reordered queue, in case a waiter has become wakable).  
+If any test detects a soft cycle, we can try to resolve it by adding each  
+soft link in that cycle, in turn, to the proposed rearrangement list.  
+This is repeated recursively until we either find a workable rearrangement  
+or determine that none exists.  In the latter case, the outer level  
+resolves the deadlock by aborting the original start-point transaction.  
+The particular order in which rearrangements are tried depends on the  
+order FindLockCycle() happens to scan in, so if there are multiple  
+workable rearrangements of the wait queues, then it is unspecified which  
+one will be chosen.  What's more important is that we guarantee to try  
+every queue rearrangement that could lead to success.  (For example,  
+if we have A before B before C and the needed order constraints are  
+C before A and B before C, we would first discover that A before C  
+doesn't work and try the rearrangement C before A before B.  This would  
+eventually lead to the discovery of the additional constraint B before C.)  
+Got that?  
+```  
+#### [期望 PostgreSQL 增加什么功能?](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+#### [PolarDB for PostgreSQL云原生分布式开源数据库](https://github.com/ApsaraDB/PolarDB-for-PostgreSQL "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

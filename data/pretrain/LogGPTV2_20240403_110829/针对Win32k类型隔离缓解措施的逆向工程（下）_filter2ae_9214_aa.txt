@@ -1,0 +1,99 @@
+# 针对Win32k类型隔离缓解措施的逆向工程（下）
+|
+##### 译文声明
+本文是翻译文章，文章原作者 Francisco Falcon ，文章来源：blog.quarkslab.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+##
+## 传送门：上篇https://www.anquanke.com/post/id/97498
+## 前言
+在上篇文章中，我们介绍了Windows 10秋季创意者更新（Windows 10 1709）中引入的类型隔离（Type
+Isolation）功能，该功能是Win32k子系统中的一项漏洞利用缓解措施，会对SURFACE对象的内存布局（即内核端Bitmap的内部表示）进行拆分。在深入讲解了借助GDI
+Bitmaps对象来实现内核漏洞利用的方法后，我们对类型隔离的数据结构和初始化过程进行了详细分析。在本文，我们继续对类型隔离进行详细的分析。
+## 四、类型隔离的详细分析
+###  4.3 分配
+win32kfull!NtGdiCreateBitmap()系统调用负责创建GDI
+Bitmap对象。win32kfull!NtGdiCreateBitmap()会对win32kbase!GreCreateBitmap()进行调用，而后者继而调用win32kbase!SURFMEM::bCreateDIB()。win32kbase!SURFMEM::bCreateDIB()的作用是为SURFACE对象分配内存。在此前版本的Windows中，Bitmap的像素数据缓冲区通常与SURFACE头部相连续。如上文所述，这样一来就使得我们可以通过破坏SURFACE头部的sizlBitmap成员，来“扩展”像素数据缓冲区，并使其与相邻Bitmap的SURFACE头部重叠。  
+从Windows
+10秋季创意者版本开始，win32kbase!SURFMEM::bCreateDIB会确保SURFACE头部与像素数据缓冲区被分别分配，从而实现类型隔离的缓解。  
+像素数据缓冲区通过调用nt!ExAllocatePoolWithTag的Wrapper，可以直接在PagedPoolSession池中被分配：
+    SURFMEM::bCreateDIB+10B                  sub     r15d, r12d      ; alloc_size = requested_size - sizeof(SURFACE)
+    SURFMEM::bCreateDIB+10E                  jz      short loc_1C0038F91
+    SURFMEM::bCreateDIB+110                  call    cs:__imp_IsWin32AllocPoolImplSupported
+    SURFMEM::bCreateDIB+116                  test    eax, eax
+    SURFMEM::bCreateDIB+118                  js      loc_1C00C54D6
+    SURFMEM::bCreateDIB+11E                  mov     r8d, 'mbpG'                 ; Tag = 'Gpbm'
+    SURFMEM::bCreateDIB+124                  mov     edx, r15d                   ; NumberOfBytes = requested_size - sizeof(SURFACE)
+    SURFMEM::bCreateDIB+127                  mov     ecx, 21h                    ; PoolType = PagedPoolSession
+    SURFMEM::bCreateDIB+12C                  call    cs:__imp_Win32AllocPoolImpl ; ::AllocateType(void)
+    SURFMEM::bCreateDIB+184                  mov     rsi, rax        ; rsi = buffer for the SURFACE header
+    SURFMEM::bCreateDIB+187                  test    rax, rax        ; the returned buffer is a View of a Section object
+    SURFMEM::bCreateDIB+18A                  jz      loc_1C00C5791
+通过深入研究CTypeIsolation::AllocateType()函数，我们了解到分配算法的工作原理。  
+CTypeIsolation::AllocateType()会对CSectionEntry对象列表进行遍历，针对每个CSectionEntry，它会调用nt!RtlFindClearBits来检查其CSectionBitmapAllocator是否在RTL_BITMAP结构中包含一个闲置位。通过借助CSectionBitmapAllocator的bitmap_hint_index成员，可以实现这一检查过程的加速。
+    .text:00000001C0039863                 mov     r8d, ebp        ; HintIndex = 0
+    .text:00000001C0039866                 cmp     eax, 0F0h       ; bitmap_hint_index >= RTL_BITMAP->size?
+    .text:00000001C003986B                 jnb     short loc_1C0039870
+    .text:00000001C003986D                 mov     r8d, eax        ; HintIndex = bitmap_hint_index
+    .text:00000001C0039870
+    .text:00000001C0039870 loc_1C0039870:                          ; CODE XREF: NSInstrumentation::CTypeIsolation::AllocateType(void)+6Bj
+    .text:00000001C0039870                 mov     rcx, [rsi+18h]  ; rcx = CSectionBitmapAllocator->xored_rtl_bitmap
+    .text:00000001C0039874                 mov     edx, 1          ; NumberToFind
+    .text:00000001C0039879                 xor     rcx, [rsi+10h]  ; BitMapHeader = CSectionBitmapAllocator->xored_rtl_bitmap
+    .text:00000001C0039879                                         ; ^ CSectionBitmapAllocator->xor_key
+    .text:00000001C003987D                 call    cs:__imp_RtlFindClearBits
+    .text:00000001C0039883                 mov     r12d, eax       ; r12 = free_bit_index
+    .text:00000001C0039886                 cmp     eax, 0FFFFFFFFh ; free_bit_index == -1?
+    .text:00000001C0039889                 jz      short loc_1C00398D6 ; if so, RTL_BITMAP is full, check another CSectionEntry
+如果nt!RtlFindClearBits返回值为-1，那就表示RTL_BITMAP中所有位都为1（即RTL_BITMAP已满），接下来会尝试对列表中的下一个CSectionEntry重复该操作，我们接下来会进行研究。否则，如果nt!RtlFindClearBits返回了一个不为-1的值，则意味着RTL_BITMAP至少有一个闲置位，也就是说当前CSectionEntry的Section内存中至少有一个用于SURFACE头部的空闲位置。  
+因此，我们需要将nt!RtlFindClearBits()返回的RTL_BITMAP中闲置位的索引映射到Section视图中空闲位置的相应内存地址。为了实现这一点，闲置位的索引将会除以6，原因在于该Section的每个0x1000字节视图能够容纳6个大小为0x280的SURFACE头部。我在下面的反汇编代码中调用了view_index，这个view_index的范围是[0,
+0x27]。因为每个Section的大小是0x28000字节，所以它可以被分为大小为0x1000的0x28个视图，并且在一个Section中会有0x28个视图可能被用来寻址。  
+这个view_index会与CSectionBitmapAllocator对象的num_commited_views成员中保存的当前实际视图数进行比较。  
+正如MSDN中（ 
+）所描述的那样：“在访问虚拟内存范围之前，没有为视图分配物理内存”。如果经过比较，view_index小于提交视图的计数，那么我们就不需要再提交一个新的视图，会直接进行分配。否则，就通过调用nt!MmCommitSessionMappedView，来计算相应视图的地址（first_view
++ view_index * 0x1000），并将其提交到物理内存之中。
+    .text:00000001C003988B                 mov     eax, 0AAAAAAABh
+    .text:00000001C0039890                 mul     r12d
+    .text:00000001C0039893                 mov     eax, [rsi+24h]  ; eax = CSectionBitmapAllocator->num_commited_views
+    .text:00000001C0039896                 mov     r15d, edx       ; HI_DWORD(free_bit_index * 0xaaaaaaab) / 4 == free_bit_index / 6
+    .text:00000001C0039899                 shr     r15d, 2         ; r15d = view_index = free_bit_index / 6 (6 SURFACE headers fit in 0x1000 bytes)
+    .text:00000001C003989D                 cmp     r15d, eax       ; view_index = MAX_VIEW_INDEX ?
+    .text:00000001C00398A9                 jnb     loc_1C003998A
+    .text:00000001C00398AF                 mov     rbp, [rsi+8]
+    .text:00000001C00398AF                                         ; rbp = CSectionBitmapAllocator->xored_view
+    .text:00000001C00398B3                 mov     edx, r15d       ; edx = view_index
+    .text:00000001C00398B6                 xor     rbp, [rsi+10h]  ; CSectionBitmapAllocator->xored_view ^ CSectionBitmapAllocator->xor_key
+    .text:00000001C00398BA                 shl     edx, 0Ch        ; view_index * 0x1000
+    .text:00000001C00398BD                 add     rbp, rdx        ; rbp = view + view_index * 0x1000
+    .text:00000001C00398C0                 mov     edx, 1000h      ; edx = size to commit
+    .text:00000001C00398C5                 mov     rcx, rbp        ; rcx = addr of view to commit
+    .text:00000001C00398C8                 call    cs:__imp_MmCommitSessionMappedView
+成功提交后，0x1000字节的视图被初始化为0（该写操作实际上终止了提交过程），并且CSectionBitmapAllocator的num_commited_views成员会进行相应的更新。
+    .text:00000001C0039975 loc_1C0039975:                          ; CODE XREF: NSInstrumentation::CTypeIsolation::AllocateType(void)+D0j
+    .text:00000001C0039975                 xor     edx, edx        ; Val
+    .text:00000001C0039977                 mov     r8d, 1000h      ; Size
+    .text:00000001C003997D                 mov     rcx, rbp        ; Dst
+    .text:00000001C0039980                 call    memset          ; this memset actually commits the memory
+    .text:00000001C0039985                 inc     dword ptr [rsi+24h] ; CSectionBitmapAllocator->num_commited_views++
+    .text:00000001C0039988                 xor     ebp, ebp
+无论是否需要提交新的视图，RTL_BITMAP的闲置位索引都会通过调用nt!RtlSetBit()被设置为1，从而标记为忙状态。但奇怪的是，代码会调用nt!RtlSetBit()将其设置为1，但并不检查其返回值。此外，CSectionBitmapAllocator的bitmap_hint_index成员会不断递增1，但如果超出0xF0-1的最大值，它就会被重置为0。
+    .text:00000001C003998A                 mov     rcx, [rsi+18h]  ; rcx = CsectionBitmapAllocator->xored_rtl_bitmap
+    .text:00000001C003998E                 mov     edx, r12d       ; BitNumber = free bit index
+    .text:00000001C0039991                 xor     rcx, [rsi+10h]  ; BitMapHeader = CSectionBitmapAllocator->xored_rtl_bitmap
+    .text:00000001C0039991                                         ; ^ CSectionBitmapAllocator->xor_key
+    .text:00000001C0039995                 call    cs:__imp_RtlTestBit ; [!] return value not checked
+    .text:00000001C003999B                 mov     rcx, [rsi+18h]  ; rcx = CsectionBitmapAllocator->xored_rtl_bitmap
+    .text:00000001C003999F                 mov     edx, r12d       ; BitNumber
+    .text:00000001C00399A2                 xor     rcx, [rsi+10h]  ; BitMapHeader = xored_rtl_bitmap ^ xor_key
+    .text:00000001C00399A6                 call    cs:__imp_RtlSetBit
+    .text:00000001C00399AC                 inc     dword ptr [rsi+20h] ; CSectionBitmapAllocator->bitmap_hint_index++
+    .text:00000001C00399AF                 cmp     dword ptr [rsi+20h], 0F0h ; CSectionBitmapAllocator->bitmap_hint_index >= bitmap size?
+    .text:00000001C00399B6                 jnb     short loc_1C0039A27
+    [...]
+    .text:00000001C0039A27 loc_1C0039A27:                          ; CODE XREF: NSInstrumentation::CTypeIsolation::AllocateType(void)+1B6j
+    .text:00000001C0039A27                 mov     [rsi+20h], ebp  ; CSectionBitmapAllocator->bitmap_hint_index = 0
+    .text:00000001C0039A2A                 jmp     short loc_1C00399B8
+现在，我们已经将闲置位映射到相应的视图中，接下来需要在该视图中选择一个0x280字节的块。每个视图可以保存6个SURFACE头部（0x1000 /
+0x280 == 6）。为实现这一点，会进行如下计算：free_bit_index – view_index *
+6，该计算可简化为：free_bit_index % 6。
+    .text:00000001C00399B8                 mov     rax, [rsi+10h]  ; rax = CSectionBitmapAllocator->xor_key

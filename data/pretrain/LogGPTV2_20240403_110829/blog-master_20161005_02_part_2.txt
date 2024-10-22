@@ -1,0 +1,278 @@
+postgres=# select pg_sleep(10);
+session B:
+pg_sleep执行结束前，赶快查看，可以观察到xmin，SQL执行结束再查看xmin就会消失。  
+xmin与第一条SQL不一样，因为read committed隔离级别的事务，每条SQL开始时都会新申请快照。  
+postgres=# select pid,backend_xid,backend_xmin from pg_stat_activity where pid=57479;
+  pid  | backend_xid | backend_xmin 
+-------+-------------+--------------
+ 57479 |             |        78341
+(1 row)
+session A:
+执行一条会申请XID的SQL，例如插入数据。  
+postgres=# insert into tbl1 values (1);
+INSERT 0 1
+session B:
+xid有值了，为session A对应事务申请下来的事务号，是已消耗掉的，XID不会变化，直到事务结束。  
+postgres=# select pid,backend_xid,backend_xmin from pg_stat_activity where pid=57479;
+  pid  | backend_xid | backend_xmin 
+-------+-------------+--------------
+ 57479 |       78341 |             
+(1 row)
+```
+以上例子解释了事务快照中的xmin, xid的含义，大家熟悉后，就可以看PostgreSQL 9.6的改进了。  
+### lsn, whenTaken
+快照中的lsn表示获取快照时WAL的写入位置，whenTaken表示获取快照时的时间  
+```
+        int64           whenTaken;              /* timestamp when snapshot was taken */
+        XLogRecPtr      lsn;                    /* position in the WAL stream when taken */
+```
+### PostgreSQL 9.6 判断快照过旧的代码
+1\. src/include/storage/bufmgr.h  
+```
+/*
+ * Check whether the given snapshot is too old to have safely read the given
+ * page from the given table.  If so, throw a "snapshot too old" error.
+ *
+ * This test generally needs to be performed after every BufferGetPage() call
+ * that is executed as part of a scan.  It is not needed for calls made for
+ * modifying the page (for example, to position to the right place to insert a
+ * new index tuple or for vacuuming).  It may also be omitted where calls to
+ * lower-level functions will have already performed the test.
+ *
+ * Note that a NULL snapshot argument is allowed and causes a fast return
+ * without error; this is to support call sites which can be called from
+ * either scans or index modification areas.
+ *
+ * For best performance, keep the tests that are fastest and/or most likely to
+ * exclude a page from old snapshot testing near the front.
+ */
+static inline void
+TestForOldSnapshot(Snapshot snapshot, Relation relation, Page page)
+{
+        Assert(relation != NULL);
+        if (old_snapshot_threshold >= 0
+                && (snapshot) != NULL
+                && ((snapshot)->satisfies == HeapTupleSatisfiesMVCC
+                        || (snapshot)->satisfies == HeapTupleSatisfiesToast)
+                && !XLogRecPtrIsInvalid((snapshot)->lsn)
+                && PageGetLSN(page) > (snapshot)->lsn)
+                TestForOldSnapshot_impl(snapshot, relation);
+}
+```
+2\. src/backend/storage/buffer/bufmgr.c  
+```
+/*
+ * Implement slower/larger portions of TestForOldSnapshot
+ *
+ * Smaller/faster portions are put inline, but the entire set of logic is too
+ * big for that.
+ */
+void
+TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
+{
+        if (RelationAllowsEarlyPruning(relation)
+                && (snapshot)->whenTaken mutex_threshold);
+        threshold_timestamp = oldSnapshotControl->threshold_timestamp;
+        SpinLockRelease(&oldSnapshotControl->mutex_threshold);
+        return threshold_timestamp;
+}
+```
+GUC变量old_snapshot_threshold，表示多少分钟以前的xmin可能会被垃圾回收时清除掉。  
+```
++ * GUC parameters
++ */
++int            old_snapshot_threshold;     /* number of minutes, -1 disables */
++
+```
+报错与old_snapshot_threshold快照相关信息的数据结构    
+```
+/*
+ * Structure for dealing with old_snapshot_threshold implementation.
+ */
+typedef struct OldSnapshotControlData
+{
+        /*
+         * Variables for old snapshot handling are shared among processes and are
+         * only allowed to move forward.
+         */
+        slock_t         mutex_current;  /* protect current_timestamp */
+        int64           current_timestamp;              /* latest snapshot timestamp */
+        slock_t         mutex_latest_xmin;              /* protect latest_xmin and
+                                                                                 * next_map_update */
+        TransactionId latest_xmin;      /* latest snapshot xmin */
+        int64           next_map_update;        /* latest snapshot valid up to */
+        slock_t         mutex_threshold;        /* protect threshold fields */
+        int64           threshold_timestamp;    /* earlier snapshot is old */
+        TransactionId threshold_xid;    /* earlier xid may be gone */
+        /*
+         * Keep one xid per minute for old snapshot error handling.
+         *
+         * Use a circular buffer with a head offset, a count of entries currently
+         * used, and a timestamp corresponding to the xid at the head offset.  A
+         * count_used value of zero means that there are no times stored; a
+         * count_used value of OLD_SNAPSHOT_TIME_MAP_ENTRIES means that the buffer
+         * is full and the head must be advanced to add new entries.  Use
+         * timestamps aligned to minute boundaries, since that seems less
+         * surprising than aligning based on the first usage timestamp.  The
+         * latest bucket is effectively stored within latest_xmin.  The circular
+         * buffer is updated when we get a new xmin value that doesn't fall into
+         * the same interval.
+         *
+         * It is OK if the xid for a given time slot is from earlier than
+         * calculated by adding the number of minutes corresponding to the
+         * (possibly wrapped) distance from the head offset to the time of the
+         * head entry, since that just results in the vacuuming of old tuples
+         * being slightly less aggressive.  It would not be OK for it to be off in
+         * the other direction, since it might result in vacuuming tuples that are
+         * still expected to be there.
+         *
+         * Use of an SLRU was considered but not chosen because it is more
+         * heavyweight than is needed for this, and would probably not be any less
+         * code to implement.
+         *
+         * Persistence is not needed.
+         */
+        int                     head_offset;    /* subscript of oldest tracked time */
+        int64           head_timestamp; /* time corresponding to head xid */
+        int                     count_used;             /* how many slots are in use */
+        TransactionId xid_by_minute[FLEXIBLE_ARRAY_MEMBER];    // 记录每分钟的最大xid号，垃圾回收时有用  
+} OldSnapshotControlData;
+```
+query获取快照时，会更新这个结构的值，开启快照过旧的功能，目前有重度性能影响（指高并发的场景）      
+```
+GetSnapshotData -> MaintainOldSnapshotTimeMapping -> 更新xid_by_minute......
+```
+## PostgreSQL 9.6 snapshot too old的配置和测试
+配置old_snapshot_threshold参数，需要重启数据库  
+```
+old_snapshot_threshold = 1min     # 为了方便测试，设置为1分钟。           # 1min-60d; -1 disables; 0 is immediate
+                                                                        # (change requires restart)
+```
+PostgreSQL 9.6目前解决的问题是长时间持有backend_xmin的问题，它并不关心是否存在backend_xid。  
+1\. 包含xmin，没有申请xid的只读事务  
+当持有xmin的query执行时间超过old_snapshot_threshold设置的阈值，并且读取到数据块的LSN大于快照存储的LSN时，报snapshot too old错误。    
+```
+postgres=# create table tbl1(id int);
+CREATE TABLE
+postgres=# insert into tbl1 select generate_series(1,10000);
+INSERT 0 10000
+postgres=# create index idx_tbl1 on tbl1(id);
+CREATE INDEX
+session A:
+postgres=# begin transaction isolation level repeatable read;
+BEGIN
+1号数据块的数据
+postgres=# select ctid,* from tbl1 where id=2;
+ ctid  | id 
+-------+----
+ (0,1) |  2
+(1 row)
+另一个数据块的数据
+postgres=# select ctid,* from tbl1 where id=1000;
+  ctid  |  id  
+--------+------
+ (4,95) | 1000
+(1 row)
+session B:
+更新1号数据块的某条记录
+postgres=# update tbl1 set id=0 where id=2 returning ctid,*;
+  ctid   | id 
+---------+----
+ (44,57) |  0
+(1 row)
+UPDATE 1
+1分钟后
+session A:
+访问未发生变化的数据块正常(因为id=1000走索引，所以不会扫描变更的数据块，这也是前面测试要建立索引的原因)
+postgres=# select ctid,* from tbl1 where id=1000;
+  ctid  |  id  
+--------+------
+ (4,95) | 1000
+(1 row)
+访问发生变化的数据块, snapshot too old  
+postgres=# select ctid,* from tbl1 where id=3;
+ERROR:  snapshot too old
+postgres=# end;
+ROLLBACK
+```
+2\. 已申请xid的写repeatable read/serializable事务，由于持有了xmin，一样可能出现snapshot too old。    
+```
+session A:
+postgres=# begin transaction isolation level repeatable read;
+BEGIN
+postgres=# insert into tbl1 values (1) returning ctid,*;
+  ctid   | id 
+---------+----
+ (44,60) |  1
+(1 row)
+session B:
+修改44号数据块的记录，导致44号数据块LSN变大
+postgres=# update tbl1 set id=0 where ctid::text ~ '^\(44,' returning ctid,*;
+   ctid   | id 
+----------+----
+ (44,61)  |  0
+ (44,62)  |  0
+ (44,63)  |  0
+ (44,64)  |  0
+ (44,65)  |  0
+ (44,66)  |  0
+ (44,67)  |  0
+......
+UPDATE 58
+1分钟后  
+session A:
+访问变更的数据块，报错  
+postgres=# select * from tbl1 where ctid::text ~ '^\(44,';
+ERROR:  snapshot too old
+postgres=# end;
+ROLLBACK
+```
+3\. 已申请xid的read committed写事务，由于query开始时会重新生成快照，所以通常query持有的快照lsn大于或等于访问到的PAGE的LSN，则不会出现snapshot too old。      
+```
+session A:
+postgres=# begin transaction isolation level read committed;
+BEGIN
+postgres=# insert into tbl1 values (1) returning ctid,*;
+   ctid   | id 
+----------+----
+ (44,178) |  1
+(1 row)
+session B:
+修改44号数据块的记录，导致44号数据块LSN变大
+postgres=# update tbl1 set id=0 where ctid::text ~ '^\(44,' returning ctid,*;
+   ctid   | id 
+----------+----
+ (44,179) |  0
+ (44,180) |  0
+ (44,181) |  0
+UPDATE 58
+1分钟后  
+session A:
+访问变更的数据块，不会报错  
+postgres=# select * from tbl1 where ctid::text ~ '^\(44,';
+ id 
+----
+  0
+  0
+  0
+  0
+  0
+......
+但是如果QUERY本身访问时间长，并且访问到了快照创建以后被修改的页，还是会报错的。  
+模拟长SQL
+session A:
+with t as (select pg_sleep(100) ) select * from tbl1,t;
+立即执行如下
+session B:
+postgres=# update tbl1 set id=0 where ctid::text ~ '^\(44,' returning ctid,*;
+   ctid   | id 
+----------+----
+ (44,166) |  0
+长SQL报错
+session A:
+ERROR:  snapshot too old
+```
+## 小结
+### 哪些情况可能导致snapshot too old错误  
+包含了backend_xmin的事务，只要SQL的执行时间超过old_snapshot_threshold阈值，并且该SQL读取到了LSN超过快照存储的LSN的数据块时。  
+1\. snapshot too old报错通常出现在非常大的SQL，同时读取的数据块在不断的变化。  

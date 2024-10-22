@@ -1,0 +1,115 @@
+        'SNAKE': true,
+        'MUSHROOM': 42,
+      },
+      cwd: '/usr',
+      stdio: 'pipe',
+      aslr: 'auto'
+    });
+当然，修改完成之后，子进程的路径、参数和环境都可以置空了，这个置空已经可以区分“用默认的环境配置”和“不使用任何环境配置”了。
+## 子进程插装机制大更新
+###  存在的问题：子进程多线程机制混乱容易崩
+首先来回顾一下，传统的`fork()`函数本来的操作是这样婶儿的，它会克隆完整的父进程空间给子进程，这个过程通常开销不大，因为有着`copy-on-write`机制，然后将子进程的进程`ID`返回给父进程，将`0`返回给子进程。
+而当涉及到多线程的时候，情况就会变得复杂起来，只有调用`fork()`函数的线程，可以“存活”到子进程里面，而如果其他线程碰巧有线程锁，这些锁在子进程里将永远不会被解开。
+所以说`App`如果要同时进行多线程和`fork`操作的话，必须得非常谨慎，当然大多数`App`都在`fork`进程时都是使用的单线程设计，可是在注入我们的`frida-gum`之后，该进程就变成了多线程，所以程序经常会崩溃或失去响应。还有一种情况就是拥有共享属性的文件描述符，处理的时候也需要非常非常谨慎。
+在这个版本中作者花了大力气，最终解决了这个问题。作者非常鸡冻的宣布，现在`FRIDA`可以检测到即将运行`fork()`函数，临时暂停`FRIDA`的线程，暂停通讯通道，并随着`fork()`的过程一起备份，备份完成之后恢复运行。也就是说在子进程开始运行之前，我们就把想要实施的插装操作应用到子进程上了。
+当然不仅仅是`fork()`，还有`execve(), posix_spawn(),
+CreateProcess()`等系列子进程操作函数，这么说吧，只要是对进程实施的操作，不管是像`execve()`一样替换自身进程的，还是像`posix_spawn()`一样另起一个进程的，都会像`fork()`函数一样，由`FRIDA`先实施好插桩之后，再开始运行。
+### 解决的方法：引入新的子进程控制`API`：`Child gating`
+前两个问题主要就是由这个新引入的“子进程控制”的`API`来解决的，我们为拥有`create_script()`方法的`Session`对象全新加入了`enable_child_gating()`和`disable_child_gating()`这两个方法，在不显示调用新`API`的情况下，`Frida`的机制还是会跟从前一样，我们需要手动调用`enable_child_gating()`方法来切换到子进程控制的模式。
+进入子进程控制模式之后，所有的子进程都会先暂停，等我们一顿操作完成之后，再对子进程的`PID`调用`resume()`来恢复子进程的运行。`Device`对象有一个叫做`delivered`的信号，我们可以在这个信号上装一个回调`callback`，这样有新的进程被产生出来的时候就会得到通知，得到通知之后立刻对新进程进行插桩等操作即可，然后调用`resume()`函数就可以恢复新进程的运行。`Device`对象还有一个新的`enumerate_pending_children()`的方法，用来列出即将产生的子进程列表，所有即将产生的子进程都会在这个表里，直到用户运行`resume()`函数恢复其运行，或者直接被
+**kill** 掉。
+理论讲完了，接下来实际操作一遍。下面是`host`端的`py`代码：
+    from __future__ import print_function
+    import frida
+    from frida.application import Reactor
+    import threading
+    class Application(object):
+        def __init__(self):
+            self._stop_requested = threading.Event()
+            self._reactor = Reactor(run_until_return=lambda reactor: self._stop_requested.wait())
+            self._device = frida.get_local_device()
+            self._sessions = set()
+            self._device.on("delivered", lambda child: self._reactor.schedule(lambda: self._on_delivered(child)))
+        def run(self):
+            self._reactor.schedule(lambda: self._start())
+            self._reactor.run()
+        def _start(self):
+            argv = ["/bin/sh", "-c", "cat /etc/hosts"]
+            print("✔ spawn(argv={})".format(argv))
+            pid = self._device.spawn(argv)
+            self._instrument(pid)
+        def _stop_if_idle(self):
+            if len(self._sessions) == 0:
+                self._stop_requested.set()
+        def _instrument(self, pid):
+            print("✔ attach(pid={})".format(pid))
+            session = self._device.attach(pid)
+            session.on("detached", lambda reason: self._reactor.schedule(lambda: self._on_detached(pid, session, reason)))
+            print("✔ enable_child_gating()")
+            session.enable_child_gating()
+            print("✔ create_script()")
+            script = session.create_script("""'use strict';
+    Interceptor.attach(Module.findExportByName(null, 'open'), {
+      onEnter: function (args) {
+        send({
+          type: 'open',
+          path: Memory.readUtf8String(args[0])
+        });
+      }
+    });
+    """)
+            script.on("message", lambda message, data: self._reactor.schedule(lambda: self._on_message(pid, message)))
+            print("✔ load()")
+            script.load()
+            print("✔ resume(pid={})".format(pid))
+            self._device.resume(pid)
+            self._sessions.add(session)
+        def _on_delivered(self, child):
+            print("⚡ delivered: {}".format(child))
+            self._instrument(child.pid)
+        def _on_detached(self, pid, session, reason):
+            print("⚡ detached: pid={}, reason='{}'".format(pid, reason))
+            self._sessions.remove(session)
+            self._reactor.schedule(self._stop_if_idle, delay=0.5)
+        def _on_message(self, pid, message):
+            print("⚡ message: pid={}, payload={}".format(pid, message["payload"]))
+    app = Application()
+    app.run()
+然后来运行这段代码：
+    $ python3 example.py
+    ✔ spawn(argv=['/bin/sh', '-c', 'cat /etc/hosts'])
+    ✔ attach(pid=42401)
+    ✔ enable_child_gating()
+    ✔ create_script()
+    ✔ load()
+    ✔ resume(pid=42401)
+    ⚡ message: pid=42401,
+    ↪payload={'type': 'open', 'path': '/dev/tty'}
+    ⚡ detached: pid=42401, reason='process-replaced'
+    ⚡ delivered: Child(pid=42401, parent_pid=42401,
+    ↪path="/bin/cat", argv=['cat', '/etc/hosts'],
+    ↪envp=['SHELL=/bin/bash', 'TERM=xterm-256color', …],
+    ↪origin=exec)
+    ✔ attach(pid=42401)
+    ✔ enable_child_gating()
+    ✔ create_script()
+    ✔ load()
+    ✔ resume(pid=42401)
+    ⚡ message: pid=42401,
+    ↪payload={'type': 'open', 'path': '/etc/hosts'}
+    ⚡ detached: pid=42401, reason='process-terminated'
+    $
+我们重构了子进程的`hook`机制，也顺便重构了`Android App`的启动机制，移除了之前的`frida-loader-{32,64}.so`，全新的`Zygote`插桩机制会在后台承担所有的子进程控制工作，这也意味着可以对`Zygote`进行任意的插桩工作，当然得记好要调用`enable_child_gating()`来开启这这个功能，对于不需要进行插桩的子进程立即使用`resume()`来恢复其运行。
+## 退出(崩溃)消息机制大更新
+###  存在的问题：程序崩溃时消息来不及发出
+另外一个一直以来存在的问题就是，当进程快要意外崩溃的时候，进程传给`FRIDA`的`send()`的`API`的数据，可能会来不及发出去，虽然民间也有一种解决的办法就是可以`hook`一些`exit()`或`abort()`函数，然后在`hook`的语句里进行`send()`和`recv().wait()`的`client-host`结对操作，虽然不是很优雅，但针对特定平台也是有效的。
+### 解决的方法：对各大平台的停止进程`API`进行插装
+针对程序意外崩溃的情况，`Frida`目前已经可以介入各大系统平台常用的停止进程的`API`，为用户做好进程崩溃时的清理工作，包含把数据发送出去。
+有些脚本会把想要输出的数据在本地做个持久化然后定期通过`send()`传出去，这种情况下需要在进程即将崩溃的时候显式地将数据传输出去，我们为这种情况定制了一个`RPC`，导出名为`dispose`：
+    rpc.exports = {
+      dispose: function () {
+        send(bufferedData);
+      }
+    };
+几个大的机制的更新先介绍到这里，应该还会有下一篇，介绍一些小的但是刁钻的，或者是理念式的变化，不要小看这些变化，对于代码来讲，every line
+matters 。

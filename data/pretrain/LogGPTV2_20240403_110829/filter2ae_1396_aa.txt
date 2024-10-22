@@ -1,0 +1,192 @@
+#### Problem
+​ 因为个人偏爱AFL，习惯用AFL做模糊测试，发现一些CVE，但是一直苦于AFL的工作方式，由于AFL只能够从stdin/file获取输入，变异。
+而网络应用多是`socket`或者其他network相关的通信方式，而且默认情况下，afl每次都会重新启动程序，网络应用如server启动时间比较久，影响了模糊测试的效率。一般情况下，可以通过为特定的程序编写一个`harness`，用于fuzz程序的部分代码。但是这种方式首先需要你对源码有一定的理解，其次它的覆盖率比较低。
+在网上学习发现这篇文章[how-fuzz-server-american-fuzzy-lop](https://www.fastly.com/blog/how-fuzz-server-american-fuzzy-lop)，方法与思维都很有学习应用的价值，翻译&应用后记录此文。
+#### Solution: Persistent mode
+AFL的工作模式与模糊测试的主循环一致：创建新的进程，提供一个case，然后监视直到进程结束，再重复...
+为了避免`execve`的开销和链接等时间消耗，AFL引入了`forkserver`机制，新的进程`fork`得到，由于`copy-on-write`机制，提高了性能。
+但即使如此，每次新的fuzz的不同case输入仍然会引入`fork`的开销。
+对于很多测试目标，连续的`fork`和`initalization`的过程是一个代价较高的过程。在很多情况下，API是没有状态的，或者可以被重置为接近原始状态的，因此至少在一次进程结束后可以不用抛弃该进程。这就是
+**进程内模糊测试** 的概念：在该方案下，测试用例是进程内部生成，并以自定义编写单进程循环的形式反馈到待测试的底层API。 **进程内模糊测试**
+能够提高模糊测试效率在10x左右，但是也是有代价的：例如，它很容易由于测试代码中存在的内存泄漏或者Dos而失败。
+自afl-1.81b始，afl-fuzz提供了一种`persistent`模式——将 **进程内模糊测试** 与更传统的多进程工具的强大功能结合起来。
+在该模式下，afl将测试用例喂给一个单独的、存活时间长的进程，该进程读取输入，将其传递给待fuzz的API，并通过终止本进程通知fuzzer测试成功运行。最终当父进程恢复时，自定义的进程循环回到起点。只需要写一个极简的`harness`完成这样一个循环，AFL会完成细节，如crash检查。
+一个简单的`harness`样例
+    int main(int argc, char** argv) {
+      while (__AFL_LOOP(1000)) {
+        /* Reset state. */
+        memset(buf, 0, 100);
+        /* Read input data. */
+        read(0, buf, 100);
+        /* Parse it in some vulnerable way. You'd normally call a library here. */
+        if (buf[0] != 'p') puts("error 1"); else
+        if (buf[1] != 'w') puts("error 2"); else
+        if (buf[2] != 'n') puts("error 3"); else
+          abort();
+      }
+    }
+`Persisten`模式只需要控制以下两点
+1、AFL何时fork目标进程
+2、AFL何时提供新的测试样例。
+3、每一轮循环开始需要重置目标进程状态，否则找到的bug可能是`harness`的而不是目标程序的。
+#### Persisten mode & server
+大部分server实现时都会在处理client的请求后重置状态，通常，一个server的实现如下
+    while(go):
+        req = get_request()
+        process(req)
+为了使用AFL `persistent`模式，只需要如下修改程序
+    while(go):
+        put_request(read(file))                 //AFL
+        req = get_request()
+        process(req)
+        notify_fuzzer()                         // AFL
+#### Applying the tachnique in Knot DNS
+##### Analyze
+Knot DNS使用sockets通信，其中处理udp数据包的代码在`src/knot/server/udp-handler.c`中
+主要函数`udp_master`中有一个循环，等待socket事件，接收并处理udp数据包，是一个合适的fuzz点。
+    int udp_master(dthread_t *thread)
+    {
+        if (thread == NULL || thread->data == NULL) {
+            return KNOT_EINVAL;
+        }
+        iohandler_t *handler = (iohandler_t *)thread->data;
+        int thread_id = handler->thread_id[dt_get_id(thread)];
+        if (handler->server->n_ifaces == 0) {
+            return KNOT_EOK;
+        }
+        /* Set thread affinity to CPU core (same for UDP and XDP). */
+        unsigned cpu = dt_online_cpus();
+        if (cpu > 1) {
+            unsigned cpu_mask = (dt_get_id(thread) % cpu);
+            dt_setaffinity(thread, &cpu_mask, 1);
+        }
+        /* Choose processing API. */
+        udp_api_t *api = NULL;
+        if (is_xdp_thread(handler->server->ifaces, thread_id)) {
+    #ifdef ENABLE_XDP
+            api = &xdp_recvmmsg_api;
+    #else
+            assert(0);
+    #endif
+        } else {
+    #ifdef ENABLE_RECVMMSG
+            api = &udp_recvmmsg_api;
+    #else
+            api = &udp_recvfrom_api;
+    #endif
+        }
+        void *rq = api->udp_init();
+        /* Create big enough memory cushion. */
+        knot_mm_t mm;
+        mm_ctx_mempool(&mm, 16 * MM_DEFAULT_BLKSIZE);
+        /* Create UDP answering context. */
+        udp_context_t udp = {
+            .server = handler->server,
+            .thread_id = thread_id,
+        };
+        knot_layer_init(&udp.layer, &mm, process_query_layer());
+        /* Allocate descriptors for the configured interfaces. */
+        void *xdp_socket = NULL;
+        size_t nifs = handler->server->n_ifaces;
+        fdset_t fds;
+        if (fdset_init(&fds, nifs) != KNOT_EOK) {
+            goto finish;
+        }
+        unsigned nfds = udp_set_ifaces(handler->server->ifaces, nifs, &fds,
+                                       thread_id, &xdp_socket);
+        if (nfds == 0) {
+            goto finish;
+        }
+        //** AFL 在主循环之前 定义变量 Shim1**// 
+        /* Loop until all data is read. */
+        //** 循环等待socket事件，接收并处理udp数据包 **/
+        for (;;) {
+            /* Cancellation point. */
+            if (dt_is_cancelled(thread)) {
+                break;
+            }
+            /* Wait for events. */
+            fdset_it_t it;
+            (void)fdset_poll(&fds, &it, 0, -1);
+            // ** AFL:读取输入文件 Shim2**/ 
+            /* Process the events. */
+            for (; !fdset_it_is_done(&it); fdset_it_next(&it)) {
+                if (!fdset_it_is_pollin(&it)) {
+                    continue;
+                }
+                if (api->udp_recv(fdset_it_get_fd(&it), rq, xdp_socket) > 0) {
+                    api->udp_handle(&udp, rq, xdp_socket);
+                    api->udp_send(rq, xdp_socket);
+                }
+            }
+            //** AFL: 通知fuzzer processing complete Shim3**/
+        }
+    finish:
+        api->udp_deinit(rq);
+        mp_delete(mm.ctx);
+        fdset_clear(&fds);
+        return KNOT_EOK;
+    }
+##### First shim
+第一个shim负责定义、初始化用于后续shim的变量
+    #ifdef KNOT_AFL_PERSISTENT_SHIM  /* For AFL persistent mode fuzzing shim  */
+        /* Initialize variables for fuzzing */
+        size_t insize;
+        struct sockaddr_in servaddr;
+        int udp_socket; 
+        char *env_dest_ip = getenv("KNOT_AFL_DEST_IP");
+        char *env_dest_port = getenv("KNOT_AFL_DEST_PORT");
+        int dest_port = env_dest_port ? strtol(env_dest_port, NULL, 10) : 9090;
+        char *dest_ip = env_dest_ip ? env_dest_ip : "127.0.0.1";
+        bzero(&servaddr,sizeof(servaddr));
+        servaddr.sin_family = AF_INET; 
+        servaddr.sin_addr.s_addr = inet_addr(dest_ip);
+        servaddr.sin_port = htons(dest_port); 
+        char buf[5120]; 
+    #endif // #ifdef KNOT_AFL_PERSISTENT_SHIM
+##### Second shim
+负责从文件中获取测试样例，并将内容填充到Knot DNS监听的socket中，方便起见，这里直接从`stdin`获取输入
+    #ifdef KNOT_AFL_PERSISTENT_SHIM  /* For AFL persistent mode fuzzing shim  */
+            /* Read fuzzed packet from stdin and send to socket */
+            if (getenv("KNOT_AFL_STDIN") || getenv("KNOT_AFL_CMIN") ||
+                    getenv("AFL_PERSISTENT")) {
+                memset(buf, 0, 5120);
+                insize = read(0, buf, 5120);                        // read fuzz case from stdin
+                udp_socket = handler->server->ifaces->fd_udp[0];
+                sendto(udp_socket, buf, insize,0, (struct sockaddr *)&servaddr,sizeof(servaddr));
+            }
+    #endif // #ifdef KNOT_AFL_PERSISTENT_SHIM
+##### Third shim
+最后一个shim就是负责终止本进程，通知fuzzer本次测试完成（通过SIGSTOP信号），以便fuzzer处理下一个测试样例
+    #ifdef KNOT_AFL_PERSISTENT_SHIM  /* For AFL persistent mode fuzzing shim  */
+            /* Signal AFL to fuzz input and continue execution */
+            if (getenv("AFL_PERSISTENT")) {
+                raise(SIGSTOP);
+            } else if (getenv("KNOT_AFL_CMIN")) {
+                exit(0);
+            }
+    #endif // #ifdef KNOT_AFL_PERSISTENT_SHIM
+##### Configure and compile target
+    CC=~/path-afl/afl-clang-fast CFLAGS='-DKNOT_AFL_PERSISTENT_SHIM' ./configure --disable-shared
+    make
+##### How run knot server
+这些可以在knot项目的`Readme`中获得
+1、首先需要config，使用的`./tests-fuzz/knotd_wrap/knot_stdio.conf`
+2、工作目录，创建config指定的工作目录
+3、启动server: `src/knotd`
+##### Minimize test cases
+    KNOT_AFL_CMIN=1 ~/path-afl/afl-cmin -i in -o cmin -- ./src/knot -c my_config.config
+    KNOT_AFL_CMIN=1 ~/treebacker/fuzzwork/mm_afl/afl-2.52b/afl-cmin -i  -o cmin -- ./src/knotd -c my_config.conf
+##### Start fuzzing in persistent mode
+    AFL_PERSISTENT=1 ~/path-afl/afl-fuzz -i cmin -o out -- ./src/knot -c my_config.conf
+#### More
+其实在Knot-dns项目中，我们能找到开发者自己使用AFL测试的几个点：`fuzz_packet; fuzz_dnamr_from_str;
+fuzz_dname_to_str, fuzz_zscanner..`
+也是为fuzz目标提供一个function wrapper, 最终可以利用AFL从文件获取内容，fuzz一个调用这个function
+wrapper的harness。
+并且也保留了一个`knotd_wrap`，重写了udp, tcp 的recv方法，从stdin读取，便于afl模糊测试。
+#### Refer
+[New in AFL](https://lcamtuf.blogspot.com/2015/06/new-in-afl-persistent-mode.html)
+[how-fuzz-server-american-fuzzy-lop](https://www.fastly.com/blog/how-fuzz-server-american-fuzzy-lop)
+[Knot-dns-Project](https://gitlab.nic.cz/knot/knot-dns/)#### Fuzz Server With
+AFL

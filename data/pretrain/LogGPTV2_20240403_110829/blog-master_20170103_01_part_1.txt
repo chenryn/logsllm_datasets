@@ -1,0 +1,113 @@
+## 在OOM现场 谈一谈数据库内存分配, 以及审计的重要性  
+##### [TAG 6](../class/6.md)
+### 作者                                                                                                                         
+digoal                                                                                                                          
+### 日期                                                                                                                        
+2017-01-03                                  
+### 标签                                                                                                                        
+PostgreSQL , Linux , OOM , SQL审计 , palloc , rss                                                                                                 
+----                                                                                                                        
+## 背景            
+数据库是比较重内存的应用软件之一，比如排序、聚合、使用较大的列、使用很长的SQL（值SQL本身的内容长度），或者传入很大的变长类型值时，都可能使得单个连接就会消耗很大的内存。     
+而另一方面，每个连接会消耗一定的内存，比如SYSCACHE , RELCACHE，随着访问的对象变多，如果是长连接，消耗的内存也会越多。  通常来说，长连接当访问了很多元数据时，可能占用几十MB到上百MB不等。    
+当使用了cgroup来限制数据库实例的总内存时，随着数据库占用的RSS部分的内存越来越多，如果数据库连接在申请内存时，超出了cgroup的限制，则连接可能被OOM掉。    
+当然，即使不使用cgroup，Linux也会根据内核的配置，以及用户申请内存的动作，当时的剩余内存等情况综合，发生OOM。  
+有几篇文章可以参考一下  
+[《精确度量Linux下进程占用多少内存的方法》](../201606/20160608_01.md)  
+[《一个笛卡尔积的update from语句引发的(内存泄露?)问题》](../201608/20160824_01.md)  
+[《PostgreSQL relcache在长连接应用中的内存霸占"坑"》](../201607/20160709_01.md)  
+[《Linux page allocation failure 的问题处理 - lowmem_reserve_ratio》](../201612/20161221_01.md)  
+当发生了OOM后，如何找到引起OOM的那个会话，他是罪魁祸首（指单个会话申请了过多的内存），还是压死骆驼的最后一根稻草（指连接数过多）呢？  
+数据库又是如何申请内存的呢？  
+## rss和cache  
+简单讲一下rss和cache.  
+rss是程序申请的内存，不能被内核自动释放，由用户自己来管理它什么时候被释放。    
+cache，通常指缓存，比如文件系统的缓存，不由用户进程来管理，它可以被内核释放。  
+我们所指的内存不足，是指即使cache完全被释放，也无法分配足够的内存给用户请求。  
+在cgroup的memory子系统中，我们可以看到这两个部分，rss很多，cache很少时，就要注意了，可能会发生OOM。  
+```
+# cat memory.stat   
+cache 204800  
+rss 0  
+mapped_file 0  
+pgpgin 974906  
+pgpgout 974856  
+swap 0  
+inactive_anon 155648  
+active_anon 0  
+inactive_file 49152  
+active_file 0  
+unevictable 0  
+hierarchical_memory_limit 102400000  
+hierarchical_memsw_limit 102400000  
+total_cache 204800  
+total_rss 0  
+total_mapped_file 0  
+total_pgpgin 974906  
+total_pgpgout 974856  
+total_swap 0  
+total_inactive_anon 155648  
+total_active_anon 0  
+total_inactive_file 49152  
+total_active_file 0  
+total_unevictable 0  
+```  
+## 数据库申请内存举例  
+以PostgreSQL数据库为例，为了管理方便，pg使用统一的内存分配和释放API，便于管理，详见src/backend/utils/mmgr/mcxt.c。  
+用得比较多的比如palloc，它申请的内存某些时候可以自动被回收，比如事务结束，会话断开，QUERY结束时，使用palloc申请的某些内存，会自动被释放。  
+还有一些内存分配接口详见src/backend/utils/mmgr/mcxt.c。  
+```  
+ * mcxt.c  
+ *	  POSTGRES memory context management code.  
+ *  
+ * This module handles context management operations that are independent  
+ * of the particular kind of context being operated on.  It calls  
+ * context-type-specific operations via the function pointers in a  
+ * context's MemoryContextMethods struct.  
+ *  
+ *  
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group  
+ * Portions Copyright (c) 1994, Regents of the University of California  
+ *  
+ *  
+ * IDENTIFICATION  
+ *	  src/backend/utils/mmgr/mcxt.c  
+void *  
+palloc(Size size)  
+{  
+	/* duplicates MemoryContextAlloc to avoid increased overhead */  
+	void	   *ret;  
+	AssertArg(MemoryContextIsValid(CurrentMemoryContext));  
+	if (!AllocSizeIsValid(size))  // 目前变长类型，最大支持1GB，要更大可以使用大对象类型。  
+		elog(ERROR, "invalid memory alloc request size %zu", size);  
+	CurrentMemoryContext->isReset = false;  
+	ret = (*CurrentMemoryContext->methods->alloc) (CurrentMemoryContext, size);  // 分配方法，用户可以自定义memcontx或者使用已有的。    
+	VALGRIND_MEMPOOL_ALLOC(CurrentMemoryContext, ret, size);  
+	return ret;  
+}  
+```  
+处理单个值时，内存限制。单条SQL的内存限制也是1GB。    
+```  
+ * memutils.h  
+ *	  This file contains declarations for memory allocation utility  
+ *	  functions.  These are functions that are not quite widely used  
+ *	  enough to justify going in utils/palloc.h, but are still part  
+ *	  of the API of the memory management subsystem.  
+ *  
+ *  
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group  
+ * Portions Copyright (c) 1994, Regents of the University of California  
+ *  
+ * src/include/utils/memutils.h  
+#define MaxAllocSize	((Size) 0x3fffffff)		/* 1 gigabyte - 1 */  
+#define AllocSizeIsValid(size)	((Size) (size) nTuples);  
+adt/rangetypes_spgist.c:        upperBounds = palloc(sizeof(RangeBound) * in->nTuples);  
+adt/rangetypes_spgist.c:                out->mapTuplesToNodes = palloc(sizeof(int) * in->nTuples);  
+...  
+adt/varchar.c:  char       *res = (char *) palloc(64);  
+adt/varchar.c:  result = (BpChar *) palloc(maxlen + VARHDRSZ);  
+adt/varchar.c:  result = palloc(maxlen + VARHDRSZ);  
+adt/varchar.c:  result = (BpChar *) palloc(VARHDRSZ + 1);  
+adt/varchar.c:  /* We use palloc0 here to ensure result is zero-padded */  
+adt/varchar.c:  result = (Name) palloc0(NAMEDATALEN);  
+...  

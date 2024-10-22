@@ -1,0 +1,305 @@
+    DelegateProviderMetaDataInvoker wrapperInvoker = new DelegateProviderMetaDataInvoker(invoker, this);
+    Exporter exporter = protocol.export(wrapperInvoker);
+    exporters.add(exporter);
+这两处基本都是一致的处理，首先通过proxyFactory代理工厂对象对interface进行代理，dubbo中代理工厂实现有两类：
+  1. javassist
+  2. jdk proxy
+    org.apache.dubbo.rpc.proxy.javassist.JavassistProxyFactory
+    org.apache.dubbo.rpc.proxy.jdk.JdkProxyFactory
+它们位于dubbo-rpc-api这个module的com.alibaba.dubbo.rpc.proxy包底下。
+其中它们都具有getProxy、getInvoker方法实现
+getProxy：主要用于服务消费者对interface进行代理，生成实例提供程序调用。而InvokerInvocationHandler是实际调用对象，其对上层程序代码隐藏了远程调用的细节
+    public  T getProxy(Invoker invoker, Class[] interfaces) {
+        return (T) Proxy.newProxyInstance(Thread.currentThread().getContextClassLoader(), interfaces, new InvokerInvocationHandler(invoker));
+    }
+getInvoker：主要用于服务提供者对实际被调用实例进行代理包装，以实现实际对象方法被调用后，进行结果、异常的CompletableFuture的封装
+    @Override
+    public  Invoker getInvoker(T proxy, Class type, URL url) {
+        return new AbstractProxyInvoker(proxy, type, url) {
+            @Override
+            protected Object doInvoke(T proxy, String methodName,
+                                      Class[] parameterTypes,
+                                      Object[] arguments) throws Throwable {
+                Method method = proxy.getClass().getMethod(methodName, parameterTypes);
+                return method.invoke(proxy, arguments);
+            }
+        };
+    }
+也就是说，getProxy方法为服务消费者，也就是RPC的客户端生成代理实例，作为进行RPC的媒介，而getInvoker为服务提供者，也即是RPC的服务端，它的服务实现进行包装。
+客户端，也就是服务消费者在执行RPC时，真正执行的是InvokerInvocationHandler的invoke，了解java动态代理的会很清楚，InvokerInvocationHandler包装了真正的RPC实现
+InvokerInvocationHandler：
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        String methodName = method.getName();
+        Class[] parameterTypes = method.getParameterTypes();
+        if (method.getDeclaringClass() == Object.class) {
+            return method.invoke(invoker, args);
+        }
+        if ("toString".equals(methodName) && parameterTypes.length == 0) {
+            return invoker.toString();
+        }
+        if ("hashCode".equals(methodName) && parameterTypes.length == 0) {
+            return invoker.hashCode();
+        }
+        if ("equals".equals(methodName) && parameterTypes.length == 1) {
+            return invoker.equals(args[0]);
+        }
+        if ("$destroy".equals(methodName) && parameterTypes.length == 0) {
+            invoker.destroy();
+        }
+        RpcInvocation rpcInvocation = new RpcInvocation(method, invoker.getInterface().getName(), args);
+        rpcInvocation.setTargetServiceUniqueName(invoker.getUrl().getServiceKey());
+        return invoker.invoke(rpcInvocation).recreate();
+    }
+从上述代码可以知道，对于一些方法，默认是不会进行RPC。
+AbstractProxyInvoker：
+    public Result invoke(Invocation invocation) throws RpcException {
+        try {
+            Object value = doInvoke(proxy, invocation.getMethodName(), invocation.getParameterTypes(), invocation.getArguments());
+            CompletableFuture future = wrapWithFuture(value, invocation);
+            CompletableFuture appResponseFuture = future.handle((obj, t) -> {
+                AppResponse result = new AppResponse();
+                if (t != null) {
+                    if (t instanceof CompletionException) {
+                        result.setException(t.getCause());
+                    } else {
+                        result.setException(t);
+                    }
+                } else {
+                    result.setValue(obj);
+                }
+                return result;
+            });
+            return new AsyncRpcResult(appResponseFuture, invocation);
+        } catch (InvocationTargetException e) {
+            if (RpcContext.getContext().isAsyncStarted() && !RpcContext.getContext().stopAsync()) {
+                logger.error("Provider async started, but got an exception from the original method, cannot write the exception back to consumer because an async result may have returned the new thread.", e);
+            }
+            return AsyncRpcResult.newDefaultAsyncResult(null, e.getTargetException(), invocation);
+        } catch (Throwable e) {
+            throw new RpcException("Failed to invoke remote proxy method " + invocation.getMethodName() + " to " + getUrl() + ", cause: " + e.getMessage(), e);
+        }
+    }
+到此为止的总结是：
+  * 服务提供者启动时，先创建相应选择的协议对象（Protocol），然后通过代理工厂创建Invoker对象，接着使用协议对象对Invoker进行服务注册至注册中心。
+  * 服务消费者启动时，先创建相应选择的协议对象（Protocol），然后通过协议对象引用到服务提供者，得到Invoker对象，接着通过代理工厂创建proxy对象。
+回到ServiceConfig的doExportUrlsFor1Protocol方法中：
+    Exporter exporter = protocol.export(wrapperInvoker);
+从栈信息我们可以知道，其中protocol经过了多层的包装，通过装饰模式进行一些额外功能的加入，从而实现一条链式的执行，包括注册中心注册、协议暴露等。
+跟进protocol的注册协议expose实现中（com.alibaba.dubbo.registry.integration.RegistryProtocol#export）：
+    @Override
+    public  Exporter export(final Invoker originInvoker) throws RpcException {
+        //export invoker
+        final ExporterChangeableWrapper exporter = doLocalExport(originInvoker);
+        URL registryUrl = getRegistryUrl(originInvoker);
+        //registry provider
+        //通过SPI的方式，根据URL的配置（dubbo:registry标签配置），获取对应的Registry实例，进行注册到注册中心
+        final Registry registry = getRegistry(originInvoker);
+        final URL registeredProviderUrl = getRegisteredProviderUrl(originInvoker);
+        //to judge to delay publish whether or not
+        boolean register = registeredProviderUrl.getParameter("register", true);
+        ProviderConsumerRegTable.registerProvider(originInvoker, registryUrl, registeredProviderUrl);
+        if (register) {
+            //注册到注册中心
+            register(registryUrl, registeredProviderUrl);
+            ProviderConsumerRegTable.getProviderWrapper(originInvoker).setReg(true);
+        }
+        // Subscribe the override data
+        // FIXME When the provider subscribes, it will affect the scene : a certain JVM exposes the service and call the same service. Because the subscribed is cached key with the name of the service, it causes the subscription information to cover.
+        final URL overrideSubscribeUrl = getSubscribedOverrideUrl(registeredProviderUrl);
+        final OverrideListener overrideSubscribeListener = new OverrideListener(overrideSubscribeUrl, originInvoker);
+        overrideListeners.put(overrideSubscribeUrl, overrideSubscribeListener);
+        //订阅对应的service在注册中心的数据，数据被覆盖修改后，可以得到通知处理
+        registry.subscribe(overrideSubscribeUrl, overrideSubscribeListener);
+        //Ensure that a new exporter instance is returned every time export
+        return new DestroyableExporter(exporter, originInvoker, overrideSubscribeUrl, registeredProviderUrl);
+    }
+注册到注册中心：
+    public void register(URL registryUrl, URL registedProviderUrl) {
+        Registry registry = registryFactory.getRegistry(registryUrl);
+        registry.register(registedProviderUrl);
+    }
+实际上，真正的注册到注册中心的实现，被com.alibaba.dubbo.registry.support.FailbackRegistry#register包装了
+FailbackRegistry#register：
+    @Override
+    public void register(URL url) {
+        super.register(url);
+        failedRegistered.remove(url);
+        failedUnregistered.remove(url);
+        try {
+            // Sending a registration request to the server side
+            doRegister(url);
+        } catch (Exception e) {
+            Throwable t = e;
+            // If the startup detection is opened, the Exception is thrown directly.
+            boolean check = getUrl().getParameter(Constants.CHECK_KEY, true)
+                    && url.getParameter(Constants.CHECK_KEY, true)
+                    && !Constants.CONSUMER_PROTOCOL.equals(url.getProtocol());
+            boolean skipFailback = t instanceof SkipFailbackWrapperException;
+            if (check || skipFailback) {
+                if (skipFailback) {
+                    t = t.getCause();
+                }
+                throw new IllegalStateException("Failed to register " + url + " to registry " + getUrl().getAddress() + ", cause: " + t.getMessage(), t);
+            } else {
+                logger.error("Failed to register " + url + ", waiting for retry, cause: " + t.getMessage(), t);
+            }
+            // Record a failed registration request to a failed list, retry regularly
+            failedRegistered.add(url);
+        }
+    }
+FailbackRegistry实现了一些容错机制的处理。
+doRegister的具体实现，因为我们这边配置的是zookeeper注册中心，所以实现类为com.alibaba.dubbo.registry.zookeeper.ZookeeperRegistry#doRegister
+    @Override
+    protected void doRegister(URL url) {
+        try {
+            zkClient.create(toUrlPath(url), url.getParameter(Constants.DYNAMIC_KEY, true));
+        } catch (Throwable e) {
+            throw new RpcException("Failed to register " + url + " to zookeeper " + getUrl() + ", cause: " + e.getMessage(), e);
+        }
+    }
+这边用惯zookeeper的读者，可以清晰的看到，使用了zookeeper的java客户端进行创建节点，也就是完成了对服务的注册到注册中心（zookeeper）。
+接着，在装饰模式下，下一步执行的是dubbo协议的暴露服务。
+跟进protocol的dubbo协议expose实现中（com.alibaba.dubbo.rpc.protocol.dubbo.DubboProtocol#export）：
+    @Override
+    public  Exporter export(Invoker invoker) throws RpcException {
+        //取出URL总线配置
+        URL url = invoker.getUrl();
+        // export service.
+        //根据url配置，生成注册到注册中心的service key
+        String key = serviceKey(url);
+        //把invoker放到一个集合map中，后续RPC的时候取出调用
+        DubboExporter exporter = new DubboExporter(invoker, key, exporterMap);
+        exporterMap.put(key, exporter);
+        //export an stub service for dispatching event
+        Boolean isStubSupportEvent = url.getParameter(Constants.STUB_EVENT_KEY, Constants.DEFAULT_STUB_EVENT);
+        Boolean isCallbackservice = url.getParameter(Constants.IS_CALLBACK_SERVICE, false);
+        if (isStubSupportEvent && !isCallbackservice) {
+            String stubServiceMethods = url.getParameter(Constants.STUB_EVENT_METHODS_KEY);
+            if (stubServiceMethods == null || stubServiceMethods.length() == 0) {
+                if (logger.isWarnEnabled()) {
+                    logger.warn(new IllegalStateException("consumer [" + url.getParameter(Constants.INTERFACE_KEY) +
+                            "], has set stubproxy support event ,but no stub methods founded."));
+                }
+            } else {
+                stubServiceMethodsMap.put(url.getServiceKey(), stubServiceMethods);
+            }
+        }
+        //根据url配置创建服务提供者服务器，接收服务消费者的请求（RPC通讯）
+        openServer(url);
+        //配置自定义的序列化实现
+        optimizeSerialization(url);
+        return exporter;
+    }
+上述代码的核心地方是openServer方法的调用，最终通过它创建一个服务提供者的服务端，用于接收消费者的RPC请求。
+    private void openServer(URL url) {
+        // find server.
+        String key = url.getAddress();
+        //client can export a service which's only for server to invoke
+        boolean isServer = url.getParameter(Constants.IS_SERVER_KEY, true);
+        if (isServer) {
+            //从缓存读取ExchangeServer，若不存在则创建新的ExchangeServer，并缓存到map中
+            ExchangeServer server = serverMap.get(key);
+            if (server == null) {
+                serverMap.put(key, createServer(url));
+            } else {
+                //若缓存已存在，则reset重置服务
+                // server supports reset, use together with override
+                server.reset(url);
+            }
+        }
+    }
+创建服务：
+    private ExchangeServer createServer(URL url) {
+        //...
+        ExchangeServer server;
+        try {
+            server = Exchangers.bind(url, requestHandler);
+        } catch (RemotingException e) {
+            throw new RpcException("Fail to start server(url: " + url + ") " + e.getMessage(), e);
+        }
+        //...
+    }
+从上面的代码可以看到，dubbo中不但广泛地使用URL消息总线模式，还广泛的使用SPI（PS：扩展了Java原生的SPI）
+跟进Exchangers.bind(url, requestHandler)方法实现：
+    public static ExchangeServer bind(URL url, ExchangeHandler handler) throws RemotingException {
+        if (url == null) {
+            throw new IllegalArgumentException("url == null");
+        }
+        if (handler == null) {
+            throw new IllegalArgumentException("handler == null");
+        }
+        url = url.addParameterIfAbsent(Constants.CODEC_KEY, "exchange");
+        return getExchanger(url).bind(url, handler);
+    }
+    public static Exchanger getExchanger(URL url) {
+        String type = url.getParameter(Constants.EXCHANGER_KEY, Constants.DEFAULT_EXCHANGER);
+        return getExchanger(type);
+    }
+根据URL的配置，通过SPI选择Exchanger的实现，执行bind，最后生成ExchangeServer。
+Exchangers类中，可以看到有很多重载的bind、connect方法，bind方法返回的是ExchangeServer，connect方法返回的是ExchangeClient，下面是以前阅读dubbo源码做的一些笔记总结：
+  * ExchangeServer：服务提供者对服务暴露时，使用Protocol对象进行export，export中对其进行Exchangers.bind得到ExchangeServer，其重点为第二个参数ExchangeHandler，其被多个handler进行包装，进行了多层的处理，其为最外层，进行实际实例方法的调用invoke，然后返回Result
+  * ExchangeClient：服务消费者对服务引用时，使用Protocol对象进行refer，refer中中对其进行Exchangers.connect得到ExchangeClient，然后把其封装在Invoker中，接着Invoker被proxy，当消费者执行Proxy对象方法时，其会通过InvokeInvocationHandler对Invoker进行invoke，然后Invoker调用ExchangeClient进行request，其重点为第二个参数ExchangeHandler，其被多个handler进行包装，进行了多层的处理，其为最外层，对响应进行处理DefaultFuture.received
+回到前面，Exchangers.bind时传入的是requestHandler：
+    private ExchangeHandler requestHandler = new ExchangeHandlerAdapter() {
+        @Override
+        public Object reply(ExchangeChannel channel, Object message) throws RemotingException {
+            if (message instanceof Invocation) {
+                Invocation inv = (Invocation) message;
+                Invoker invoker = getInvoker(channel, inv);
+                // need to consider backward-compatibility if it's a callback
+                if (Boolean.TRUE.toString().equals(inv.getAttachments().get(IS_CALLBACK_SERVICE_INVOKE))) {
+                    String methodsStr = invoker.getUrl().getParameters().get("methods");
+                    boolean hasMethod = false;
+                    if (methodsStr == null || methodsStr.indexOf(",") == -1) {
+                        hasMethod = inv.getMethodName().equals(methodsStr);
+                    } else {
+                        String[] methods = methodsStr.split(",");
+                        for (String method : methods) {
+                            if (inv.getMethodName().equals(method)) {
+                                hasMethod = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!hasMethod) {
+                        logger.warn(new IllegalStateException("The methodName " + inv.getMethodName()
+                                + " not found in callback service interface ,invoke will be ignored."
+                                + " please update the api interface. url is:"
+                                + invoker.getUrl()) + " ,invocation is :" + inv);
+                        return null;
+                    }
+                }
+                RpcContext.getContext().setRemoteAddress(channel.getRemoteAddress());
+                return invoker.invoke(inv);
+            }
+            throw new RemotingException(channel, "Unsupported request: "
+                    + (message == null ? null : (message.getClass().getName() + ": " + message))
+                    + ", channel: consumer: " + channel.getRemoteAddress() + " --> provider: " + channel.getLocalAddress());
+        }
+        @Override
+        public void received(Channel channel, Object message) throws RemotingException {
+            if (message instanceof Invocation) {
+                reply((ExchangeChannel) channel, message);
+            } else {
+                super.received(channel, message);
+            }
+        }
+        @Override
+        public void connected(Channel channel) throws RemotingException {
+            invoke(channel, Constants.ON_CONNECT_KEY);
+        }
+        @Override
+        public void disconnected(Channel channel) throws RemotingException {
+            if (logger.isInfoEnabled()) {
+                logger.info("disconnected from " + channel.getRemoteAddress() + ",url:" + channel.getUrl());
+            }
+            invoke(channel, Constants.ON_DISCONNECT_KEY);
+        }
+        private void invoke(Channel channel, String methodKey) {
+            Invocation invocation = createInvocation(channel, channel.getUrl(), methodKey);
+            if (invocation != null) {
+                try {
+                    received(channel, invocation);
+                } catch (Throwable t) {
+                    logger.warn("Failed to invoke event method " + invocation.getMethodName() + "(), cause: " + t.getMessage(), t);
+                }

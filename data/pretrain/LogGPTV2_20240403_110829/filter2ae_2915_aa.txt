@@ -1,0 +1,109 @@
+原文地址：
+## 引言
+在上一篇[文章](https://perception-point.io/resources/research/cve-2019-0539-root-cause-analysis/
+"文章")中，我们介绍了CVE-2019-0539漏洞的成因，在本文中，我们将为读者介绍如何实现完整的R/W（读/写）原语，以为实现RCE（远程执行代码）攻击打下基础。需要注意的是，Microsoft
+Edge进程是运行在沙箱中的，因此，为了彻底拿下整个系统，需要借助其他漏洞来实现沙箱逃逸。
+在这里，我们要特别感谢[Lokihardt](https://bugs.chromium.org/p/project-zero/issues/detail?id=1703&desc=2 "Lokihardt")和[Bruno
+Keith](https://github.com/bkth/Attacking-Edge-Through-the-JavaScript-Compiler
+"Bruno Keith")在这一领域的精彩研究，这些研究对于本文来说非常有价值。
+## 漏洞利用
+正如我们在成因分析中所看到的，该漏洞使我们能够覆盖javascript对象的slot数组指针。在BlueHat IL 2019大会上，Bruno
+Keith[发表](https://www.youtube.com/watch?v=lBL4KGIybWE
+"发表")了一篇精彩的[研究](https://github.com/bkth/Attacking-Edge-Through-the-JavaScript-Compiler "研究")，我们从中了解到，在Chakra中，javascript对象（o={a: 1, b:
+2};）是通过Js::DynamicObject
+类实现的，并且，它们可能具有不同的内存布局；同时，我们还了解到属性的slot数组指针称为auxSlots。从DynamicObject类的定义（位于lib\Runtime\Types\DynamicObject.h文件中）中，我们找到了Bruno讨论的DynamicObject的三种可能内存布局的实际规范：
+    // Memory layout of DynamicObject can be one of the following:
+    //        (#1)                (#2)                (#3)
+    //  +--------------+    +--------------+    +--------------+
+    //  | vtable, etc. |    | vtable, etc. |    | vtable, etc. |
+    //  |--------------|    |--------------|    |--------------|
+    //  | auxSlots     |    | auxSlots     |    | inline slots |
+    //  | union        |    | union        |    |              |
+    //  +--------------+    |--------------|    |              |
+    //                      | inline slots |    |              |
+    //                      +--------------+    +--------------+
+    // The allocation size of inline slots is variable and dependent on profile data for the
+    // object. The offset of the inline slots is managed by DynamicTypeHandler.
+所以，一个对象可能只有一个auxSlots指针而没有内联slot(#1)，或者，也可能只有内联slot却没有auxSlots指针(#3)，或者两者都有(#2)。在CVE-2019-0539漏洞的[POC](https://bugs.chromium.org/p/project-zero/issues/detail?id=1703&desc=2
+"POC")中，“o”对象是从(#3)内存布局表单开始其生命周期的。然后，当JIT代码最后一次调用OP_InitClass函数时，对象“o”的内存布局就地更改为(#1)。特别是，在JIT代码调用OP_InitClass函数之前和之后，“o”的内存布局如下所示：
+    之前:                             之后:
+    +---------------+                   +--------------+   +--->+--------------+
+    |    vtable     |                   |    vtable    |   |    |    slot 1    | // o.a
+    +---------------+                   +--------------+   |    +--------------+
+    |     type      |                   |     type     |   |    |    slot 2    | // o.b
+    +---------------+                   +--------------+   |    +--------------+
+    | inline slot 1 | // o.a            |   auxSlots   +---+    |    slot 3    |
+    +---------------+                   +--------------+        +--------------+
+    | inline slot 2 | // o.b            |  objectArray |        |    slot 4    |
+    +---------------+                   +--------------+        +--------------+
+在调用OP_InitClass之前，o.a属性通常位于第一个内联slot中。调用后，它通常位于auxSlots指向的数组中，如slot1。因此，正如我们之前在成因分析中所解释的那样，JIT代码会尝试用0x1234来更新第一个内联slot中的o.a属性，但是，由于它不知道对象的内存布局已经发生了变化，因此，它实际上会覆盖auxSlots指针。
+现在，为了利用这个漏洞来获得完整的R\W原语，如Bruno所言，我们需要破坏其他一些有用的对象，并通过这些对象来读\写内存中的任意地址。但是，我们首先需要更好地理解该漏洞能给我们带来了哪些好处。当我们覆盖DynamicObject的auxSlots指针时，我们可以像在auxSlots数组那样，来“对待”auxSlots中的内容。因此，如果我们可以使用该漏洞来设置auxSlots，使其指向JavaScriptArray对象，如下所示
+    some_array = [{}, 0, 1, 2];
+    ...
+    opt(o, cons, some_array); // o->auxSlots = some_array
+然后，我们可以通过将这些属性赋值为“o”来覆盖JavascriptArray对象“some_array”的内存。在使用该漏洞覆盖auxSlots后，内存状态如下所示：
+    o                        some_array
+    +--------------+   +--->+---------------------+
+    |    vtable    |   |    |       vtable        | // o.a
+    +--------------+   |    +---------------------+
+    |     type     |   |    |        type         | // o.b
+    +--------------+   |    +---------------------+
+    |   auxSlots   +---+    |      auxSlots       | // o.c?
+    +--------------+        +---------------------+
+    |  objectArray |        |     objectArray     | // o.d?
+    +--------------+        |- - - - - - - - - - -|
+                            |      arrayFlags     |
+                            |  arrayCallSiteIndex |
+                            +---------------------+
+                            |       length        | // o.e??
+                            +---------------------+
+                            |        head         | // o.f??
+                            +---------------------+
+                            |    segmentUnion     | // o.g??
+                            +---------------------+
+                            |        ....         |
+                            +---------------------+
+因此，理论上说，如果我们想要覆盖数组的长度字段，我们可以执行o.e = 0xFFFFFFFF之类的赋值操作，然后，通过some_array
+[1000]，就能根据数组的基地址访问一些远程地址。但是，这里面临几个问题：
+除“a”和“b”之外的所有其他属性都未定义。这意味着为了将o.e定义在正确的槽中，我们首先需要为所有其他属性分配相应的空间，这个操作会破坏比所需更多的内存，从而导致我们的数组无法使用。
+  1. 原始的auxSlots数组不够大。它最初只分配了4个slot。如果我们定义了4个以上的属性，Js::DynamicTypeHandler::AdjustSlots函数将分配一个新的slot数组，并让auxSlots指向它，而非指向我们的JavascriptArray对象。
+  2. 我们原本打算放入JavascriptArray对象的length字段中的0xFFFFFFFF值将无法完全按原样写入。因为Chakra会使用所谓的标记型数字，因此，待写入的数字将被进行“包装”。（相关的细节，请参阅Chartra的博客文章）。
+  3. 即使我们能够用一些较大的值覆盖长度字段，同时避免破坏内存的其余部分，我们也只能得到一个“相对”的R\W原语（相对于数组基地址），其功能明显不如“绝对”R\W原语强大。
+  4. 实际上，覆盖JavascriptArray的长度字段是没有用的，这无法帮助我们实现所期望的相对R\W原语。在这种特殊情况下，真正需要做的是破坏数组的段大小，但我们不会在这里讨论。尽管如此，让我们假设覆盖长度字段是有用的，因为它很好地展示了该利用方法的精妙之处。
+因此，我们需要找到一些特殊的技术，才能克服上述问题。现在，让我们先讨论问题1和问题2。首先要想到的是，在触发漏洞之前，可以先在“o”对象中预定义更多的属性。这样的话，当覆盖auxSlots指针时，我们就已经在与数组的长度字段相对应的正确槽中定义好了o.e。不幸的是，当预先添加更多属性时，会出现以下两种情况之一：
+  * 我们过早地将对象内存布局修改为布局(#1)，这样的话，从一开始就阻止了该漏洞的发生，因为，再也没有机会覆盖auxSlots指针了。
+  * 我们只是创建了更多的内联slot，而这些slot在触发该漏洞后始终保持内联状态。对象以布局(#2)结束，大多数属性位于新的内联slot中。因此，我们仍然无法抵达所谓的auxSlots数组中索引号高于slot2的slot，即“some_array”对象的内存。
+Bruno
+Keith在他的演讲中提出了一个很好的思路，可以同时解决问题1和问题2。该方法不是直接破坏目标对象（在我们的示例中是JavaScriptArray），而是首先破坏另一个预先准备好的、具有许多属性的DynamicObject，该对象已经位于内存布局(#1)中，具体如下所示：
+    obj = {}
+    obj.a = 1;
+    obj.b = 2;  
+    obj.c = 3;
+    obj.d = 4;
+    obj.e = 5;
+    obj.f = 6;
+    obj.g = 7;
+    obj.h = 8;
+    obj.i = 9;
+    obj.j = 10;
+    some_array = [{}, 0, 1, 2];
+    ...
+    opt(o, cons, obj); // o->auxSlots = obj
+    o.c = some_array; // obj->auxSlots = some_array
+让我们看一下运行o.c=some_array；语句前后的内存状态：
+    运行之前： 
+           o                      obj
+    +--------------+   +--->+--------------+        +->+--------------+
+    |    vtable    |   |    |    vtable    | //o.a  |  |    slot 1    | // obj.a
+    +--------------+   |    +--------------+        |  +--------------+ 
+    |     type     |   |    |     type     | //o.b  |  |    slot 2    | // obj.b
+    +--------------+   |    +--------------+        |  +--------------+ 
+    |   auxSlots   +---+    |   auxSlots   +--------+  |    slot 3    | // obj.c
+    +--------------+        +--------------+           +--------------+ 
+    |  objectArray |        |  objectArray |           |    slot 4    | // obj.d
+    +--------------+        +--------------+           +--------------+ 
+                                                       |    slot 5    | // obj.e
+                                                       +--------------+ 
+                                                       |    slot 6    | // obj.f
+                                                       +--------------+ 
+                                                       |    slot 7    | // obj.g

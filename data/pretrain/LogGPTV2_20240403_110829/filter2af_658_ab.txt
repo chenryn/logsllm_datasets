@@ -1,0 +1,56 @@
+> 原文： wow64-applications-part-1/>
+# Part 2
+## **前情回顾**
+在本系列的 [第一部分](https://www.sentinelone.com/blog/deep-hooks-monitoring-native-execution-wow64-applications-part-1/)中，我们介绍了几种能够向[WoW64](https://www.sentinelone.com/blog/now-stage-deep-hooks-monitoring-native-execution-wow64-applications/)进程注入64位DLL的方法，最终目的是使用这个DLL在进程中钩住64位API函数。  
+我们通过APC提供注入完成了这篇文章，发现在CFG-aware进程测试时，注入DLL失败，导致进程崩溃。为什么要理解为这样，所以我们必须深入了解实现CFG的一些细节。
+## **CFG简介**
+CFG(控制流保护)是一个相对较新的漏洞缓解程序，最初在Windows 8.1更新3中引入，后来在Windows
+10中得到增强。它是一种支持编译器的缓解措施，旨在通过防止对非合法目标的间接调用来对抗内存损坏漏洞。在每次间接函数调用之前，编译器会向位于NTDLL中的专用验证例程插入一个额外的调用。这个例程接收调用目标，并在8字节的粒度范围内检查它是否是函数的起始地址。如果不是，则安全检查失败(i)。
+图8 Mimikatz，使用(右)和不使用(左)CFG编译  
+为了使这种验证更简单和高效，CFG使用了一个专门为此添加了新内存区域，称为CFG位图。在这个位图中，每个位表示进程地址空间中8字节的状态，并标记它们是否构成有效的调用目标。由于这种映射比率，位图必须是进程虚拟地址空间总数的1/64，在64位进程中可以得到相当大的-2TB，其总地址空间是128TB。  
+显然，在64位进程中，这个位图的大部分都是未提交的，因为实际上只使用了进程地址空间的很小一部分。只有在引入新的可执行页面时(通过直接分配虚拟内存、映射节对象的视图或将页保护更改为可执行文件)，内核才提交并设置位图中与该页对应的位。
+## **WoW64进程中的CFG**
+Alex Ionescu在他的 [博客文章](http://www.alex-ionescu.com/?p=300)《关闭“天堂之门”》中描述了WoW64工艺中CFG的一些独特特征。如图所示，支持CFG的WoW64进程不是一个而是两个单独的CFG位图:
+    *  一个本地位图，为进程中的64位代码标记有效的调用目标。由于这个位图必须对32位代码不可访问，所以它位于4GB边界之上，通常位于本机NTDLL的旁边。
+    *  一个WoW64位图，为进程中的32位代码标记有效的调用目标。它的预留大小是32MB，因为它只覆盖较低的4GB地址空间(32位代码可以在此运行)。显然，它总是位于4GB边界以下，通常在主图像旁边。
+因为WoW64进程有两个CFG位图和两个版本的NTDLL加载到它们中，所以很自然地，还有两个版本的验证函数。该函数的32位版本根据WoW64位图检查提供的地址，而64位版本根据本机位图检查地址。
+图9 32位的notepad.exe在Windows 10 x64上虚拟地址空间的快照。
+如前所述，每当引入一个新的可执行页面时，内核都会在CFG位图中设置位。这就提出了一个问题，在WoW64进程中，哪一个位图受到了影响?正如Ionescu指出的，答案在于`MiSelectCfgBitMap()`和`MiSelectBitMapForImage()`函数，每当需要对CFG位图进行更改时，内存管理器都会调用这些函数。  
+图10 当内存被映射到进程时，部分调用堆栈显示对`MiSelectCfgBitMap()`和`MiSelectBitMapForImage()`的调用  
+这两个函数的伪代码如下:  
+图11.1 Windows 10 x64 RS3下`MiSelectCfgBitMap()`的伪代码。
+图11.2 `MiSelectBitMapForImage()`的伪代码(同Windows 10 x64 RS3下)  
+从这两个函数可以得出一些结论:
+  1. 可以预料到所有32位模块都在WoW64位图中标记。
+  2. 所有64位模块都在本机位图中标记，包括那些映射到较低的4GB地址空间的模块。这很重要，因为否则本机NTDLL将无法与包含WoW64环境的本机dll进行互操作。例如，NTDLL甚至不能加载这些模块，因为对其入口点的调用将导致CFG验证逻辑失败。
+  3. 在4GB以下的所有私有内存分配都在WoW64位图中标记，不管谁分配它们或出于什么目的。正如机敏的读者可能已经注意到的那样，在图8所示的示例中，4GB边界以上的所有地址空间都被保留了(本地NTDLL和本地CFG位图除外)。由于内存不能从保留区域分配，这实际上意味着所有私有内存分配都将被单独标记在WoW64位图中。  
+现在很清楚为什么前面展示的使用APC的DLL注入技术注定会失败:尽管“适配器thunk”包含64位代码，但它是一个私有内存分配，因此它将填充WoW64位图。但是，负责APCs初始调度的函数是`KiUserApcDispatcher()`的64位版本，它将尝试根据本机位图验证thunk的地址，但没有成功。  
+因此，如果我们希望维护APC注入功能，我们必须以某种方式修改我们的技术以克服CFG验证问题。  
+## **APC注入回顾**  
+对于CFG实现的细节有一些预先的知识，可以建议使用`VmCfgCallTargetInformation`类调用`NtSetInformationVirtualMemory()`，将适配器thunk简单地标记为有效的调用目标。尽管这个选择很有前途，但实际上并不能解决问题。原因是在内部，`NtSetInformationVirtualMemory()`依赖于`MiSelectCfgBitMap()`来帮助决定哪一个位图应该受到影响。出于与前面描述的相同的原因，当与适配器thunk的地址一起提供时，`MiSelectCfgBitmap()`仍将返回WoW64位图，从而保持原生位图不变。  
+因为`NtSetInformationVirtualMemory()`内部依赖`MiSelectCfgBitMap()`故其只影响WoW64的版本。
+在取消此解决方案的资格后，下一个要考虑的选项是找到一种方法，以某种方式“欺骗”`MiSelectCfgBitmap()`返回本机位图，就在分配适配器thunk的内存时。
+## **“一个WoW64进程**
+在查看图11.1中显示的MiSelectCfgBitmap()的伪代码时，可以清楚地看到，对于“真正的”64位进程，总是会返回本机位图。这是显而易见的，因为64位进程应该只有一个本地的CFG位图。因此，如果我们设法“本土化”WoW64进程，适配器thunk将会在本地位图中被标记，因此APC调度应该会按计划成功。
+内核判断给定进程是否是本机进程的方法是探测EPROCESS结构的WoW64Process成员。如果将此成员设置为NULL，则认为该进程是本机进程，否则视为WoW64进程。  
+图12 在Windows 10 RS3中看到的`EPROCESS`结构的部分视图。注意，`Wow64Process`指针位于偏移量`0x428`处。  
+考虑到这一点，我们可以应用基于`DKOM-based`的解决方案，其中wow64进程在为适配器thunk分配内存之前被归零，然后恢复到初始值。  
+图13 使适配器“咚”一声占据本地位图的伪代码  
+附录B中给出的这个解决方案使我们的APC注入在支持cfg的WoW64进程中获得成功，并在Windows 10 RS3上进行了测试。  
+这种方法虽然简单，但也有一些明显的缺点。首先，需要修改的EPROCESS结构在很大程度上是没有文档记录的，并且在Windows版本之间
+[经常更改](http://terminus.rewolf.pl/terminus/structures/ntdll/_EPROCESS_combined.html)。因此，结构内部的wow64进程的偏移量不能依赖于保持不变，必须在运行时进行试探性搜索。其次，清除WoW64Process成员可能会有一些意想不到的副作用和危险，尤其是在进程包含多个线程的情况下。  
+综上所述，这是使APC注入器在cfg敏感过程中工作的一个有效选择，但是它相当不稳定和不可靠，应该非常谨慎地使用。考虑到这些缺点，我们希望找到一个更可靠的问题解决方案，最好不依赖于私有的可执行内存分配。
+## **Thunkless APC注入**
+在初始化APC时，可以设置APC例程来指向我们选择的任何函数，无论是现有的函数还是我们专门为此目的创建的函数。这意味着——至少在理论上——我们可以通过创建一个APC来注入DLL，这个APC将直接调用本机`LdrLoadDll()`，而不需要通过适配器的“砰砰”声。显然，`LdrLoadDll()`是64位代码的有效调用目标，因此它可以充当APC目标，而不会触发CFG冲突。  
+但是，在二进制级别上似乎存在一个问题:`LdrLoadDll()`和`KNORMAL_ROUTINE`的原型不匹配。`LdrLoadDll()`需要4个参数，而KNORMAL_ROUTINE类型的函数似乎只接收3个参数:
+图14.1 `LdrLoadDll()`的原型  
+图14.2 `KNORMAL_ROUTINE`的原型  
+不过,每个人都应该考虑`__fastcall`调用协定使用依照`x64 ABI`:每个函数的前四个参数传递给它通过寄存器RCX、RDX、R8
+R9机型,所以当`LdrLoadDll()`将由`KiUserApcDispatcher()`无论值目前持有的R9机型将解释为第四个参数。根据上述原型，`LdrLoadDll()`接收到的第四个参数被声明为“`_out_phandle
+ModuleHandle`”。这意味着要使`LdrLoadDll()`成功，R9必须包含一个指向可写内存位置的有效指针，该位置能够保存指针大小的数据。  
+不幸的是，由于标准的APC过程只需要三个参数，显然无法在APC初始化期间为第四个参数指定值。因此，R9在进入APC例程时所持有的值基本上是未知的。因此问题就出现了:我们能否以某种方式保证R9将持有一个有效的指针，以满足所有`LdrLoadDll()`需求?令人惊讶的是，这个问题的答案是肯定的，但是我们怎么能确定呢?
+图15
+`KeInitializeApc`和`KeInsertQueueApc`的原型。用户模式APC例程(NormalRoutine)的用户控制参数以红色突出显示。  
+在探索APC调度的一些内部方面的文章中，
+[Skywing](http://www.nynaeve.net/?p=202)演示了64位的KiUserApcDispatcher()实际上向APC例程发送了第四个“隐藏”参数，指向一个上下文结构。这个结构保存了在APC调度进程完成时通过NtContinue()恢复的CPU状态。尽管这篇文章相当陈旧，但在Windows
+10等较新的系统中查看KiUserApcDispatcher()的实现可以看出，这仍然适用:  

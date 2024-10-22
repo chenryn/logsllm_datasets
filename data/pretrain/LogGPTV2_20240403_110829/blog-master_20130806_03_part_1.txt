@@ -1,0 +1,166 @@
+## PostgreSQL pending patch : fail-back without fresh backup (have bug?)  
+### 作者                                                             
+digoal                                                             
+### 日期                                                             
+2013-08-06                                                           
+### 标签                                                             
+PostgreSQL , backup , pg_basebackup , failover    
+----                                                             
+## 背景     
+## 补充说明  
+本文测试fail-back未成功的bug是-m immediate的一个bug, 已经修复 :   
+http://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=91c3613d3748d881706c3e60d8221ea92833ac1a  
+http://blog.163.com/digoal@126/blog/static/16387704020137894542352/  
+## 正文  
+PostgreSQL的流复制应用非常普遍, 同时也可以作为HA的关键技术, 当主节点出现故障时, 可以通过激活备节点的方法达到高可用到目的.  
+当备份节点激活后, 原来的主节点可以作为备节点来使用.   
+但是, 如果主节点在发生故障前的WAL没有全部同步给备节点的话, 备节点激活后, 实际上与主节点是存在一定差异的. 这种情况下主节点不能直接作为备节点参与利用流复制做的增量恢复.  遇到这样的情况怎么样把主节点变成备节点呢?  
+1\. 使用pg_basebackup, 或者COPY 的方法重新做一个standby, 这样的话相当于要把整个数据库的数据文件全部传一遍. 数据量大或者网络交差的话是比较痛苦的事情.  
+2\. 使用rsync, 只传输增量数据, 但是需要注意的是, 如果数据库很大的话, rsync的数据比对过程非常漫长, 并且要消耗大量的io资源.  
+除了以上两种方法, 还有其他的工具可以利用, 例如在此前写过一篇关于fail-back的工具pg_rewind的使用文章.   
+pg_rewind利用新的primary的history 文件, 取出切换时间线是的xlog位置信息, 用这个位置信息来匹配旧的primary节点的xlog文件中的信息, 如果旧的primary在这个点之后还产生了xlog信息, 那么说明standby在promote后有未同步至standby节点的xlog数据, 所以需要对这部分xlog做差异处理. 把这部分xlog对应的变更的块以及控制文件,clog等从新的primary拷贝到老的primary节点.   
+具体可参考 :   
+http://blog.163.com/digoal@126/blog/static/1638770402013758511857/  
+除了pg_rewind, PostgreSQL可能在内核中加入类似pg_rewind的功能, 当然原理完全不一样, 加入内核的功能原理如下 :   
+```  
+The proposal is based on the concept of master should not do any file  
+system level change until corresponding WAL record is replicated to the  
+standby.  
+There are many places in the code which need to be handled to support the  
+proposed solution.  Following cases explains the need of fresh backup at  
+the time of failover, and how can we avoid this need by our approach.  
+1. We must not write any heap pages to the disk before the WAL records  
+corresponding to those changes are received by the standby. Otherwise if  
+standby failed to receive WAL corresponding to those heap pages there will  
+be inconsistency.  
+2. When CHECKPOINT happens on the master, control file of master gets  
+updated and last checkpoint record is written to it. Suppose failover  
+happens and standby fails to receive the WAL record corresponding to  
+CHECKPOINT, then master and standby has inconsistent copies of control file  
+that leads to the mismatch in redo record and recovery will not start  
+normally. To avoid this situation we must not update the control file of  
+master before the corresponding checkpoint WAL record is received by the  
+standby  
+3. Also when we truncate any of the physical files on the master and  
+suppose the standby failed to receive corresponding WAL, then that physical  
+file is truncated on master but still available on standby causing  
+inconsistency. To avoid this we must not truncate physical files on the  
+master before the WAL record corresponding to that operation is received by  
+the standby.  
+4. Same case applies to CLOG pages. If CLOG page is written to the disk and  
+corresponding WAL record is not replicated to the standby, leads to the  
+inconsistency. So we must not write the CLOG pages (and may be other SLRU  
+pages too) to the disk before the corresponding WAL records are received by  
+standby.  
+5. The same problem applies for the commit hint bits. But it is more  
+complicated than the other problems, because no WAL records are generated  
+for that, hence we cannot apply the same above method, that is wait for  
+corresponding WAL record to be replicated on standby.  So we delay the  
+processes of updating the commit hint bits, similar to what is done by  
+asynchronous commits.  In other words we need to check if the WAL  
+corresponding to the transaction commit is received by the failback safe  
+standby and then only allow hint bit updates.  
+*Patch explanation:*  
+The initial work on this patch is done by Pavan Deolasee. I tested it and  
+will make further enhancements based on the community feedback.  
+This patch is not complete yet, but I plan to do so with the help of this  
+community. At this point, the primary purpose is to understand the  
+complexities and get some initial performance numbers to alleviate some of  
+the concerns raised by the community.  
+There are two GUC parameters which supports this failsafe standby  
+1. failback_safe_standby_name  [ name of the failsafe standby ] It is the  
+name of failsafe standby. Master will not do any file system level change  
+before corresponding WAL is replicated on the this failsafe standby  
+2. failback_safe_standby_mode  [ off/remote_write/remote_flush] This  
+parameter specifies the behavior of master i.e. whether it should wait for  
+WAL to be written on standby or WAL to be flushed on standby.  We should  
+turn it off when we do not want the failsafe standby. This failsafe mode  
+can be combined with synchronous as well as asynchronous streaming  
+replication.  
+Most of the changes are done in the syncrep.c. This is a slight misnomer  
+because that file deals with synchronous standby and a failback standby  
+could and most like be a async standby. But keeping the changes this way  
+has ensured that the patch is easy to read. Once we have acceptance on the  
+approach, the patch can be modified to reorganize the code in a more  
+logical way.  
+The patch adds a new state SYNC_REP_WAITING_FOR_FAILBACK_SAFETY to the sync  
+standby states. A backend which is waiting for a failback safe standby to  
+receive WAL records, will wait in this state.  Failback safe mechanism can  
+work in two different modes, that is wait for WAL to be written or flushed  
+on failsafe standby. That is represented by two new modes  
+SYNC_REP_WAIT_FAILBACK_SAFE_WRITE and SYNC_REP_WAIT_FAILBACK_SAFE_FLUSH  
+respectively.  
+Also the SyncRepWaitForLSN() is changed for conditional wait. So that we  
+can delay hint bit updates on master instead of blocking the wait for the  
+failback safe standby to receiver WAL's.  
+```  
+到第四版的补丁, 新增的参数名更改为synchronous_transfer, 可配置3个值 :   
+```  
+synchronous_transfer = commit   # data page synchronization level  
+                                # commit, data_flush or all  
+```  
+synchronous_transfer参数的含义 :   
+```  
+-'commit'  
+    'commit' means that master waits for corresponding WAL to flushed  
+to disk of standby server on commits.  
+    but master doesn't waits for replicated data pages.  
+  -'data_flush'  
+    'data_flush' means that master waits for replicated data page  
+(e.g, CLOG, pg_control) before flush to disk of master server.  
+    but if user set to 'data_flush' to this parameter,  
+'synchronous_commit' values is ignored even if user set  
+'synchronous_commit'.  
+  -'all'  
+    'all' means that master waits for replicated WAL and data page.  
+```  
+commit类似同步流复制,记录master节点的commit状态前,等待该xlog已经在standby flushed to disk.   
+data_flush则表示master节点在flush data page前, 必须确保这些变更对应的xlog信息已经在standby 节点flush to disk了. (这个配置将忽略synchronous_commit的配置)  
+同步流复制增加1种等待模式(SYNC_REP_WAIT_DATA_FLUSH) :   
+```  
++++ b/src/include/replication/syncrep.h  
+@@ -19,23 +19,42 @@  
+ #define SyncRepRequested() \  
+        (max_wal_senders > 0 && synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH)  
++#define SyncTransRequested() \  
++       (max_wal_senders > 0 && synchronous_transfer > SYNCHRONOUS_TRANSFER_COMMIT)  
++  
++#define IsSyncRepSkipped() \  
++       (max_wal_senders > 0 && synchronous_transfer ==  SYNCHRONOUS_TRANSFER_DATA_FLUSH)  
++  
+ /* SyncRepWaitMode */  
+-#define SYNC_REP_NO_WAIT               -1  
+-#define SYNC_REP_WAIT_WRITE            0  
+-#define SYNC_REP_WAIT_FLUSH            1  
++#define SYNC_REP_NO_WAIT                                       -1  
++#define SYNC_REP_WAIT_WRITE                                    0  
++#define SYNC_REP_WAIT_FLUSH                                    1  
++#define SYNC_REP_WAIT_DATA_FLUSH       2  
+-#define NUM_SYNC_REP_WAIT_MODE 2  
++#define NUM_SYNC_REP_WAIT_MODE                         3  
+ /* syncRepState */  
+-#define SYNC_REP_NOT_WAITING           0  
+-#define SYNC_REP_WAITING                       1  
+-#define SYNC_REP_WAIT_COMPLETE         2  
++#define SYNC_REP_NOT_WAITING                                   0  
++#define SYNC_REP_WAITING                                               1  
++#define SYNC_REP_WAIT_COMPLETE                                 2  
++  
++typedef enum  
++{  
++       SYNCHRONOUS_TRANSFER_COMMIT,            /* no wait for flush data page */  
++       SYNCHRONOUS_TRANSFER_DATA_FLUSH,        /* wait for data page flush only  
++                                                                                * no wait for WAL */  
++       SYNCHRONOUS_TRANSFER_ALL                /* wait for data page flush */  
++}      SynchronousTransferLevel;  
+src/backend/replication/syncrep.c  
+/*  
+ * ===========================================================  
+ * Synchronous Replication functions for normal user backends  
+ * ===========================================================  
+ */  
+/*  
+ * Wait for synchronous replication, if requested by user.  
+ *  
+ * Initially backends start in state SYNC_REP_NOT_WAITING and then  
+ * change that state to SYNC_REP_WAITING/SYNC_REP_WAITING_FOR_DATA_FLUSH  

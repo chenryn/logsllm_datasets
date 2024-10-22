@@ -1,0 +1,151 @@
+select rb_and_cardinality_agg(bitmap) from tbl where tagid in (?,......?);  
+```  
+2、求合并的BIT，对应的BIT位置  
+```  
+select RB_ITERATE(rb) from (select rb_and_agg(bitmap) as rb from tbl where tagid in(1,2,3)) t;  
+```  
+### 加速  
+由于目前roaringbitmap gp这个插件没有支持agg中的prefunc，所以聚合是收集到master节点操作的，这个势必影响性能。  
+```  
+postgres=# explain select rb_and_cardinality_agg(bitmap) from tbl where tagid in (1,2,3,4,5,6,7,8);  
+                                    QUERY PLAN                                       
+-----------------------------------------------------------------------------------  
+ Aggregate  (cost=0.04..0.06 rows=1 width=4)  
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..0.04 rows=1 width=32)  
+         ->  Seq Scan on tbl  (cost=0.00..0.00 rows=1 width=32)  
+               Filter: tagid = ANY ('{1,2,3,4,5,6,7,8}'::integer[])  
+(4 rows)  
+postgres=# explain select RB_ITERATE(rb) from (select rb_and_agg(bitmap) as rb from tbl where tagid in(1,2,3)) t;  
+                                       QUERY PLAN                                          
+-----------------------------------------------------------------------------------------  
+ Result  (cost=0.04..0.07 rows=3 width=32)  
+   ->  Aggregate  (cost=0.04..0.06 rows=1 width=32)  
+         ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..0.04 rows=1 width=32)  
+               ->  Seq Scan on tbl  (cost=0.00..0.00 rows=1 width=32)  
+                     Filter: tagid = ANY ('{1,2,3}'::integer[])  
+(5 rows)  
+```  
+为了加速，务必要实现这些聚合函数的prefunc。  
+Greenplum支持的两种聚合运算模式：  
+1\. 如果只配置了sfunc，则相关数据全部收集到master节点，在master节点对所有数据依条加上sfunc的结果(第一次可选为initcond)输入给sfunc计算，直到所有数据都跑完sfunc，最后如果设置了finalfunc，则计算并得到最终结果。      
+2\. 如果同时配置了sfunc和prefunc，则在segment节点并行完成sfunc，然后将segment节点执行的结果发给master，在master调用prefunc进行再次聚合，输出结果，如果配置了finalfunc，则这个结果再给finalfunc执行并输出最终结果。      
+优化例子：  
+```  
+//bitmap and trans  
+PG_FUNCTION_INFO_V1(rb_and_trans_pre);  
+Datum rb_and_trans_pre(PG_FUNCTION_ARGS);  
+Datum  
+rb_and_trans_pre(PG_FUNCTION_ARGS) {  
+    MemoryContext aggctx;  
+    roaring_bitmap_t *r1;  
+    roaring_bitmap_t *r2;  
+    // We must be called as a transition routine or we fail.  
+    if (!AggCheckCallContext(fcinfo, &aggctx))  
+        ereport(ERROR,  
+                (errcode(ERRCODE_DATA_EXCEPTION),  
+                        errmsg("rb_and_trans outside transition context")));  
+    // Is the first argument a NULL?  
+    if (PG_ARGISNULL(0)) {  
+        r1 = setup_roaringbitmap(aggctx);  
+    } else {  
+        r1 = (roaring_bitmap_t *) PG_GETARG_POINTER(0);  
+    }  
+    // Is the second argument non-null?  
+    if (!PG_ARGISNULL(1)) {  
+        r2 = (roaring_bitmap_t *) PG_GETARG_POINTER(1);  
+        if (PG_ARGISNULL(0)) {  
+            r1 = roaring_bitmap_copy(r2);  
+        } else {  
+            roaring_bitmap_and_inplace(r1, r2);  
+        }  
+        roaring_bitmap_free(r2);  
+    }  
+    PG_RETURN_POINTER(r1);  
+}  
+CREATE OR REPLACE FUNCTION rb_and_trans_pre(internal, internal)  
+     RETURNS internal  
+      AS 'roaringbitmap.so', 'rb_and_trans_pre'  
+     LANGUAGE C IMMUTABLE;  
+CREATE AGGREGATE rb_and_agg(roaringbitmap)(  
+       SFUNC = rb_and_trans,  
+       PREFUNC = rb_and_trans_pre,  
+       STYPE = internal,  
+       FINALFUNC = rb_serialize  
+);  
+```  
+实现prefunc后，执行计划就会变成这样的，先在计算节点执行一阶段聚合，然后再到master执行第二阶段的聚合，效率明显提升。   
+```
+postgres=# explain select RB_ITERATE(rb) from (select rb_and_agg(bitmap) as rb from tbl where tagid in(1,2,3)) t;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Result  (cost=0.07..0.10 rows=3 width=32)
+   ->  Aggregate  (cost=0.07..0.08 rows=1 width=32)
+         ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.01..0.06 rows=1 width=4)
+               ->  Aggregate  (cost=0.01..0.01 rows=1 width=4)
+                     ->  Seq Scan on tbl  (cost=0.00..0.00 rows=1 width=32)
+                           Filter: tagid = ANY ('{1,2,3}'::integer[])
+(6 rows)
+postgres=# explain select rb_and_agg(bitmap) from tbl where tagid in (1,2,3,4,5,6,7,8);
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Aggregate  (cost=0.07..0.08 rows=1 width=32)
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.01..0.06 rows=1 width=4)
+         ->  Aggregate  (cost=0.01..0.01 rows=1 width=4)
+               ->  Seq Scan on tbl  (cost=0.00..0.00 rows=1 width=32)
+                     Filter: tagid = ANY ('{1,2,3,4,5,6,7,8}'::integer[])
+(5 rows)
+```
+## roaring bitmap空间评估
+```
+postgres=# select pg_column_size(rb_build(array(select ((random()*4000000000)::int8-2000000000)::int from generate_series(1,1000)))) ;
+ pg_column_size 
+----------------
+           9972
+(1 row)
+postgres=# select pg_column_size(rb_build(array(select ((random()*4000000000)::int8-2000000000)::int from generate_series(1,10000)))) ;
+ pg_column_size 
+----------------
+          93588
+(1 row)
+postgres=# select pg_column_size(rb_build(array(select ((random()*4000000000)::int8-2000000000)::int from generate_series(1,100000)))) ;
+ pg_column_size 
+----------------
+         593094
+(1 row)
+postgres=# select pg_column_size(rb_build(array(select ((random()*4000000000)::int8-2000000000)::int from generate_series(1,1000000)))) ;
+ pg_column_size 
+----------------
+        2487818
+(1 row)
+postgres=# select pg_column_size(rb_build(array(select ((random()*4000000000)::int8-2000000000)::int from generate_series(1,10000000)))) ;
+ pg_column_size 
+----------------
+       20441260
+(1 row)
+```
+## 小结
+gpdb-roaringbitmap是一个很好的插件，可以帮助用户高效的实现多组标签的人群圈选。    
+目前需要实现prefunc来支持多阶段聚合，否则只能gather到master去聚合。文中有例子。   
+阿里云HybridDB for PostgreSQL提供的roaring bitmap插件，已实现多阶段聚合，解决了聚合的性能瓶颈问题。   
+## 参考  
+[《PostgreSQL (varbit, roaring bitmap) VS pilosa(bitmap库)》](../201706/20170612_01.md)    
+[《Roaring Bitmap - A better compressed bitset》](../201505/20150507_01.md)    
+[《阿里云RDS PostgreSQL varbitx实践 - 流式标签 (阅后即焚流式批量计算) - 万亿级，任意标签圈人，毫秒响应》](../201712/20171212_01.md)    
+[《基于 阿里云 RDS PostgreSQL 打造实时用户画像推荐系统(varbitx)》](../201610/20161021_01.md)    
+[《阿里云RDS for PostgreSQL varbitx插件与实时画像应用场景介绍》](../201705/20170502_01.md)    
+[《Greenplum 最佳实践 - 估值插件hll的使用(以及hll分式聚合函数优化)》](../201608/20160825_02.md)    
+[《PostgreSQL 10 自定义并行计算聚合函数的原理与实践》](../201801/20180119_04.md)    
+[《Postgres-XC customized aggregate introduction》](../201305/20130502_01.md)    
+[《PostgreSQL aggregate function customize》](../201212/20121218_02.md)    
+https://github.com/RoaringBitmap/CRoaring  
+https://github.com/zeromax007/gpdb-roaringbitmap  
+[《惊天性能！单RDS PostgreSQL实例 支撑 2000亿 - 实时标签透视案例》](../201712/20171223_01.md)    
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

@@ -1,0 +1,145 @@
+# 【技术分享】深入分析基于异常的 iOS 漏洞利用技术
+|
+##### 译文声明
+本文是翻译文章，文章来源：googleprojectzero.blogspot.jp
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+****
+****
+翻译：[ **shan66**](http://bobao.360.cn/member/contribute?uid=2522399780)
+预估稿费：300RMB
+投稿方式：发送邮件至linwei#360.cn，或登陆网页版在线投稿
+**前言**
+本文将为读者详细介绍编号为[ **CVE-2017-2370**](https://bugs.chromium.org/p/project-zero/issues/detail?id=1004)的mach_voucher_extract_attr_recipe_trap mach trap
+堆溢出的发现和利用过程。这里不仅介绍了这个漏洞本身的情况，还讲解了漏洞利用技术的开发过程，包括如何反复故意导致系统崩溃，以及如何使用旧的内核漏洞构建活动内核自省功能。
+**这是一陷阱！**
+除了大量的[
+**BSD**](https://developer.apple.com/library/content/documentation/Darwin/Conceptual/KernelProgramming/BSD/BSD.html)系统调用（如ioctl，mmap，execve等）之外，XNU还提供了少量其他的系统调用，通常称为mach陷阱，用来为内核的[
+**MACH**](https://developer.apple.com/library/content/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)特性提供支持。Mach
+陷阱系统调用的号码是从0x1000000开始的。下面的代码来自定义陷阱表的[
+**syscall_sw.c**](https://opensource.apple.com/source/xnu/xnu-3789.1.32/osfmk/kern/syscall_sw.c.auto.html)文件：
+    /* 12 */ MACH_TRAP(_kernelrpc_mach_vm_deallocate_trap, 3, 5, munge_wll),
+    /* 13 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+    /* 14 */ MACH_TRAP(_kernelrpc_mach_vm_protect_trap, 5, 7, munge_wllww),
+对于大多数Mach陷阱来说，它们实际上就是内核API的快速通道，并且也是通过标准MACH
+MIG内核API向外界提供接口的。例如，mach_vm_allocate也是一个可以在任务端口上调用的MIG RPC。
+由于避免了调用内核MIG
+API所涉及的序列化和反序列化所引起的开销，因此Mach陷阱能够为这些内核函数提供速度更快的接口。但是，由于没有提供复杂的代码自动生成功能，所以mach陷阱通常需要以手工方式完成参数解析，但是要想正确完成这项工作的话，那是非常需要技巧的。
+在iOS 10中，mach_traps表中出现了一个新条目：
+    /* 72 */ MACH_TRAP(mach_voucher_extract_attr_recipe_trap, 4, 4, munge_wwww),
+mach陷阱入口代码会把从用户空间传递给该陷阱的参数打包到如下所示的结构中：
+      struct mach_voucher_extract_attr_recipe_args {
+        PAD_ARG_(mach_port_name_t, voucher_name);
+        PAD_ARG_(mach_voucher_attr_key_t, key);
+        PAD_ARG_(mach_voucher_attr_raw_recipe_t, recipe);
+        PAD_ARG_(user_addr_t, recipe_size);
+      };
+然后将指向该结构的指针作为第一个参数传递给该陷阱的实现代码。值得注意的是，添加一个这样的新系统调用后，我们就可以从系统上的每个沙盒进程中调用它了。直至你到达一个没有沙箱保护的强制性访问控制钩子（并且这里也没有）为止。
+我们来看看陷阱代码：
+    kern_return_t
+    mach_voucher_extract_attr_recipe_trap(
+      struct mach_voucher_extract_attr_recipe_args *args)
+    {
+      ipc_voucher_t voucher = IV_NULL;
+      kern_return_t kr = KERN_SUCCESS;
+      mach_msg_type_number_t sz = 0;
+      if (copyin(args->recipe_size, (void *)&sz, sizeof(sz)))
+        return KERN_MEMORY_ERROR;
+在Linux上，copyin具有与copy_from_user相似的语义。它会从用户空间指针args->
+recipe_size中将4个字节复制到内核堆栈上的sz变量中，确保整个源区段真正位于用户空间中，如果源区段未完全映射或指向内核，则返回错误代码。这样，攻击者就能控制sz变量了。
+      if (sz > MACH_VOUCHER_ATTR_MAX_RAW_RECIPE_ARRAY_SIZE)
+        return MIG_ARRAY_TOO_LARGE;
+由于mach_msg_type_number_t是32位无符号类型，所以sz必须小于或等于MACH_VOUCHER_ATTR_MAX_RAW_RECIPE_ARRAY_SIZE（5120）。
+      voucher = convert_port_name_to_voucher(args->voucher_name);
+      if (voucher == IV_NULL)
+        return MACH_SEND_INVALID_DEST;
+convert_port_name_to_voucher会在调用任务的mach端口命名空间中查找args-> voucher_name
+mach端口名称，并检查它是否命名了一个ipc_voucher对象，如果是的话，则返回该凭证的引用。因此，我们需要提供一个有效的凭证端口，用于处理voucher_name。
+      if (sz recipe, (void *)krecipe, sz)) {
+          kr = KERN_MEMORY_ERROR;
+            goto done;
+        }
+        kr = mach_voucher_extract_attr_recipe(voucher,
+                 args->key, (mach_voucher_attr_raw_recipe_t)krecipe, &sz);
+        if (kr == KERN_SUCCESS && sz > 0)
+          kr = copyout(krecipe, (void *)args->recipe, sz);
+      }
+如果sz小于MACH_VOUCHER_TRAP_STACK_LIMIT（256），那么这将在内核堆栈上分配一个小的可变长度数组，并将args->
+recipe中的用户指针的sz字节复制到VLA中。然后，该代码将在调用copyout（它需要用到内核和用户空间参数，作用与copyin相反）将结果送回用户空间之前，调用目标mach_voucher_extract_attr_recipe方法。好了，下面让我们来看看如果sz过大，为了保持速度继续让其留在堆栈上会发生什么：
+      else {
+        uint8_t *krecipe = kalloc((vm_size_t)sz);
+        if (!krecipe) {
+          kr = KERN_RESOURCE_SHORTAGE;
+          goto done;
+        }
+        if (copyin(args->recipe, (void *)krecipe, args->recipe_size)) {
+          kfree(krecipe, (vm_size_t)sz);
+          kr = KERN_MEMORY_ERROR;
+          goto done;
+        }
+我们不妨仔细考察一下这个代码段。它调用kalloc在内核堆上分配了一段sz字节的内存，并将相应的地址分赋给krecipe。然后调用copyin，根据args->
+recipe用户空间指针复制args-> recipe_size字节到krecipe内核堆缓冲区。
+如果您还没有发现错误，请返回到代码段的开头部分，再重新阅读。这绝对是一个漏洞，只是乍一看，好像没有任何毛病！
+为了解释这个漏洞，我们不妨探究一下到底发生了什么事情，才导致了这样的代码。当然，这里只是猜想，不过我认为这是相当合理的。
+**copypasta相关代码**
+在mach_kernelrpc.c中，mach_voucher_extract_attr_recipe_trap方法的上面是另一个mach陷阱host_create_mach_voucher_trap的相关代码。
+这两个函数看起来很相似。它们都有用于处理小型输入和大型输入的分支，在处理小型输入的分支上面都带有同样的/* keep small recipes on
+the stack for speed */ 注释，并且都在处理大型输入的分支中分配了内核堆。
+很明显，mach_voucher_extract_attr_recipe_trap的代码是从host_create_mach_voucher_trap那里复制粘贴过来的，然后进行了相应的更新。这不同的是，host_create_mach_voucher_trap的size参数是整数，而mach_voucher_extract_attr_recipe_trap的size参数是一个指向整数的指针。
+这意味着mach_voucher_extract_attr_recipe_trap需要首先使用copyin处理复制size参数，然后才能使用。更令人困惑的是，原始函数中的size参数被称为recipes_size，而在较新的函数中，它被称为recipe_size（少了一个's'）。
+下面是这两个函数的相关代码，其中第一个代码段很好，但是第二个代码中有安全漏洞：
+    host_create_mach_voucher_trap:
+     if (copyin(args->recipes, (void *)krecipes, args->recipes_size)) {
+       kfree(krecipes, (vm_size_t)args->recipes_size);
+       kr = KERN_MEMORY_ERROR;
+       goto done;
+     }
+    mach_voucher_extract_attr_recipe_trap:
+      if (copyin(args->recipe, (void *)krecipe, args->recipe_size)) {
+        kfree(krecipe, (vm_size_t)sz);
+        kr = KERN_MEMORY_ERROR;
+        goto done;
+      }
+我的猜测是，开发人员复制粘贴了整个函数的代码，然后尝试添加额外的间接级别，但忘记将第三个参数更改为上面显示的copyin调用。他们构建XNU并考察了编译器错误消息。使用[
+**clang**](https://clang.llvm.org/)构建XNU时，出现了下面的错误消息：
+    error: no member named 'recipes_size' in 'struct mach_voucher_extract_attr_recipe_args'; did you mean 'recipe_size'?
+    if (copyin(args->recipes, (void *)krecipes, args->recipes_size)) {
+                                                      ^~~~~~~~~~~~
+                                                      recipe_size
+Clang认为开发人员多输入了一个“s”。Clang并没有意识到，它的假设在语义上是完全错误的，并且会引发严重的内存破坏问题。我认为开发人员采取了cl
+ang的建议，删除了's'，然后重新进行了构建，并且没有再出现编错误。
+**构建原语**
+如果size参数大于0x4000000，则iOS上的copyin将失败。由于recipes_size也需要一个有效的用户空间指针，这意味着我们必须能够映射一个低的地址。对于64位iOS应用程序来说，我们可以通过给pagezero_size链接器选项赋予一个比较小的值来达到这个目的。通过确保我们的数据与内存页末尾右对齐，后跟一个未映射的内存页来完全控制副本的大小。当副本到达未映射的内存页并停止时，copyin将发生故障。
+如果copyin失败，缓冲区将立即释放。
+综合起来，我们就可以分配一个大小介于256到5120字节之间的kalloc堆，然后使用完全受控数据任意溢出。
+当我利用一个新的漏洞时，我会花费很多时间寻找新的原语；例如分配在堆上的对象，如果我可以溢出它，就可能会导致一连串有趣的事情发生。一般有趣的意思是，如果我得手了，我可以用它来建立一个更好的原语。通常我的最终目标是链接这些原语以获得任意的、可重复和可靠的内存读/写。
+为此，我一直在寻找一种对象，它包含一个可以被破坏的长度或大小字段，同时不必完全损坏任何指针。这通常是一个有趣的目标，值得进一步探究。
+对于曾经写过浏览器漏洞的人来说，这将是一个熟悉的结构！
+**ipc_kmsg**
+为了寻找相应的原语，我通读了XNU的代码，并无意中发现了ipc_kmsg：
+    struct ipc_kmsg {
+      mach_msg_size_t            ikm_size;
+      struct ipc_kmsg            *ikm_next;
+      struct ipc_kmsg            *ikm_prev;
+      mach_msg_header_t          *ikm_header;
+      ipc_port_t                 ikm_prealloc;
+      ipc_port_t                 ikm_voucher;
+      mach_msg_priority_t        ikm_qos;
+      mach_msg_priority_t        ikm_qos_override
+      struct ipc_importance_elem *ikm_importance;
+      queue_chain_t              ikm_inheritance;
+    };
+这是一个具有可能被破坏的大小字段的结构，并且不需要知道任何指针值。那么，我们该如何使用ikm_size字段？
+在代码中寻找对ikm_size的交叉引用，我们可以看到它仅在少数几个地方被用到：
+    void ipc_kmsg_free(ipc_kmsg_t kmsg);
+这个函数使用kmsg->
+ikm_size将kmsg释放给正确的kalloc内存区。内存区分配器将检测到错误的区域，所以必须小心，在修复大小之前不要释放损坏的ipc_kmsg。
+该宏用于设置ikm_size字段：
+    #define ikm_init(kmsg, size)  
+    MACRO_BEGIN                   
+     (kmsg)->ikm_size = (size);   
+    该宏使用ikm_size字段来设置ikm_header指针： 
+    #define ikm_set_header(kmsg, mtsize)                        
+    MACRO_BEGIN                                                
+     (kmsg)->ikm_header = (mach_msg_header_t *)                 
+     ((vm_offset_t)((kmsg) + 1) + (kmsg)->ikm_size - (mtsize)); 

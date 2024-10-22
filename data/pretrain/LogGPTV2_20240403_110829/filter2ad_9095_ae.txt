@@ -1,0 +1,138 @@
+            }
+            throw new FileNotFoundException("Multiple items at " + uri);
+        }
+        c.moveToFirst();
+        int i = c.getColumnIndex("_data");
+        String path = (i >= 0 ? c.getString(i) : null);
+        c.close();
+        if (path == null) {
+            throw new FileNotFoundException("Column _data not found.");
+        }
+        int modeBits = ParcelFileDescriptor.parseMode(mode);
+        return ParcelFileDescriptor.open(new File(path), modeBits);
+    }
+这个方法的主要作用是方便子类用于快速实现 `openFile` 方法，通常不会直接在子类去覆盖。不过由于其中基于 `_data`
+列去打开文件的特性可能会攻击者插入恶意数据后间接地实现任意文件读写。
+一个经典案例就是三星手机的 `SemClipboardProvider`，在插入时未校验用户数据：
+    public Uri insert(Uri uri, ContentValues values) {
+        long row = this.database.insert(TABLE_NAME, "", values);
+        if (row > 0) {
+            Uri newUri = ContentUris.withAppendedId(CONTENT_URI, row);
+            getContext().getContentResolver().notifyChange(newUri, null);
+            return newUri;
+        }
+        throw new SQLException("Fail to add a new record into " + uri);
+    }
+而该 Provider 又在 `system_server` 进程中，拥有极高的运行权限，攻击者通过利用这个漏洞去就能实现系统层面的任意文件读写，其 PoC
+如下：
+    ContentValues vals = new ContentValues();
+    vals.put("_data", "/data/system/users/0/newFile.bin");
+    URI semclipboard_uri = URI.parse("content://com.sec.android.semclipboardprovider")
+    ContentResolver resolver = getContentResolver();
+    URI newFile_uri = resolver.insert(semclipboard_uri, vals);
+    return resolver.openFileDescriptor(newFile_uri, "w").getFd(); 
+该漏洞与其他漏洞一起曾被用于在野攻击中，由 Google TAG 团队捕获，对这一条 Fullchain 的分析可以参考 Project Zero
+近期的文章：[A Very Powerful Clipboard: Analysis of a Samsung in-the-wild exploit
+chain](https://googleprojectzero.blogspot.com/2022/11/a-very-powerful-clipboard-samsung-in-the-wild-exploit-chain.html)
+### call
+ContentProvider 中提供了 `call` 方法，用于实现调用服务端定义方法，其函数签名如下：
+    public Bundle call (String authority, 
+                    String method, 
+                    String arg, 
+                    Bundle extras)
+    public Bundle call (String method, 
+                    String arg, 
+                    Bundle extras)
+默认的实现是个空函数直接返回 `null`，开发者可以通过覆盖该函数去实现一些动态方法，返回值也会传回到调用者中。
+看起来和常规的 RPC 调用类似，但这里有个小陷阱，开发者文档中也特别标注了：Android 系统并没有对 `call` 函数进行权限检查，因为系统不知道在
+call 之中对数据进行了读还是写，因此也就无法根据 Manifest 中定义的权限约束进行判断。因此要求开发者自己对 call 中的逻辑进行权限校验。
+如果开发者实现了该方法，但是又未进行校验或者校验不充分，就可能出现越权调用的情况。一个案例是 `CVE-2021-23243`， OPPO 某系统应用中
+`HostContentProviderBase` 的 call 方法实现中，直接用 DexClassLoader 去加载了传入 dex
+文件，直接导致攻击者的代码在特权进程中运行，所有继承该基类的 Provider 都会受到影响 ()。
+另外在某些系统 Provider 中，可以通过 call 方法去获取某些远程对象实例，例如在文章 [Android 中的特殊攻击面（三）—— 隐蔽的
+call 函数](https://paper.seebug.org/1269/) 中，作者就通过 `SliceProvider` 与
+`KeyguardSliceProvider` 获取到了系统应用内部的 PendingIntent 对象，进一步利用实现了伪造任意广播的功能。
+# 其他
+除了上述和四大组件直接相关的漏洞，Android 系统中还有许多不太好分类的漏洞，本节主要挑选其中几个最为常见的漏洞进行简单介绍。
+## PendingIntent
+[PendingIntent](https://developer.android.com/reference/android/app/PendingIntent)
+是对 Intent 的表示，本身并不是 Intent 对象，但是是一个 Parcelable
+对象。将该对象传递给其他应用后，其他应用就可以以发送方的身份去执行所指向的 Intent 指定的操作。 PendingIntent
+使用下述静态方法之一进行创建：
+  * getActivity(Context, int, Intent, int);
+  * getActivities(Context, int, Intent[], int);
+  * getBroadcast(Context, int, Intent, int);
+  * getService(Context, int, Intent, int);
+PendingIntent 本身只是系统对原始数据描述符的一个引用，可以大致将其理解为 `Intent 的指针`。也因为如此，即便创建
+PendingIntent 的应用关闭后，其他应用仍然可以使用该数据。如果原始应用后来进行了重启并以同样的参数创建了一个
+PendingIntent，那么实际上返回 PendingIntent 与之前创建的会指向同样的 token。注意判断 Intent 是否相同是使用
+[filterEquals](https://developer.android.com/reference/android/content/Intent#filterEquals\(android.content.Intent\))
+方法，其中会判断 action，data， type，identity，class，categories 是否相同，注意 `extra`
+并不在此列，因此仅有 extra 不同的 Intent 也会被认为是相等的。
+由于 PendingIntent 可代表其他应用的特性，在某些场景下可能被用于滥用。例如，如果开发者创建了这样一个默认的 PendingIntent
+并传递给其他应用：
+    pi = PendingIntent.getActivity(this, 0, new Intent(), 0);
+    bundle.putParcelable("pi", pi)
+    // send bundle
+恶意的应用在收到此 PendingIntent 后，可以获取到原始的 intent，并使用 `Intent.fillin` 去填充空字段，如果原始
+Intent 是上述空 Intent，那么攻击者就可以将其修改为特定的
+Intent，从而以目标的身份去启动应用，包括未导出的私有应用。一个经典的案例就是早期的
+[broadAnywhere](https://android.googlesource.com/platform/packages/apps/Settings/+/f5d3e74ecc2b973941d8adbe40c6b23094b5abb7%5E%21/#F0)
+漏洞，Android Settings 应用中的 addAccount 方法内创建了一个 PendingIntent 广播，但 intent
+内容为空，这导致收到 intent 的的恶意应用可以 fillin 填充广播的 action，从而实现越权发送系统广播，实现伪造短信、回复出厂设置等功能。
+为了缓解这类问题，Andorid 中对 Intent.fillin 的改写做了诸多限制，比如已有的字段不能修改，component 和 selector
+字段不能修改（除非额外设置 FILL_IN_COMPONENT/SELECTOR），隐式 Intent 的 action 不能修改等。
+不过有研究者提出了针对隐式 Intent 的利用方法，即通过修改 flag 添加 FLAG_GRANT_WRITE_URI_PERMISSION，并修改
+data 的 URI 指向受害者私有的 Provider，将 package 改为攻击者；同时攻击者在自身的 Activity 中声明相同的 intent
+filter，这样在转发 intent 时会启动攻击者应用，同时也获取了目标私有 Provider
+的访问权限，从而实现私有文件窃取或者覆盖。关于该攻击思路详情可以阅读下面的参考文章。
+  * [broadAnywhere：Broadcast组件权限绕过漏洞（Bug: 17356824）](http://retme.net/index.php/2014/11/14/broadAnywhere-bug-17356824.html)
+  * [PendingIntent重定向：一种针对安卓系统和流行App的通用提权方法——BlackHat EU 2021议题详解（上）](https://blog.csdn.net/weixin_59152315/article/details/123481053)
+  * [PendingIntent重定向：一种针对安卓系统和流行App的通用提权方法——BlackHat EU 2021议题详解（下）](https://blog.csdn.net/weixin_59152315/article/details/123503289)
+> 在 Android 12+ 之后，PendingIntent 在创建时候要求显式指定 `FLAG_MUTABLE` 或者
+> `FLAG_IMMUTABLE`，表示是否可以修改。
+## DeepLink
+在大部分操作系统中都有 deeplink 的概念，即通过自定义 schema 打开特定的应用。比如通过点击 
+可以唤起默认浏览器打开目标网页，点击  会唤起拨号界面，点击  会唤起微信，等等。其他系统暂且不论，在 Android 中这主要是通过隐式 Intent
+去实现的。
+应用要想注册类似的自定义协议，需要在应用清单文件中进行声明：
+由于这类隐式 Intent 可以直接通过点击链接去触发，因此更受攻击者喜爱。如果处理对应 Intent 的组件没有过滤好用户传入的内容，很可能会造成
+1-click 的漏洞。相关案例可以参考文章：[Android
+中的特殊攻击面（二）——危险的deeplink](https://mp.weixin.qq.com/s/81Lq-JwASnkSS2wg62HSvA)
+## Webview
+在 Andorid
+系统中，[Webview](https://developer.android.com/reference/android/webkit/WebView)
+主要用于应用在自身的 Activty 中展示网页内容，并提供了一些额外的接口来给开发者实现自定义的控制。更高的拓展性也就意味着更多出错的可能，尤其是如今
+Android 客户端开发式微，Java 开发也朝着 “大前端” 的方向发展。原本许多使用原生应用实现的逻辑逐渐转移到了 web 页面中，比如
+h5、小程序等，这样一来，webview 的攻击面也就扩宽了不少。
+常规的 Webview 安全问题主要是在与一些配置的不安全，比如覆盖 `onReceivedSslError` 忽略 SSL
+错误导致中间人攻击，`setAllowFileAccessFromFileURLs` 导致本地私有文件泄露等。但现在的漏洞更多出在 JSBridge
+上，这是 Java 代码与网页中的 JavaScript 代码沟通的桥梁。
+由于 Webview 或者说 JS 引擎的沙箱特性，网页中的 Javascript 代码本身无法执行许多原生应用才能执行的操作，比如无法从
+Javascript 中发送广播，无法访问应用文件等。而由于业务的复杂性，很多逻辑又必须在 Java 层甚至是 Native 层才能实现，因此这就需要用到
+JSBridage。传统的 JSBridge 通过 `Webview.addJavascriptInterface` 实现，一个简单示例如下：
+    class JsObject {
+        @JavascriptInterface
+        public String toString() { return "injectedObject"; }
+    }
+    webview.getSettings().setJavaScriptEnabled(true);
+    webView.addJavascriptInterface(new JsObject(), "injectedObject");
+    webView.loadData("", "text/html", null);
+    webView.loadUrl("javascript:alert(injectedObject.toString())");
+Java 层返回数据给 Javascript 一般是通过直接使用 loadUrl 执行 JS 代码实现。当然除了这种方式注册
+Bridge，还有很多应用特异的实现，比如使用 `console.log` 传输数据并在 Java 层使用 `onConsoleMessage`
+回调去接收。但无论如何，这都导致攻击面的增加，大型应用甚至注册了上百个 jsapi 来供网页调用。
+从历史漏洞来看，Webview 漏洞的成因主要是 jsapi 域名校验问题和 Bridge 代码本身的漏洞，由于篇幅原因就不展开了。
+# 后记
+本文中主要通过 Android
+中的四大组件介绍了一系列相关的逻辑问题，尽可能地囊括了笔者所了解的历史漏洞。由于个人认知水平有限，总是难免挂一漏万，但即便如此，文章的篇幅还是比预想中的超出了亿点点。从温故知新的角度看，挖掘这类逻辑漏洞最好的策略还是使用静态分析工具，搜集更多
+Sink 模式并编写有效的规则去进行扫描，实在没有条件的话用 (rip)grep 也是可以的。
+# 参考资料
+  * [Galaxy Leapfrogging 盖乐世蛙跳 Pwning the Galaxy S8](https://paper.seebug.org/1050/)
+  * [Chainspotting: Building Exploit Chains with Logic Bugs](https://labs.f-secure.com/archive/chainspotting-building-exploit-chains-with-logic-bugs/) ([如何用11个exp攻破三星S8](https://paper.seebug.org/628/))
+  * [Huawei Mate 9 Pro Mobile Pwn2Own 2017](https://labs.withsecure.com/publications/nhuawew-blog-post)
+  * [Detect dangerous vulnerabilities in the TikTok Android app - Oversecured](https://blog.oversecured.com/Oversecured-detects-dangerous-vulnerabilities-in-the-TikTok-Android-app/)
+  * [魔形女漏洞白皮书 - 京东探索研究院信息安全实验室](https://dawnslab.jd.com/mystique-paper/)
+  * [HACKING XIAOMI'S ANDROID APPS - Part1](http://blog.takemyhand.xyz/2021/07/hacking-on-xiaomis-android-apps.html)
+  * [Automating Pwn2Own with Jandroid](https://labs.f-secure.com/blog/automating-pwn2own-with-jandroid/)
+* * *

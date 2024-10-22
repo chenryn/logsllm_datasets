@@ -1,0 +1,153 @@
+                      #ifndef DISABLE_PRDR
+                        prdr_requested ? US", PRDR Requested" : US"",
+                          #else
+                        US"",
+                      #endif
+                        US"\r\n");
+          else
+            {
+          #ifndef DISABLE_PRDR
+            if (prdr_requested)
+               user_msg = string_sprintf("%s%s", user_msg, US", PRDR Requested");
+          #endif
+            smtp_user_msg(US"250", user_msg);
+            }
+    ......
+    # RCPT TO
+        if (rc == OK)
+          {
+          BOOL more = pipeline_response();
+          if (user_msg)
+            smtp_user_msg(US"250", user_msg);
+          else
+            smtp_printf("250 Accepted\r\n", more);
+          receive_add_recipient(recipient, -1);
+    ......
+审计了一波函数，发现只有`MAIL FROM`和`RCPT
+TO`指令处理成功后，并且开启了PIPELINE，并且后续还有输入的情况下，more才为TRUE。
+单从上面说的这些看，这代码好像没啥问题。一开始我也看不出为啥这会造成UAF，随后研究了一下Github上的EXP，步骤如下：
+  1. EHLO xxxx # 建立TLS之前必须先EHLO
+  2. STARTTLS
+  3. EHLO xxxxx # MAIL FROM/RCPT TO之前必须先EHLO
+  4. MAIL FROM # RCPT TO之前必须先MAIL FROM
+  5. RCPT TO: `\nNO`
+  6. 关闭TLS信道，切换回明文信道
+  7. OP\n
+  8. 使用EHLO或者REST调用smtp_reset
+  9. STARTTLS
+  10. NOOP
+最关键的在5，6，8步，下面堆这三步进行解释：
+5.. 必须要让RCPT执行成功，所以可以发送`RCPT TO:
+`，处理完RCPT的时候，进入`tls_write`进行输出，因为more等于1，所以会把成功的输出字符串`250
+Accept\r\n`储存到`corked`变量中。随后处理剩下的字符`NO`，因为没接收到回车，所以继续等待输出。
+6..
+但是这个时候我们把TLS信道关闭，切换回明文信道，但是却不会调用smtp_reset，把tls用的堆比如`corked`给释放掉。因为进入了明文信道，随后的输出就不会再调用`tls_write`函数了。
+8.. 比如我们调用EHLO
+xxx，后续将会调用`smtp_reset`函数，变量`corked`指向的堆将会被回收。但是`corked`的值却不会被设置为NULL。随后我们再次切换到TLS信道，随便输入一个命令，将会调用`tls_write`进行输出，这个时候`corked`不为空，但是其指向的堆却已经被释放。所以这就造成了UAF漏洞。
+#### RCE利用思路
+利用思路还是跟这篇文章写的一样[3]，大致分为3步：
+  1. 利用漏洞泄漏出堆地址。
+  2. 泄漏出堆地址后，在堆上搜索字符串`acl_check_mail`的位置。
+  3. 利用任意写把上面的字符串替换成：`acl_check_mail:(condition = ${run{/bin/sh -c '%s'}})`
+其中最难的是第一步，利用UAF漏洞泄漏出任意堆地址。或者说这步是影响通杀的地方，后续的步骤我测试了两个版本，都可以用一个代码通杀，但是第一步还是没办法。
+#### UAF利用思路
+这里就来具体说说利用UAF进行堆泄漏的过程，不知道是不是我环境问题（我感觉环境没错），Github上的exp，是没办法进行堆泄漏的。所以后面我花了很长一段时间在研究/调试堆，所以后续我就按照自己的思路进行讲解。
+前面固定步骤：
+  1. EHLO x
+  2. STARTTLS
+  3. EHLO x
+接下来就有区分度了：
+  1. 一次性发送`MAIL FROM: <>\n` \+ `RCPT TO: ` * n + "NO"
+  2. 先发送`MAIL FROM: <>\n`，在发送`RCPT TO: ` * n + "NO"
+不同的方式可以控制`corked`地址的高低，但只能控制高低，却不能进行微调。
+没有进行过多次测试，但是我估计n在`exim 4.92+`上必须小于9。
+理由如下：
+corked是使用`string_catn`函数进行堆分配的，所以是在第一次字符串长度的基础上加上127，因为要求MAIL和RCPT必须要成功，所以返回不是`250
+Accepted\r\n`就是`250 OK\r\n`，长度都是在0x10以内，所以申请下来的堆长度基本是0x10字符串结构的头部 + 0x80 +
+0x10 = 0x100，所以当n的值过大的时候，会根据新的长度进行新的堆分配申请。
+在RCPT请求中，会调用`string_sprintf`函数，我们来比较一下在`exim4.90`和`exim4.92`中这个函数的区别：
+    #define STRING_SPRINTF_BUFFER_SIZE (8192 * 4)
+    # exim 4.90
+    uschar *
+    string_sprintf(const char *format, ...)
+    {
+    va_list ap;
+    uschar buffer[STRING_SPRINTF_BUFFER_SIZE];
+    va_start(ap, format);
+    if (!string_vformat(buffer, sizeof(buffer), format, ap))
+      log_write(0, LOG_MAIN|LOG_PANIC_DIE,
+        "string_sprintf expansion was longer than " SIZE_T_FMT
+        "; format string was (%s)\nexpansion started '%.32s'",
+        sizeof(buffer), format, buffer);
+    va_end(ap);
+    return string_copy(buffer);
+    }
+    uschar *
+    string_copy(const uschar *s)
+    {
+    int len = Ustrlen(s) + 1;
+    uschar *ss = store_get(len);
+    memcpy(ss, s, len);
+    return ss;
+    }
+    # exim 4.92
+    uschar *
+    string_sprintf(const char *format, ...)
+    {
+    #ifdef COMPILE_UTILITY
+    uschar buffer[STRING_SPRINTF_BUFFER_SIZE];
+    gstring g = { .size = STRING_SPRINTF_BUFFER_SIZE, .ptr = 0, .s = buffer };
+    gstring * gp = &g;
+    #else
+    gstring * gp = string_get(STRING_SPRINTF_BUFFER_SIZE);
+    #endif
+    gstring * gp2;
+    va_list ap;
+    va_start(ap, format);
+    gp2 = string_vformat(gp, FALSE, format, ap);
+    gp->s[gp->ptr] = '\0';
+    va_end(ap);
+    if (!gp2)
+      log_write(0, LOG_MAIN|LOG_PANIC_DIE,
+        "string_sprintf expansion was longer than %d; format string was (%s)\n"
+        "expansion started '%.32s'",
+        gp->size, format, gp->s);
+    #ifdef COMPILE_UTILITY
+    return string_copy(gp->s);
+    #else
+    gstring_reset_unused(gp);
+    return gp->s;
+    #endif
+    }
+我最开始测试的就是`exim4.92`，默认是没有定义`COMPILE_UTILITY`。所以在这个版本中，每调用一次`sprintf_smpt`就得`store_get_3(0x8000)`，分配赋值之后，根据具体长度，调整`next_yield`和`yield_length`。但是随后测试的ubuntu18.04，用的就是`exim4.90`，也就是使用多少分配多少。
+> > > 这里简单说一下exim中的堆管理，如果理解不了，请阅读`store_get_3`源码 其实只要关注3个全局变量就好了：
+> current_block/next_yield/yield_length
+> 每次申请内存，都会和yield_length进行比较，如果小于，那就直接分配从next_yiled开始的堆，current_block是当前大堆(malloc的堆)地址，也就是`yield_length
+> + (next_yield-current_block) == current_block.length`
+> 如果请求的堆大于yield_length，则重新向malloc申请新的堆块，堆块的最小长度为0x4000，最大程度为申请的长度。旧堆块则会被放入chainbase，除非被释放，要不然是不会再被使用了。
+如果n的值过大，因为之前有多个RCPT，则会调用多个`sprintf_smpt`，那么就会调用非常多个`store_get_3(0x8000)`，这个时候堆布局将会被拉扯的非常大非常大，那这个时候`string_catn`申请的新堆块将会在非常后面。
+在我实际测试的过程中发现，当调用smtp_reset的时候，过大的堆都会在内存中被释放。也就是该地址变为了不可访问的地址。在EXP的表现就会变为在最后NOOP的时候，程序会crash。
+因为exim处理请求都是fork出来的子进程处理的，就是crash了。也不影响主进程，所以没啥用，连dos都做不到。
+到这里为止，我们主要是对corked的地址进行选择（选择题，感觉是没法变为填空题）。
+接下来：
+  1. 关闭TLS信道，进入明文信道
+  2. 发送OP\n，得到OK\r\n的返回
+接下来又有多种选择：
+有以下几种命令可以调用：
+  * EHLO/HELO xxxx 都能调用smtp_reset
+  * RESET 也是用来调用smtp_reset的
+  * MAIL FROM 在reset后必须跟EHLO才能MAIL FROM
+  * RCPT TO 必须先MAIL FROM
+  * \xFF * n 发送n个无效命令
+  * DATA
+顺序啥的都是自己自由调整，但是最开始最好得有一个调用reset的命令，因为这样才能让corked的堆进入释放的状态，后续我们才能用其他命令覆盖该堆地址的内容。
+具体顺序各位可以自己自行调整，答案不唯一。我就分享一下我的经验：
+因为我们的目的是泄漏出堆地址，所以我们得让堆地址出现在`corked`的有效区域内，这个时候就有两种方法：
+  1. 调用`string_get`这类有指针函数的结构，不过我在调试的过程中只找到这一个。该结构的首地址必须要高于`corked`，这样输出`corked`的时候，就能把这个结构的指针泄漏出来。
+  2. 修改`corked->ptr`的大小，只要变的足够大，总能泄漏出堆地址。
+Github的exp使用的是第一种方法，但是我使用的是第二种方法。
+因为在我的研究中，好像做不到第一种情况，如果要做到第一种情况，会把corked的指针覆盖掉，所以就算在后面写了指针也没用。
+不过后面研究`exim4.90`的时候猜测，也许Github的环境是设置了`COMPILE_UTILITY`。
+在这个时候，不会有一堆`store_get_3(0x8000)`捣乱，那么当`string_catn`扩展堆的时候，堆指针和指针指向的值就不连续了，这样在覆盖值的时候就不会影响到指针了。
+(：不过这都不重要了，反正我也研究出了思路2的exp。
+思路2可以找一个命令，这个命令最后一个分配的堆块有可控的命令。比如我找的就是`RCPT TO`，可以这样构造：`RCPT TO:

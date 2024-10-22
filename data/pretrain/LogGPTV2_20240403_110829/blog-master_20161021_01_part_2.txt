@@ -1,0 +1,306 @@
+rowid int表示，也就是说单个APPID不能允许超过20亿的用户，从0开始自增，配合BIT下标的表示。    
+appid int表示，不会超过40亿个。    
+1\. 字典表, rowid决定MAP顺序，使用窗口查询返回顺序。    
+```
+drop table IF EXISTS t_userid_dic;
+create table IF NOT EXISTS t_userid_dic(appid int not null, rowid int not null, userid int8 not null, unique (appid,userid), unique (appid,rowid));
+```
+插入用户字典表的函数，可以产生无缝的连续ROWID。  
+```
+create or replace function f_uniq(i_appid int, i_userid int8) returns int as $$
+declare
+  newid int;
+  i int := 0;
+  res int;
+  stack1 text;
+  stack2 text;
+  stack3 text;
+  stack4 text;
+  stack5 text;
+  stack6 text;
+  stack7 text;
+  stack8 text;
+  stack9 text;
+  stack10 text;
+begin
+  loop 
+    if i>0 then 
+      perform pg_sleep(random());
+    else
+      i := i+1;
+    end if;
+    -- 获取已有的最大ID+1 (即将插入的ID)
+    select max(rowid)+1 into newid from t_userid_dic where appid=i_appid;
+    if newid is not null then
+      -- 获取AD LOCK (乘以appid, 为了避免不同ID的冲突, 算法可以再改进) 
+      if pg_try_advisory_xact_lock(i_appid::int8 * newid) then
+        -- 插入
+	insert into t_userid_dic (appid, rowid, userid) values (i_appid, newid, i_userid);
+        -- 返回此次获取到的UID
+	return newid;
+      else
+	-- 没有获取到AD LOCK则继续循环
+	continue;
+      end if;
+    else
+      -- 表示这是第一条记录，获取AD=0 的LOCK
+      if pg_try_advisory_xact_lock(0 * i_appid::int8) then
+	insert into t_userid_dic (appid, rowid, userid) values (i_appid, 0, i_userid);
+        return 0;
+      else
+	continue;
+      end if;
+    end if;
+  end loop;
+  exception 
+  -- 只忽略违反唯一约束的错误，其他错误继续报 
+  when SQLSTATE '23505' then 
+    /*
+    -- 参考 https://www.postgresql.org/docs/9.6/static/plpgsql-control-structures.html#PLPGSQL-ERROR-TRAPPING
+    GET STACKED DIAGNOSTICS stack1 = RETURNED_SQLSTATE,
+                            stack2 = COLUMN_NAME,
+                            stack3 = CONSTRAINT_NAME,
+                            stack4 = PG_DATATYPE_NAME,
+                            stack5 = MESSAGE_TEXT,
+                            stack6 = TABLE_NAME,
+                            stack7 = SCHEMA_NAME,
+                            stack8 = PG_EXCEPTION_DETAIL,
+                            stack9 = PG_EXCEPTION_HINT,
+                            stack10 = PG_EXCEPTION_CONTEXT;
+    -- 如果因为瞬态导致PK冲突了，继续调用(注意如果appid+userid重复，会无限循环，所以不建议使用)
+    --  select f_uniq(i_appid, i_userid) into res;
+    raise notice 'RETURNED_SQLSTATE, %', stack1;
+    raise notice 'COLUMN_NAME, %', stack2;
+    raise notice 'CONSTRAINT_NAME, %', stack3;
+    raise notice 'PG_DATATYPE_NAME, %', stack4;
+    raise notice 'MESSAGE_TEXT, %', stack5;
+    raise notice 'TABLE_NAME, %', stack6;
+    raise notice 'SCHEMA_NAME, %', stack7;
+    raise notice 'PG_EXCEPTION_DETAIL, %', stack8;
+    raise notice 'PG_EXCEPTION_HINT, %', stack9;
+    raise notice 'PG_EXCEPTION_CONTEXT, %', stack10;
+    -- 没有插入成功，返回NULL
+    */
+    return null;
+end;
+$$ language plpgsql strict;
+```
+如果以上调用返回NULL，说明插入失败，可能违反了唯一约束，应用端重试即可。    
+压测以上函数是否能无缝插入，压测时raise notice可以去掉。    
+```
+$ vi test.sql
+\set appid random(1,1000)
+\set userid random(1,2000000000)
+select f_uniq(:appid, :userid);
+164个并发  
+$ pgbench -M prepared -n -r -P 1 -f ./test.sql -c 164 -j 164 -T 10
+progress: 10.0 s, 85720.5 tps, lat 1.979 ms stddev 34.808
+transaction type: ./test.sql
+scaling factor: 1
+query mode: prepared
+number of clients: 164
+number of threads: 164
+duration: 10 s
+number of transactions actually processed: 827654
+latency average = 2.039 ms
+latency stddev = 35.674 ms
+tps = 75435.422933 (including connections establishing)
+tps = 75483.813182 (excluding connections establishing)
+script statistics:
+ - statement latencies in milliseconds:
+         0.001  \set appid random(1,1000)
+         0.000  \set userid random(1,2000000000)
+         2.034  select f_uniq(:appid, :userid);
+```
+验证  
+```
+postgres=# select count(*) from t_userid_dic ;
+ count  
+--------
+ 825815
+(1 row)
+postgres=# select appid,count(*),max(rowid) from t_userid_dic group by 1;
+ appid | count | max 
+-------+-------+-----
+   251 |   857 | 857
+   106 |   854 | 854
+   681 |   816 | 816
+   120 |   826 | 826
+   285 |   815 | 815
+   866 |   778 | 778
+   264 |   873 | 873
+......
+postgres=# select * from (select appid,count(*),max(rowid) from t_userid_dic group by 1) t where max<>count;
+ appid | count | max 
+-------+-------+-----
+(0 rows)
+```
+插入速度，无缝需求，完全符合要求。  
+生成1亿测试用户,APPID=1, 用于后面的测试  
+```
+truncate t_userid_dic;
+insert into t_userid_dic select 1, generate_series(1,100000000), generate_series(1,100000000);
+```
+2\. 实时变更表  
+为了提高写入性能，数据将实时的写入这张表，后台增量的将这个表的数据合并到TAG表。  
+```
+drop table IF EXISTS t_user_tags;
+create table IF NOT EXISTS t_user_tags(id serial8 primary key, appid int, userid int8, tag int, ins boolean, dic boolean default false);  
+create index idx_t_user_tags_id on t_user_tags(id) where dic is false;
+-- ins = true表示新增tag, =false 表示删除tag。  
+-- dic = true表示该记录设计的USERID已经合并到用户字典表  
+-- 这张表的设计有优化余地，例如最好切换使用，以清理数据，比如每天一张，保存31天。  
+```
+生成1.5千万测试数据(APPID=1 , USERID 总量20亿，随机产生, 新增tagid 范围1-10000, 删除tagid 范围1-1000)    
+```
+insert into t_user_tags (appid,userid,tag,ins) select 1, 2000000000*random(),10000*random(),true from generate_series(1,10000000);
+insert into t_user_tags (appid,userid,tag,ins) select 1, 2000000000*random(),5000*random(),false from generate_series(1,5000000);
+```
+3\. tag + userids bitmap 表，这个是最关键的表，查询量很大，从t_user_tags增量合并进这个表。  
+```
+drop table IF EXISTS t_tags;
+create table IF NOT EXISTS t_tags(id serial primary key, appid int, tag int, userids varbit);
+-- id可以用于advisory lock, 并行更新
+create unique index idx_t_tags_uk on t_tags(tag,appid);
+```
+生成1万个TAG的测试数据，每个TAG包含1亿个用户的BIT。方便下面的测试      
+```
+-- 生成随机bit  
+CREATE OR REPLACE FUNCTION public.randbit(integer)
+ RETURNS bit varying
+ LANGUAGE plpgsql
+ STRICT
+AS $function$
+declare
+  res varbit;
+begin
+  select (string_agg(mod((2*random())::int,2)::text,''))::varbit into res from generate_series(1,$1);
+  if res is not null then 
+    return res;
+  else
+    return ''::varbit;
+  end if;
+end;
+$function$
+create sequence seq;
+-- 并行插入10000条记录
+$ vi test.sql
+insert into t_tags(appid,tag,userids) select 1,nextval('seq'::regclass),randbit(100000000);
+$ pgbench -M simple -n -r -f ./test.sql -c 50 -j 50 -t 200
+```
+### 测试TAG组合查询性能
+这个指标显示了用户勾选一些TAG组合后，圈定并返回用户群体的性能。  
+测试方法很简单： 包含所有，不包含，包含任意。    
+1\. 包含以下TAG的用户ID  
+```
+userids (bitand) userids  
+```
+结果为bit位为1的用户  
+测试SQL如下  
+```
+-- 获取最大BIT的长度 
+with tmp as ( select max(bit_length(userids)) maxlen from t_tags where tag in (?,?,...) ) 
+select appid,userid from t_userid_dic, tmp 
+where appid = ? 
+and rowid = any 
+(
+  ( 
+    -- 正向取出1万个bit=1的用户, 如果要反向取，使用false(表示取最近的用户数据) 
+    -- rowid从0开始计数，刚好与bit下标起始位置匹配 
+    select bit_posite(res, 1, 10000, true) from 
+    (
+      select t1.userids & t2.userids & t3.userids & t4.userids AS res -- & ......
+       from
+           -- 根据最大长度, BIT补齐 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t1 , 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t2 , 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t3 , 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t4 
+          -- ......
+    ) t
+  )::int[]
+)
+;
+```
+性能数据  
+```
+with tmp as ( select max(bit_length(userids)) maxlen from t_tags where tag in (226833, 226830, 226836, 226834) ) 
+select appid,userid from t_userid_dic, tmp 
+where appid = 1  
+and rowid = any  
+(
+  ( 
+    select bit_posite(res, 1, 10000, true) from 
+    (
+      select t1.userids & t2.userids & t3.userids & t4.userids as res
+       from
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226833 ) t1 , 
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226830 ) t2 , 
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226836 ) t3 , 
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226834 ) t4 
+    ) t
+  )::int[]
+)
+;
+```
+2\. 不包含以下TAG的用户   
+```
+userids (bitor) userids  
+```
+结果为bit位为0的用户  
+测试SQL如下  
+```
+-- 获取最大BIT的长度 
+with tmp as ( select max(bit_length(userids)) maxlen from t_tags where tag in (?,?,...) ) 
+select appid,userid from t_userid_dic, tmp 
+where appid = ? 
+and rowid = any 
+(
+  ( 
+    -- 正向取出1万个bit=0的用户, 如果要反向取，使用false(表示取最近的用户数据)  
+    select bit_posite(res, 0, 10000, true) from 
+    (
+      select t1.userids | t2.userids | t3.userids | t4.userids AS res -- | ......
+       from
+           -- 根据最大长度, BIT补齐 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t1 , 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t2 , 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t3 , 
+         ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags where tag = ? ) t4 
+          -- ......
+    ) t
+  )::int[]
+)
+;
+```
+性能数据  
+```
+with tmp as ( select max(bit_length(userids)) maxlen from t_tags where tag in (226833, 226830, 226836, 226834) ) 
+select appid,userid from t_userid_dic, tmp 
+where appid = 1  
+and rowid = any  
+(
+  ( 
+    select bit_posite(res, 0, 10000, true) from 
+    (
+      select t1.userids | t2.userids | t3.userids | t4.userids as res
+       from
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226833 ) t1 , 
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226830 ) t2 , 
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226836 ) t3 , 
+          ( select set_bit_array(userids, 0, 0, array[tmp.maxlen-1]) userids from t_tags,tmp where tag = 226834 ) t4 
+    ) t
+  )::int[]
+)
+;
+```
+3\. 包含以下任意TAG  
+```
+userids (bitor) userids  
+```
+结果为bit位为1的用户  
+测试SQL如下  
+```
+-- 获取最大BIT的长度 
+with tmp as ( select max(bit_length(userids)) maxlen from t_tags where tag in (?,?,...) ) 
+select appid,userid from t_userid_dic, tmp 

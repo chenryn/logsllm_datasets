@@ -1,0 +1,165 @@
+# 漏洞成因
+  * pipe维护了一个`struct pipe_buffer`的数组，每个pipe_buffer指向一个page，page里存的就是pipe的数据
+  * 正常情况下，往pipe里写数据时会申请一个page，把数据拷贝到page里后再让pipe_buffer指向这个page。splice系统调用实现了一种零拷贝的技术，直接让pipe_buffer指向这个原始的数据page，这样就省去了内存拷贝的过程，提升效率
+  * 往pipe里写数据时不可能每次都正好是page_size的整数倍，如果每次写数据都要重新分配一个新的page来存，必然会造成空间的浪费。但是如果pipe_buffer的`PIPE_BUF_FLAG_CAN_MERGE`flag被置位，数据就会接着上一次的数据在同一个page中写入，而不是申请新的page，减少了空间的浪费
+  * 但是splice在给pipe_buffer赋值时没有初始化flag，这就造成之前被置位的`PIPE_BUF_FLAG_CAN_MERGE`flag不会被清除，所以只要先让所有的pipe_buffer的`PIPE_BUF_FLAG_CAN_MERGE`flag被置位，然后调用splice让pipe_buffer指向目标文件page cache，这时再向pipe里写数据就会直接修改page cache里的内容，造成任意文件覆盖漏洞
+# 源码分析
+以下源码来自[Linux5.8.1](https://elixir.bootlin.com/linux/v5.8.1/source)
+## pipe
+### 关键数据结构
+#### pipe_inode_info
+    /**
+     *  struct pipe_inode_info - a linux kernel pipe
+     *  @mutex: mutex protecting the whole thing
+     *  @rd_wait: reader wait point in case of empty pipe
+     *  @wr_wait: writer wait point in case of full pipe
+     *  @head: The point of buffer production
+     *  @tail: The point of buffer consumption
+     *  @note_loss: The next read() should insert a data-lost message
+     *  @max_usage: The maximum number of slots that may be used in the ring
+     *  @ring_size: total number of buffers (should be a power of 2)
+     *  @nr_accounted: The amount this pipe accounts for in user->pipe_bufs
+     *  @tmp_page: cached released page
+     *  @readers: number of current readers of this pipe
+     *  @writers: number of current writers of this pipe
+     *  @files: number of struct file referring this pipe (protected by ->i_lock)
+     *  @r_counter: reader counter
+     *  @w_counter: writer counter
+     *  @fasync_readers: reader side fasync
+     *  @fasync_writers: writer side fasync
+     *  @bufs: the circular array of pipe buffers
+     *  @user: the user who created this pipe
+     *  @watch_queue: If this pipe is a watch_queue, this is the stuff for that
+     **/
+    struct pipe_inode_info {
+        struct mutex mutex;
+        wait_queue_head_t rd_wait, wr_wait;
+        unsigned int head;
+        unsigned int tail;
+        unsigned int max_usage;
+        unsigned int ring_size;
+    #ifdef CONFIG_WATCH_QUEUE
+        bool note_loss;
+    #endif
+        unsigned int nr_accounted;
+        unsigned int readers;
+        unsigned int writers;
+        unsigned int files;
+        unsigned int r_counter;
+        unsigned int w_counter;
+        struct page *tmp_page;
+        struct fasync_struct *fasync_readers;
+        struct fasync_struct *fasync_writers;
+        struct pipe_buffer *bufs;
+        struct user_struct *user;
+    #ifdef CONFIG_WATCH_QUEUE
+        struct watch_queue *watch_queue;
+    #endif
+    };
+其中bufs是一个`struct
+pipe_buffer`的数组，默认数量为16，每个pipe_buffer能存储一个page的数据。这16个page组成一个环形缓冲区，用来存储管道里的数据。
+#### pipe_buffer
+    /**
+     *  struct pipe_buffer - a linux kernel pipe buffer
+     *  @page: the page containing the data for the pipe buffer
+     *  @offset: offset of data inside the @page
+     *  @len: length of data inside the @page
+     *  @ops: operations associated with this buffer. See @pipe_buf_operations.
+     *  @flags: pipe buffer flags. See above.
+     *  @private: private data owned by the ops.
+     **/
+    struct pipe_buffer {
+        struct page *page;
+        unsigned int offset, len;
+        const struct pipe_buf_operations *ops;
+        unsigned int flags;
+        unsigned long private;
+    };
+`PIPE_BUF_FLAG_CAN_MERGE`就包含在flags字段中，它将影响page指向的内存页
+### 写pipe
+调用write向pipe里写数据时会经过层层调用，最终实际调用pipe_write
+    static ssize_t
+    pipe_write(struct kiocb *iocb, struct iov_iter *from)
+    {
+        struct file *filp = iocb->ki_filp;
+        struct pipe_inode_info *pipe = filp->private_data;
+        unsigned int head;
+        ssize_t ret = 0;
+        size_t total_len = iov_iter_count(from);
+        ssize_t chars;
+        bool was_empty = false;
+        bool wake_next_writer = false;
+        /* Null write succeeds. */
+        if (unlikely(total_len == 0))
+            return 0;
+        __pipe_lock(pipe);
+        // 确保读者数量不为0
+        if (!pipe->readers) {
+            send_sig(SIGPIPE, current, 0);
+            ret = -EPIPE;
+            goto out;
+        }
+    #ifdef CONFIG_WATCH_QUEUE
+        if (pipe->watch_queue) {
+            ret = -EXDEV;
+            goto out;
+        }
+    #endif
+        /*
+         * Only wake up if the pipe started out empty, since
+         * otherwise there should be no readers waiting.
+         *
+         * If it wasn't empty we try to merge new data into
+         * the last buffer.
+         *
+         * That naturally merges small writes, but it also
+         * page-aligs the rest of the writes for large writes
+         * spanning multiple pages.
+         */
+        head = pipe->head;
+        was_empty = pipe_empty(head, pipe->tail);
+        chars = total_len & (PAGE_SIZE-1); // 要写入的数据的大小相对页帧大小的余数
+        // 如果余数不为0，且pipe不为空
+        if (chars && !was_empty) {
+            unsigned int mask = pipe->ring_size - 1;
+            // 当前头部的上一个缓冲区，因为要尝试将多余的数据与之前的数据合并
+            struct pipe_buffer *buf = &pipe->bufs[(head - 1) & mask]; 
+            int offset = buf->offset + buf->len;
+            // 如果PIPE_BUF_FLAG_CAN_MERGE被置位，且buf能容下chars大小的数据
+            if ((buf->flags & PIPE_BUF_FLAG_CAN_MERGE) &&
+                offset + chars page, offset, chars, from);
+                if (unlikely(ret len += ret;
+                // 如果没有其余数据需要写入，则退出
+                if (!iov_iter_count(from))
+                    goto out;
+            }
+        }
+        for (;;) {
+            // 确保对着数量不为0
+            if (!pipe->readers) {
+                send_sig(SIGPIPE, current, 0);
+                if (!ret)
+                    ret = -EPIPE;
+                break;
+            }
+            head = pipe->head;
+            // 如果pipe没被填满
+            if (!pipe_full(head, pipe->tail, pipe->max_usage)) {
+                unsigned int mask = pipe->ring_size - 1;
+                struct pipe_buffer *buf = &pipe->bufs[head & mask];
+                struct page *page = pipe->tmp_page; // tmp_page用来临时存数据
+                int copied;
+                // 如果tmp_page还未分配，则用alloc_page分配一个page并赋值
+                if (!page) {
+                    page = alloc_page(GFP_HIGHUSER | __GFP_ACCOUNT);
+                    if (unlikely(!page)) {
+                        ret = ret ? : -ENOMEM;
+                        break;
+                    }
+                    pipe->tmp_page = page;
+                }
+                /* Allocate a slot in the ring in advance and attach an
+                 * empty buffer.  If we fault or otherwise fail to use
+                 * it, either the reader will consume it or it'll still
+                 * be there for the next write.
+                 */

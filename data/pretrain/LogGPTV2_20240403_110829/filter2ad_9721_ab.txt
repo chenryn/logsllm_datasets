@@ -1,0 +1,131 @@
+        854                 new->cap_permitted = cap_intersect(new->cap_permitted,
+        855                                                    old->cap_permitted);
+        856         }
+        857 
+        858         new->suid = new->fsuid = new->euid;
+        859         new->sgid = new->fsgid = new->egid;
+        ===================== skip ======================
+    }
+如上
+  * 行 845, 检测 euid 是否跟原有的 uid 不一致 (在函数 bprm_fill_uid 分析里我们知道，如果执行的文件是 setuid bit 的， euid 就会不一致)
+`所以这里等同于检测执行的可执行程序是不是 setid 程序`
+  * 行 847, 检测本进程是否是 tracee
+如果两个条件同时满足，需要执行 ptracer_capable 函数进行权限检测，假设检测不通过， 会执行 downgrade 降权
+  * 行 851, 将 new->euid 的值重新变成 new->uid， 就是说在函数 bprm_fill_uid 里提的权在这里可能又被降回去
+    499 bool ptracer_capable(struct task_struct *tsk, struct user_namespace *ns)
+    500 {
+    501         int ret = 0;  /* An absent tracer adds no restrictions */
+    502         const struct cred *cred;
+    503         rcu_read_lock();
+    504         cred = rcu_dereference(tsk->ptracer_cred); // ptracer_cred’
+  * 行 506, 进入 lsm 框架对 ‘tsk->ptracer_cred’ 进行检测
+到了这里， 这个漏洞涉及到的变量 ‘tsk->ptracer_cred’ 终于出现了， 如前所述，这个变量是建立 trace 关系时， tracee 保存的
+tracer 的 cred
+当 tracee 随后执行 execve 去执行 suid 可执行程序时，就会调用 ptracer_capable 这个函数， 通过 lsm
+里的安全框架去判断 ‘ptracer_cred’ 的权限
+lsm 框架里的 capable hook 检测我们这里不分析了， 简单来说， 如果 tracer 本身是 root 权限， 则这里的检测会通过，
+如果不是， 就会返回失败
+根据前面的分析，如果 ptracer_capable 检测失败， new->euid 的权限会被降回去
+举个例子， A ptrace B , B execve 执行 ‘/usr/bin/passwd’, 根据上面代码的分析， 如果 A 是 root 权限， 则
+B 执行 passwd 时的 euid 是 root, 否则就还是原有的权限
+    kernel/ptrace.c >
+                 ptrace_link(current, current->real_parent);  
+    static void ptrace_link(struct task_struct *child, struct task_struct *new_parent)
+    {
+            rcu_read_lock();
+            __ptrace_link(child, new_parent, __task_cred(new_parent));
+            rcu_read_unlock();
+    }
+回到漏洞代码, 为什么 traceme 在建立 trace link 时记录 parent 的 cred 是不对的呢? 明明这时候 parent 就是
+tracer 啊?
+我们用 Jann Horn 举的例子来说明为什么 traceme 这种方式建立 trace link 时不能使用 tracer 的 cred
+    - 1, task A: fork()s a child, task B
+    - 2, task B: fork()s a child, task C
+    - 3, task B: execve(/some/special/suid/binary)
+    - 4, task C: PTRACE_TRACEME (creates privileged ptrace relationship)
+    - 5, task C: execve(/usr/bin/passwd)
+    - 6, task B: drop privileges (setresuid(getuid(), getuid(), getuid()))
+    - 7, task B: become dumpable again (e.g. execve(/some/other/binary))
+    - 8, task A: PTRACE_ATTACH to task B
+    - 9, task A: use ptrace to take control of task B
+    - 10, task B: use ptrace to take control of task C
+如上场景有 3 个进程 A, B, C
+  * 第 4 步， task C 使用 PTRACE_TRACE 建立跟 B 的 trace link 时， 由于 B 此时是 euid = 0 (因为它刚刚执行了 suid binary), 所以 C 记录的 ptracer_cred 的 euid 也是 0
+  * 第 5 步， task C 随后执行 execve(suid binary), 根据我们上面的分析，由于 C 的 ptracer_cred 是特权的， 所以 ptracer_capable 函数检测通过，所以执行完 execve 后， task C 的 euid 也提权成 0 , 注意此时 B 和 C 的 trace link 还是有效的
+  * 第 6 步， task B 执行 setresuid 将自己降权， 这个降权的目的是为了能让 task A attach
+  * 第 8 步， task A 使用 PTRACE_ATTACH 建立跟 B 的 trace link, A 和 B 都是普通权限, 之后 A 可以控制 B 执行任何操作
+  * 第 9 步， task B 控制 task C 执行提权操作
+前面 8 步，依据之前的代码分析都是成立的，那么第 9 步能不能成立呢?
+执行第 9 步时， task B 本身是普通权限， task C 的 euid 是 root 权限， B 和 C 的 trace link 有效,
+这种条件下 B 能不能发送 ptrace request 让 C 执行各种操作，包括提权操作?
+下面我们结合代码分析这个问题
+    1111 SYSCALL_DEFINE4(ptrace, long, request, long, pid, unsigned long, addr,
+    1112                 unsigned long, data)
+    1113 {
+    1114         struct task_struct *child;
+    1115         long ret;
+    1116 
+    1117         if (request == PTRACE_TRACEME) {
+    1118                 ret = ptrace_traceme(); //  ptrace_request 
+          -> generic_ptrace_peekdata
+              generic_ptrace_pokedata 
+                 -> ptrace_access_vm 
+                      -> ptracer_capable 
+     kernel/ptrace.c
+     884 int ptrace_request(struct task_struct *child, long request,
+     885                    unsigned long addr, unsigned long data)
+     886 {
+     887         bool seized = child->ptrace & PT_SEIZED;
+     888         int ret = -EIO;
+     889         siginfo_t siginfo, *si;
+     890         void __user *datavp = (void __user *) data;
+     891         unsigned long __user *datalp = datavp;
+     892         unsigned long flags;
+     893 
+     894         switch (request) {
+     895         case PTRACE_PEEKTEXT:
+     896         case PTRACE_PEEKDATA:
+     897                 return generic_ptrace_peekdata(child, addr, data);
+     898         case PTRACE_POKETEXT:
+     899         case PTRACE_POKEDATA:
+     900                 return generic_ptrace_pokedata(child, addr, data);
+     901 
+     =================== skip ================
+     1105 }
+     1156 int generic_ptrace_peekdata(struct task_struct *tsk, unsigned long addr,
+     1157                             unsigned long data)
+     1158 {
+     1159         unsigned long tmp;
+     1160         int copied;
+     1161 
+     1162         copied = ptrace_access_vm(tsk, addr, &tmp, sizeof(tmp), FOLL_FORCE); // ptrace ||
+    49             (current != tsk->parent) ||
+    50             ((get_dumpable(mm) != SUID_DUMP_USER) &&
+    51              !ptracer_capable(tsk, mm->user_ns))) { // ptracer_cred);
+    505         if (cred)
+    506                 ret = security_capable_noaudit(cred, ns, CAP_SYS_PTRACE);
+    507         rcu_read_unlock();
+    508         return (ret == 0);
+    509 }
+如上， ptrace_access_vm 函数会调用我们之前分析到的 ‘ptracer_capable’ 来决定这个 request 是否可以进行, 这是
+‘ptracer_capable’ 函数的第二种使用场景
+根据之前我们分析的结果， task C 此时保存的 ptracer_cred 是特权 cred, 所以这时候 ptracer_capable 会通过，
+也就是说我们回答了刚刚的问题， 这种情况下，普通权限的 task B 是可以发送 ptrace request 去读写 root 权限的 task C
+的内存区和代码区的
+至此，task C 记录的这个特权 ptracer_cred 实际上发挥了 2 种作用
+  * 1，可以让 task C 执行 execve(suid binary) 给自己提权
+  * 2，可以让普通权限的 task B 执行 ptrace 读写 task C 的代码区和内存区，从而控制 task C 执行任意操作
+上面 2 点合起来，不就是完整的提权操作吗?
+## 小结
+我们仔细回顾上述代码分析过程， 才终于明白补丁描述写的这段话
+    PTRACE_TRACEME records the parent's credentials as if the parent was 
+    acting as the subject, but that's not the case.  If a malicious
+    unprivileged child uses PTRACE_TRACEME and the parent is privileged, and
+    at a later point, the parent process becomes attacker-controlled
+    (because it drops privileges and calls execve()), the attacker ends up
+    with control over two processes with a privileged ptrace relationship,
+    which can be abused to ptrace a suid binary and obtain root privileges.
+本质上这个漏洞有点像 [TOCTOU](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use) 类漏洞, ptracer_cred 的获取是在 traceme 阶段, 而 ptracer_cred 的应用是在随后的各种 request 阶段，
+而在随后的 ptrace request 的时候， tracer 的 cred 可能已经不是一开始建立 trace link 时的那个 cred 了
+    diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+    index 8456b6e..705887f 100644

@@ -1,0 +1,113 @@
+# 针对 Windows 事件跟踪日志篡改的攻防研究
+##### 译文声明
+本文是翻译文章，文章原作者 palantir，文章来源：medium.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前言
+[Windows事件跟踪](https://blogs.msdn.microsoft.com/ntdebugging/2009/08/27/part-1-etw-introduction-and-overview/)(Event Tracing for
+Windows,ETW)是Windows用于跟踪和记录系统事件的机制。攻击者经常通过清除事件日志来掩盖他们的踪迹。虽然清除事件日志会生成事件，但熟悉ETW的攻击者可能会利用篡改技术暂时中止甚至永久停止日志记录，并且整个过程不会生成任何事件日志。
+Windows事件日志是Palantir应急小组的[警报和检测策略](https://medium.com/palantir/alerting-and-detection-strategy-framework-52dc33722df2)的数据源，因此熟悉事件日志篡改操作对我们至关重要。我们不断地评估关于事件数据源完整性的假设，记录盲点，并调整实现。这篇文章的目的是与社区分享ETW背景和基础知识、事件日志篡改技术和检测策略。
+## ETW和事件日志
+[ETW结构](https://docs.microsoft.com/en-us/windows/desktop/etw/about-event-tracing)分为三个部分：事件提供者(provider)、事件消费者(consumers)和事件跟踪会话(tracing
+session)。跟踪会话负责从提供者收集事件，并传送到日志文件和消费者。会话由控制者(controller)创建和配置，比如内置的logman.exe命令行工具。下面是一些常用的命令，用于搜索现有的跟踪会话和各自的ETW提供者；请注意，这些命令通常需要足够的权限才能运行。
+###  列出所有正在运行的跟踪会话
+    > logman query -ets
+    Data Collector Set                Type    Status
+    -------------------------------------------------    Circular Kernel Context Logger    Trace   Running
+    AppModel                          Trace   Running
+    ScreenOnPowerStudyTraceSession    Trace   Running
+    DiagLog                           Trace   Running
+    EventLog-Application              Trace   Running
+    EventLog-System                   Trace   Running
+    LwtNetLog                         Trace   Running
+    NtfsLog                           Trace   Running
+    TileStore                         Trace   Running
+    UBPM                              Trace   Running
+    WdiContextLog                     Trace   Running
+    WiFiSession                       Trace   Running
+    UserNotPresentTraceSession        Trace   Running
+    Diagtrack-Listener                Trace   Running
+    MSDTC_TRACE_SESSION               Trace   Running
+    WindowsUpdate_trace_log           Trace   Running
+###  列出所有订阅跟踪会话的提供者
+    > logman query "EventLog-Application" -ets
+    Name:                 EventLog-Application
+    Status:               Running
+    Root Path:            %systemdrive%PerfLogsAdmin
+    Segment:              Off
+    Schedules:            On
+    Segment Max Size:     100 MB
+    Name:                 EventLog-ApplicationEventLog-Application
+    Type:                 Trace
+    Append:               Off
+    Circular:             Off
+    Overwrite:            Off
+    Buffer Size:          64
+    Buffers Lost:         0
+    Buffers Written:      242
+    Buffer Flush Timer:   1
+    Clock Type:           System
+    File Mode:            Real-time
+    Provider:
+    Name:                 Microsoft-Windows-SenseIR
+    Provider Guid:        {B6D775EF-1436-4FE6-BAD3-9E436319E218}
+    Level:                255
+    KeywordsAll:          0x0
+    KeywordsAny:          0x8000000000000000 (Microsoft-Windows-SenseIR/Operational)
+    Properties:           65
+    Filter Type:          0
+    Provider:
+    Name:                 Microsoft-Windows-WDAG-Service
+    Provider Guid:        {728B02D9-BF21-49F6-BE3F-91BC06F7467E}
+    Level:                255
+    KeywordsAll:          0x0
+    KeywordsAny:          0x8000000000000000
+    Properties:           65
+    Filter Type:          0
+    ...
+    Provider:
+    Name:                 Microsoft-Windows-PowerShell
+    Provider Guid:        {A0C1853B-5C40-4B15-8766-3CF1C58F985A}
+    Level:                255
+    KeywordsAll:          0x0
+    KeywordsAny:          0x9000000000000000 (Microsoft-Windows-PowerShell/Operational,Microsoft-Windows-PowerShell/Admin)
+    Properties:           65
+    Filter Type:          0
+该命令详细说明了跟踪会话的配置，还有每个订阅会话的提供者的配置，包括以下参数：
+  * Name: 提供者的名称。提供者只有在有已注册的manifest的情况下才有名称，但它始终具有唯一的GUID。
+  * Provider GUID: 提供者的GUID。在对特定提供者进行分析或操作时，GUID和（或）提供者的名称非常有用。
+  * Level: 指定日志记录级别。标准的日志记录级别是：0-Log Always；1- Critical；2-Error；3-Warning；4- Informational；5-Verbose。也可以自定义日志记录级别，但级别6-15是保留的。每个ORing级别可以捕获多个日志记录级别；通常使用255(0xFF)捕获所有支持的日志记录级别。
+  * KeywordsAll: 关键字用于筛选特定类别的事件。日志记录级别用于按事件详细/重要性进行筛选，而关键字允许按事件类别进行筛选。关键字对应于特定的位值。所有这些都表明，对于由KeywordsAny匹配的给定关键字，应该根据KeywordsAll中的特定位掩码进行进一步的筛选。这个字段通常设置为零。在[这里](https://docs.microsoft.com/en-us/windows/desktop/wes/defining-keywords-used-to-classify-types-of-events)可以找到更多信息。
+  * KeywordsAny：基于指定的任意关键字组合启用筛选。这可以看作是逻辑或，而KeywordsAll是逻辑和。低位的6个字节指定特定提供者的关键字。高位的两个字节是在Windows SDK中的WinMeta.xml中保留和定义的。例如，在与事件日志相关的跟踪会话中，可以看到设置为特定值的高位字节。这对应于下面的一个或多个事件通道： 
+          0x01 - Admin channel
+      0x02 - Debug channel
+      0x04 - Analytic channel
+      0x08 - Operational channel
+  * Properties: 在写入事件时可以指定的可选ETW属性。目前支持的值(更多信息查看[这里](https://docs.microsoft.com/en-us/windows/desktop/ETW/enable-trace-parameters))： 
+          0x001 - EVENT_ENABLE_PROPERTY_SID
+      0x002 - EVENT_ENABLE_PROPERTY_TS_ID
+      0x004 - EVENT_ENABLE_PROPERTY_STACK_TRACE
+      0x008 - EVENT_ENABLE_PROPERTY_PSM_KEY
+      0x010 - EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0
+      0x020 - EVENT_ENABLE_PROPERTY_PROVIDER_GROUP
+      0x040 - EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0
+      0x080 - EVENT_ENABLE_PROPERTY_PROCESS_START_KEY
+      0x100 - EVENT_ENABLE_PROPERTY_EVENT_KEY
+      0x200 - EVENT_ENABLE_PROPERTY_EXCLUDE_INPRIVATE
+从检测的角度来看，`EVENT_ENABLE_PROPERTY_SID`、`EVENT_ENABLE_PROPERTY_TS_ID`、`EVENT_ENABLE_PROPERTY_PROCESS_START_KEY`是值得收集的字段。例如，`EVENT_ENABLE_PROPERTY_PROCESS_START_KEY`生成唯一标识进程的值。注意，Process
+ID不是进程实例的唯一标识符。
+  * 筛选器（Filter Type）：提供者可以选择其他筛选；支持的筛选器是在提供者manifest中定义的。实际上在所有注册的提供者上运行[TdhEnumerateProviderFilters](https://docs.microsoft.com/en-us/windows/desktop/api/tdh/nf-tdh-tdhenumerateproviderfilters)时，内置提供者都没有运行过滤器。eventprov.h(在Windows SDK中)中的一些预定义的筛选器类型：
+    0x00000000 - EVENT_FILTER_TYPE_NONE
+    0x80000000 - EVENT_FILTER_TYPE_SCHEMATIZED
+    0x80000001 - EVENT_FILTER_TYPE_SYSTEM_FLAGS
+    0x80000002 - EVENT_FILTER_TYPE_TRACEHANDLE
+    0x80000004 - EVENT_FILTER_TYPE_PID
+    0x80000008 - EVENT_FILTER_TYPE_EXECUTABLE_NAME
+    0x80000010 - EVENT_FILTER_TYPE_PACKAGE_ID
+    0x80000020 - EVENT_FILTER_TYPE_PACKAGE_APP_ID
+    0x80000100 - EVENT_FILTER_TYPE_PAYLOAD
+    0x80000200 - EVENT_FILTER_TYPE_EVENT_ID
+    0x80000400 - EVENT_FILTER_TYPE_EVENT_NAME
+    0x80001000 - EVENT_FILTER_TYPE_STACKWALK
+    0x80002000 - EVENT_FILTER_TYPE_STACKWALK_NAME
+    0x80004000 - EVENT_FILTER_TYPE_STACKWALK_LEVEL_KW

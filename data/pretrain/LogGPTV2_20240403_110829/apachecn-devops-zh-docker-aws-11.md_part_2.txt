@@ -1,0 +1,158 @@
+然后，使用相同的`aws cloudformation deploy`命令部署变更。
+在部署运行时，如果您打开 AWS 控制台，浏览到 cloudinformation 仪表板，并选择 todobackend 栈**事件**选项卡，您应该能够看到 cloudinformation 如何执行滚动更新:
+![](img/8bcbaeaf-b39e-44b4-89e1-f01e76b5a885.png)
+CloudFormation Rolling Updates
+在前面的截图中，您可以看到 CloudFormation 首先临时增加了自动缩放组的大小，因为它需要始终保持至少一个实例在运行。一旦新实例向云信息发出成功信号，自动缩放组中的旧实例将终止，滚动更新完成。
+此时，您可能会感到非常高兴——只需对您的云信息配置进行一点小小的更改，您就能够向栈中添加滚动更新。但是有一个问题，当旧的 EC2 实例被终止时，它立即被终止*。这实际上会导致服务中断，如果您导航到 CloudWatch 控制台，选择度量，在所有度量选项卡中选择 ECS **|** 集群名称，然后选择名为 todoback-cluster 的集群的 MemoryReservation 度量，您就可以看到这一指示。*
+ *以下屏幕截图显示了单击图表度量选项卡并将统计列更改为最小值并将周期更改为 1 分钟后的屏幕:
+![](img/a53807f6-88a9-49e8-938f-b488d5040709.png)
+ECS Memory Reservation
+如果您回顾一下前面截图中的时间线，您可以看到在 21:17:33，旧的 ECS 容器实例被终止，在前面的截图中，您可以看到集群的内存预留在 21:18 (09:18)相应地下降到 0%。这表明在这个时间点，没有实际的容器在运行，给定保留的集群内存百分比为 0，说明在旧实例被突然终止后，当 ECS 试图恢复 todobackend 服务到新的 ECS 容器实例时，出现了一个小的中断，尽管是短暂的。
+Because the minimum CloudWatch metrics resolution is 1 minute, it is possible that you may not observe the dip to 0% in the previous figure if ECS is able to recover the ECS service within a minute, but rest assured there is an outage to your application.
+显然这并不理想，正如我们之前讨论的，我们现在需要引入 EC2 自动扩展生命周期挂钩来解决这种情况。
+# 创建 EC2 自动扩展生命周期挂钩
+为了解决 EC2 实例终止影响我们的 ECS 服务的问题，我们现在需要创建一个 EC2 自动扩展生命周期挂钩，它将通知我们一个 EC2 实例即将终止。回到第一个图表，这需要几个资源:
+*   实际的生命周期挂钩
+*   一个生命周期挂钩角色，授予 EC2 自动缩放组向 SNS 主题发布生命周期挂钩通知的权限
+*   可以发布和订阅生命周期挂钩的社交网站主题
+以下示例演示了如何创建生命周期挂钩、生命周期挂钩角色和社交网络主题:
+```
+...
+...
+Resources:
+  ...
+  ...
+ LifecycleHook:
+ Type: AWS::AutoScaling::LifecycleHook
+ Properties:
+ RoleARN: !Sub ${LifecycleHookRole.Arn}
+ AutoScalingGroupName: !Ref ApplicationAutoscaling
+ DefaultResult: CONTINUE
+ HeartbeatTimeout: 900
+ LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+ NotificationTargetARN: !Ref LifecycleHookTopic
+ LifecycleHookRole:
+ Type: AWS::IAM::Role
+ Properties:
+ AssumeRolePolicyDocument:
+ Version: "2012-10-17"
+ Statement:
+ - Action:
+ - sts:AssumeRole
+ Effect: Allow
+ Principal:
+ Service: autoscaling.amazonaws.com
+ Policies:
+- PolicyName: LifecycleHookPermissions
+ PolicyDocument:
+ Version: "2012-10-17"
+ Statement:
+ - Sid: PublishNotifications
+ Action: 
+ - sns:Publish
+ Effect: Allow
+ Resource: !Ref LifecycleHookTopic
+ LifecycleHookTopic:
+ Type: AWS::SNS::Topic
+ Properties: {}
+  LifecycleHookSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Sub ${LifecycleHookFunction.Arn}
+      Protocol: lambda
+      TopicArn: !Ref LifecycleHookTopic    ...
+    ...
+```
+Creating Life Cycle Hook Resources in CloudFormation
+在前面的示例中，`LifecycleHook`资源创建了一个新的钩子，该钩子使用`AutoScalingGroupName`属性链接到`ApplicationAutoscaling`资源，并由即将终止的自动缩放组中的 EC2 实例触发，如为`LifecycleTransition`属性配置的值`autoscaling:EC2_INSTANCE_TERMINATING`所指定的。挂钩被配置为向名为`LifecycleHookTopic`的新 SNS 主题资源发送通知，链接的`LifecycleHookRole` IAM 角色授予`autoscaling.amazonaws.com`服务(在角色的`AssumeRolePolicyDocument`部分中指定)向该主题发布生命周期挂钩事件的权限。`DefaultResult`属性指定了在达到`HeartbeatTimeout`周期且没有收到挂钩响应的情况下应该创建的默认结果，在本例中是发送`CONTINUE`消息，指示自动缩放服务继续处理可能注册的任何其他生命周期挂钩。`DefaultResult`属性的另一个选项是发送`ABANDON`消息，该消息仍然指示自动缩放服务继续实例终止，但放弃处理可能配置的任何其他生命周期挂钩。
+最终的`LifecycleHookSubscription`资源创建了对`LifecycleHookTopic` SNS 主题资源的订阅，订阅了一个名为`LifecycleHookFunction`的 Lambda 函数资源，我们将很快创建这个资源，这意味着只要有消息发布到 SNS 主题，这个函数就会被调用。
+# 创建一个 Lambda 函数来使用生命周期挂钩
+随着各种生命周期挂钩资源的到位，难题的最后一块是创建一个 Lambda 函数和相关的资源，这些资源将订阅您在上一节中定义的生命周期挂钩 SNS 主题，并最终在发出生命周期挂钩操作可以继续的信号之前执行 ECS 容器实例清空。
+让我们首先关注 Lambda 函数本身及其需要执行的相关源代码:
+```
+...
+...
+Resources: LifecycleHookFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LifecycleHookFunctionLogGroup
+    Properties:
+      Role: !Sub ${LifecycleFunctionRole.Arn}
+      FunctionName: !Sub ${AWS::StackName}-lifecycleHooks
+      Description: !Sub ${AWS::StackName} Autoscaling Lifecycle Hook
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref ApplicationCluster
+      Code:
+        ZipFile: |
+          import os, time
+          import json
+          import boto3
+          cluster = os.environ['ECS_CLUSTER']
+          # AWS clients
+          ecs = boto3.client('ecs')
+          sns = boto3.client('sns')
+          autoscaling = boto3.client('autoscaling')
+          def handler(event, context):
+            print("Received event %s" % event)
+            for r in event.get('Records'):
+              # Parse SNS message
+              message = json.loads(r['Sns']['Message'])
+              transition, hook = message['LifecycleTransition'], message['LifecycleHookName']
+              group, ec2_instance = message['AutoScalingGroupName'], message['EC2InstanceId']
+              if transition != 'autoscaling:EC2_INSTANCE_TERMINATING':
+                print("Ignoring lifecycle transition %s" % transition)
+                return
+              try:
+                # Get ECS container instance ARN
+                ecs_instance_arns = ecs.list_container_instances(
+                  cluster=cluster
+                )['containerInstanceArns']
+                ecs_instances = ecs.describe_container_instances(
+                  cluster=cluster,
+                  containerInstances=ecs_instance_arns
+                )['containerInstances']
+                # Find ECS container instance with same EC2 instance ID in lifecycle hook message
+                ecs_instance_arn = next((
+                  instance['containerInstanceArn'] for instance in ecs_instances
+                  if instance['ec2InstanceId'] == ec2_instance
+                ), None)
+                if ecs_instance_arn is None:
+                  raise ValueError('Could not locate ECS instance')
+                # Drain instance
+                ecs.update_container_instances_state(
+                  cluster=cluster,
+                  containerInstances=[ecs_instance_arn],
+                  status='DRAINING'
+                )
+                # Check task count on instance every 5 seconds
+                count = 1
+                while count > 0 and context.get_remaining_time_in_millis() > 10000:
+                  status = ecs.describe_container_instances(
+                    cluster=cluster,
+                    containerInstances=[ecs_instance_arn],
+                  )['containerInstances'][0]
+                  count = status['runningTasksCount']
+                  print("Sleeping...")
+                  time.sleep(5)
+                if count == 0:
+                  print("All tasks drained - sending CONTINUE signal")
+                  autoscaling.complete_lifecycle_action(
+                    LifecycleHookName=hook,
+                    AutoScalingGroupName=group,
+                    InstanceId=ec2_instance,
+                    LifecycleActionResult='CONTINUE'
+                  )
+                else:
+                  print("Function timed out - republishing SNS message")
+                  sns.publish(TopicArn=r['Sns']['TopicArn'], Message=r['Sns']['Message'])
+              except Exception as e:
+                print("A failure occurred with exception %s" % e)
+                autoscaling.complete_lifecycle_action(
+                  LifecycleHookName=hook,
+                  AutoScalingGroupName=group,
+                  InstanceId=ec2_instance,
+                  LifecycleActionResult='ABANDON'
+                )
+      Runtime: python3.6
+      MemorySize: 128
