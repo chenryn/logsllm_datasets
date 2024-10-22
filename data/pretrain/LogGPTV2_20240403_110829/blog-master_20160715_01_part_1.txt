@@ -1,0 +1,173 @@
+## PostgreSQL 老湿机图解平安科技遇到的垃圾回收"坑"    
+### 作者                                                                                                     
+digoal                                                                                                      
+### 日期                                                                                                    
+2016-07-15              
+### 标签                                                                                                    
+PostgreSQL , mvcc , vacuum , naptime , iops , 垃圾回收 , 原理 , btree , 索引组织表                                            
+----                                                                                                    
+## 背景  
+近日收到 平安科技 海安童鞋 那里反馈的一个问题，在生产环境使用PostgreSQL的过程中，遇到的一个有点"不可思议"的问题。    
+一张经常被更新的表，通过主键查询这张表的记录时，发现需要扫描异常多的数据块。    
+本文将为你详细剖析这个问题，同时给出规避的方法，以及内核改造的方法。    
+文中还涉及到索引的结构解说，仔细阅读定有收获。    
+## 原因分析  
+1\. 和长事务有关，我在很多文章都提到过，PG在垃圾回收时，只判断垃圾版本是否是当前数据库中最老的事务之前的，如果是之后产生的，则不回收。    
+所以当数据库存在长事务时，同时被访问的记录被多次变更，造成一些垃圾版本没有回收。    
+![screenshot](20160715_01_pic_001.png)  
+2\. PG的索引没有版本信息，所以必须要访问heap tuple获取版本。    
+![screenshot](20160715_01_pic_002.png)  
+## 复现方法  
+测试表    
+```  
+postgres=# create unlogged table test03 (id int primary key, info text);  
+```  
+频繁更新100条记录    
+```  
+$ vi test.sql  
+\setrandom id 1 100  
+insert into test03 values(:id, repeat(md5(random()::text), 1000)) on conflict on constraint test03_pkey do update set info=excluded.info;  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 48 -j 48 -T 10000000  
+```  
+开启长事务，啥也不干    
+```  
+postgres=# begin;  
+BEGIN  
+postgres=# select txid_current();  
+ txid_current   
+--------------  
+   3474642778  
+(1 row)  
+```  
+经过一段时间的更新，发现需要访问很多数据块了。    
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from test03 where id=2;  
+                                                         QUERY PLAN                                                            
+-----------------------------------------------------------------------------------------------------------------------------  
+ Index Scan using test03_pkey on public.test03  (cost=0.42..8.44 rows=1 width=417) (actual time=0.661..4.440 rows=1 loops=1)  
+   Output: id, info  
+   Index Cond: (test03.id = 2)  
+   Buffers: shared hit=1753  
+ Planning time: 0.104 ms  
+ Execution time: 4.468 ms  
+(6 rows)  
+```  
+观察访问很多的块是heap块    
+```  
+postgres=# set enable_indexscan=off;  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from test03 where id=2;  
+                                                      QUERY PLAN                                                         
+-----------------------------------------------------------------------------------------------------------------------  
+ Bitmap Heap Scan on public.test03  (cost=4.43..8.44 rows=1 width=416) (actual time=5.818..5.819 rows=1 loops=1)  
+   Output: id, info  
+   Recheck Cond: (test03.id = 2)  
+   Heap Blocks: exact=1986  
+   Buffers: shared hit=1996  
+   ->  Bitmap Index Scan on test03_pkey  (cost=0.00..4.43 rows=1 width=0) (actual time=0.418..0.418 rows=1986 loops=1)  
+         Index Cond: (test03.id = 2)  
+         Buffers: shared hit=10  
+ Planning time: 0.200 ms  
+ Execution time: 5.851 ms  
+(10 rows)  
+```  
+提交长事务前，使用vacuum verbose可以看到无法回收这些持续产生的垃圾page(包括index和heap的page)。    
+提交长事务    
+```  
+postgres=# end;  
+COMMIT  
+```  
+等待autovacuum进程回收垃圾，delete half index page。    
+访问的数据块数量下降了。    
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from test03 where id=2;  
+                                                     QUERY PLAN                                                       
+--------------------------------------------------------------------------------------------------------------------  
+ Bitmap Heap Scan on public.test03  (cost=4.43..8.45 rows=1 width=417) (actual time=0.113..0.118 rows=1 loops=1)  
+   Output: id, info  
+   Recheck Cond: (test03.id = 2)  
+   Heap Blocks: exact=3  
+   Buffers: shared hit=14  
+   ->  Bitmap Index Scan on test03_pkey  (cost=0.00..4.43 rows=1 width=0) (actual time=0.067..0.067 rows=3 loops=1)  
+         Index Cond: (test03.id = 2)  
+         Buffers: shared hit=11  
+ Planning time: 0.101 ms  
+ Execution time: 0.148 ms  
+(10 rows)  
+```  
+## 深入分析  
+使用pageinspect观察测试过程中索引页的内容变化    
+创建extension    
+```  
+postgres=# create extension pageinspect;  
+```  
+开启长事务    
+```  
+postgres=# begin;  
+BEGIN  
+postgres=# select txid_current();  
+```  
+测试60秒更新    
+```  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 48 -j 48 -T 60  
+```  
+观察需要扫描多少数据块    
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from test03 where id=1;  
+                                                          QUERY PLAN                                                            
+------------------------------------------------------------------------------------------------------------------------------  
+ Index Scan using test03_pkey on public.test03  (cost=0.43..8.45 rows=1 width=417) (actual time=0.052..15.738 rows=1 loops=1)  
+   Output: id, info  
+   Index Cond: (test03.id = 1)  
+   Buffers: shared hit=2663  
+ Planning time: 0.572 ms  
+ Execution time: 15.790 ms  
+(6 rows)  
+postgres=# set enable_indexscan=off;  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from test03 where id=1;  
+                                                      QUERY PLAN                                                         
+-----------------------------------------------------------------------------------------------------------------------  
+ Bitmap Heap Scan on public.test03  (cost=4.44..8.45 rows=1 width=417) (actual time=6.138..6.139 rows=1 loops=1)  
+   Output: id, info  
+   Recheck Cond: (test03.id = 1)  
+   Heap Blocks: exact=2651  
+   Buffers: shared hit=2663  
+   ->  Bitmap Index Scan on test03_pkey  (cost=0.00..4.44 rows=1 width=0) (actual time=0.585..0.585 rows=2651 loops=1)  
+         Index Cond: (test03.id = 1)  
+         Buffers: shared hit=12  
+ Planning time: 0.093 ms  
+ Execution time: 6.218 ms  
+(10 rows)  
+```  
+观察索引页, root=412, 层级=2        
+```  
+postgres=# select * from bt_metap('test03_pkey');  
+ magic  | version | root | level | fastroot | fastlevel   
+--------+---------+------+-------+----------+-----------  
+ 340322 |       2 |  412 |     2 |      412 |         2  
+(1 row)  
+```  
+查看root页内容      
+```  
+postgres=# select * from bt_page_stats('test03_pkey',412);  
+ blkno | type | live_items | dead_items | avg_item_size | page_size | free_size | btpo_prev | btpo_next | btpo | btpo_flags   
+-------+------+------------+------------+---------------+-----------+-----------+-----------+-----------+------+------------  
+   412 | r    |          3 |          0 |            13 |      8192 |      8096 |         0 |         0 |    2 |          2  
+(1 row)  
+postgres=# select * from bt_page_items('test03_pkey',412);  
+ itemoffset |  ctid   | itemlen | nulls | vars |          data             
+------------+---------+---------+-------+------+-------------------------  
+          1 | (3,1)   |       8 | f     | f    |   
+          2 | (584,1) |      16 | f     | f    | 21 00 00 00 00 00 00 00  
+          3 | (411,1) |      16 | f     | f    | 46 00 00 00 00 00 00 00  
+(3 rows)  
+```  
+查看最左branch 页内容      
+```  
+postgres=# select * from bt_page_items('test03_pkey',3);  
+ itemoffset |  ctid   | itemlen | nulls | vars |          data             
+------------+---------+---------+-------+------+-------------------------  
+          1 | (58,1)  |      16 | f     | f    | 21 00 00 00 00 00 00 00  
+          2 | (1,1)   |       8 | f     | f    |   
+          3 | (937,1) |      16 | f     | f    | 01 00 00 00 00 00 00 00  

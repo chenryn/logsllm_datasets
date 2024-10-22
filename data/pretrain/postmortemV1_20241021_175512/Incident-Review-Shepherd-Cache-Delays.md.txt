@@ -1,0 +1,250 @@
+Incident Review:
+Shepherd Cache Delays
+—
+In this incident review, we’ll cover the outage from September 8th, 2022, where our ingest
+system went down repeatedly and caused interruptions for over eight hours. We will first cover
+the background behind the incident with a high-level view of the relevant architecture, how we
+tried to investigate and fix the system, and finally, we’ll go over some meaningful elements that
+surfaced from our incident review process.
+The events
+Our ingestion path is one of these core parts of the system where we know there is continuously
+increasing stress, and that we will soon re-architect to support growth. Most salient bottlenecks
+and design flaws have been identified, and we have a list of fixes to apply to extend our runway
+while other, more brittle parts of the stack are addressed. One of these scaling limits is the
+in-memory caching mechanism used by Shepherd hosts, which stand at the edge of the system
+and accept all customer data.
+We noticed that when we had too many Shepherd hosts, CPU usage in our schema database
+(RDS) would rise, and response times would increase dramatically for a few minutes before
+cache filled up and stabilized.
+We had two short-term workarounds: scale the database up vertically so it can take more heat,
+or scale Shepherds up vertically so they use fewer hosts and the cost of filling the cache on a
+cold start—when scaling up or deploying—is minimized.
+
+In the last few weeks, we encountered these issues again and again. We decided to vertically
+scale up the schema database to fix this, but we still had occasional bad performance, without
+1
+
+its CPU shooting up. This hinted at contention somewhere, and to extend our runway, we slowed
+rollouts down massively.
+These seemed to work, trading off some operational costs (slow deploys) for stability while we
+scheduled corrective work (reducing contention, pre-warming the cache on boot to be more
+efficient) and worked around other issues that occured at the same time.
+But on September 8th, despite many mitigation efforts, we started running into crashes and
+cratering of performance, something our engineers called the “shark fin” pattern:
+This pattern lines up with a deployment. We expected the problem to self-resolve within 15
+minutes or so, but unlike what we saw before, this was a persistent,metastablefailure loop.
+Someone noticed that the Shepherd ingest hosts were running out of memory (OOM) and
+restarting. This was tied with cascading crashes in our Refinery cluster, which is in charge of
+sampling Shepherd traces for our Dogfood environment. A new theory emerged: something in
+Refinery went bad, and Shepherd assumed Refinery would be up. As such, it probably
+accumulated and queued up data, couldn’t flush it, ran out of space, and got killed.
+By now, the incident response had bubbled up to seven engineers doing five distinct
+investigations, some looking for mitigations and stabilization efforts, others digging into what
+events may have triggered the change. For example, we were growing the Shepherd connection
+2
+
+pools since they were saturated, and debugging our rate-limiting Redis pool that also was
+alerting.
+We decided to do more aggressive sampling in an attempt to stabilize the Refinery cluster by
+changing the sampling to keep less data. This seemed to work, and Shepherd also appeared to
+behave a bit better—though not perfectly—and sampling aggressively was impacting our ability
+to observe the system. Not long after, OOM errors recurred in both Shepherd and Refinery, so
+that wasn’t a workable fix.
+We were very much in a situation where we did not know how to explain what we were seeing,
+and we fell back to cache-adjacent issues. We tried to scale Shepherd up vertically to reduce
+their number, following a known recipe. Someone concurrently discovered an ingest traffic spike
+that correlated with all of this, but nothing seemed to really work. Everything was messy.
+And then, everything magically stabilized.
+This was both goodandbad. It was good because itgave people a break—several engineers
+reported being tired at this point—but it was bad because we hadno ideawhat caused the
+3
+
+system to stabilize, even with the benefit of days of investigation. Whatever circumstance
+triggered this had enough of an impact to also take out its own traces in the process. It is still a
+mystery what exactly tipped things over on that day.
+While ingest was back to a healthy level, engineers pinned builds in place to prevent other
+deployments from triggering issues again, and ordered each other to take a break. A few
+responders stayed behind to investigate, and one of them found a critical clue about how
+Shepherd’s cache works.
+Each Shepherd worker that receives customer data validates it against known data: keys, teams,
+dataset, schemas, column values. To ingest data as fast as possible, each Shepherd maintains
+a copy of the relevant data in memory, as a time-limited cache. The cache is filled on demand:
+the first time information is required and isn’t found locally, thegoroutinegrabs a database
+connection from a pool and asks for the information. It then inserts this data within the cache
+table and keeps going.
+The issue was that every time the cache table was updated, a lock was acquired. And the lock
+was a table-wide lock. So every time a missing entry was backfilled, the entire cache could grind
+to a halt for a brief time period. If many cache lines timed out at the same time, they could start
+piling up.
+4
+
+This could explain bad performance past a certain threshold, and be the cause of the “shark fin”
+graphs. However, we still had no idea what sort of event would trigger this bad state. Our past
+experience always involved the database being overtaxed, which wasn’t the case here. Even
+today, as we write this, we haven’t found a satisfactory explanation.
+We suspect it could have been related to database contention for it to become coordinated
+cluster-wide, but maybe it was all Shepherd-internal too and timing-related. If the contention was
+at the database level, then having more hosts risked making things worse. If the triggering
+element was local, having fewer—but bigger—hosts or connection pools would make things
+worse by increasing local contention as well. Two possible fixes with opposite effects.
+At the turn of the hour, despite having pinned versions, a deployment went through anyway. At
+first it looked fine, and then the shark fin pattern started again. The deployment happened
+because of a peculiarity of our deployment mechanism. Our main repository contains CI/CD
+code that generates the build artifacts that run everywhere. These get put in a manifest file,
+which is used to direct which versions of components are rolled out in which environments.
+When we pin versions to prevent deployments from happening, this manifest file gets frozen,
+and since the artifacts don’t change, there is no need to roll them out.
+Unfortunately, our Kubernetes service definitions live as Helm charts that are located in a
+different repository, under the control of the platform team. These are not part of the manifest.
+Whenever the deployment mechanism runs, it uses the latest stable version of a chart and
+applies all changes. Automation is in place to confirm that all rollouts and changes are healthy,
+but this only prevents new changes from rolling out had they failed in non-production
+environments.
+Since these environments were healthy, all the small fixes we made to Shepherds’ charts in an
+attempt to investigate and fix the problem rolled out unimpeded. This cycled Shepherds, flushed
+their cache, and threw us back into the incident. Our deployment pipeline is a bit convoluted, so
+we weren’t surprised that not everyone knew pinning builds could still result in deployments.
+Back to our Shepherds. We still didn’t have good explanations, but we had less trust in the
+cache, and everyone felt tired. We got an initial all-hands-on-deck reaction, and as the incident
+ate more and more of our day, we ended up in a situation where nobody was fresh and available.
+One thing we tried was to force a scale-down of Shepherds to have a lower host count than
+what vertically scaling them up provided. One of the properties of a metastable system is that it
+remains in its state until you disrupt it: fewer (overworked) hosts could maybe get us out of the
+crash loop.
+5
+
+Minutes after we ran the command, the autoscaler decided we had too few
+Shepherds—crashlooping demands a lot of CPU—and added even more of them. We let go of
+this approach since we didn’t trust in it, and looked for other options. We found out that the
+Shepherd hosts stopped dying due to lack of memory (possibly due to being upsized) and
+instead were getting reaped by the Kubernetes scheduler because they were missing their
+liveness and readiness probes.
+When health checks don’t return in time, Kubernetes says “this pod is busted,” kills it, and
+creates a new one instead, which then tries to fill its cache. We gave the probes more time in
+case that would help the cache fills succeed.
+Meanwhile, two of us decided to fix the cache itself. We reached the end of the list of things we
+thought could help and fell back to our last-ditch option: develop and fix production code under
+pressure, while tired.
+This is generally considered a bad idea. Our preferred approach is to stabilize, understand,then
+fix while rested, but since nothing we did would stabilize the system, we felt as though we were
+backed into a corner.
+One engineer tried to reduce contention on the cache hot path. The other one worked on
+pre-filling the cache before Shepherd hosts accept traffic. Both were the ticketed items we
+wanted to tackle for our runway extension, but the context wasn’t ideal.
+Some responders tried to come up with new mitigation strategies in the meantime. False alarms
+also started popping up about disk usage on some of our Refinery hosts, but were deemed
+unrelated. After roughly two hours of waiting and trying other small things, the first fix for the
+cache-prefill was ready. The build rolled out at a high priority, and it instantly improved the
+situation: ingest, connection pools, Shepherds, and Kafka were all performing better. Only
+Refinery remained broken.
+This, incidentally, also resolved the causal link between Shepherd and Refinery: Shepherd could
+runjust finewithout Refinery, and we now had proof.Therefore, we could suggest that Shepherd
+going bad threw Refinery in a spiral, not the other way around.
+We pinned builds to maintain ingest stability until the next day. Some responders took off as it
+was now past midnight EDT (9 p.m. PDT). The rest tried to stabilize Refinery.
+One of our engineers who had past experience with Refinery luckily dropped by right then. The
+metastable failure loop in Refinery tends to be caused by a need to scale it out. When load was
+previously stable, we were able to run with only 90 hosts in the cluster. However, when crashes
+started happening and extra volume from Shepherd came in, there were insufficient hosts to
+6
+
+handle the burst load and to recover from partial failures. We needed to add another 20-30 hosts
+to get it out of the spiral.
+This was pointed out as a recurring problem: the Refinery cluster is stable enough that we only
+learn about its lack of capacity when it spirals out. Refinery is sort of invisible to most of us, and
+does not tend to get stress-tested much.
+Once everything was stable (though not optimal), everyone went to sleep. Our plan was to
+investigate and clean up more fixes on the next day,only for this effort to be interrupted by an
+outage of the secret store provider we use. As wefixedthatincident and came back to return
+Refinery’s usual sampling rate, all other pending alerts cleared up.
+All in all, this outage took out a serious portion of our ingest data for over eight hours and a half,
+not all consecutive. We believe most customers sending data at the time may have been
+impacted at least partially.
+Analysis
+There were multiple interesting things about this incident. It revealed areas where various
+members of our engineering teams had built mental models of system components that proved
+inaccurate during incidents, and could even at times clash with each other. The incident review
+was an opportunity to contrast and highlight some specific elements, namely the importance of
+shark fin diagrams, how this type of outage is more exhausting than regular ones, the ability of
+evidence to self-destruct, and an overview of the fix we made.
+On shark fin diagrams
+One of the elements that came up in our review was a general interpretation of what shark fin
+diagrams mean.
+The shark fin graph comes up when you’re waiting for something to happen, requests start
+stacking up, and then they all complete at the same time.
+These graphs point at a blockage where the oldest request will have the longest duration, and
+the newest request (after you got blocked) the shortest one. As soon as the blocker (say a lock
+or long task) gets removed, everything completes rapidly.
+It is possible for tasks tonotbe blocked at thesame time, or on the same resource. This means
+that sometimes, requests that are partially blocked start and finishbeforerequests that are fully
+blocked.
+7
+
+As you watch the graph and refresh queries, it maylooklike everything is returning to normal,
+but a few minutes later, the worst offenders’ spans finally make it to Honeycomb and the chart
+looks wonky again. If your processing gets blocked for 10 minutes, it may therefore take 10
+minutes for the spike to show up. Once you realize this is happening, you have to introduce a
+delay in all your observations before you can confirm any corrective action has the desired
+effect.
+On causal confusion
+At one point during the incident, our understanding of the situation looked like the following
+diagram, where the areas in orange denote places where we observed unusual behavior:
+8
+
+Ingestion volume was higher (maybe retries, maybe overload), connection pools were filling up,
+Shepherd hosts were crashing, our rate-limiting host died (because it sometimes does—the
+timing wasn’t great), Kafka showed hiccups (as a consequence of Shepherd issues, we figured),
+9
+
+Refinery was overloaded and partly crashing while some disk was false-alarming as bad, and
+almost all of our observability data was in bad shape due to aggressive emergency sampling.
+Everything felt like it fed back into everything—we even foundsurprising failure modes in our
+lambda extension. The common patterns we knew thatdirected us towards cache issues were
+familiar enough to sound probable, but still too different to think we were in the same type of
+situation we were used to.
+This sort of situation—where everything seems broken and no one understands why/can’t do
+much to help—isextremelydemanding. Almost all participatingengineers reported feeling tired,
+found it hard to think, and were stressed out.
+In fact, many pointed out that on the following day when thesecret store outagehappened,
+knowing what to do (even if already tired from this incident’s handling) felt much better, even if
+things were faster-paced. Indeed, sitting around while feeling accountable to figure out what to
+do and how to fix things—and not succeeding—takes a toll on most people.
+Engineers involved in the incident were prompted to take time off in the following days to rest a
+bit. Most did, but still reported fatigue in the following days. The impact of these events on
+people tends to outlast the impact on the technical components of the sociotechnical system.
+This is something we try to keep in mind when evaluating our call rotations: the volume of alerts
+is a useful signal, but how confident you feel handling them can act as a multiplier and increase
+impact drastically.
+On the solution found
+Let’s be honest: we still don’t know what triggered all of this, we just know that it was fixed by
+the cache pre-fill. We have not encountered this specific failure mode before nor after this
+incident. We are confident the fix worked and is effective because it’s been through various
+rollouts, scale-ups and scale-downs, and we reverted most of the other temporary fixes that
+precariously kept things stable.
+Aside from that, the incident review pointed out interesting challenges in mitigating and fixing
+the problem:
+● Database contention would require fewer Shepherd hosts to properly lower contention at
+the database level (fewer instances trying to fill their cache at once) and mitigate the
+problem.
+● Shepherd-internal contention would require more Shepherd hosts to properly lower
+contention at the cache table level (fewer Go workers trying to refresh the local cache at
+once) and mitigate the problem.
+10
+
+There is also the possibility thatbothmechanisms were contending at the same time, leaving us
+in a no-win situation where any action can potentially make the problem worse. We can’t
+eliminate any of them, but pre-filling the cache reduced enough of the blocking to prevent either
+type of concern. But we still don’t know exactly how it managed to make things work, and we
+have accepted that we probably won’t figure it out.
+The data simply isn’t there anymore, our runway has been extended, and we’re now looking for
+longer-term fixes that circumvent the overall pattern via next-generation architecture. The
+current caching mechanism is sadly some of the oldest code in the company, and Shepherd is
+the oldest service we have.
+This is, we assume, part of the normal software development life cycle going through rapid
+growth. While we hope to be ahead of the scaling curve, this sort of incident shows that we’re
+sometimes going to be a few days late, and this may have unpleasant effects. Surprises are par
+for the course, and we hope to extract as much value as we can from these events, whenever
+they come up.
+We’re hoping that you find useful information in this report as well. Let us know your thoughts in
+ourPollinators community on Slack.
+11

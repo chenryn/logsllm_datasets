@@ -1,0 +1,167 @@
+            BEGIN_IPC(getDbName) 
+            string result = Server::database(db)->dbName();
+    -       assert(result.length() dbName(name);
+            END_IPC(DL)
+    }
+补丁中，在 `ucsp_server_{get, set}DbName`中新增对路径名字的检查（checkPathLength），防止超长的 dbName
+溢出固定长度（PATH_MAX）的 name。
+因为`std::string` 与 `strlen`都会被且仅能被 `“\0”`截断，所以 `setDbName` 与 `getDbName`
+的处理方式就一致了。
+### CVE-2019-8520 （10.14.4 版本修复）
+通过对比两个版本之间的源码，发现了 CVE-2019-8520 漏洞的补丁。
+该漏洞位于 `Security Server Daemon(securityd)` 中，`securityd（root）` 负责处理系统中的管理系统中的
+Authroization 和 Authentication，认证或者授权过程中，如果需要与用户交互（输入密码）以验证身份，securityd 就会通过
+XPC 与 Security Agent（当前用户身份运行）通信，由 Security Agent 负责弹框与用户交互。
+这个漏洞就出现在 securityd 与 Security Agent 的交互过程，securityd 在接收来自 Security Agent
+的数据时，通过 XPC 传入 data，data 的长度为 length，另外通过另一个字段传入 sensitivelength，拷贝的时候，从 data
+的起始位置拷贝长度为 sensitivelength 的内容到新创建的 dataCopy，因此，如果传入一个超长的
+sensitivelength，超过上面传入的 data 的实际长度，将导致 data 的越界拷贝，会越界读取 data 变量之后的内存。
+    --- a/Security-58286.240.4/securityd/src/agentquery.cpp
+    +++ b/Security-58286.251.4/securityd/src/agentquery.cpp
+    static void xpcArrayToAuthItemSet(AuthItemSet *setToBuild, xpc_object_t input) {
+        setToBuild->clear();
+        xpc_array_apply(input,  ^bool(size_t index, xpc_object_t item) {
+            const char *name = xpc_dictionary_get_string(item, AUTH_XPC_ITEM_NAME);
+            size_t length;
+            const void *data = xpc_dictionary_get_data(item, AUTH_XPC_ITEM_VALUE, &length); 
+            void *dataCopy = 0;
+            //  authd is holding on to multiple copies of my password in the clear  
+            bool sensitive = xpc_dictionary_get_value(item, AUTH_XPC_ITEM_SENSITIVE_VALUE_LENGTH);
+            if (sensitive) {
+               size_t sensitiveLength = (size_t)xpc_dictionary_get_uint64(item, AUTH_XPC_ITEM_SENSITIVE_VALUE_LENGTH);+
+               if (sensitiveLength > length) {+
+                 secnotice("SecurityAgentXPCQuery", "Sensitive data len %zu is not valid", sensitiveLength);+  
+                 return true;+ 
+                 }           
+                 dataCopy = malloc(sensitiveLength); 
+                 memcpy(dataCopy, data, sensitiveLength); 
+                 memset_s((void *)data, length, 0, sensitiveLength); // clear the sensitive data, memset_s is never optimized away
+                 length = sensitiveLength;
+             } else { 
+                dataCopy = malloc(length);
+                memcpy(dataCopy, data, length);
+             }        
+             uint64_t flags = xpc_dictionary_get_uint64(item, AUTH_XPC_ITEM_FLAGS);        
+             AuthItemRef nextItem(name, AuthValueOverlay((uint32_t)length, dataCopy), (uint32_t)flags); 
+             setToBuild->insert(nextItem); 
+             memset(dataCopy, 0, length); // The authorization items contain things like passwords, so wiping clean is important. 
+             free(dataCopy); 
+             return true; 
+        });
+    }
+漏洞的修复逻辑就是加了一个对 sensitiveLength 的长度检查，保证 memcpy 的长度不超过 data。
+### CVE-2019-8526（10.14.4 版本修复）
+通过比对代码，发现了补丁。
+    --- a/Security-58286.240.4/securityd/src/child.cpp
+    +++ b/Security-58286.251.4/securityd/src/child.cpp
+    @@ -57,7 +57,7 @@ ServerChild::ServerChild() 
+    // 
+    ServerChild::~ServerChild()
+    {
+    - mServicePort.destroy();
+    +       mServicePort.deallocate();
+    --- a/Security-58286.240.4/securityd/src/clientid.cpp
+    +++ b/Security-58286.251.4/securityd/src/clientid.cpp
+    @@ -45,14 +45,18 @@ ClientIdentification::ClientIdentification() 
+    // Initialize the ClientIdentification.
+    // This creates a process-level code object for the client.
+    //
+    -void ClientIdentification::setup(pid_t pid)
+    +void ClientIdentification::setup(Security::CommonCriteria::AuditToken const &audit) 
+    {
+         StLock _(mLock);
+         StLock __(mValidityCheckLock);
+    -    OSStatus rc = SecCodeCreateWithPID(pid, kSecCSDefaultFlags, &mClientProcess.aref());
+    -       if (rc)
+    -               secinfo("clientid", "could not get code for process %d: OSStatus=%d",
+    -                       pid, int32_t(rc));
+    +
+    +    audit_token_t const token = audit.auditToken();
+    +    OSStatus rc = SecCodeCreateWithAuditToken(&token, kSecCSDefaultFlags, &mClientProcess.aref());
+    +
+    +    if (rc) {+        secerror("could not get code for process %d: OSStatus=%d",+                audit.pid(), int32_t(rc));
+    +    } 
+         mGuests.erase(mGuests.begin(), mGuests.end());
+         }
+     --- a/Security-58286.240.4/securityd/src/csproxy.cpp
+     +++ b/Security-58286.251.4/securityd/src/csproxy.cpp
+     @@ -64,13 +64,12 @@ void CodeSigningHost::reset()
+             case noHosting:
+                  break;  // nothing to do
+             case dynamicHosting:-                  mHostingPort.destroy();- 
+                  mHostingPort = MACH_PORT_NULL;
+    +               mHostingPort.deallocate(); 
+            secnotice("SecServer", "%d host unregister", mHostingPort.port());                break;
+            case proxyHosting:
+            Server::active().remove(*this); // unhook service handler
+    -               mHostingPort.destroy(); // destroy receive right
+    +               mHostingPort.modRefs(MACH_PORT_RIGHT_RECEIVE, -1);                           mHostingState = noHosting;  
+                    mHostingPort = MACH_PORT_NULL;  
+                    mGuests.erase(mGuests.begin(), mGuests.end());
+    --- a/Security-58286.240.4/securityd/src/process.cpp
+    +++ b/Security-58286.251.4/securityd/src/process.cpp
+    @@ -40,7 +40,7 @@ 
+    // Construct a Process object.
+    //
+    Process::Process(TaskPort taskPort,    const ClientSetupInfo *info, const CommonCriteria::AuditToken &audit)
+    - :  mTaskPort(taskPort), mByteFlipped(false), mPid(audit.pid()), mUid(audit.euid()), mGid(audit.egid())
+    + :  mTaskPort(taskPort), mByteFlipped(false), mPid(audit.pid()), mUid(audit.euid()), mGid(audit.egid()), mAudit(audit)
+    {  
+         StLock _(*this);
+         @@ -48,6 +48,11 @@ Process::Process(TaskPort taskPort,  const    ClientSetupInfo *info, const CommonCri        =parent(Session::find(audit.sessionId(), true));
+         // let's take a look at our wannabe client...
+    +
+    +       // Not enough to make sure we will get the right process, as
+    +       // pids get recycled. But we will later create the actual SecCode using
+    +       // the audit token, which is unique to the one instance of the process,
+    +       // so this just catches a pid mismatch early.
+            if (mTaskPort.pid() != mPid) {
+                    secnotice("SecServer", "Task/pid setup mismatch pid=%d task=%d(%d)",
+                                     mPid, mTaskPort.port(), mTaskPort.pid());
+    @@ -55,7 +60,14 @@ Process::Process(TaskPort taskPort,  const ClientSetupInfo *info, const CommonCri        
+            } 
+            setup(info);
+    -       ClientIdentification::setup(this->pid());
+    +       ClientIdentification::setup(this->audit_token());
+这个漏洞正是之前读过 Paper 的 KeySteal 漏洞，补丁代码位于 securityd(Security Server Daemon)
+，securityd 在通过 MIG 实现 Hosting Guest Code 机制时存在问题。
+从补丁中可以看出漏洞存在的两个问题：
+第一个是实现 Hosting Guest Code 机制，securityd 在创建 SecCode 时，错误地使用
+SecCodeCreateWithPID 这个 API，这个 API 根据 pid 标识 Client Process，因此如补丁中的注释代码所说，存在
+PID Reuse 的问题。
+修复的方式是 SecCodeCreateWithPID 换做 SecCodeCreateWithAuditToken 用 audit token 表示
+client。关于 PID 方式有何问题，可以参考之前 Samuel Gro? 的[Don’t Trust the
+PID!](http://saelo.github.io/presentations/warcon18_dont_trust_the_pid.pdf)
+第二个是 Mach Port 的引用计数问题，`CodeSigningHost::reset()`调用 destory() 导致强制释放 Mach
+Port，被 destory 的 Mach Port 可能仍然被某些数据结构引用，同时因为用户态进程的 Mach Port 本身是 mach port
+name，其实就是个 number，既然是 number 就存在被 reuse 的可能。所以，在下次使用之前如果可以导致重新被占用，就可以实现
+UAF。补丁修复也很容易，就是 destory 改为引用计数版本的 deallocate()。
+### CVE-2018-4400（10.14.1 版本修复）
+这个漏洞 Apple 公告中的描述是处理 S/MIME 消息时拒绝服务，对比代码，得到的了疑似补丁，不敢完全确定
+    --- a/Security-58286.200.222/OSX/libsecurity_smime/lib/smimeutil.c
+    +++ b/Security-58286.220.15/OSX/libsecurity_smime/lib/smimeutil.c
+    @@ -733,6 +733,8 @@ SecSMIMEGetCertFromEncryptionKeyPreference(SecKeychainRef keychainOrArray, CSSM_
+            cert = CERT_FindCertByIssuerAndSN(keychainOrArray, rawCerts, NULL, tmppoolp, ekp.id.issuerAndSN);
+         break;
+            case NSSSMIMEEncryptionKeyPref_RKeyID:
+    +        cert = CERT_FindCertBySubjectKeyID(keychainOrArray, rawCerts, NULL, &ekp.id.recipientKeyID->subjectKeyIdentifier);
+    +        break;
+         case NSSSMIMEEncryptionKeyPref_SubjectKeyID:
+             cert = CERT_FindCertBySubjectKeyID(keychainOrArray, rawCerts, NULL, ekp.id.subjectKeyID);
+             break;
+对证书管理及相关的数据结构暂时还不太熟悉，暂时不进一步分析了
+上面这些是目前我找到的比较确定的一些漏洞及其补丁，因为 Apple 开源代码非常滞后，所以上面这些主要是 10.14.版本中涉及 `Security
+Framework`的漏洞的分析。
+## 总结
+以上就是我这段时间研究 Security Framework 并做的分享。因为 Security Framework 比较庞大，我只重点介绍了
+Keychain 以及历史上被发现漏洞比较多的 Security Server 组件。其他像 Auth
+组件来得及分析，等后续对这些组件有了新的研究，我将继续分享。
+如果发现上面的内容有错误，或者您也对 macOS 感兴趣，欢迎联系我 [@yuebinsun](http://twitter.com/yuebinsun
+"@yuebinsun")。
+## References
+  1. 
+  2. 
+  3. 
+  4. 
+  5. 
+* * *

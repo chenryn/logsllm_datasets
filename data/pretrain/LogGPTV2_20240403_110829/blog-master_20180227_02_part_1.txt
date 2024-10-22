@@ -1,0 +1,215 @@
+## PostgreSQL 全局ID分配(数据字典化)服务 设计实践    
+### 作者                                                               
+digoal                                                               
+### 日期                                                               
+2018-02-27                                                             
+### 标签                                                               
+PostgreSQL , 全局ID分配服务 , 序列 , UDF , plpgsql , 字典化          
+----                                                               
+## 背景      
+设计一个全局ID分配服务，要求：    
+### 功能性要求    
+1\.  输入字符串 返回 ID     
+i\.  已经存在系统中的字符串返回原ID 【严格要求】    
+ii\.  新字符串分配新ID  递增分配    
+2\.  输入ID 返回字符串    
+3\.  每个Topic一个ID序列    
+4\.  Topic可以动态增删    
+5\.  支持hsf调用    
+### 性能要求    
+1\.  支持 100万QPS以上的读访问    
+2\.  支持批量 双向查询读操作，一次批量100的查询延时在1ms    
+3\.  支持1万QPS左右的写操作     
+4\.  支持批量写操作 ，一次批量100的写延时在10ms    
+### 系统性要求    
+1\.  稳定可靠    
+2\.  数据完全一致    
+3\.  数据永远不丢    
+4\.  ID从0开始递增，尽量少空洞  【空洞占比少于 1%】    
+5\.  灾难自恢复    
+实际上在之前，我有写过另一个任务分配系统的设计。    
+[《PostgreSQL 高并发任务分配系统 实践》](../201712/20171216_01.md)      
+另一方面，如果业务要求完全无缝的自增ID，我也有对应的文档提及。    
+[《PostgreSQL 无缝自增ID的实现 - by advisory lock》](../201610/20161020_02.md)      
+那么接下来按本文开头提到的几个要求进行设计。    
+## 设计一、含组ID，每个组一个序列，序列和文本在单个组内唯一    
+1、设计一个UDF，自动生成与组ID一对一的序列，并返回序列的值。    
+```    
+create or replace function get_per_gp_id(    
+  text,   -- 序列名前缀  
+  int     -- 分组ID，作为序列名后缀  
+) returns int8 as $$    
+declare    
+begin    
+  return nextval(($1||$2)::regclass);    
+  exception when others then    
+    execute 'create sequence if not exists '||$1||$2||' start with 0 minvalue 0' ;    
+    return nextval(($1||$2)::regclass);    
+end;    
+$$ language plpgsql strict;    
+```    
+2、创建测试表    
+```    
+create table tbl1(    
+  gid int,   -- 分组ID  
+  ts text,   -- 文本  
+  sn int8,   -- 自增序列值  
+  unique(gid,ts),     
+  unique(gid,sn)    
+);    
+```    
+3、创建一个UDF，当输入组ID和文本时，如果文本存在，返回已有的序列，如果文本不存在则分配一个唯一ID，并返回这个ID。    
+```    
+create or replace function ins1(    
+  int,   -- 分组ID  
+  text   -- 文本  
+) returns int8 as $$    
+declare    
+  res int8;    
+begin    
+  -- 查看该分组内该文本是否已存在  
+  select sn into res from tbl1 where gid=$1 and ts=$2;    
+  if found then    
+    return res;    
+  else    
+    -- 不存在，则生成一个ID  
+    insert into tbl1 (gid,ts,sn) values ($1, $2, get_per_gp_id('seq_', $1)) returning sn into res;    
+    return res;    
+  end if;    
+  exception when others then    
+    -- 异常则可能是其他并行会话正在生成该序列，重新查询，并返回SN。  
+    select sn into res from tbl1 where gid=$1 and ts=$2;    
+    if found then    
+      return res;    
+    else     
+      raise ;    
+    end if;    
+end;    
+$$ language plpgsql strict;    
+```    
+## 设计二、不含组ID，文本和序列全局唯一    
+1、创建一个序列即可    
+```    
+create sequence seq_tbl2_sn start with 0 minvalue 0;    
+```    
+2、创建测试表    
+```    
+create table tbl2(    
+  ts text unique,   -- 文本  
+  sn int8 default nextval('public.seq_tbl2_sn'::regclass) unique  -- 序列  
+);    
+```    
+3、创建一个UDF，当输入文本时，如果文本已存在，返回文本对应的序列，如果文本不存在，则分配一个唯一序列值，同时返回该值。    
+```    
+create or replace function ins2(    
+  text    
+) returns int8 as $$    
+declare    
+  res int8;    
+begin    
+  -- 查看该文本是否已存在  
+  select sn into res from tbl2 where ts=$1;    
+  if found then    
+    return res;    
+  else    
+    -- 不存在，则生成一个ID  
+    insert into tbl2 (ts) values ($1) returning sn into res;    
+    return res;    
+  end if;    
+  exception when others then    
+    -- 异常则可能是其他并行会话正在生成该序列，重新查询，并返回SN。  
+    select sn into res from tbl2 where ts=$1;    
+    if found then    
+      return res;    
+    else     
+      raise ;    
+    end if;    
+end;    
+$$ language plpgsql strict;    
+```    
+## 设计三、含组ID，并且全局唯一    
+我们假设字典空间为40亿，则使用INT4。  
+如果字典空间超过40亿，则需要使用INT8。  
+1、创建序列，设置起始值为INT4的最小值  
+```  
+create sequence seq_tbl_dict minvalue -2147483648 start with -2147483648;  
+```  
+2、创建测试表    
+```    
+create table tbl_dict(    
+  gid int2,    -- 组ID  
+  ts text,     -- 文本  
+  sn int4 default nextval('public.seq_tbl_dict'::regclass),  -- 序列  
+  unique (gid,ts),  
+  unique (sn)  
+);    
+```    
+3、创建一个UDF，当输入文本时，如果文本已存在，返回文本对应的序列，如果文本不存在，则分配一个唯一序列值，同时返回该值。    
+```    
+create or replace function get_sn(int2, text) returns int as $$  
+declare  
+  res int;  
+begin    
+  -- 乐观查询  
+  select sn into res from tbl_dict where gid=$1 and ts=$2;   
+  if found then   
+    return res;   
+  end if;  
+  -- 如果没有查到，则插入  
+  insert into tbl_dict values($1,$2,nextval('public.seq_tbl_dict'::regclass)) on conflict (gid,ts) do nothing returning sn into res;  
+  if found then  
+    return res;  
+  -- 如果插入冲突，则继续查询返回sn  
+  else  
+    select sn into res from tbl_dict where gid=$1 and ts=$2;  
+    return res;  
+  end if;  
+end;  
+$$ language plpgsql strict;  
+```    
+## 批量操作用法    
+```    
+select ins1(gid, ts) from (values (),(),.....()) as t(gid, ts);    
+select ins2(ts) from (values (),(),.....()) as t(ts);    
+```    
+例子与性能，分配100条文本的ID约2毫秒    
+```    
+select ins1(id, 'test'||id) from generate_series(1,100) t(id);    
+...........    
+       0    
+(100 rows)    
+Time: 1.979 ms    
+```    
+## 写操作压测    
+1、包括组ID    
+```    
+vi test1.sql    
+\set gid random(1,10)    
+\set ts random(1,100000000)    
+select ins1(:gid, md5(:ts::text));    
+```    
+```    
+pgbench -M prepared -n -r -P 1 -f ./test1.sql -c 56 -j 56 -T 120    
+transaction type: ./test1.sql    
+scaling factor: 1    
+query mode: prepared    
+number of clients: 56    
+number of threads: 56    
+duration: 120 s    
+number of transactions actually processed: 18082960    
+latency average = 0.232 ms    
+latency stddev = 0.517 ms    
+tps = 150680.114138 (including connections establishing)    
+tps = 150687.227354 (excluding connections establishing)    
+statement latencies in milliseconds:    
+         0.001  \set gid random(1,10)    
+         0.000  \set ts random(1,100000000)    
+         0.230  select ins1(:gid, md5(:ts::text));    
+```    
+2、不包括组ID    
+```    
+vi test2.sql    
+\set ts random(1,100000000)    
+select ins2(md5(:ts::text));    
+```    
+```    

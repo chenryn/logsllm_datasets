@@ -1,0 +1,163 @@
+# 0 前言
+本编文章是笔者在复现CVE-2018-5146时参考的资料。  
+CVE-2018-5146是pwn2Own2018上用于攻下firefox浏览器的一个漏洞，这里不是我要分享的内容。笔者完全复现了这个漏洞，后面有机会将会放出详细的分析与复现过程。  
+**后续补充：我在 freebuf 写了这个漏洞 poc
+的构建过程，有兴趣点[这里](https://www.freebuf.com/vuls/210040.html "这里") 啦。**  
+回到该文章，原文链接：[The Shadow over Firefox](http://phrack.org/issues/69/14.html "The
+Shadow over Firefox")  
+由于文章是Firefox浏览器为载体，且版本比较低，文章中说提到的Firefox堆管理的特征，变量的特性等诸多知识,在最新版本的Firefox中或许已发生改变，不再是文中所说的情况。所以笔者在编写之中加上了一些自己分析的成果，不会完全按照原文进行翻译。作者在最后还给出了源代码，由于篇幅原因本文将不给出。  
+文章整体结构如下：
+  * 1.简介
+  * 2.Firefox和SpiderMonkey的内部
+    * 2.1 内存中的表现形式
+    * 2.2 分代垃圾收集（GGC）
+    * 2.3 jemalloc（和GGC）
+  * 3.Firefox的强化功能
+    * 3.1 PresArena
+    * 3.2 jemalloc堆清理
+    * 3.3 垃圾回收
+    * 3.4 沙盒
+  * 4.shadow在Firefox上的利用
+  * 5.Exploitation
+    * 5.1 数组对象中的对象
+    * 5.2 jemalloc风水
+    * 5.3 xul.dll基地址泄漏与我们在内存中的定位
+    * 5.4 EIP控制
+    * 5.5 任意地址泄漏
+    * 5.6 Use-after-free bugs
+  * 6.结论
+  * 7.参考文献
+# 1.简介
+本文的目标是在大多数操作系统提供的现代保护环境中，针对最新版本的Mozilla Firefox浏览器定义可重用的exploitation
+方法。这里的术语“exploitation ”是指利用内存损坏漏洞（不同类型的，即缓冲区溢出，释放后重用，类型混淆）。
+“可重用方法”是指可用于利用大多数漏洞和漏洞类的攻击模式。虽然本文中的材料来自Windows版本的Firefox，但据我所知，所包含的技术可以在Firefox支持的所有平台上使用。  
+具体来说，我在Windows 8.1
+x86-64上使用了最新版本的Firefox（撰写本文时为41.0.1）。请注意，Windows上的Firefox稳定版（即使在x86-64系统上）也是x86。
+# 2.Firefox和SpiderMonkey的内部
+首先将解释一些 exploitation开发所需的Firefox和SpiderMonkey内部的结构情况。
+SpiderMonkey（Firefox的JavaScript引擎）使用JS ::
+Value（或简称jsval）类型的C++变量来表示字符串，数字（包括整数和双精度），对象（包括数组和函数），布尔值以及特殊值null和undefined
+[JSV]。 当在JavaScript（JS）中将字符串分配给变量或对象的属性时，运行时必须能够查询其类型。
+因此，jsvals必须遵循对值和类型进行编码的表示。 为此，SpiderMonkey使用64位IEEE-754编码[IFP]。 具体来说，jsval
+double使用完整的64位作为其值。 所有其他jsvals（整数，字符串等）都使用32位进行编码，用于指定其类型的标记和用于其值的32位。
+在Firefox的源代码中，我们可以在js / public / Value.h中找到jsval类型的常量：
+    - #define JSVAL_TYPE_DOUBLE    ((uint8_t)0x00)
+    - #define JSVAL_TYPE_INT32     ((uint8_t)0x01)
+    - #define JSVAL_TYPE_UNDEFINED ((uint8_t)0x02)
+    - #define JSVAL_TYPE_BOOLEAN   ((uint8_t)0x03)
+    - #define JSVAL_TYPE_MAGIC     ((uint8_t)0x04)
+    - #define JSVAL_TYPE_STRING    ((uint8_t)0x05)
+    - #define JSVAL_TYPE_SYMBOL    ((uint8_t)0x06)
+    - #define JSVAL_TYPE_NULL      ((uint8_t)0x07)
+    - #define JSVAL_TYPE_OBJECT    ((uint8_t)0x08)
+然后使用这些常量来获取不同类型的32位jsval标记：
+    - #define JSVAL_TAG_CLEAR ((uint32_t)(0xFFFFFF80))
+    - #define JSVAL_TAG_INT32 ((uint32_t)(JSVAL_TAG_CLEAR | JSVAL_TYPE_INT32))
+    - #define JSVAL_TAG_UNDEFINED ((uint32_t)(JSVAL_TAG_CLEAR | \JSVAL_TYPE_UNDEFINED))
+    - #define JSVAL_TAG_STRING ((uint32_t)(JSVAL_TAG_CLEAR | JSVAL_TYPE_STRING))
+    - #define JSVAL_TAG_SYMBOL ((uint32_t)(JSVAL_TAG_CLEAR | JSVAL_TYPE_SYMBOL))
+    - #define JSVAL_TAG_BOOLEAN ((uint32_t)(JSVAL_TAG_CLEAR | \JSVAL_TYPE_BOOLEAN))
+    - #define JSVAL_TAG_MAGIC ((uint32_t)(JSVAL_TAG_CLEAR | JSVAL_TYPE_MAGIC))
+    - #define JSVAL_TAG_NULL ((uint32_t)(JSVAL_TAG_CLEAR | JSVAL_TYPE_NULL))
+    - #define JSVAL_TAG_OBJECT ((uint32_t)(JSVAL_TAG_CLEAR | JSVAL_TYPE_OBJECT))
+当SpiderMonkey运行时查询jsval的类型时，如果其32位标记值大于0xFFFFFF80（JSVAL_TAG_CLEAR从上面定义），那么64位将被解释为相应类型的jsval。如果标记值小于或等于0xFFFFFF80，则64位被解释为IEEE-754双精度。此时我将参考的一个重要注意事项是，没有IEEE-754
+64位双精度对应于大于0xFFF00000的32位编码值。
+除了jsvals之外，SpiderMonkey还使用JSObject
+[JSO]类型的复杂对象来表示各种JavaScript对象（jsobjects）。实质上，这些是从名称（对象属性）到值的映射。为了避免从这些属性到相应值（存储在jsobject的数组中）的"昂贵"的字典查找，SpiderMonkey使用名叫“形状”的结构。“形状”是直接从属性名称指向保存其值的数组索引的结构描述。
+JSObject类使用NativeObject类进行内部实现（确切地说，NativeObject类继承自JSObject类）。
+这些复杂对象还包含一个内联动态大小（但有数量限制）的数组，该数组用于存储命名属性，以及JavaScript数组和类型化数组的元素。
+第一个（命名属性）由slots指针索引，后者（数组元素）由elements指针索引。 实际存储可以是内联jsobject存储，也可以是堆上动态分配的区域。
+而且，jsobject数组有一个头; 此标头由ObjectElements类描述。 可以在js / src /
+jsobj.h中找到JSObject类的定义，在js / src / vm /
+NativeObject.h中可以找到NativeObject和ObjectElements的定义。
+下面我将一起讨论所有这些（将其视为伪代码），仅与本文相关的部分：
+    class NativeObject : public JSObject
+        {
+            /*
+             * From JSObject; 结构描述，以避免从属性名称到slots_数组索引的字典查找 
+             */
+            js::HeapPtrShape shape_;
+            /*
+             * From JSObject; jsobject的类型（与上面描述的jsval类型无关）
+             */
+            js::HeapPtrTypeObject type_;
+            /*
+             * From NativeObject; 指向jsobject属性存储的指针。
+             */
+            js::HeapSlot *slots_;
+            /*
+             * From NativeObject;  指向jsobject元素存储的指针
+             * 这由JavaScript数组和类型化数组使用。 正如上面所描述的那样，JavaScript数组的元素是jsvals
+             */
+            js::HeapSlot *elements_;
+            /*
+             * From ObjectElements;如何将数据写入elements_和其他元数据。
+             */
+            uint32_t flags;
+            /*
+             * From ObjectElements;初始化元素的数量，小于或等于非数组的jsobjects的容量（见下文），小于或等于数组的jsobjects的长度（见下文）。
+             */
+            uint32_t initializedLength;
+            /*
+             * From ObjectElements; 分配的slots数（为对象属性）。
+             */
+            uint32_t capacity;
+            /*
+             * From ObjectElements; 数组jsobjects的长度。
+             */
+            uint32_t length;
+        };
+在本文的以下部分中，将把它称为'jsobject'（或'jsobject类'），虽然从技术层面上来说是不正确的（正如上面所解释的），但这会使讨论更简单。
+## 2.1内存中的表现形式
+为了更好的分析，让我们看一下jsvals和jsobjects在内存中的表示。假设有以下JavaScript代码：
+    var arr = new Array();          // an array jsobject (ArrayObject)
+    arr[0]  = 0x40414140;           // [A] an integer
+    arr[1]  = "Hello, Firefox!";    // [B] a string
+    arr[2]  = 0x42434342;
+    arr[3]  = true;                 // [C] a boolean
+    arr[4]  = 0x44454544;
+    arr[5]  = new Array(666);       // [D] an object
+    // 给这个数组填充一些元素
+    arr[5][0] = 666;
+    arr[5][1] = "sixsixsix";
+    arr[5][2] = 0.666;
+    arr[5][3] = false;
+    arr[5][4] = new Array(666);
+    arr[6]  = 0x46474746;
+    arr[7]  = null;
+    arr[8]  = 0x48494948;
+    // [E] 初始化为32位无符号整数的对象
+    arr[9]  = new Uint32Array(128);
+    // 用一些数据来填充这个数组
+    // total size: 128 * 4 == 512
+    for(var j = 0; j  s -d 0 0x0 l?0xffffffff 40414140
+        09e10980  40414140 ffffff81 0f352880 ffffff85  @AA@.....(5.....
+        09e10a00  40414140 ffffff81 0f352880 ffffff85  @AA@.....(5.....
+可以看到两次找到我们的标记值0x40414140。现在，让我们从0x40414140之前的几个dwords进行内存转储;
+从WinDbg注释转储，以便于我们后续分析：
+    0:000> dd 09e10980-20 l?48
+        [ Our arr ArrayObject ]
+                  shape_   type_    slots    elements
+        09e10960  0eed89a0 0f3709b8 00000000 09e10a00
+        [ 旧元素的数据，ArrayObjects的默认长度为6 ]
+                  flags    initlen  capacity length
+        09e10970  00000000 00000006 00000006 00000006
+        [ 旧元素的地址 ]
+        09e10980  40414140 ffffff81 0f352880 ffffff85
+        09e10990  42434342 ffffff81 00000001 ffffff83
+        09e109a0  44454544 ffffff81 09e109b0 ffffff88
+        09e109b0  0eed89a0 0f3709e8 00000000 0c94e010
+        09e109c0  00000000 00000000 00000000 0000029a
+        09e109d0  0eed89a0 0f370a30 00000000 0d177010
+        09e109e0  00000000 00000000 00000000 0000029a
+        [ 重定位后元素的元数据，新ArrayObject的长度为0xe，或十进制为14 ]
+                  flags    initlen  capacity length
+        09e109f0  00000000 0000000e 0000000e 0000000e
+        [ 新元素的地址 ]
+                  int32 jsval [A]   string jsval [B]
+        09e10a00  40414140 ffffff81 0f352880 ffffff85
+                                    bool jsval [C]
+        09e10a10  42434342 ffffff81 00000001 ffffff83
+                                    object jsval (ArrayObject) [D]
+        09e10a20  44454544 ffffff81 09e109b0 ffffff88
+        09e10a30  46474746 ffffff81 00000000 ffffff87

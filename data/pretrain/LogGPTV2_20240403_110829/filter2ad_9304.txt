@@ -1,0 +1,135 @@
+**作者：wzt  
+原文链接：**
+这篇文章主要是讨论ios内核堆的分配特性，辟谣下：zalloc内存分配器并没有在释放内存时将object随机的插入到freelist链表里。xnu内核没有单独设计这个特性，这个只是zalloc架构特性导致的，无意中让风水的布局变困难了些。笔者分析过windows、linux、bsd这些os的内存分配器都没有发现释放随机化的安全特性，
+因为只有保持内存分配器fifo的特性，才能加快分配速度，任何一个内存分配器的设计值都不会违背这个原则。
+下面将仔细探讨下xnu的zalloc特性， 在xnu-4903内核中，一个zone有四条队列：
+    struct zone {
+            struct {
+                    queue_head_t                    any_free_foreign;       
+                    queue_head_t                    all_free;
+                    queue_head_t                    intermediate;
+                    queue_head_t                    all_used;
+            } pages;
+    }
+半满外围队列any_free_foreign，全空队列all_free，半满半空队列intermediate，全满队列all_used。我们先讨论下zcache关闭的情况下，在try_alloc_from_zone分配一个object内存时有如下调用：
+    static inline vm_offset_t
+    try_alloc_from_zone(zone_t zone,
+                            vm_tag_t tag __unused,
+                        boolean_t* check_poison)
+    {
+            if (zone->allows_foreign && !queue_empty(&zone->pages.any_free_foreign))
+                    page_meta = (struct zone_page_metadata *)queue_first(&zone->pages.any_free_foreign);
+            else if (!queue_empty(&zone->pages.intermediate))
+                    page_meta = (struct zone_page_metadata *)queue_first(&zone->pages.intermediate);
+            else if (!queue_empty(&zone->pages.all_free)) {
+                    page_meta = (struct zone_page_metadata *)queue_first(&zone->pages.all_free);
+                    assert(zone->count_all_free_pages >= page_meta->page_count);
+                    zone->count_all_free_pages -= page_meta->page_count;
+            } else {
+                    return 0;
+            }
+    }
+如果zone开启了allows_foreign并且any_free_foreign队列不为空，则从此队列取出队列头节点page_meta，从这个meta里分配内存，如果条件不符合，那么依次从intermediate半满半空队列里取meta，如果还是不符合，那么在从all_free队列里选meta。一个zone是否支持allows_foreign，是通过调用zone_change函数设置的，笔者搜索了整个xnu源码文件，发现只有vm自身的几个zone才会使用此标志，因此jailbreaker关心的zone，比如ipc_port都没有使用，这将简化exploit程序对堆风水布局的处理。当选取完meta后，通过page_metadata_get_freelist获取了meta上的第一个空闲节点，然后要通过page_metadata_set_freelist重新设置新的空闲节点，满足下次的分配需求。最后还要重新布局下当前meta所在的队列。try_alloc_from_zone函数最后有如下代码：
+    static inline vm_offset_t
+    try_alloc_from_zone(zone_t zone,
+                            vm_tag_t tag __unused,
+                        boolean_t* check_poison)
+    {
+            if (page_meta->free_count == 0) {[1]
+                    re_queue_tail(&zone->pages.all_used, &(page_meta->pages));
+            } else {
+                    if (!zone->allows_foreign || from_zone_map(element, zone->elem_size)) { 
+                            if (get_metadata_alloc_count(page_meta) == page_meta->free_count + 1) {[2]
+                                    re_queue_tail(&zone->pages.intermediate, &(page_meta->pages));
+                            }
+                    }
+            }
+    }
+[1] 当这个meta在分配完一个空闲节点后，
+如果free_count为0，说明meta已经没有空闲的节点了，那么就要将这个meta节点转移到all_used队列。
+[2]处的判断meta是否为一个全空的队列，当它分配一个空闲节点后，就变成半满的状态了，因此需要转移到半满队列intermediate。转移队列的操作函数为re_queue_tail：
+    re_queue_tail(queue_t que, queue_entry_t elt)
+    {
+            queue_entry_t   n_elt, p_elt;
+            /* remqueue */
+            n_elt = elt->next;[1]
+            p_elt = elt->prev;
+            n_elt->prev = p_elt;
+            p_elt->next = n_elt;
+            /* enqueue_tail */
+            p_elt = que->prev;[2]
+            elt->next = que;
+            elt->prev = p_elt;
+            p_elt->next = elt;
+            que->prev = elt;
+    }
+[1]
+处先从当前队列删除自身，然后[2]处将其挂载到新队列的末尾。注意这个操作是挂接到队尾，那么当出现一些极端状况发生队列转移时，如果新的队列节点不为空，就要等待前面所有的节点都被用完或发生队列迁移时，这个节点才会被调用到，这就发生了不是fifo的情况，对于jailbreaker的风水布局就会产生影响，这个状态被一些人误以为是ios提供了新的安全特性，在释放时”随机”的将object插入到freelist链表中。
+然后有个很有意思的事情发生了，
+在最新的xnu-7195.81.3内核中，笔者发现meta队列转移的操作不是挂接到队列末尾，而是队列头部，将队列变成fifo的链表了！
+    __header_always_inline void
+    zone_meta_queue_push(zone_t z, zone_pva_t *headp,
+        struct zone_page_metadata *meta, zone_addr_kind_t kind)
+    {
+            zone_pva_t head = *headp;
+            zone_pva_t queue_pva = zone_queue_encode(headp);             [1]
+            struct zone_page_metadata *tmp;
+            meta->zm_page_next = head; [2]
+            if (!zone_pva_is_null(head)) {
+                    tmp = zone_pva_to_meta(head, kind);
+                    if (!zone_pva_is_equal(tmp->zm_page_prev, queue_pva)) { [3]
+                            zone_page_metadata_list_corruption(z, meta);
+                    }
+                    tmp->zm_page_prev = zone_pva_from_meta(meta, kind);  [4]
+            }
+            meta->zm_page_prev = queue_pva;                           [5]
+            *headp = zone_pva_from_meta(meta, kind);                    [6]
+    }
+新内核的struct zone_page_metadata结构多了两个成员：
+    struct zone_page_metadata {
+            zone_pva_t      zm_page_next;
+            zone_pva_t      zm_page_prev;
+    }
+在zone中的队列头也使用zone_pva_t重新定义：
+    typedef struct zone_packed_virtual_address {
+            uint32_t packed_address;
+    } zone_pva_t
+    struct zone {
+            zone_pva_t          pages_any_free_foreign;     
+            zone_pva_t          pages_all_used_foreign;
+            zone_pva_t          pages_all_free;
+            zone_pva_t          pages_intermediate;
+            zone_pva_t          pages_all_used;
+            zone_pva_t          pages_sequester;
+    }
+从四条队列变为了六条队列，每个队列头的地址是被编码起来保存的，通过zone_pva_from_meta函数将一个meta进行转化编码为队列地址，其实就是meta地址在meta
+base中的偏移。每个meta结构通过双向链链表起来，如果meta是队列中的第一个节点，则它的zm_page_prev指向的是一个”特殊地址”,
+这个地址通过zone_queue_encode进行编码，主要原理是把当前队列的地址转为为在zone_array中的索引进行保存。当以后队列节点不为空时，通过[3]处的比较可以确定当前队列的头节点是否被破坏了。如果meta不是队列中的第一个节点，则指向前一个带有正确编码的队列地址。[6]处的操作将meta节点挂载到了最队列的头部，所以这是一个fifo的队列。
+在队列取节点时，也是从队列头取出，而不是队列末尾。
+    __header_always_inline struct zone_page_metadata *
+    zone_meta_queue_pop(zone_t z, zone_pva_t *headp, zone_addr_kind_t kind,
+        vm_offset_t *page_addrp)
+    {
+            zone_pva_t head = *headp;
+            struct zone_page_metadata *meta = zone_pva_to_meta(head, kind);
+            vm_offset_t page_addr = zone_pva_to_addr(head);
+            struct zone_page_metadata *tmp;
+            if (kind == ZONE_ADDR_NATIVE && !from_native_meta_map(meta)) {
+                    zone_page_metadata_native_queue_corruption(z, headp);
+            }
+            if (kind == ZONE_ADDR_FOREIGN && from_zone_map(meta, sizeof(*meta))) {
+                    zone_page_metadata_foreign_queue_corruption(z, headp);
+            }
+            if (!zone_pva_is_null(meta->zm_page_next)) {
+                    tmp = zone_pva_to_meta(meta->zm_page_next, kind);
+                    if (!zone_pva_is_equal(tmp->zm_page_prev, head)) {
+                            zone_page_metadata_list_corruption(z, meta);
+                    }
+                    tmp->zm_page_prev = meta->zm_page_prev;
+            }
+            *headp = meta->zm_page_next;
+            *page_addrp = page_addr;
+            return meta;
+    }
+那么在新内核里，对于布局堆的风水其实是更加便利了！
+* * *

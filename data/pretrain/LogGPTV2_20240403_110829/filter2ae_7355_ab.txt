@@ -1,0 +1,96 @@
+    }
+并且遗漏了一些可能在代码路径执行路径上可能不会调用verifyPath的函数，比如：
+    public void notAlwaysCallsVerify(boolean call) {
+      if (call) {
+        verifyPath();
+      }
+    }
+用VerifyPathActionConf，我现在就能寻找到那些直接执行SpEL表达式而没有调用verifyPath的地方。更特别的是，我想发现PATCH请求中仍然存在的漏洞。当发出PATCH请求能触发PatchOperation类的perform函数的时候，这标志着这个操作可能会有安全问题。比如
+    public void perform(Object target, Class type) {
+      spelExpression.getValue()
+    }
+在不先调用verifyPath的情况下直接评估spelExpression，我还需要确定可传递地评估spelExpression的情况：
+    public void perform(Object target, Class type) {
+      evaluateWithoutVerify();  //没有调用verifyPath的spelExpression
+    }
+还漏掉一种安全的情况
+    public void perform(Object target, Class type) {
+      verifyPath(type);
+      evaluateWithoutVerify();
+    }
+或者
+    public void perform(Object target, Class type) {
+      evaluateWithVerify(); //calls verifyPath before evaluation.
+    }
+与局部控制流分析不同，QL会找到更多的可能性和他们之间的传递关系，所以，QL处理这些场景会更加轻松一些。总之，不安全的调用应该满足下面的条件：
+  * 在进入表达式解析器之前没有调用verifyPath 
+  * 进入不安全的解析器函数之前没有调用verifyPath 
+我们看到一些不安全的调用被递归的定义，所以为了构造一个QL类，我们使用递归进行建模：
+    /** A method that evaluates the expression before calling `verifyPath`.*/
+    class UnsafeEvaluateCall extends MethodAccess {
+      UnsafeEvaluateCall() {
+        (
+          //Base of the recursion.
+          this.getMethod() instanceof Evaluate
+          or
+          //recursive definition: This calls another `UnsafeEvaulateCall`
+          exists(UnsafeEvaluateCall unsafe |
+            this.getMethod() = unsafe.getEnclosingCallable()
+          )
+        )
+        and
+        //Does not always call verify before this.
+        not exists(VerifyPathCallerAccess verify |
+          dominates(verify, this)
+        )
+      }
+    }
+使用这段代码查询（ 
+）。你会发现copy，move和remove操作依然有漏洞。经过测试发现，这些操作依然可以被利用，之后我把这些问题报告给了Pivotal。Pivotal
+很快的给我回信说，他们已经确认问题，并且用verifyPath保护了所有的操作。并且还添加了一些单元测试 （
+）保证漏洞已经被修复
+# 查询，不要猜测
+在所有的操作前面加上verifyPath 函数似乎已经完全修复了所有的漏洞，但是我决定去检查一下verifyPath
+本身是否实现的正确。当检测具体的算法实现的时，最好把这个工作留给人去做。但我们已经看出来，在识别逻辑错误的这方面，QL非常有用。尤其，程序员和我假设，PatchOperation中的路径这个变量是唯一被spelExpression解析的，所以我想知道这个是不是真的。我写了另一个查询，目的是寻找流入parse
+函数的参数的所有表达式。
+    from FlowSource source, Expr sink
+    where source.flowsTo(sink)
+      and exists(ParseExpression m | sink = m.getAnArgument() and 
+        m.getQualifier().getType().(RefType).getASupertype*() instanceof ExpressionParser and
+        m.getEnclosingCallable().getDeclaringType() instanceof PathToSpEL)
+      //Exclude the field `path` that have been checked by `verifyPath` already.
+      and source.getEnclosingCallable().getDeclaringType().getASupertype*() instanceof PatchOperation
+      and not exists(PathField path, FlowSource commonSource |
+                     commonSource.flowsTo(path.getAnAccess()) and commonSource.flowsTo(source)
+                     )
+    select source, sink
+这个查询 （  ）给出了三个结果。所以我看到了copy和move
+操作，另外一个被调用的变量from （ [https://lgtm.com/projects/g/spring-projects/spring-data-rest/snapshot/dfc2adf373ac6c110377e6a7ea2745205342629d/files/spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/FromOperation.java?sort=name&dir=ASC&mode=heatmap&excluded=false#L42](https://lgtm.com/projects/g/spring-projects/spring-data-rest/snapshot/dfc2adf373ac6c110377e6a7ea2745205342629d/files/spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/FromOperation.java?sort=name&dir=ASC&mode=heatmap&excluded=false#L42)
+） 也被SpEL表达式解析（ [https://lgtm.com/projects/g/spring-projects/spring-data-rest/snapshot/dfc2adf373ac6c110377e6a7ea2745205342629d/files/spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/CopyOperation.java?sort=name&dir=ASC&mode=heatmap&excluded=false#L60](https://lgtm.com/projects/g/spring-projects/spring-data-rest/snapshot/dfc2adf373ac6c110377e6a7ea2745205342629d/files/spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/CopyOperation.java?sort=name&dir=ASC&mode=heatmap&excluded=false#L60)
+） 。这个发现是非常有意义的，因为要给copy和move提供两个路径，一个是源地址另一个是目的地址。无论怎样，当我们观察
+PatchOperation函数的时候，很容易想到只提供一个路径的操作，但是会忽略掉另一种情况。尤其过一些时间之后，当不同的人添加代码实现新的操作的时候。通过QL，而不是通过猜测，几分钟之后我完成了搜索并且得到了我想要的结果。经过测试我发现这些操作依然可以被利用，我把这些发现又报告给了Pivotal
+。这次他们也确认了，并且添加了新的单元测试目的是捕捉所有的问题，并且花了稍微长的时间才做出回应。观察这次测试（
+），很明显的是from这个参数没有被测试。即使这样，这个漏洞也需要path这个变量是一个合法的路径，这对于单元测试或者普通的fuzzing测试来说，这个问题很难被发现。
+最后。解析表达式的全部代码被重写（  ）。这次，所有的SpEL
+表达式解析被放入了一个叫 SpelPath 的类中（ [https://lgtm.com/projects/g/spring-projects/spring-data-rest/snapshot/dist-48000263-1509466693845/files/spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/SpelPath.java?sort=name&dir=ASC&mode=heatmap&excluded=false#L57](https://lgtm.com/projects/g/spring-projects/spring-data-rest/snapshot/dist-48000263-1509466693845/files/spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/SpelPath.java?sort=name&dir=ASC&mode=heatmap&excluded=false#L57)
+） ，这个类中有一个子类叫 TypedSpelPath （ 
+） ，这个类在初始化的时候调用了verifyPath。  
+回到最原始的问题，是否有一些操作会在TypedSpelPath之外调用。为了验证这个想法，我写了一个简单的查询去寻找这样的操作：
+    from Method m
+    where exists(Method e | e instanceof Evaluate and m.polyCalls(e))
+    select m, m.getDeclaringType()
+运行这个查询 （  ）
+我发现所有的操作都在TypedSpelPath之中，所以我觉得这个漏洞修补成功了。
+# 漏洞时间线和厂商反馈
+  * 2017年九月7日：首次向Pivotal 安全团队透发聩洞信息。
+  * 2017年九月21日：Pivotal发布安全公告 （  ）
+  * 2017年9月22日：验证Pivotal发布的补丁之后，向厂商报告没有修复完善 （ 并且升级了利用方式） 
+  * 2017年9月26日：Pivotal 回复了新的修复方式 （  ）
+  * 2017年9月27日：验证Pivotal发布的补丁之后，向厂商报告没有修复完善 （ 并且升级了利用方式） 
+  * 2017年十月25日：完全修复该漏洞 （  ） 
+  * 2018年三月1日：在 lgtm.com/blog 公开了两篇文章。由于漏洞影响太广泛。在Pivotal的要求下，我们直到2018年的三月才公开这漏洞细节。 
+# 结论
+在这篇文章中，我们看到怎样使用QL在代码中识别类似的漏洞并且确保漏洞已经被修复完善。这种类型的变体分析已经在很多客户中取得了巨大的成功，并且我希望这些也对你有用。这里有一些更进一步的例子，这个查询
+（  ）可以识别 CVE-2017-4971 （
+ ） 和 CVE-2017-8039 （
+）。我已经在更早的文章中解析过这两个漏洞，他们都是因为不安全的SpEL 表达式解析造成的。

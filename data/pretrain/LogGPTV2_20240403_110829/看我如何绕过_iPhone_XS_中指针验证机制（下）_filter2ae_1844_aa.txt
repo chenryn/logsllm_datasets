@@ -1,0 +1,140 @@
+# 看我如何绕过 iPhone XS 中指针验证机制（下）
+|
+##### 译文声明
+本文是翻译文章，文章原作者 googleprojectzero，文章来源：googleprojectzero.blogspot.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+上一章中，我们对当前的PAC机制在理论上提出了一些可能的漏洞，这一章结合实际的 A12 设备进行验证。该篇可能会比较长，如果大家没有耐心，可以直接跳转到
+一节。
+## 寻找内核代码执行的入口点
+现在我们已经对如何在 A12 设备上绕过和伪造 PAC 有了一些理论的想法，接下来，我们将要研究如何真正的绕过 PAC 来执行内核中的任意代码。
+传统的读写内核代码的方法是 Stefan Esser 在[Tales from iOS 6
+Exploitation](https://conference.hitb.org/hitbsecconf2013kul/materials/D2T2%20-%20Stefan%20Esser%20-%20Tales%20from%20iOS%206%20Exploitation%20and%20iOS%207%20Security%20Changes.pdf)中提到的
+iokit_user_client_trap 策略。此策略需要 patch IOUserClient 实例的 vtable 来调用用户态的函数
+IOConnectTrap6()，它可以调用任意函数，并且传入最多7个参数。这样就能在内核中调用 iokit_user_client_trap() 函数了。  
+如果想要了解其工作原理，可以参考下面 XNU 4903.221.2 中 iokit_user_client_trap() 的实现：
+    kern_return_t iokit_user_client_trap(struct iokit_user_client_trap_args *args)
+    {
+       kern_return_t result = kIOReturnBadArgument;
+       IOUserClient *userClient;
+       if ((userClient = OSDynamicCast(IOUserClient,
+               iokit_lookup_connect_ref_current_task((mach_port_name_t)
+                   (uintptr_t)args->userClientRef)))) {
+           IOExternalTrap *trap;
+           IOService *target = NULL;
+           trap = userClient->getTargetAndTrapForIndex(&target, args->index);
+           if (trap && target) {
+               IOTrap func;
+               func = trap->func;
+               if (func) {
+                   result = (target->*func)(args->p1, args->p2, args->p3,
+                                            args->p4, args->p5, args->p6);
+               }
+           }
+           iokit_remove_connect_reference(userClient);
+       }
+       return result;
+    }
+如果我们能够 patch IOUserClient 实例，使得 getTargetAndTrapForIndex() 返回的 trap 和 target
+是我们可控的值，那么下面调用 target->func 将可以调用任意内核函数，并且传入最多7个参数(p1 到 p6 加上 target 本身)。
+为了了解这个策略在 A12 设备上能否成功，让我们来看看 PAC 引入的对这个功能的更改。
+    iokit_user_client_trap
+       PACIBSP
+       ...        ;; Call iokit_lookup_connect_ref_current_task() on
+       ...        ;; args->userClientRef and cast the result to IOUserClient.
+    loc_FFFFFFF00808FF00
+       STR        XZR, [SP,#0x30+var_28]  ;; target = NULL
+       LDR        X8, [X19]               ;; x19 = userClient, x8 = ->vtable
+       AUTDZA     X8                      ;; validate vtable's PAC
+       ADD        X9, X8, #0x5C0          ;; x9 = pointer to vmethod in vtable
+       LDR        X8, [X8,#0x5C0]         ;; x8 = vmethod getTargetAndTrapForIndex
+       MOVK       X9, #0x2BCB,LSL#48      ;; x9 = 2BCB`vmethod_pointer
+       LDR        W2, [X20,#8]            ;; w2 = args->index
+       ADD        X1, SP, #0x30+var_28    ;; x1 = &target
+       MOV        X0, X19                 ;; x0 = userClient
+       BLRAA      X8, X9                  ;; PAC call ->getTargetAndTrapForIndex
+       LDR        X9, [SP,#0x30+var_28]   ;; x9 = target
+       CMP        X0, #0
+       CCMP       X9, #0, #4, NE
+       B.EQ       loc_FFFFFFF00808FF84    ;; if !trap || !target
+       LDP        X8, X11, [X0,#8]        ;; x8 = trap->func, x11 = func virtual?
+       AND        X10, X11, #1
+       ORR        X12, X10, X8
+       CBZ        X12, loc_FFFFFFF00808FF84       ;; if !func
+       ADD        X0, X9, X11,ASR#1       ;; x0 = target
+       CBNZ       X10, loc_FFFFFFF00808FF58
+       MOV        X9, #0                  ;; Use context 0 for non-virtual func
+       B          loc_FFFFFFF00808FF70
+    loc_FFFFFFF00808FF58
+       ...        ;; Handle the case where trap->func is a virtual method.
+    loc_FFFFFFF00808FF70
+       LDP        X1, X2, [X20,#0x10]     ;; x1 = args->p1, x2 = args->p2
+       LDP        X3, X4, [X20,#0x20]     ;; x3 = args->p3, x4 = args->p4
+       LDP        X5, X6, [X20,#0x30]     ;; x5 = args->p5, x6 = args->p6
+       BLRAA      X8, X9                  ;; PAC call func(target, p1, ..., p6)
+       MOV        X21, X0
+    loc_FFFFFFF00808FF84
+       ...        ;; Call iokit_remove_connect_reference().
+    loc_FFFFFFF00808FF8C
+       ...        ;; Epilogue.
+       RETAB
+我们可以看到，有几个地方对 PAC 进行了验证: 第一个地方是出现在动态切换到 IOUserClient。 然后会验证 userClient 的
+vtable，然后在 PAC 的保护下，调用 getTargetAndTrapForIndex。
+再然后，在读取 trap->func 时并没有验证，然后 func 函数在调用时会被验证，使用的上下文是 0.
+这种机制对于攻击者来说已经非常好了。 如果我们能找到一个合法的用户，让它来提供 getTargetAndTrapForIndex() 的实现，而这个
+getTargetAndTrapForIndex 能够返回一个指向驻留在可写内存中的 IOExternalTrap 的指针。 那么我们只需要考虑如何将
+trap->func 替换成我们的函数指针就行了，但是这个函数指针是受 PAC 保护的，它使用 APIAKEY 签名了，上下文为 0。 这意味着我们只要绕过
+PAC 一次就足够了，即伪造 PACIZA 签名过的指针。
+稍微找了一下，在 kernelcache 中发现一个特别的 IOUserClient 类， IOAudio2DeviceUserClient
+，它符合这些条件。下面是它的getTargetAndTrapForIndex() 方法的反编译:
+    IOExternalTrap *IOAudio2DeviceUserClient::getTargetAndTrapForIndex(
+           IOAudio2DeviceUserClient *this, IOService **target, unsigned int index)
+    {
+       ...
+       *target = (IOService *)this;
+       return &this->IOAudio2DeviceUserClient.traps[index];
+    }
+在 IOAudio2DeviceUserClient::initializeExternalTrapTable() 中， traps
+字段会被初始化为堆分配的 IOExternalTrap 对象：
+    this->IOAudio2DeviceUserClient.trap_count = 1;
+    this->IOAudio2DeviceUserClient.traps = IOMalloc(sizeof(IOExternalTrap));
+因此，我们所需要做的就是创建一个自己的 IOAudio2DeviceUserClient 连接，伪造一个 PACIZA 指针，然后覆盖了用这个指针覆盖
+userClient->traps[0].func，最后再再用户态调用 IOConnectTrap6 。这样我们就可以控制除 X0 之外的所有参数，因为
+X0 是由 IOAudio2DeviceUserClient 的 getTargetAndTrapForIndex() 显式设置的。
+为了控制 X0，我们需要替换 vtable 中 IOAudio2DeviceUserClient 对 getTargetAndTrapForIndex()
+的实现。这意味着，除了伪造我们调用的函数的 PACIZA 指针外，我们还需要伪造 vtable，它是由指向虚方法的 PACIA
+指针组成。所以，我们需要用一个 vtable 的 PACDZA 的指针替换当前 vtable 指针。而这就需要一些更加复杂的 PAC 伪造技术了。
+然而，即使我们只能伪造 PACIZA 指针，仍然有一种方法可以控制X0 : JOP gadget。通过 kernelcache
+进行快速搜索，可以发现以下设置 X0 的代码:
+    MOV         X0, X4
+    BR          X5
+这使我们可以只使用一个伪造指针，就能调用任意少于 4 个参数的内核函数: 使用 iokit_user_client_trap()
+调用指向这个代码的指针，这个指针已经被 PACDZA 签名过了，然后将 X4 设置为我们期望的 X0 值，X5 设置为 我们想要调用的函数。
+## 分析在 A12 上的 PAC
+现在我们已经知道了如何使用 PAC 伪造来调用任意的内核函数，下面我们开始分析苹果在 A12 芯片上实现的 PAC
+的脆弱点。理想情况下，我们能够找到一种方法来同时执行PACIA和PACDA
+签名的伪造，但是正如前面所讨论的，即使伪造单个PACIZA指针，也需要调用任意4个参数内核函数的能能力。
+为了能够展开分析，我使用 [voucher_swap](https://bugs.chromium.org/p/project-zero/issues/detail?id=1731#c10) 来读写 iPhone XR 的内核，收集的操作系统为 iOS 12.1.1 build
+16C50 版。
+###  在内核中找到 PAC 的密钥
+第一步是要找到 PAC 的密钥在内核中是如何赋值的。不幸的是， IDA 并不显示用于存储 PAC 密钥的名称，因此我不得不一点点的向下挖掘。
+在 [LLVM](https://github.com/llvm-mirror/llvm/) 仓库中，查找 “APIAKEY”, 显示存储 APIAKEY
+的寄存器叫做 APIAKeyLo_EL1 和 APIAKeyHi_EL1， 存储其他密钥的寄存器命名也都相似。
+在文件 [AArch64SystemOperands.td](https://github.com/llvm-mirror/llvm/blob/efea7114d4f7bc56ab90df04037bdb7cd7d4f8c3/lib/Target/AArch64/AArch64SystemOperands.td#L1289)
+中的代码声明了这些寄存器。 这是我们可以在 IDA 中很轻松的找到这些寄存器。 比如，要查找 APIAKeyLo_EL1 赋值的过程，我查找字符串 “#0,
+c2, c1, #0”，这让我想到了common_start的一部分，可以参考文件
+[osfmk/arm64/start.s](https://opensource.apple.com/source/xnu/xnu-4903.221.2/osfmk/arm64/start.s.auto.html):
+    _WriteStatusReg(TCR_EL1, sysreg_restore);               // 3, 0, 2, 0, 2
+    PPLTEXT__set__TTBR0_EL1(x25 & 0xFFFFFFFFFFFF);
+    _WriteStatusReg(TTBR1_EL1, (x25 + 0x4000) & 0xFFFFFFFFFFFF);    // 3, 0, 2, 0, 1
+    _WriteStatusReg(MAIR_EL1, 0x44F00BB44FF);               // 3, 0, 10, 2, 0
+    if ( x21 )
+       _WriteStatusReg(TTBR1_EL1, cpu_ttep);               // 3, 0, 2, 0, 1
+    _WriteStatusReg(VBAR_EL1, ExceptionVectorsBase + x22 - x23);    // 3, 0, 12, 0, 0
+    do
+       x0 = _ReadStatusReg(S3_4_C15_C0_4);                 // ????
+    while ( !(x0 & 2) );
+    _WriteStatusReg(S3_4_C15_C0_4, x0 | 5);                 // ????
+    __isb(0xF);
+    _WriteStatusReg(APIBKeyLo_EL1, 0xFEEDFACEFEEDFACF);     // 3, 0, 2, 1, 2
+    _WriteStatusReg(APIBKeyHi_EL1, 0xFEEDFACEFEEDFACF);     // 3, 0, 2, 1, 3

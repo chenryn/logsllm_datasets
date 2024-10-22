@@ -1,0 +1,103 @@
+# Chrome 浏览器越界写漏洞分析Part 2
+|
+##### 译文声明
+本文是翻译文章，文章原作者 googleprojectzero，文章来源：googleprojectzero.blogspot.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 简介
+在我们了解了bug的工作原理后，并将这些细节发送给Chrome以帮助他们开始修复之后，我们回到了其他项目。这个bug仍然是一个讨论的话题，我们没有理由不为它编写exploit。
+这样做的一个主要原因是了解Chrome网络栈中的漏洞有多容易被利用，因为进程架构的变化相对较晚。团队中没有人认真考虑过利用Chrome网络堆栈中的问题，因此相对于代码库中更广为人知的区域（例如renderer错误或更典型的浏览器进程沙盒逃逸漏洞），它可能会提供一些更值得关注的见解。
+我们的许多失败并不是由于任何特殊的困难，而是由于粗心大意，在处理不可靠的原语时，这种粗心大意似乎更成问题；很容易花一整天调试失败的堆，而没有注意到Web服务器在错误的端口上运行…
+## Chapter 4：Exploit
+上篇文章，我们使用了一个非常强大的原语；该漏洞让我们在堆分配结束后写入指定大小的可控数据。只有一个主要的缺点需要克服——由于bug的工作方式，我们覆盖的分配总是大小为0。
+与大多数其他分配器一样，tcmalloc
+以最小的类大小存储它，在本例中最大为16个字节。size类有两个问题。首先，“useful”对象（即那些包含我们可能要覆盖的指针对象）通常大于这个值。其次，size类相当阻塞，因为几乎每个IPC对网络进程的调用都会触发其中的分配和释放。因此，我们不能使用“heavy”
+获取API来进行堆喷射/清理。不幸的是，在网络进程中很少有对象类型可以容纳16个字节，并且创建这些对象类型不会触发大量其他的分配。
+也有一些好消息。如果网络进程崩溃，它将以默认方式重新启动，因此，如果我们正在努力提高可靠性，我们能够将此作为一个支撑 —
+我们的exploit在成功之前可以尝试几次。
+**NetToMojoPendingBuffer**
+通过枚举与网络进程相关的类，我们能够相对快速地找到适合于构造“write-what-where”（任意写）原语的对象。在每个URLLoader::ReadMore调用上都会创建一个新的NetToMojoPendingBuffer对象，因此攻击者可以通过延迟在Web服务器分配响应块来控制这些分配。
+    class COMPONENT_EXPORT(NETWORK_CPP) NetToMojoPendingBuffer
+        : public base::RefCountedThreadSafe {
+      mojo::ScopedDataPipeProducerHandle handle_;
+      void* buffer_;
+    };
+我们不需要担心覆盖handle_因为当Chrome遇到一个无效的handle，它只是提前返回而不会崩溃。将要写入缓冲区备份存储的数据正是下一个HTTP响应块，因此也受到了完全控制。
+不过，有一个问题 — 如果没有单独的信息泄漏，单靠原语是不够的。使功能更强大的一个明显方法是对buffer_
+进行部分覆盖，然后破坏其他size类中的对象（希望更方便）。但是，指针永远不会被分配到常规堆地址。相反，NetToMojoPendingBuffer对象的备份存储是在一个共享内存区域中分配的，这个区域只用于IPC，不包含对象，所以不会破坏任何东西。
+除了NetToMojoPendingBuffer，我们在16字节大小的类中找不到任何立即有用的东西。
+**寻找STL容器**
+幸运的是，我们并不局限于c++类和结构。相反，我们可以针对任意大小的缓冲区，比如容器备份存储。当一个元素被插入到一个空的std::vector中时，我们为一个单独的元素分配一个存储空间。在随后的插入中，如果没有剩余的空间，它就会加倍。其他一些容器类似的方式操作。因此，如果我们精确地控制对指针向量的插入，我们可以对其中一个指针执行部分覆盖，从而将bug转变为某种类型的混淆。
+**WatcherDispatcher**
+在我们尝试使用 `NetToMojoPendingBuffer` 时，出现了与 `WatcherDispatcher`
+相关的崩溃。WatcherDispatcher类不是特定于网络进程的。它是基础的Mojo结构之一，用于IPC消息发送和接收。类结构如下：
+    class WatcherDispatcher : public Dispatcher {
+      using WatchSet = std::set;
+      base::Lock lock_;
+      bool armed_ = false;
+      bool closed_ = false;
+      base::flat_map> watches_;
+      base::flat_map> watched_handles_;
+      WatchSet ready_watches_;
+      const Watch* last_watch_to_block_arming_ = nullptr;
+    };
+    class Watch : public base::RefCountedThreadSafe {
+      const scoped_refptr watcher_;
+      const scoped_refptr dispatcher_;
+      const uintptr_t context_;
+      const MojoHandleSignals signals_;
+      const MojoTriggerCondition condition_;
+      MojoResult last_known_result_ = MOJO_RESULT_UNKNOWN;
+      MojoHandleSignalsState last_known_signals_state_ = {0, 0};
+      base::Lock notification_lock_;
+      bool is_cancelled_ = false;
+    };
+    MojoResult WatcherDispatcher::Close() {
+      // We swap out all the watched handle information onto the stack so we can
+      // call into their dispatchers without our own lock held.
+      base::flat_map> watches;
+      {
+        base::AutoLock lock(lock_);
+        if (closed_)
+          return MOJO_RESULT_INVALID_ARGUMENT;
+        closed_ = true;
+        std::swap(watches, watches_);
+        watched_handles_.clear();
+      }
+      // Remove all refs from our watched dispatchers and fire cancellations.
+      for (auto& entry : watches) {
+        entry.second->dispatcher()->RemoveWatcherRef(this, entry.first);
+        entry.second->Cancel();
+      }
+      return MOJO_RESULT_OK;
+    }
+`std::flat_map`实际上是由`std::vector`支持的，并且`watched_handles_`只包含一个元素，它只需要16个字节。这意味着我们可以覆盖一个Watch指针！
+Watch类的大小相对较大，为104字节，由于tcmalloc，我们只能针对大小相似的对象进行部分覆盖。标对象应该包含在某些偏移上的有效指针，以便在调用Watch方法后仍然有效。不幸的是，网络进程似乎不包含满足上述简单类型混淆要求的类。
+我们可以利用Watch是一个引用计数类，我们的想法是喷射大量Watch-sized缓冲区，  
+tcmalloc将这些缓冲区放置在实际Watch对象的旁边，并希望`scoped_refptr`与覆盖的最少有效字节将指向我们的一个缓冲区。缓冲区应将第一个64位word（即fake引用计数）设置为1，其余的设置为0。在这种情况下，调用`WatcherDispatcher::Close`，释放`scoped_refptr`，将触发
+fake Watch 的删除，析构函数将优雅地完成，缓冲区将被释放。
+如果我们的缓冲区被计划任务发送到攻击者的服务器或返回到renderer进程，这将泄漏tcmalloc的屏蔽freelist指针，或者，更好的是一些有用的指针，如果我们设法在此期间分配其他东西。因此，我们现在需要的是能够在网络进程中创建这样的缓冲区，并延迟发送它们，直到发生破坏。
+原来Chrome中的网络进程也负责处理WebSocket连接。重要的是WebSocket是一个低开销的协议，它允许传输二进制数据。如果我们让连接的接收端足够慢,并且发送足够的数据来填充操作系统套接字的发送缓冲区，直到`TCPClientSocket::Write`
+变为“异步”操作，则后续对`WebSocket::send`的调用将导致原始帧数据被存储为IOBuffer
+对象，每个调用只有两个额外的32字节分配。此外，我们可以通过修改接收端的延迟来控制缓冲区的存活时间。
+看起来我们找到了一个近乎完美的堆喷射原语!不过它有一个缺点——不能释放独立的缓冲区。当大量发送或断开连接时，与连接相关的所有帧都会立即释放。显然，我们不能为每个spray对象建立WebSocket连接，并且上面的每个操作都会在堆中产生许多不希望的“noise”。不过，让我们暂时把它放在一边。
+方法概述如下：
+不幸的是，`watched_handles_` 很快被证明是一个欠佳的目标。它的一些缺点是：
+  * 实际上有两个flat _map成员，但是我们只能使用其中的一个，因为破坏 watched_handles_ 将在RemoveWatcherRef虚函数调用期间立即触发崩溃。
+  * 每个`WatcherDispatcher`分配在我们关注的size类中触发许多“noise”。
+  * 在Watch size类中，指针的LSB有16个(= 256 / GCD(112, 256))可能的值，其中大多数值甚至不会指向对象的头部。
+尽管我们可以使用这种方法泄漏一些数据，但其成功率很低。该方法似乎是合理的，但是我们必须找到一个更“方便”的容器来覆盖。
+**WebSocketFrame**
+现在是时候仔细看看如何实现发送WebSocket frame了。
+    class NET_EXPORT WebSocketChannel {
+    [...]
+      std::unique_ptr data_being_sent_;
+      // Data that is queued up to write after the current write completes.
+      // Only non-NULL when such data actually exists.
+      std::unique_ptr data_to_send_next_;
+    [...]
+    };
+    class WebSocketChannel::SendBuffer {
+      std::vector> frames_;
+      uint64_t total_bytes_;
+    };

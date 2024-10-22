@@ -1,0 +1,172 @@
+FEK，并将其保存在 ecryptfs_crypt_stat 的 key 成员；之后在`ecryptfs_compute_root_iv()` 函数里初始化
+`ecryptfs_crypt_stat`的 root_iv 成员，在 `ecryptfs_init_crypt_ctx()`函数里初始化
+ecryptfs_crypt_stat 的 kernel crypto 接口 tfm。至此，`ecryptfs_crypt_stat`
+对象初始化完毕，后续文件在读写操作时使用到的加解密所需的所有信息均在该对象中获取。
+##### 加密文件 read 过程
+read 过程指应用程序通过 read()函数在 eCryptfs 挂载的目录下读取文件的过程。因为挂载点在挂载 eCryptfs
+之前可能已经存在文件，这些已存在的文件属于非加密文件，只有在完成 eCryptfs 挂载后的文件才自动保存成 eCryptfs
+格式的加密文件，所以读取文件时需要区分文件是否属于加密文件。从应用程序发起read()操作到eCryptfs层响应的函数调用关系流程图如十所示，读取时采用page
+read的机制，涉及到page cache的问题，图中以首次读取文件，即文件内容还没有被读取到page
+cache的情况为示例。自`ecryptfs_read_update_atime()`起进入到 eCryptfs
+层，由此函数完成从底层文件系统中读取出文件内容，若是加密文件则利用 kernel crypto 和 open 时初始化好的
+ecryptfs_crypt_stat 对象完成内容的解密，之后将解密后的文件内容拷贝到上层应用程序，同时更新文件的访问时间，其中
+touch_atime()完成文件的访问时间的更新；`generic_file_read_iter()`
+函数调用内核函数`do_generic_file_read()`，完成内存页的申请，并借助 mapping->a_ops->readpage()
+调用真正干活的主力 `ecryptfs_readpage()` 来完成解密工作，最后通过 `copy_page_to_iter()`
+将解密后的文件内容拷贝到应用程序。到了关键的解密阶段，描述再多也不如代码来的直观，ecryptfs_readpage() 的核心代码如清单八、九、十所示。
+图十 create 经由 VFS 调用 ecryptfs_create 的流程
+###### 清单八 ecryptfs_readpage()关键代码
+    static int ecryptfs_readpage(struct file *file, struct page *page)
+    {
+        struct ecryptfs_crypt_stat *crypt_stat =
+            &ecryptfs_inode_to_private(page->mapping->host)->crypt_stat;
+        int rc = 0;
+        if (!crypt_stat || !(crypt_stat->flags & ECRYPTFS_ENCRYPTED)) {
+        //读取非加密文件
+            rc = ecryptfs_read_lower_page_segment(page, page->index, 0,
+                                  PAGE_CACHE_SIZE,
+                                  page->mapping->host);
+        } else if (crypt_stat->flags & ECRYPTFS_VIEW_AS_ENCRYPTED) {
+        //直接读取密文给上层，此时应用程序读到的是一堆乱码
+            if (crypt_stat->flags & ECRYPTFS_METADATA_IN_XATTR) {
+                rc = ecryptfs_copy_up_encrypted_with_header(page, crypt_stat);
+                …
+            } else {
+                rc = ecryptfs_read_lower_page_segment(
+                    page, page->index, 0, PAGE_CACHE_SIZE,
+                    page->mapping->host);
+                …
+            }
+        } else {
+        //读取密文并调用kernel crypto解密
+            rc = ecryptfs_decrypt_page(page);
+            …
+        }
+        …
+        return rc;
+    }
+###### 清单九 ecryptfs_decrypt_page()核心代码
+    int ecryptfs_decrypt_page(struct page *page)
+    {
+        …
+        ecryptfs_inode = page->mapping->host;
+        //获取包含有FEK、cipher、crypto context tfm信息的ecryptfs_crypt_stat
+        crypt_stat = &(ecryptfs_inode_to_private(ecryptfs_inode)->crypt_stat);
+        //计算加密文件内容在底层文件中的偏移
+        lower_offset = lower_offset_for_page(crypt_stat, page);
+        page_virt = kmap(page);
+        //利用底层文件系统的接口读取出加密文件的内容
+        rc = ecryptfs_read_lower(page_virt, lower_offset, PAGE_CACHE_SIZE, ecryptfs_inode);
+        kunmap(page);
+        …
+        for (extent_offset = 0;
+             extent_offset extent_size);
+             extent_offset++) {
+            //解密文件内容
+            rc = crypt_extent(crypt_stat, page, page,
+                      extent_offset, DECRYPT);
+            …
+        }
+        …
+    }
+###### 清单十 crypt_extent()核心加解密函数的关键代码
+    static int crypt_extent(struct ecryptfs_crypt_stat *crypt_stat,
+                struct page *dst_page,
+                struct page *src_page,
+                unsigned long extent_offset, int op)
+    {
+        //op 指示时利用该函数进行加密还是解密功能
+        pgoff_t page_index = op == ENCRYPT ? src_page->index : dst_page->index;
+        loff_t extent_base;
+        char extent_iv[ECRYPTFS_MAX_IV_BYTES];
+        struct scatterlist src_sg, dst_sg;
+        size_t extent_size = crypt_stat->extent_size;
+        int rc;
+        extent_base = (((loff_t)page_index) * (PAGE_CACHE_SIZE / extent_size));
+        rc = ecryptfs_derive_iv(extent_iv, crypt_stat,
+                    (extent_base + extent_offset));
+        …
+        sg_init_table(&src_sg, 1);
+        sg_init_table(&dst_sg, 1);
+        sg_set_page(&src_sg, src_page, extent_size,
+                extent_offset * extent_size);
+        sg_set_page(&dst_sg, dst_page, extent_size,
+                extent_offset * extent_size);
+        //调用kernel crypto API进行加解密
+        rc = crypt_scatterlist(crypt_stat, &dst_sg, &src_sg, extent_size, extent_iv, op);
+        …
+        return rc;
+    }
+理顺了 mount、open 的流程，知道 FEK、cipher、kernel crypto context
+的值及存放位置，同时了解了加密文件的格式，解密的过程显得比较简单，感兴趣的同学可以继续查看 crypt_scatterlist()的代码，该函数纯粹是调用
+kernel crypto API 进行加解密的过程，跟 eCryptfs 已经没有关系。
+##### 加密文件 write 过程
+eCryptfs 文件 write 的流程跟 read 类似，在写入 lower file 前先通过 ecryptfs_writepage()
+函数进行文件内容的加密，这里不再详述。
+#### 四、ChromeOS 使用 eCryptfs 的方法及流程
+Chromeos 在保护用户数据隐私方面可谓不遗余力，首先在系统分区上专门开辟出专用于存储用户数据的 stateful
+partition，当用户进行正常和开发者模式切换时，该分区的数据将会被自动擦除；其次该 stateful partition 的绝大部分数据采用 dm-crypt 进行加密，在系统启动时用户登录前由 mount-encrypted
+完成解密到`/mnt/stateful_partition/encrypted`，另外完成以下几个mount工作：将`/Chromeos/mnt/stateful_partition/home
+bind mount` 到`/home`；将`/mnt/stateful_partition/encrypted/var bind
+mount`到`/var`目录；将`/mnt/stateful_partition/encrypted/chromos bind mount`
+到`/home/chronos`。最后在用户登录时发起对该用户私有数据的 eCryptfs 加解密的流程，具体工作由 cryptohomed
+守护进程负责完成，eCryptfs
+加密文件存放在`/home/.shadow/[salted_hash_of_username]/vault`目录下，感兴趣的读者可通过 ecryptfs-stat 命令查看其文件状态和格式，mount
+点在`/home/.shadow/[salted_hash_of_username]/mount`，之后对`/home/.shadow/[salted_hash_of_username]/mount`下的
+user 和 root 建立 bind mount
+点，方便用户使用，如将`/home/.shadow/[salted_hash_of_username]/mount/user bind
+mount`到`/home/user/[salted_hash_of_username]`和`/home/chronos/u-[salted_hash_of_username]`
+；将`/home/.shadow/[salted_hash_of_username]/mount/root bind
+mount`到`/home/root/[salted_hash_of_username]`。用户在存取数据时一般是对目录`/home/chronos/u-[salted_hash_of_username]`进行操作。
+eCryptfs 在 Chromeos 中的应用架构如图十所示。系统启动后开启 cryptohomed 的守护进程，由该进程来响应 eCryptfs
+的挂载和卸载等，进程间采用D-Bus的方式进行通信，cryptohome应用程序主用于封装用户的动作命令，后通过 D-Bus 向 cryptohomed
+发起请求。如可通过cryptohome命令“cryptohome -–action=mount -–user=[account_id]”来发起
+eCryptfs 的挂载;通过命令“cryptohome
+-–action=unmount”卸载eCryptfs的挂载，执行成功此命令后，用户的所有个人数据将无法访问，如用户先前下载的文件内容不可见、安装的应用程序不可使用，`/home/.shadow/[salted_hash_of_username]/mount`内容为空。
+图十一 eCryptfs 在 Chromeos 中的架构图
+cryptohomed 特色的 mount 流程如下：
+1.cryptohomed 在 D-Bus 上接收到持（包含用户名和密码）有效用户证书的mount请求，当然D-Bus请求也是有权限控制的；
+2.假如是用户首次登陆，将进行：
+a．
+建立`/home/.shadow/[salted_hash_of_username]`目录，采用SHA1算法和系统的salt对用户名进行加密，生成`salted_hash_of_username`，简称s_h_o_u;
+b． 生成`vault keyset
+/home/.shadow/[salted_hash_of_username]/master.0`和`/home/.shadow/[salted_hash_of_username]/master.0.sum`。
+master.0 加密存储了包含有 FEK 和 FNEK 的内容以及非敏感信息如 salt、password rounds 等；master.0.sum
+是对 master.0 文件内容的校验和。
+3.采用通过 mount 请求传入的用户证书解密 keyset。当 TPM 可用时优先采用 TPM 解密，否则采用 Scrypt 库，当 TPM
+可用后再自动切换回使用 TPM。cryptohome 使用 TPM 仅仅是为了存储密钥，由 TPM 封存的密钥仅能被 TPM
+自身使用，这可用缓解密钥被暴力破解，增强保护用户隐私数据的安全。TPM 的首次初始化由 cryptohomed 完成。这里默认 TPM
+可正常使用，其解密机制如下图十二所示，其中：
+UP：User Passkey，用户登录口令
+EVKK：Ecrypted vault keyset key，保存在master.0中的”tpm_key”字段
+IEVKK：Intermediate vault keyset key，解密过程生成的中间文件，属于EVKK的解密后产物，也是RSA解密的输入密文
+TPM_CHK: TPM-wrapped system-wide Cryptohome
+key，保存在/home/.shadow/cryptohome.key，TPM init时加载到TPM
+VKK：Vault keyset key
+VK：Vault Keyset，包含FEK和FNEK
+EVK：Encrypted vault keyset，保存在master.0里”wrapped_keyset”字段
+图十二中的 UP（由发起 mount 的D-Bus请求中通过 key 参数传入）做为一个 AES key 用于解密EVKK，解密后得到的 IEVKK；然后将
+IEVKK 做为 RSA 的密文送入 TPM，使用 TPM_CHK 做为密钥进行解密，解密后得到 VKK；最后生成的VKK是一个 AES key，用于解密
+master.0里的 EVK，得到包含有 FEK 和 FNEK 明文的 VK。经过三层解密，终于拿到关键的 FEK，那么问题来了，Chromeos 的
+FEK 的保存及解密流程与上文介绍的 eCryptfs 时不一致，FEK 不应该是 open 时从加密文件的头部 metadata 里的 EFEK
+中解密出来的么？不过一次解密出FEK，全局使用，效率的确比每次读取文件时解析FEK高很多，之后通过 key 的系统调用将 key 传入内核的
+keyring，使用时通过key sign匹配。最后跟上文所述实属异曲同工。
+4.通过 mount 系统调用传入 option 完成挂载。
+该部分与正常的 Linux 做法一致，在 mount 的 option 里传入关键的 cipher、key sign、key bytes 等信息。
+图十二 TPM解密VK的流程
+#### 五、结语
+ecryptfs 建立在系统安全可信的基础上，保护用户数据的安全，核心基础组件是加密密钥，若在内核被攻破后密钥被通过某些手段窃取，ecryptfs
+的安全性将同样被攻破。另外 page cache 中加密文件的明文页有可能被交换到 swap 区，在 chromeos
+中已经禁用了swap，因此不会产生影响，但是其他版本的 Linux 系统需要注意该问题。
+eCryptfs 首次实现到现在已经十年有余，直到近几年才在 chromeos 和 Ubuntu
+上使用，个人认为除了之前人们的安全意识不如现在强烈外，更重要的是随着处理器性能的增强，eCryptfs
+加解密引起的文件读写性能下降的问题已经得到缓解。但实际的性能损耗如何，有待继续研究。或许出于性能的原因，年初的时候 Google 在 chromeos
+实现了基于ext4 crypto 的 dircrypto，用于实现跟 eCryptfs 同样的功能，目前 chromeos 同时支持 eCryptfs 和
+dircrypto，但在60版本后优先采用 dircrypto 技术，相关技术在另外的文章中进行介绍。
+最后，文中必有未及细看而自以为是的东西，望大家能够去伪存真，更求不吝赐教。
+#### 六、参考资料
+  * [企业级加密文件系统 eCryptfs 详解](https://www.ibm.com/developerworks/cn/linux/l-cn-ecryptfs/ "企业级加密文件系统 eCryptfs 详解")
+  * [eCryptfs: a Stacked Cryptographic Filesystem](http://www.linuxjournal.com/article/9400 "eCryptfs: a Stacked Cryptographic Filesystem")
+  * [Linux kernel-V4.4.79 sourcecode](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/v4.4.79 "Linux kernel-V4.4.79 sourcecode")
+  * [chromiumos platform-9653 sourcecode](https://chromium.googlesource.com/chromiumos/ "chromiumos platform-9653 sourcecode")
+* * *

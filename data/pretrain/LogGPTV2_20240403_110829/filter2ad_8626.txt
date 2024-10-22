@@ -1,0 +1,138 @@
+# CDPwn系列之CVE-2020-3119分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 漏洞简介
+`CDPwn`系列漏洞是由来自`Armis`的安全研究员在思科`CDP(Cisco Discovery Protocol)`协议中发现的5个`0
+day`漏洞，影响的产品包括思科交换机、路由器、`IP`电话以及摄像机等。其中，`CVE-2020-3119`是`NX-OS`系统中存在的一个栈溢出漏洞，利用该漏洞可在受影响的设备(如`Nexus`系列交换机)上实现任意代码执行，如修改`Nexus`交换机的配置以穿越`VLAN`等。
+下面借助`GNS3`软件搭建`Nexus`交换机仿真环境，来对该漏洞进行分析。
+## 环境准备
+根据[漏洞公告](https://tools.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-20200205-nxos-cdp-rce)，选取`Nexus 9000 Series Switches in standalone NX-OS
+mode`作为分析目标，获取到对应的镜像如`nxosv.9.2.2.qcow2`后，根据`GNS3`提供的`Cisco NX-OSv 9000
+appliance`中的模板进行操作即可。需要说明的是，
+  * 与思科`ASAV`防火墙不同，模拟`Nexus 9000`系列交换机除了需要设备镜像外，还需要一个`UEFI`格式的启动文件；
+  * 模拟`Nexus 9000`系列交换机对虚拟机的配置要求较高(`8G`内存)，建议采用`GNS3`设备模板中的默认配置，降低配置的话可能导致设备无法启动。
+设备启动后，建议连接到设备的`Ethernet1/1`口，之后对设备进行配置。
+在`Nexus 9000`系列交换机上，存在以下3种`shell`：
+  * `vsh`：正常配置设备时`CLI`界面的`shell`；
+  * `guestshell`：在`vsh`中运行`guestshell`命令后进入的`shell`，可以运行常见的`shell`命令；
+  * `bash shell`：在`vsh`中运行`run bash`命令后进入的`shell`，可以查看底层系统中的文件，以及设备上的进程信息等；  
+> 需要先在`configure`模式下，运行`feature bash-shell`开启`bash shell`
+默认配置下，`bash
+shell`中是没有`ip`信息的。为了方便后续进行分析调试，需要给之前连接的`Ethernet1/1`口配置`ip`信息，根据`mac`地址查找对应的网口，然后配置对应的`ip`即可。
+> 设备的`mgmt`口在`bash shell`下不存在对应的网口
+另外，由于采用`binwalk`工具对设备镜像进行解压提取失败，因而直接通过`bash
+shell`拷贝设备文件系统中的文件：将公钥置于`/root/.ssh/authorized_keys`，然后通过`scp`方式进行拷贝即可。
+## CDP数据包分析
+为了便于后续的分析，需要先了解`CDP`数据包的相关格式。在`GNS3`中设备之间的链路上捕获流量，看到设备发送的`CDP`数据包示例如下。
+可以看到，除了开始的`version`、`ttl`和`checksum`字段外，后面的每一部分都是典型的`TLV(Type-Length-Value)`格式，`Device ID`和`Addresses`部分的字段明细如下。其中，在`Addresses`部分，其`Value`还有更细致的格式。
+另外，`python` `scapy`模块支持`CDP`协议，可以很方便地构造和发送`CDP`数据包，示例如下。
+    from scapy.contrib import cdp
+    from scapy.all import Dot3, LLC, SNAP, sendp
+    ethernet = Dot3(dst="01:00:0c:cc:cc:cc")
+    llc = LLC(dsap=0xaa, ssap=0xaa, ctrl=0x03)/SNAP()
+    # Cisco Discovery Protocol
+    cdp_header = cdp.CDPv2_HDR(vers=2, ttl=180)
+    deviceid = cdp.CDPMsgDeviceID(val='nxos922(97RROM91ST3)')
+    portid = cdp.CDPMsgPortID(iface="br0")
+    address = cdp.CDPMsgAddr(naddr=1, addr=cdp.CDPAddrRecordIPv4(addr="192.168.110.130"))
+    cap = cdp.CDPMsgCapabilities(cap=1)
+    power_req = cdp.CDPMsgUnknown19(val="aaaa"+"bbbb")
+    power_level = cdp.CDPMsgPower(power=16)
+    cdp_packet = cdp_header/deviceid/portid/address/cap/power_req/power_level
+    sendp(ethernet/llc/cdp_packet, iface="ens36")
+## 漏洞分析
+根据`Armis`的[技术报告](https://info.armis.com/rs/645-PDC-047/images/Armis-CDPwn-WP.pdf)可知，该漏洞存在于程序`/isan/bin/cdpd`中的函数`cdpd_poe_handle_pwr_tlvs()`里，其主要功能是对`Power
+Request(type=0x19)`部分的数据进行解析和处理，该部分的协议格式示例如下。
+函数`cdpd_poe_handle_pwr_tlvs()`的部分伪代码如下，其中，`cdp_payload_pwr_req_ptr`指向`Power
+Request(type=0x19)`部分的起始处。可以看到，首先在`(1)`处获取到`Length`字段的值，在`(2)`处计算得到`Power
+Requested`字段的个数(`Type` \+ `Length` \+ `Request-ID` \+ `Management-ID`为8字节，`Power Requested`字段每项为`4`字节)，之后在`(4)`处将每个`Power
+Requested`字段的值保存到`v35`指向的内存空间中。由于`v35`指向的内存区域为栈(在`(3)`处获取局部变量的地址，其距离`ebp`的大小为`0x40`)，而循环的次数外部可控，因此当`Power
+Requested`字段的个数超过`0x11`后，将覆盖栈上的返回地址。
+    // 为方便理解, 对函数/变量进行了重命名
+    char __cdecl cdpd_poe_handle_pwr_tlvs(int *a1, int cdp_payload_pwr_cons_ptr, _WORD *cdp_payload_pwr_req_ptr)
+    {
+      v32 = *a1;
+      result = cdp_payload_pwr_cons_ptr == 0;
+      v33 = cdp_payload_pwr_req_ptr == 0;
+      if ( cdp_payload_pwr_cons_ptr || !v33 )
+      {
+        v28 = a1 + 300;
+        if ( v33 && cdp_payload_pwr_cons_ptr )  // version 1
+        {
+          // ...
+        }
+        if ( !result && !v33 )  // version 2
+        {
+          // ... 
+          cdp_payload_pwr_req_len_field = __ROR2__(cdp_payload_pwr_req_ptr[1], 8);  // (1)
+          cdp_payload_pwr_req_req_id = __ROR2__(cdp_payload_pwr_req_ptr[2], 8);
+          cdp_payload_pwr_req_mgmt_id = __ROR2__(cdp_payload_pwr_req_ptr[3], 8);
+          // ...
+          v8 = cdp_payload_pwr_req_len_field - 8;
+          if ( v8 > 2;  // (2)
+          // ...
+          if ( (signed int)cdp_payload_pwr_req_num_of_level > 0 )
+          {
+            cdp_payload_pwr_req_level_ptr = (unsigned int *)(cdp_payload_pwr_req_ptr + 4);
+            v35 = &cdp_payload_pwr_cons_len_field;  // (3) cdp_payload_pwr_cons_len_field: [ebp-0x40]
+            pwr_levels_count = 0;
+            do
+            {
+              *v35 = _byteswap_ulong(*cdp_payload_pwr_req_level_ptr);  // (4)
+              // ...
+              a1[pwr_levels_count + 311] = *v35;  // (5) 
+              ++cdp_payload_pwr_req_level_ptr;
+              ++pwr_levels_count;
+              ++v35;
+            }
+            while ( cdp_payload_pwr_req_num_of_level > pwr_levels_count );    // controllable
+          }
+          v9 = *((_WORD *)a1 + 604);
+          v10 = *((_WORD *)a1 + 602);
+          v11 = a1[303];
+          if ( cdp_payload_pwr_req_req_id != v9 || cdp_payload_pwr_req_mgmt_id != v10 ) // (6)
+          {
+            // ...
+    }
+在后续进行漏洞利用时，由于在`(5)`处将`v35`指向的内存地址空间的内容保存到了`a1[pwr_levels_count +
+311]`中，而该地址与函数`cdpd_poe_handle_pwr_tlvs()`的第一个参数有关，在覆盖栈上的返回地址之后也会覆盖该参数，因此需要构造一个合适的参数，使得`(5)`处不会崩溃。另外，还要保证`(6)`处的条件不成立，即执行`else`分支，否则在该函数返回前还会出现其他崩溃。
+另外，`cdpd`程序启用的保护机制如下，同时设备上的`ASLR`等级为2。由于`cdpd`程序崩溃后会重启，因此需要通过爆破的方式来猜测程序相关的基地址。
+    $ checksec --file cdpd
+        Arch:     i386-32-little
+        RELRO:    No RELRO
+        Stack:    No canary found
+        NX:       NX enabled
+        PIE:      PIE enabled
+        RPATH:    b'/isan/lib/convert:/isan/lib:/isanboot/lib'
+之后漏洞利用可以执行注入的`shellcode`，或者通过调用`system()`来执行自定义的`shell`命令。
+> 通过`/isan/bin/vsh`可以执行设备配置界面中的命令，如`system('/isan/bin/vsh -c "conf t ;
+> username aaa password test123! role network-admin"`执行成功后，会添加一个`aaa`的管理用户。
+###  补丁分析
+根据思科的[漏洞公告](https://tools.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-20200205-nxos-cdp-rce)，该漏洞在如下的版本中已修复。
+以`7.0(3)I7(8)`为例，函数`cdpd_poe_handle_pwr_tlvs()`的部分伪代码如下。可以看到，在`(1)`处增加了对`Power
+Requested`字段个数的判断，其最大值为10。
+    char __cdecl cdpd_poe_handle_pwr_tlvs(int *a1, int a2, _WORD *a3)
+    {
+      // ...
+      if ( !result && !v35 )  // version 2
+      {
+        // ...
+        v38 = __ROR2__(a3[1], 8);
+        v33 = __ROR2__(a3[2], 8);
+        v32 = __ROR2__(a3[3], 8);
+        // ...
+        v8 = v38 - 8;
+        if ( v8 > 2;
+        if ( v29  v39 );
+        goto LABEL_78;
+      }
+      // ...
+    }
+## 小结
+  * 通过`GNS3`软件搭建设备的仿真环境，同时对该漏洞的形成原因进行了分析：在对`Power Request(type=0x19)`部分的数据进行解析时，由于缺乏对其内容长度的校验，造成栈溢出。
+## 相关链接
+  * [CDPwn: 5 Zero-Days in Cisco Discovery Protocol](https://www.armis.com/cdpwn/)
+  * [Cisco NX-OS Software Cisco Discovery Protocol Remote Code Execution Vulnerability](https://tools.cisco.com/security/center/content/CiscoSecurityAdvisory/cisco-sa-20200205-nxos-cdp-rce)
+  * [VIRTUALIZING A CISCO NEXUS 9K WITH GNS3](http://www.itcrunch.eu/index.php/2017/09/20/virtualizing-cisco-nexus-9k-with-gns3/)
+  * [CVE-2020-3119 Cisco CDP 协议栈溢出漏洞分析](https://paper.seebug.org/1154/)

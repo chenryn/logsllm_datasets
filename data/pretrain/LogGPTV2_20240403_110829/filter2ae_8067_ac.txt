@@ -1,0 +1,118 @@
+    }
+    pEval->CallFunction(function, 1, &value);
+## payload分离
+至此，我们已经注入了代码，我们可以选择在执行恶意投标时将其绑定在目标进程上，或者使其分离调试器，继续自己执行（希望payload在内部运行）。
+分离只是一个调用问题：
+    debug->Detach();
+但是，如果要脱离目标并允许其继续执行而不会被杀死，则需要满足许多条件。主要包括：
+    停止当前连接到线程的所有步进器。
+    需要完成所有的代码评估。
+    我们必须处于同步状态，无论是通过调用ICorDebug::Stop方法，还是通过使之处于一个回调事件处理程序中。
+第1项和第3项非常容易实现，但是我想谈谈第2项。让我们以一个非常简单的.NET方法为例，该方法要在目标中执行：
+    namespace Injected {
+      class Injected {
+        public static void Entry() {
+          while(true) {
+            Console.WriteLine("I'm in...");
+            Thread.Sleep(2000);
+          }
+        }
+      }
+    }
+然后我们通过以下方式请求执行此代码：
+    pEval->CallFunction(function, 0, NULL);
+我们会发现，我们无法彻底脱离进程。这是因为我们不满足要求2，因为我们的代码评估永远不会返回，因此`EvalComplete`永远不会发生回调。这意味着任何分离尝试都将遇到错误`CORDBG_E_DETACH_FAILED_OUTSTANDING_EVALS`。
+因此，我们必须时刻保证初始代码执行能够返回并且在尝试分离之前处理回调。话虽如此，让我们看一些典型目标的示例，以及如何使用它们执行一些常见的后渗透工具。
+## 标准注入
+为了在一个正在运行的进程中执行我们的代码，我们需要找到一个不会闲置的目标。因此需要一个非常活跃的进程，并推动代码进行JIT处理。
+一个潜在选择是`eventvwr.exe`，它实际上会在加载.NET运行时生成`mmc.exe`。由于此进程积极地在后台处理事件，因此它成为此类技术的理想目标。
+那么如何才能在此进程中执行.NET方法呢？首先生成事件查看器留待他用：
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    HRESULT hr;
+    memset(&si, 0, sizeof(STARTUPINFOA));
+    si.cb = sizeof(STARTUPINFOA);
+    CreateProcessW(
+        L"C:\\\\Windows\\\\System32\\\\eventvwr.exe",
+        NULL,
+        NULL,
+        NULL,
+        false,
+        CREATE_NEW_CONSOLE,
+        NULL,
+        NULL,
+        &si,
+        &pi);
+现在我们已经生成了进程，我们需要使用以下`ICorDebug::DebugActiveProcess`方法来连接调试器：
+    ICorDebugProcess *process;
+    debug->DebugActiveProcess(PID, false, &process);
+连接完成后，我们可以使用上述步骤来执行任意.NET方法，或者在本poc中，加载任意.NET程序集。让我们尝试加载SharpDump，以表明我们可以控制进程，并有望允许转储lsass.exe内存。  
+[这里有个演示小视频](https://youtu.be/obTMt7_yyCQ)
+## 量身定制注入
+在诸如`eventvwr.exe`之类的进程中，.NET的payload执行起来非常容易，我们还可以进一步针对目标进程本身进行定制注入。例如，其他.NET进程中，`AddInProcess.exe`可以和.NET框架绑定。如果我们把它拆分出来，会发现它有两个参数：
+第一个参数是GUID，用于创建通过命名管道侦听的IPC服务器：
+第二个参数是进程的PID，该进程将被监视并阻塞主线程，直到目标进程退出：
+这意味着，尽管进程将处于闲置状态（因此不满足我们运行JIT'er的要求），但实际上我们可以附加一个调试器，然后与IPC服务建立连接以触发代码的JIT，用来把步进器方入GC安全点，最后达到注入代码目的。
+对于此示例，让我们将代码注入到`AddInProcess.exe`，看看会发生什么。我们不会重定向I/O，而是会手动触发命名管道连接，因此您可以准确了解正在发生的情况：  
+[又有一个小视频](https://youtu.be/9mhO_wBVI10)
+## payload构造并注入
+通过注入现有进程，设计payload以触发特定应用程序状态从而允许注入。但是，如果只是想立即产生并注入一个新进程以迁移我们的恶意代码怎么办？使用ICorDebug公开的`CreateProcessW`包装器，这是完全可行的：
+    debug->CreateProcessW(
+        L"C:\\\\Windows\\\\Microsoft.NET\\\\Framework64\\\\v4.0.30319\\\\AddInUtil.exe",
+        NULL,
+        NULL,
+        NULL,
+        false,
+        CREATE_NEW_CONSOLE,
+        NULL,
+        NULL,
+        &si,
+        &pi,
+        (CorDebugCreateProcessFlags)0,
+        &this->process);
+这里可以使用定制的参数（基于个人喜好），并使用新的父进程或缓解策略。这也使安全点搜寻变得轻松多了，因为在进程产生时，JIT'er会努力为我们提供充足的时间来达到GC安全点。
+现在，在尝试在新的.NET进程中调用任意.NET方法时，需要考虑一些因素，主要是应用程序在运行payload的情况下的执行时间长度。毕竟，如果目标只是打印一些帮助然后就退出了，则注入payload并没有多大用处。
+避免此限制的一种方法是制作.NET
+payload以生成其他托管线程。由于.NET支持后台和前台托管线程的概念，因此我们发现，即使Main()函数返回，生成的前台线程也会阻塞目标退出，继续运行注入的代码，直到达到我们想要的时间。
+例如，让我们采用一个非常简单的.NET payload：
+    namespace Injected {
+      class Injected {
+        public static void ThreadEntry() {
+          while(True) {
+            Console.WriteLine("Injected... we're in!");
+            Thread.Sleep(1000);
+          }
+        }
+    public static void Entry() {
+          var thread = new System.Threading.Thread(new ThreadStart(ThreadEntry));
+          thread.Start(); 
+        }
+      }
+    }
+[又有一个小视频](https://youtu.be/CsCnlndKC1c)
+## 进一步改进
+在前面的示例中，我尝试显示了在正确以及不进行任何CLR按摩的情况下，此技术在某些地方的可用性。但是，值得指出的是，有一些问题稍不注意可能会让我们功亏一篑，其中最主要的是`ngen`（或本机映像），它们是预编译JIT的二进制文件，已加载到.NET进程中，目的是加快执行速度。当我们遇到这个问题时，很明显，要达到可以评估所需的JIT编译代码的程度，我们的注入将变得非常困难。另外还有.NET优化进程，这将再次减少我们在某些进程中找到GC安全点的机会。
+那么有什么办法可以避免这种情况？事实证明，使用`COMPlus`环境变量就可以了。具体有两种设置会增加我们在“顽固”进程中实现执行的几率：`COMPlus_JITMinOpts`和`COMPlus_ZapDisable`。实际上，与x64相比，x86进程似乎更需要这样设置。
+## POC
+作为这篇文章的一部分，我发布了一个POC工具，可用于探索所讨论的一些概念，可以在Github上[找到](https://github.com/xpn/DotNetDebug)。
+编译后，将按以下方式启动POC：
+    DotNetDebug.exe attach mmc.exe
+    DotNetDebug.exe attachpid 1234
+    DotNetDebug.exe launch C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\AddInProcess.exe
+默认情况下，此POC将`Assembly.Load`在目标中执行，以暂存.NET程序集。该程序将依次从`C:\Windows\Temp\inject.exe`中加载代码。这将使您可以使用此技术来测试一些您最喜欢的现有工具，当然您可以执行想要的任何操作。
+## 侦测
+因此，现在我们有了一个思路，即如何使用调试器API在.NET进程中执行任意方法，我们需要考虑所有这些事情的幕后所发生的事情，以及防御者如何着手检测。我不会深入讲解太多关于Windows的调试子系统，已经有一个辉煌的一系列文档说明。相反，让我们看一些对检测有用的特定区域。
+首先是流程之间的交互，例如，调试框架在附加到目标时会调用哪些值得注意的API？与大多数注入方法一样，在整个调试会话中都会大量使用`WriteProcessMemory`方法来修改目标进程。
+其次，在远程进程中需要实际的线程来触发断点。在附加到现有进程的情况下，可以使用`kernelbase!DebugActiveProcess`API方法，但是如果在调用此方法时查看调用栈的栈底，则会发现以下内容：
+此`ntdll!NtCreateThreadEx`调用负责在远程进程中创建线程。用于此远程线程的入口点为`ntdll!DbgUiRemoteBreakin`,仅用于触发一个断点，该断点挂起目标并向我们的调试器发出事件。当然，这意味着基于传统分配的内存入口点来寻找注入的线程是行不通的，因为线程的初始地址是ntdll函数的地址，但是对特定的`ntdll!DbgUiRemoteBreakin`调用，则是成功以某种形式操作目标的好兆头。
+此外，Sysmon将提供一个很好的`CreateRemoteThread`指示符来显示进入点，因为`DbgUiRemoteBreakin`对于防御者可能是一个很好的指示。
+话虽如此，只有在现有进程中寻找执行.NET代码的情况下，情况才会如此。像上述最后一个示例所示，如果我们连接了调试器来启动一个新的.NET进程，则将看不到此远程线程的创建，因此也不会触发此检测机制。这是因为通过`DEBUG_PROCESS`的`CreateProcess`选项来创建初始调试器会话，这意味着`ntdll!NtCreateThreadEx`从不使用该调用。但是，如果稍后使用诸如`DebugBreakProcess`这样的调用，则将导致与上文所述相同的远程线程签名。
+接下来，我们还必须考虑到在调试过程时，可以使用几个API来表明正在连接的活动调试器（任何编写过反分析代码的人都会知道）。例如，使用目标进程句柄中的`CheckRemoteDebuggerPresent`调用将显示调试器会话是否处于活动状态。
+诸如`ProcessHacker`之类的工具还可以通过突出显示进程来表明调试器会话的存在：
+当然，只有在调试器会话处于活动状态时才适用。因此，如果代码已执行且调试器会话已停止，则情况将不再如此。
+## 一些有用的参考
+    https://googleprojectzero.blogspot.com/2019/04/windows-exploitation-tricks-abusing.html
+    http://index-of.es/Windows/dbgk-1.pdf
+    https://mattwarren.org/2016/08/08/GC-Pauses-and-Safe-Points/
+    https://github.com/Samsung/netcoredbg
+[原文链接](https://blog.xpnsec.com/debugging-into-net)

@@ -1,0 +1,279 @@
+## PostgreSQL 快速大版本升级多种方案 - 含重点介绍fast & safe upgrade to PostgreSQL 9.4 use pg_upgrade & zfs     
+### 作者                         
+digoal                       
+### 日期                                                                                                                                         
+2014-12-19                                                                    
+### 标签                                                                      
+PostgreSQL , pg_upgrade , 跨版本升级 , 原地升级 , 快速       
+----                                                                                                                                      
+## 背景       
+已使用pg_upgrade顺利将一个8TB的生产数据库(包含表, 索引, 类型, 函数, 外部对象等对象大概10万个)从9.3升级到9.4, 升级比较快(约2分钟), 因为数据库较大后期analyze的时间比较长, 不过你可以将常用的表优先analyze一下, 就可以放心大胆的提供服务了.  
+PostgreSQL 9.4于(2014-12-18)正式发布, 为了让大家可以快速的享受9.4带来的强大特性, 写一篇使用zfs和pg_upgrade升级9.4的快速可靠的文章. 希望对大家有帮助.  
+提醒:  
+在正式升级9.4前, 请做好功课, 至少release note要阅读一遍, 特别是兼容性. 例如有些应用可能用了某些9.4不兼容的语法或者插件的话, 需要解决了再上. (以前就有出现过版本升级带来的bytea的默认表述变更导致的程序异常)  
+pg_upgrade支持从8.3.x以及更新的版本的跨大版本升级, 使用LINK模式, 可以减少数据的拷贝工作, 大大提高版本升级的速度.  
+本文将演示一下使用pg_upgrade将数据库从9.3.5升级到最新的9.4.  
+使用zfs快照来保存老的数据文件和软件. 如果升级失败, 回滚非常简单, 回退到ZFS快照或者使用ZFS快照克隆都可以.  
+实际上，使用备库来进行升级演练，把流程都跑通，是很不错的选择。ZFS则是加一道保险，或者说方便多次（克隆ZFS进行演练）演练。  
+![pic](20141219_01_pic_001.png)  
+## 升级步骤简介  
+1、假设主机已是基于ZFS  
+```  
+  停库  
+  创建快照  
+  使用upgrade升级  
+```  
+2、假设主机不是基于ZFS  
+```  
+  创建ZFS主机  
+  创建PostgreSQL物理standby  
+  主备角色切换，把主库切到ZFS主机下。  
+  以下基于新的主库操作：  
+  停主  
+  创建快照  
+  使用upgrade升级  
+```  
+3、如何把老版本的standby升级成为9.4 standby?  
+```  
+  pg start backup  
+  rsync 数据文件  
+  pg_stop_backup  
+  创建recovery.conf 继续.  
+```  
+### 使用ZFS和pg_upgrade升级9.4的详细步骤  
+以CentOS 7 x64为例,  
+测试环境部署  
+安装zfs  
+http://download.fedoraproject.org/pub/epel 找到最新的epel7 rpm包, 加入YUM仓库.  
+例如当下版本如下 :   
+```  
+[root@localhost ~]# yum localinstall --nogpgcheck http://ftp.cuhk.edu.hk/pub/linux/fedora-epel/7/x86_64/e/epel-release-7-5.noarch.rpm  
+[root@localhost ~]# yum localinstall --nogpgcheck http://archive.zfsonlinux.org/epel/zfs-release.el7.noarch.rpm  
+[root@localhost ~]# uname -r  
+3.10.0-123.el7.x86_64  
+[root@localhost ~]# yum install kernel-devel-3.10.0-123.el7 zfs   
+```  
+安装好ZFS后, 创建ZPOOL, 我们使用5个文件来模拟5块磁盘.  
+```  
+[root@localhost disks]# dd if=/dev/zero of=./disk1 bs=8192k count=1024 oflag=direct  
+[root@localhost disks]# dd if=/dev/zero of=./disk2 bs=8192k count=1024 oflag=direct  
+[root@localhost disks]# dd if=/dev/zero of=./disk3 bs=8192k count=1024 oflag=direct  
+[root@localhost disks]# dd if=/dev/zero of=./disk4 bs=8192k count=1024 oflag=direct  
+[root@localhost disks]# dd if=/dev/zero of=./disk5 bs=8192k count=1024 oflag=direct  
+```  
+创建zpool  
+```  
+[root@localhost disks]# zpool create -o ashift=12 zp1 raidz /data01/disks/disk1 /data01/disks/disk2 /data01/disks/disk3 /data01/disks/disk4 /data01/disks/disk5  
+[root@localhost disks]# zpool status  
+  pool: zp1  
+ state: ONLINE  
+  scan: none requested  
+config:  
+        NAME                     STATE     READ WRITE CKSUM  
+        zp1                      ONLINE       0     0     0  
+          raidz1-0               ONLINE       0     0     0  
+            /data01/disks/disk1  ONLINE       0     0     0  
+            /data01/disks/disk2  ONLINE       0     0     0  
+            /data01/disks/disk3  ONLINE       0     0     0  
+            /data01/disks/disk4  ONLINE       0     0     0  
+            /data01/disks/disk5  ONLINE       0     0     0  
+```  
+设置zfs默认参数 :   
+```  
+[root@localhost disks]# zfs set atime=off zp1  
+[root@localhost disks]# zfs set compression=lz4 zp1  
+[root@localhost disks]# zfs set canmount=off zp1  
+```  
+接下来, 我们需要规划一下数据库的目录结构.  
+假设分开5个文件系统来存放.  
+```  
+$PGDATA  
+pg_xlog  
+pg_arch  
+tbs1  
+tbs2  
+```  
+创建对应的zfs文件系统  
+```  
+[root@localhost disks]# zfs create -o mountpoint=/pgdata01 zp1/pg_root  
+[root@localhost disks]# zfs create -o mountpoint=/pgdata02 zp1/pg_xlog  
+[root@localhost disks]# zfs create -o mountpoint=/pgdata03 zp1/pg_arch  
+[root@localhost disks]# zfs create -o mountpoint=/pgdata04 zp1/tbs1  
+[root@localhost disks]# zfs create -o mountpoint=/pgdata05 zp1/tbs2  
+[root@localhost disks]# df -h  
+zp1/pg_root                 32G  256K   32G   1% /pgdata01  
+zp1/pg_xlog                 32G  256K   32G   1% /pgdata02  
+zp1/pg_arch                 32G  256K   32G   1% /pgdata03  
+zp1/tbs1                    32G  256K   32G   1% /pgdata04  
+zp1/tbs2                    32G  256K   32G   1% /pgdata05  
+```  
+创建数据目录  
+```  
+[root@localhost ~]# mkdir /pgdata01/pg_root  
+[root@localhost ~]# mkdir /pgdata02/pg_xlog  
+[root@localhost ~]# mkdir /pgdata03/pg_arch  
+[root@localhost ~]# mkdir /pgdata04/tbs1  
+[root@localhost ~]# mkdir /pgdata05/tbs2  
+[root@localhost ~]# chown -R postgres:postgres /pgdata0*/  
+```  
+接下来安装PostgreSQL 9.3.5, 并初始化数据库, 生成测试数据.  
+```  
+[root@localhost soft_bak]# tar -jxvf postgresql-9.3.5.tar.bz2  
+[root@localhost soft_bak]# cd postgresql-9.3.5  
+```  
+注意在升级到9.4时, 软件的编译参数要一致, 例如我们这里使用了非默认的数据块, 所以在编译9.4时也需要一致.  
+```  
+[root@localhost soft_bak]# yum -y install glib2 lrzsz sysstat e4fsprogs xfsprogs ntp readline-devel zlib zlib-devel openssl openssl-devel pam-devel libxml2-devel libxslt-devel python-devel tcl-devel gcc make smartmontools flex bison perl perl-devel perl-ExtUtils* OpenIPMI-tools openldap openldap-devel  
+[root@localhost postgresql-9.3.5]# ./configure --prefix=/opt/pgsql9.3.5 --with-pgport=1921 --with-perl --with-tcl --with-python --with-openssl --with-pam --without-ldap --with-libxml --with-libxslt --enable-thread-safety --with-blocksize=32 --with-wal-blocksize=32 && gmake world && gmake install-world  
+[root@localhost postgresql-9.3.5]# ln -s /opt/pgsql9.3.5 /opt/pgsql  
+[root@localhost postgresql-9.3.5]# vi /etc/ld.so.conf  
+/opt/pgsql/lib  
+[root@localhost postgresql-9.3.5]# ldconfig  
+[root@localhost postgresql-9.3.5]# ldconfig -p|grep /opt/pgsql  
+        libpqwalreceiver.so (libc6,x86-64) => /opt/pgsql/lib/libpqwalreceiver.so  
+        libpq.so.5 (libc6,x86-64) => /opt/pgsql/lib/libpq.so.5  
+        libpq.so (libc6,x86-64) => /opt/pgsql/lib/libpq.so  
+        libpgtypes.so.3 (libc6,x86-64) => /opt/pgsql/lib/libpgtypes.so.3  
+        libpgtypes.so (libc6,x86-64) => /opt/pgsql/lib/libpgtypes.so  
+        libecpg_compat.so.3 (libc6,x86-64) => /opt/pgsql/lib/libecpg_compat.so.3  
+        libecpg_compat.so (libc6,x86-64) => /opt/pgsql/lib/libecpg_compat.so  
+        libecpg.so.6 (libc6,x86-64) => /opt/pgsql/lib/libecpg.so.6  
+        libecpg.so (libc6,x86-64) => /opt/pgsql/lib/libecpg.so  
+[root@localhost postgresql-9.3.5]# vi /etc/profile  
+export PATH=/opt/pgsql/bin:$PATH  
+[root@localhost postgresql-9.3.5]# . /etc/profile  
+[root@localhost postgresql-9.3.5]# which psql  
+/opt/pgsql/bin/psql  
+[root@localhost postgresql-9.3.5]# which pg_config  
+/opt/pgsql/bin/pg_config  
+```  
+再安装一个外部插件, 提醒各位在使用pg_upgrade升级时, 也需要在新的版本中编译进去(请使用相同的版本).  
+如果外部插件不支持PostgreSQL 9.4的话, 那么请在9.3的数据库中先卸载对应的插件(包括里面创建的类型, 函数等有依赖的一切).   
+我这里以pldebug为例  
+```  
+http://git.postgresql.org/gitweb/?p=pldebugger.git;a=summary  
+[root@localhost soft_bak]# tar -zxvf pldebugger-85d7b3b.tar.gz  
+[root@localhost soft_bak]# mv pldebugger-85d7b3b postgresql-9.3.5/contrib/  
+[root@localhost soft_bak]# cd postgresql-9.3.5/contrib/pldebugger-85d7b3b/  
+[root@localhost pldebugger-85d7b3b]# which pg_config  
+/opt/pgsql/bin/pg_config  
+[root@localhost pldebugger-85d7b3b]# gmake clean  
+[root@localhost pldebugger-85d7b3b]# gmake  
+[root@localhost pldebugger-85d7b3b]# gmake install  
+```  
+初始化数据库  
+```  
+[root@localhost pldebugger-85d7b3b]# useradd postgres  
+# su - postgres  
+$ vi .bash_profile  
+export PS1="$USER@`/bin/hostname -s`-> "  
+export PGPORT=1921  
+export PGDATA=/pgdata01/pg_root  
+export LANG=en_US.utf8  
+export PGHOME=/opt/pgsql  
+export LD_LIBRARY_PATH=$PGHOME/lib:/lib64:/usr/lib64:/usr/local/lib64:/lib:/usr/lib:/usr/local/lib:$LD_LIBRARY_PATH  
+export DATE=`date +"%Y%m%d%H%M"`  
+export PATH=$PGHOME/bin:$PATH:.  
+export MANPATH=$PGHOME/share/man:$MANPATH  
+export PGUSER=postgres  
+export PGHOST=$PGDATA  
+export PGDATABASE=postgres  
+alias rm='rm -i'  
+alias ll='ls -lh'  
+$ . ~/.bash_profile  
+```  
+修改权限  
+```  
+[root@localhost pldebugger-85d7b3b]# chown -R postgres:postgres /pgdata0*/*  
+[root@localhost pldebugger-85d7b3b]# chmod -R 700 /pgdata0*/*  
+```  
+初始化数据库  
+```  
+postgres@localhost-> initdb -D $PGDATA -U postgres -E UTF8 --locale=C -W -X /pgdata02/pg_xlog  
+```  
+修改配置文件, 开启归档  
+```  
+vi pg_hba.conf  
+host all all 0.0.0.0/0 md5  
+vi postgresql.conf  
+listen_addresses = '0.0.0.0'            # what IP address(es) to listen on;  
+port = 1921                             # (change requires restart)  
+max_connections = 100                   # (change requires restart)  
+superuser_reserved_connections = 3      # (change requires restart)  
+unix_socket_directories = '.'   # comma-separated list of directories  
+unix_socket_permissions = 0700          # begin with 0 to use octal notation  
+tcp_keepalives_idle = 60                # TCP_KEEPIDLE, in seconds;  
+tcp_keepalives_interval = 10            # TCP_KEEPINTVL, in seconds;  
+tcp_keepalives_count = 10               # TCP_KEEPCNT;  
+shared_buffers = 512MB                  # min 128kB  
+maintenance_work_mem = 512MB            # min 1MB  
+vacuum_cost_delay = 10                  # 0-100 milliseconds  
+vacuum_cost_limit = 10000               # 1-10000 credits  
+bgwriter_delay = 10ms                   # 10-10000ms between rounds  
+wal_level = hot_standby                 # minimal, archive, or hot_standby  
+synchronous_commit = off                # synchronization level;  
+wal_buffers = 16384kB                   # min 32kB, -1 sets based on shared_buffers  
+wal_writer_delay = 10ms         # 1-10000 milliseconds  
+checkpoint_segments = 32                # in logfile segments, min 1, 16MB each  
+archive_mode = on               # allows archiving to be done  
+archive_command = 'DIR="/pgdata03/pg_arch/`date +%F`";test -d $DIR || mkdir -p $DIR; cp %p $DIR/%f'               # command to use to archive a logfile segment  
+archive_timeout = 600           # force a logfile segment switch after this  
+effective_cache_size = 4096MB  
+log_destination = 'csvlog'              # Valid values are combinations of  
+logging_collector = on          # Enable capturing of stderr and csvlog  
+log_directory = 'pg_log'                # directory where log files are written,  
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log' # log file name pattern,  
+log_file_mode = 0600                    # creation mode for log files,  
+log_truncate_on_rotation = on           # If on, an existing log file with the  
+log_checkpoints = on  
+log_connections = on  
+log_disconnections = on  
+log_error_verbosity = verbose           # terse, default, or verbose messages  
+log_lock_waits = on                     # log lock waits >= deadlock_timeout  
+log_statement = 'ddl'                   # none, ddl, mod, all  
+log_timezone = 'PRC'  
+autovacuum = on                 # Enable autovacuum subprocess?  'on'  
+log_autovacuum_min_duration = 0 # -1 disables, 0 logs all actions and  
+datestyle = 'iso, mdy'  
+timezone = 'PRC'  
+lc_messages = 'C'                       # locale for system error message  
+lc_monetary = 'C'                       # locale for monetary formatting  
+lc_numeric = 'C'                        # locale for number formatting  
+lc_time = 'C'                           # locale for time formatting  
+default_text_search_config = 'pg_catalog.english'  
+```  
+启动数据库  
+```  
+postgres@localhost-> pg_ctl start  
+```  
+创建测试用户  
+```  
+postgres=# create role digoal login encrypted password 'digoal';  
+CREATE ROLE  
+```  
+创建表空间, 数据库  
+```  
+postgres=# create tablespace tbs1 location '/pgdata04/tbs1';  
+CREATE TABLESPACE  
+postgres=# create tablespace tbs2 location '/pgdata05/tbs2';  
+CREATE TABLESPACE  
+postgres=# create database digoal template template0 encoding 'UTF8' tablespace tbs1;  
+CREATE DATABASE  
+postgres=# grant all on database digoal to digoal;  
+GRANT  
+postgres=# grant all on tablespace tbs1 to digoal;  
+GRANT  
+postgres=# grant all on tablespace tbs2 to digoal;  
+GRANT  
+postgres=# \c digoal digoal  
+You are now connected to database "digoal" as user "digoal".  
+digoal=> create schema digoal;  
+CREATE SCHEMA  
+```  
+创建extension, 用于后面模拟9.3升级到9.4的扩展模块.  
+```  
+postgres=# \c digoal postgres  
+You are now connected to database "digoal" as user "postgres".  
+digoal=# create extension pldbgapi;  
+CREATE EXTENSION  
+```  

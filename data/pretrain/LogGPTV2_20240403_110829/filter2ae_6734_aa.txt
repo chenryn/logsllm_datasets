@@ -1,0 +1,142 @@
+# 前言
+前段时间一直有个想法，做个内网多级代理的工具，更方便突破网络限制，然后就开始物色各种代理工具，如frp、nps等等，frp的稳定性很出色，他的代码结构和实现细节也很值得借鉴，但缺点也很明显，他并不是为了渗透而生的，所以在功能上有许多不太符合之处，比如不支持正向代理，代理转发等配置不支持热启动，不支持级联等等。然后有朋友推荐了stowaway，看介绍是venom的改进版，我测试了下功能，确实蛮符合渗透要求的，多级代理、上传下载文件、热启动正反向端口转发及socks代理，很灵活，当然要投入实战的话，还有不少需要改进的地方，所以就有了后面的改造计划。  
+​
+# 代码分析
+在做改造之前，先简单分析下他的代码，方便后续的改造。  
+项目地址：  
+​
+工具分为agent和admin，admin是一个console交互式程序，用于管理agent。  
+agent比frp小很多，也是一个好的点。具体功能可以参考项目readme，写的蛮详细的。
+代码目录如下，admin和agent分为单独的目录实现功能
+    ├─admin
+    │  ├─cli
+    │  ├─handler
+    │  ├─initial
+    │  ├─manager
+    │  ├─printer
+    │  ├─process
+    │  └─topology
+    ├─agent
+    │  ├─handler
+    │  ├─initial
+    │  ├─manager
+    │  └─process
+    ├─crypto
+    ├─global
+    ├─protocol
+    ├─release
+    ├─script
+    ├─share
+    ├─tools
+    └─utils
+​
+​
+## admin
+目录结构  
+连接分成两个阶段，初始化和监听阶段  
+初始化阶段：  
+根据当前模式，是主动连接还是被动监听，发起密钥交互（我后面多加了一个websocket头部交互和tls封装），然后返回conn。  
+初始化函数放在initial包里。  
+initial包里有参数解析和认证。  
+监听阶段：  
+然后是最下面的`admin.Run()`，启动各种处理函数  
+admin/process/process.go  
+其中`go
+admin.handleMessFromDownstream(console)`主要用于下游agent消息接收，然后把接收信息通过channel传递给各个以Dispatch开头的消息处理函数。  
+这些消息处理函数主要发送消息给下游。  
+`console.Run()`也会用于消息发送，是一个交互式shell用于操作。  
+​
+所以看到这个结构。  
+admin.handleMessFromDownstream用于下游消息接收  
+Dispatch消息处理函数和console.Run()用于发送消息给下游，处理函数统一放在handler包里。  
+​
+所以websocket的心跳包也在这里设计，添加一个DispatchKeepMess处理函数，用于定期发送数据给下游，保持会话。  
+而Dispatch处理函数又由manager包进行管理，通过该包进行协程间通信以及任务处理  
+​
+​
+## agent
+目录结构  
+其实和admin的目录结构差不多
+  * handler: 消息处理函数，在节点间发送信息
+  * initial: 参数解析以及连接初始化
+  * manager：管理handler包的处理函数，用于协程间通信以及任务分发
+  * process: 主控程序，运行各个消息处理函数以及接收节点信息。
+​
+和admin逻辑差不多。  
+启动管理端以及各个消息处理函数，最后运行handleDataFromUpstream处理上游数据  
+# 短连接接收数据错误
+在增加功能前，我在测试功能时发现个问题，socks、正向端口转发、反向端口转发，在遇到http、redis爆破等各种短连接时，会出现用户端数据接收不完整的问题，比如web访问有的页面文件加载不出来，爆破无效果等，而如果是rdp等长连接却没有这个问题。  
+这个问题很影响代理，所以必须优先解决。  
+​
+测试环境PC(192.168.111.112)、admin(192.168.111.1)、agent(192.168.100.18)、web（192.168.100.1）  
+​
+socks代理，F12调试的时候发现无法加载的文件，提示都是ERR_CONTENT_LENGTH_MISMATCH，啥意思，就是响应包里的长度和body不一致。  
+点开一个查看，这里响应头是完整的，还有body长度  
+但body部分确实空的，这是怎么回事  
+抓包查看本地和socks之间的请求，响应确实只有header  
+客户端请求正常发送，但最后确实由服务端主动发送FIN请求，从而断开连接  
+然后看了其他正常接收的数据包，同样也是服务端发送的FIN请求，所以一个资源加载时灵时不灵，可能就和这个有关了。
+我们来看下不过socks代理，正常的请求包里，FIN是由客户端主动发起，从而断开连接，所以问题很可能就在于因为连接是服务端主动断开的，而不是客户端控制的，导致数据未接收完整。  
+接着我测试了frp，frp是稳定正常的，并且和不挂socks一样的过程，FIN是由客户端发起断开的，那么这里其实很明显了，stowaway的连接机制有问题。  
+那么具体问题，我们跟踪下代码看看  
+admin/handler/socks.go#handleSocks  
+conn是和客户端的链接  
+读取客户端数据，这里conn.Close()是后来注释掉的  
+写入数据发送给客户端，这里调试的时候发现，agent完整传回数据给admin了，但这里写入居然报错，发现再写入最后数据时，conn已关闭。  
+然后找admin上关闭conn的位置，handlesocks里有几处close的地方，我注释掉了，但仍然还是有问题，就进一步跟踪conn。  
+在启用handleSocks前，conn存储在SocksTask结构体里，并传输给`mgr.SocksManager.TaskChan`，  
+最后定位到admin/manager/socks.go#closeTCP  
+这里会关闭conn，closeTCP由谁调用呢  
+run()里，如果接收到agent发送的SocksTCPFin信号，那么就会强制关闭conn，那么后续就无法写入数据给客户端了。  
+梳理下通信过程，大致如下，  
+PC----socks---->admin----tcp---->agent----http---->web
+agent（192.168.100.18）和web（192.168.100.1）之间，可以看到是正常的客户端发起FIN，但因为这里是最早结束请求断开连接的，那么agent会发送TCP
+FIN信号给admin，让admin也断开连接，这时admin接收到的web数据可能还没来得及返回给PC，就因为TCP
+FIN信号断开和PC的链接，导致数据接收不完整。  
+所以我将这段代码注释掉，由PC主动和admin断开连接，而不是agent通知。  
+而handleSocks里的conn.Close改成defer，编译测试，一切都正常了。  
+然后抓了PC到admin之间的socks流量，可以看到这里TCP FIN就正常了，由PC
+192.168.111.112主动发起，而不像原来是由admin发起的。  
+总结下来就是，agent和目标先一步交互完数据并断开连接，这时目标返回的数据会通过agent发送给admin，同时agent还会发送一个TCP
+FIN信号给admin，此时就可能出现admin先一步处理了TCP FIN信号，断开了和PC之间的链接，导致数据无法返回给PC。
+那么forward和backward应该也有一样的。
+admin/handler/forward.go#DispatchForwardMess  
+修改后  
+backward是从agent端主动发起的请求，所以这里应该改的是agent端。  
+PS: 从上面的可以看出TCP FIN是双向都会发送的，调整都是根据请求方向，在请求侧做优化。  
+agent/handler/backward.go#DispatchBackwardMess  
+​
+这里也是一样的现象，只不过是变成agent发起而已。  
+修改后  
+​
+# 短连接接收数据错误-续
+我将该问题、解决方案和作者沟通了下，作者给出了另一种方案，我觉得更合适点。  
+​
+上面的操作是通过注释发送端的FIN信号，让请求者自己断开，但直接注释会导致不调用closeTCP，这样里面的channel不会关闭，导致无法释放  
+所以还是需要FIN信号，但如上在closeTCP里不调用conn.Close()  
+closeSocks里也注释掉  
+那么再哪里关闭呢，既然是因为接收后写给客户端不完整导致的，那么在如下位置关闭即可。  
+tcpDataChan在上面关闭了，但由于是一个非阻塞channel，那么如果还有数据会继续接收，直到为空后才会为false，接着就关闭conn了。这个思路更巧妙一点。  
+其他模块如上修改即可。  
+​
+​
+# 流量全加密
+bug修复后，就可以开始改造了，作者在readme里说到该工具数据传输是通过AES加密的，所以就抓包看了下流量。  
+​
+实际上该工具的流量只加密了payload部分，而header部分是明文的，比如`THREREISNOROUTE`等等  
+这个问题其实好解决，只需要在原来的Conn外封装一层tls即可，这样其实payload都无需加密了。  
+这个参考frp修改即可，frp本身也有一个tls_enable的选项，他就是这个思路。  
+​
+找到node之间连接的代码，搜索net.Dail或Accept()，如下在原来建立成功的conn对象后面，判断是否启动tls，然后调用WrapTLSClientConn封装即可。（为啥还要搞个选项，为了调试方式，不然全是密文，流量侧不好调试）  
+这里tlsConfig暂时没传递证书，可以改成自定义证书，防止tls指纹，最后一个options.Connect是sni。  
+    if proxy == nil && options.TlsEnable {
+    // TODO:  options.Connect不准确
+    tlsConfig, err := transport.NewClientTLSConfig("", "", "", options.Connect)
+    if err != nil {
+    printer.Fail("[*] Error occured: %s", err.Error())
+    conn.Close()
+    continue
+    }
+    conn = net2.WrapTLSClientConn(conn, tlsConfig)
+    }
+WrapTLSClientConn内部只是调用官方库的tls.Client来封装原来的Conn对象

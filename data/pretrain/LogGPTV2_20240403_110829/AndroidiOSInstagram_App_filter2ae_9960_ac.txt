@@ -1,0 +1,159 @@
+    /* Coefficient buffer control */
+    struct jpeg_d_coef_controller {
+      void (*start_input_pass) (j_decompress_ptr cinfo);
+      int (*consume_data) (j_decompress_ptr cinfo);
+      void (*start_output_pass) (j_decompress_ptr cinfo);
+      int (*decompress_data) (j_decompress_ptr cinfo, JSAMPIMAGE output_buf);
+      jvirt_barray_ptr *coef_arrays;
+    };
+    /* Decompression postprocessing (color quantization buffer control) */
+    struct jpeg_d_post_controller {
+      void (*start_pass) (j_decompress_ptr cinfo, J_BUF_MODE pass_mode);
+      void (*post_process_data) (j_decompress_ptr cinfo, JSAMPIMAGE input_buf,
+                                 JDIMENSION *in_row_group_ctr,
+                                 JDIMENSION in_row_groups_avail,
+                                 JSAMPARRAY output_buf, JDIMENSION *out_row_ctr,
+                                 JDIMENSION out_rows_avail);
+我们需要找到3种结构在堆存储器中的位置，基于此我们可以覆盖其中至少一种结构以获得对PC寄存器的控制。
+为了弄清楚这一点，我们需要了解使用Mozjpeg解压缩图像时堆的样子。
+## Mozjpeg内的内存管理器
+让我们回想一下`cinfo`最重要的struct成员之一：
+    struct jpeg_memory_mgr *mem;  /* Memory manager module */
+Mozjpeg有自己的内存管理器。JPEG库的内存管理器控制内存的分配和释放，并管理大型“虚拟”数据数组。
+库中的所有内存和临时文件分配都是通过内存管理器完成的。 这种方法有助于防止内存泄漏问题，并且在malloc/free运行缓慢时加速操作。
+内存管理器创建被释放内存的“内存池”，并且可以一次释放整个池。
+一些数据是被“永久”分配使用的，直到销毁JPEG对象后才会释放。
+大多数数据是根据图像大小来分配的，并由`jpeg_finish_decompress`或`jpeg_abort`函数释放。
+例如，让我们看一下Mozjpeg在图像解码过程中所做的一种堆的分配。
+当Mozjpeg要求分配0x108字节时，堆分配器实际上会给一个大小为0x777的堆块。 我们看到，请求的大小和分配的实际大小不同。
+我们需要来分析一下这种行为。
+Mozjpeg使用封装的两个函数`alloc_small`和`alloc_large`来分配较小和较大的内存块。
+    METHODDEF(void *)
+    alloc_small(j_common_ptr cinfo, int pool_id, size_t sizeofobject){
+    ...
+    ...
+    hdr_ptr = (small_pool_ptr)jpeg_get_small(cinfo, min_request + slop);
+    slop = first_pool_slop[1] == 16000
+    min_request = sizeof(small_pool_hdr) + sizeofobject + ALIGN_SIZE - 1;
+    sizeofobject == round_up_pow2(0x120, ALIGN_SIZE) == 0x120
+    ALIGN_SIZE   == 16
+    sizeof(small_pool_hdr) = 0x20
+    static const size_t first_pool_slop[JPOOL_NUMPOOLS] = {
+                        1600,                    /* first PERMANENT pool */
+                        16000                    /* first IMAGE pool */
+                                                          };
+调用`jpeg_get_small`时，基本上是在调用`malloc`。
+    GLOBAL(void *)
+    jpeg_get_small(j_common_ptr cinfo, size_t sizeofobject)
+    {
+      return (void *)malloc(sizeofobject);
+    }
+分配的“池”由`alloc_small`和其他封装的函数管理，这些函数维护一组成员，以帮助它们监视“池”的状态。
+因此，每当请求内存分配时，封装的函数都会检查“池”中是否有足够的空间。
+如果有可用空间，则`alloc_small`函数从当前“池”中返回一个地址，并使指向池中空闲块的指针移动。
+当“池”空间不足时，它将使用从`first_pool_slop`数组中读取的预定义的内存块分配另一个“池”，在我们的示例中为`1600`和`16000`。
+    static const size_t first_pool_slop[JPOOL_NUMPOOLS] = {
+                        1600,                    /* first PERMANENT pool */
+                        16000                    /* first IMAGE pool */
+                                                          };
+现在，我们了解了Mozjpeg的内存管理器是如何工作的，我们需要确定哪个内存“池”保存着目标虚拟函数指针。
+作为解压缩过程的一部分，有两个主要函数可对图像元数据进行解码并为以后的处理做好准备。直到我们到达wildcopy循环为止，仅有`jpeg_read_header`和`jpeg_start_decompress`两个函数负责内存分配。
+`jpeg_read_header`解析文件中的不同标记。
+在解析这些标记时，第二个也是最大的“池”，大小为`16000(0x3e80)`，由Mozjpeg内存管理器分配。“池”的大小是`first_pool_slop`数组（来自上面的代码段）中的const值，这意味着Mozjpeg的内部分配器已经使用了第一个池的所有空间。
+我们知道，我们的目标main，coef和post结构是从`jpeg_start_decompress`函数中分配的。因此，我们可以放心地假设其他分配的结构（直到我们到达wildcopy循环）也将位于第二个大“池”中，包括我们要覆盖的main，coef和post结构！
+现在，让我们仔细看看Jemalloc如何处理这种大小类分配。
+## 使用shadow照亮堆
+Jemalloc返回的内存大小分为三类-小，大，巨大。
+>   * 小型/中型：这些区域小于内存页大小（通常为4KB）。
+>   * 大：这些区域介于小/中和大之间（内存页大小与块(chunk)大小之间）。
+>   * 巨大：大于块(chunk)的大小。它们被单独处理与arenas无关，有一个全局分配器树。
+>
+操作系统返回的内存分为多个部分。在Android中，对应于不同的版本，这些块的大小也不相同。它们通常约为2MB/4MB。每个块都与一个arena关联。
+run可用于托管一个分配的大块或分配的多个小块。
+大型regions有自己的runs，即每个分配的大块都有专用的run。
+我们知道我们的目标“池”大小为(0x3e80 = 16,000 DEC)，大于内存页大小(4K)，小于Android
+chunk大小。因此，Jemalloc每次都会分配一个大的run(0x5000)！
+让我们仔细看看。
+    (gdb)info registers X0
+    X0        0x3fc7
+    (gdb)bt
+    #0  0x0000007e6a0cbd44 in malloc () from target:/system/lib64/libc.so
+    #1  0x0000007e488b3e3c in alloc_small () from target:/data/data/com.instagram.android/lib-superpack-zstd/libfb_mozjpeg.so
+    #2  0x0000007e488ab1e8 in get_sof () from target:/data/data/com.instagram.android/lib-superpack-zstd/libfb_mozjpeg.so
+    #3  0x0000007e488aa9b8 in read_markers () from target:/data/data/com.instagram.android/lib-superpack-zstd/libfb_mozjpeg.so
+    #4  0x0000007e488a92bc in consume_markers () from target:/data/data/com.instagram.android/lib-superpack-zstd/libfb_mozjpeg.so
+    #5  0x0000007e488a354c in jpeg_consume_input () from target:/data/data/com.instagram.android/lib-superpack-zstd/libfb_mozjpeg.so
+    #6  0x0000007e488a349c in jpeg_read_header () from target:/data/data/com.instagram.android/lib-superpack-zstd/libfb_mozjpeg.so
+我们可以看到传给malloc的实际参数值确实是（0x3fc7）。
+这与16000（0x3e80）的内存size加上Mozjpeg的`large_pool_hdr`的size，以及应该分配的对象的实际size和`ALIGN_SIZE(16/32)
+– 1`的值相匹配。
+在为漏洞利用实现堆布局时，有一种可视化堆的方法：查看堆上下文中的各种内存分配。
+为此，我们使用一个简单的工具，使我们可以在漏洞利用开发过程中检查目标进程的堆状态。
+我们使用了`argp`和`vats`编写的名为[shadow](https://github.com/CENSUS/shadow)的工具来可视化Jemalloc堆。
+我们使用gdb上的shadow执行了调试会话，以验证我们的假设。
+    Cinfo:
+    (gdb) x/164xw 0x729f4f8b98
+    0x729f4f8b98:    0x9f4f89f0    0x00000072    0xbdfe3040    0x00000072
+    0x729f4f8ba8:    0x00000000    0x00000000    0x00000014    0x000002a8
+    0x729f4f8bb8:    0x00000001    0x000000cd    0xbdef79f0    0x00000072
+    0x729f4f8bc8:    0x00006a44    0x00009a2e    0x00000003    0x00000003
+    0x729f4f8bd8:    0x0000000c    0x00000001    0x00000001    0x00000000
+    0x729f4f8be8:    0x00000000    0x3ff00000    0x00000000    0x00000000
+    0x729f4f8bf8:    0x00000000    0x00000001    0x00000001    0x00000000
+    0x729f4f8c08:    0x00000002    0x00000001    0x00000100    0x00000000
+    0x729f4f8c18:    0x00000000    0x00000000    0x00006a44    0x00009a2e
+    0x729f4f8c28:    0x00000004    0x00000004    0x00000001    0x00000000
+    0x729f4f8c38:    0x00000000    0x00000000    0x00000000    0x00000001
+    0x729f4f8c48:    0x00000000    0x00000001    0x00000000    0x00000000
+    0x729f4f8c58:    0x00000000    0x00000000    0xbdef7a40    0x00000072
+    0x729f4f8c68:    0xbdef7ad0    0x00000072    0x00000000    0x00000000
+    0x729f4f8c78:    0x00000000    0x00000000    0xbdef7b60    0x00000072
+    0x729f4f8c88:    0xbdef7da0    0x00000072    0x00000000    0x00000000
+    0x729f4f8c98:    0x00000000    0x00000000    0xbdef7c80    0x00000072
+    0x729f4f8ca8:    0x9f111ca0    0x00000072    0x00000000    0x00000000
+    0x729f4f8cb8:    0x00000000    0x00000000    0x00000008    0x00000000
+    0x729f4f8cc8:    0xa63e9be0    0x00000072    0x00000000    0x00000000
+    0x729f4f8cd8:    0x00000000    0x00000000    0x00000000    0x00000000
+    0x729f4f8ce8:    0x00000000    0x01010101    0x01010101    0x01010101
+    0x729f4f8cf8:    0x01010101    0x05050505    0x05050505    0x05050505
+    0x729f4f8d08:    0x05050505    0x00000000    0x00000000    0x00000101
+    0x729f4f8d18:    0x00010001    0x00000000    0x00000000    0x00000000
+    0x729f4f8d28:    0x00000000    0x00000000    0x00000002    0x00000002
+    0x729f4f8d38:    0x00000008    0x00000008    0x000009a3    0x00000000
+    0x729f4f8d48:    0xa63e9e00    0x00000072    0x00000003    0x00000000
+    0x729f4f8d58:    0xa63e9be0    0x00000072    0xa63e9c40    0x00000072
+    0x729f4f8d68:    0xa63e9ca0    0x00000072    0x00000000    0x00000000
+    0x729f4f8d78:    0x000006a5    0x000009a3    0x00000006    0x00000000
+    0x729f4f8d88:    0x00000000    0x00000000    0x00000000    0x00000001
+    0x729f4f8d98:    0x00000002    0x00000000    0x00000000    0x00000000
+    0x729f4f8da8:    0x00000000    0x00000000    0x0000003f    0x00000000
+    0x729f4f8db8:    0x00000000    0x00000008    0xa285d500    0x00000072
+    0x729f4f8dc8:    0x0000003f    0x00000000    0xbdef7960    0x00000072
+    0x729f4f8dd8:    0xa63eaa70    0x00000072  <========= main
+                                0xa63ea900    0x00000072  <========= post
+    0x729f4f8de8:    0xa63ea3e0    0x00000072  <========= coef
+        0xbdef7930    0x00000072
+    0x729f4f8df8:    0xbdef7820    0x00000072    0xa63ea790    0x00000072
+    0x729f4f8e08:    0xa63ea410    0x00000072    0xa63ea2c0    0x00000072
+    0x729f4f8e18:    0xa63ea280    0x00000072    0x00000000    0x00000000
+    (gdb) jeinfo 0x72a63eaa70  <========= main
+    parent    address         size    
+    --------------------------------------    arena     0x72c808fc00    -       
+    chunk     0x72a6200000    0x200000
+    run       0x72a63e9000    0x5000  <========= our large targeted run!
+## 堆布局策略
+我们的目标是利用整数溢出来导致堆缓冲区溢出。
+利用这些类型的bug都是对于堆对象的精确定位。我们想强制某些对象被分配在堆中的特定位置，因此我们可以布局形成有用的邻接关系来破坏内存。
+为了实现这种邻接，我们需要调整堆的布局，以便将可利用的内存对象分配在目标对象之前。
+不幸的是，我们无法控制free操作。根据Mozjpeg文档，大多数数据是按“per
+image”分配的，并由`jpeg_finish_decompress`或`jpeg_abort`释放。这意味着所有free操作都在解压缩过程结束时使用`jpeg_finish_decompress`或`jpeg_abort`进行，只有在完成使用Wildcopy循环的覆盖内存后，才会调用该操作。
+但是，在我们的例子中，我们不需要任何free操作，因为我们可以控制一个函数，该函数最终会执行内存分配大小受我们控制的malloc函数。这使我们能够选择将可溢出的缓冲区放在堆上的位置。
+我们想将可以溢出的缓冲区对象放置在执行函数指针调用的`main/post/coef`大型(0x5000)数据结构对象之前。
+因此，我们利用此漏洞的最简单方法是对堆进行布局，以便将溢出的缓冲区分配到我们的目标（0x5000byte）对象之前，然后（使用该错误）覆盖`main/post/coef`虚函数地址。这使我们可以完全控制虚表，将任意方法重定向到指定的地址。
+我们知道目标对象具有相同的大小(0x5000)，并且因为`Jemalloc`从顶到底分配空间，所以我们唯一需要做的就是将溢出对象放在目标块所在的底部。
+在我们测试的Android版本中，`Jemalloc`的块大小为2MB。
+对象之间的距离（以字节为单位）并不重要，因为我们有一个wildcopy循环，可以逐行复制大量数据（我们控制行的大小）。被复制的数据最终大于2MB，因此我们可以确定，最终我们将破坏溢出对象之后的块中的每个对象。
+由于我们无法控制free操作，因此无法创建对象会掉进去的洞。
+（洞是run过程中一个或多个被free的位置。）相反，我们尝试查找在图像解压缩流程中无论如何都会出现的洞，并寻找在调试期间反复出现的大小。
+让我们使用shadow工具检查块在内存中的布局：
+    (gdb) jechunk 0x72a6200000

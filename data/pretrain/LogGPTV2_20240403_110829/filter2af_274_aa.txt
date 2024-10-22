@@ -1,0 +1,92 @@
+## 0x001 简介
+这是前些年一组VirtualBox的逃逸漏洞。NAT模式下的VirtualBox guest虚拟机（默认网络配置）启用每个VM
+DHCP服务器，该服务器为guest虚拟机分配IP地址。
+    renorobert@ubuntuguest:~$ ifconfig enp0s3
+    enp0s3    Link encap:Ethernet  HWaddr 08:00:27:b8:b7:4c  
+              inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0
+              inet6 addr: fe80::a00:27ff:feb8:b74c/64 Scope:Link
+              UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
+              RX packets:119 errors:0 dropped:0 overruns:0 frame:0
+              TX packets:94 errors:0 dropped:0 overruns:0 carrier:0
+              collisions:0 txqueuelen:1000 
+              RX bytes:11737 (11.7 KB)  TX bytes:12157 (12.1 KB)
+伪造的DHCP服务器在`10.0.2.2`的IP地址上，发送到此DHCP服务器的数据包将由host机来进行解析
+    renorobert@ubuntuguest:~$ sudo nmap -sU -p 68 10.0.2.2
+    . . .
+    68/udp open|filtered dhcpc
+    MAC Address: 52:54:00:12:35:03 (QEMU virtual NIC)
+Oracle在2016年10月期间修复了两个漏洞`CVE-2016-5610`和`CVE-2016-5611`。该漏洞存在于代码`src/Vbox/Devices/Network/slirp/bootp.c`中，影响5.0.28、5.1.8之前的VirtualBox版本。  
+[Oracle重要补丁更新公告 -2016年10月](https://translate.googleusercontent.com/translate_c?depth=1&hl=zh-CN&rurl=translate.google.com&sl=auto&sp=nmt4&tl=zh-CN&u=https://www.oracle.com/technetwork/security-advisory/cpuoct2016-2881722.html&xid=17259,15700023,15700186,15700191,15700256,15700259,15700262&usg=ALkJrhizE19ukw1hSSiriSQYi0ascbG9vg)
+DHCP数据包在`src/Vbox/Devices/Network/slirp/bootp.c`中定义如下：
+    #define DHCP_OPT_LEN            312
+    /* RFC 2131 */
+    struct bootp_t
+    {
+        struct ip      ip;                          /**pbootp_clients = RTMemAllocZ(sizeof(BOOTPClient) * NB_ADDR);
+        if (!pData->pbootp_clients)
+            return VERR_NO_MEMORY;
+        return VINF_SUCCESS;
+    }
+## 0x002 CVE-2016-5611 dhcp_find_option()中的越界读取漏洞
+    static uint8_t *dhcp_find_option(uint8_t *vend, uint8_t tag)
+    {
+        uint8_t *q = vend;
+        uint8_t len;
+        . . .
+        while(*q != RFC1533_END)          // expects  END tag in an untrusted input 
+        {
+            if (*q == RFC1533_PAD)
+            {
+                q++;   // incremented without validation 
+                continue;
+            }
+            if (*q == tag)
+                return q;   // returns pointer if tag found
+            q++;
+            len = *q;    
+            q += 1 + len;   // length and pointer not validated
+        }
+        return NULL;
+    }
+`dhcp_find_option()`解析guest虚拟机在DHCP数据包中提供的`bp_vend`字段。但是，缺少正确的验证可能会返回一个在DHCP数据包缓冲区外的指针，或者如果while循环永远不会终止直到访问未映射的地址，则会导致VM崩溃。利用该漏洞，通过发送DHCP拒绝数据包去触发信息泄漏。
+    bootp.c:65:static uint8_t *dhcp_find_option(uint8_t *vend, uint8_t tag)
+    bootp.c:412:    req_ip = dhcp_find_option(&bp->bp_vend[0], RFC2132_REQ_ADDR);
+    bootp.c:413:    server_ip = dhcp_find_option(&bp->bp_vend[0], RFC2132_SRV_ID);
+    bootp.c:701:    pu8RawDhcpObject = dhcp_find_option(bp->bp_vend, RFC2132_MSG_TYPE);
+    bootp.c:726:        parameter_list = dhcp_find_option(&bp->bp_vend[0], RFC2132_PARAM_LIST);
+    bootp.c:773:            pu8RawDhcpObject = dhcp_find_option(&bp->bp_vend[0], RFC2132_REQ_ADDR);
+    static void dhcp_decode(PNATState pData, struct bootp_t *bp, const uint8_t *buf, int size)
+    {
+    . . .
+            case DHCPDECLINE:
+                /* note: pu8RawDhcpObject doesn't point to DHCP header, now it's expected it points
+                 * to Dhcp Option RFC2132_REQ_ADDR
+                 */
+                pu8RawDhcpObject = dhcp_find_option(&bp->bp_vend[0], RFC2132_REQ_ADDR);
+     . . .
+                req_ip.s_addr = *(uint32_t *)(pu8RawDhcpObject + 2);
+                rc = bootp_cache_lookup_ether_by_ip(pData, req_ip.s_addr, NULL);
+                if (RT_FAILURE(rc))
+                {
+                    . . .
+                    bc->addr.s_addr = req_ip.s_addr;
+                    slirp_arp_who_has(pData, bc->addr.s_addr);
+                    LogRel(("NAT: %RTnaipv4 has been already registered\n", req_ip));
+                }
+                /* no response required */
+                break;
+    . . .
+客户端发送`DHCPDECLINE`消息，表明提供的IP地址已在使用中。此IP地址是`bp_vend`字段的一部分。服务器调用`dhcp_find_option()`以获取指向`bp_vend`字段内的IP地址的指针。这里可以返回DHCP缓冲区外的指针，指向一些垃圾数据作为IP地址。
+服务器首先通过调用`bootp_cache_lookup_ether_by_ip()`来检查IP地址是否已在分配的列表中。如果没有，它进一步调用`slirp_arp_who_has`来生成ARP请求，其中在DHCP缓冲区外部读取的字节为IP地址。该请求将由guest虚拟机接收，因为它的广播数据包泄漏了一些字节。
+要触发此漏洞，需要发送一个`DHCPDECLINE`数据包，其中`bp_vend`填充`RFC1533_PAD`。如果没有崩溃，将触发ARP数据包，如下所示：
+    renorobert@guest:~$ sudo tcpdump -vv -i eth0 arp
+    [sudo] password for renorobert:
+    tcpdump: listening on eth0, link-type EN10MB (Ethernet), capture size 65535 bytes
+    15:51:34.557995 ARP, Ethernet (len 6), IPv4 (len 4), Request who-has 45.103.99.109 (Broadcast) tell 10.0.2.2, length 46
+`45.103.99.109`是泄漏的主机进程字节。
+## 0x003 CVE-2016-5610 - dhcp_decode_request()中的堆溢出
+    static int dhcp_decode_request(PNATState pData, struct bootp_t *bp, struct mbuf *m)
+    {
+    . . .
+        /*?? renewing ??*/
+        switch (dhcp_stat)

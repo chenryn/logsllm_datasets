@@ -1,0 +1,181 @@
+## 重新发现PostgreSQL之美 - 23 奥卡姆剃刀原则应用 优化not in大列表    
+### 作者          
+digoal          
+### 日期          
+2021-06-13          
+### 标签          
+PostgreSQL , 彭祖 , 唾沫 , 废话 , not in      
+----          
+## 背景       
+视频回放: https://www.bilibili.com/video/BV13v411p7cz/   
+场景:  
+- 论坛、短视频、社交、电商等推荐业务.   
+- 在推荐的过程中要过滤已读列表.   
+挑战:  
+- 已读列表巨大, 普通数据库没有多值列类型, 每个已读ID需要存储1条.   
+- 使用not in过滤, 性能极差.   
+PG 解决方案:   
+- 1、多值列, 一个用户已读只需要存储1条  
+- 2、datasketch 近似类型, 几KB空间可以存储上亿唯一值.   
+- 3、压缩存储多值列 roaringbitmap类型, 效率和空间的平衡.  
+- 4、使用partial index, 拆散过滤列表, 降低每次请求的无效数据.   
+## 例子  
+本文不谈推荐算法, 有兴趣的读者可以参考末尾文档或我的github, 为了观察方便, 本文尽量简化过程, 就用一个排序维度进行过滤.   
+### 传统方案  
+1、已读列表, 存储已读视频ID  
+```  
+create unlogged table u_readlist (  
+  uid int,  -- UID  
+  vid int   -- 已读VID  
+);   
+create index idx_u_readlist on u_readlist (uid);  
+```  
+2、视频ID表, 存储推荐分数  
+```  
+create unlogged table vscore (  
+  vid int primary key,  -- 视频ID  
+  score float4,   -- 推荐分数  
+  ts timestamp     
+);  
+create index idx_vscore on vscore (score desc);  
+```  
+3、插入1000万条视频  
+```  
+insert into vscore select generate_series(1,10000000), random()*100, clock_timestamp();  
+```  
+4、插入1000个用户, 每个用户已读5万条视频.   
+```  
+with a as (select vid from vscore order by score desc limit 50000)  
+insert into u_readlist select generate_series(1,1000),vid from a;  
+```  
+5、传统数据库没有多值列数据类型, 需要5000万条记录存储已读列表.   
+```  
+ public | u_readlist   | table             | postgres | unlogged    | heap          | 1729 MB |   
+```  
+6、为1号用户推荐视频并过滤已读, 取出100个vid.  
+```  
+select vid from vscore   
+where vid not in (select vid from u_readlist where uid=1)  
+order by score desc   
+limit 100;  
+                                           QUERY PLAN                                              
+-------------------------------------------------------------------------------------------------  
+ Limit  (cost=48446.32..48451.80 rows=100 width=8) (actual time=103.616..103.704 rows=100 loops=1)  
+   ->  Index Scan using idx_vscore on vscore  (cost=48446.32..322781.27 rows=4999930 width=8) (actual time=103.615..103.693 rows=100 loops=1)  
+         Filter: (NOT (hashed SubPlan 1))  
+         Rows Removed by Filter: 50000  
+         SubPlan 1  
+           ->  Bitmap Heap Scan on u_readlist  (cost=434.17..48321.27 rows=49846 width=4) (actual time=13.819..53.265 rows=50000 loops=1)  
+                 Recheck Cond: (uid = 1)  
+                 Heap Blocks: exact=50000  
+                 ->  Bitmap Index Scan on idx_u_readlist  (cost=0.00..421.71 rows=49846 width=0) (actual time=4.610..4.610 rows=50000 loops=1)  
+                       Index Cond: (uid = 1)  
+ Planning Time: 0.086 ms  
+ Execution Time: 104.279 ms  
+(12 rows)  
+```  
+### PG 解决方案1  
+1、PG可以使用数组存储多个已读VID, 记录数节省5万倍.  
+```  
+create unlogged table p_u_readlist (  
+  uid int,  -- UID  
+  vid int[]   -- 已读VID  
+);   
+create index idx_p_u_readlist on p_u_readlist (uid);  
+```  
+2、5000万条压缩到1000条   
+```  
+insert into p_u_readlist select uid,array_agg(vid) from u_readlist group by uid;  
+```  
+3、空间约仅占1/10  
+```  
+ public | p_u_readlist | table             | postgres | unlogged    | heap          | 198 MB  |   
+```  
+4、为1号用户推荐视频并过滤已读, 取出100个vid.  
+```  
+select vid from vscore  
+where vid not in (select unnest(vid) from p_u_readlist where uid=1)  
+order by score desc   
+limit 100;  
+ Limit  (cost=3.01..8.50 rows=100 width=8) (actual time=56.343..56.438 rows=100 loops=1)  
+   ->  Index Scan using idx_vscore on vscore  (cost=3.01..274337.96 rows=4999930 width=8) (actual time=56.342..56.427 rows=100 loops=1)  
+         Filter: (NOT (hashed SubPlan 1))  
+         Rows Removed by Filter: 50000  
+         SubPlan 1  
+           ->  ProjectSet  (cost=0.28..2.55 rows=10 width=4) (actual time=0.113..3.904 rows=50000 loops=1)  
+                 ->  Index Scan using idx_p_u_readlist on p_u_readlist  (cost=0.28..2.49 rows=1 width=18) (actual time=0.018..0.022 rows=1 loops=1)  
+                       Index Cond: (uid = 1)  
+ Planning Time: 0.112 ms  
+ Execution Time: 56.814 ms  
+(10 rows)  
+```  
+### PG 解决方案2  
+在VID表存储已读UID, 而不是在UID中存储已读VID  
+```  
+create unlogged table p_vscore (  
+  vid int primary key,  -- 视频ID  
+  score float4,   -- 推荐分数  
+  uid int[],   -- 已读UID   
+  ts timestamp     
+);   
+create index idx_p_vscore on p_vscore (score desc);   
+```  
+插入1000万条视频, score排名前5万个视频全部被1000个用户已读.  
+```  
+insert into p_vscore select vid,score,null,ts from vscore;  
+update p_vscore set   
+  uid=array(select generate_series(1,1000))    
+where vid in (  
+  select vid from p_vscore order by score desc limit 50000  
+);    
+```  
+```  
+ public | vscore | table | postgres | unlogged    | heap          | 422 MB |   
+ public | p_vscore      | table             | postgres | unlogged    | heap          | 687 MB  |   
+```  
+为1号用户推荐视频并过滤已读, 取出100个vid  
+```  
+select vid from p_vscore   
+where uid is null or not uid @> array[1]   
+order by score desc   
+limit 100;  
+ Limit  (cost=0.43..3.08 rows=100 width=8) (actual time=384.599..384.696 rows=100 loops=1)  
+   ->  Index Scan using idx_p_vscore on p_vscore  (cost=0.43..264791.46 rows=9999712 width=8) (actual time=384.598..384.685 rows=100 loops=1)  
+         Filter: ((uid IS NULL) OR (NOT (uid @> '{1}'::integer[])))  
+         Rows Removed by Filter: 50000  
+ Planning Time: 0.062 ms  
+ Execution Time: 384.713 ms  
+(6 rows)  
+```  
+和之前视频讲的一样, 为什么这种方式更慢了? 具有olap属性, 如下:    
+[《重新发现PostgreSQL之美 - 21 探访宇航员的食物》](../202106/20210612_03.md)    
+### PG 解决方案3  
+1、使用HLL、roaringbitmap存储过滤列表, 可以节省列表的存储空间, 有些用户可能已读VID达到上百万, 需要大量的存储空间.  
+```  
+create extension hll;   
+create unlogged table p1_u_readlist (  
+  uid int,  -- UID  
+  vid hll   -- 已读VID  
+);   
+create index idx_p1_u_readlist on p1_u_readlist (uid);  
+```  
+5000万条压缩到1000条   
+```  
+insert into p1_u_readlist select uid,hll_add_agg(hll_hash_integer(vid)) from u_readlist group by uid;  
+ public | p1_u_readlist | table             | postgres | unlogged    | heap          | 1376 kB |   
+```  
+为1号用户推荐视频并过滤已读, 取出100个vid.    
+```  
+select vid from vscore  
+where not exists (select 1 from p1_u_readlist where uid=1 and p1_u_readlist.vid = hll_add(p1_u_readlist.vid,hll_hash_integer(vscore.vid)))  
+order by score desc   
+limit 100;   
+ Limit  (cost=0.71..5.23 rows=100 width=8) (actual time=602.038..632.683 rows=100 loops=1)  
+   ->  Nested Loop Anti Join  (cost=0.71..449335.43 rows=9949861 width=8) (actual time=602.037..632.672 rows=100 loops=1)  
+         Join Filter: (p1_u_readlist.vid = hll_add(p1_u_readlist.vid, hll_hash_integer(vscore.vid, 0)))  
+         Rows Removed by Join Filter: 100  
+         ->  Index Scan using idx_vscore on vscore  (cost=0.43..249335.74 rows=9999860 width=8) (actual time=0.010..37.183 rows=52695 loops=1)  
+         ->  Materialize  (cost=0.28..2.50 rows=1 width=1287) (actual time=0.000..0.000 rows=1 loops=52695)  
+               ->  Index Scan using idx_p1_u_readlist on p1_u_readlist  (cost=0.28..2.49 rows=1 width=1287) (actual time=0.019..0.021 rows=1 loops=1)  
+                     Index Cond: (uid = 1)  
+ Planning Time: 0.146 ms  

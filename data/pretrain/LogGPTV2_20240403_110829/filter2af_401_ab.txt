@@ -1,0 +1,149 @@
+    393         kctx->pending_regions[cookie_nr] = reg;
+    394 
+    395         /* relocate to correct base */
+    396         cookie = cookie_nr + PFN_DOWN(BASE_MEM_COOKIE_BASE);
+    397         cookie api_version api_version > KBASE_API_VERSION(10, 4)) {
+    405             *gpu_va = (u64) cookie;
+    406             kbase_gpu_vm_unlock(kctx);
+    407             return reg;
+    408         }
+    484 }
+这里的逻辑很简单：在`kctx->pending_regions`数组中找一个空余位置（line 391），然后保存reg（line
+393），需要注意的是返回值并非真正的地址（line 405），只是一个临时值而已（line 396/397），这个值会在后续过程中使用。
+至此，`kbase_api_mem_alloc()`的主要过程我们已经分析完毕：
+    drivers/gpu/arm/b_r19p0/mali_kbase_core_linux.c
+    kbase_api_mem_alloc()
+    |
+    |-> kbase_mem_alloc()
+        |
+        |-> kbase_check_alloc_flags()                   // 检查属性是否合法
+        |
+        |-> kbase_alloc_free_region()                   // 分配reg
+        |
+        |-> kbase_reg_prepare_native()                  // 分配kbase_mem_phy_alloc，reg->cpu_alloc和reg->gpu_alloc指向同一个对象
+        |
+        |-> kbase_alloc_phy_pages()                     // 分配物理页
+        |
+        |-> kctx->pending_regions[cookie_nr] = reg      // 返回假的虚拟地址
+### GPU映射物理页过程 – 建立CPU及GPU映射
+应用该如何使用假的虚拟地址呢？实际上是作为`mmap`系统调用参数：
+    gpu_va = mmap(0, MALI_MAP_PAGES * PAGE_SIZE, PROT_READ | PROT_WRITE,
+                MAP_SHARED, dev, alloc.out.gpu_va);
+`mmap`系统调用最终调用Mali驱动注册的`kbase_mmap()`，这个函数具体过程如下：
+    drivers/gpu/arm/b_r19p0/mali_kbase_core_linux.c
+    kbase_mmap()
+    |
+    |-> kbase_context_mmap()
+        |
+        |-> kbase_reg_mmap()
+        |   |
+        |   | reg = kctx->pending_regions[cookie]
+        |   |
+        |   |-> kbase_gpu_mmap()
+        |
+        |-> kbase_cpu_mmap()
+`mmap`系统调用正常语义是将物理页映射到进程的地址空间，由于驱动指定了`BASE_MEM_SAME_VA`，所以`kbase_mmap()`在实现正常的映射功能之外，还要将这些物理页映射到GPU地址空间中。需要注意的是：CPU和GPU映射的虚拟地址是一样的。
+这里仅分析`kbase_gpu_mmap()`：
+    drivers/gpu/arm/b_r19p0/mali_kbase_mem.c
+    1174 int kbase_gpu_mmap(struct kbase_context *kctx, struct kbase_va_region *reg, u64 addr, size_t nr_pages, size_t align)
+    1175 {
+    1198     err = kbase_add_va_region(kctx, reg, addr, nr_pages, align);
+    1199     if (err)
+    1200         return err;
+    1205     if (reg->gpu_alloc->type == KBASE_MEM_TYPE_ALIAS) {
+                // 稍后我会分析这里
+    1235     } else {
+    1236         err = kbase_mmu_insert_pages(kctx->kbdev,
+    1237                 &kctx->mmu,
+    1238                 reg->start_pfn,
+    1239                 kbase_get_gpu_phy_pages(reg),
+    1240                 kbase_reg_current_backed_size(reg),
+    1241                 reg->flags & gwt_mask,
+    1242                 ctx->as_nr,
+    1243                 group_id);
+    1244         if (err)
+    1245             goto bad_insert;
+    1246         kbase_mem_phy_alloc_gpu_mapped(alloc);
+    1247     }
+    1291 }
+`kbase_gpu_mmap()`主要功能是将物理页映射到IOMMU中，即调用`kbase_mmu_insert_pages()`，之后将`alloc->gpu_mappings`引用计数加1。这个引用计数至关重要，驱动通过查看这个引用计数来确定相关操作是否可以应用到相应的内存区域。最终，`mmap`系统调用返回值就是映射到CPU和GPU的虚拟地址。
+综上所述，GPU映射的典型流程分为两步：
+    alloc and map pages for GPU
+    |
+    |-> kbase_api_mem_alloc()        // 分配reg及物理页，reg->gpu_alloc->gpu_mappings = 0
+    |
+    |-> kbase_mmap()                // 将reg中的物理页映射到CPU和GPU空间，reg->gpu_alloc->gpu_mappings = 1
+在分配物理页时，这些页面并没有映射到GPU的虚拟地址空间中，因此，`reg->gpu_alloc->gpu_mappings`计数为0；当`kbase_gpu_mmap()`将物理页映射到GPU空间时，`reg->gpu_alloc->gpu_mappings`计数加1。从语义上看，这样做非常合理，`gpu_alloc->gpu_mappings`准确、及时地表示了内存区域中物理页的映射状态。但是，随着功能的增加，情况变得复杂。
+### GPU映射物理页过程 – 别名操作
+正如我之前提到，Mali
+GPU实现了KBASE_IOCTL_MEM_ALIAS命令，它的主要作用是将同一个内存区域映射到多个不同的虚拟地址空间中。整个别名实现过程类似于`KBASE_IOCTL_MEM_ALLOC`，也是分为两步：
+    alias mapping on GPU
+    |
+    |-> kbase_api_mem_alias()            // 创建新的reg对象，引用需要别名操作的内存区域，返回假的虚拟地址
+    |
+    |-> kbase_mmap()                    // 将内存区域映射到新的虚拟地址
+`kbase_api_mem_alias()`主要逻辑由`kbase_mem_alias()`完成，其实现如下：
+    drivers/gpu/arm/b_r19p0/mali_kbase_core_linux.c
+    1681 u64 kbase_mem_alias(struct kbase_context *kctx, u64 *flags, u64 stride,
+    1682             u64 nents, struct base_mem_aliasing_info *ai,
+    1683             u64 *num_pages)
+    1684 {
+    1696     *flags &= (BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+    1697            BASE_MEM_COHERENT_SYSTEM | BASE_MEM_COHERENT_LOCAL |
+    1698            BASE_MEM_PROT_CPU_RD | BASE_MEM_COHERENT_SYSTEM_REQUIRED);
+    1723     if (!kbase_ctx_flag(kctx, KCTX_COMPAT)) {
+    1726         *flags |= BASE_MEM_NEED_MMAP;
+    1727         reg = kbase_alloc_free_region(&kctx->reg_rbtree_same, 0,
+    1728                 *num_pages,
+    1729                 KBASE_REG_ZONE_SAME_VA);
+    1730     }
+    1743     reg->gpu_alloc = kbase_alloc_create(kctx, 0, KBASE_MEM_TYPE_ALIAS,
+    1744         BASE_MEM_GROUP_DEFAULT);
+    1762     for (i = 0; i > PAGE_SHIFT) gpu_alloc;
+    1812             reg->gpu_alloc->imported.alias.aliased[i].alloc = kbase_mem_phy_alloc_get(alloc);
+    1813             reg->gpu_alloc->imported.alias.aliased[i].length = ai[i].length;
+    1814             reg->gpu_alloc->imported.alias.aliased[i].offset = ai[i].offset;
+    1817         }
+    1818     }
+    1821     if (!kbase_ctx_flag(kctx, KCTX_COMPAT)) {
+    1827         /* return a cookie */
+    1828         gpu_va = __ffs(kctx->cookies);
+    1829         kctx->cookies &= ~(1UL pending_regions[gpu_va]);
+    1831         kctx->pending_regions[gpu_va] = reg;
+    1832 
+    1833         /* relocate to correct base */
+    1834         gpu_va += PFN_DOWN(BASE_MEM_COOKIE_BASE);
+    1835         gpu_va gpu_alloc->imported.alias.aliased[i].alloc`引用了原来的reg。同时，`kbase_mem_phy_alloc_get()`会将`reg->ref`加1。
+与`kbase_mem_alloc()`一样，`kbase_mem_alias()`将reg挂载到`kctx->pending_regions`数组中（line
+1831），返回假的虚拟地址（line 1853）。
+之后，用户同样需要调用`mmap`，`kbase_gpu_mmap`会根据reg的类型（KBASE_MEM_TYPE_ALIAS）进行相应的处理：
+    drivers/gpu/arm/b_r19p0/mali_kbase_core_linux.c
+    kbase_mmap() -> kbase_context_mmap()
+    |
+    |-> kbasep_reg_mmap()
+        |
+        |-> kbase_gpu_mmap()
+    drivers/gpu/arm/b_r19p0/mali_kbase_mem.c
+    1174 int kbase_gpu_mmap(struct kbase_context *kctx, struct kbase_va_region *reg, u64 addr, size_t nr_pages, size_t align)
+    1175 {
+    1202     alloc = reg->gpu_alloc;
+    1203     group_id = alloc->group_id;
+    1204 
+    1205     if (reg->gpu_alloc->type == KBASE_MEM_TYPE_ALIAS) {
+    1206         u64 const stride = alloc->imported.alias.stride;
+    1207 
+    1208         KBASE_DEBUG_ASSERT(alloc->imported.alias.aliased);
+    1209         for (i = 0; i imported.alias.nents; i++) {
+    1210             if (alloc->imported.alias.aliased[i].alloc) {
+    1211                 err = kbase_mmu_insert_pages(kctx->kbdev,
+    1212                         &kctx->mmu,
+    1213                         reg->start_pfn + (i * stride),
+    1214                         alloc->imported.alias.aliased[i].alloc->pages + alloc->imported.alias.aliased[i].offset,
+    1215                         alloc->imported.alias.aliased[i].length,
+    1216                         reg->flags & gwt_mask,
+    1217                         kctx->as_nr,
+    1218                         group_id);
+    1219                 if (err)
+    1220                     goto bad_insert;
+    1221 
+    1222                 kbase_mem_phy_alloc_gpu_mapped(alloc->imported.alias.aliased[i].alloc);

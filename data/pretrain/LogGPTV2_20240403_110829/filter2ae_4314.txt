@@ -1,0 +1,46 @@
+**作者：墨云科技VLab Team  
+原文链接：**
+Google于2022年4月11日更新了Chrome的100.0.4896.88，其中修复了由@btiszka在3月18日报告的正则表达式模块的UAF漏洞；6月28日，Google纰漏了该漏洞的具体细节，目前该漏洞已被修复并公开了技术细节，本文将从技术角度分析漏洞的成因和修复方式。
+要理解这个漏洞，需要对V8的垃圾回收机制有一定的了解，本文首先简单介绍V8的垃圾回收机制，然后结合具体漏洞PoC代码分析漏洞成因。
+## **V8垃圾回收机制**
+垃圾回收一直是V8引擎的优化重点，是多种复杂优化策略组合形成的机制，其本质采用的标记跟踪回收算法，在堆布局上使用分代布局，大致可以分为新生代和老年代，具体的回收策略可分为Major
+GC（Mark-Compact）和Minor GC(Scavenger)。这里仅对两种策略的关键阶段做简单介绍，详细实现可以从参考文档和源代码进行学习。
+**Major GC(Mark-Compact）**
+V8的主要GC负责对整个堆区的垃圾进行回收，可分为标记、清除、整理三个阶段，其中清除阶段释放无用内存，整理阶段将已使用内存移动压实，算法的重点在标记阶段。
+标记阶段中，收集器需要发现并标记所有的活动对象。收集器从维护的一组根对象开始，跟随指针迭代发现更多的对象，通过持续标记新发现的对象并跟随指针，直到没有需要标记的对象为止。
+V8使用三色标记法来标记对象，每个对象通过两个标记位和一个标记列表来实现标记，两个标记位标识三种颜色：白色(00)、灰色(10)
+和黑色(11)。最初所有对象都是白色的，当收集器发现白色物体并将其推送到标记列表时，它会变成灰色。当收集器从标记工作列表中弹出对象并访问其所有字段时，灰色对象变为黑色。当不再有灰色对象时，标记完成，所有剩余的白色物体都无法到达，可以安全地回收。
+**Minor GC(Scavenger)**
+次要GC主要工作在新生代空间中，可以分为标记、疏散和指针更新三个阶段，这些阶段都是交错执行的，没有严格的先后顺序。Scavenger将新生代的空间分为From-Space和To-Space，这两个空间可以互相交换，新分配的对象都会出现在From-Space，在标记和回收完成后的疏散阶段，Scavenger会将依然存活的对象移动到To-Space紧密排列，然后交换From-Space和To-Space，开始下一轮GC。
+这里需要特别介绍写屏障(Write-Barrier)机制，它是此漏洞发生的关键原因。Write-Barrier维护了一组从旧对象到新对象的列表，一般是老年代指向年轻代中的对象的指针，使用这个引用列表可以直接进行标记，不需要跟踪整个老年代。
+可以看到，Write-Barrier将一个关联的可访问的value对象标记为灰色，并放入marking_worklist中，后续的标记程序可以不需要再遍历老年代中的对象，直接从该列表开始进行标记。
+## **漏洞分析**
+Chrome V8命令执行漏洞（CVE-2022-1310）出现在V8引擎的正则表达式模块，作者在报告中提到的漏洞PoC部分关键代码如下：
+    var re = new RegExp('foo', 'g');
+    re.exec = function() {
+        gc(); // move `re` to oldspace using a mark-sweep gc
+        delete re.exec; // transition back to initial regexp map to pass HasInitialRegExpMap
+        re.lastIndex = 1073741823; // maximum smi, adding one will result in a HeapNumber
+        RegExp.prototype.exec = function() {
+            throw ''; // break out of Regexp.replace
+        }
+        return ...;
+    };
+    try {
+        var newstr = re[Symbol.replace]("fooooo", ".$"); // trigger
+    } catch(e) {}
+    gc({type:'minor'});
+    %DebugPrint(re.lastIndex);
+通过对比PoC和分析源码，当在JS代码中调用`re[Symbol.replace]`函数时，V8引擎使用Runtime_RegExpReplaceRT函数进行处理，函数中的异常退出分支会调用`RegExpUtils::SetAdvancedStringIndex`，该函数最终将`re.lastIndex`加1并写回re对象中。
+可见，上述函数功能约等于`re.lastIndex +=
+1`，对于类似的代码逻辑，在底层语言中通常需要考虑边界值，防止出现数据溢出。V8中的Number类型分为Smi和HeapNumber，Smi代表了小整数，和对象中的指针共享存储空间，通过值的最低位是否为0来区分类型，超出Smi表示范围的值会在堆中创建HeapNumber对象来表示，在32位环境下，Smi值的范围为-2^30到2^30
+- 1。
+根据上述逻辑，当我们对RegExp对象赋值`re.lastIndex=1073741823`，并进入Runtime_RegExpReplaceRT函数逻辑时，由于加1后的值1073741824超过Smi的表示范围，V8引擎在堆中重新申请了一个HeapNumber对象来存储新的lastIndex值，此时，该RegExp对象的lastIndex属性不再是一个Smi数，而是一个指向堆中HeapNumber对象的指针。如下图所示：
+在之前的垃圾回收中已经介绍，V8的Minor GC的Write-Barrier机制需要对将新生代内存中的新建对象置灰并添加到标记列表中，以省略对老年代对象的遍历。但函数SetLastIndex在处理RegExp对象存在初始化Map情况的代码分支中，默认lastIndex是一个Smi值并使用SKIP_WRITE_BARRIER标记跳过了写屏障。因此，当re.lastIndex变成了HeapNumber对象，又没有被Write-Barrier标记，那么在GC发生时，该对象就会被当作可回收对象被释放，释放后re.lastIndex属性指针就变成了一个悬垂指针，指向了一个已释放的堆空间，再次尝试访问这个对象空间，就产生了Use-After-Free漏洞。
+该漏洞（CVE-2022-1310）是一个典型的UAF漏洞，触发后可以通过堆喷重新分配释放后的内存空间达到利用的目的，但由于GC时间和堆喷的不稳定性，会给漏洞利用增加一定难度。在漏洞报告中，作者也给出了完整的利用代码，感兴趣可通过参考文档中的issue
+1307610的完整报告继续研究。
+## **总结**
+漏洞（CVE-2022-1310）出现的根本因为是V8在处理Number类型数据时，没有考虑Smi值溢出的情况，致使新分配的HeapNumber对象破坏了Write-Barrier机制造成UAF，最终导致了任意代码执行，修复方案也非常简单，将SKIP_WRITE_BARRIER标记改成UPDATE_WRITE_BARRIER即可。
+该漏洞最早在2020年6月25日就有安全研究员发布了相关信息，直到2022年4月才被修复，目前漏洞细节和利用代码均已经被公开，由于V8引擎影响范围较广，请大家积极升级相关软件至最新版本。
+## **参考资料**
+* * *

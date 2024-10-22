@@ -1,0 +1,241 @@
+原文地址：
+## 简介
+自从[4.8版本](https://devblogs.microsoft.com/dotnet/announcing-the-net-framework-4-8/ "4.8版本")开始，.NET框架引入了Antimalware Scan Interface（AMSI）和Windows
+Lockdown
+Policy（WLDP）安全机制，用来阻止潜在的恶意软件从内存运行。WLDP机制会检查动态代码的数字签名，而AMSI机制则会扫描有害或被管理员禁止的软件。在本文中，我们将会为红队队员介绍三种绕过AMSI安全机制的方法，以及一种绕过WLDP安全机制的方法。对于文中介绍的方法，并不要求读者具备AMSI或WLDP方面的专业知识。
+## 利用C语言编写的AMSI示例
+对于给定的文件路径，可以通过以下函数将打开该文件，将其映射到内存，并使用AMSI机制检查文件内容是否有害或被管理员禁止。
+    typedef HRESULT (WINAPI *AmsiInitialize_t)(
+      LPCWSTR      appName,
+      HAMSICONTEXT *amsiContext);
+    typedef HRESULT (WINAPI *AmsiScanBuffer_t)(
+      HAMSICONTEXT amsiContext,
+      PVOID        buffer,
+      ULONG        length,
+      LPCWSTR      contentName,
+      HAMSISESSION amsiSession,
+      AMSI_RESULT  *result);
+    typedef void (WINAPI *AmsiUninitialize_t)(
+      HAMSICONTEXT amsiContext);
+    BOOL IsMalware(const char *path) {
+        AmsiInitialize_t   _AmsiInitialize;
+        AmsiScanBuffer_t   _AmsiScanBuffer;
+        AmsiUninitialize_t _AmsiUninitialize;
+        HAMSICONTEXT       ctx;
+        AMSI_RESULT        res;
+        HMODULE            amsi;
+        HANDLE             file, map, mem;
+        HRESULT            hr = -1;
+        DWORD              size, high;
+        BOOL               malware = FALSE;
+        // load amsi library
+        amsi = LoadLibrary("amsi");
+        // resolve functions
+        _AmsiInitialize = 
+          (AmsiInitialize_t)
+          GetProcAddress(amsi, "AmsiInitialize");
+        _AmsiScanBuffer =
+          (AmsiScanBuffer_t)
+          GetProcAddress(amsi, "AmsiScanBuffer");
+        _AmsiUninitialize = 
+          (AmsiUninitialize_t)
+          GetProcAddress(amsi, "AmsiUninitialize");
+        // return FALSE on failure
+        if(_AmsiInitialize   == NULL ||
+           _AmsiScanBuffer   == NULL ||
+           _AmsiUninitialize == NULL) {
+          printf("Unable to resolve AMSI functions.\n");
+          return FALSE;
+        }
+        // open file for reading
+        file = CreateFile(
+          path, GENERIC_READ, FILE_SHARE_READ,
+          NULL, OPEN_EXISTING, 
+          FILE_ATTRIBUTE_NORMAL, NULL); 
+        if(file != INVALID_HANDLE_VALUE) {
+          // get size
+          size = GetFileSize(file, &high);
+          if(size != 0) {
+            // create mapping
+            map = CreateFileMapping(
+              file, NULL, PAGE_READONLY, 0, 0, 0);
+            if(map != NULL) {
+              // get pointer to memory
+              mem = MapViewOfFile(
+                map, FILE_MAP_READ, 0, 0, 0);
+              if(mem != NULL) {
+                // scan for malware
+                hr = _AmsiInitialize(L"AMSI Example", &ctx);
+                if(hr == S_OK) {
+                  hr = _AmsiScanBuffer(ctx, mem, size, NULL, 0, &res);
+                  if(hr == S_OK) {
+                    malware = (AmsiResultIsMalware(res) || 
+                               AmsiResultIsBlockedByAdmin(res));
+                  }
+                  _AmsiUninitialize(ctx);
+                }              
+                UnmapViewOfFile(mem);
+              }
+              CloseHandle(map);
+            }
+          }
+          CloseHandle(file);
+        }
+        return malware;
+    }
+下面，让我们分别扫描一个正常的文件和一个[恶意](https://github.com/GhostPack/SafetyKatz "恶意")文件。
+如果您已经熟悉AMSI的内部机制，可以跳过下面一节的内容，直接阅读相关的绕过方法。
+## AMSI的上下文结构
+context是一个未有公开文档说明的结构，不过，我们可以通过下面的代码来了解这个返回的句柄。
+    typedef struct tagHAMSICONTEXT {
+      DWORD        Signature;          // "AMSI" or 0x49534D41
+      PWCHAR       AppName;            // set by AmsiInitialize
+      IAntimalware *Antimalware;       // set by AmsiInitialize
+      DWORD        SessionCount;       // increased by AmsiOpenSession
+    } _HAMSICONTEXT, *_PHAMSICONTEXT;
+## AMSI初始化
+appName是一个指向unicode格式的用户定义字符串的指针，而amsiContext则是指向HAMSICONTEXT类型的句柄的一个指针。当成功初始化AMSI的context结构之后，会返回S_OK。虽然以下代码并非完整的函数实现，但对于了解其内部运行机制来说，是非常有帮助的。
+    HRESULT _AmsiInitialize(LPCWSTR appName, HAMSICONTEXT *amsiContext) {
+        _HAMSICONTEXT *ctx;
+        HRESULT       hr;
+        int           nameLen;
+        IClassFactory *clsFactory = NULL;
+        // invalid arguments?
+        if(appName == NULL || amsiContext == NULL) {
+          return E_INVALIDARG;
+        }
+        // allocate memory for context
+        ctx = (_HAMSICONTEXT*)CoTaskMemAlloc(sizeof(_HAMSICONTEXT));
+        if(ctx == NULL) {
+          return E_OUTOFMEMORY;
+        }
+        // initialize to zero
+        ZeroMemory(ctx, sizeof(_HAMSICONTEXT));
+        // set the signature to "AMSI"
+        ctx->Signature = 0x49534D41;
+        // allocate memory for the appName and copy to buffer
+        nameLen = (lstrlen(appName) + 1) * sizeof(WCHAR);
+        ctx->AppName = (PWCHAR)CoTaskMemAlloc(nameLen);
+        if(ctx->AppName == NULL) {
+          hr = E_OUTOFMEMORY;
+        } else {
+          // set the app name
+          lstrcpy(ctx->AppName, appName);
+          // instantiate class factory
+          hr = DllGetClassObject(
+            CLSID_Antimalware, 
+            IID_IClassFactory, 
+            (LPVOID*)&clsFactory);
+          if(hr == S_OK) {
+            // instantiate Antimalware interface
+            hr = clsFactory->CreateInstance(
+              NULL,
+              IID_IAntimalware, 
+              (LPVOID*)&ctx->Antimalware);
+            // free class factory
+            clsFactory->Release();
+            // save pointer to context
+            *amsiContext = ctx;
+          }
+        }
+        // if anything failed, free context
+        if(hr != S_OK) {
+          AmsiFreeContext(ctx);
+        }
+        return hr;
+    }
+其中，HAMSICONTEXT结构的内存空间是在堆上分配的，并使用appName、AMSI签名（0x49534D41）和[IAntimalware](https://docs.microsoft.com/en-us/windows/desktop/api/amsi/nn-amsi-iantimalware "IAntimalware")接口进行初始化处理。
+## AMSI扫描
+通过下面的代码，我们可以大致了解调用函数时会执行哪些操作。如果扫描成功，则返回的结果将为S_OK，并且应检查[AMSI_RESULT](https://docs.microsoft.com/en-us/windows/desktop/api/amsi/ne-amsi-amsi_result
+"AMSI_RESULT")，以确定缓冲区是否包含有害的软件。
+    HRESULT _AmsiScanBuffer(
+      HAMSICONTEXT amsiContext,
+      PVOID        buffer,
+      ULONG        length,
+      LPCWSTR      contentName,
+      HAMSISESSION amsiSession,
+      AMSI_RESULT  *result)
+    {
+        _HAMSICONTEXT *ctx = (_HAMSICONTEXT*)amsiContext;
+        // validate arguments
+        if(buffer           == NULL       ||
+           length           == 0          ||
+           amsiResult       == NULL       ||
+           ctx              == NULL       ||
+           ctx->Signature   != 0x49534D41 ||
+           ctx->AppName     == NULL       ||
+           ctx->Antimalware == NULL)
+        {
+          return E_INVALIDARG;
+        }
+        // scan buffer
+        return ctx->Antimalware->Scan(
+          ctx->Antimalware,     // rcx = this
+          &CAmsiBufferStream,   // rdx = IAmsiBufferStream interface
+          amsiResult,           // r8  = AMSI_RESULT
+          NULL,                 // r9  = IAntimalwareProvider
+          amsiContext,          // HAMSICONTEXT
+          CAmsiBufferStream,
+          buffer,
+          length, 
+          contentName,
+          amsiSession);
+    }
+请注意这里是如何对参数进行验证的。这是强制AmsiScanBuffer运行失败并返回E_INVALIDARG的众多方法之一。
+##  AMSI的CLR实现
+CLR使用一个名为AmsiScan的私有函数来检测通过Load方法传递的有害软件。以下代码演示了CLR是如何实现AMSI的。
+    AmsiScanBuffer_t _AmsiScanBuffer;
+    AmsiInitialize_t _AmsiInitialize;
+    HAMSICONTEXT     *g_amsiContext;
+    VOID AmsiScan(PVOID buffer, ULONG length) {
+        HMODULE          amsi;
+        HAMSICONTEXT     *ctx;
+        HAMSI_RESULT     amsiResult;
+        HRESULT          hr;
+        // if global context not initialized
+        if(g_amsiContext == NULL) {
+          // load AMSI.dll
+          amsi = LoadLibraryEx(
+            L"amsi.dll", 
+            NULL, 
+            LOAD_LIBRARY_SEARCH_SYSTEM32);
+          if(amsi != NULL) {
+            // resolve address of init function
+            _AmsiInitialize = 
+              (AmsiInitialize_t)GetProcAddress(amsi, "AmsiInitialize");
+            // resolve address of scanning function
+            _AmsiScanBuffer =
+              (AmsiScanBuffer_t)GetProcAddress(amsi, "AmsiScanBuffer");
+            // failed to resolve either? exit scan
+            if(_AmsiInitialize == NULL ||
+               _AmsiScanBuffer == NULL) return;
+            hr = _AmsiInitialize(L"DotNet", &ctx);
+            if(hr == S_OK) {
+              // update global variable
+              g_amsiContext = ctx;
+            }
+          }
+        }
+        if(g_amsiContext != NULL) {
+          // scan buffer
+          hr = _AmsiScanBuffer(
+            g_amsiContext,
+            buffer,
+            length,
+            0,
+            0,        
+            &amsiResult);
+          if(hr == S_OK) {
+            // if malware was detected or it's blocked by admin
+            if(AmsiResultIsMalware(amsiResult) ||
+               AmsiResultIsBlockedByAdmin(amsiResult))
+            {
+              // "Operation did not complete successfully because "
+              // "the file contains a virus or potentially unwanted" 
+              // software.
+              GetHRMsg(ERROR_VIRUS_INFECTED, &error_string, 0);
+              ThrowHR(COR_E_BADIMAGEFORMAT, &error_string);          
+            }           
+          }
+        }
+    }

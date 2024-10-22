@@ -1,0 +1,94 @@
+原文地址：
+## Introduction
+对于从2.4.17版本（2015年10月9日发布）到2.4.38版本（2019年4月1日发布）之间的Apache
+HTTP系统来说，由于存在数组访问越界导致的任意函数调用问题，导致系统容易受到本地root提权攻击。当Apache正常重新启动(apache2ctl
+graceful）时，就会触发该漏洞。 在标准Linux配置环境中，logrotate程序每天早上6:25都会运行重启命令，以便重置日志文件句柄。
+该漏洞会影响mod_prefork、mod_worker和mod_event等模块。下面，我们将详细介绍该漏洞的利用过程。
+## Bug description
+在MPM prefork模式中，主服务器进程是以root用户权限运行的，用于管理一个单线程、低权限（www-data）的工作进程池，处理各种HTTP请求。为了获得worker的反馈，Apache维护了一个共享内存区域(SHM)，即scoreboard，用于存放各种信息，如worker
+PID及其处理的最后一个请求。每个worker都要维护与其PID相关联的process_score结构，并且赋予了针对SHM的完整读/写权限。
+ap_scoreboard_image：指向共享内存块的指针
+    (gdb) p *ap_scoreboard_image 
+    $3 = {
+      global = 0x7f4a9323e008, 
+      parent = 0x7f4a9323e020, 
+      servers = 0x55835eddea78
+    }
+    (gdb) p ap_scoreboard_image->servers[0]
+    $5 = (worker_score *) 0x7f4a93240820
+与PID为19447的worker相关联的共享内存示例
+    (gdb) p ap_scoreboard_image->parent[0]
+    $6 = {
+      pid = 19447, 
+      generation = 0, 
+      quiescing = 0 '\000', 
+      not_accepting = 0 '\000', 
+      connections = 0, 
+      write_completion = 0, 
+      lingering_close = 0, 
+      keep_alive = 0, 
+      suspended = 0, 
+      bucket = 0 parent
+    type = struct process_score {
+        pid_t pid;
+        ap_generation_t generation;
+        char quiescing;
+        char not_accepting;
+        apr_uint32_t connections;
+        apr_uint32_t write_completion;
+        apr_uint32_t lingering_close;
+        apr_uint32_t keep_alive;
+        apr_uint32_t suspended;
+        int bucket; parent[0]->bucket
+    (gdb) p all_buckets[$index]
+    $7 = {
+      pod = 0x7f19db2c7408, 
+      listeners = 0x7f19db35e9d0, 
+      mutex = 0x7f19db2c7550
+    }
+    (gdb) ptype all_buckets[$index]
+    type = struct prefork_child_bucket {
+        ap_pod_t *pod;
+        ap_listen_rec *listeners;
+        apr_proc_mutex_t *mutex; meth->child_init()了。这就意味着，攻击者能够以root身份调用任意函数。
+## Vulnerable code
+下面，我们将深入考察server/mpm/prefork/prefork.c，以弄清楚漏洞所在的位置以及相应的漏洞机制。
+  * 恶意worker修改共享内存中的bucket索引，使其指向自己的结构（也位于SHM中）。 
+  * 第二天早上6:25，logrotate请求从Apache正常重启。 
+  * 于是，Apache主进程会首先“清剿”原来的worker，然后生成新的worker。 
+  * 在“消灭”原来的worker时，主要是通过向worker发送SIGUSR1来完成的。按照预期，它们应该立即退出。 
+  * 然后，调用prefork_run()([L853](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L853 "L853"))来生成新的worker。由于retained->mpm->was_graceful([L861](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L861 "L861"))为true，所以，worker并不会立即重启。 
+  * 所以，我们将进入主循环([L933](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L933 "L933"))并监视已经杀死的worker的PID。当原来的worker死亡时，ap_wait_or_timeout()将返回其PID([L940](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L940 "L940"))。 
+  * 与该PID相关联的process_score结构的索引将存储到child_slot([L948](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L948 "L948"))中。 
+  * 如果worker没有完全被杀死([L969](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L969 "L969"))，则使用ap_get_scoreboard_process(child_slot)->bucket作为其第三个参数来调用make_child()。 如前所述，这时bucket的值已经被一个恶意worker篡改了。 
+  * make_child()将创建一个新的子进程，然后利用fork()处理([L671](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L671 "L671"))主进程。 
+  * 这样，就会出现OOB读取([L691](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L691 "L691"))，从而导致my_bucket落入攻击者的控制之下。 
+  * 之后，child_main()被调用([L722](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L722 "L722")，[L433](https://github.com/apache/httpd/blob/23167945c17d5764820fdefdcab69295745a15a1/server/mpm/prefork/prefork.c#L433 "L433"))。 
+  * `SAFE_ACCEPT()`只有在Apache监听两个或更多端口时才会执行``，这种情况经常发生，因为服务器会监听HTTP(80)和HTTPS(443)。
+  * 假设执行``，则调用apr_proc_mutex_child_init()，这将导致调用(*mutex)->meth->child_init(mutex, pool, fname)，其中mutex位于攻击者控制之下。 
+  * 权限将在执行后删除(L446)。 
+## Exploitation
+漏洞利用分四步进行：1.获取worker进程的R/W访问权限。2.在SHM中编写一个伪prefork_child_bucket结构。3.让all_buckets[bucket]指向该结构。4.待到上午6:25，就能调用任意函数了。
+优点：主进程永远不会退出，因此，我们可以通过读取/proc/self/maps（ASLR/PIE无用）来获悉所有内容的映射位置——当worker死亡（或发生段错误）时，主进程会自动重启worker，因此，不会出现Apache的DOSing问题。
+缺点：PHP不允许对/proc/self/mem进行读写操作，因此，我们无法直接编辑SHM——all_buckets在正常重启后会被重新分配（！）
+### 1.获取worker进程的R/W访问权限
+#### PHP UAF 0-day
+由于mod_prefork经常与mod_php结合使用，因此，可以考虑通过PHP来利用它。实际上，[CVE-2019-6977](https://github.com/cfreal/exploits/tree/master/CVE-2019-6977-imagecolormatch
+"CVE-2019-6977")将是一个完美的候选者，但当我开始编写这个漏洞的利用代码时，相应的利用代码还没有公之于众。于是，我转而求助于PHP
+7.x版本中0day UAF（在PHP 5.x版本中好像也行得通）：
+    PHP UAF
+    y;
+        return $this;
+      }
+    }
+    function get_aslr()
+    {
+      global $p, $y;
+      $p = 0;
+      $y = [new X('PT1S')];
+      json_encode([1234 => &$y]);
+      print("ADDRESS: 0x" . dechex($p) . "\n");
+      return $p;
+    }
+    get_aslr();
+这是一种针对PHP对象的UAF漏洞：我们释放了$y[0]（X的一个实例），但是仍然可以通过$this来使用相应的内存。

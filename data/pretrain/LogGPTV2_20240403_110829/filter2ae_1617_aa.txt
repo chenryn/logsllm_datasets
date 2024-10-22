@@ -1,0 +1,218 @@
+**作者：wzt  
+原文链接：**
+## **1.1** **简介**
+XNU将进程凭证credential、文件系统acl授权、进程和文件系统监控这几个安全功能抽象为一个安全框架，叫做kauth子系统。它的具体功能主要包含：
+\- 进程凭证credential的创建、更新、销毁。
+\- 文件系统acl的创建、评估、销毁。
+\- 提供kauth scope框架，对进程、文件系统做监控， 支持系统默认监控函数，提供kpi接口，使得第三方内核扩展可以动态添加钩子。
+## **1.2** **进程凭证维护**
+### **1.2.1 基本结构**
+XNU与传统UNIX的进程凭证cred稍有不同。
+    bsd/sys/ucred.h：
+    struct ucred {
+            TAILQ_ENTRY(ucred)      cr_link; /* never modify this without KAUTH_CRED_HASH_LOCK */
+            u_long  cr_ref;                 /* reference count */
+    struct posix_cred {
+            uid_t   cr_uid;                 /* effective user id */
+            uid_t   cr_ruid;                /* real user id */
+            uid_t   cr_svuid;               /* saved user id */
+            short   cr_ngroups;             /* number of groups in advisory list */
+            gid_t   cr_groups[NGROUPS];     /* advisory group list */
+            gid_t   cr_rgid;                /* real group id */
+            gid_t   cr_svgid;               /* saved group id */
+            uid_t   cr_gmuid;               /* UID for group membership purposes */
+            int     cr_flags;               /* flags on credential */
+    } cr_posix;
+            struct label    *cr_label;      /* MAC label */
+            struct au_session cr_audit;             /* user auditing data */
+    };
+struct ucred基本继承了BSD的ucred结构，保留了MAC
+label和audit审计成员，因为xnu内核完全继承了BSD的MAC和audit子系统能力。同时去掉了poison成员， xnu没有使用bsd
+jail的功能，对于xnu的沙箱功能，在后面的系列文章中在详细介绍。xnu
+ucred仍然包含用户所在的组概念，成员cr_groups数组长度为16，是unix家族中标准的用户组大小。除了cr_groups，xnu使用kauth子系统扩展了用户所在组的概念，cr_groups包含的仅是本地机器的用户组，Mac
+OS可以作为服务器使用，kauth建立了一种额外的扩展能力，可以将网络上的其他机器用户组包含到本地组里。
+XNU是一个混合的内核，mach微内核部分控制内核的进程创建与调度功能，
+mach的进程结构体包含了指向bsd进程和线程结构体的指针，而cred是BSD内核的功能，自然包含在bsd封装的进程和线程结构体里，它们之间的数据结构体关系如下：
+内核通过current_thread()宏来获取mach层的struct thread指针，以i386架构为例：
+    osfmk/i386/cpu_data.h
+    #define current_thread_fast()           get_active_thread()
+    #define current_thread()                current_thread_fast()
+    static inline __pure2 thread_t
+    get_active_thread(void)
+    {
+            CPU_DATA_GET(cpu_active_thread,thread_t)
+    }
+    #define CPU_DATA_GET(member,type)                                       \
+            type ret;                                                       \
+            __asm__ volatile ("mov %%gs:%P1,%0"                             \
+                    : "=r" (ret)                                            \
+                    : "i" (offsetof(cpu_data_t,member)));                   \
+            return ret；
+    typedef struct cpu_data
+    {
+            thread_t                cpu_active_thread;
+    } cpu_data_t;
+cpu_data_t结构体里的cpu_active_thread成员指向的就是当前cpu指向的mac thread指针，
+通过offsetof宏计算处它的偏移，在i386下%gs:offset保存的就是它的地址。X64下保存在%fs:offset。
+内核通过get_bsdthread_info函数获取mac thread指向的bsd thread指针：
+    osfmk/kern/bsd_kern.c
+    void *get_bsdthread_info(thread_t th)
+    {
+            return(th->uthread);
+    }
+内核通过get_threadtask函数获取mac thread指向的mac task指针，然后就可以通过mac task找到bsd进程的proc指针。
+    osfmk/kern/bsd_kern.c
+    task_t  get_threadtask(thread_t th)
+    {
+            return(th->task);
+    }
+    void  *get_bsdtask_info(task_t t)
+    {
+            return(t->bsd_info);
+    }
+内核通过kauth_cred_get函数获取进程的cred结构指针，根据以上结构信息也就不难理解了。
+    bsd/kern/kern_credential.c
+    kauth_cred_t
+    kauth_cred_get(void)
+    {
+            struct proc *p;
+            struct uthread *uthread;
+            uthread = get_bsdthread_info(current_thread());
+            if (uthread == NULL)
+                    panic("thread wants credential but has no BSD thread info");
+            if (uthread->uu_ucred == NOCRED) {
+                    if ((p = (proc_t) get_bsdtask_info(get_threadtask(current_thread()))) == NULL)
+                            panic("thread wants credential but has no BSD process");
+                    uthread->uu_ucred = kauth_cred_proc_ref(p);
+            }
+            return(uthread->uu_ucred);
+    }
+### **1.2.2 cred维护**
+XNU对于进程cred的维护与BSD、linux有所不同，
+它将每个进程的cred缓存在一个hash表里，对于复制cred等操作，可以通过引用计数来实现，在它的代码注释中提到这种优化对于一个桌面系统来讲，可以至少节省200k左右的内存。
+### **1.2.3 组扩展机制**
+前面提到xnu扩展了bsd的用户组管理机制，在内核中叫做kauth resolver机制，
+在kauth初始化时，建立了几个队列，当内核使用cred进行用户组授权的过程中，
+将本次请求封装为一个worker，加入相应的队列中等待用户态进程进行处理。xnu增加了一个系统调用identitysvc，用户进程使用这个系统调用与kauth通讯，比如获取等待队列中的worker，然后在用户态进行处理。用户组涉及到的处理逻辑相对复杂，xnu直接引用了windows
+nt内核的sid概念来完善kuath授权系统。
+#### **1.2.3.1 kauth resolver机制初始化**
+    bsd/kern/kern_authorization.c
+    void
+    kauth_init(void)
+    {
+    #if CONFIG_EXT_RESOLVER
+            kauth_identity_init();[1]
+            kauth_groups_init();[2]
+    #endif
+    #if CONFIG_EXT_RESOLVER
+            kauth_resolver_init();[3]
+    #endif
+    }
+Kauth_init在初始时[1]处调用kauth_identity_init()初始化kauth_identities链表，每个节点是struct
+kauth_identity结构体，这个链表用来缓存cred的身份信息，因为如果每次身份验证时都要用户态进程参与，那么效率将会非常低，kauth在每次用户态验证完时，将验证成功的身份信息缓存在kauth_identities链表里，下次验证时将在缓存里进行搜索，如果没有匹配到，在通知用户态进程处理。[2]处的kauth_groups_init()函数功能机理与上述一致。[3]处的kauth_resolver_init函数初始化了三个队列，分别为kauth_resolver_unsubmitted、kauth_resolver_submitted、kauth_resolver_done。
+#### **1.2.3.2 identitysvc系统调用**
+用户态进程通过调用identitysvc系统调用在内核中进行注册，更新缓存大小、获取处理任务以及发送任务的处理结果。
+先来看下用户进程的注册过程。
+    bsd/kern/kern_credential.c
+    int
+    identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int32_t *retval)
+    {
+     if (opcode == KAUTH_EXTLOOKUP_REGISTER) {
+                    new_id = current_proc()->p_pid;
+                    if ((error = kauth_authorize_generic(kauth_cred_get(), KAUTH_GENERIC_ISSUSER)) != 0) {                                            [1]
+                            KAUTH_DEBUG("RESOLVER - pid %d refused permission to become identity resolver", new_id);
+                            return(error);
+                    }
+                    if (kauth_resolver_identity != new_id) {[2]
+                            kauth_resolver_identity = new_id;[3]
+                            kauth_resolver_registered = 1;
+                            wakeup(&kauth_resolver_unsubmitted);[4]
+    }
+当来自用户空间的请求码为KAUTH_EXTLOOKUP_REGISTER时， 在[1]处调用 kauth_authorize_generic，
+这是后面将要讲到的kauth scope监控机制，当前内核的默认授权只是检测当前进程uid是不是为0，
+也就是说只有root权限用户才可以注册。[2]处判断当前进程和之前注册的进程号是否相同，如果不相同就会用当前进程号替换原来的进程号kauth_resolver_identity，然后在[4]处唤醒kauth_resolver_unsubmitted等待队列上的进程。
+我们看到用户进程的注册过程相当简单，这里就会有几个安全问题。所有root进程都可以进行注册，linux使用了capability进一步将root权限进行了划分，
+比如auditd的注册就需要有CAP_NET_ADMIN这个能力才可以。而XNU并没有继承BSD的capability能力模型以及privilege特权模型，这使得它对内核权限的控制就没有那么细致化。其次新的用户进程直接就可以替换老的用户进程，并没有使用一些可信验证手段，
+这使得任何的恶意root进程都可以对其进行替换和仿冒，这样身份验证机制就形同虚设了。
+我们在来看下用户进程是如何从内核获取任务的。
+    bsd/kern/kern_credential.c
+    int
+    identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int32_t *retval)
+    {
+            if (opcode & KAUTH_EXTLOOKUP_WORKER) {
+                    if ((error = kauth_resolver_getwork(message)) != 0)
+                            return(error);
+            }
+    }
+    static int
+    kauth_resolver_getwork(user_addr_t message)
+    {
+            struct kauth_resolver_work *workp;
+            while ((workp = TAILQ_FIRST(&kauth_resolver_unsubmitted)) == NULL) {
+                    thread_t thread = current_thread();
+                    struct uthread *ut = get_bsdthread_info(thread);
+                    ut->uu_save.uus_kauth.message = message;
+                    error = msleep0(&kauth_resolver_unsubmitted, kauth_resolver_mtx, PCATCH, "GRGetWork", 0, kauth_resolver_getwork_continue);
+                    KAUTH_RESOLVER_UNLOCK();
+                    if (!kauth_resolver_identity) {
+                            printf("external resolver died");
+                            error = KAUTH_RESOLVER_FAILED_ERRCODE;
+                    }
+                    return(error);
+            }
+            return kauth_resolver_getwork2(message);
+    }
+kauth_resolver_getwork函数用户获取内核任务，
+首先判断kauth_resolver_unsubmitted队列是否为空，这个队列保存的是内核发布的等待用户进程获取的任务节点，下一小节会对其进行描述。如果队列为空，就使用msleep进行睡眠，同时回调函数设置为kauth_resolver_getwork_continue，这个函数只是继续判断队列是否为空，然后递归调用自己。当队列不为空时，会调用kauth_resolver_getwork2。它从kauth_resolver_unsubmitted队列头取下一个节点，用copyout函数拷贝给用户空间的进程，然后将这个节点移入到kauth_resolver_submitted队列，这样用户进程就获取了要进行身份验证的信息。
+当用户进程处理完毕后，处理结果要返回给内核。
+    bsd/kern/kern_credential.c
+    int
+    identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int32_t *retval)
+    {
+            if (opcode & KAUTH_EXTLOOKUP_RESULT) {
+                    if ((error = kauth_resolver_complete(message)) != 0)
+                            return(error);
+            }
+    }
+    static int
+    kauth_resolver_complete(user_addr_t message)
+    {
+            if ((error = copyin(message, &extl, sizeof(extl))) != 0) {
+                    KAUTH_DEBUG("RESOLVER - error getting completed work\n");
+                    return(error);
+            }
+            if (extl.el_result != KAUTH_EXTLOOKUP_FATAL) {
+                    TAILQ_FOREACH(workp, &kauth_resolver_submitted, kr_link) {
+                            if (workp->kr_seqno == extl.el_seqno) {
+                                    TAILQ_INSERT_TAIL(&kauth_resolver_done, workp, kr_link);
+    }
+kauth_resolver_complete通过copyin将用户信息拷贝到内核，然后遍历kauth_resolver_submitted队列，根据seq号找到对应的节点，更新处理信息，然后将这个节点移动到kauth_resolver_done队列。
+### 1.2.3.3 cred身份验证
+当涉及到cred的身份验证时，kauth调用kauth_cred_cache_lookup函数进行处理。
+    bsd/kern/kern_credential.c
+    static int
+    kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
+    {
+            switch(from) {
+            case KI_VALID_UID:[1]
+                    error = kauth_identity_find_uid(*(uid_t *)src, &ki, namebuf);
+                    if (expired) {
+                            if (!expired(&ki)) {[2]
+                                    KAUTH_DEBUG("CACHE - entry valid, unexpired");
+            error = kauth_resolver_submit(&el, extend_data);[3]
+            if (error == 0) {
+                    kauth_identity_updatecache(&el, &ki, extend_data);[4]
+    }
+kauth在kauth_identities
+cache中维护着一个转换列表，cred中的uid可以对应kauth_identities中的guid、ntsid等等。比如转换类型为KI_VALID_UID，则在[1]处调用kauth_identity_find_uid，在cache中进行搜索。找到后，还要在[2]处进行验证身份信息是否过
+    static int
+    kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data)
+    {
+            struct kauth_resolver_work *workp, *killp;
+            MALLOC(workp, struct kauth_resolver_work *, sizeof(*workp), M_KAUTH, M_WAITOK); [1]
+            if (workp == NULL)
+                    return(ENOMEM);
+            workp->kr_work = *lkp;
+            workp->kr_extend = extend_data;
+            workp->kr_refs = 1;
+            workp->kr_flags = KAUTH_REQUEST_UNSUBMITTED;

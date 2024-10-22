@@ -1,0 +1,148 @@
+# 【技术分享】CVE-2016-8655内核竞争条件漏洞调试分析
+|
+##### 译文声明
+本文是翻译文章，文章来源：360安全应急响应中心
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+****
+**  
+**
+**作者：张开翔** ****
+**传送门：**[
+**【漏洞预警】CVE-2016-8655:Linux内核通杀提权漏洞（21:45更新POC）**](http://bobao.360.cn/learning/detail/3267.html)
+**  
+**
+**前言**
+12月5日，hilipPettersson公布了一枚已存在Linux
+kernel长达5年的本地提权漏洞，几乎影响所有Linux主流发行版本，一时风头无二，绝不亚于前段时间的“Dirty
+Cow”。对于这个黑魔法漏洞，只有走进源码才不会管中窥豹，正是源于好奇，于是开始了整个漏洞的调试和分析。
+漏洞调试是乏味的，建议大家在调试的过程中，保持心静，捋清步骤，逐渐展开。
+感谢cyg07的敦促和指导！
+**漏洞技术分析**
+* * *
+**1、漏洞描述**  
+漏洞作者：hilipPettersson（[PI:EMAIL](mailto:PI:EMAIL)）
+漏洞危害：低权限用户提权到root
+影响范围：Linuxkernel version =4.8.13）
+官方补丁：https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=84ac7260236a49c79eede91617700174c2c19b0cLinuxkernel(net/packet/af_packet.c)代码中存在条件竞争，可造成低权限用户提权到root。漏洞利用要创建原始套接字，需具备CAP_NET_RAW能力。
+然而在某些特定的Linux发行版本（Ubuntu、Fedora）允许非特权用户创建的网络命名空间具备该能力，可成功利用。
+**  
+**
+**2、漏洞成因**
+packet_set_ring函数在创建ringbuffer的时候，如果packet版本为TPACKET_V3，则会初始化struct
+timer_list，如下图所示。packet_set_ring函数返回之前，其他线程可调用setsockopt函数将packet版本设定为TPACKET_V1。前面初始化的timer未在内核队列中被注销，timer过期时触发struct
+timer_list中回调函数的执行，形成UAF漏洞。
+    switch(po->tp_version){
+    case TPACKET_V3:
+    /* Transmit path isnot supported. We checked
+    * it above but justbeing paranoid
+    */
+    if(!tx_ring)
+    init_prb_bdqc(po, rb, pg_vec, req_u);
+             break;
+             default:
+             break;
+    }
+当套接字关闭，packet_set_ring函数会再次被调用，如果packet的版本大于TPACKET_V2，内核会在队列中注销掉先前的这个定时器，如下图所示。
+    if(closing &&(po->tp_version > TPACKET_V2)){
+             /* Because we don't support block-based V3 on tx-ring */
+             if(!tx_ring)
+                       prb_shutdown_retire_blk_timer(po, rb_queue);
+    }
+但是packet版本被更改为TPACKET_V1后，原本的执行流程就发生了改变，使得
+prb_shutdown_retire_blk_timer()函数不被执行，timer结构体也没有在内核的队列中被注销，一旦timer过期，内核就会执行相应的处理函数。timer的类型是struct
+timer_list，定义如下：
+    struct timer_list {
+             /*     * All fields that change during normal runtimegrouped to the
+              * same cacheline  */
+             struct hlist_node        entry;
+             unsignedlong             expires;
+             void                    (*function)(unsignedlong);
+             unsignedlong             data;
+             u32                     flags;
+             int                       slack;
+    #ifdefCONFIG_TIMER_STATS
+             int                       start_pid;
+             void                    *start_site;
+             char                    start_comm[16];
+    #endif
+    #ifdefCONFIG_LOCKDEP
+             struct lockdep_maplockdep_map;
+    #endif
+    };
+**  
+**
+**3、漏洞利用**
+漏洞利用的本质是通过触发竞态，使得内核不注销socket内部的timer，然后使用内存喷射的方法覆盖timer未释放前的内核空间，将timer内部的函数替换成想要执行的函数，一旦timer时间过期，内核就会执行timer的过期处理函数，实际就是替换后的函数，从而达到漏洞利用的目的。触发竞态的代码如下：
+    void*vers_switcher(void*arg)
+    {
+        int val,x,y;
+        while(barrier){}
+        while(1){
+            val = TPACKET_V1;
+            x = setsockopt(sfd, SOL_PACKET, PACKET_VERSION,&val,sizeof(val));
+            y++;
+            if(x !=0)break;
+            val = TPACKET_V3;
+            x = setsockopt(sfd, SOL_PACKET, PACKET_VERSION,&val,sizeof(val));
+            if(x !=0)break;
+            y++;
+        }
+        fprintf(stderr,"version switcher stopping, x = %d (y = %d, last val = %d)n",x,y,val);
+        vers_switcher_done =1;
+        returnNULL;
+    }
+漏洞作者公布了POC，利用步骤分为三个阶段：第一阶段是准备struct
+ctl_table数据，并将它存放在vsyscall页，作为register_sysctl_table()函数的调用参数。具体方法是首先将vsyscall页设置成可写属性页，可通过调用set_memory_rw(syscall_page)来完成，然后再修改页内容，填充为精心构造的structctl_table结构体的数据，将该结构体的核心成员.data设置为moprobe_path。
+**timer覆盖前数据：**
+**timer覆盖后数据：**
+第二阶段是注册sysctl条目，指定内核参数为modprobe_path。具体方法是通过调用register_sysctl_table()函数来完成，调用参数就是上一阶段构造好的struct
+ctl_table数据，调用成功后“/proc/sys”目录下会新生成名为ctl_table.
+Procname的文件。此后通过改写该文件就能动态替换modprobe程序。
+上述过程完成了两个功能，所以触发和利用漏洞也需要成功地进行两次，但如何将准确替换先前socket内部的timer呢？
+堆喷射，通过循环调用add_key()函数（作者称此函数最稳定）在内核中分配内存，使用精心构造的exploit
+buffer来填充，内核通过papcket_create()函数创建socket的结构数据struct sock，大小为1408字节。
+但是POC调用kmalloc()函数时指定的payload长度为1384字节，为何？因为内核在调用add_key()函数时会先创建structuser_key_payload结构体，其大小为24字节，然后在它后面复制用户态payload数据，相关代码如下：
+    struct callback_head {
+             structcallback_head *next;
+             void(*func)(structcallback_head *head);
+    } __attribute__((aligned(sizeof(void*))));
+    #define rcu_headcallback_head
+    ¡­ ¡­
+    struct user_key_payload {
+             structrcu_head         rcu;            /* RCU destructor */
+             unsignedshort  datalen;            /* length of this data */
+             char           data[0];                     /* actual data */
+    };
+    int user_preparse(structkey_preparsed_payload *prep)
+    {
+             structuser_key_payload *upayload;
+             size_t datalen = prep->datalen;
+             if(datalen 0|| datalen>32767||!prep->data)
+                       return-EINVAL;
+             upayload = kmalloc(sizeof(*upayload)+ datalen, GFP_KERNEL);
+             if(!upayload)
+                       return-ENOMEM; 
+             /* attach the data */
+             prep->quotalen = datalen;
+             prep->payload.data[0]= upayload;
+             upayload->datalen = datalen;
+             memcpy(upayload->data, prep->data, datalen);
+             return0;
+    }
+此外，POC中构造的timer相对于exploitbuf的偏移为0x35e字节，如何得到？因为structuser_key_payload中成员data相对于结构体首地址的偏移为0x12字节，两者相加得0x370字节，恰好是timer在struct
+packet_sock结构体中的偏移，覆盖前和覆盖后的内存对比如下图所示。
+第三阶段创建root
+shell。具体方法是首先更改“/proc/sys/hack”文件内容，达到替换modprobe程序的目的，然后触发内核执行替换后的modprobe程序，如何做到呢？POC通过调用socket()函数引用未被内核加载的网络驱动模块实现，如果内核当前未加载此模块，就会使用modprobe程序来加载它从而达到目的。其实，替换后的modprobe程序就是POC程序，当被内核执行时会更改文件属主为root，添加S权限位。最后，当普通用户再执行POC程序时它会创建root
+shell。
+    readlink("/proc/self/exe",(char*)&buf,256);
+     write(fd,buf,strlen(buf)+1);
+     socket(AF_INET,SOCK_STREAM,132);
+下图是完整的执行结果：
+**  
+**
+**4、参考引用**
+[http://securityaffairs.co/wordpress/54168/hacking/cve-2016-8655-linux-kernel.html](http://securityaffairs.co/wordpress/54168/hacking/cve-2016-8655-linux-kernel.html)
+[http://seclists.org/oss-sec/2016/q4/607](http://seclists.org/oss-sec/2016/q4/607)
+**传送门** **：**[
+**【漏洞预警】CVE-2016-8655:Linux内核通杀提权漏洞（21:45更新POC）**](http://bobao.360.cn/learning/detail/3267.html)

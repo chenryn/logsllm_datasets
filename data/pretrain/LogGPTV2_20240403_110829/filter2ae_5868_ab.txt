@@ -1,0 +1,88 @@
+            else
+            {
+              // ...
+    LABEL_287:
+              // ...
+              if ( dword_1A870C )
+              {
+                free((void *)dword_1A870C);
+                dword_1A870C = 0;
+              }
+              sub_2F284((int *)&v224);
+              dword_1A870C = (int)malloc(v105 + 0x258);     // (6)
+              if ( dword_1A870C || ...)
+              {
+                memset((void *)dword_1A870C, 0x20, v105 + 0x258);
+                v203=var_offset-v102; // 对于超长请求, var_offset最大值位0x800(只会触发recv() 2次)
+                memcpy((void *)dword_1A870C, &s1[v102], var_offset-v102);// (7) heap overflow
+                // ...
+### 漏洞利用
+#### 原始方法
+`ZDI`的[博客](https://www.zerodayinitiative.com/blog/2020/6/24/zdi-20-709-heap-overflow-in-the-netgear-nighthawk-r6700-router)中也给出了漏洞的上下文以及利用思路，这里进行简单概括。关于该漏洞的上下文如下：
+  * 可以往堆上写任意的数据，包括`'\x00'`
+  * `ASLR` 等级为1，因此堆空间的起始地址是固定的
+  * 该设备使用的是`uClibc`，相当于一个简化版的`glibc`，其关于堆的检查条件比`glibc`中宽松很多
+  * 在实现堆溢出之后，`fopen()`函数会被调用，其中会分别调用`malloc(0x60)`和`malloc(0x1000)`，之后也会调用free()进行释放。堆块的申请与释放先后顺序如下：
+      free(dword_1A870C) -> dword_1A870C = malloc() -> free(malloc(0x60)) -> free(malloc(0x1000))
+  * 通过请求接口`"/strtblupgrade.cgi"`，可以实现任意大小的堆块申请与释放：`free(malloc())`
+`d4rkn3ss`利用`fastbin dup
+attack`的思路来进行漏洞利用，即通过破坏堆的状态，使得后续的`malloc()`返回指定的地址，由于可以往该地址写任意内容(`write-what-where`)，故可以通过覆盖`got`表项的方式实现任意代码执行。但是前面提到，在实现堆溢出之后，在`fopen()`内会调用`malloc(0x1000)`，其会触发`__malloc_consolidate()`，从而破坏已有的`fastbin`，因此需要先解决`__malloc_consolidate()`的问题。
+在`uClibc`中的`free()`函数内，在释放`fastbin`时存在越界写问题，而在`malloc_state`结构体中，`max_fast`变量正好在`fastbins`数组前，通过越界写可以实现修改`max_fast`变量的目的。当`max_fast`变量被改成一个很大的值后，后续再调用`malloc(0x1000)`时便不会触发`__malloc_consolidate()`，从而可以执行`fastbin
+dup attack`。
+    void free(void* mem)
+    {
+        // ...
+        /*
+           If eligible, place chunk on a fastbin so it can be found
+           and used quickly in malloc.
+           */
+        if ((unsigned long)(size) max_fast)
+            /* If TRIM_FASTBINS set, don't place chunks
+               bordering top into fastbins */
+            && (chunk_at_offset(p, size) != av->top)
+           ) {
+        set_fastchunks(av);
+        fb = &(av->fastbins[fastbin_index(size)]);  // out-of-bounds write
+        p->fd = *fb;
+        *fb = p;
+        }
+        // ...
+    struct malloc_state {
+      /* The maximum chunk size to be eligible for fastbin */
+      size_t  max_fast;   /* low 2 bits used as flags */
+      /* Fastbins */
+      mfastbinptr      fastbins[NFASTBINS];
+      /* Base of the topmost chunk -- not otherwise kept in a bin */
+      mchunkptr        top;
+      /* The remainder from the most recent split of a small request */
+      mchunkptr        last_remainder;
+      // ...
+综上，漏洞利用的过程如下：
+  * 通过堆溢出修改下一个空闲块的`prev_size`字段和`size`字段，填充合适的`prev_size`值，并使得`PREV_INUSE`标志位为0；
+>
+> 之后在触发`__malloc_consolidate()`时，会对该`fastbin`进行后向合并，因此需要保证能根据伪造的`prev_size`找到前面的某个空闲块，否则`unlink`时会报错
+  * 通过`/strtblupgrade.cgi`接口申请一个合适大小的堆块，该堆块会与上面已分配的堆块重叠，从而可以修改上面堆块的大小为`0x8`；
+> 在上一步`__malloc_consolidate()`后，由于堆块的后向合并，故会存在一个空闲的堆块与已分配的堆块重叠
+  * 释放上面已分配的堆块，在将其放入`fastbins`数组中时，会出现越界写，从而将`max_fast`修改为一个很大的值；
+>
+> max_fast被修改为一个很大的值后，调用`mallco(0x1000)`时就不会触发`__malloc_consolidate()`，之后就可以执行`fastbin
+> dup attack`
+  * 再次通过堆溢出覆盖下一个空闲块，修改其`fd`指针为`free()`的`got`地址(准确来说为`free_got_addr - offset`)；
+  * 连续申请2个合适的堆块，返回的第2个堆块的地址指向`free()`的got表项，通过向堆块中写入数据，将其修改为`system()`的`plt`地址；
+  * 当释放第2个堆块时，执行`free()`将调用`system()`，同时其参数指向构造的`payload`，从而实现代码执行。
+>
+> `H4lo`师傅提供了另外的思路来进行漏洞利用，具体可参考[这里](https://e3pem.github.io/2019/08/26/0ctf-2019/embedded_heap/)
+#### “意外”方法
+基于上述思路，在`R6400v2`设备上进行漏洞利用时发现存在如下问题：
+  * 通过`malloc(0x30) -> malloc(0x40) -> malloc(0x30)`方式进行堆布局时，得到的两个堆块之间的偏移比较小，但是由于返回的堆地址比较小，在后续触发`__malloc_consolidate()`对空闲堆块进行后向合并时，往前找不到合适的空闲堆块，无法进行堆块合并。尝试通过分配不同的堆块大小、以及发送不同的请求等方式，均无法得到满足条件的堆块。
+  * 通过`malloc(0x20) -> malloc(0x10) -> malloc(0x20)`方式进行堆布局时，得到的两个堆块之间的偏移比较大(`超过0x470`)，按照`d4rkn3ss`提供的漏洞利用代码，好像无法实现溢出来覆盖下一个堆块。
+由于多次尝试第一种方式均失败，只能寄希望于第二种方式。由于触发漏洞的接口为`"/backup.cgi"`(配置文件上传接口)，按理来说上传的配置文件可以比较大，故该接口应该可以处理较长的请求，但当文件内容长度超过`0x400`时却无法溢出。通过对该请求的处理流程进行分析发现，要通过该接口触发漏洞，整个请求的长度要在`0x400~0x800`之间，如下：
+  * 该请求必须触发2次`recv()` ，即对应请求长度必须>`0x400`，否则无法到达漏洞点处；
+  * 该请求只会触发2次`recv()`，当对应请求长度>`0x800`，过长的内容会被截断，后续拷贝时无法造成溢出。
+在`d4rkn3ss`提供的漏洞利用脚本中，可以看到在请求头中有一个`'a'*0x200`的占位符，同时`make_filename()`也有一个类似的占位符，因此实际可上传的配置文件大小约为`0x2c0`左右，故当两个堆块之间的偏移超过`0x400`时无法造成堆溢出。解决方式很简单，当要上传大文件时，去掉占位符`'a'*0x200`即可。
+    def make_filename(chunk_size):
+        return 'a' * (0x1d7 - chunk_size)
+    def exploit():
+        path = '/cgi-bin/genie.cgi?backup.cgiContent-Length: 4156559'
+        headers = ['Host: %s:%s' % (rhost, rport), 'a'*0x200 + ': d4rkn3ss']
+在解决了该问题后，打算按照原来的思路进行利用，可能存在的一些问题如下：

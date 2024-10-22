@@ -1,0 +1,207 @@
+## 为PostgreSQL讨说法 - 浅析《UBER ENGINEERING SWITCHED FROM POSTGRES TO MYSQL》          
+### 作者                                                                                                   
+digoal                                                                                                    
+### 日期                                                                                                  
+2016-07-28            
+### 标签                                                                                                  
+PostgreSQL , uber , mysql , mvcc , index , 索引组织表 , innodb                                       
+----                                                                                                  
+## 背景   
+最近有一篇文档，在国外闹得沸沸扬扬，是关于UBER使用mysql替换postgres原因的文章。    
+英文原文    
+https://eng.uber.com/mysql-migration/    
+[来自高可用架构的 中文翻译](http://mp.weixin.qq.com/s?__biz=MzAwMDU1MTE1OQ==&mid=2653547609&idx=1&sn=cbb55ee823ddec9d98ef1fa984e001f6&scene=0#wechat_redirect)    
+文章涉及到 **PG数据库的部分，背后的原理并没有深入的剖析，导致读者对PostgreSQL的误解** 。      
+## uber在文章阐述的遇到的PG问题    
+We encountered many Postgres limitations:      
+* Inefficient architecture for writes     
+* Inefficient data replication     
+* Issues with table corruption     
+* Poor replica MVCC support     
+* Difficulty upgrading to newer releases      
+**本文接下来会依依介绍其背后的原理**。    
+### 1. Inefficient architecture for writes  
+#### **uber文章的观点**   
+PG的MVCC机制，更新数据为新增版本，会带来两个问题      
+* SSD的写放大    
+* 索引的写放大    
+#### **本文观点**    
+事实并不是PG的MVCC的问题，所有的数据库只要支持并发读写，就需要MVCC，只是版本管理的手段可能不一样。    
+有通过回滚段管理的，也有通过多版本进行管理的。    
+#### **原理剖析**     
+**基于回滚段实现MVCC的数据库**   
+当更新一条记录时，有些数据库需要将整个数据块拷贝到回滚段区域（有些是基于逻辑行的拷贝，则拷贝到回滚段的是记录）。     
+注意写回滚段也是会产生REDO写操作的。    
+带来一个问题，包含更新、删除操作的事务会变慢，相当于双倍的时间。    
+* 更新可能在当前的row进行。     
+   这种情况，只要索引字段不变化，索引就不需要变。     
+   如果索引字段值发生变化，索引也要变化。      
+![screenshot](20160728_01_pic_001.png)    
+* 如果更新后的记录超过原来行的长度，可能在本页找一块空闲区域（如果能装下），也可能要到其他页找一块区域进行更新，有擦除旧记录，写入新纪录的写操作。    
+  不管怎样，索引都要变化。      
+![screenshot](20160728_01_pic_002.png)    
+基于回滚段实现MVCC的数据库，除了前面说的更新、删除操作的响应变慢，同时还有另一个影响如果要回滚事务，开销会很大（特别是当事务修改的数据量很大时），因为要从回滚段将整个块拷贝到数据文件（基于逻辑行拷贝的回滚则是类似重新来一遍UNDO事务的SQL操作，同时还需要擦除之前更改的行）。      
+*代价非常高* 。    
+通常出现在执行大事务，同时回滚段写满的时候，报snapshot too old，导致事务不得不回滚，回滚又会是一个非常漫长的操作。    
+**基于多版本实现MVCC的数据库**    
+当更新一条记录时，产生一个新的版本。    
+* PostgreSQL 会优先使用在当前页更新（HOT），即在当前页进行更新，不管行长度是否发生变化。     
+   这种情况，只要索引字段不变化，索引就不需要变。    
+   如果索引字段值发生变化，索引也要变化。      
+  (hot时，索引不变，通过HEAP页内旧item指向新item来做到定位到新的记录)      
+  ![screenshot](20160728_01_pic_003.png)    
+* 如果未在当前页更新，则索引才需要变化    
+  （通过配置表的fillfactor，可以大大减少这种情况的发送，尽量走HOT）    
+  如果读者还是担心这个问题，我们可以做一个压测试验，看看到底会不会更新索引，会不会对更新造成性能影响如何？    
+  有几个参数需要注意，很多用户可能不关注这个，导致了膨胀      
+```  
+autovacuum_work_mem = 4GB               # min 1MB, or -1 to use maintenance_work_mem  
+autovacuum = on                 # Enable autovacuum subprocess?  'on'  
+autovacuum_max_workers = 8              # max number of autovacuum subprocesses  
+autovacuum_naptime = 30s         # time between autovacuum runs  
+autovacuum_vacuum_threshold = 50        # min number of row updates before  
+autovacuum_analyze_threshold = 50       # min number of row updates before  
+autovacuum_vacuum_scale_factor = 0.002  # fraction of table size before vacuum  
+autovacuum_analyze_scale_factor = 0.001 # fraction of table size before analyze  
+autovacuum_vacuum_cost_delay = 0        # default vacuum cost delay for  
+```  
+  测试1000万数据，9个字段，8个索引，更新其中的mod_time字段。    
+```  
+postgres=# create table tbl(id int, mod_time timestamp(0), c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int) with (fillfactor=80);  
+CREATE TABLE  
+Time: 1.906 ms  
+postgres=# insert into tbl select i,clock_timestamp(),i+1,i+2,i+3,i+4,i+5,i+6,i+6 from generate_series(1,10000000) t(i);  
+INSERT 0 10000000  
+Time: 14522.098 ms  
+postgres=# create index idx1 on tbl(c1) with (fillfactor=80);  
+CREATE INDEX  
+Time: 3005.753 ms  
+postgres=# create index idx2 on tbl(c2) with (fillfactor=80);  
+CREATE INDEX  
+Time: 2793.361 ms  
+postgres=# create index idx3 on tbl(c3) with (fillfactor=80);  
+CREATE INDEX  
+Time: 2804.031 ms  
+postgres=# create index idx4 on tbl(c4) with (fillfactor=80);  
+CREATE INDEX  
+Time: 2856.954 ms  
+postgres=# create index idx5 on tbl(c5) with (fillfactor=80);  
+CREATE INDEX  
+Time: 2895.643 ms  
+postgres=# create index idx6 on tbl(c6) with (fillfactor=80);  
+CREATE INDEX  
+Time: 2932.394 ms  
+postgres=# create index idx7 on tbl(c7) with (fillfactor=80);  
+CREATE INDEX  
+Time: 2939.927 ms  
+postgres=# alter table tbl add constraint pk_tbl primary key(id) with (fillfactor=80);  
+ALTER TABLE  
+Time: 3292.544 ms  
+```  
+  记录下当前表的大小和8个索引的大小，用于压测后对比大小变化      
+```  
+postgres=# \dt+ tbl  
+                    List of relations  
+ Schema | Name | Type  |  Owner   |  Size  | Description   
+--------+------+-------+----------+--------+-------------  
+ public | tbl  | table | postgres | 919 MB |   
+(1 row)  
+postgres=# \di+   
+                                      List of relations  
+ Schema |         Name          | Type  |  Owner   |      Table       |  Size  | Description   
+--------+-----------------------+-------+----------+------------------+--------+-------------  
+ public | idx1                  | index | postgres | tbl              | 241 MB |   
+ public | idx2                  | index | postgres | tbl              | 241 MB |   
+ public | idx3                  | index | postgres | tbl              | 241 MB |   
+ public | idx4                  | index | postgres | tbl              | 241 MB |   
+ public | idx5                  | index | postgres | tbl              | 241 MB |   
+ public | idx6                  | index | postgres | tbl              | 241 MB |   
+ public | idx7                  | index | postgres | tbl              | 241 MB |   
+ public | pk_tbl                | index | postgres | tbl              | 241 MB |   
+```  
+  全力压测30分钟，更新mod_time字段    
+```  
+$ vi test.sql  
+\setrandom id 1 10000000  
+update tbl set mod_time=now() where id=:id;  
+压测开始  
+pgbench -M prepared -n -r -P 5 -f ./test.sql -c 48 -j 48 -T 1800  
+```  
+  压测结果，更新速度维持在 13万/s 以上。  这个压力应该可以覆盖很多的用户吧。    
+```  
+progress: 5.0 s, 133373.6 tps, lat 0.357 ms stddev 0.269  
+progress: 10.0 s, 133148.2 tps, lat 0.359 ms stddev 0.310  
+progress: 15.0 s, 134249.0 tps, lat 0.356 ms stddev 0.299  
+progress: 20.0 s, 131037.9 tps, lat 0.364 ms stddev 0.341  
+progress: 25.0 s, 135326.3 tps, lat 0.353 ms stddev 0.292  
+progress: 30.0 s, 135023.9 tps, lat 0.354 ms stddev 0.289  
+......  
+progress: 1385.0 s, 135997.9 tps, lat 0.351 ms stddev 0.261  
+progress: 1390.0 s, 133152.5 tps, lat 0.359 ms stddev 0.302  
+progress: 1395.0 s, 133540.7 tps, lat 0.357 ms stddev 0.287  
+progress: 1400.0 s, 132034.8 tps, lat 0.362 ms stddev 0.314  
+progress: 1405.0 s, 135366.6 tps, lat 0.353 ms stddev 0.266  
+progress: 1410.0 s, 134606.6 tps, lat 0.355 ms stddev 0.280  
+.....  
+progress: 1855.0 s, 134013.7 tps, lat 0.356 ms stddev 0.298  
+progress: 1860.0 s, 132374.8 tps, lat 0.361 ms stddev 0.306  
+progress: 1865.0 s, 133868.3 tps, lat 0.357 ms stddev 0.282  
+progress: 1870.0 s, 133457.1 tps, lat 0.358 ms stddev 0.303  
+progress: 1875.0 s, 133598.3 tps, lat 0.357 ms stddev 0.297  
+progress: 1880.0 s, 133234.5 tps, lat 0.358 ms stddev 0.297  
+progress: 1885.0 s, 131778.9 tps, lat 0.362 ms stddev 0.319  
+progress: 1890.0 s, 134932.2 tps, lat 0.354 ms stddev 0.274  
+......  
+progress: 2235.0 s, 135724.6 tps, lat 0.352 ms stddev 0.284  
+progress: 2240.0 s, 136845.0 tps, lat 0.349 ms stddev 0.256  
+progress: 2245.0 s, 136240.6 tps, lat 0.350 ms stddev 0.264  
+progress: 2250.0 s, 136983.2 tps, lat 0.348 ms stddev 0.248  
+progress: 2255.0 s, 137494.5 tps, lat 0.347 ms stddev 0.251  
+......  
+```  
+  压测结束后，查看表和索引的大小，如果按UBER文中指出的，会更新索引，但实际上，结果说话，表和索引根本没有膨胀。    
+  UBER 文章对用户的误导不攻自破。    
+```  
+表的大小未变化  
+postgres=# \dt+  
+                          List of relations  
+ Schema |       Name       | Type  |  Owner   |  Size   | Description   
+--------+------------------+-------+----------+---------+-------------  
+ public | tbl              | table | postgres | 919 MB  |   
+索引的大小也未变化  
+postgres=# \di+  
+                                      List of relations  
+ Schema |         Name          | Type  |  Owner   |      Table       |  Size  | Description   
+--------+-----------------------+-------+----------+------------------+--------+-------------  
+ public | idx1                  | index | postgres | tbl              | 241 MB |   
+ public | idx2                  | index | postgres | tbl              | 241 MB |   
+ public | idx3                  | index | postgres | tbl              | 241 MB |   
+ public | idx4                  | index | postgres | tbl              | 241 MB |   
+ public | idx5                  | index | postgres | tbl              | 241 MB |   
+ public | idx6                  | index | postgres | tbl              | 241 MB |   
+ public | idx7                  | index | postgres | tbl              | 241 MB |   
+ public | pk_tbl                | index | postgres | tbl              | 241 MB |   
+```  
+另外再给大家分析一个信息，PostgreSQL nbtree 索引方法针对更新做了优化，可以大幅降低锁的产生，所以并发的更新性能是非常棒的。    
+我们来看一个测试，更新c1与mod_time两个字段，其中c1是索引字段。     
+压测脚本变更如下     
+```  
+vi test.sql  
+\setrandom id 1 10000000  
+update tbl set mod_time=now(),c1=c1+1 where id=:id;   
+```  
+压测数据截取，可以看出性能是很好的，和单纯更新非索引列差不多    
+```  
+...  
+progress: 1025.0 s, 138077.5 tps, lat 0.346 ms stddev 0.264  
+progress: 1030.0 s, 138746.9 tps, lat 0.344 ms stddev 0.270  
+progress: 1035.0 s, 137590.2 tps, lat 0.347 ms stddev 0.273  
+progress: 1040.0 s, 139072.3 tps, lat 0.343 ms stddev 0.258  
+progress: 1045.0 s, 140480.3 tps, lat 0.340 ms stddev 0.255  
+...  
+```  
+欲了解PostgreSQL nbtree的原理，可以参考Lehman & Yao Algorithm    
+src/backend/access/nbtree/README    
+#### **小结**       
+* 基于回滚段实现MVCC的数据库，在更新数据时SSD写放大 > 100%(因为回滚段是一定要写的，并行写回滚段的操作也需要写REDO)；而基于多版本实现MVCC的数据库，SSD写放大的概率低于100%(因为可能发生HOT，发生在当前页)，而且旧记录只改行的xmax标记，产生的REDO极少。      
+* 基于回滚段实现MVCC的数据库，在删除数据时SSD写放大是100%(因为回滚段是一定要写的，并行写回滚段的操作也需要写REDO)；而基于多版本实现MVCC的数据库，SSD写放大的概率为0 (因为只需要改一下行头部的xmax的标记)。      

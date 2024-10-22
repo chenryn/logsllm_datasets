@@ -1,0 +1,240 @@
+## PostgreSQL 最佳实践 - 在线逻辑备份与恢复介绍  
+##### [TAG 24](../class/24.md)
+### 作者   
+digoal    
+### 日期  
+2016-08-23   
+### 标签  
+PostgreSQL , 逻辑备份与恢复  
+----  
+## 背景  
+PostgreSQL 逻辑备份, 指在线备份数据库数据, DDL以SQL语句形式输出, 数据则可以以SQL语句或者固定分隔符(row格式)的形式输出.  
+备份时不影响其他用户对备份对象的DML操作.  
+本文主要介绍一下PostgreSQL提供的逻辑备份工具pg_dump, pg_dumpall, 以及数据库的COPY命令的备份方法.  
+## pg_dump  
+使用pg_dump进行备份时, 其他用户可以同时进行DML(SELECT, UPDATE, DELETE, INSERT)操作, 相互之间没有干扰.  
+### 一、pg_dump备份程序的逻辑，源码分析.  
+1\. pg_dump的一次完整的备份是在一个事务中完成的, 事务隔离级别为serializable 或者 repeatable read. 代码如下 :  
+```
+        ExecuteSqlStatement(fout, "BEGIN");    
+        if (fout->remoteVersion >= 90100)    
+        {    
+                if (serializable_deferrable)    
+                        ExecuteSqlStatement(fout,    
+                                                                "SET TRANSACTION ISOLATION LEVEL "    
+                                                                "SERIALIZABLE, READ ONLY, DEFERRABLE");    
+                else    
+                        ExecuteSqlStatement(fout,    
+                                                                "SET TRANSACTION ISOLATION LEVEL "    
+                                                                "REPEATABLE READ");    
+        }    
+        else    
+                ExecuteSqlStatement(fout,    
+                                                        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");    
+```
+2\. pg_dump在备份数据开始前, 需要对进行备份的对象加ACCESS SHARE锁, 代码如下 :  
+```
+if (tblinfo[i].dobj.dump && tblinfo[i].relkind == RELKIND_RELATION)    
+                {    
+                        resetPQExpBuffer(query);    
+                        appendPQExpBuffer(query,    
+                                                          "LOCK TABLE %s IN ACCESS SHARE MODE",    
+                                                          fmtQualifiedId(fout,    
+                                                                                tblinfo[i].dobj.namespace->dobj.name,    
+                                                                                         tblinfo[i].dobj.name));    
+                        ExecuteSqlStatement(fout, query->data);    
+                }    
+```
+pg_dump加的锁与DDL冲突, 例如TRUNCATE, DROP, ALTER, VACUUM FULL, 以及以及unqualified LOCK TABLE冲突, 所以备份开始后是不能进行这些操作的. 可以防止备份过程中数据结构改变, 或者数据被物理的删除掉了.  
+正因为pg_dump在备份数据前要对备份对象加锁, 所以为了防止pg_dump无休止的的锁等待, pg_dump支持锁超时.  
+```
+        if (lockWaitTimeout && fout->remoteVersion >= 70300)    
+        {    
+                /*    
+                 * Arrange to fail instead of waiting forever for a table lock.    
+                 *    
+                 * NB: this coding assumes that the only queries issued within the    
+                 * following loop are LOCK TABLEs; else the timeout may be undesirably    
+                 * applied to other things too.    
+                 */    
+                resetPQExpBuffer(query);    
+                appendPQExpBuffer(query, "SET statement_timeout = ");    
+                appendStringLiteralConn(query, lockWaitTimeout, GetConnection(fout));    
+                ExecuteSqlStatement(fout, query->data);    
+        }    
+```
+例如 :  
+SESSION A :  
+```
+pg93@db-172-16-3-33-> psql    
+psql (9.3devel)    
+Type "help" for help.    
+digoal=# begin;    
+BEGIN    
+digoal=# truncate table test;    
+TRUNCATE TABLE    
+```
+不结束A事务.  
+SESSION B :  
+```
+pg93@db-172-16-3-33-> pg_dump -f ./test.dmp    
+```
+会一直等SESSION A是否test的锁.  
+从第三个会话可以看出这个等待.  
+SESSION C :  
+```
+digoal=# select query,waiting from pg_stat_activity;    
+                    query                    | waiting     
+---------------------------------------------+---------    
+ LOCK TABLE public.test IN ACCESS SHARE MODE | t  -- 这条就是pg_dump发起的.    
+ truncate table test;                        | f    
+ select query,waiting from pg_stat_activity; | f    
+(3 rows)    
+```
+如果不想让pg_dump一直等待下去, 那么可以使用--lock-wait-timeout参数.  
+例如以下命令, 等待5秒未成功获得锁则退出pg_dump.  
+```
+pg93@db-172-16-3-33-> pg_dump -f ./test.dmp --lock-wait-timeout=5s    
+pg_dump: [archiver (db)] query failed: ERROR:  canceling statement due to statement timeout    
+pg_dump: [archiver (db)] query was: LOCK TABLE public.test IN ACCESS SHARE MODE    
+```
+3\. 一切准备就绪后, pg_dump将开始备份数据.  
+### 二、备份的内容格式 :  
+以PostgreSQL 9.3 为例, pg_dump 支持4种格式 :  
+```
+           p, plain    
+               默认格式, 备份输出为可读的text文本. 还原时在数据库中直接执行备份文本的SQL即可.    
+           c, custom    
+               可自定义的归档格式, 同时默认开启了数据压缩, 还原时可以调整备份对象的还原顺序, 同时支持选择还原的对象.     
+               备份写入到一个文件中. 需要注意文件系统支持的单个文件大小.    
+               这个格式必须使用pg_restore命令进行还原.     
+           d, directory    
+               目录归档格式, 与custom格式类似, 需要使用pg_restore还原. 但是目录归档格式下会创建一个目录, 然后每个表或者每个大对象对应一个备份输出文件.    
+               加上TOC文件名描述备份的详细信息, 这个格式默认支持压缩, 同时支持并行导出.    
+           t, tar    
+               tar归档格式, 不支持压缩, 同时限制每个表最大不能超过8GB, 同样需要使用pg_restore还原.     
+```
+### 三、全库一致性备份举例 :  
+注意全库一致性不是指集群一致性, 一个PostgreSQL 集群中可以创建多个数据库.  
+pg_dump的全库一致性备份指的是集群中的单个数据库的一致性备份，因为备份不同的数据库需要切换连接，无法在不同的数据库之间共享snapshot，因此只能单库一致.  
+排他选项 :  
+使用多次 --exclude-table-data=TABLE 排除不需要备份的表.  
+使用多次 --exclude-schema=SCHEMA 排除不需要备份的schema.  
+备份前查看一下备份数据的hash值. 方便还原后对照 :  
+```
+pg93@db-172-16-3-33-> psql    
+psql (9.3devel)    
+Type "help" for help.    
+digoal=# \dt    
+             List of relations    
+ Schema |      Name      | Type  |  Owner       
+--------+----------------+-------+----------    
+ public | pwd_dictionary | table | postgres    
+ public | tbl_user       | table | postgres    
+ public | test           | table | postgres    
+(3 rows)    
+digoal=# select sum(hashtext(t.*::text)) from pwd_dictionary t;    
+    sum         
+------------    
+ -719496483    
+(1 row)    
+digoal=# select sum(hashtext(t.*::text)) from tbl_user t;    
+      sum          
+---------------    
+ -131178135551    
+(1 row)    
+digoal=# select sum(hashtext(t.*::text)) from test t;    
+ sum     
+-----    
+(1 row)    
+```
+备份命令 :  
+备份digoal库, DDL中不包含表空间. 所以恢复时不需要提前创建对应的表空间.  
+```
+pg93@db-172-16-3-33-> pg_dump -f ./digoal.dmp -F p -C -E UTF8 --no-tablespaces -h 127.0.0.1 -p 1999 -U postgres digoal    
+```
+删除digoal库.  
+```
+digoal=# \c postgres    
+You are now connected to database "postgres" as user "postgres".    
+postgres=# drop database digoal;    
+DROP DATABASE    
+```
+还原, 直接执行备份SQL即可 :  
+```
+pg93@db-172-16-3-33-> psql postgres postgres -f ./digoal.dmp     
+SET    
+SET    
+SET    
+SET    
+SET    
+SET    
+CREATE DATABASE    
+ALTER DATABASE    
+You are now connected to database "digoal" as user "postgres".    
+SET    
+SET    
+SET    
+SET    
+SET    
+SET    
+CREATE SCHEMA    
+ALTER SCHEMA    
+CREATE EXTENSION    
+COMMENT    
+SET    
+CREATE FUNCTION    
+ALTER FUNCTION    
+CREATE FUNCTION    
+ALTER FUNCTION    
+SET    
+CREATE TABLE    
+ALTER TABLE    
+CREATE TABLE    
+ALTER TABLE    
+CREATE SEQUENCE    
+ALTER TABLE    
+ALTER SEQUENCE    
+CREATE TABLE    
+ALTER TABLE    
+SET    
+CREATE TABLE    
+ALTER TABLE    
+SET    
+ALTER TABLE    
+ setval     
+--------    
+      1    
+(1 row)    
+SET    
+SET    
+ALTER TABLE    
+ALTER TABLE    
+REVOKE    
+REVOKE    
+GRANT    
+GRANT    
+REVOKE    
+REVOKE    
+GRANT    
+GRANT    
+```
+检查还原后的hash值, 与备份前一致.  
+```
+pg93@db-172-16-3-33-> psql    
+psql (9.3devel)    
+Type "help" for help.    
+digoal=# select sum(hashtext(t.*::text)) from pwd_dictionary t;    
+    sum         
+------------    
+ -719496483    
+(1 row)    
+digoal=# select sum(hashtext(t.*::text)) from tbl_user t;    
+      sum          
+---------------    
+ -131178135551    
+(1 row)    
+digoal=# select sum(hashtext(t.*::text)) from test t;    
+ sum     
+-----    
+(1 row)    

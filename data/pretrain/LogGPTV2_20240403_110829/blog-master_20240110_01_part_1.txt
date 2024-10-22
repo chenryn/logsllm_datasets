@@ -1,0 +1,235 @@
+## 为什么PostgreSQL支持基于表空间的在线备份和完全恢复?    
+### 作者                                      
+digoal                                      
+### 日期                                      
+2024-01-10                               
+### 标签                                      
+PostgreSQL , PolarDB , DuckDB , 表空间备份与完全恢复 , Selectivity Tablespace backup and recovery        
+----                                      
+## 背景     
+本文内容有别于[《PostgreSQL如何支持可选择性表空间(Selectivity Tablespace)备份和时间点(PITR)恢复?》](../202401/20240107_01.md)    
+PostgreSQL在恢复模式中, 从哪个位置开始恢复? backup_label文件内容优先级高于控制文件.  
+执行pg_start_backup后会产生一个backup_label文件, 记录了这个备份集需要从wal的什么位置开始进行恢复.  执行pg_stop_backup后, backup_label这个文件会被删掉.   
+```  
+START WAL LOCATION: 0/2000060 (file 000000010000000000000002)  
+CHECKPOINT LOCATION: 0/2000098  
+BACKUP METHOD: pg_start_backup  
+BACKUP FROM: primary  
+START TIME: 2024-01-10 03:00:20 UTC  
+LABEL: a  
+START TIMELINE: 1  
+```  
+将backup_label文件放到$PGDATA, 以恢复模式打开PostgreSQL, 将从backup_label标记的wal位置开始恢复. 此时backup_lable的优先级高于控制文件中的`Latest checkpoint location` wal位置优先级.   
+基于这个原理, 我们可以实现表空间的备份和时间点恢复吗?  先抛结论:    
+- 如果没有备份全局数据(`$PGDATA`), 只有backup_label+表空间+WAL归档, 那么只能进行表空间的完全恢复(恢复到集群最新状态).    
+- 如果有备份全局数据(`$PGDATA`)+backup_label+表空间+WAL归档, 那么可以对表空间实现时间点恢复(恢复到过去的某个状态), 这个在下面这篇信息中已经做过实验:   
+    - [《PostgreSQL如何支持可选择性表空间(Selectivity Tablespace)备份和时间点(PITR)恢复?》](../202401/20240107_01.md)    
+为什么没有备份全局数据(`$PGDATA`), 只有表空间+WAL归档, 只能进行表空间的完全恢复(恢复到集群最新状态)?  
+- 因为数据库的全局数据文件(`$PGDATA`)是最新的, 类似于拿最新的数据文件直接进行redo恢复, 如果不能将所有wal都回放完整, 也就是集群无法到达最新状态, 那么全局数据(`$PGDATA`)有些block可能是“未来”的, 元数据的内容可能会出现“错误”, 所以有较小概率出现问题.    
+思考: 数据库的全局数据文件块是最新的, 类似于拿最新的数据文件直接进行redo恢复, 有没有问题?   
+- 想一想: 异步standby激活成为新主库后, 老的主库需要做rewind才能变成新主库的standby.    
+- 但是本例的时间线没有变化, 没有分叉. 只要redo文件完整(归档以及未归档的wal文件都在), 理论上不存在问题.   
+## PostgreSQL基于表空间的在线备份和完全恢复 demo  
+前置条件:     
+- 开启归档  
+- 归档正常  
+在PostgreSQL 14上做个测试, 使用如下docker环境:     
+- [《ARM64版, PostgreSQL docker image》](../202308/20230814_02.md)         
+- [《AMD64版, PostgreSQL docker image》](../202307/20230710_03.md)         
+备份步骤:   
+- 1、select pg_start_backup('bak');  
+- 2、copy backup_label from `$PGDATA`  
+- 3、copy tbs   
+- 4、select pg_stop_backup();  
+破坏表空间, 删除数据库实例的tbs数据文件;  
+恢复:   
+- 1、停数据库实例  
+- 2、将backup_label拷贝到`$PGDATA`  
+- 3、使用备份的tbs覆盖原有的tbs目录  
+- 4、配置postgresql.conf recovery  
+```  
+# 注释归档    
+#archive_mode = on     
+#archive_command = 'test ! -f /tmp/arch/%f && cp %p /tmp/arch/%f'    
+# 恢复配置    
+restore_command = 'cp /tmp/arch/%f %p'    
+recovery_target_timeline = 'latest'    
+# 配置 zero_damaged_pages 跳过错误的块      
+zero_damaged_pages = on   
+```  
+- 5、touch recovery file  
+```    
+touch $PGDATA/recovery.signal    
+```   
+- 6、启动数据库, 恢复到最新状态.    
+## 例子
+创建docker容器      
+```    
+docker run -d -it -P --cap-add=SYS_PTRACE --cap-add SYS_ADMIN --privileged=true --name pg --shm-size=1g --entrypoint /bin/bash registry.cn-hangzhou.aliyuncs.com/digoal/opensource_database:pg14_with_exts    
+```    
+进入容器      
+```    
+docker exec -ti pg bash      
+```    
+创建归档目录    
+```    
+su - postgres    
+mkdir /tmp/arch    
+```    
+配置归档    
+```    
+su - postgres    
+vi $PGDATA/postgresql.conf    
+archive_mode = on     
+archive_command = 'test ! -f /tmp/arch/%f && cp %p /tmp/arch/%f'     
+```    
+启动数据库    
+```    
+pg_ctl start    
+```    
+创建a,b表空间    
+```    
+mkdir /tmp/tbsa    
+mkdir /tmp/tbsb    
+```    
+```    
+postgres@dcdaa877dadd:~/14/pgdata$ psql    
+psql (14.10 (Debian 14.10-1.pgdg110+1))    
+Type "help" for help.    
+postgres=# create tablespace tbsa location '/tmp/tbsa';    
+CREATE TABLESPACE    
+postgres=# create tablespace tbsb location '/tmp/tbsb';    
+CREATE TABLESPACE    
+```    
+创建a,b数据库. 但是不设置默认数据库默认表空间为tbsa, tbsb. 所以元数据依旧存储在pg_default内(`$PGDATA/base`).   
+```    
+postgres=# create database a;    
+CREATE DATABASE    
+postgres=# create database b;    
+CREATE DATABASE    
+```    
+pgbench a,b数据库, 写入数据, 执行DML压测    
+```    
+postgres@dcdaa877dadd:~/14/pgdata$ pgbench -i -s 10 a --tablespace=tbsa   
+dropping old tables...    
+NOTICE:  table "pgbench_accounts" does not exist, skipping    
+NOTICE:  table "pgbench_branches" does not exist, skipping    
+NOTICE:  table "pgbench_history" does not exist, skipping    
+NOTICE:  table "pgbench_tellers" does not exist, skipping    
+creating tables...    
+generating data (client-side)...    
+1000000 of 1000000 tuples (100%) done (elapsed 1.35 s, remaining 0.00 s)    
+vacuuming...    
+creating primary keys...    
+done in 2.65 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 1.39 s, vacuum 0.28 s, primary keys 0.96 s).    
+postgres@dcdaa877dadd:~/14/pgdata$ pgbench -i -s 10 b --tablespace=tbsb   
+dropping old tables...    
+NOTICE:  table "pgbench_accounts" does not exist, skipping    
+NOTICE:  table "pgbench_branches" does not exist, skipping    
+NOTICE:  table "pgbench_history" does not exist, skipping    
+NOTICE:  table "pgbench_tellers" does not exist, skipping    
+creating tables...    
+generating data (client-side)...    
+1000000 of 1000000 tuples (100%) done (elapsed 1.30 s, remaining 0.00 s)    
+vacuuming...    
+creating primary keys...    
+done in 2.59 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 1.33 s, vacuum 0.28 s, primary keys 0.96 s).    
+```    
+```    
+postgres@dcdaa877dadd:~/14/pgdata$ pgbench -M prepared -n -r -P 5 -c 4 -j 4 -T 30 a    
+pgbench (14.10 (Debian 14.10-1.pgdg110+1))    
+progress: 5.0 s, 4232.7 tps, lat 0.944 ms stddev 0.138    
+progress: 10.0 s, 4370.0 tps, lat 0.915 ms stddev 0.119    
+progress: 15.0 s, 4198.2 tps, lat 0.952 ms stddev 0.198    
+progress: 20.0 s, 3990.6 tps, lat 1.002 ms stddev 0.178    
+progress: 25.0 s, 4015.2 tps, lat 0.996 ms stddev 0.153    
+progress: 30.0 s, 3964.6 tps, lat 1.008 ms stddev 0.173    
+transaction type:     
+scaling factor: 10    
+query mode: prepared    
+number of clients: 4    
+number of threads: 4    
+duration: 30 s    
+number of transactions actually processed: 123863    
+latency average = 0.968 ms    
+latency stddev = 0.165 ms    
+initial connection time = 4.305 ms    
+tps = 4129.040009 (without initial connection time)    
+statement latencies in milliseconds:    
+         0.001  \set aid random(1, 100000 * :scale)    
+         0.000  \set bid random(1, 1 * :scale)    
+         0.000  \set tid random(1, 10 * :scale)    
+         0.000  \set delta random(-5000, 5000)    
+         0.117  BEGIN;    
+         0.150  UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;    
+         0.131  SELECT abalance FROM pgbench_accounts WHERE aid = :aid;    
+         0.148  UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;    
+         0.154  UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;    
+         0.129  INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);    
+         0.137  END;    
+postgres@dcdaa877dadd:~/14/pgdata$ pgbench -M prepared -n -r -P 5 -c 4 -j 4 -T 30 b    
+pgbench (14.10 (Debian 14.10-1.pgdg110+1))    
+progress: 5.0 s, 4034.0 tps, lat 0.990 ms stddev 0.185    
+progress: 10.0 s, 3840.7 tps, lat 1.041 ms stddev 0.167    
+progress: 15.0 s, 3736.8 tps, lat 1.070 ms stddev 0.253    
+progress: 20.0 s, 3826.7 tps, lat 1.045 ms stddev 0.206    
+progress: 25.0 s, 3840.7 tps, lat 1.041 ms stddev 0.178    
+progress: 30.0 s, 3772.4 tps, lat 1.060 ms stddev 0.171    
+transaction type:     
+scaling factor: 10    
+query mode: prepared    
+number of clients: 4    
+number of threads: 4    
+duration: 30 s    
+number of transactions actually processed: 115260    
+latency average = 1.040 ms    
+latency stddev = 0.197 ms    
+initial connection time = 4.525 ms    
+tps = 3842.482744 (without initial connection time)    
+statement latencies in milliseconds:    
+         0.001  \set aid random(1, 100000 * :scale)    
+         0.000  \set bid random(1, 1 * :scale)    
+         0.000  \set tid random(1, 10 * :scale)    
+         0.000  \set delta random(-5000, 5000)    
+         0.126  BEGIN;    
+         0.161  UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;    
+         0.141  SELECT abalance FROM pgbench_accounts WHERE aid = :aid;    
+         0.157  UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;    
+         0.167  UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;    
+         0.139  INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);    
+         0.148  END;    
+```    
+start backup    
+```    
+postgres=# select pg_start_backup(now()::text, true);    
+ pg_start_backup   
+-----------------  
+ 0/170000D8  
+(1 row)  
+```    
+创建备份目录    
+```    
+root@dcdaa877dadd:~# su - postgres    
+postgres@dcdaa877dadd:~$ mkdir /tmp/backup    
+```    
+拷贝backup_label文件    
+```    
+postgres@dcdaa877dadd:~$ cp $PGDATA/backup_label /tmp/backup/    
+```    
+backup_label文件内容  
+```  
+postgres@18abdaba58e0:~$ cat /tmp/backup/backup_label   
+START WAL LOCATION: 0/170000D8 (file 000000010000000000000017)  
+CHECKPOINT LOCATION: 0/17000110  
+BACKUP METHOD: pg_start_backup  
+BACKUP FROM: primary  
+START TIME: 2024-01-10 07:41:50 UTC  
+LABEL: 2024-01-10 07:41:50.391356+00  
+START TIMELINE: 1  
+```  
+拷贝b表空间    
+```    
+postgres@dcdaa877dadd:~$ cp -r /tmp/tbsb /tmp/backup/    
+```    
+拷贝归档(略, 但是请知道:恢复时需要归档)     
+stop backup    

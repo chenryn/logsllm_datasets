@@ -1,0 +1,218 @@
+## PostgreSQL 9.6 内核优化 - sort性能增强(batch化quicksort代替replacement selection when work_mem small)
+### 作者             
+digoal              
+### 日期            
+2016-10-08             
+### 标签            
+PostgreSQL , 9.6 , 内核优化 , sort , replacement selection , quciksort        
+----            
+## 背景   
+排序是比较常见的业务需求，为了降低排序的CPU开销，通常会使用索引来满足排序的需求。  
+但是并不是所有的QUERY都能使用索引排序，或者说使用索引排序就一定高效。  
+例如带过滤条件的QUERY，过滤完之后再根据某些字段或表达式排序。这种QUERY的排序不一定能用上索引。  
+当需要实时排序时，PostgreSQL数据库怎么处理的呢？   
+PostgreSQL根据排序的数据量, work_mem的大小 选择合适的排序算法。  
+排序算法参考    
+https://en.wikipedia.org/wiki/Sorting_algorithm  
+包括每种排序算法的最小开销，最大开销，平均开销，内存需求，稳定性等。  
+1\. 当需要排序的数据量较小，可以在work_mem参数设置的内存值内完成时，会使用qsort排序，这个9.6并没有改进，与以前一样。  
+quicksort算法参考    
+https://en.wikipedia.org/wiki/Quicksort    
+![pic3](20161008_02_pic_003.gif)    
+2\. 当需要排序的数据量较大，无法在work_mem参数设置的内存值内完成时，会使用临时文件以及标准的external sort算法。  
+2\.1  PostgreSQL 9.6以前的版本external sort使用heapsort算法(selection排序的变种)。  
+参考1 Knuth volume 3, Algorithm 5.2.3H  
+https://books.google.com.hk/books?id=cYULBAAAQBAJ&pg=PA757&lpg=PA757&dq=Knuth++5.2.3H&source=bl&ots=KJCxOiQs5G&sig=s0gEBVMp_bB0uqRGxShzfRDBYjU&hl=zh-CN&sa=X&ved=0ahUKEwiy8tSJ0czPAhXE3YMKHe3yDr0Q6AEIOjAE#v=onepage&q&f=false    
+![pic4](20161008_02_pic_004.png)    
+参考2 Heapsort      
+https://en.wikipedia.org/wiki/Sorting_algorithm#Heapsort    
+heapsort原理如图  
+![pic4](20161008_02_pic_005.gif)    
+selection sort原理如图，对排序顺序与实际顺序一致的数据效果很不错，但是对离散数据效果不好。    
+![pic4](20161008_02_pic_006.gif)    
+2\.2 PostgreSQL 9.6 的改进，只对头部扫描的N条记录使用selection排序，提升随机数据的排序效率，通过参数work_mem与replacement_sort_tuples限制N。随后的数据使用分批的quicksort和merge sort得到结果。      
+决定使用replacement selection  
+```
+/*
+ * Possible states of a Tuplesort object.  These denote the states that
+ * persist between calls of Tuplesort routines.
+ */
+typedef enum
+{
+        TSS_INITIAL,                            /* Loading tuples; still within memory limit */
+        TSS_BOUNDED,                            /* Loading tuples into bounded-size heap */
+        TSS_BUILDRUNS,                          /* Loading tuples; writing to tape */
+        TSS_SORTEDINMEM,                        /* Sort completed entirely in memory */
+        TSS_SORTEDONTAPE,                       /* Sort completed, final run is on tape */
+        TSS_FINALMERGE                          /* Performing final merge on-the-fly */
+} TupSortStatus;
+......
+/*
+ * useselection - determine algorithm to use to sort first run.
+ *
+ * It can sometimes be useful to use the replacement selection algorithm if it
+ * results in one large run, and there is little available workMem.  See
+ * remarks on RUN_SECOND optimization within dumptuples().
+ */
+static bool
+useselection(Tuplesortstate *state)
+{
+        /*
+         * memtupsize might be noticeably higher than memtupcount here in atypical
+         * cases.  It seems slightly preferable to not allow recent outliers to
+         * impact this determination.  Note that caller's trace_sort output
+         * reports memtupcount instead.
+         */
+        if (state->memtupsize replaceActive = useselection(state);
+......
+                case TSS_BUILDRUNS:
+                        /*
+                         * Insert the tuple into the heap, with run number currentRun if
+                         * it can go into the current run, else HEAP_RUN_NEXT.  The tuple
+                         * can go into the current run if it is >= the first
+                         * not-yet-output tuple.  (Actually, it could go into the current
+                         * run if it is >= the most recently output tuple ... but that
+                         * would require keeping around the tuple we last output, and it's
+                         * simplest to let writetup free each tuple as soon as it's
+                         * written.)
+                         *
+                         * Note that this only applies when:
+                         *
+                         * - currentRun is RUN_FIRST
+                         *
+                         * - Replacement selection is in use (typically it is never used).
+                         *
+                         * When these two conditions are not both true, all tuples are
+                         * appended indifferently, much like the TSS_INITIAL case.
+                         *
+                         * There should always be room to store the incoming tuple.
+                         */
+                        Assert(!state->replaceActive || state->memtupcount > 0);
+                        if (state->replaceActive &&
+                                COMPARETUP(state, tuple, &state->memtuples[0]) >= 0)
+                        {
+                                Assert(state->currentRun == RUN_FIRST);
+```
+replacement_sort_tuples建议设置的值与CPU cache size有关，CPU cache size越大，可以调大这个值。  否则建议不要修改它。    
+3\. 分批使用Knuth's Algorithm 5.4.2D, 在PostgreSQL的logtape.c中实现。  
+4\. merge sort, 参考  
+https://en.wikipedia.org/wiki/Polyphase_merge_sort    
+5\. tuplesort说明。  
+src/backend/utils/sort/tuplesort.c  
+```
+ * This module handles sorting of heap tuples, index tuples, or single
+ * Datums (and could easily support other kinds of sortable objects,
+ * if necessary).  It works efficiently for both small and large amounts
+ * of data.  Small amounts are sorted in-memory using qsort().  Large
+ * amounts are sorted using temporary files and a standard external sort
+ * algorithm.
+ *
+ * See Knuth, volume 3, for more than you want to know about the external
+ * sorting algorithm.  Historically, we divided the input into sorted runs
+ * using replacement selection, in the form of a priority tree implemented
+ * as a heap (essentially his Algorithm 5.2.3H), but now we only do that
+ * for the first run, and only if the run would otherwise end up being very
+ * short.  We merge the runs using polyphase merge, Knuth's Algorithm
+ * 5.4.2D.  The logical "tapes" used by Algorithm D are implemented by
+ * logtape.c, which avoids space wastage by recycling disk space as soon
+ * as each block is read from its "tape".
+ *
+ * We do not use Knuth's recommended data structure (Algorithm 5.4.1R) for
+ * the replacement selection, because it uses a fixed number of records
+ * in memory at all times.  Since we are dealing with tuples that may vary
+ * considerably in size, we want to be able to vary the number of records
+ * kept in memory to ensure full utilization of the allowed sort memory
+ * space.  So, we keep the tuples in a variable-size heap, with the next
+ * record to go out at the top of the heap.  Like Algorithm 5.4.1R, each
+ * record is stored with the run number that it must go into, and we use
+ * (run number, key) as the ordering key for the heap.  When the run number
+ * at the top of the heap changes, we know that no more records of the prior
+ * run are left in the heap.  Note that there are in practice only ever two
+ * distinct run numbers, because since PostgreSQL 9.6, we only use
+ * replacement selection to form the first run.
+ *
+ * In PostgreSQL 9.6, a heap (based on Knuth's Algorithm H, with some small
+ * customizations) is only used with the aim of producing just one run,
+ * thereby avoiding all merging.  Only the first run can use replacement
+ * selection, which is why there are now only two possible valid run
+ * numbers, and why heapification is customized to not distinguish between
+ * tuples in the second run (those will be quicksorted).  We generally
+ * prefer a simple hybrid sort-merge strategy, where runs are sorted in much
+ * the same way as the entire input of an internal sort is sorted (using
+ * qsort()).  The replacement_sort_tuples GUC controls the limited remaining
+ * use of replacement selection for the first run.
+ *
+ * There are several reasons to favor a hybrid sort-merge strategy.
+ * Maintaining a priority tree/heap has poor CPU cache characteristics.
+ * Furthermore, the growth in main memory sizes has greatly diminished the
+ * value of having runs that are larger than available memory, even in the
+ * case where there is partially sorted input and runs can be made far
+ * larger by using a heap.  In most cases, a single-pass merge step is all
+ * that is required even when runs are no larger than available memory.
+ * Avoiding multiple merge passes was traditionally considered to be the
+ * major advantage of using replacement selection.
+ *
+ * The approximate amount of memory allowed for any one sort operation
+ * is specified in kilobytes by the caller (most pass work_mem).  Initially,
+ * we absorb tuples and simply store them in an unsorted array as long as
+ * we haven't exceeded workMem.  If we reach the end of the input without
+ * exceeding workMem, we sort the array using qsort() and subsequently return
+ * tuples just by scanning the tuple array sequentially.  If we do exceed
+ * workMem, we begin to emit tuples into sorted runs in temporary tapes.
+ * When tuples are dumped in batch after quicksorting, we begin a new run
+ * with a new output tape (selected per Algorithm D).  After the end of the
+ * input is reached, we dump out remaining tuples in memory into a final run
+ * (or two, when replacement selection is still used), then merge the runs
+ * using Algorithm D.
+ *
+ * When merging runs, we use a heap containing just the frontmost tuple from
+ * each source run; we repeatedly output the smallest tuple and insert the
+ * next tuple from its source tape (if any).  When the heap empties, the merge
+ * is complete.  The basic merge algorithm thus needs very little memory ---
+ * only M tuples for an M-way merge, and M is constrained to a small number.
+ * However, we can still make good use of our full workMem allocation by
+ * pre-reading additional tuples from each source tape.  Without prereading,
+ * our access pattern to the temporary file would be very erratic; on average
+ * we'd read one block from each of M source tapes during the same time that
+ * we're writing M blocks to the output tape, so there is no sequentiality of
+ * access at all, defeating the read-ahead methods used by most Unix kernels.
+ * Worse, the output tape gets written into a very random sequence of blocks
+ * of the temp file, ensuring that things will be even worse when it comes
+ * time to read that tape.  A straightforward merge pass thus ends up doing a
+ * lot of waiting for disk seeks.  We can improve matters by prereading from
+ * each source tape sequentially, loading about workMem/M bytes from each tape
+ * in turn.  Then we run the merge algorithm, writing but not reading until
+ * one of the preloaded tuple series runs out.  Then we switch back to preread
+ * mode, fill memory again, and repeat.  This approach helps to localize both
+ * read and write accesses.
+ *
+ * When the caller requests random access to the sort result, we form
+ * the final sorted run on a logical tape which is then "frozen", so
+ * that we can access it randomly.  When the caller does not need random
+ * access, we return from tuplesort_performsort() as soon as we are down
+ * to one run per logical tape.  The final merge is then performed
+ * on-the-fly as the caller repeatedly calls tuplesort_getXXX; this
+ * saves one cycle of writing all the data out to disk and reading it in.
+ *
+ * Before Postgres 8.2, we always used a seven-tape polyphase merge, on the
+ * grounds that 7 is the "sweet spot" on the tapes-to-passes curve according
+ * to Knuth's figure 70 (section 5.4.2).  However, Knuth is assuming that
+ * tape drives are expensive beasts, and in particular that there will always
+ * be many more runs than tape drives.  In our implementation a "tape drive"
+ * doesn't cost much more than a few Kb of memory buffers, so we can afford
+ * to have lots of them.  In particular, if we can have as many tape drives
+ * as sorted runs, we can eliminate any repeated I/O at all.  In the current
+ * code we determine the number of tapes M on the basis of workMem: we want
+ * workMem/M to be large enough that we read a fair amount of data each time
+ * we preread from a tape, so as to maintain the locality of access described
+ * above.  Nonetheless, with large workMem we can have many tapes.
+```
+## external sort
+当work_mem不足完成内存排序时，会选择external sort或external merge。  
+![pic1](20161008_02_pic_001.png)  
+根据数据量的大小，分阶段排序，合并。  
+可以通过trace_sort观察，后面会有例子。  
+explain 时可能看到的一些信息   
+```
+tuplesort_get_stats
+......

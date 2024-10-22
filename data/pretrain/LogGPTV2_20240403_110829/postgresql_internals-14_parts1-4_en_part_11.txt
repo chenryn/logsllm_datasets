@@ -1,0 +1,299 @@
+Now the second transaction is going to use the snapshot of the first transaction,
+andconsequently,itwillseefourrows(insteadofzero):
+104
+4.7 ExportingSnapshots
+=> SELECT count(*) FROM accounts;
+count
+−−−−−−−
+4
+(1 row)
+Clearly,thesecondtransactionwillnotseeanychangesmadebythefirsttransac-
+tionafterthesnapshotexport(andviceversa): regularvisibilityrulesstillapply.
+Theexportedsnapshot’slifetimeisthesameasthatoftheexportingtransaction.
+=> COMMIT;
+=> COMMIT;
+105
+5
+Page Pruning and HOT Updates
+5.1 Page Pruning
+While a heap page is being read or updated,Postgre can perform some quick
+pagecleanup,orpruning.1 Ithappensinthefollowingcases:
+• Thepreviousoperationdidnotfindenoughspacetoplaceanewtuple
+intothesamepage.Thiseventisreflectedinthepageheader.
+100 • The heap page contains more data than allowed by the fillfactor storage pa-
+rameter.
+Anoperationcanaddanewrowintothepageonlyifthispageisfilled
+forlessthanfillfactor percent. Therestofthespaceiskeptforopera-
+tions(nosuchspaceisreservedbydefault).
+Pagepruningremovesthetuplesthatcannotbevisibleinanysnapshotanymore
+p. (thatis,thatarebeyondthedatabasehorizon).Itnevergoesbeyondasingleheap
+page, but in return it is performed very fast. Pointers to pruned tuples remain
+inplacesincetheymaybereferencedfromanindex—whichisalreadyadifferent
+page.
+Forthesamereason,neitherthevisibilitymapnorthefreespacemapisrefreshed
+(sotherecoveredspaceissetasideforupdates,notforinsertions).
+Since a page can be pruned during reads, any  statement can cause page
+modifications. Thisisyetanothersuchcaseinadditiontodeferredsettingofin-
+p. formationbits.
+1 backend/access/heap/pruneheap.c,heap_page_prune_optfunction
+106
+5.1 PagePruning
+Let’s take a look at how page pruning actually works. We are going to create a
+two-columntableandbuildanindexoneachofthecolumns:
+=> CREATE TABLE hot(id integer, s char(2000)) WITH (fillfactor = 75);
+=> CREATE INDEX hot_id ON hot(id);
+=> CREATE INDEX hot_s ON hot(s);
+IfthescolumncontainsonlyLatinletters,eachheaptuplewillhaveafixedsize
+ofbytes,plusbytesoftheheader. Thefillfactor storageparameterisset
+to%. Itmeansthatthepagehasenoughfreespaceforfourtuples,butwecan
+insertonlythree.
+Let’sinsertanewrowandupdateitseveraltimes:
+=> INSERT INTO hot VALUES (1, 'A');
+=> UPDATE hot SET s = 'B';
+=> UPDATE hot SET s = 'C';
+=> UPDATE hot SET s = 'D';
+Nowthepagecontainsfourtuples:
+=> SELECT * FROM heap_page('hot',0);
+ctid | state | xmin | xmax
+−−−−−−−+−−−−−−−−+−−−−−−−+−−−−−−−
+(0,1) | normal | 801 c | 802 c
+(0,2) | normal | 802 c | 803 c
+(0,3) | normal | 803 c | 804
+(0,4) | normal | 804 | 0 a
+(4 rows)
+Expectedly, we have just exceeded the fillfactor threshold. You can tell it by the
+difference between the pagesize and upper values—it is bigger than % of the p.
+pagesize,whichisbytes:
+=> SELECT upper, pagesize FROM page_header(get_raw_page('hot',0));
+upper | pagesize
+−−−−−−−+−−−−−−−−−−
+64 | 8192
+(1 row)
+Thenextpage accesstriggers page pruningthat removesallthe outdated tuples.
+Thenanewtuple(,)isaddedintothefreedspace:
+107
+Chapter5 PagePruningandHOTUpdates
+=> UPDATE hot SET s = 'E';
+=> SELECT * FROM heap_page('hot',0);
+ctid | state | xmin | xmax
+−−−−−−−+−−−−−−−−+−−−−−−−+−−−−−−
+(0,1) | dead | |
+(0,2) | dead | |
+(0,3) | dead | |
+(0,4) | normal | 804 c | 805
+(0,5) | normal | 805 | 0 a
+(5 rows)
+The remaining heap tuples are physically moved towards the highest addresses
+sothatallthefreespaceisaggregatedintoasinglecontinuouschunk. Thetuple
+pointersarealsomodifiedaccordingly.Asaresult,thereisnofreespacefragmen-
+tationinthepage.
+Thepointerstotheprunedtuplescannotberemovedyetbecausetheyarestillref-
+erenced from the indexes; Postgre changes their status from normal to dead.
+Let’stakealookatthefirstpageofthehot_sindex(thezeropageisusedformeta-
+data):
+=> SELECT * FROM index_page('hot_s',1);
+itemoffset | htid
+−−−−−−−−−−−−+−−−−−−−
+1 | (0,1)
+2 | (0,2)
+3 | (0,3)
+4 | (0,4)
+5 | (0,5)
+(5 rows)
+Wecanseethesamepictureintheotherindextoo:
+=> SELECT * FROM index_page('hot_id',1);
+itemoffset | htid
+−−−−−−−−−−−−+−−−−−−−
+1 | (0,1)
+2 | (0,2)
+3 | (0,3)
+4 | (0,4)
+5 | (0,5)
+(5 rows)
+108
+5.1 PagePruning
+Anindexscancanreturn(,),(,),and(,)astupleidentifiers. Theservertries
+toreadthecorrespondingheaptuplebutseesthatthepointerhasthedeadstatus;
+itmeansthatthistupledoesnotexistanymoreandshouldbeignored.Andwhile
+being at it,the server also changes the pointer status in the index page to avoid
+repeatedheappageaccess.1
+Let’sextendthefunctiondisplayingindexpagessothatitalsoshowswhetherthe v.
+pointerisdead:
+=> DROP FUNCTION index_page(text, integer);
+=> CREATE FUNCTION index_page(relname text, pageno integer)
+RETURNS TABLE(itemoffset smallint, htid tid, dead boolean)
+AS $$
+SELECT itemoffset,
+htid,
+dead -- starting from v.13
+FROM bt_page_items(relname,pageno);
+$$ LANGUAGE sql;
+=> SELECT * FROM index_page('hot_id',1);
+itemoffset | htid | dead
+−−−−−−−−−−−−+−−−−−−−+−−−−−−
+1 | (0,1) | f
+2 | (0,2) | f
+3 | (0,3) | f
+4 | (0,4) | f
+5 | (0,5) | f
+(5 rows)
+Allthepointersintheindexpageareactivesofar. Butassoonasthefirstindex
+scanoccurs,theirstatuschanges:
+=> EXPLAIN (analyze, costs off, timing off, summary off)
+SELECT * FROM hot WHERE id = 1;
+QUERY PLAN
+−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−
+Index Scan using hot_id on hot (actual rows=1 loops=1)
+Index Cond: (id = 1)
+(2 rows)
+1 backend/access/index/indexam.c,index_fetch_heapfunction
+109
+Chapter5 PagePruningandHOTUpdates
+=> SELECT * FROM index_page('hot_id',1);
+itemoffset | htid | dead
+−−−−−−−−−−−−+−−−−−−−+−−−−−−
+1 | (0,1) | t
+2 | (0,2) | t
+3 | (0,3) | t
+4 | (0,4) | t
+5 | (0,5) | f
+(5 rows)
+Although the heap tuple referenced by the fourth pointer is still unpruned and
+hasthenormalstatus,itisalreadybeyondthedatabasehorizon. That’swhythis
+pointerisalsomarkedasdeadintheindex.
+5.2 HOT Updates
+Itwouldbeveryinefficienttokeepreferencestoallheaptuplesinanindex.
+Tobeginwith,eachrowmodificationtriggersupdatesofalltheindexescreatedon
+thetable: onceanewheaptupleappears,eachindexmustincludeareferenceto
+thistuple,evenifthemodifiedfieldsarenotindexed.
+Furthermore,indexesaccumulatereferencestohistoricheaptuples,sotheyhave
+p. tobeprunedtogetherwiththesetuples.
+Thingsgetworseasyoucreatemoreindexesonatable.
+Butiftheupdatedcolumnisnotapartofany index,thereisnopointincreating
+anotherindexentrythatcontainsthesamekeyvalue.Toavoidsuchredundancies,
+PostgreprovidesanoptimizationcalledHeap-OnlyTupleupdates.1
+Ifsuchanupdateisperformed,anindexpagecontainsonlyoneentryforeachrow.
+Thisentrypointstotheveryfirstrowversion;allthesubsequentversionslocated
+inthesamepageareboundintoachainbyctidpointersinthetupleheaders.
+RowversionsthatarenotreferencedfromanyindexaretaggedwiththeHeap-Only
+Tuplebit.Ifaversionisincludedintothechain,itistaggedwiththeHeapHot
+Updatedbit.
+1 backend/access/heap/README.HOT
+110
+5.2 HOTUpdates
+IfanindexscanaccessesaheappageandfindsarowversionmarkedasHeapHot
+Updated,itmeansthatthescanshouldcontinue,soitgoesfurtheralongthechain
+ofupdates. Obviously,allthefetchedrowversionsarecheckedforvisibility
+beforetheresultisreturnedtotheclient.
+Totakealookathowupdatesareperformed,let’sdeleteoneoftheindexes
+andtruncatethetable.
+=> DROP INDEX hot_s;
+=> TRUNCATE TABLE hot;
+For convenience, we will redefine the heap_page function so that its output in-
+cludesthreemorefields: ctidandthetwobitsrelatedtoupdates:
+=> DROP FUNCTION heap_page(text,integer);
+=> CREATE FUNCTION heap_page(relname text, pageno integer)
+RETURNS TABLE(
+ctid tid, state text,
+xmin text, xmax text,
+hhu text, hot text, t_ctid tid
+) AS $$
+SELECT (pageno,lp)::text::tid AS ctid,
+CASE lp_flags
+WHEN 0 THEN 'unused'
+WHEN 1 THEN 'normal'
+WHEN 2 THEN 'redirect to '||lp_off
+WHEN 3 THEN 'dead'
+END AS state,
+t_xmin || CASE
+WHEN (t_infomask & 256) > 0 THEN ' c'
+WHEN (t_infomask & 512) > 0 THEN ' a'
+ELSE ''
+END AS xmin,
+t_xmax || CASE
+WHEN (t_infomask & 1024) > 0 THEN ' c'
+WHEN (t_infomask & 2048) > 0 THEN ' a'
+ELSE ''
+END AS xmax,
+CASE WHEN (t_infomask2 & 16384) > 0 THEN 't' END AS hhu,
+CASE WHEN (t_infomask2 & 32768) > 0 THEN 't' END AS hot,
+t_ctid
+FROM heap_page_items(get_raw_page(relname,pageno))
+ORDER BY lp;
+$$ LANGUAGE sql;
+111
+Chapter5 PagePruningandHOTUpdates
+Let’srepeattheinsertandupdateoperations:
+=> INSERT INTO hot VALUES (1, 'A');
+=> UPDATE hot SET s = 'B';
+Thepagenowcontainsachainofupdates:
+• The Heap Hot Updated bit shows that the executor should follow the 
+chain.
+• The Heap OnlyTuple bit indicates that this tuple is not referenced from any
+indexes.
+=> SELECT * FROM heap_page('hot',0);
+ctid | state | xmin | xmax | hhu | hot | t_ctid
+−−−−−−−+−−−−−−−−+−−−−−−−+−−−−−−+−−−−−+−−−−−+−−−−−−−−
+(0,1) | normal | 812 c | 813 | t | | (0,2)
+(0,2) | normal | 813 | 0 a | | t | (0,2)
+(2 rows)
+Aswemakefurtherupdates,thechainwillgrow—butonlywithinthepagelimits:
+=> UPDATE hot SET s = 'C';
+=> UPDATE hot SET s = 'D';
+=> SELECT * FROM heap_page('hot',0);
+ctid | state | xmin | xmax | hhu | hot | t_ctid
+−−−−−−−+−−−−−−−−+−−−−−−−+−−−−−−−+−−−−−+−−−−−+−−−−−−−−
+(0,1) | normal | 812 c | 813 c | t | | (0,2)
+(0,2) | normal | 813 c | 814 c | t | t | (0,3)
+(0,3) | normal | 814 c | 815 | t | t | (0,4)
+(0,4) | normal | 815 | 0 a | | t | (0,4)
+(4 rows)
+Theindexstillcontainsonlyonereference,whichpointstotheheadofthischain:
+=> SELECT * FROM index_page('hot_id',1);
+itemoffset | htid | dead
+−−−−−−−−−−−−+−−−−−−−+−−−−−−
+1 | (0,1) | f
+(1 row)
+112
+5.3 PagePruningforHOTUpdates
+Aupdateispossibleifthemodifiedfieldsarenotapartofany index. Other-
+wise,someoftheindexeswouldcontainareferencetoaheaptuplethatappears
+inthemiddleofthechain,whichcontradictstheideaofthisoptimization. Since
+achaincangrowonlywithinasinglepage,traversingthewholechainnever
+requiresaccesstootherpagesandthusdoesnothamperperformance.
+5.3 Page Pruning for HOT Updates
+A special case of page pruning—which is nevertheless important—is pruning of
+updatechains.
+Intheexampleabove,thefillfactorthresholdisalreadyexceeded,sothenextup-
+dateshouldtriggerpagepruning. Butthistimethepagecontainsachainof
+updates. The head of this chain must always remain in its place since it is refer-
+encedfromtheindex,butotherpointerscanbereleasedbecausetheyaresureto
+havenoexternalreferences.
+Toavoidmovingthehead,Postgreusesdualaddressing:thepointerreferenced
+fromtheindex(whichis(,)inthiscase)receivestheredirectstatussinceitpoints
+tothetuplethatcurrentlystartsthechain:
+=> UPDATE hot SET s = 'E';
+=> SELECT * FROM heap_page('hot',0);
+ctid | state | xmin | xmax | hhu | hot | t_ctid
+−−−−−−−+−−−−−−−−−−−−−−−+−−−−−−−+−−−−−−+−−−−−+−−−−−+−−−−−−−−
+(0,1) | redirect to 4 | | | | |
+(0,2) | normal | 816 | 0 a | | t | (0,2)
+(0,3) | unused | | | | |
+(0,4) | normal | 815 c | 816 | t | t | (0,2)
+(4 rows)
+Thetuples(,),(,),and(,)havebeenpruned;theheadpointerremainsfor
+redirectionpurposes,whilepointersandhavebeendeallocated(receivedthe
+unusedstatus)sincetheyareguaranteedtohavenoreferencesfromindexes. The
+newtupleiswrittenintothefreedspaceastuple(,).
+113
+Chapter5 PagePruningandHOTUpdates
+Let’sperformsomemoreupdates:
+=> UPDATE hot SET s = 'F';
+=> UPDATE hot SET s = 'G';
+=> SELECT * FROM heap_page('hot',0);
+ctid | state | xmin | xmax | hhu | hot | t_ctid
+−−−−−−−+−−−−−−−−−−−−−−−+−−−−−−−+−−−−−−−+−−−−−+−−−−−+−−−−−−−−
+(0,1) | redirect to 4 | | | | |
+(0,2) | normal | 816 c | 817 c | t | t | (0,3)
+(0,3) | normal | 817 c | 818 | t | t | (0,5)
+(0,4) | normal | 815 c | 816 c | t | t | (0,2)

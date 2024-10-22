@@ -1,0 +1,163 @@
+# PrintSpoofer提权原理探究
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+> 相关工具实现在文章中列出
+## 前言
+在安全研究员itm4n发布了PrintSpoofer提权的思路，整体思路其实也是通过中继获取SYSTEM令牌，再通过模拟令牌执行命令。
+另有区别的是在`Potato`提权中多数是通过利用RPC中继的方式，例如在`Rotten
+Potato`中，通过`CoGetInstanceFromIStorage` 加载COM对象`BITS
+服务`来使得以SYSTEM身份运行的`BITS服务`向攻击者监听的端口发起连接并进行NTLM认证,但是NTLM认证仍然需要被重放到RPC服务器(默认情况下是135端口)以构造`对应的协商或者挑战包`从而返回,以实现欺骗`NT
+AUTHORITY\SYSTEM`帐户通过
+NTLM向我们控制的`TCP`端点进行身份验证，最后通过`AcquireCredentialsHandle`和`AcceptSecurityContext`来完成身份验证过程并获取令牌，从而以高权限令牌指定运行进程
+> CoGetInstanceFromIStorage会尝试从 “指定的 host:port” 加载 “指定对象“ 的实例（通过 CLSID
+> 指定对象），BITS 的 CLSID 为 {4991d34b-80a1-4291-83b6-3328366b9097}
+下图可以很清晰的看出`Rotten Potato`的攻击流程
+但是利用该接口在`Windows
+10`上将不再适用，原因是可能由于OXID解析器有关，在调用`IstorageTrigger::MarshalInterface`已经省略RPC绑定字符串中的端口，其中port也就是我们的本地侦听器端口，这就意味着COM连接现在只允许在TCP端口135上使用，因此就无法实现中间人攻击，但是RPC不是可用于这种中继场景的唯一协议，这里PrintSpoofer提权中则是使用了非常经典的管道(pipe)
+但是在开始之前，想先介绍`Windows Access Token`令牌模拟部分
+## Windows Access Token令牌模拟
+`Windows Token`又叫`Access
+Token(访问令牌)`，它是一个描述进程或者线程安全上下文的一个对象。不同的用户登录计算机后,都会生成一个`Access
+Token`，这个Token在用户创建进程或者线程时会被使用并且不断的拷贝，这也就解释了A用户创建一个进程而该进程也不会有B用户的权限。
+关于该令牌的解释可以在MSDN中找到:  
+[https://docs.microsoft.com/zh-cn/windows/win32/secauthz/access-tokens?redirectedfrom=MSDN](https://)
+###  Access Token组成
+令牌分为如下两类:
+  * 主令牌（Primary令牌）
+  * 模拟令牌（Impersonation令牌）
+> 注:当用户注销后，系统将会使主令牌切换为模拟令牌，而模拟令牌不会被清除，只有在重启机器后才会清除
+每个进程都有一个主令牌，用于描述与进程关联的用户帐户的安全上下文。 默认情况下，当进程的线程与安全对象交互时，系统将使用主令牌。
+此外，线程可以模拟客户端帐户。模拟允许线程使用客户端的安全上下文与安全对象进行交互。模拟客户端的线程同时具有主令牌和模拟令牌。
+令牌的组成主要有如下部分:
+    用户帐户 ( SID) 安全标识符
+    用户是其中一个成员的组的 ID
+    标识 当前登录 会话的 登录 SID
+    用户 或 用户组拥有的权限列表
+    所有者 SID
+    主组的 SID
+    用户创建安全对象而不指定安全描述符时系统 使用的默认 DACL
+    访问令牌的源
+    令牌是主 令牌还是模拟令牌
+    限制 SID 的可选列表
+    当前模拟级别
+    其他统计信息
+关于`Windows Access Token`的 **创建过程** :
+使用凭据(用户密码)进行认证–>登录Session创建–>Windows返回用户sid和用户组sid–>LSA(Local Security
+Authority)创建一个Token–>依据该token创建进程、线程(如果CreaetProcess时自己指定了 Token, LSA会用该Token，
+否则就继承父进程Token进行运行)
+**模拟等级**  
+[https://docs.microsoft.com/zh-cn/windows/win32/secauthz/impersonation-levels](https://)  
+`SECURITY _ IMPERSONATION _ LEVEL`枚举定义四个模拟级别，这些模拟级别确定服务器可以在客户端上下文中执行的操作。
+模拟级别 | 说明  
+---|---  
+SecurityAnonymous | 服务器无法模拟或标识客户端  
+SecurityIdentification | 服务器可以获取客户端的标识和特权，但不能模拟客户端  
+SecurityImpersonation | 服务器可以模拟本地系统上的客户端安全上下文  
+SecurityDelegation | 服务器可以在远程系统上模拟客户端的安全上下文  
+文档中给出了三个通过用户身份创建进程的函数:
+函数 | 需要特权 | 输入  
+---|---|---  
+CreateProcessWithLogon | null | 域/用户名/密码  
+CreateProcessWithToken | SeImpersonatePrivilege | Primary令牌  
+CreateProcessAsUser | SeAssignPrimaryTokenPrivilege和SeIncreaseQuotaPrivilege |
+Primary令牌  
+从这三个Win
+API中我们可以很容易的发现，当拥有SeAssignPrimaryToken或者SeImpersonate权限时，我们可以通过模拟Primary令牌的方式来创建新进程从而提升权限，换句话说只有当令牌具有Impersonation和Delegation级别的时候才可以进行模拟。
+**如何获取令牌**  
+Win API中提供了`OpenProcessToken/openThreadToken`等函数用来打开某个进程或者线程的访问令牌，其函数原型如下:
+    BOOL OpenProcessToken(
+      HANDLE  ProcessHandle, //访问令牌已打开的进程的句柄
+      DWORD   DesiredAccess,
+      PHANDLE TokenHandle //指向句柄的指针，该句柄在函数返回时标识新打开的访问令牌。
+    );
+    BOOL OpenThreadToken(
+      HANDLE  ThreadHandle, //打开访问令牌的线程的句柄。
+      DWORD   DesiredAccess,
+      BOOL    OpenAsSelf,
+      PHANDLE TokenHandle //指向接收新打开的访问令牌句柄的变量的指针
+    );
+> 通过OpenThreadToken/OpenProcessToken函数来获取访问令牌具有客户端安全上下文的模拟令牌。
+在这里，模拟令牌和主令牌之间是可以通过`DuplicateTokenEx`函数互相转换的  
+[DuplicateTokenEx](https://docs.microsoft.com/zh-cn/windows/win32/api/securitybaseapi/nf-securitybaseapi-duplicatetokenex)
+文档中给出了`DuplicateTokenEx`创建主令牌的典型场景,服务器应用程序创建一个线程，该线程调用其中一个模拟函数（例如
+`ImpersonateNamedPipeClient`）来模拟客户端。模拟线程然后调用
+OpenThreadToken函数来获取自己的令牌，该令牌是具有客户端安全上下文的模拟令牌。该线程在对`DuplicateTokenEx`的调用中指定此模拟令牌，并指定
+TokenPrimary标志。该DuplicateTokenEx函数创建一个主令牌具有客户端的安全上下文。
+因此，一个模拟令牌的过程大概是:  
+OpenProcess(获取目标进程上下文)->OpenProcessToken(获得进程访问令牌的句柄)–>DuplicateTokenEx(创建一个主/模拟令牌)–>CreateProcessWithTokenW(创建进程)
+因此当我们拥有`SeImpersonatePrivilege`权限时便可以通过对进程爆破的方式找到满足如下条件的进程:
+  * 进程运行用户是SYSTEM
+  * 令牌级别至少是Impersonation级别
+  * 攻击者运行的权限至少拥有SeImpersonatePrivilege
+这里仿照编写了一个C#的提权程序，遍历进程并且通过`openProcessToken`得到模拟令牌转化成主令牌创建进程
+**项目地址:**  
+ ****
+我们可以看到，当以管理员身份运行cmd时才会有`SeImpersonatePrivilege`
+注意不要认为该情况适用于所有存在`SeImpersonatePrivilege`特权的账户，例如服务账户等，因为如果以服务账户启动的时候虽然存在该特权，但是在任务管理器中并没有可以利用的`SYSTEM`权限运行的进程:
+而当我们以管理员或者普通用户来查看时会发现:
+存在大量的SYSTEM进程可以利用，因此这也就是为何我们还需进一步探索PrintSpoofer提权
+## 如何模拟RPC
+回到前面遇到的问题上，我们知道在Win 10中已经做出了调整，利用`IStorage
+COM`组件只允许和135端口进行通信，意味着中间人攻击已经失效，我们无法进行重放，因此漏洞作者把目光放到了管道上:
+管道可以有两种类型：
+  * 匿名管道 — 匿名管道通常在父进程和子进程之间传输数据。它们通常用于在子进程与其父进程之间重定向标准输入和输出。
+  * 命名管道 — 命名管道可以在不相关的进程之间传输数据，前提是管道的权限授予对客户端进程的适当访问权限。
+我们知道，RPC服务器一般通过`RpcImpersonateClient()`来模拟RPC客户端安全上下文，模拟后续可以进行委派或其他操作，而在Windows中同样管道也可以通过`ImpersonateNamedPipeClient()`RPC模拟客户端
+同样是借助官方文档的说明:
+命名管道服务器线程可以调用`ImpersonateNamedPipeClient`函数来假定连接到管道客户端的用户的访问令牌。例如，命名管道服务器可以提供对管道服务器具有特权访问权限的数据库或文件系统的访问。当管道客户端向服务器发送请求时，服务器模拟客户端并尝试访问受保护的数据库。然后系统会根据客户端的安全级别授予或拒绝服务器的访问权限。当服务器完成时，它使用`RevertToSelf`函数恢复其原始安全令牌。
+**该模拟级别决定了在模拟客户端服务器可以执行的操作。默认情况下，服务器在 SecurityImpersonation模拟级别进行模拟**
+。但是，当客户端调用CreateFile函数打开管道客户端的句柄时，客户端可以使用
+`SECURITY_SQOS_PRESENT`标志来控制服务器的模拟级别。
+这里写了一个简单的管道模拟RPC客户端的程序，显示在模拟RPC客户端时能够拿到的令牌种类和模拟权限,这里主要是通过`TOKEN_STATICS结构体`来确定令牌的相关信息，结构体如下:
+    typedef struct _TOKEN_STATISTICS {
+        LUID TokenId;
+        LUID AuthenticationId;
+        LARGE_INTEGER ExpirationTime;
+        TOKEN_TYPE TokenType;
+        SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
+        DWORD DynamicCharged;
+        DWORD DynamicAvailable;
+        DWORD GroupCount;
+        DWORD PrivilegeCount;
+        LUID ModifiedId;
+    } TOKEN_STATISTICS, *PTOKEN_STATISTICS;
+其中核心代码贴出:
+**项目地址:**  
+ ****
+可以看到在这里映证了通过`OpenThreadToken`拿到的令牌是模拟令牌，并且模拟级别是`SecurityImpersonation`,意味着服务器可以在本地系统上模拟客户端的安全上下文。
+需要注意的是如果连接管道是使用`\\.\pipe\crispr`，连接建立但是并不会有后续操作,也就是说`ImpersonateNamedPipeClient()`函数会失败
+这一点在作者原文中也并没有找到答案，因此如果有知道原因的师傅还请指正。
+## 令牌的利用
+接着前文我们知道获取的令牌是有能够模拟RPC客户端的权限，而在前文`Windows Access
+Token`我们提到了如果拥有`SeImpersonatePrivilege`权限时，我们可以通过`CreateProcessWithToken`的方式创建进程，同样用前文所提的写的一个项目来演示:
+在这里新加一个函数用来利用令牌实现一些其他的自定义功能,在这里为了演示方便就弹个notepad:
+    void DoSomethingAsImpersonatedUser(HANDLE hToken)
+    {
+        DWORD dwCreationFlags = 0;
+        dwCreationFlags = CREATE_UNICODE_ENVIRONMENT;
+        BOOL g_bInteractWithConsole = TRUE;
+        LPWSTR pwszCurrentDirectory = NULL;
+        dwCreationFlags |= g_bInteractWithConsole ? 0 : CREATE_NEW_CONSOLE;
+        LPVOID lpEnvironment = NULL;
+        PROCESS_INFORMATION pi = { 0 };
+        STARTUPINFO si = { 0 };
+        HANDLE hSystemTokenDup = INVALID_HANDLE_VALUE;
+        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hSystemTokenDup))
+        {
+            wprintf(L"DuplicateTokenEx() failed. Error: %d\n", GetLastError());
+            CloseHandle(hToken);
+        }
+        if (!CreateProcessWithTokenW(hSystemTokenDup, LOGON_WITH_PROFILE, NULL, L"notepad.exe", dwCreationFlags, lpEnvironment, pwszCurrentDirectory, &si, &pi))
+        {
+            wprintf(L"CreateProcessWithTokenW() failed. Error: %d\n", GetLastError());
+            CloseHandle(hSystemTokenDup);
+        }
+        else
+        {
+            wprintf(L"[+] CreateProcessWithTokenW() OK\n");
+        }
+    }
+当我们以普通用户运行尝试调用`CreateProcessWithTokenW`时是会失败的，原因是我们并没有`SeImpersonatePrivilege`特权
+> 需要注意的是管道就像文件或注册表项一样是安全的对象。这意味着如果没有在创建的命名管道上设置适当的权限，以不同身份运行的客户端可能根本无法访问它
+而当我们拥有`SeImpersonatePrivilege`权限时,这里以`NT AUTHORITY\NETWORK SERVICE`服务用户为例

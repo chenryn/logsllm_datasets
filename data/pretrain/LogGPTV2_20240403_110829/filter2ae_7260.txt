@@ -1,0 +1,86 @@
+## 前言
+前一段时间Project Zero的Jann Horn披露了几个binder中的漏洞[3]，这里学习一下，做个笔记。
+## 基础知识
+### Linux文件系统
+Linux从诞生以来，一直用struct task_struct来表示进程/线程，用struct file表示打开的文件，用struct
+inode表示文件本身。struct file和struct inode的区别在于，如果两次open同一个文件，会有两个struct
+file对象指向同一个struct inode对象。  
+最早的Linux内核直接把元素为struct file*的定长数组放在struct task_struct里。2.6.14 引入了struct
+fdtable作为files_struct的间接成员，把fd、max_fds、close_on_exec等成员移入fdtable。这么做是为了方便采用RCU，让fdtable可以整体替换。  
+从int fd取到struct file*
+fp的途径：current->files->fdt->fd[fd]。实际的代码比这个要复杂，因为files->fdt这一步(fdt=files_fdtable(files))要用rcu_dereference来做(上图的红线)。
+### task work机制
+task
+work机制可以在内核中向指定的进程添加一些任务函数，这些任务函数会在进程返回用户态时执行，使用的是该进程的上下文。在task_struct结构体中有一个task_works成员来存储这些待进行的任务链表头。  
+task_work_add函数把work添加到链表头。  
+task_work_run函数执行task_work_add函数添加的work。  
+### fdget函数和fdput函数
+fget函数从 **文件描述符表** 中读取 **文件描述符** 时，会增加 **文件描述符** 的引用计数 **f_count**
+。相对应的，fput函数会减少 **f_count** 。这样做的一个负面影响是经常访问这个文件的话包含 **f_count**
+的缓存行就会一直是脏的。如果多个任务并行，就会发生cache line
+bouncing(当很多线程在频繁修改某个字段时，这个字段所在的缓存行被不停地同步到不同的核上，就像在核间弹来弹去)。  
+Linux提供了fdget函数和fdput函数避免这种开销。fdget函数检查 **文件描述符表** 的引用计数 **count**
+是否为1，如果是则意味着当前任务拥有 **文件描述符表** 的唯一所有权，那么fdget函数不会增加 **f_count** 。fdget函数根据是否已获取
+**f_count** 在其返回值中设置一个标志，fdput函数根据这个标志使用普通的fput函数的逻辑或者什么也不做。详情请见下面3.13版的源代码。  
+使用时sockfd_lookup_light函数和fput_light函数搭配；fdget函数和fdput函数搭配。  
+在3.13之后发生了一点小变化，目前(5.0)，原来的fget_light函数被替换成__fget_light函数，并且不再使用fput_needed而是FDPUT_FPUT标志，当然原理是一样的。sockfd_lookup_light函数调用fdget函数最终调用到__fget_light函数，fput_light函数并没有发生变化。  
+### android中的binder通信机制
+binder是一种android中实现IPC(Inter-Process Communication)的方式。这里只通过简单介绍Service
+Manager让读者快速了解与漏洞有关的知识，读者如果有兴趣深入分析binder可自行查阅网上资料。  
+Service
+Manager是binder的核心组件之一，它扮演者binder上下文管理者的角色，同时负责管理系统中的Service组件，并向Client组件提供获取Service代理对象的服务。  
+(binder.c指的是/frameworks/native/cmds/servicemanager/binder.c，binder驱动指的是内核的/drivers/android/binder.c)  
+上图是Service
+Manager的时序图。在service_manager.c中首先通过binder_open函数打开/dev/binder，然后调用binder_become_context_manager函数告诉binder驱动程序自己是binder上下文管理者，最后调用binder_loop函数进入消息循环等待client的请求。  
+binder_fops变量是struct file_operations类型，指定了各种操作的函数。  
+binder.c中的binder_become_context_manager函数调用的ioctl函数就是binder驱动中的binder_ioctl函数。  
+binder_ioctl函数提供了很多命令，我们重点关注BINDER_WRITE_READ，它也是最重要的一个命令之一。处理这个命令的是binder_ioctl_write_read函数。  
+该命令下又分为若干子命令，与漏洞有关的一个命令是BC_FREE_BUFFER，它告诉binder驱动释放数据缓冲。binder_ioctl_write_read函数中继续调用binder_thread_write/binder_thread_read函数，binder_thread_write/binder_thread_read函数中处理这个命令的是binder_free_buf函数。  
+在binder_free_buf函数中首先调用binder_transaction_buffer_release函数释放相关引用，真正的释放在binder_alloc_free_buf函数中。  
+在binder_transaction_buffer_release函数中对于与漏洞有关的BINDER_TYPE_FDA类型(文件描述符数组)，会调用ksys_close函数关闭它们。  
+## 漏洞解析
+### 漏洞原理
+显而易见使用fdget/fdput需要遵守下面这三条规则，这三条规则也写在__fget_light函数之前的注释里了，简单的说就是：  
+A)当前task在fdget函数和fdput函数之间时，不可以复制它。  
+B)必须在系统调用结束之前使用fdput函数删除通过fdget函数获取的引用。  
+C)在fdget函数和fdput函数之间的task不能在与fdget函数相同的文件描述符上调用filp_close函数。  
+这个漏洞违反的就是第三条规则。因为fdget函数和fdput函数没有改变文件描述符引用计数，如果调用filp_close函数就造成UAF了。根据我们刚才的分析，在binder_transaction_buffer_release函数中对于与漏洞有关的BINDER_TYPE_FDA类型(文件描述符数组)，会调用ksys_close函数关闭它们。ksys_close函数通过调用__close_fd函数最终会调用filp_close函数。而ksys_ioctl第一步就是调用fdget函数。  
+考虑下面这种情况：  
+client和manager两个task通过binder通信。client打开了/dev/binder，文件描述符编号是X。两个任务都是单线程的。
+1.manager给client发送一个包含BINDER_TYPE_FDA的binder消息，其中包含一个文件描述符  
+2.client读出binder_io中的binder_buffer_object，得到binder_buffer_object中的文件描述符Y  
+3.client使用dup2(X,Y)用/dev/binder覆盖文件描述符Y  
+4.client unmap掉用户态的binder内存映射，现在client的/dev/binder的引用计数是2  
+5.client关闭文件描述符X，现在client的/dev/binder的引用计数是1  
+6.client对文件描述符X调用BC_FREE_BUFFER来释放传入的binder消息，client的/dev/binder的引用计数减为0
+### 漏洞利用
+因为fput函数使用task
+work机制的原因，这还并不会造成KASAN可以检测到的UAF，所以用下面的方式构造POC。漏洞存在于linux内核和wahoo内核，这里只分析linux内核中的情况。Project
+Zero给出的POC中有五个文件。binder.c和binder.h对servicemanager中的binder.c和binder.h进行了一些改动；使用compile.sh编译exploit_client.c得到exploit_client，编译exploit_manager.c得到exploit_manage；0001-binder-upstream-repro-aid.patch文件patch内核增加一些log信息和msleep函数调用。重点看exploit_client.c、exploit_manager.c和binder.c。
+1.manager给client发送一个包含BINDER_TYPE_FDA的binder消息，其中包含一个文件描述符  
+这里的bio_put_fda函数是加在binder.c里面的。  
+2.client读出binder_io中的binder_buffer_object，得到binder_buffer_object中的文件描述符Y  
+这里为了能够传递文件描述符在binder_call函数中对flags也进行了改动。  
+3.client使用dup2(X,Y)用/dev/binder覆盖文件描述符Y  
+4.client unmap掉用户态的binder内存映射，现在client的/dev/binder的引用计数是2  
+5.client关闭文件描述符X，现在client的/dev/binder的引用计数是1  
+6.client创建一个子进程child复制文件描述符表，现在client的/dev/binder的引用计数是2  
+7.client对文件描述符X调用BC_FREE_BUFFER来释放传入的binder消息，client的/dev/binder的引用计数减为1  
+8.child调用close(X)，将client的/dev/binder的引用计数减为0然后将其释放
+9.client尝试获取binder_proc，此时KASAN检测到UAF
+### 补丁情况
+我翻了一下linux内核中binder.c的commit记录找到了补丁的细节[4]。原来的ksys_close函数被换成了binder_deferred_fd_close函数。  
+这个函数先调用了__close_fd_get_file函数，然后利用我们前面讲解的task
+work机制调用task_work_add函数添加了一个binder_do_fd_close函数。  
+__close_fd_get_file函数和原来的__close_fd函数的区别在于它把fd对应的struct
+file*保存到了binder_task_work_cb结构体中。  
+当我们从ioctl返回之后，task_work_run函数执行binder_do_fd_close函数，此时才会去执行ksys_close函数。  
+## 参考资料
+1.[Linux 内核文件描述符表的演变](https://zhuanlan.zhihu.com/p/34280875 "Linux
+内核文件描述符表的演变")  
+2.[Android Binder机制(三)
+ServiceManager守护进程](http://wangkuiwu.github.io/2014/09/03/Binder-ServiceManager-Daemon/ "Android Binder机制\(三\) ServiceManager守护进程")  
+3.[Issue 1719: Android: binder use-after-free via fdget() optimization
+](https://bugs.chromium.org/p/project-zero/issues/detail?id=1719 "Issue 1719:
+Android: binder use-after-free via fdget\(\) optimization ")  
+4.

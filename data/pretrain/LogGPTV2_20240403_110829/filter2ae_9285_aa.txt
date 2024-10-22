@@ -1,0 +1,182 @@
+作者：[suezi@IceSword Lab](http://www.iceswordlab.com/2017/10/30/ChromeOS-Userdata-Protection-Mechanism-Based-On-EXT4-Encryption/ "suezi@IceSword Lab")
+#### 概述
+自2015年开发的 EXT4 Encryption 经过两年的验证性使用，Google 终于在年初的时候将 EXT4 Encryption 合并入
+Chrome OS 用于保护用户的隐私数据，完成与 eCryptfs 同样的功能，简称该技术为 Dircrypto。当前，Chrome OS 仍是
+eCryptfs 和 Dircrypto 两种技术并存，但优先采用 Dircrypto，这表明 Dircrypto
+将成为以后的主流趋势。本文试图阐述该技术的实现原理。
+与 eCryptfs 一样，EXT4 Encryption
+用于完成文件（包括目录）和文件名的加密，以实现多用户系统中各个用户私有数据的安全，即使在设备丢失或被盗的情况下，用户隐私数据也不会轻易被人窥见。本文着重介绍文件内容加解密，文件名加解密留给读者自行研究，技术要点主要包括：加解密模型、密钥管理、EXT4
+Encrytion 功能的开/关及参数设定操作。
+#### EXT4 Encryption 简述
+创立 eCryptfs 十年之后，其主要的作者 Michael Halcrow 已从之前的 IBM 转向服务 Google。Google
+在保护用户数据隐私方面具有强烈的需求，应用在其旗下的 Android、Chrome OS 及数据中心，此时采用的文件系统都是 EXT4，eCryptfs
+属于堆叠在 EXT4 上的文件系统，性能必定弱于直接在 EXT4 实现加密，恰好 EXT4 的主要维护者是 Google 的 Theodore Ts’o
+，因此由 Michael Halcrow 主导、Theodore Ts’o 协助开发完成 EXT4
+Encryption，目标在于“Harder，Better，Faster，Stronger”。
+相比 eCryptfs，EXT4 Encryption 在内存使用上有所优化，表现在 read page 时，直接读入密文到 page cache 并在该
+page 中解密；而 eCryptfs 首先需要调用 EXT4 接口完成读入密文到 page cache，然后再解密该 page 到另外的 page
+cache 页，内存花销加倍。当然，write page 时，两者都不能直接对当前 page cache
+加密，因为cache的明文内容需要保留着后续使用。在对文件加密的控制策略上，两者都是基于目录，但相比 eCryptfs 使用的 mount 方法，EXT4
+Encryption 采用 ioctl 的策略显得更加方便和灵活。另外，在密钥管理方面，两者也不相同。
+EXT4 Encryption 加/解密文件的核心思想是：每个用户持有一个 64 Bytes 的 master key，通过 master key
+的描述（master key descriptor，实际使用时一般采用 key signature
+加上“ext4:”前缀）进行识别，每个文件单独产生一个16 Bytes的随机密钥称为nonce，之后以nonce做为密钥，采用 AES-128-ECB
+算法加密 master key，产生 derived key。加/解密文件时采用 AES-256-XTS 算法，密钥是 derived
+key。存储文件时，将包含有格式版本、内容加密算法、文件名加密算法、旗标、 master key 描述、nonce等信息在内的数据保存在文件的 xattr
+扩展属性中。而master key由用户通过一些加密手段进行存储，在激活 EXT4 Encryption
+前通过keys的系统调用以“logon”类型传入内核keyring，即保证master只能被应用程序创建及更新但不能被应用程序读取。加密是基于目录树的形式进行，加密策略通过`EXT4_IOC_SET_ENCRYPTION
+ioctl`对某个目录进行下发，其子目录或文件自动继承父目录的属性，ioctl
+下发的内容包括策略版本号、文件内容加密模式、文件名加密模式、旗标、master key 的描述。文件 read 操作时，从磁盘 block 中读入密文到
+page cache 并在该 page 中完成解密，然后拷贝到应用程序；文件 write 时采用 write page 的形式写入磁盘，但不是在当前
+page cache 中直接加密，而是将加密后的密文保存在另外的 page 中。
+和 eCryptfs 一样，EXT4 Encryption 在技术实现时利用了 page cache 机制的 Buffered I/O,换而言之就是不支持
+Direct I/O。其加/解密的流程如图一所示。
+图一 EXT4 Encryption加/解密流程
+图一中，在创建加密文件时通过`get_random_bytes`函数产生 16 Bytes 的随机数，将其做为 nonce 保存到文件的 xattr
+属性中；当打开文件时取出文件的 nonce 和 master key 的描述，通过 master key 描述匹配到应用程序下发的 master
+key；然后以 nonce 做为密钥，采用 AES-128-ECB 算法加密 master key 后产生 derived
+key，加/解密文件时采用该derived key做为密钥，加密算法由用户通过 ioctl 下发并保存到 xattr
+的`“contents_encryption_mode”`字段，目前版本仅支持 AES-256-XTS；加/解密文件内容时调用 kernel crypto
+API 完成具体的加/解密功能。
+下面分别从 EXT4 Encryption 使用的数据结构、内核使能 EXT4 Encryption 功能、如何添加 master key 到
+keyring、如何开启 EXT4 Encryption 功能、创建和打开加密文件、读取和解密文件、加密和写入加密文件等方面详细叙述。
+#### EXT4 Encryption 详述
+##### EXT4 Encryption 的主要数据结构
+通过数据结构我们可以窥视到 EXT4 Encryption 的密钥信息的保存和使用方式，非常有利于理解该加密技术。涉及到主要数据结构如下：
+master key 的 payload 的数据表示如清单一所示，应用程序通过 add_key 系统调用将其和 master key descriptor
+传入内核 keyring。
+###### 清单一 master key
+    /* This is passed in from userspace into the kernel keyring */
+    struct ext4_encryption_key {
+            __u32 mode;
+            char raw[EXT4_MAX_KEY_SIZE];
+            __u32 size;
+    } __attribute__((__packed__));
+EXT4 Encryption 的文件加密信息的数据存储结构如清单二结构体`struct
+ext4_encryption_context`所示，每个文件都对应保存着这样的一个数据结构在其 xattr
+中，包含了加密版本、文件内容和文件名的加密算法、旗标、master key descriptor 和随机密钥 nonce。
+###### 清单二 加密信息存储格式
+    /**
+     * Encryption context for inode
+     *
+     * Protector format:
+     *  1 byte: Protector format (1 = this version)
+     *  1 byte: File contents encryption mode
+     *  1 byte: File names encryption mode
+     *  1 byte: Reserved
+     *  8 bytes: Master Key descriptor
+     *  16 bytes: Encryption Key derivation nonce
+     */
+    struct ext4_encryption_context {
+        char format;
+        char contents_encryption_mode;
+        char filenames_encryption_mode;
+        char flags;
+        char master_key_descriptor[EXT4_KEY_DESCRIPTOR_SIZE];
+        char nonce[EXT4_KEY_DERIVATION_NONCE_SIZE];
+    } __attribute__((__packed__));
+设置 EXT4 Encryption 开启是通过对特定目录进行`EXT4_IOC_SET_ENCRYPTION
+ioctl`完成，具体策略使用清单三所示的`struct ext4_encryption_policy`
+数据结构进行封装，包括版本号、文件内容的加密算法、文件名的加密算法、旗标、master key
+descriptor。每个加密文件保存的`ext4_encryption_context`信息均继承自该数据结构，子目录继承父目录的`ext4_encryption_context`。
+###### 清单三 Encryption policy
+    /* Policy provided via an ioctl on the topmost directory */
+    struct ext4_encryption_policy {
+        char version;
+        char contents_encryption_mode;
+        char filenames_encryption_mode;
+        char flags;
+        char master_key_descriptor[EXT4_KEY_DESCRIPTOR_SIZE];
+    } __attribute__((__packed__));
+    `
+open 文件时将文件加密相关信息从 xattr 中读出并保存在清单四的`struct ext4_crypt_info`数据结构中，成员 ci_ctfm
+用于调用 kernel crypto，在文件 open 时做好 key 的初始化。从磁盘获取到加密信息后，将该数据结构保存到 inode
+的内存表示`struct ext4_inode_info`中的`i_crypt_info`字段，方便后续的 readpage、writepage
+时获取到相应数据进行加/解密操作。
+###### 清单四 保存加/解密信息及调用接口的数据结构
+    struct ext4_crypt_info {
+        char        ci_data_mode;
+        char        ci_filename_mode;
+        char        ci_flags;
+        struct crypto_ablkcipher *ci_ctfm;
+        char        ci_master_key[EXT4_KEY_DESCRIPTOR_SIZE];
+    };
+    `
+如清单五所示，采用 `struct ext4_crypto_ctx` 表示在 readpage、writepage 时进行 page 加/解密的
+context。在 writepage 时因为涉及到 cache 机制，需要保存明文页，所以专门申请单独的 bounce_page 保存密文用于写入磁盘，用
+control_page 来指向正常的明文页。在 readpage 时，通过 bio 从磁盘中读出数据到内存页，读页完成后通过 queue_work
+的形式调用解密流程并将明文保存在当前页，因此 context 中存在 work 成员。另外，为了提高效率，在初始化阶段一次性申请了128个
+`ext4_crypto_ctx` 的内存空间并通过 free_list 链表进行管理。
+###### 清单五 用于表示加/解密 page 的 context
+    struct ext4_crypto_ctx {
+        union {
+            struct {
+                struct page *bounce_page;       /* Ciphertext page */
+                struct page *control_page;      /* Original page  */
+            } w;
+            struct {
+                struct bio *bio;
+                struct work_struct work;
+            } r;
+            struct list_head free_list;     /* Free list */
+        };
+        char flags;                      /* Flags */
+        char mode;                       /* Encryption mode for tfm */
+    };
+    `
+##### 使能 EXT4 Encryption
+Linux kernel具有良好的模块化设计，EXT4 Encryption属于一个EXT4
+FS中一个可选的模块，在编译kernel前需通过配置选项使能该功能，如下：
+    CONFIG_EXT4_FS_SECURITY=y
+    CONFIG_EXT4_FS_ENCRYPTION=y
+##### 添加 master key 的流程
+将 master key 添加到内核 keyring 属于 EXT4 Encryption 的第一步，该步骤通过 add_key 系统调用完成，master
+key 在不同的 Linux 发行版有不同的产生及保存方法，这里以 Chrome OS 为例。
+Chrome OS 在 cryptohomed 守护进程中完成 master key 的获取和添加到 keyring。因为兼容 eCryptfs 和
+EXT4 Encryption（为了跟 Chrome OS 保持一致，后续以 Dircrypto 代替 EXT4 Encryption 的称呼），而
+eCryptfs 属于前辈，eCryptfs 通过 mount 的方式完成加密文件的开启，为了保持一致性，cryptohomed 同样是在 mount
+的准备过程中解密出 master key 和开启 Dircrypto，此 master key 即 eCryptfs 加密模式时用的 FEK，master
+key descriptor 即 FEK 的 key signature，所以本节介绍 Dircrypto 流程时所谓的 mount
+流程，望读者能够理解，在 Dircrypto 模式下，mount 不是真正“mount”，千万不要混淆。cryptohomed 的 mount 流程如下：
+1.cryptohomed 在 D-Bus 上接收到持（包含用户名和密码）有效用户证书的 mount 请求，当然 D-Bus 请求也是有权限控制的；
+2.假如是用户首次登陆，将进行：
+a． 建立`/home/.shadow/[salt_hash_of_username]`目录，采用 SHA1 算法和系统的 salt
+对用户名进行加密，生成`salt_hash_of_username`，简称`s_h_o_u`;
+b． 生成`vault keyset
+/home/.shadow/[salt_hash_of_username]/master.0`和`/home/.shadow/[salt_hash_of_username]/master.0.sum`。master.0
+加密存储了包含有 FEK 和 FNEK 的内容以及非敏感信息如 salt、password rounds 等；master.0.sum 是对
+master.0 文件内容的校验和。
+3.采用通过 mount 请求传入的用户证书解密 keyset。当 TPM 可用时优先采用 TPM 解密，否则采用 Scrypt 库，当 TPM
+可用后再自动切换回使用 TPM。cryptohome 使用 TPM 仅仅是为了存储密钥，由 TPM 封存的密钥仅能被 TPM
+自身使用，这可用缓解密钥被暴力破解，增强保护用户隐私数据的安全。TPM 的首次初始化由 cryptohomed 完成。这里默认 TPM
+可正常使用，其解密机制如下图二所示，其中：
+UP：User Passkey，用户登录口令
+EVKK：Ecrypted vault keyset key，保存在 master.0 中的“tpm_key”字段
+IEVKK：Intermediate vault keyset key，解密过程生成的中间文件，属于EVKK的解密后产物，也是RSA解密的输入密文
+TPM_CHK: TPM-wrapped system-wide Cryptohome
+key，保存在`/home/.shadow/cryptohome.key`，TPM init时加载到TPM
+VKK：Vault keyset key
+VK：Vault Keyset，包含FEK和FNEK
+EVK：Encrypted vault keyset，保存在master.0里”wrapped_keyset”字段
+图二 TPM解密VK的流程
+图二中的UP（由发起mount的D-Bus请求中通过key参数传入）做为一个AES
+key用于解密EVKK，解密后得到的IEVKK；然后将IEVKK做为RSA的密文送入TPM，使用TPM_CHK做为密钥进行解密，解密后得到VKK；最后生成的VKK是一个AES
+key，用于解密master.0里的EVK，得到包含有FEK和FNEK明文的VK。经过三层解密，终于拿到关键的FEK，此FEK在Dircrypto模式下当做master
+key使用，FEK signature即做master key descriptor使用。
+最后通过 add_key 系统调用将 master key 及 master key descriptor（在 keyring 中为了方便区分，master
+key descriptor 由 key sign 加上前缀“ext4:”组成）添加到 keyring，如下清单六代码所示
+###### 清单六 Chrome OS 传入 master key 的核心代码
+    key_serial_t AddKeyToKeyring(const brillo::SecureBlob& key,
+                                 const brillo::SecureBlob& key_descriptor) {
+      //参数中的key即是master key，key_descriptor即sig
+      if (key.size() > EXT4_MAX_KEY_SIZE ||
+          key_descriptor.size() != EXT4_KEY_DESCRIPTOR_SIZE) {
+        LOG(ERROR) (EXT4_KEY_DESCRIPTOR_SIZE),
+                key_descriptor.size());
+      /*这里的dir代表要开启EXT4 Encryption的目录 */
+      base::ScopedFD fd(HANDLE_EINTR(open(dir.value().c_str(),
+                                          O_RDONLY | O_DIRECTORY)));
+      if (!fd.is_valid()) {
+        PLOG(ERROR) << "Ext4: Invalid directory" << dir.value();
+        return false;
+      }

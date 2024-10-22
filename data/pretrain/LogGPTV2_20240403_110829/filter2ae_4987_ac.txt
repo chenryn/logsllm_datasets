@@ -1,0 +1,110 @@
+    00000000`77b49528 00000000`77b0f878 USER32!_fnINOUTDRAG
+    00000000`77b49530 00000000`77ae85a0 USER32!_fnGETTEXTLENGTHS
+    00000000`77b49538 00000000`77b0fb9c USER32!_fnINCNTOUTSTRING
+在调用一个系统调用时，nt!KiSystemService 或 nt!KiFastCallEntry
+在内核线程栈中存储一个陷阱帧（TRAP_FRAME）来保存当前线程上下文，并使在返回到用户模式时能够恢复寄存器的值。为了在用户模式回调中实现到用户模式的过渡，KeUserModeCallback
+首先使用由线程对象保存的陷阱帧信息将输入缓冲区拷贝至用户模式栈中，接着通过设为 ntdll!KiUserCallbackDispatcher 的 EIP
+创建新的陷阱帧，代替线程对象的 TrapFrame 指针，最后调用 nt!KiServiceExit 返回对用户模式回调分发的执行。
+由于用户模式回调需要一个位置存储例如陷阱帧等线程状态信息，Windows XP 和 2003
+会扩大内核栈以确保足够的空间可用。然而，因为通过递归调用回调栈空间会被很快耗尽，Vista 和 Windows 7
+转而在每个用户模式回调中创建新的内核线程栈。为了达到追踪先前的栈等目的，Windows 在栈的基地址位置为 KSTACK_AREA
+结构体保留空间，紧随其后的是构造的陷阱帧。
+    kd> dt nt!_KSTACK_AREA
+       +0x000 FnArea                  : _FNSAVE_FORMAT
+       +0x000 NpxFrame                : _FXSAVE_FORMAT
+       +0x1e0 StackControl            : _KERNEL_STACK_CONTROL
+       +0x1fc Cr0NpxState             : Uint4B
+       +0x200 Padding                 : [4] Uint4B
+    kd> dt nt!_KERNEL_STACK_CONTROL -b
+       +0x000 PreviousTrapFrame       : Ptr32
+       +0x000 PreviousExceptionList   : Ptr32
+       +0x004 StackControlFlags       : Uint4B
+       +0x004 PreviousLargeStack      : Pos 0, 1 Bit
+       +0x004 PreviousSegmentsPresent : Pos 1, 1 Bit
+       +0x004 ExpandCalloutStack      : Pos 2, 1 Bit
+       +0x008 Previous                : _KERNEL_STACK_SEGMENT
+          +0x000 StackBase               : Uint4B
+          +0x004 StackLimit              : Uint4B
+          +0x008 KernelStack             : Uint4B
+          +0x00c InitialStack            : Uint4B
+          +0x010 ActualLimit             : Uint4B
+一旦用户模式回调执行完成，其将调用 NtCallbackReturn 来恢复并继续在内核中的执行。该函数将回调的结果复制回原来的内核栈，并通过使用保存在
+KERNEL_STACK_CONTROL
+结构体中的信息恢复原来的陷阱帧（PreviousTrapFrame）和内核栈。在跳转到其先前弃用的位置之前，内核回调栈将被删除。
+    NTSTATUS NtCallbackReturn (
+      IN PVOID Result OPTIONAL,
+      IN ULONG ResultLength,
+      IN NTSTATUS Status
+      );
+由于递归或嵌套回调会导致内核栈的无限增长（XP）或创建任意数目的栈，内核会为每个运行中的线程在线程对象结构体（KTHREAD->CallbackDepth）中追踪回调的深度（内核栈空间被用户模式回调完全使用）。在每个回调中，线程栈已使用的字节数（栈的基地址
+- 栈指针）被加到 CallbackDepth 变量中。每当内核尝试迁移至新栈时，nt!KiMigrateToNewKernelStack 确保
+CallbackDepth 总计不会超过 0xC000，否则将返回 STATUS_STACK_OVERFLOW 栈溢出的错误码。
+#### 3\. 通过用户模式回调实施的内核攻击
+在这一节中，我们将提出一些会允许对手从用户模式回调中执行特权提升的攻击载体。在更详细地讨论每个攻击载体之前，我们首先从研究用户模式回调如何处理用户临界区开始。
+##### 3.1 Win32k 命名约定
+像在 2.2 节中所描述的那样，在操作内部管理器结构体时，窗口管理器使用临界区和全局锁机制。由于用户模式回调能够潜在地允许应用程序冻结 GUI
+子系统，win32k 总是在反向调用进用户模式之前离开临界区。通过这种方式，win32k
+能够在用户模式代码正在执行的同时，执行其他任务。在从回调中返回时，在函数在内核中继续执行之前，win32k 重入临界区。我们可以在任何调用
+KeUserModeCallback 的函数中观察到这种行为，如下面的指令片段所示。
+    call   _UserSessionSwitchLeaveCrit@0
+    lea    eax, [ebp+var_4]
+    push   eax
+    lea    eax, [ebp+var_8]
+    push   eax
+    push   0
+    push   0
+    push   43h
+    call   ds:__imp__KeUserModeCallback@20
+    call   _UserEnterUserCritSec@0
+在从用户模式回调中返回时，win32k
+必须确保被引用的对象和数据结构仍处于可预知的状态。由于在进入回调之前离开临界区，用户模式回调代码可随意修改对象属性、重分配数组，等等。例如，某个回调能够调用
+SetParent()
+函数来改变窗口的父级，如果内核在调用回调之前存储对父级窗口的引用，并在返回后在没有执行属性检查或对象锁定的情况下继续操作该引用，这将引发一处安全漏洞。
+由于对潜在地反向调用至用户模式的函数的追踪非常重要（为了使开发者做出预防措施），win32k.sys 使用它自己的函数命名约定。需要注意的是，函数以 xxx
+或 zzz 作为前缀取决于其会以何种方式调用用户模式回调。以 xxx
+作为前缀的函数在大多数情况下离开临界区并调用用户模式回调。然而，在一些情况下函数可能会请求特定的参数以偏离回调实际被调用的路径。这就是为什么有时你会看到无前缀的函数调用
+xxx 函数的原因，因为它们提供给 xxx 函数的参数不会引发一个回调。
+以 zzz 作为前缀的函数调用异步或延时的回调。这通常是拥有确定类型的窗口事件的情况，因为各种各样的原因，不能或不应立刻进行处理。在这种情况下，win32k
+调用 xxxFlushDeferredWindowEvents 来清理事件队列。对 zzz 函数来说需要注意的重要一点是，其要求在调用
+xxxWindowEvent 之前确保 win32k!gdwDeferWinEvent 为非空值。如果不是这种情况，那么回调会被立即处理。
+Win32k 使用的命名约定的问题是缺乏一致性。在 win32k
+中一些函数调用回调，但是并未被视作其理应被视作的类型。这样的原因是不透明，但一个可能的解释是：随着时间的推移，函数已被修改，但没有更新函数名称的必要。因此，开发者可能会被误导地认为某个函数可能不会实际地调用回调，因此而避免做类似的不必要的验证（例如对象保持非锁定状态，以及指针不重新验证）。在
+MS11-034 [7] 针对漏洞的应对方案中，有些函数名称已被更新成正确反映其对用户模式回调使用的格式。
+    Windows 7 RTM          Windows 7 (MS11-034)
+    MNRecalcTabStrings     xxxMNRecalcTabStrings
+    FreeDDEHandle          xxxFreeDDEHandle
+    ClientFreeDDEHandle    xxxClientFreeDDEHandle
+    ClientGetDDEFlags      xxxClientGetDDEFlags
+    ClientGetDDEHookData   xxxClientGetDDEHookData
+##### 3.2 用户对象锁定
+像在 2.2
+节中所解释的那样，用户对象实行引用计数来追踪对象何时被使用及应该从内存中释放。正因如此，在内核离开用户临界区之后预期有效的对象必须被锁定。锁定通常有两种形式：线程锁定和赋值锁定。
+线程锁定（Thread Locking）
+线程锁定通常在某些函数中用来锁定对象或缓冲区。线程锁定的每个项被存储在线程锁定结构体中（win32k! _TL_
+），通过单向的线程锁定链表连接，线程信息结构体中存在指向该链表的指针（THREADINFO.ptl）。在表项被 push 进或被 pop
+出时，线程锁定链表的操作遵循先进先出（FIFO）队列原则。在 win32k 中，线程锁定一般内联地执行，并能够被内联的指针增量识别，通常在 xxx
+函数调用之前（如下清单所示）。当给定的一个 win32k 中的函数不再需要对象或缓冲区时，其调用 ThreadUnlock()
+来从线程锁定列表中删除锁定表项。
+    mov    ecx, _gptiCurrent
+    add    ecx, tagTHREADINFO.ptl  ; thread lock list
+    mov    edx, [ecx]
+    mov    [ebp+tl.next], edx
+    lea    edx, [ebp+tl]
+    mov    [ecx], edx              ; push new entry on list
+    mov    [ebp+tl.pobj], eax      ; window object
+    inc    [eax+tagWND.head.cLockObj]
+    push   [ebp+arg_8]
+    push   [ebp+arg_4]
+    push   eax
+    call   _xxxDragDetect@12       ; xxxDragDetect(x,x,x)
+    mov    esi, eax
+    call   _ThreadUnlock1@0        ; ThreadUnlock1()
+在对象已被锁定但未被适当地解锁（例如由正在处理用户模式回调时的进程销毁导致）的情况下，在线程销毁时 win32k
+处理线程锁定列表来释放任何遗留的表项。这可以在 xxxDestroyThreadInfo 函数中调用 DestroyThreadsObjects
+函数时被观察到。
+赋值锁定（Assignment Locking）
+不像线程锁定那样，赋值锁定用于对用户对象实施更加长期的锁定。例如，当在一个桌面中创建窗口时，win32k
+在窗口对象结构体中适当的偏移位置对桌面对象执行赋值锁定。与在列表中操作相反，赋值锁定项只是存储在内存中的（指向锁定对象的）指针。如果在 win32k
+需要对某个对象执行赋值锁定的位置有已存在的指针，模块在锁定前会先解锁已存在的项，并用请求的项替换它。
+句柄管理器提供提过执行赋值锁定和解锁的函数。在对对象执行锁定时，win32k 调用 HMAssignmentLock(Address,Object)
+函数，并类似地调用 HMAssignmentUnlock(Address)

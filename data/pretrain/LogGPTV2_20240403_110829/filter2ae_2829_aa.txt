@@ -1,0 +1,176 @@
+**作者：rook1e@知道创宇404实验室  
+时间：2021年5月19日 **
+近年来 Golang 热度飙升，得益于其性能优异、开发效率高、跨平台等特性，被广泛应用在开发领域。在享受 Golang
+带来便利的同时，如何保护代码、提高逆向破解难度也是开发者们需要思考的问题。
+由于 Golang 的反射等机制，需要将文件路径、函数名等大量信息打包进二进制文件，这部分信息无法被 strip，所以考虑通过混淆代码的方式提高逆向难度。
+本文主要通过分析 [burrowers/garble](https://github.com/burrowers/garble) 项目的实现来探索
+Golang 代码混淆技术，因为相关资料较少，本文大部分内容是通过阅读源码来分析的，如有错误请师傅们在评论区或邮件指正。
+## 前置知识
+### 编译过程
+Go 的编译过程可以抽象为：
+  1. 词法分析：将字符序列转换为 token 序列
+  2. 语法分析：解析 token 成 AST
+  3. 类型检查
+  4. 生成中间代码
+  5. 生成机器码
+本文不展开编译原理的内容，详细内容推荐阅读 [Go 语言设计与实现
+#编译原理](https://draveness.me/golang/docs/part1-prerequisite/ch02-compile/golang-compile-intro/) 和 [Introduction to the Go
+compiler](https://github.com/golang/go/tree/master/src/cmd/compile)。
+下面我们从源码角度更直观的探索编译的过程。`go build` 的实现在
+`src/cmd/go/internal/work/build.go`，忽略设置编译器类型、环境信息等处理，我们只关注最核心的部分：
+    func runBuild(ctx context.Context, cmd *base.Command, args []string) {
+        ...
+      var b Builder
+      ...
+      pkgs := load.PackagesAndErrors(ctx, args)
+      ...
+        a := &Action{Mode: "go build"}
+        for _, p := range pkgs {
+            a.Deps = append(a.Deps, b.AutoAction(ModeBuild, depMode, p))
+        }
+        ...
+        b.Do(ctx, a)
+    }
+这里的 Action 结构体表示一个行为，每个 action 有描述、所属包、依赖（Deps）等信息，所有关联起来的 action 构成一个 action
+graph。
+    // An Action represents a single action in the action graph.
+    type Action struct {
+        Mode     string         // description of action operation
+        Package  *load.Package  // the package this action works on
+        Deps     []*Action      // actions that must happen before this one
+        Func     func(*Builder, context.Context, *Action) error // the action itself (nil = no-op)
+        ...
+    }
+在创建好 a 行为作为“根顶点”后，遍历命令中指定的要编译的包，为每个包创建 action，这个创建行为是递归的，创建过程中会分析它的依赖，再为依赖创建
+action，例如 `src/cmd/go/internal/work/action.go (b *Builder) CompileAction` 方法：
+    for _, p1 := range p.Internal.Imports {
+        a.Deps = append(a.Deps, b.CompileAction(depMode, depMode, p1))
+    }
+最终的 `a.Deps` 就是 action graph 的“起点”。构造出 action graph 后，将 a 顶点作为“根”进行深度优先遍历，把依赖的
+action 依次加入任务队列，最后并发执行 `action.Func`。
+每一类 action 的 Func 都有指定的方法，是 action 中核心的部分，例如：
+    a := &Action{
+      Mode: "build",
+      Func: (*Builder).build,
+      ...
+    }
+    a := &Action{
+      Mode: "link",
+      Func: (*Builder).link,
+      ...
+    }
+    ...
+进一步跟进会发现，除了一些必要的预处理，`(*Builder).link` 中会调用 `BuildToolchain.ld`
+方法，`(*Builder).build` 会调用
+`BuildToolchain.symabis`、`BuildToolchain.gc`、`BuildToolchain.asm`、`BuildToolchain.pack`
+等方法来实现核心功能。BuildToolchain 是 toolchain 接口类型的，定义了下列方法：
+    // src/cmd/go/internal/work/exec.go
+    type toolchain interface {
+        // gc runs the compiler in a specific directory on a set of files
+        // and returns the name of the generated output file.
+        gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, out []byte, err error)
+        // cc runs the toolchain's C compiler in a directory on a C file
+        // to produce an output file.
+        cc(b *Builder, a *Action, ofile, cfile string) error
+        // asm runs the assembler in a specific directory on specific files
+        // and returns a list of named output files.
+        asm(b *Builder, a *Action, sfiles []string) ([]string, error)
+        // symabis scans the symbol ABIs from sfiles and returns the
+        // path to the output symbol ABIs file, or "" if none.
+        symabis(b *Builder, a *Action, sfiles []string) (string, error)
+        // pack runs the archive packer in a specific directory to create
+        // an archive from a set of object files.
+        // typically it is run in the object directory.
+        pack(b *Builder, a *Action, afile string, ofiles []string) error
+        // ld runs the linker to create an executable starting at mainpkg.
+        ld(b *Builder, root *Action, out, importcfg, mainpkg string) error
+        // ldShared runs the linker to create a shared library containing the pkgs built by toplevelactions
+        ldShared(b *Builder, root *Action, toplevelactions []*Action, out, importcfg string, allactions []*Action) error
+        compiler() string
+        linker() string
+    }
+Go 分别为 gc 和 gccgo 编译器实现了此接口，`go build` 会在程序初始化时进行选择：
+    func init() {
+        switch build.Default.Compiler {
+        case "gc", "gccgo":
+            buildCompiler{}.Set(build.Default.Compiler)
+        }
+    }
+    func (c buildCompiler) Set(value string) error {
+        switch value {
+        case "gc":
+            BuildToolchain = gcToolchain{}
+        case "gccgo":
+            BuildToolchain = gccgoToolchain{}
+      ...
+    }
+这里我们只看 gc 编译器部分 `src/cmd/go/internal/work/gc.go`。以 gc 方法为例：
+    func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, output []byte, err error) {
+        // ...
+        // 拼接参数
+        // ...
+        args := []interface{}{cfg.BuildToolexec, base.Tool("compile"), "-o", ofile, "-trimpath", a.trimpath(), gcflags, gcargs, "-D", p.Internal.LocalPrefix}
+        // ...
+        output, err = b.runOut(a, base.Cwd, nil, args...)
+        return ofile, output, err
+    }
+粗略的看，其实 gc 方法并没有实现具体的编译工作，它的主要作用是拼接命令来调用路径为 `base.Tool("compile")`
+的二进制程序。这些程序可以被称为 Go 编译工具，位于 `pkg/tool` 目录下，源码位于
+`src/cmd`。同理，其他的方法也是调用了相应的编译工具完成实际的编译工作。
+细心的读者可能会发现一个有趣的问题：拼接的命令中真正的运行对象并不是编译工具，而是 `cfg.BuildToolexec`。跟进到定义处可知它是由 `go
+build -toolexec` 参数设置的，官方释义为：
+    -toolexec 'cmd args'
+      a program to use to invoke toolchain programs like vet and asm.
+      For example, instead of running asm, the go command will run
+      'cmd args /path/to/asm '.
+即用 `-toolexec` 指定的程序来运行编译工具。这其实可以看作是一个 hook
+机制，利用这个参数来指定一个我们的程序，在编译时用这个程序调用编译工具，从而介入编译过程，下文中分析的 garble
+项目就是使用了这种思路。附一段从编译过程中截取的命令（ `go build -n` 参数可以输出执行的命令）方便理解，比如我们指定了
+`-toolexec=/home/atom/go/bin/garble`，那么编译时实际执行的就是：
+    /home/atom/go/bin/garble /usr/local/go/pkg/tool/linux_amd64/compile -o $WORK/b016/_pkg_.a -trimpath "/usr/local/go/src/sync=>sync;$WORK/b016=>" -p sync -std -buildid FRNt7EHDh77qHujLKnmK/FRNt7EHDh77qHujLKnmK -goversion go1.16.4 -D "" -importcfg $WORK/b016/importcfg -pack -c=4 /usr/local/go/src/sync/cond.go /usr/local/go/src/sync/map.go /usr/local/go/src/sync/mutex.go /usr/local/go/src/sync/once.go /usr/local/go/src/sync/pool.go /usr/local/go/src/sync/poolqueue.go /usr/local/go/src/sync/runtime.go /usr/local/go/src/sync/runtime2.go /usr/local/go/src/sync/rwmutex.go /usr/local/go/src/sync/waitgroup.go
+总结一下，`go build` 通过拼接命令的方式调用 compile 等编译工具来实现具体的编译工作，我们可以使用 `go build
+-toolexec` 参数来指定一个程序“介入”编译过程。
+### go/ast
+Golang 中 AST 的类型及方法由 go/ast 标准库定义。后文分析的 garble 项目中会有大量涉及 go/ast
+的类型断言和类型选择，所以有必要对这些类型有大致了解。大部分类型定义在 `src/go/ast/ast.go`
+，其中的注释足够详细，但为了方便梳理关系，笔者整理了关系图，图中的分叉代表继承关系，所有类型都基于 Node 接口：
+本文无意去深入探究 AST，但相信读者只要对 AST 有基础的了解就足以理解本文的后续内容。如果理解困难，建议阅读
+[Go语法树入门——开启自制编程语言和编译器之旅！](https://github.com/chai2010/go-ast-book/)
+补充需要的知识，也可以通过在线工具 [goast-viewer](https://yuroyoro.github.io/goast-viewer/index.html) 将 AST 可视化来辅助分析。
+## 工具分析
+开源社区中关于 Go 代码混淆 star 比较多的两个项目是
+[burrowers/garble](https://github.com/burrowers/garble) 和
+[unixpickle/gobfuscate](https://github.com/unixpickle/gobfuscate)，前者的特性更新一些，所以本文主要分析
+garble，版本
+[8edde922ee5189f1d049edb9487e6090dd9d45bd](https://github.com/burrowers/garble/tree/8edde922ee5189f1d049edb9487e6090dd9d45bd)。
+### 特性
+  * 支持 modules，Go 1.16+
+  * 不处理以下情况：
+  * CGO
+  * `ignoreObjects` 标记的：
+    * 传入 `reflect.ValueOf` 或 `reflect.TypeOf` 方法的参数的类型
+    * `go:linkname` 中使用的函数
+    * 导出的方法
+    * 从未混淆的包中引入的类型和变量
+    * 常量
+  * runtime 及其依赖的包（[support obfuscating the runtime package #193](https://github.com/burrowers/garble/issues/193)）
+  * Go 插件
+  * 哈希处理符合条件的包、函数、变量、类型等的名称
+  * 将字符串替换为匿名函数
+  * 移除调试信息、符号表
+  * 可以设置 `-debugdir` 输出混淆过的 Go 代码
+  * 可以指定不同的种子以混淆出不同的结果
+整体上可以将 garble 分为两种模式：
+  * 主动模式：当命令传入的第一个指令与 garble 的预设相匹配时，代表是被用户主动调用的。此阶段会根据参数进行配置、获取依赖包信息等，然后将配置持久化。如果指令是 build 或 test，则再向命令中添加 `-toolexec=path/to/garble` 将自己设置为编译工具的启动器，引出启动器模式
+  * 启动器模式：对 tool/asm/link 这三个工具进行“拦截”，在编译工具运行前进行源代码混淆、修改运行参数等操作，最后运行工具编译混淆后的代码
+获取和修改参数的工作花费了大量的代码，为了方便分析，后文会将其一笔带过，感兴趣的读者可以查询官方文档来了解各个参数的作用。
+### 构造目标列表
+构造目标列表的行为发生在主动模式中，截取部分重要的代码：
+    // listedPackage contains the 'go list -json -export' fields obtained by the
+    // root process, shared with all garble sub-processes via a file.
+    type listedPackage struct {
+        Name       string
+        ImportPath string
+        ForTest    string
+        Export     string
+        BuildID    string

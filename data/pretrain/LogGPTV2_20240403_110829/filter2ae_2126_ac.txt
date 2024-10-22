@@ -1,0 +1,276 @@
+      public String method(String param) {
+        return param;
+      }
+    }
+从上述代码，我们可以看到类A和方法method，方法method接收到参数后，通过return返回，接着赋值给main方法中的cmd变量，最后Runtime.exec执行命令。
+所以，根据上面代码展示，我们只要能控制method这个方法的入参，就能控制其方法的返回值，并控制数据流最终流向Runtime.exec。这其实类似于污点分析，而在PassthroughDiscovery这个类的处理阶段中，最主要就是做这样的一件事，通过不断的分析所有的方法，它们是否会被入参所污染。
+还有就是，方法数据流的传递，不仅仅是一层两层，可能在整个gadget
+chain中，会牵涉到非常之多的方法，那么，对于所有方法数据流的污点分析，其分析顺序将会是成功与否的前提条件。这边继续讲一个例子吧：
+    public void main(String args) throws IOException {
+        String cmd = new A().method1(args);
+        new B().method2(cmd);
+    }
+    class A {
+      public String method1(String param) {
+        return param;
+      }
+    }
+    class B {
+      public void method2(String param) throws IOException {
+        new C().method3(param);
+      }
+    }
+    class C {
+      public void method3(String param) throws IOException {
+        Runtime.getRuntime().exec(param);
+      }
+    }
+上述代码，可以看到source-slink之间的具体流程，经过数据流的污点分析，我们可以得到结果：
+    A$method1-1
+    B$method2-1
+    C$method3-1
+从代码上分析，因为A.method1的入参我们可以控制，并且其返回值间接的也被入参控制，接着赋值给了cmd变量，那么就表示cmd这个变量我们也是可以控制的，接着调用B.method2，cmd变量作为入参，并接着再把其入参作为C.method3的入参，最终走到Runtime.getRuntime().exec(param)，那么，就意味着只要我们控制了A.method1的入参，最终我们可以通过这个数据，最终影响整个source->slink，并最终得到执行exec。
+而从上面的代码流程，我们只要搞明白了A类的method1方法、B类的method2方法以及C类的method3方法能被哪个参数污染下去，那么，我们就能确定整个source至slink的污点传递，但是，这里有个问题，在得到B类的method2方法参数的污染结果之前，必须得先把C类的method3方法参数的污染结果得到，而具体怎么做到呢？在gadgetinspector中，通过了DTS，一种逆拓扑顺序的方式，先得到方法执行链的逆序排序的方法集合，然后由此，从最末端进行参数污点分析，倒着回来，也就是，我先确认C类的method3方法参数的污染结果，并存储起来，接着进行分析B类的method2方法的时候，就能根据前面得到的结果，继续分析下去，最后得到B类的method2方法的参数污染结果。
+那么，逆拓扑顺序的具体代码实现是如何呢？
+我们跟进passthroughDiscovery.discover方法
+    //加载文件记录的所有方法信息
+    Map methodMap = DataLoader.loadMethods();
+    //加载文件记录的所有类信息
+    Map classMap = DataLoader.loadClasses();
+    //加载文件记录的所有类继承、实现关联信息
+    InheritanceMap inheritanceMap = InheritanceMap.load();
+可以看到前三个操作分别是加载前面MethodDiscovery收集到的类、方法、继承实现的信息
+接着，调用discoverMethodCalls方法，整理出所有方法，调用者方法caller和被调用者target方法之间映射的集合
+    //搜索方法间的调用关系，缓存至methodCalls集合，返回 类名->类资源 映射集合
+    Map classResourceByName = discoverMethodCalls(classResourceEnumerator);
+通过ASM Visitor的方式，使用MethodCallDiscoveryClassVisitor这个ClassVisitor实现类进行方法调用的收集
+    private Map discoverMethodCalls(final ClassResourceEnumerator classResourceEnumerator) throws IOException {
+        Map classResourcesByName = new HashMap<>();
+        for (ClassResourceEnumerator.ClassResource classResource : classResourceEnumerator.getAllClasses()) {
+            try (InputStream in = classResource.getInputStream()) {
+                ClassReader cr = new ClassReader(in);
+                try {
+                    MethodCallDiscoveryClassVisitor visitor = new MethodCallDiscoveryClassVisitor(Opcodes.ASM6);
+                    cr.accept(visitor, ClassReader.EXPAND_FRAMES);
+                    classResourcesByName.put(visitor.getName(), classResource);
+                } catch (Exception e) {
+                    LOGGER.error("Error analyzing: " + classResource.getName(), e);
+                }
+            }
+        }
+        return classResourcesByName;
+    }
+MethodCallDiscoveryClassVisitor中的运转流程：
+    private class MethodCallDiscoveryClassVisitor extends ClassVisitor {
+        public MethodCallDiscoveryClassVisitor(int api) {
+            super(api);
+        }
+        private String name = null;
+        @Override
+        public void visit(int version, int access, String name, String signature,
+                          String superName, String[] interfaces) {
+            super.visit(version, access, name, signature, superName, interfaces);
+            if (this.name != null) {
+                throw new IllegalStateException("ClassVisitor already visited a class!");
+            }
+            this.name = name;
+        }
+        public String getName() {
+            return name;
+        }
+        @Override
+        public MethodVisitor visitMethod(int access, String name, String desc,
+                                         String signature, String[] exceptions) {
+            MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
+            //在visit每个method的时候，创建MethodVisitor对method进行观察
+            MethodCallDiscoveryMethodVisitor modelGeneratorMethodVisitor = new MethodCallDiscoveryMethodVisitor(
+                    api, mv, this.name, name, desc);
+            return new JSRInlinerAdapter(modelGeneratorMethodVisitor, access, name, desc, signature, exceptions);
+        }
+        @Override
+        public void visitEnd() {
+            super.visitEnd();
+        }
+    }
+方法的执行顺序是visit->visitMethod->visitEnd，前面也说过了，ASM对于观察者模式的具体表现。
+  * visit：在这个方法中，把当前观察的类名赋值到了this.name
+  * visitMethod：在这个方法中，继续进一步的对被观察类的每一个方法细节进行观察
+继续进一步对方法的观察实现类是MethodCallDiscoveryMethodVisitor：
+    private class MethodCallDiscoveryMethodVisitor extends MethodVisitor {
+        private final Set calledMethods;
+        /**
+         *
+         * @param api
+         * @param mv
+         * @param owner 上一步ClassVisitor在visitMethod时，传入的当前class
+         * @param name visit的方法名
+         * @param desc visit的方法描述
+         */
+        public MethodCallDiscoveryMethodVisitor(final int api, final MethodVisitor mv,
+                                           final String owner, String name, String desc) {
+            super(api, mv);
+            //创建calledMethod收集调用到的method，最后形成集合{{sourceClass,sourceMethod}:[{targetClass,targetMethod}]}
+            this.calledMethods = new HashSet<>();
+            methodCalls.put(new MethodReference.Handle(new ClassReference.Handle(owner), name, desc), calledMethods);
+        }
+        /**
+         * 方法内，每一个方法调用都会执行该方法
+         *
+         * @param opcode 调用操作码：INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC or INVOKEINTERFACE.
+         * @param owner 被调用的类名
+         * @param name 被调用的方法
+         * @param desc 被调用方法的描述
+         * @param itf 被调用的类是否接口
+         */
+        @Override
+        public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean itf) {
+            calledMethods.add(new MethodReference.Handle(new ClassReference.Handle(owner), name, desc));
+            super.visitMethodInsn(opcode, owner, name, desc, itf);
+        }
+    }
+具体的代码，我这里也做了比较详细的注释，在MethodCallDiscoveryMethodVisitor构造方法执行的时候，会对this.calledMethods集合进行初始化，该集合的主要作用是在被观察方法对其他方法进行调用时（会执行visitMethodInsn方法），用于缓存记录被调用的方法，因此，我们可以看到visitMethodInsn方法中，执行了
+    calledMethods.add(new MethodReference.Handle(new ClassReference.Handle(owner), name, desc));
+并且在构造方法执行的时候，集合calledMethods也会被添加到gadgetinspector.PassthroughDiscovery#methodCalls中，做全局性的收集，因此，最后我们能通过discoverMethodCalls这一个方法，实现对这样一个数据的全量收集：
+    {{sourceClass,sourceMethod}:[{targetClass,targetMethod}]}
+    收集哪个class的method调用了哪一个class的method关系集合
+接着，在下一步，通过调用
+    List sortedMethods = topologicallySortMethodCalls();
+完成了对上述收集到的数据：
+    {{sourceClass,sourceMethod}:[{targetClass,targetMethod}]}
+实现逆拓扑的排序，跟进topologicallySortMethodCalls方法
+    Map> outgoingReferences = new HashMap<>();
+    for (Map.Entry> entry : methodCalls.entrySet()) {
+        MethodReference.Handle method = entry.getKey();
+        outgoingReferences.put(method, new HashSet<>(entry.getValue()));
+    }
+第一步，对methodCalls的数据进行了封装整理，形成了Map>这样结构的数据
+    // Topological sort methods
+    LOGGER.debug("Performing topological sort...");
+    Set dfsStack = new HashSet<>();
+    Set visitedNodes = new HashSet<>();
+    List sortedMethods = new ArrayList<>(outgoingReferences.size());
+    for (MethodReference.Handle root : outgoingReferences.keySet()) {
+        //遍历集合中的起始方法，进行递归搜索DFS，通过逆拓扑排序，调用链的最末端排在最前面，
+        // 这样才能实现入参、返回值、函数调用链之间的污点影响
+        dfsTsort(outgoingReferences, sortedMethods, visitedNodes, dfsStack, root);
+    }
+    LOGGER.debug(String.format("Outgoing references %d, sortedMethods %d", outgoingReferences.size(), sortedMethods.size()));
+    private static void dfsTsort(Map> outgoingReferences,
+                                List sortedMethods, Set visitedNodes,
+                                Set stack, MethodReference.Handle node) {
+    if (stack.contains(node)) {
+        return;
+    }
+    if (visitedNodes.contains(node)) {
+        return;
+    }
+    //根据起始方法，取出被调用的方法集
+    Set outgoingRefs = outgoingReferences.get(node);
+    if (outgoingRefs == null) {
+        return;
+    }
+    //入栈，以便于递归不造成类似循环引用的死循环整合
+    stack.add(node);
+    for (MethodReference.Handle child : outgoingRefs) {
+        dfsTsort(outgoingReferences, sortedMethods, visitedNodes, stack, child);
+    }
+    stack.remove(node);
+    visitedNodes.add(node);//记录已被探索过的方法，用于在上层调用遇到重复方法时可以跳过
+    sortedMethods.add(node);//递归完成的探索，会添加进来
+    }
+接着，通过遍历每个方法，并调用dfsTsort实现逆拓扑排序，具体细节示意图，我前面推荐的那篇文章画得非常不错，建议此时去看看
+  1. dfsStack用于在在逆拓扑时候不会形成环
+  2. visitedNodes在一条调用链出现重合的时候，不会造成重复的排序
+  3. sortedMethods最终逆拓扑排序出来的结果集合
+最终，实现的效果如下：
+    public void main(String args) throws IOException {
+        String cmd = new A().method1(args);
+        new B().method2(cmd);
+    }
+    class A {
+      public String method1(String param) {
+        return param;
+      }
+    }
+    class B {
+      public void method2(String param) throws IOException {
+        new C().method3(param);
+      }
+    }
+    class C {
+      public void method3(String param) throws IOException {
+        Runtime.getRuntime().exec(param);
+      }
+    }
+调用链main->A.method1,main->B.method2->C.method3
+排序后的结果：
+    A.method1
+    C.method3
+    B.method2
+    main
+通过这样的一个结果，就如我们前面所讲的，就能在污点分析方法参数的时候，根据这个排序后的集合顺序进行分析，从而在最末端开始进行，在上一层也能通过缓存取到下层方法已经过污点分析的结果，继而继续走下去。
+这些，便是逆拓扑排序的实现以及意义。
+接着，就到重头戏了，我这篇文章最想要描述的ASM怎么进行参数和返回结果之间的污点分析
+    /**
+     * classResourceByName：类资源集合
+     * classMap：类信息集合
+     * inheritanceMap：继承、实现关系集合
+     * sortedMethods：方法集合
+     * SerializableDecider：决策者
+     */
+    passthroughDataflow = calculatePassthroughDataflow(classResourceByName, classMap, inheritanceMap, sortedMethods,
+            config.getSerializableDecider(methodMap, inheritanceMap));
+跟进calculatePassthroughDataflow这个方法
+首先，会初始化一个集合，用于收集污染结果，key对应方法名，value对应可以污染下去的参数索引集合
+    final Map> passthroughDataflow = new HashMap<>();
+紧接着，遍历被排序过后的方法，并跳过static静态初始化方法，因为静态代码块我们基本上是没办法污染的，其执行的时机在类加载的阶段
+    //遍历所有方法，然后asm观察所属类，经过前面DFS的排序，调用链最末端的方法在最前面
+    for (MethodReference.Handle method : sortedMethods) {
+        //跳过static静态初始化代码
+        if (method.getName().equals("")) {
+            continue;
+        }
+        ...
+    }
+然后根据方法信息，获取到所属的类，接着通过ASM对其进行观察
+    //获取所属类进行观察
+    ClassResourceEnumerator.ClassResource classResource = classResourceByName.get(method.getClassReference().getName());
+    try (InputStream inputStream = classResource.getInputStream()) {
+        ClassReader cr = new ClassReader(inputStream);
+        try {
+            PassthroughDataflowClassVisitor cv = new PassthroughDataflowClassVisitor(classMap, inheritanceMap,
+                    passthroughDataflow, serializableDecider, Opcodes.ASM6, method);
+            cr.accept(cv, ClassReader.EXPAND_FRAMES);
+            passthroughDataflow.put(method, cv.getReturnTaint());//缓存方法返回值与哪个参数有关系
+        } catch (Exception e) {
+            LOGGER.error("Exception analyzing " + method.getClassReference().getName(), e);
+        }
+    } catch (IOException e) {
+        LOGGER.error("Unable to analyze " + method.getClassReference().getName(), e);
+    }
+PassthroughDataflowClassVisitor实现中，重点在于visitMethod方法
+    //不是目标观察的method需要跳过，上一步得到的method都是有调用关系的method才需要数据流分析
+    if (!name.equals(methodToVisit.getName()) || !desc.equals(methodToVisit.getDesc())) {
+        return null;
+    }
+因为在上述构造PassthroughDataflowClassVisitor时，最后一个参数传入的便是需要观察的方法，因此，在ASM每观察到一个方法都会执行visitMethod的时候，通过此处重新判断是否我们关心的方法，只有我们关心的方法，最终才通过下一步构建PassthroughDataflowMethodVisitor对其进行方法级别的观察
+    //对method进行观察
+    MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
+    passthroughDataflowMethodVisitor = new PassthroughDataflowMethodVisitor(
+            classMap, inheritanceMap, this.passthroughDataflow, serializableDecider,
+            api, mv, this.name, access, name, desc, signature, exceptions);
+继续跟进PassthroughDataflowMethodVisitor，可以看到，它继承了TaintTrackingMethodVisitor，并有以下几个方法的实现：
+  1. visitCode：在进入方法的第一时间，ASM会先调用这个方法
+  2. visitInsn：在方法体重，每一个字节码操作指令的执行，ASM都会调用这个方法
+  3. visitFieldInsn：对于字段的调用，ASM都会调用这个方法
+  4. visitMethodInsn：方法体内，一旦调用了其他方法，都会触发这个方法的调用
+在展示这四个方法的具体代码前，我还要说一下其父类中的一个方法：visitVarInsn，这个方法，会在方法体内字节码操作变量时，会被调用
+为了实现类似污点分析，去分析参数对方法的污染，其模仿了jvm，实现了两个个集合，分别是本地变量表和操作数栈，通过其，实现具体的污点分析，那么具体是怎么进行的呢？
+在分析前，我继续贴一个代码例子：
+    public class Main {
+      public String main(String args) throws IOException {
+        String cmd = new A().method1(args);
+        return new B().method2(cmd);
+      }
+    }
+    class A {

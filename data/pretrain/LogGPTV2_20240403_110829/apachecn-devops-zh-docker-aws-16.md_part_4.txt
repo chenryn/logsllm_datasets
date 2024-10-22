@@ -1,0 +1,178 @@
+`collectstatic`服务装载`public`共享卷，并运行适当的`manage.py`任务来生成静态内容。在`deploy`部分，假设`collectstatic`服务每次部署只需要运行一次，我们将副本计数配置为 1，然后配置一个`restart_policy`，说明 Docker Swarm 应该在失败时尝试重新启动服务，每次重新启动尝试之间的延迟为 30 秒，最多 6 次尝试。这提供了最终的一致性行为，因为它允许 collectstatic 在 EFS 卷装载操作进行时最初失败，然后在卷装载完毕并准备就绪后最终成功。
+如果现在部署栈并监视 collectstatic 服务，您可能会注意到一些初始故障:
+```
+> docker stack deploy --with-registry-auth -c stack.yml todobackend
+Creating network todobackend_default
+Creating network todobackend_net
+Creating service todobackend_collectstatic
+Creating service todobackend_app
+> docker service ps todobackend_collectstatic NAME                        NODE                          DESIRED STATE CURRENT STATE
+todobackend_collectstatic.1 ip-172-31-40-246.ec2.internal Running       Running 2 seconds ago
+\_ todobackend_collectstatic.1 ip-172-31-40-246.ec2.internal Shutdown     Rejected 32 seconds ago
+```
+`docker service ps`命令不仅显示当前服务状态，还显示服务历史记录(如之前任何运行服务的尝试)，可以看到 32 秒前第一次尝试运行`collectstatic`失败，之后 Docker Swarm 尝试重新启动服务。此尝试成功，尽管`collectstatic`服务最终将完成并退出，但由于重启策略设置为失败，Docker Swarm 不会再次尝试启动该服务，因为该服务已无错误退出。这支持在出现故障时具有重试功能的“一次性”服务的概念，并且 Swarm 将尝试再次运行该服务的唯一时间是在该服务的新配置被部署到集群的情况下。
+如果您现在浏览到外部负载平衡器 URL，您应该会发现 todobackend 应用的静态内容现在已经正确显示，但是数据库配置错误仍然存在。
+# 创建用于存储应用数据库的永久存储器
+我们现在可以将注意力转移到应用数据库上，它是 todobackend 应用的一个重要支持组件。如果您在 AWS 中运行，我的典型建议是，无论容器编排平台如何，都使用关系数据库服务(RDS)，就像我们在本书中所做的那样，但是 todobackend 应用的应用数据库要求提供了一个机会来演示如何使用 AWS 的 Docker 解决方案来支持持久存储。
+除了 EFS 支持的卷，Cloudstor 卷插件还支持*可重定位*弹性块存储(EBS)卷。可重定位意味着，如果 Docker Swarm 决定将容器从一个节点重定位到另一个节点，插件将自动将容器的当前分配的 EBS 卷重定位到另一个节点。在 EBS 卷的重新定位过程中实际发生的情况取决于场景:
+*   **新节点在同一个可用性区域**:插件只是将卷从现有节点的 EC2 实例中分离出来，并在新节点上重新连接卷。
+*   **新节点位于不同的可用性区域**:这里，插件会对现有卷进行快照，然后根据快照在新的可用性区域中创建新卷。一旦完成，先前的卷将被销毁。
+需要注意的是，Docker 只支持对可重定位的 EBS 支持的卷的单一访问，也就是说，在任何给定时间，应该只有一个容器对该卷进行读/写操作。如果您需要共享访问卷，则必须创建一个 EFS 支持的共享卷。
+现在，让我们定义一个名为`data`的卷来存储 todobackend 数据库，并创建一个`db`服务，该服务将运行 MySQL 并连接到`data`卷:
+```
+version: '3.6'
+networks:
+  net:
+    driver: overlay
+volumes:
+  public:
+    driver: cloudstor:aws
+    driver_opts:
+      backing: shared
+ data:
+ driver: cloudstor:aws
+ driver_opts: 
+ backing: relocatable
+ size: 10
+ ebstype: gp2
+services:
+  app:
+    image: 385605022855.dkr.ecr.us-east-1.amazonaws.com/docker-in-aws/todobackend
+    ports:
+      - target: 8000
+        published: 80
+    networks:
+      - net
+    volumes:
+      - public:/public
+    ...
+    ...
+  collectstatic:
+    image: 385605022855.dkr.ecr.us-east-1.amazonaws.com/docker-in-aws/todobackend
+    volumes:
+      - public:/public
+    ...
+    ...
+  db:
+ image: mysql:5.7
+ environment:
+ MYSQL_DATABASE: todobackend
+ MYSQL_USER: todo
+ MYSQL_PASSWORD: password
+ MYSQL_ROOT_PASSWORD: password
+ networks:
+ - net
+ volumes:
+ - data:/var/lib/mysql
+ command:
+ - --ignore-db-dir=lost+found
+ deploy:
+      replicas: 1
+ placement:
+ constraints:
+ - node.role == manager
+```
+首先，我们创建一个名为`data`的卷，并将驱动程序配置为`cloudstor:aws`。在驱动程序选项中，我们指定了一个可重定位的备份来创建一个 EBS 卷，指定了 10 GB 的大小和一个 EBS 类型的`gp2`(固态硬盘)存储。然后，我们定义了一个名为`db`的新服务，它运行官方的 MySQL 5.7 映像，将`db`服务连接到之前定义的网络，并在`/var/lib/mysql`装载数据量，这是 MySQL 存储其数据库的地方。请注意，因为 Cloudstor 插件将装入的卷格式化为`ext4`，所以在格式化过程中会自动创建一个名为`lost+found`的文件夹，这会导致 [MySQL 容器中止](https://github.com/docker-library/mysql/issues/69#issuecomment-365927214)，因为它认为存在名为`lost+found`的现有数据库。
+为了克服这一点，我们传入了一个名为`--ignore-db-dir`的标志，它引用了`lost+found`文件夹，该文件夹被传递到 MySQL 映像入口点，并将 MySQL 守护程序配置为忽略该文件夹。
+最后，我们定义了一个放置约束，它将强制将`db`服务部署到 Swarm 管理器，这将允许我们通过稍后将这个放置约束更改为一个工作者来测试数据卷的可重定位特性。
+如果您现在部署栈并监控`db`服务，您应该观察到服务在数据卷初始化时需要一些时间才能启动:
+```
+> docker stack deploy --with-registry-auth -c stack.yml todobackend
+docker stack deploy --with-registry-auth -c stack.yml todobackend
+Updating service todobackend_app (id: 28vrdqcsekdvoqcmxtum1eaoj)
+Updating service todobackend_collectstatic (id: sowciy4i0zuikf93lmhi624iw)
+Creating service todobackend_db
+> docker service ps todobackend_db --format "{{ .Name }} ({{ .ID }}): {{ .CurrentState }}" todobackend_db.1 (u4upsnirpucs): Preparing 35 seconds ago
+> docker service ps todobackend_db --format "{{ .Name }} ({{ .ID }}): {{ .CurrentState }}"
+todobackend_db.1 (u4upsnirpucs): Running 2 seconds ago
+```
+要验证 EBS 卷是否已实际创建，您可以使用 AWS 命令行界面，如下所示:
+```
+> aws ec2 describe-volumes --filters Name=tag:CloudstorVolumeName,Values=* \
+    --query "Volumes[*].{ID:VolumeId,Zone:AvailabilityZone,Attachment:Attachments,Tag:Tags}"
+[
+    {
+        "ID": "vol-0db01995ba87433b3",
+        "Zone": "us-east-1b",
+        "Attachment": [
+            {
+                "AttachTime": "2018-07-20T09:58:16.000Z",
+                "Device": "/dev/xvdf",
+                "InstanceId": "i-0dc762f73f8ce4abf",
+                "State": "attached",
+                "VolumeId": "vol-0db01995ba87433b3",
+                "DeleteOnTermination": false
+            }
+        ],
+        "Tag": [
+            {
+                "Key": "CloudstorVolumeName",
+                "Value": "todobackend_data"
+            },
+            {
+                "Key": "StackID",
+                "Value": "0825319e9d91a2fc0bf06d2139708b1a"
+            }
+        ]
+    }
+]
+```
+请注意，由 Cloudstor 插件创建的 EBS 卷用关键字`CloudstorVolumeName`和 Docker Swarm 卷名的值进行标记。在前面的示例中，您还可以看到卷是在 us-east-1b 可用性区域中创建的。
+# 重新定位 EBS 卷
+现在，您已经成功创建并附加了一个 EBS 支持的数据卷，让我们通过更改其放置约束来测试将`db`服务从管理器节点迁移到工作器节点:
+```
+version: '3.6'
+...
+...
+services:
+  ...
+  ...
+  db:
+    image: mysql:5.7
+    environment:
+      MYSQL_DATABASE: todobackend
+      MYSQL_USER: todo
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: password
+    networks:
+      - net
+    volumes:
+      - data:/var/lib/mysql
+    command:
+      - --ignore-db-dir=lost+found
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+ - node.role == worker
+```
+如果您现在部署您的更改，您应该能够观察到 EBS 重新定位过程:
+```
+> volumes='aws ec2 describe-volumes --filters Name=tag:CloudstorVolumeName,Values=*
+ --query "Volumes[*].{ID:VolumeId,State:Attachments[0].State,Zone:AvailabilityZone}"
+ --output text' > snapshots='aws ec2 describe-snapshots --filters Name=status,Values=pending
+    --query "Snapshots[].{Id:VolumeId,Progress:Progress}" --output text' > docker stack deploy --with-registry-auth -c stack.yml todobackend
+Updating service todobackend_app (id: 28vrdqcsekdvoqcmxtum1eaoj)
+Updating service todobackend_collectstatic (id: sowciy4i0zuikf93lmhi624iw)
+Updating service todobackend_db (id: 4e3sc0dlot9lxlmt5kwfw3sis)
+> eval $volumes vol-0db01995ba87433b3 detaching us-east-1b
+> eval $volumes vol-0db01995ba87433b3 None us-east-1b
+> eval $snapshots vol-0db01995ba87433b3 76%
+> eval $snapshots
+vol-0db01995ba87433b3 99%
+> eval $volumes vol-0db01995ba87433b3 None us-east-1b
+vol-07e328572e6223396 None us-east-1a
+> eval $volume
+vol-07e328572e6223396 None us-east-1a
+> eval $volume
+vol-07e328572e6223396 attached us-east-1a
+> docker service ps todobackend_db --format "{{ .Name }} ({{ .ID }}): {{ .CurrentState }}"
+todobackend_db.1 (a3i84kwz45w9): Running 1 minute ago
+todobackend_db.1 (u4upsnirpucs): Shutdown 2 minutes ago
+```
+我们首先定义一个显示当前 Cloudstor 卷状态的`volumes`查询和一个显示任何正在进行的 EBS 快照的`snapshots`查询。部署放置约束更改后，我们多次运行卷查询并观察位于`us-east-1b`的当前卷，转换到`detaching`状态和`None`状态(分离)。
+然后，我们运行快照查询，您可以看到正在为刚刚分离的卷创建快照，一旦该快照完成，我们将多次运行卷查询，以观察旧卷被删除，并且在`us-east-1a`中创建新卷，然后连接该卷。此时，`todobackend_data`卷已从`us-east-1b`中的管理器重新定位到`us-east-1a`，您可以通过执行`docker service ps`命令来验证`db`服务现在已启动并再次运行。
+Because the Docker for AWS CloudFormation template creates separate auto scaling groups for managers and workers, there is a possibility the manager and worker are running in the same subnet and availability zone, which will change the behavior of the example above.
+在进入下一部分之前，我们实际上需要拆除栈，因为当前在栈文件中使用明文密码的密码管理策略并不理想，并且我们的数据库已经用这些密码进行了初始化:
+```
+> docker stack rm todobackend

@@ -1,0 +1,194 @@
+**作者：时钟@RainSec  
+本文为作者投稿，Seebug Paper 期待你的分享，凡经采用即有礼品相送！ 投稿邮箱：PI:EMAIL**
+## 前置技术
+### Magic Link
+/proc/目录下存在很多的链接文件，但是在Linux
+也存在一种特殊的链接文件，这种文件的大小为0，我们知道普通的链接文件的大小等于链接目标的文件路径长度，但是Magic
+Link的大小为0，它们在打开方式上面也存在差别，普通链接文件会解析出链接文件的路径然后进行打开操作，但是Magic
+LInk的话不会这样，它会调用内核专门的处理函数，然后返回目标文件的文件描述符。
+### 匿名文件
+Linux [Anonymous Files](https://stackoverflow.com/questions/21617539/what-exactly-are-anonymous-files)，也叫匿名文件，匿名文件和普通的文件十分类似，可以被定义，修改，写入，读取等等，但是和普通文件不同的是它并不是一个实体的文件，当用户使用memfd_create创建一个匿名文件的时候会返回一个文件描述符，一旦对这个文件描述符的所有引用都被丢弃的时候，该匿名文件就会被销毁，而且在该文件的整个生命周期中都是存在于内存的RAM当中，并不具备实体的文件。
+### mount namespace是如何实现的？
+首先要了解在内核进程结构体[task_struct](https://elixir.bootlin.com/linux/latest/source/include/linux/sched.h#L723)里面存在一个nsproxy成员：
+        struct task_struct {
+        .........
+        /* Namespaces: */
+        struct nsproxy          *nsproxy;
+        .......
+        }
+nsproxy结构体如下：
+    struct nsproxy {
+        atomic_t count;
+        struct uts_namespace *uts_ns;
+        struct ipc_namespace *ipc_ns;
+        struct mnt_namespace *mnt_ns;
+        struct pid_namespace *pid_ns_for_children;
+        struct net       *net_ns;
+        struct time_namespace *time_ns;
+        struct time_namespace *time_ns_for_children;
+        struct cgroup_namespace *cgroup_ns;
+    };
+可以看到各种不同的namespace都有自己的相关结构体，但是本文着重介绍mount
+namespace相关实现，因此通过追踪内核中进程的创建过程发现mount namespace的实现如下：
+内核函数调用链：
+    kernel_clone(_do_fork) -> copy_process
+在[copy_process](https://elixir.bootlin.com/linux/latest/source/kernel/fork.c#L1930)中发现大量和namespace相关的信息：
+    static __latent_entropy struct task_struct *copy_process(
+                        struct pid *pid,
+                        int trace,
+                        int node,
+                        struct kernel_clone_args *args)
+    {
+        int pidfd = -1, retval;
+        struct task_struct *p;
+        struct multiprocess_signals delayed;
+        struct file *pidfile = NULL;
+        u64 clone_flags = args->flags;
+        struct nsproxy *nsp = current->nsproxy;
+        /*
+         * Don't allow sharing the root directory with processes in a different
+         * namespace
+         */
+        if ((clone_flags & (CLONE_NEWNS|CLONE_FS)) == (CLONE_NEWNS|CLONE_FS))
+            return ERR_PTR(-EINVAL);
+        if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
+            return ERR_PTR(-EINVAL);
+    ......
+    }
+可以看到其实进程间的namespace可能具备某种继承关系，因此自然联想到系统0号进程，查阅相关资料发现存在init_task，它在内核刚启动的时候就进行了[初始化](https://elixir.bootlin.com/linux/latest/source/init/main.c#L938)，而且在[相关结构体](https://elixir.bootlin.com/linux/latest/source/init/init_task.c#L123)里面也确实找到了对于nsproxy的初始化：
+    ......
+        .nsproxy    = &init_nsproxy,
+    ......
+init_nsproxy的相关定义如下：
+    struct nsproxy init_nsproxy = {
+        .count          = ATOMIC_INIT(1),
+        .uts_ns         = &init_uts_ns,
+    #if defined(CONFIG_POSIX_MQUEUE) || defined(CONFIG_SYSVIPC)
+        .ipc_ns         = &init_ipc_ns,
+    #endif
+        .mnt_ns         = NULL,
+        .pid_ns_for_children    = &init_pid_ns,
+    #ifdef CONFIG_NET
+        .net_ns         = &init_net,
+    #endif
+    #ifdef CONFIG_CGROUPS
+        .cgroup_ns      = &init_cgroup_ns,
+    #endif
+    #ifdef CONFIG_TIME_NS
+        .time_ns        = &init_time_ns,
+        .time_ns_for_children   = &init_time_ns,
+    #endif
+    };
+可以发现，mnt_ns的相关初始化函数是NULL，因此mnt_ns并不继承父进程命名空间，回过头来看之前的copy_namespaces函数，发现其中存在[create_new_namespaces](https://elixir.bootlin.com/linux/latest/source/kernel/nsproxy.c#L67)函数调用，在其中发现mnt_namespace确实是通过[copy_mnt_ns](https://elixir.bootlin.com/linux/latest/source/fs/namespace.c#L3400)函数新创建的，至此我们已经大致了解了整个mnt_namespace的实现和创建流程。同时，通过copy_mnt_ns函数大致了解到，其实就是提供了独立的文件系统视图，设置各种挂载点，因此只要帮助绕过视图的影响就可以绕过mount
+namespace，所以符号链接攻击一直也是容器的痛点问题之一。
+### runC nsenter模块
+在查看runC源码的时候发现nsenter模块，改模块的主要实现使用C语言写的，而且只在init.go的import中被引入，因此它的执行顺序是很靠前的。
+    package nsenter
+    /*
+    #cgo CFLAGS: -Wall
+    extern void nsexec();
+    void __attribute__((constructor)) init(void) {
+        nsexec();
+    }
+    */
+    import "C"
+在import "C"前面紧跟注释是cgo的一种特殊语法，注释里面包含的都是c语言的语法
+## 漏洞分析
+在容器中执行docker run或者docker exec的时候，最终结果都是runC驱动执行用户想要执行的命令。同时，分析runC源码发现，无论是runC
+run还是runC exec，一个比较核心的思想就是创建一个runner结构体，然后调用其实现的run()函数：
+    func execProcess(context *cli.Context) (int, error) {
+        container, err := getContainer(context)
+        if err != nil {
+            return -1, err
+        }
+        status, err := container.Status()
+        if err != nil {
+            return -1, err
+        }
+        if status == libcontainer.Stopped {
+            return -1, errors.New("cannot exec in a stopped container")
+        }
+        if status == libcontainer.Paused && !context.Bool("ignore-paused") {
+            return -1, errors.New("cannot exec in a paused container (use --ignore-paused to override)")
+        }
+        path := context.String("process")
+        if path == "" && len(context.Args()) == 1 {
+            return -1, errors.New("process args cannot be empty")
+        }
+        state, err := container.State()
+        if err != nil {
+            return -1, err
+        }
+        bundle := utils.SearchLabels(state.Config.Labels, "bundle")
+        p, err := getProcess(context, bundle)
+        if err != nil {
+            return -1, err
+        }
+        cgPaths, err := getSubCgroupPaths(context.StringSlice("cgroup"))
+        if err != nil {
+            return -1, err
+        }
+        r := &runner{
+            enableSubreaper: false,
+            shouldDestroy:   false,
+            container:       container,
+            consoleSocket:   context.String("console-socket"),
+            detach:          context.Bool("detach"),
+            pidFile:         context.String("pid-file"),
+            action:          CT_ACT_RUN,
+            init:            false,
+            preserveFDs:     context.Int("preserve-fds"),
+            subCgroupPaths:  cgPaths,
+        }
+        return r.run(p)
+    }
+不过在此之前都会通过loadFactory类来创建基础的libcontainer以便和容器进行交互，在exec.go中，getContainer的一个重要功能就是创建libccontainer实例：
+    // loadFactory returns the configured factory instance for execing containers.
+    func loadFactory(context *cli.Context) (libcontainer.Factory, error) {
+        root := context.GlobalString("root")
+        abs, err := filepath.Abs(root)
+        if err != nil {
+            return nil, err
+        }
+        intelRdtManager := libcontainer.IntelRdtFs
+        // We resolve the paths for {newuidmap,newgidmap} from the context of runc,
+        // to avoid doing a path lookup in the nsexec context. TODO: The binary
+        // names are not currently configurable.
+        newuidmap, err := exec.LookPath("newuidmap")
+        if err != nil {
+            newuidmap = ""
+        }
+        newgidmap, err := exec.LookPath("newgidmap")
+        if err != nil {
+            newgidmap = ""
+        }
+        return libcontainer.New(abs, intelRdtManager,
+            libcontainer.CriuPath(context.GlobalString("criu")),
+            libcontainer.NewuidmapPath(newuidmap),
+            libcontainer.NewgidmapPath(newgidmap))
+    }
+在结尾的New函数中，可以看到runC存储了一个MagicLink作为InitPath:
+    // New returns a linux based container factory based in the root directory and
+    // configures the factory with the provided option funcs.
+    func New(root string, options ...func(*LinuxFactory) error) (Factory, error) {
+        if root != "" {
+            if err := os.MkdirAll(root, 0o700); err != nil {
+                return nil, err
+            }
+        }
+        l := &LinuxFactory{
+            Root:      root,
+            InitPath:  "/proc/self/exe",
+            InitArgs:  []string{os.Args[0], "init"},
+            Validator: validate.New(),
+            CriuPath:  "criu",
+        }
+        for _, opt := range options {
+            if opt == nil {
+                continue
+            }
+            if err := opt(l); err != nil {
+                return nil, err
+            }
+        }
+        return l, nil

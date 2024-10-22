@@ -1,0 +1,166 @@
+     binarySize = 0x1000
+     payloadOffset = 0x50
+     payloadSize = 0x100
+     sessionId = 0x41414141
+     ...
+     #...0x100 bytes...#
+    }
+有了以上的知识，我决定看看 Version 3 中的 DnD/CP 功能中是不是也存在类似的问题。令人惊讶的是，几乎相同的漏洞存在于 Version 3
+的代码中（这个漏洞最初通过逆向分析来发现，但是我们后来意识到 v3 的代码也在 open-vm-tools 的 git 仓库中）：
+    Bool  
+    DnD_TransportBufAppendPacket(DnDTransportBuffer *buf,          // IN/OUT  
+                                 DnDTransportPacketHeader *packet, // IN
+                                 size_t packetSize)                // IN
+    {
+       ASSERT(buf);
+       ASSERT(packetSize == (packet->payloadSize + DND_TRANSPORT_PACKET_HEADER_SIZE) &&
+              packetSize payloadSize + packet->offset) totalSize &&
+              packet->totalSize payloadSize + DND_TRANSPORT_PACKET_HEADER_SIZE) ||
+           packetSize > DND_MAX_TRANSPORT_PACKET_SIZE ||
+           (packet->payloadSize + packet->offset) > packet->totalSize || //[1]
+           packet->totalSize > DNDMSG_MAX_ARGSZ) {
+          goto error;
+       }
+       /*
+        * If seqNum does not match, it means either this is the first packet, or there
+        * is a timeout in another side. Reset the buffer in all cases.
+        */
+       if (buf->seqNum != packet->seqNum) {
+          DnD_TransportBufReset(buf);
+       }
+       if (!buf->buffer) {
+          ASSERT(!packet->offset);
+          if (packet->offset) {
+             goto error;
+          }
+          buf->buffer = Util_SafeMalloc(packet->totalSize);
+          buf->totalSize = packet->totalSize;
+          buf->seqNum = packet->seqNum;
+          buf->offset = 0;
+       }
+       if (buf->offset != packet->offset) {
+          goto error;
+       }
+       memcpy(buf->buffer + buf->offset,
+              packet->payload,
+              packet->payloadSize);
+       buf->offset += packet->payloadSize;
+       return TRUE;
+    error:  
+       DnD_TransportBufReset(buf);
+       return FALSE;
+    }
+Version 3 的 DnD/CP 在分片重组时，上面的函数会被调用。此处我们可以在[1]处看到与之前相同的情形，代码依然假设后续分片中的
+totalSize 会和第一个分片一致。因此这个漏洞可以用和之前相同的方法触发：
+    packet 1{  
+     ...
+     totalSize = 0x100
+     payloadOffset = 0
+     payloadSize = 0x50
+     seqNum = 0x41414141
+     ...
+     #...0x50 bytes...#
+    }
+    packet 2{  
+     ...
+     totalSize = 0x1000
+     payloadOffset = 0x50
+     payloadSize = 0x100
+     seqNum = 0x41414141
+     ...
+     #...0x100 bytes...#
+    }
+在 Pwn2Own
+这样的比赛中，这个漏洞是很弱的，因为它只是受到之前漏洞的启发，而且甚至可以说是同一个。因此，这样的漏洞在赛前被修补并不惊讶（好吧，也许我们并不希望这个漏洞在比赛前一天被修复）。对应的
+VMware
+安全公告在[这里](https://www.vmware.com/security/advisories/VMSA-2017-0005.html)。受到这个漏洞影响的
+VMWare Workstation Pro 最新版本是12.5.3。
+接下来，让我们看一看这个漏洞是如何被用来完成从 guest 到 host 的逃逸的！
+#### 4\. 漏洞利用
+为了实现代码执行，我们需要在堆上覆盖一个函数指针，或者破坏C++对象的虚表指针。
+首先让我们看一看如何将 DnD/CP 协议的设置为 version 3，依次发送下列 RPCI 命令即可：
+    tools.capability.dnd_version 3  
+    tools.capability.copypaste_version 3  
+    vmx.capability.dnd_version  
+    vmx.capability.copypaste_version  
+前两行消息分别设置了 DnD 和 Copy/Paste 的版本，后续两行用来查询版本，这是必须的，因为只有查询版本才会真正触发版本切换。RPCI 命令
+`vmx.capability.dnd_version` 会检查 DnD/CP 协议的版本是否已被修改，如果是，就会创建一个对应版本的C对象。对于
+version 3，2个大小为 0xA8 的C对象会被创建，一个用于 DnD 命令，另一个用于 Copy/Paste 命令。
+这个漏洞不仅可以让我们控制分配的大小和溢出的大小，而且能够让我们进行多次越界写。理想的话，我们可以用它分配大小为0xA8的内存块，并让它分配在C对象之前，然后利用堆溢出改写C对象的
+vtable 指针，使其指向可控内存，从而实现代码执行。
+这并非易事，在此之前我们必须解决一些其他问题。首先我们需要找到一个方法来绕过 ASLR，同时处理好Windows Low Fragmented Heap。
+##### 4.1 绕过ASLR
+一般来说，我们需要找到一个对象，通过溢出来影响它，然后实现信息泄露。例如破坏一个带有长度或者数据指针的对象，并且可以从guest读取，然而我们没有找到这种对象。于是我们逆向了更多的RPCI命令处理函数，来寻找可用的东西。那些成对的命令特别引人关注，例如你能用一个命令来设置一些数据，同时又能用相关命令来取回数据，最终我们找到的是一对命令info-set和info-get：
+    info-set guestinfo.KEY VALUE  
+    info-get guestinfo.KEY  
+VALUE 是一个字符串，字符串的长度可以控制堆上 buffer
+的分配长度，而且我们可以分配任意多的字符串。但是如何用这些字符串来泄露数据呢？我们可以通过溢出来覆盖结尾的null字节，让字符串连接上相邻的内存块。如果我们能够在发生溢出的内存块和
+DnD 或 CP 对象之间分配一个字符串，那么我们就能泄露对象的 vtable 地址，从而我们就可以知道 vmware-vmx 的地址。尽管 Windows
+的 LFH 堆分配存在随机化，但我们能够分配任意多的字符串，因此可以增加实现上述堆布局的可能性，但是我们仍然无法控制溢出buffer后面分配的是 DnD
+还是 CP 对象。经过我们的测试，通过调整一些参数，例如分配和释放不同数量的字符串，我们可以实现60%到80%的成功率。
+下图总结了我们构建的堆布局情况（Ov代表溢出内存块，S代表String，T代表目标对象）。
+我们的策略是：首先分配一些填满“A”的字符串，然后通过溢出写入一些“B”，接下来读取所有分配的字符串，其中含有“B”的就是被溢出的字符串。这样我们就找到了一个字符串可以被用来读取泄露的数据，然后以
+bucket 的内存块大小 0xA8 的粒度继续溢出，每次溢出后都检查泄露的数据。由于 DnD 和 CP 对象的 vtable 距离 vmware-vmx
+基地址的偏移是固定的，每次溢出后只需要检查最低一些数据位，就能够判断溢出是否到达了目标对象。
+##### 4.2 获取代码执行
+现在我们实现了信息泄露，也能知道溢出的是哪个C++对象，接下来要实现代码执行。我们需要处理两种情形：溢出 CopyPaste 和 DnD
+。需要指出的是能利用的代码路径有很多，我们只是选择了其中一个。
+###### 4.2.1 覆盖 CopyPaste 对象
+对于 CopyPaste
+对象，我们可以覆盖虚表指针，让它指向我们可控的其他数据。我们需要找到一个指针，指针指向的数据是可控并被用做对象的虚表。为此我们使用了另一个 RPCI 命令
+`unity.window.contents.start`。这个命令主要用于 Unity 模式下，在 host 上绘制一些图像。这个操作可以让我们往相对
+vmware-vmx
+偏移已知的位置写入一些数据。该命令接收的参数是图像的宽度和高度，二者都是32位，合并起来我们就在已知位置获得了一个64位的数据。我们用它来作为虚表中的一个指针，通过发送一个
+CopyPast 命令即可触发该虚函数调用，步骤如下：
+  * 发送 `unity.window.contents.start` 命令，通过指定参数宽度和高度，往全局变量处写入一个64位的栈迁移 gadget 地址
+  * 覆盖对象虚表指针，指向伪造的虚表（调整虚表地址偏移）
+  * 发送 CopyPaste 命令，触发虚函数调用
+  * ROP
+###### 4.2.2 覆盖DnD对象
+对于 DnD 对象，我们不能只覆盖 vtable 指针，因为在发生溢出之后 vtable 会立马被访问，另一个虚函数会被调用，而目前我们只能通过 unity
+图像的宽度和高度控制一个 qword，所以无法控制更大的虚表。
+让我们看一看 DnD 和 CP 对象的结构，总结如下（一些类似的结构可以在 open-vm-tools 中找到，但是在 vmware-vmx
+中会略有区别）：
+    DnD_CopyPaste_RpcV3{  
+        void * vtable;
+        ...
+        uint64_t ifacetype;
+        RpcUtil{
+            void * vtable;
+            RpcBase * mRpc;
+            DnDTransportBuffer{
+                uint64_t seqNum;
+                uint8_t * buffer;
+                uint64_t totalSize;
+                uint64_t offset;
+                ...
+            }
+            ...
+        }
+    }
+    RpcBase{  
+        void * vtable;
+        ...
+    }
+我们在此省略了结构中很多与本文无关的属性。对象中有个指针指向另一个C++对象 RpcBase，如果我们能用一个可控数据的指针的指针覆盖 mRpc
+这个域，那我们就控制了 RpcBase 的 vtable。对此我们可以继续使用 `unity.window.contents.start` 命令来来控制
+mRpc，该命令的另一个参数是 imgsize，这个参数代表分配的图像 buffer 的大小。这个 buffer 分配出来后，它的地址会存在 vmware-vmx 的固定偏移处。我们可以使用命令 `unity.window.contents.chunk` 来填充 buffer 的内容。步骤如下：
+  * 发送unity.window.contents.start命令来分配一个buffer，后续我们用它来存储一个伪造的vtable。
+  * 发送unity.window.contents.chunk命令来填充伪造的vtable，其中填入一个栈迁移的gadget
+  * 通过溢出覆盖DnD对象的mRpc域，让它指向存储buffer地址的地方（某全局变量处），即写入一个指针的指针
+  * 通过发送DnD命令来触发mRpc域的虚函数调用
+  * ROP
+P.S：vmware-vmx 进程中有一个可读可写可执行的内存页（至少在版本12.5.3中存在）。
+##### 4.3 稳定性讨论
+正如前面提及的，因为 Windows LFH 堆的随机化，当前的 exploit 无法做到 100% 成功率。不过可以尝试下列方法来提高成功率：
+  * 观察 0xA8 大小的内存分配，考虑是否可以通过一些malloc和free的调用来实现确定性的LFH分配，参考[这里](http://illmatics.com/Understanding_the_LFH.pdf)和[这里](https://www.blackhat.com/docs/us-16/materials/us-16-Yason-Windows-10-Segment-Heap-Internals-wp.pdf)。
+  * 寻找堆上的其他C++对象，尤其是那些可以在堆上喷射的
+  * 寻找堆上其他带有函数指针的对象，尤其是那些可以在堆上喷射的
+  * 找到一个独立的信息泄漏漏洞
+  * 打开更多脑洞
+##### 4.4 演示效果
+演示视频：[VMware workstation
+12.5.3逃逸演示](http://v.youku.com/v_show/id_XMjg3MjcwMzU4MA==.html?spm=a2h3j.8428770.3416059.1)
+#### 5\. 感想与总结
+“No pwn no fun”，如果你想参加 Pwn2Own 这样的比赛，你就需要准备多个漏洞，或者找到高质量的漏洞。
+* * *

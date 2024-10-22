@@ -1,0 +1,233 @@
+          users.id,  
+          title,  
+          tags,  
+          BODY,  
+          displayname,  
+          websiteurl,  
+          LOCATION,  
+          aboutme,  
+          age  
+   FROM posts  
+   JOIN users ON posts.owneruserid = users.id) t;  
+```  
+The processing is quite long because the two tables involved total nearly 40GB.  
+So I get a 40GB table that looks like this:  
+```  
+ \dt+ json_stack  
+                      List of relations  
+ Schema |    Name    | Type  |  Owner   | Size  | Description  
+--------+------------+-------+----------+-------+-------------  
+ public | json_stack | table | postgres | 40 GB |  
+(1 row)  
+\d json_stack  
+             Table "public.json_stack"  
+ Column  |  Type   | Collation | Nullable | Default  
+---------+---------+-----------+----------+---------  
+ post_id | integer |           |          |  
+ json    | jsonb   |           |          |  
+select post_id,jsonb_pretty(json) from json_stack  
+    where json_displayname(json) = 'anayrat' limit 1;  
+ post_id  |  
+----------+-----------------------------------------------------------------------------------------  
+ 26653490 | {  
+          |     "id": 4197886,  
+          |     "age": null,  
+          |     "body": "I have an issue with date filter. I follow [...]  
+          |     "tags": "",  
+          |     "title": "Logstash date filter failed parsing",  
+          |     "aboutme": "Sysadmin, Postgres DBA\n",  
+          |     "post_id": 26653490,  
+          |     "location": "Valence",  
+          |     "websiteurl": "https://blog.anayrat.info",  
+          |     "displayname": "anayrat",  
+          |     "owneruserid": 4197886  
+          | }  
+```  
+#### Operators and indexing for JSONB  
+PostgreSQL provides several operators for querying JSONB 1. We will use the operator @>.  
+It is also possible to index JSONB using GIN indexes:  
+```  
+create index ON json_stack using gin (json );  
+```  
+Finally, here is an example of query:  
+```  
+explain (analyze,buffers)  select * from json_stack  
+    where json @>  '{"displayname":"anayrat"}'::jsonb;  
+                                  QUERY PLAN  
+---------------------------------------------------------------------------------------  
+ Bitmap Heap Scan on json_stack  
+                (cost=286.95..33866.98 rows=33283 width=1011)  
+                (actual time=0.099..0.102 rows=2 loops=1)  
+   Recheck Cond: (json @> '{"displayname": "anayrat"}'::jsonb)  
+   Heap Blocks: exact=2  
+   Buffers: shared hit=17  
+   ->  Bitmap Index Scan on json_stack_json_idx  
+                          (cost=0.00..278.62 rows=33283 width=0)  
+                          (actual time=0.092..0.092 rows=2 loops=1)  
+         Index Cond: (json @> '{"displayname": "anayrat"}'::jsonb)  
+         Buffers: shared hit=15  
+ Planning time: 0.088 ms  
+ Execution time: 0.121 ms  
+(9 rows)  
+```  
+Reading this plan we see that postgres is completely wrong. He estimates getting 33,283 lines, but the query returns only two rows. The error factor is around 15,000!  
+#### Selectivity on JSONB  
+What is the cardinality of the table? The information is contained in the system catalog:  
+```  
+select reltuples from pg_class where relname = 'json_stack';  
+  reltuples  
+-------------  
+ 3.32833e+07  
+```  
+What is the estimated selectivity?  
+```  
+select 33283 / 3.32833e+07;  
+        ?column?  
+------------------------  
+ 0.00099999098647069251  
+```  
+Arround 0.001.  
+#### Diving in the code  
+I had fun taking out the debugger GDB to find out where this number could come from. I ended up arriving in this function:  
+```  
+[...]  
+79 /*  
+80  *  contsel -- How likely is a box to contain (be contained by) a given box?  
+81  *  
+82  * This is a tighter constraint than "overlap", so produce a smaller  
+83  * estimate than areasel does.  
+84  */  
+85  
+86 Datum  
+87 contsel(PG_FUNCTION_ARGS)  
+88 {  
+89     PG_RETURN_FLOAT8(0.001);  
+90 }  
+[...]  
+```  
+The selectivity depends on the type of the operator. Let’s look in the system catalog:  
+```  
+select oprname,typname,oprrest from pg_operator op  
+    join pg_type typ ON op.oprleft= typ.oid where oprname = '@>';  
+ oprname | typname  |   oprrest  
+---------+----------+--------------  
+ @>      | polygon  | contsel  
+ @>      | box      | contsel  
+ @>      | box      | contsel  
+ @>      | path     | -  
+ @>      | polygon  | contsel  
+ @>      | circle   | contsel  
+ @>      | _aclitem | -  
+ @>      | circle   | contsel  
+ @>      | anyarray | arraycontsel  
+ @>      | tsquery  | contsel  
+ @>      | anyrange | rangesel  
+ @>      | anyrange | rangesel  
+ @>      | jsonb    | contsel  
+```  
+There are several types, in fact the operator ```@>``` means (roughly): “Does the object on the left contain the right element?”. It is used for different types: geometry, array …  
+In our case, does the left JSONB object contain the ```''{" displayname ":" anayrat "}''``` element?  
+A JSON object is a special type. Determining the selectivity of an element would be quite complex. The comment is quite explicit:  
+```  
+ 25 /*  
+ 26  *  Selectivity functions for geometric operators.  These are bogus -- unless  
+ 27  *  we know the actual key distribution in the index, we can't make a good  
+ 28  *  prediction of the selectivity of these operators.  
+ 29  *  
+ 30  *  Note: the values used here may look unreasonably small.  Perhaps they  
+ 31  *  are.  For now, we want to make sure that the optimizer will make use  
+ 32  *  of a geometric index if one is available, so the selectivity had better  
+ 33  *  be fairly small.  
+[...]  
+```  
+It is therefore not possible (currently) to determine the selectivity of JSONB objects.  
+But all is not lost   
+### Functional indexes  
+PostgreSQL permits to creates so-called functional indexes. We create an index on a fonction.  
+You’re going to say, “Yes, but we do not need it.” In your example, postgres is already using an index.  
+That’s right, the difference is that postgres collects statistics about this index. As if the result of the function was a new column.  
+#### Creating the function and the index  
+It is very simple :  
+```  
+CREATE or replace FUNCTION json_displayname (jsonb )  
+RETURNS text  
+AS $$  
+select $1->>'displayname'  
+$$  
+LANGUAGE SQL IMMUTABLE PARALLEL SAFE  
+;  
+create index ON json_stack (json_displayname(json));  
+```  
+#### Search using a function  
+To use the index we just created, use it in the query:  
+```  
+explain (analyze,verbose,buffers) select * from json_stack  
+        where json_displayname(json) = 'anayrat';  
+                        QUERY PLAN  
+----------------------------------------------------------------------------  
+ Index Scan using json_stack_json_displayname_idx on public.json_stack  
+            (cost=0.56..371.70 rows=363 width=1011)  
+            (actual time=0.021..0.023 rows=2 loops=1)  
+   Output: post_id, json  
+   Index Cond: ((json_stack.json ->> 'displayname'::text) = 'anayrat'::text)  
+   Buffers: shared hit=7  
+ Planning time: 0.107 ms  
+ Execution time: 0.037 ms  
+(6 rows)  
+```  
+This time postgres estimates to get 363 rows, which is much closer to the final result (2).  
+#### Another example and selectivity calculation  
+This time we will search on the “age” field of the JSON object:  
+```  
+explain (analyze,buffers)  select * from json_stack  
+      where json @>  '{"age":27}'::jsonb;  
+                      QUERY PLAN  
+---------------------------------------------------------------------  
+ Bitmap Heap Scan on json_stack  
+        (cost=286.95..33866.98 rows=33283 width=1011)  
+        (actual time=667.411..12723.906 rows=804630 loops=1)  
+   Recheck Cond: (json @> '{"age": 27}'::jsonb)  
+   Rows Removed by Index Recheck: 2211190  
+   Heap Blocks: exact=391448 lossy=344083  
+   Buffers: shared hit=576350 read=881510  
+   I/O Timings: read=2947.458  
+   ->  Bitmap Index Scan on json_stack_json_idx  
+        (cost=0.00..278.62 rows=33283 width=0)  
+        (actual time=562.648..562.648 rows=804644 loops=1)  
+         Index Cond: (json @> '{"age": 27}'::jsonb)  
+         Buffers: shared hit=9612 read=5140  
+         I/O Timings: read=11.195  
+ Planning time: 0.073 ms  
+ Execution time: 12809.392 ms  
+(12 lignes)  
+set work_mem = '100MB';  
+explain (analyze,buffers)  select * from json_stack  
+      where json @>  '{"age":27}'::jsonb;  
+                      QUERY PLAN  
+---------------------------------------------------------------------  
+ Bitmap Heap Scan on json_stack  
+        (cost=286.95..33866.98 rows=33283 width=1011)  
+        (actual time=748.968..5720.628 rows=804630 loops=1)  
+   Recheck Cond: (json @> '{"age": 27}'::jsonb)  
+   Rows Removed by Index Recheck: 14  
+   Heap Blocks: exact=735531  
+   Buffers: shared hit=123417 read=780542  
+   I/O Timings: read=1550.124  
+   ->  Bitmap Index Scan on json_stack_json_idx  
+        (cost=0.00..278.62 rows=33283 width=0)  
+        (actual time=545.553..545.553 rows=804644 loops=1)  
+         Index Cond: (json @> '{"age": 27}'::jsonb)  
+         Buffers: shared hit=9612 read=5140  
+         I/O Timings: read=11.265  
+ Planning time: 0.079 ms  
+ Execution time: 5796.219 ms  
+(12 lignes)  
+```  
+In this example we see that postgres still estimates 33,283 records. Out he gets 804 644. This time he is too much optimistic.  
+P.S: In my example you will see that I run the same query by modifying ```work_mem```. This is to prevent the bitmap from being [lossy](https://blog.anayrat.info/en/2017/11/26/postgresql---jsonb-and-statistics/#fn:2)  
+As seen above we can create a function:  
+```  
+CREATE or replace FUNCTION json_age (jsonb )  
+RETURNS text  
+AS $$  
+select $1->>'age'  

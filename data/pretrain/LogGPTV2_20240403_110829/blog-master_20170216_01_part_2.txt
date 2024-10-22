@@ -1,0 +1,186 @@
+			 * - but seems safer to let them be archived and removed later.  
+			 */  
+			if (!XLogArchiveIsReady(xlde->d_name))  
+				RemoveXlogFile(xlde->d_name, switchpoint);  
+		}  
+	}  
+...  
+```  
+5\. 什么时候标记.ready, .done呢？  
+如果开启了归档，当切换xlog时，会记录.ready和.done  
+什么时候清除.ready, .done归档标记呢？  
+在每次归档命令被执行后，会触发清除标签的动作，在执行检查点时，也会在调用remove xlog函数时触发清除归档标签文件的动作。  
+5\.1 清除归档标记文件，  
+src/backend/postmaster/pgarch.c  
+```  
+/*  
+ * pgarch_ArchiverCopyLoop  
+ *  
+ * Archives all outstanding xlogs then returns  
+ */  
+static void  
+pgarch_ArchiverCopyLoop(void)  
+{  
+	char		xlog[MAX_XFN_CHARS + 1];  
+	/*  
+	 * loop through all xlogs with archive_status of .ready and archive  
+	 * them...mostly we expect this to be a single file, though it is possible  
+	 * some backend will add files onto the list of those that need archiving  
+	 * while we are still copying earlier archives  
+	 */  
+	while (pgarch_readyXlog(xlog))  
+	{  
+		int			failures = 0;  
+		for (;;)  
+		{  
+			/*  
+			 * Do not initiate any more archive commands after receiving  
+			 * SIGTERM, nor after the postmaster has died unexpectedly. The  
+			 * first condition is to try to keep from having init SIGKILL the  
+			 * command, and the second is to avoid conflicts with another  
+			 * archiver spawned by a newer postmaster.  
+			 */  
+			if (got_SIGTERM || !PostmasterIsAlive())  
+				return;  
+			/*  
+			 * Check for config update.  This is so that we'll adopt a new  
+			 * setting for archive_command as soon as possible, even if there  
+			 * is a backlog of files to be archived.  
+			 */  
+			if (got_SIGHUP)  
+			{  
+				got_SIGHUP = false;  
+				ProcessConfigFile(PGC_SIGHUP);  
+			}  
+			/* can't do anything if no command ... */  
+			if (!XLogArchiveCommandSet())   // 如果设置了archive_mod=on, 但是没有设置archive_command,则不会进行拷贝，也不会清理pg_xlog目录下的旧文件  
+			{  
+				ereport(WARNING,  
+						(errmsg("archive_mode enabled, yet archive_command is not set")));  
+				return;  
+			}  
+			if (pgarch_archiveXlog(xlog))  
+			{  
+				/* successful */  
+				pgarch_archiveDone(xlog);   // 如果归档成功，则紧接着会清理pg_xlog目录中归档成功的文件.    
+				/*  
+				 * Tell the collector about the WAL file that we successfully  
+				 * archived  
+				 */  
+				pgstat_send_archiver(xlog, false);  
+				break;			/* out of inner retry loop */  
+			}  
+			else  
+			{  
+				/*  
+				 * Tell the collector about the WAL file that we failed to  
+				 * archive  
+				 */  
+				pgstat_send_archiver(xlog, true);  
+				if (++failures >= NUM_ARCHIVE_RETRIES)  
+				{  
+					ereport(WARNING,  
+							(errmsg("archiving transaction log file \"%s\" failed too many times, will try again later",  
+									xlog)));  
+					return;		/* give up archiving for now */  
+				}  
+				pg_usleep(1000000L);	/* wait a bit before retrying */  
+			}  
+		}  
+	}  
+}  
+```  
+src/backend/access/transam/xlogarchive.c  
+```  
+/*  
+ * XLogArchiveCheckDone  
+ *  
+ * This is called when we are ready to delete or recycle an old XLOG segment  
+ * file or backup history file.  If it is okay to delete it then return true.  
+ * If it is not time to delete it, make sure a .ready file exists, and return  
+ * false.  
+ *  
+ * If .done exists, then return true; else if .ready exists,  
+ * then return false; else create .ready and return false.  
+ *  
+ * The reason we do things this way is so that if the original attempt to  
+ * create .ready fails, we'll retry during subsequent checkpoints.  
+ */  
+bool  
+XLogArchiveCheckDone(const char *xlog)  
+{  
+        char            archiveStatusPath[MAXPGPATH];  
+        struct stat stat_buf;  
+        /* Always deletable if archiving is off */  
+        if (!XLogArchivingActive())  
+                return true;  
+        /* First check for .done --- this means archiver is done with it */  
+        StatusFilePath(archiveStatusPath, xlog, ".done");  
+        if (stat(archiveStatusPath, &stat_buf) == 0)  
+                return true;  
+        /* check for .ready --- this means archiver is still busy with it */  
+        StatusFilePath(archiveStatusPath, xlog, ".ready");  
+        if (stat(archiveStatusPath, &stat_buf) == 0)  
+                return false;  
+        /* Race condition --- maybe archiver just finished, so recheck */  
+        StatusFilePath(archiveStatusPath, xlog, ".done");  
+        if (stat(archiveStatusPath, &stat_buf) == 0)  
+                return true;  
+        /* Retry creation of the .ready file */  
+        XLogArchiveNotify(xlog);  
+        return false;  
+}  
+/*  
+ * pgarch_archiveDone  
+ *  
+ * Emit notification that an xlog file has been successfully archived.  
+ * We do this by renaming the status file from NNN.ready to NNN.done.  
+ * Eventually, a checkpoint process will notice this and delete both the  
+ * NNN.done file and the xlog file itself.  
+ */  
+static void  
+pgarch_archiveDone(char *xlog)  
+{  
+        char            rlogready[MAXPGPATH];  
+        char            rlogdone[MAXPGPATH];  
+        StatusFilePath(rlogready, xlog, ".ready");  // 清理.ready文件  
+        StatusFilePath(rlogdone, xlog, ".done");    
+        (void) durable_rename(rlogready, rlogdone, WARNING);  
+}  
+```  
+## 如何人为清理xlog文件  
+如果你的数据库配置不当，导致xlog文件堆积的话，如何人为的处理呢？  
+比如你配置了archive_mode=on，但是没有配置archive_command，那么xlog文件会一直堆积（xlog写完后，会写.ready，但是由于没有配置archive_command，也就是说不会触发归档命令，所以一直都不会写.done）。  
+从而导致xlog一直不会被清理。  
+手工清理的方法很简单，只要找到那些XLOG是可以被删除的就好了。  
+然后使用pg_archivecleanup命令来清理  
+1\. 读取控制文件，找到哪个文件是可以被清理的？  
+```  
+pg_controldata $PGDATA  
+Latest checkpoint location:           1/E000028  
+Prior checkpoint location:            1/D18C068  
+Latest checkpoint's REDO location:    1/E000028  
+Latest checkpoint's REDO WAL file:    00000001000000010000000E  
+表示00000001000000010000000E之前的xlog文件可以删除  
+```  
+2\. 使用pg_archivecleanup清理pg_xlog目录  
+```  
+pg_archivecleanup -d $PGDATA/pg_xlog 00000001000000010000000E  
+pg_archivecleanup: keep WAL file "/disk1/digoal/pgdata/pg_root1921/pg_xlog/00000001000000010000000E" and later  
+pg_archivecleanup: removing file "/disk1/digoal/pgdata/pg_root1921/pg_xlog/00000001000000010000000D"  
+```  
+用法参考  
+https://www.postgresql.org/docs/9.6/static/pgarchivecleanup.html  
+## 参考  
+https://www.postgresql.org/docs/9.6/static/pgarchivecleanup.html  
+src/backend/access/transam/xlogarchive.c  
+src/backend/postmaster/pgarch.c  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

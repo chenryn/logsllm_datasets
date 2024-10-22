@@ -1,0 +1,204 @@
+# Linux内核中利用msg_msg结构实现任意地址读写
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+题目及exp下载 —— 
+**介绍** ：本文示例是来自`corCTF 2021`中 的两个内核题，由 [BitsByWill](https://www.willsroot.io/)
+和 [D3v17](https://syst3mfailure.io/)
+所出。针对UAF漏洞，漏洞对象从`kmalloc-64`到`kmalloc-4096`，都能利用 `msg_msg`
+结构实现任意写。本驱动是基于[NetFilter](https://linux-kernel-labs.github.io/refs/heads/master/labs/networking.html#netfilter)所写，有两个模式，简单模式（对应题目`Fire_of_Salvation`）和复杂模式（对应题目`Wall_of_Perdition`），所用的内核bzImage相同。二者的区别是，简单模式下，`rule_t`
+规则结构包含长度 0x800 的字符串成员 `rule_t->desc`，漏洞对象位于`kmalloc-4k`，复杂模式下`rule_t` 规则
+也即漏洞对象位于`kmalloc-64`。
+**总结**
+：如果UAF的漏洞对象是`kmalloc-4096`，就很容易构造重叠的漏洞对象和`msg_msg`结构消息块（都位于`kmalloc-4096`），篡改`msg_msg->m_ts`和`msg_msg->next`实现
+**任意地址读写** 。
+如果UAF的漏洞对象小于`kmalloc-4096`，例如`kmalloc-64`，则可以先构造重叠的漏洞对象和`msg_msg`结构消息块（都位于`kmalloc-64`），篡改`msg_msg->m_ts`和`msg_msg->next`实现
+**越界读** 和 **任意地址读** ；然后篡改`msg_msg->next`实现 **任意地址释放**
+，再构造重叠的消息块（位于`kmalloc-4096`的`msg_msgseg`消息和`msg_msg`消息），利用userfault用户页错误处理控制消息写入的时机，篡改`msg_msg->next`指针指向cred地址，实现
+**任意地址写** 。
+注意，调用`msgrcv()`读取内核数据时，如果带上`MSG_COPY`标志，就能避免内核unlink消息，以避免第一次泄露地址时未正确伪造`msg_msg->m_list.next`和`msg_msg->m_list.prev`导致unlink时崩溃。
+**缓解机制** ：开启 CONFIG_SLAB_FREELIST_RANDOM 机制后，就能阻止该利用，但其实
+CONFIG_SLAB_FREELIST_RANDOM
+只能降低第2题泄露地址的成功率，但是泄露失败后程序会停止，泄露成功后程序会提权成功，所以多试几次就能提权成功了。
+* * *
+## 1\. 漏洞分析
+**代码分析** ：共5个函数功能，用户通过传入 `user_rule_t` 结构来创建路由规则并存入 `rule_t` 结构中，多条进出处理规则分别存入
+`firewall_rules_in` 和 `firewall_rules_out` 全局数组中（每个数组最多存0x80条规则）。
+  * `firewall_add_rule()`——添加一条规则。`rule_t` 规则结构如下。 
+        typedef struct
+    {
+        char iface[16];            // 设备名
+        char name[16];            // 规则名
+        uint32_t ip;
+        uint32_t netmask;
+        uint16_t proto;            // 只能是 TCP 或 UDP
+        uint16_t port;
+        uint8_t action;            // 只能是 DROP 或 ACCEPT
+        uint8_t is_duplicated;
+        #ifdef EASY_MODE
+        char desc[DESC_MAX];
+        #endif
+    } rule_t;
+  * `firewall_delete_rule()`——释放规则，并将全局数组上对应的指针清0。
+  * `firewall_show_rule()`——未实现。
+  * `firewall_edit_rule()`——编辑规则。
+  * `firewall_dup_rule()`——复制规则，将`firewall_rules_in` 指针复制到`firewall_rules_out` 数组，或者相反。每条规则只能复制一次，通过`rule_t->is_duplicated`来记录是否被复制过。漏洞就在这里， **可以先复制规则，再释放规则，导致UAF或double-free，只能写不能读，而且只能UAF写 0x28 – 0x30 字节** 。
+  * `process_rule()`处理规则：（本函数与漏洞利用无关）`nf_register_net_hook()`——[NetFilter hooks](https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks)注册钩子函数。`nf_hook_ops` 是注册的钩子函数的核心结构。本驱动的钩子点是`NF_INET_PRE_ROUTING` 和 `NF_INET_POST_ROUTING`，应该是分别在在路由前和路由后执行钩子函数 `firewall_inbound_hook()` 和 `firewall_outbound_hook()` 函数。钩子函数 `firewall_inbound_hook()` 和 `firewall_outbound_hook()` 函数在收到进出的 `sk_buff` 数据后，分别按照进出规则调用 `process_rule()` 函数来处理数据。 
+    * 首先设备名`skb->dev->name` 和 `rule_t->ifaces` 要匹配；
+    * 如果是进数据，则源ip所属的子网要匹配；如果是出数据，则目的ip所属的子网要匹配；
+    * 如果是TCP数据包，`rule_t->port` 要和目标端口匹配，`rule_t->action` 要为`NF_DROP` 或 `NF_ACCEPT` 接收状态，打印信息。
+    * 如果是UDP数据包，`rule_t->port` 要和目标端口匹配，`rule_t->action` 要为`NF_DROP` 或 `NF_ACCEPT` 接收状态，打印信息。
+**漏洞** ：只能UAF写 0x28 – 0x30 字节，不能UAF读，因为没有实现`firewall_show_rule()`功能。
+**保护机制** ：SMAP/SMEP/KPTI, `FG-KASLR`, `SLAB_RANDOM`, `SLAB_HARDENED`,
+`STATIC_USERMODE_HELPER`。使用SLAB分配器。可以从给出的配置文件中看出，允许`userfaultfd`
+调用、`hardened_usercopy`、`CHECKPOINT_RESTORE`。
+**利用局限** ：
+  * 由于使用了SLAB分配器，所以chunk上没有 freelist 指针（即便有freelist指针，也不在前0x30用户可控的区域，可能内核把freelist指针后移了）；
+  * `FG-KASLR`机制会阻碍你覆盖内核结构上的函数指针，例如`sk_buff`结构中的`destructor arg`回调函数指针，多数不在`.text`前面的gadget受到影响；ROP还能用，不过必须先任意读`ksymtab`泄露所在函数的地址；
+  * 设置`CONFIG_STATIC_USERMODEHELPER`，使得覆盖[`modprobe_path`](https://elixir.bootlin.com/linux/v5.8/source/kernel/kmod.c#L62)或[`core_pattern`](https://elixir.bootlin.com/linux/v5.8/source/fs/coredump.c#L57)的方法不再适用；physmap喷射可用，但是不稳定；综上，绕过SMAP最直接的方法是构造任意读，来读取task双链表，找到当前的task并覆盖cred。
+* * *
+## 2\. 内核IPC——msgsnd()与msgrcv()源码分析
+**介绍** ：内核提供了两个syscall来进行IPC通信， [msgsnd()](https://linux.die.net/man/2/msgsnd)
+和 [msgrcv()](https://linux.die.net/man/2/msgrcv)，内核消息包含两个部分，消息头
+[msg_msg](https://elixir.bootlin.com/linux/v5.8/source/include/linux/msg.h#L9)
+结构和紧跟的消息数据。长度从`kmalloc-64` 到 `kmalloc-4096`。消息头
+[msg_msg](https://elixir.bootlin.com/linux/v5.8/source/include/linux/msg.h#L9)
+结构如下所示。
+    struct msg_msg {
+        struct list_head m_list;
+        long m_type;
+        size_t m_ts;        /* message text size */
+        struct msg_msgseg *next;
+        void *security;        // security指针总为0，因为未开启SELinux
+        /* the actual message follows immediately */
+    };
+### 2.1 `msgsnd()` 数据发送
+**总体流程** ：当调用 [msgsnd()](https://linux.die.net/man/2/msgsnd) 来发送消息时，调用
+[msgsnd()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L966) ->
+[ksys_msgsnd()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L953)
+-> [do_msgsnd()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L840)
+->
+[load_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L84)
+->
+[alloc_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L46)
+来分配消息头和消息数据，然后调用
+[load_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L84)
+-> `copy_from_user()` 来将用户数据拷贝进内核。
+**示例** ：例如，如果想要发送一个包含 0x1fc8 个
+`A`的消息，用户态首先调用[msgget()](https://linux.die.net/man/2/msgget) 创建消息队列，然后调用
+`msgsnd()`发送数据：
+    [...]
+    struct msgbuf
+    {
+        long mtype;
+        char mtext[0x1fc8];
+    } msg;
+    msg.mtype = 1;
+    memset(msg.mtext, 'A', sizeof(msg.mtext));
+    qid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT));
+    msgsnd(qid, &msg, sizeof(msg.mtext), 0);
+    [...]
+**创建消息** ：
+[do_msgsnd()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L840) ->
+[load_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L84)
+->
+[alloc_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L46)
+。总结，如果消息长度超过0xfd0，则分段存储，采用单链表连接，第1个称为消息头，用
+[msg_msg](https://elixir.bootlin.com/linux/v5.8/source/include/linux/msg.h#L9)
+结构存储；第2、3个称为segment，用
+[msg_msgseg](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L37)
+结构存储。消息的最大长度由 `/proc/sys/kernel/msgmax` 确定， 默认大小为 8192 字节，所以最多链接3个成员。
+    static struct msg_msg *alloc_msg(size_t len)
+    {
+        struct msg_msg *msg;
+        struct msg_msgseg **pseg;
+        size_t alen;
+        alen = min(len, DATALEN_MSG);                             // [1] len 是用户提供的数据size，本例中为0x1fc8。 DATALEN_MSG = ((size_t)PAGE_SIZE - sizeof(struct msg_msg)) = 0x1000-0x30 = 0xfd0。 本例中 alen = 0xfd0
+        msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL_ACCOUNT); // [2] 这里分配 0x1000 堆块，对应 kmalloc-4096
+        if (msg == NULL)
+            return NULL;
+        msg->next = NULL;
+        msg->security = NULL;
+        len -= alen;                                             // [3] 待分配的size，继续分配，用单链表存起来。 len = 0x1fc8-0xfd0 = 0xff8
+        pseg = &msg->next;
+        while (len > 0) {
+            struct msg_msgseg *seg;
+            cond_resched();
+            alen = min(len, DATALEN_SEG);                         // [4] DATALEN_SEG = ((size_t)PAGE_SIZE - sizeof(struct msg_msgseg)) = 0x1000-0x8 = 0xff8。 alen = 0xff8
+            seg = kmalloc(sizeof(*seg) + alen, GFP_KERNEL_ACCOUNT); // [5] 还是分配 0x1000，位于kmalloc-4096
+            if (seg == NULL)
+                goto out_err;
+            *pseg = seg;                                         // [6] 单链表串起来
+            seg->next = NULL;
+            pseg = &seg->next;
+            len -= alen;
+        }
+        return msg;
+    out_err:
+        free_msg(msg);
+        return NULL;
+    }
+**拷贝消息** ：
+[do_msgsnd()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L840) ->
+[load_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L84)
+-> `copy_from_user()` 。将消息从用户空间拷贝到内核空间。
+    struct msg_msg *load_msg(const void __user *src, size_t len)
+    {
+        struct msg_msg *msg;
+        struct msg_msgseg *seg;
+        int err = -EFAULT;
+        size_t alen;
+        msg = alloc_msg(len);                         // [1]
+        if (msg == NULL)
+            return ERR_PTR(-ENOMEM);
+        alen = min(len, DATALEN_MSG);
+        if (copy_from_user(msg + 1, src, alen))     // [2] 从用户态拷贝数据，0xfd0字节
+            goto out_err;
+        for (seg = msg->next; seg != NULL; seg = seg->next) {
+            len -= alen;
+            src = (char __user *)src + alen;
+            alen = min(len, DATALEN_SEG);
+            if (copy_from_user(seg + 1, src, alen)) // [3] 剩下的拷贝到其他segment，0xff8字节
+                goto out_err;
+        }
+        err = security_msg_msg_alloc(msg);
+        if (err)
+            goto out_err;
+        return msg;
+    out_err:
+        free_msg(msg);
+        return ERR_PTR(err);
+    }
+**内核消息结构** ：
+### 2.2 `msgsrv()` 数据接收
+**总体流程** ：
+[msgrcv()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1265) ->
+[ksys_msgrcv()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1256)
+-> [do_msgrcv()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1090)
+-> [find_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1066)
+&
+[do_msg_fill()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1018)
+&
+[free_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L169)。
+调用 [find_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1066)
+来定位正确的消息，将消息从队列中unlink，再调用
+[do_msg_fill()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msg.c#L1018)
+->
+[store_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L150)
+来将内核数据拷贝到用户空间，最后调用
+[free_msg()](https://elixir.bootlin.com/linux/v5.8/source/ipc/msgutil.c#L169)
+释放消息。
+    long ksys_msgrcv(int msqid, struct msgbuf __user *msgp, size_t msgsz,
+             long msgtyp, int msgflg)
+    {
+        return do_msgrcv(msqid, msgp, msgsz, msgtyp, msgflg, do_msg_fill);
+    }
+    static long do_msgrcv(int msqid, void __user *buf, size_t bufsz, long msgtyp, int msgflg,
+               long (*msg_handler)(void __user *, struct msg_msg *, size_t))
+    {        // 注意：msg_handler 参数实际指向 do_msg_fill() 函数
+        int mode;
+        struct msg_queue *msq;
+        struct ipc_namespace *ns;
+        struct msg_msg *msg, *copy = NULL;
+        DEFINE_WAKE_Q(wake_q);
+        ... ...

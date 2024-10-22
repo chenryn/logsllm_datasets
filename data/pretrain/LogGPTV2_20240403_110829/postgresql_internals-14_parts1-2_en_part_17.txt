@@ -1,0 +1,290 @@
+makesthesolutionmoreexpensiveandcomplicated,suchmeasuresmayturnout
+tobeindispensable.
+Insomecases,longtransactionsaretheresultofapplicationordriverbugsrather
+thananecessity.Ifanissuecannotberesolvedinacivilizedway,theadministrator
+canresorttothefollowingtwoparameters:
+1 github.com/reorg/pg_repack
+2 github.com/dataegret/pgcompacttable
+157
+Chapter8. RebuildingTablesandIndexes
+v.. • The old_snapshot_threshold parameter defines the maximum lifetime of a
+snapshot. Once this time is up,the server has the right to remove outdated
+tuples; if a long-running transaction still requires them, it will get an error
+(“snapshottooold”).
+v.. • Theidle_in_transaction_session_timeoutparameterlimitsthelifetimeofanidle
+transaction.Thetransactionisaborteduponreachingthisthreshold.
+Data Updates
+Anotherreasonforbloatingissimultaneousmodificationofalargenumberoftu-
+ples.Ifalltablerowsgetupdated,thenumberoftuplescandouble,andvacuuming
+willnothaveenoughtimetointerfere.Pagepruningcanreducethisproblem,but
+notresolveitentirely.
+Let’sextendtheoutputwithanothercolumntokeeptrackoftheprocessedrows:
+=> ALTER TABLE vac ADD processed boolean DEFAULT false;
+=> SELECT pg_size_pretty(pg_table_size('vac'));
+pg_size_pretty
+−−−−−−−−−−−−−−−−
+6936 kB
+(1 row)
+Oncealltherowsareupdated,thetablegetsalmosttwotimesbigger:
+=> UPDATE vac SET processed = true;
+UPDATE 50000
+=> SELECT pg_size_pretty(pg_table_size('vac'));
+pg_size_pretty
+−−−−−−−−−−−−−−−−
+14 MB
+(1 row)
+To address this situation,you can reduce the number of changes performed by a
+singletransaction,spreadingthemoutovertime;thenvacuumingcandeleteout-
+datedtuplesandfreesomespacefornewoneswithinthealreadyexistingpages.
+Assumingthateachrowupdatecanbecommittedseparately,wecanusethefol-
+lowingquerythatselectsabatchofrowsofthespecifiedsizeasatemplate:
+158
+8.3. PreventiveMeasures
+SELECT ID
+FROM table
+WHERE filtering the already processed rows
+LIMIT batch size
+FOR UPDATE SKIP LOCKED
+This code snippet selects and immediately locks a set of rows that does not ex-
+ceedthespecifiedsize.Therowsthatarealreadylockedbyothertransactionsare
+skipped: theywillgetintoanotherbatchnexttime. Itisaratherflexibleandcon-
+venient solution that allows you to easily change the batch size and restart the
+operationincaseofafailure.Let’sunsettheprocessedattributeandperformfull
+vacuumingtorestoretheoriginalsizeofthetable:
+=> UPDATE vac SET processed = false;
+=> VACUUM FULL vac;
+Oncethefirstbatchisupdated,thetablesizegrowsabit:
+=> WITH batch AS (
+SELECT id FROM vac WHERE NOT processed LIMIT 1000
+FOR UPDATE SKIP LOCKED
+)
+UPDATE vac SET processed = true
+WHERE id IN (SELECT id FROM batch);
+UPDATE 1000
+=> SELECT pg_size_pretty(pg_table_size('vac'));
+pg_size_pretty
+−−−−−−−−−−−−−−−−
+7064 kB
+(1 row)
+Butfromnowon,thesizeremainsalmostthesamebecausenewtuplesreplacethe
+removedones:
+=> VACUUM vac;
+=> WITH batch AS (
+SELECT id FROM vac WHERE NOT processed LIMIT 1000
+FOR UPDATE SKIP LOCKED
+)
+UPDATE vac SET processed = true
+WHERE id IN (SELECT id FROM batch);
+UPDATE 1000
+159
+Chapter8. RebuildingTablesandIndexes
+=> SELECT pg_size_pretty(pg_table_size('vac'));
+pg_size_pretty
+−−−−−−−−−−−−−−−−
+7072 kB
+(1 row)
+160
+Part II
+Buffer Cache
+and WAL
+9
+Buffer Cache
+9.1. Caching
+Inmoderncomputingsystems,cachingisomnipresent—bothatthehardwareand
+at the software level. The processor alone can have up to three or four levels of
+cache.Rcontrollersanddisksaddtheirowncachetoo.
+Cachingisusedtoevenoutperformancedifferencebetweenfastandslowtypesof
+memory. Fastmemoryisexpensiveandhassmallervolume,whileslowmemory
+is bigger and cheaper. Therefore,fast memory cannot accommodate all the data
+stored in slow memory. But in most cases only a small portion of data is being
+activelyusedateachparticularmoment,soallocatingsomefastmemoryforcache
+to keep hot data can significantly reduce the overhead incurred by slow memory
+access.
+InPostgre,buffercache1 holdsrelationpages,thusbalancingaccesstimesto
+disks(milliseconds)and(nanoseconds).
+The operating system has its own cache that serves the same purpose. For this
+reason,databasesystemsareusuallydesignedtoavoiddoublecaching: thedata
+storedondiskisusuallyquerieddirectly,bypassingthecache. ButPostgre
+usesadifferentapproach: itreadsandwritesalldataviabufferedfileoperations.
+Double caching can be avoided if you apply direct /. It will reduce the overhead,as
+Postgre will use direct memoryaccess () instead of copying buffered pages into
+the  address space; besides,you will gain immediate control over physical writes on
+disk. However,direct/doesnotsupportdataprefetchingenabledbybufferization,so
+you have to implement it separatelyvia asynchronous /,which requires massive code
+1 backend/storage/buffer/README
+163
+Chapter9. BufferCache
+modificationsinPostgrecore,aswellashandlingincompatibilitieswhenitcomes
+todirectandasynchronous/support.Butoncetheasynchronouscommunicationisset
+up,youcanenjoyadditionalbenefitsofno-waitdiskaccess.
+ThePostgrecommunityhasalreadystartedthismajoreffort,1 butitwilltakealong
+timefortheactualresultstoappear.
+9.2. Buffer Cache Design
+Buffercacheislocatedintheserver’ssharedmemoryandisaccessibletoallthe
+processes. Ittakesthemajorpartofthesharedmemoryandissurelyoneofthe
+most important and complex data structures in Postgre. Understanding how
+cacheworksisimportantinitsownright,butevenmoresoasmanyotherstruc-
+tures (such as subtransactions,  transaction status, and  entries) use a
+similarcachingmechanism,albeitasimplerone.
+Thenameofthiscacheisinspiredbyitsinnerstructure,asitconsistsofanarrayof
+buffers. Eachbufferreservesamemorychuckthatcanaccommodateasingledata
+pagetogetherwithitsheader.2
+buffercache
+header
+page
+Aheadercontainssomeinformationaboutthebufferandthepageinit,suchas:
+• physicallocationofthepage(file,fork,andblocknumberinthefork)
+• theattributeshowingthatthedatainthepagehasbeenmodifiedandsooner
+orlaterhastobewrittenbacktodisk(suchapageiscalleddirty)
+• bufferusagecount
+• pincount(orreferencecount)
+1 www.postgresql.org/message-id/flat/20210223100344.llw5an2aklengrmn%40alap3.anarazel.de
+2 include/storage/buf_internals.h
+164
+9.2. BufferCacheDesign
+Togetaccesstoarelation’sdatapage,aprocessrequestsitfromthebufferman-
+ager1 andreceivestheofthebufferthatcontainsthispage. Thenitreadsthe
+cacheddataandmodifiesitrightinthecacheifneeded. Whilethepageisinuse,
+its buffer is pinned. Pins forbid eviction of the cached page and can be applied
+togetherwithotherlocks.Eachpinincrementstheusagecountaswell.
+Aslongasthepageiscached,itsusagedoesnotincuranyfileoperations.
+Wecanexplorethebuffercacheusingthepg_buffercacheextension:
+=> CREATE EXTENSION pg_buffercache;
+Let’screateatableandinsertarow:
+=> CREATE TABLE cacheme(
+id integer
+) WITH (autovacuum_enabled = off);
+=> INSERT INTO cacheme VALUES (1);
+Nowthebuffercachecontainsaheappagewiththenewlyinsertedrow. Youcan
+seeitforyourselfbyselectingallthebuffersrelatedtoaparticulartable. Wewill
+needsuchaqueryagain,solet’swrapitintoafunction:
+=> CREATE FUNCTION buffercache(rel regclass)
+RETURNS TABLE(
+bufferid integer, relfork text, relblk bigint,
+isdirty boolean, usagecount smallint, pins integer
+) AS $$
+SELECT bufferid,
+CASE relforknumber
+WHEN 0 THEN 'main'
+WHEN 1 THEN 'fsm'
+WHEN 2 THEN 'vm'
+END,
+relblocknumber,
+isdirty,
+usagecount,
+pinning_backends
+FROM pg_buffercache
+WHERE relfilenode = pg_relation_filenode(rel)
+ORDER BY relforknumber, relblocknumber;
+$$ LANGUAGE sql;
+1 backend/storage/buffer/bufmgr.c
+165
+Chapter9. BufferCache
+=> SELECT * FROM buffercache('cacheme');
+bufferid | relfork | relblk | isdirty | usagecount | pins
+−−−−−−−−−−+−−−−−−−−−+−−−−−−−−+−−−−−−−−−+−−−−−−−−−−−−+−−−−−−
+268 | main | 0 | t | 1 | 0
+(1 row)
+The page is dirty: it has been modified, but is not written to disk yet. Its usage
+countissettoone.
+9.3. Cache Hits
+Whenthebuffermanagerhastoreadapage,1itfirstchecksthebuffercache.
+Allbuffersarestoredinahashtable,2whichisusedtospeeduptheirsearch.
+Manymodernprogramminglanguagesincludehashtablesasoneofthebasicdatatypes.
+Hash tables are often called associative arrays,and indeed,from the user’s perspective
+theydolooklikeanarray; however,theirindex(ahashkey)canbeofanydatatype,for
+example,atextstringratherthananinteger.
+Whiletherangeofpossiblekeyvaluescanbequitelarge,hashtablesnevercontainthat
+many different values at a time. The idea of hashing is to convert a keyvalue into an
+integernumberusingahashfunction.Thisnumber(orsomeofitsbits)isusedasanindex
+ofaregulararray.Theelementsofthisarrayarecalledhashtablebuckets.
+Agoodhashfunctiondistributeshashkeysbetweenbucketsmoreorlessuniformly,butit
+canstillassignthesamenumbertodifferentkeys,thusplacingthemintothesamebucket;
+itiscalledacollision.Forthisreason,valuesarestoredinbucketstogetherwithhashkeys;
+toaccessahashedvaluebyitskey,Postgrehastocheckallthekeysinthebucket.
+Therearemultipleimplementationsofhashtables;ofallthepossibleoptions,the
+buffercacheusestheextendibletablethatresolveshashcollisionsbychaining.3
+Ahash key consists of the  of the relation file,the type of the fork,and the 
+ofthepagewithinthisfork’sfile.Thus,knowingthepage,Postgrecanquickly
+find the buffer containing this page or make sure that the page is not currently
+cached.
+1 backend/storage/buffer/bufmgr.c,ReadBuffer_commonfunction
+2 backend/storage/buffer/buf_table.c
+3 backend/utils/hash/dynahash.c
+166
+9.3. CacheHits
+3501,0,3
+2610,0,7
+hashtable
+Thebuffercacheimplementationhaslongbeencriticizedforrelyingonahashtable: this
+structureisofnousewhenitcomestofindingallthebufferstakenbypagesofaparticular
+relation,whichisrequiredtoremovepagesfromcachewhenrunningand
+commandsortruncatingatableduringvacuuming.1 Yetnoonehassuggestedanadequate
+alternativesofar.
+Ifthehashtablecontainstherequiredbuffer,thebuffermanagerpinsthisbuffer
+andreturnsitstotheprocess.Thenthisprocesscanstartusingthecachedpage
+withoutincurringany/traffic.
+Topinabuffer,Postgrehastoincrementthepincounterinitsheader;abuffer
+canbepinnedbyseveralprocessesatatime.Whileitspincounterisgreaterthan
+zero,thebufferisassumedtobeinuse,andnoradicalchangesinitscontentsare
+allowed. For example, a new tuple can appear (it will be invisible following the
+visibilityrules),butthepageitselfcannotbereplaced.
+Whenrunwiththeanalyzeandbuffersoptions,thecommandexecutesthe
+displayedqueryplanandshowsthenumberofusedbuffers:
+1 backend/storage/buffer/bufmgr.c,DropRelFileNodeBuffersfunction
+167
+Chapter9. BufferCache
+=> EXPLAIN (analyze, buffers, costs off, timing off, summary off)
+SELECT * FROM cacheme;
+QUERY PLAN
+−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−
+Seq Scan on cacheme (actual rows=1 loops=1)
+Buffers: shared hit=1
+Planning:
+Buffers: shared hit=12 read=7
+(4 rows)
+Herehit=1meansthattheonlypagethathadtobereadwasfoundinthecache.
+Bufferpinningincreasestheusagecountbyone:
+=> SELECT * FROM buffercache('cacheme');
+bufferid | relfork | relblk | isdirty | usagecount | pins
+−−−−−−−−−−+−−−−−−−−−+−−−−−−−−+−−−−−−−−−+−−−−−−−−−−−−+−−−−−−
+268 | main | 0 | t | 2 | 0
+(1 row)
+To observe pinning in action during query execution,let’s open a cursor—it will
+holdthebufferpin,asithastoprovidequickaccesstothenextrowintheresult
+set:
+=> BEGIN;
+=> DECLARE c CURSOR FOR SELECT * FROM cacheme;
+=> FETCH c;
+id
+−−−−
+1
+(1 row)
+=> SELECT * FROM buffercache('cacheme');
+bufferid | relfork | relblk | isdirty | usagecount | pins
+−−−−−−−−−−+−−−−−−−−−+−−−−−−−−+−−−−−−−−−+−−−−−−−−−−−−+−−−−−−
+268 | main | 0 | t | 3 | 1
+(1 row)
+Ifaprocesscannotuseapinnedbuffer,itusuallyskipsitandsimplychoosesan-
+otherone.Wecanseeitduringtablevacuuming:
+168
+9.3. CacheHits
+=> VACUUM VERBOSE cacheme;
+INFO: vacuuming "public.cacheme"
+INFO: table "cacheme": found 0 removable, 0 nonremovable row
+versions in 1 out of 1 pages
+DETAIL: 0 dead row versions cannot be removed yet, oldest xmin:
+877
+Skipped 1 page due to buffer pins, 0 frozen pages.
+CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s.
+VACUUM
+Thepagewasskippedbecauseitstuplescouldnotbephysicallyremovedfromthe
+pinnedbuffer.
+Butifitisexactlythisbufferthatisrequired,theprocessjoinsthequeueandwaits
+forexclusiveaccesstothisbuffer. Anexampleofsuchanoperationisvacuuming
+withfreezing.1 p.
+Oncethecursorclosesormovesontoanotherpage,thebuffergetsunpinned. In
+thisexample,ithappensattheendofthetransaction:
+=> COMMIT;
+=> SELECT * FROM buffercache('cacheme');
+bufferid | relfork | relblk | isdirty | usagecount | pins

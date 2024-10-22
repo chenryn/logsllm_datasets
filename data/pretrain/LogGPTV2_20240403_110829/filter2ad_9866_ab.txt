@@ -1,0 +1,152 @@
+  1. 将WriteFile函数的结构复原（恢复第一个字节，对应脱钩操作）
+  2. 获取线程对应上下文结构
+  3. 修改函数对应参数
+  4. 分配临时缓冲区并将函数原本要写入的内容复制进去
+  5. 在临时缓冲区中对写入内存进行修改后将其复制回函数的写入缓冲区中并将临时缓冲区释放
+  6. 重新执行函数，即再完成一次文件写入操作（前面的那一次被截断了所以并没有在文件中实际写入内容）
+  7. 再次将WriteFile函数的第一个字节更换为0xCC
+这个函数的流程比较复杂但在逻辑上是很通顺的，下面简单说一下我在编写这个函数时遇到的一些问题
+### 挂钩与脱钩 ：
+由于我们进行的是API钩取操作，所以一定会有挂钩与脱钩这一对操作，但是这里有点特殊，是先脱钩在挂钩。这是因为在前面的CreateProcessDebugEvent函数中已经完成了一次挂钩操作，而后面的函数流程中会重新运行目标API函数，如果不先脱钩的话，程序就会一直在API函数的开头被中断下来
+### 上下文结构：
+在第二步操作中我们需要获取对应线程的上下文结构：CONTEXT，这其实是程序运行时各个寄存器在Windows编程中的数据结构表示，可以在MSDN上查到，这里只看一下比较重要的部分：
+    DWORD   Edi;
+        DWORD   Esi;
+        DWORD   Ebx;
+        DWORD   Edx;
+        DWORD   Ecx;
+        DWORD   Eax;
+        //
+        // This section is specified/returned if the
+        // ContextFlags word contians the flag CONTEXT_CONTROL.
+        //
+        DWORD   Ebp;
+        DWORD   Eip;
+        DWORD   SegCs;              // MUST BE SANITIZED
+        DWORD   EFlags;             // MUST BE SANITIZED
+        DWORD   Esp;
+        DWORD   SegSs;
+这里可以看见其中包含了EIP,ESP等重要的寄存器值，而这个结构体中的成员数值在经过修改后会作为我们设置线程上下文的参数。
+**注：这个结构体在64位和32位下的程序差异很大，具体请在VS的WinNT.h中查看**
+### 线程的重启与sleep(0)：
+在完成WriteFile写入内容的修改后，需要使这个API函数从开头再执行一次，为了完成这个操作，就需要用到前面说到的上下文结构（CONTEXT）。
+我们知道，程序的执行流是由EIP这个寄存器中指向的地址来决定的，那么我们可以将这个地址指向WriteFile函数的起始地址，这样就完成了这个有点像“时空回溯”的线程重启操作：
+    ctx.Eip = (DWORD)g_pWriteFile;
+    SetThreadContext(g_cpdi.hThread, &ctx); //SetThreadContext指定CONTEXT存储到指定线程
+这里可能还有一个疑问就是：我们设置INT3指令中断的位置不就是WriteFile的起始地址吗，为什么还要修改EIP？
+**这是由于程序的执行流在遇到INT3指令时是以一个执行的状态来处理的，所以在CPU的角度上等于EIP还是自加了1（INT3指令为1个字节），所以我们要将EIP重新设置**
+还有就是当我们继续被调试进程时会使用到一个sleep(0)的操作，这个sleep函数表示将线程挂起，括号中的是挂起时间，这里乍一看挂起0秒好像没有什么意义。但是站在操作系统的角度，这个
+**挂起操作等于当前线程主动放弃自己的时间片，那么其他的线程就可以执行了。**
+在这个程序中，dbgHook.exe主动挂起，那么对应的notepad就可以继续执行其WriteFile函数（也就是让其在文件中写入我们修改后的内容），执行完后就会将控制权再次转移给dbgHook.exe，这样后面的代码才可以正常执行。
+**如果没有这个sleep(0)，那么dbgHook.exe就会继续执行，而在逻辑上，后面的挂钩操作是要等WriteFile函数执行完在进行的，所以就有可能出现内存写入错误的bug。**
+### 异常记录结构体：
+Windows编程对于用户自定义的调试器中有一个关于异常记录的数据结构：EXCEPTION_RECORD，在MSDN中可以查到如下：
+    typedef struct _EXCEPTION_RECORD {
+      DWORD                    ExceptionCode;
+      DWORD                    ExceptionFlags;
+      struct _EXCEPTION_RECORD *ExceptionRecord;
+      PVOID                    ExceptionAddress;
+      DWORD                    NumberParameters;
+      ULONG_PTR                ExceptionInformation[EXCEPTION_MAXIMUM_PARAMETERS];
+    } EXCEPTION_RECORD;
+其中比较重要的成员就是ExceptionCode，即调试信息中运行至此处对应的异常码。
+这个部分的代码即注释如下：
+    BOOL ExceprtionDebugEvent(LPDEBUG_EVENT pde) //异常触发时的处理函数
+    {
+        CONTEXT ctx; //用于记录上下文的结构，上下文中包含各种寄存器、程序状态字以及段寄存器的值等
+        PBYTE lpBuffer = NULL; //用于执行后面的临时缓冲区
+        DWORD dwNumofBytestTowrite = 0; //用于存储原WriteFile中的NumofBytestTowrite参数
+        DWORD dwAddrOfBuffer = 0; //用于存储原WriteFile中的lpBuffer参数
+        DWORD i = 0;
+        PEXCEPTION_RECORD per = &pde->u.Exception.ExceptionRecord; //关于异常记录的结构体，用于记录程序运行中发生的异常
+        if (per->ExceptionCode == EXCEPTION_BREAKPOINT) //当放生断点异常时（也就是发生INT3中断时）
+        {
+            if (g_pWriteFile == per->ExceptionAddress) //检查发生异常的地址是否与WriteFile的地址一致
+            {
+                //1.将WriteFile函数结构复原（即复原第一个字节）
+                WriteProcessMemory(g_cpdi.hProcess, g_pWriteFile, &g_orgByte, sizeof(BYTE), NULL); 
+                //2.获取线程对应的上下文  
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                GetThreadContext(g_cpdi.hThread, &ctx); 
+                //3.获取原始WriteFile函数的第二和第三个参数（也就是:lpBuffer、nNumberOfBytesToWrite）
+                ReadProcessMemory(g_cpdi.hProcess, (LPVOID)(ctx.Esp + 0x8), &dwAddrOfBuffer, sizeof(DWORD), NULL); //第二个参数在ESP+8的位置上
+                ReadProcessMemory(g_cpdi.hProcess, (LPVOID)(ctx.Esp + 0xC), &dwNumofBytestTowrite, sizeof(DWORD), NULL); //第三个参数在ESP+C的位置上
+                //4.分配临时缓冲区
+                lpBuffer = (PBYTE)malloc(dwNumofBytestTowrite + 1);
+                memset(lpBuffer, 0, dwNumofBytestTowrite + 1); //将临时缓冲区用0填充
+                //5.将WriteFile参数中lpBuffer的内容拷贝进临时缓冲区中
+                ReadProcessMemory(g_cpdi.hProcess, (LPVOID)dwAddrOfBuffer, lpBuffer, dwNumofBytestTowrite, NULL);
+                printf("orignal string: %s\n", lpBuffer);
+                //6.将小写字母转化为大写字母
+                for (i = 0; i = 0x61 && lpBuffer[i] dwProcessId, pde->dwThreadId, DBG_CONTINUE);
+                Sleep(0); //这个操作是为了让前面新开始的那个线程优先执行
+                //11.再次在WriteFile函数中设置INT3中断指令
+                WriteProcessMemory(g_cpdi.hProcess, g_pWriteFile, &g_chINT3, sizeof(BYTE), NULL);
+                return TRUE;
+            }
+            return FALSE;
+        }
+    }
+## DebugLoop：
+这个部分即使监视程序运行过程中是否出现对应调试事件并对其进行相应处理的函数
+其函数结构主体是一个while循环，即不断等待调试事件的发生，函数流程大致如下：
+  1. 等待进程创建事件发生并进行相应操作（执行CreateProcessDebugEvent函数）
+  2. 等待调试异常事件并进行相应操作（执行ExceprtionDebugEvent函数）
+  3. 等待程序退出事件发生，终止循环并退出
+这个部分的流程比较简单，着重讲一下一个在调试法中比较重要的数据结构：DEBUG_EVENT，这是Windows编程中有关调试信息的数据结构，它被解释为：
+    typedef struct _DEBUG_EVENT {
+      DWORD dwDebugEventCode;
+      DWORD dwProcessId;
+      DWORD dwThreadId;
+      union {
+        EXCEPTION_DEBUG_INFO      Exception;
+        CREATE_THREAD_DEBUG_INFO  CreateThread;
+        CREATE_PROCESS_DEBUG_INFO CreateProcessInfo;
+        EXIT_THREAD_DEBUG_INFO    ExitThread;
+        EXIT_PROCESS_DEBUG_INFO   ExitProcess;
+        LOAD_DLL_DEBUG_INFO       LoadDll;
+        UNLOAD_DLL_DEBUG_INFO     UnloadDll;
+        OUTPUT_DEBUG_STRING_INFO  DebugString;
+        RIP_INFO                  RipInfo;
+      } u;
+    } DEBUG_EVENT, *LPDEBUG_EVENT;
+这些成员都比较重要：
+  * dwDebugEventCode：标识调试事件类型的代码
+  * dwProcessId：发生调试事件的进程的标识符
+  * dwThreadId：发生调试事件的线程的标识符
+  * u:与调试事件相关的任何附加信息，这个联合体中包含EXCEPTION_DEBUG_INFO等很重要的结构体，可以自己去MSDN中详细了解一下。
+这一部分的代码及注释如下：
+    void DebugLoop()
+    {
+        DEBUG_EVENT de; //用于接受调试信息的结构体，后面将作为参数传递给调试函数使用
+        DWORD dwContinueStatus;
+        //等待被调试者发生事件
+        while (WaitForDebugEvent(&de, INFINITE)) //当事件发生时将调试信息输入到de中
+        {
+            dwContinueStatus = DBG_CONTINUE;
+            //CREATE_PROCESS_DEBUG_EVENT（也就是进程创建事件会固定出现）
+            if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) //当发生异常时de.dwDebugEventCode会被设置为相应的异常码
+            {
+                CreateProcessDebugEvent(&de); //执行当进程被创建时对应的函数
+            }
+            else if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+            {
+                if (ExceprtionDebugEvent(&de)) //执行对应异常发生时的函数
+                    continue;
+            }
+            else if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) //当被调试进程终止时跳出循环，结束调试
+            {
+                break;
+            }
+            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, dwContinueStatus); //在程序主进程退出前继续运行被调试进程
+        }
+    }
+# 测试运行：
+本次测试在XP下进行（win10环境下存在权限问题）。
+首先如下图所示输入对应参数：
+然后运行API钩取程序，之后在记事本中随意输入一些小写的英文字母：
+之后保存这个文件，此时记事本中的内容还不会有变化，但是命令提示符窗口中可以看见程序抓取到了一些信息：
+之后再次打开前面保存的文件就会发现字母全部变成大写了：
+结束程序后可能会发现程序又抓取到了一些看起来很奇怪的信息，这个是由于Windows下的可执行程序在被编译时，有些段的空白部分会被编译为一串INT3指令，在调试的过程会经常看见。
+# 参考资料:
+《逆向工程核心原理》[韩] 李承远

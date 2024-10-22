@@ -1,0 +1,230 @@
+        assert(memory_region_transaction_depth);
+        --memory_region_transaction_depth;
+        if (!memory_region_transaction_depth) {
+            if (memory_region_update_pending) {
+                MEMORY_LISTENER_CALL_GLOBAL(begin, Forward);
+                QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+                    address_space_update_topology(as);
+                }
+                MEMORY_LISTENER_CALL_GLOBAL(commit, Forward);
+            } else if (ioeventfd_update_pending) {
+                QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+                    address_space_update_ioeventfds(as);
+                }
+            }
+            memory_region_clear_pending();
+       }
+    }
+    #define MEMORY_LISTENER_CALL_GLOBAL(_callback, _direction, _args...)    
+        do {                                                                
+            MemoryListener *_listener;                                      
+            switch (_direction) {                                           
+            case Forward:                                                   
+                QTAILQ_FOREACH(_listener, &memory_listeners, link) {        
+                    if (_listener->_callback) {                             
+                        _listener->_callback(_listener, ##_args);           
+                    }                                                       
+                }                                                           
+                break;                                                      
+            case Reverse:                                                   
+                QTAILQ_FOREACH_REVERSE(_listener, &memory_listeners,        
+                                       memory_listeners, link) {            
+                    if (_listener->_callback) {                             
+                        _listener->_callback(_listener, ##_args);           
+                    }                                                       
+                }                                                           
+                break;                                                      
+            default:                                                        
+                abort();                                                    
+            }                                                               
+        } while (0)
+    MEMORY_LISTENER_CALL_GLOBAL对memory_listeners上的各个MemoryListener调用指定函数。commit中最重要的是address_space_update_topology调用。
+    static void address_space_update_topology(AddressSpace *as)
+    {
+        FlatView *old_view = address_space_get_flatview(as);
+        FlatView *new_view = generate_memory_topology(as->root);
+        address_space_update_topology_pass(as, old_view, new_view, false);
+        address_space_update_topology_pass(as, old_view, new_view, true);
+        /* Writes are protected by the BQL.  */
+        atomic_rcu_set(&as->current_map, new_view);
+        call_rcu(old_view, flatview_unref, rcu);
+        /* Note that all the old MemoryRegions are still alive up to this
+         * point.  This relieves most MemoryListeners from the need to
+         * ref/unref the MemoryRegions they get---unless they use them
+         * outside the iothread mutex, in which case precise reference
+         * counting is necessary.
+         */
+        flatview_unref(old_view);
+        address_space_update_ioeventfds(as);
+    }
+前面我们已经说了，as->root会被展开为一个FlatView，所以在这里update
+topology中，首先得到上一次的FlatView，之后调用generate_memory_topology生成一个新的FlatView，
+    static FlatView *generate_memory_topology(MemoryRegion *mr)
+    {
+        FlatView *view;
+        view = g_new(FlatView, 1);
+        flatview_init(view);
+        if (mr) {
+            render_memory_region(view, mr, int128_zero(),
+                                 addrrange_make(int128_zero(), int128_2_64()), false);
+        }
+        flatview_simplify(view);
+        return view;
+    }
+最主要的是render_memory_region生成view，这个render函数很复杂，需要递归render子树，具体以后有机会单独讨论。在生成了view之后会调用flatview_simplify进行简化，主要是合并相邻的FlatRange。在生成了当前as的FlatView之后，我们就可以更新了，这在函数address_space_update_topology_pass中完成，这个函数就是逐一对比新旧FlatView的差别，然后进行更新。
+    static void address_space_update_topology_pass(AddressSpace *as,
+                                                   const FlatView *old_view,
+                                                   const FlatView *new_view,
+                                                   bool adding)
+    {
+        unsigned iold, inew;
+        FlatRange *frold, *frnew;
+        /* Generate a symmetric difference of the old and new memory maps.
+         * Kill ranges in the old map, and instantiate ranges in the new map.
+         */
+        iold = inew = 0;
+        while (iold nr || inew nr) {
+            if (iold nr) {
+                frold = &old_view->ranges[iold];
+            } else {
+                frold = NULL;
+            }
+            if (inew nr) {
+                frnew = &new_view->ranges[inew];
+            } else {
+                frnew = NULL;
+            }
+            if (frold
+                && (!frnew
+                    || int128_lt(frold->addr.start, frnew->addr.start)
+                    || (int128_eq(frold->addr.start, frnew->addr.start)
+                        && !flatrange_equal(frold, frnew)))) {
+                /* In old but not in new, or in both but attributes changed. */
+                if (!adding) {
+                    MEMORY_LISTENER_UPDATE_REGION(frold, as, Reverse, region_del);
+                }
+                ++iold;
+            } else if (frold && frnew && flatrange_equal(frold, frnew)) {
+                /* In both and unchanged (except logging may have changed) */
+                if (adding) {
+                    MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, region_nop);
+                    if (frnew->dirty_log_mask & ~frold->dirty_log_mask) {
+                        MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, log_start,
+                                                      frold->dirty_log_mask,
+                                                      frnew->dirty_log_mask);
+                    }
+                    if (frold->dirty_log_mask & ~frnew->dirty_log_mask) {
+                        MEMORY_LISTENER_UPDATE_REGION(frnew, as, Reverse, log_stop,
+                                                      frold->dirty_log_mask,
+                                                      frnew->dirty_log_mask);
+                    }
+                }
+                ++iold;
+                ++inew;
+            } else {
+                /* In new */
+                if (adding) {
+                    MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, region_add);
+                }
+                ++inew;
+            }
+        }
+    }
+最重要的当然是MEMORY_LISTENER_UPDATE_REGION宏，这个宏会将每一个FlatRange转换为一个MemoryRegionSection，之后调用这个as对应的各个MemoryListener的回调函数。这里我们以kvm对象注册Listener为例，从kvm_memory_listener_register，我们看到其region_add回调为kvm_region_add。
+    static void kvm_region_add(MemoryListener *listener,
+                               MemoryRegionSection *section)
+    {
+        KVMMemoryListener *kml = container_of(listener, KVMMemoryListener, listener);
+        memory_region_ref(section->mr);
+        kvm_set_phys_mem(kml, section, true);
+    }
+这个函数看似复杂，主要是因为，需要判断变化的各种情况是否与之前的重合，是否是脏页等等情况。我们只看最开始的情况。
+    static void kvm_set_phys_mem(KVMMemoryListener *kml,
+                                 MemoryRegionSection *section, bool add)
+    {
+        KVMState *s = kvm_state;
+        KVMSlot *mem, old;
+        int err;
+        MemoryRegion *mr = section->mr;
+        bool writeable = !mr->readonly && !mr->rom_device;
+        hwaddr start_addr = section->offset_within_address_space;
+        ram_addr_t size = int128_get64(section->size);
+        void *ram = NULL;
+        unsigned delta;
+        /* kvm works in page size chunks, but the function may be called
+           with sub-page size and unaligned start address. Pad the start
+           address to next and truncate size to previous page boundary. */
+        delta = qemu_real_host_page_size - (start_addr & ~qemu_real_host_page_mask);
+        delta &= ~qemu_real_host_page_mask;
+        if (delta > size) {
+            return;
+        }
+        start_addr += delta;
+        size -= delta;
+        size &= qemu_real_host_page_mask;
+        if (!size || (start_addr & ~qemu_real_host_page_mask)) {
+            return;
+        }
+        if (!memory_region_is_ram(mr)) {
+            if (writeable || !kvm_readonly_mem_allowed) {
+                return;
+            } else if (!mr->romd_mode) {
+                /* If the memory device is not in romd_mode, then we actually want
+                 * to remove the kvm memory slot so all accesses will trap. */
+                add = false;
+            }
+        }
+        ram = memory_region_get_ram_ptr(mr) + section->offset_within_region + delta;
+        ...
+        if (!size) {
+            return;
+        }
+        if (!add) {
+            return;
+        }
+        mem = kvm_alloc_slot(kml);
+        mem->memory_size = size;
+        mem->start_addr = start_addr;
+        mem->ram = ram;
+        mem->flags = kvm_mem_flags(mr);
+        err = kvm_set_user_memory_region(kml, mem);
+        if (err) {
+            fprintf(stderr, "%s: error registering slot: %sn", __func__,
+                    strerror(-err));
+            abort();
+        }
+    }
+这个函数主要就是得到MemoryRegionSection在address_space中的位置，这个就是虚拟机的物理地址，函数中是start_addr,
+然后通过memory_region_get_ram_ptr得到对应其对应的qemu的HVA地址，函数中是ram，当然还有大小的size以及这块内存的flags，这些参数组成了一个KVMSlot，之后传递给kvm_set_user_memory_region。
+    static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot)
+    {
+        KVMState *s = kvm_state;
+        struct kvm_userspace_memory_region mem;
+        mem.slot = slot->slot | (kml->as_id start_addr;
+        mem.userspace_addr = (unsigned long)slot->ram;
+        mem.flags = slot->flags;
+        if (slot->memory_size && mem.flags & KVM_MEM_READONLY) {
+            /* Set the slot size to 0 before setting the slot to the desired
+             * value. This is needed based on KVM commit 75d61fbc. */
+            mem.memory_size = 0;
+            kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION, &mem);
+        }
+        mem.memory_size = slot->memory_size;
+        return kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION, &mem);
+    }
+通过层层抽象，我们终于完成了GPA->HVA的对应，并且传递到了KVM。
+**四. kvm exit之后的内存寻址**
+在address_space_init_dispatch函数中，我们可以看到，每一个通过AddressSpace都会注册一个Listener回调，回调的各个函数都一样，mem_begin，
+mem_add等。
+    void address_space_init_dispatch(AddressSpace *as)
+    {
+        as->dispatch = NULL;
+        as->dispatch_listener = (MemoryListener) {
+            .begin = mem_begin,
+            .commit = mem_commit,
+            .region_add = mem_add,
+            .region_nop = mem_add,
+            .priority = 0,
+        };
+        memory_listener_register(&as->dispatch_listener, as);
+    }

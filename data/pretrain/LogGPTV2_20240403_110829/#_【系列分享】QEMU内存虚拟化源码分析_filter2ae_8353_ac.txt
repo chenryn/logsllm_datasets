@@ -1,0 +1,220 @@
+我们重点看看mem_add
+    static void mem_add(MemoryListener *listener, MemoryRegionSection *section)
+    {
+        AddressSpace *as = container_of(listener, AddressSpace, dispatch_listener);
+        AddressSpaceDispatch *d = as->next_dispatch;
+        MemoryRegionSection now = *section, remain = *section;
+        Int128 page_size = int128_make64(TARGET_PAGE_SIZE);
+        if (now.offset_within_address_space & ~TARGET_PAGE_MASK) {
+            uint64_t left = TARGET_PAGE_ALIGN(now.offset_within_address_space)
+                           - now.offset_within_address_space;
+            now.size = int128_min(int128_make64(left), now.size);
+            register_subpage(d, &now);
+        } else {
+            now.size = int128_zero();
+        }
+        while (int128_ne(remain.size, now.size)) {
+            remain.size = int128_sub(remain.size, now.size);
+            remain.offset_within_address_space += int128_get64(now.size);
+            remain.offset_within_region += int128_get64(now.size);
+            now = remain;
+            if (int128_lt(remain.size, page_size)) {
+                register_subpage(d, &now);
+            } else if (remain.offset_within_address_space & ~TARGET_PAGE_MASK) {
+                now.size = page_size;
+                register_subpage(d, &now);
+            } else {
+                now.size = int128_and(now.size, int128_neg(page_size));
+                register_multipage(d, &now);
+            }
+        }
+    }
+mem_add在添加了内存区域之后会被调用，调用路径为
+    address_space_update_topology_pass
+    MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, region_add);
+    #define MEMORY_LISTENER_UPDATE_REGION(fr, as, dir, callback, _args...)  
+        do {                                                                
+            MemoryRegionSection mrs = section_from_flat_range(fr, as);      
+            MEMORY_LISTENER_CALL(as, callback, dir, &mrs, ##_args);         
+        } while(0)
+如果新增加了一个FlatRange，则会调用将该fr转换为一个MemroyRegionSection，然后调用Listener的region_add。
+回到mem_add，这个函数主要是调用两个函数如果是添加的地址落到一个页内，则调用register_subpage，如果是多个页，则调用register_multipage，先看看register_multipage，因为最开始注册都是一波大的，比如pc.ram。首先now.offset_within_address_space并不会落在一个页内。所以直接进入while循环，之后进入register_multipage，d这个AddressSpaceDispatch是在mem_begin创建的。
+    static void register_multipage(AddressSpaceDispatch *d,
+                                   MemoryRegionSection *section)
+    {
+        hwaddr start_addr = section->offset_within_address_space;
+        uint16_t section_index = phys_section_add(&d->map, section);
+        uint64_t num_pages = int128_get64(int128_rshift(section->size,
+                                                        TARGET_PAGE_BITS));
+        assert(num_pages);
+        phys_page_set(d, start_addr >> TARGET_PAGE_BITS, num_pages, section_index);
+    }
+首先分一个d->map->sections空间出来，其index为section_index。
+    static void phys_page_set(AddressSpaceDispatch *d,
+                              hwaddr index, hwaddr nb,
+                              uint16_t leaf)
+    {
+        /* Wildly overreserve - it doesn't matter much. */
+        phys_map_node_reserve(&d->map, 3 * P_L2_LEVELS);
+        phys_page_set_level(&d->map, &d->phys_map, &index, &nb, leaf, P_L2_LEVELS - 1);
+    }
+之后start_addr右移12位，计算出总共需要多少个页。这里说一句，qemu在这里总共使用了6级页表，最后一级长度12，然后是5 * 9 +
+7。phys_map_node_reserve首先分配页目录项。
+    static void phys_map_node_reserve(PhysPageMap *map, unsigned nodes)
+    {
+        static unsigned alloc_hint = 16;
+        if (map->nodes_nb + nodes > map->nodes_nb_alloc) {
+            map->nodes_nb_alloc = MAX(map->nodes_nb_alloc, alloc_hint);
+            map->nodes_nb_alloc = MAX(map->nodes_nb_alloc, map->nodes_nb + nodes);
+            map->nodes = g_renew(Node, map->nodes, map->nodes_nb_alloc);
+            alloc_hint = map->nodes_nb_alloc;
+        }
+    }
+phys_page_set_level填充页表。初始调用时，level为5，因为要从最开始一层填充。
+    static void phys_page_set_level(PhysPageMap *map, PhysPageEntry *lp,
+                                    hwaddr *index, hwaddr *nb, uint16_t leaf,
+                                    int level)
+    {
+        PhysPageEntry *p;
+        hwaddr step = (hwaddr)1 skip && lp->ptr == PHYS_MAP_NODE_NIL) {
+            lp->ptr = phys_map_node_alloc(map, level == 0);
+        }
+        p = map->nodes[lp->ptr];
+        lp = &p[(*index >> (level * P_L2_BITS)) & (P_L2_SIZE - 1)];
+        while (*nb && lp = step) {
+                lp->skip = 0;
+                lp->ptr = leaf;
+                *index += step;
+                *nb -= step;
+            } else {
+                phys_page_set_level(map, lp, index, nb, leaf, level - 1);
+            }
+            ++lp;
+        }
+    }
+这个函数主要就是建立一个多级页表。如图所示
+    struct PhysPageEntry {
+        /* How many bits skip to next level (in units of L2_SIZE). 0 for a leaf. */
+        uint32_t skip : 6;
+         /* index into phys_sections (!skip) or phys_map_nodes (skip) */
+        uint32_t ptr : 26;
+    };
+简单说说PhysPageEntry,
+skip表示需要移动多少步到下一级页表，如果skip为0，说明这是最末级页表了，ptr指向的是map->sections数组的某一项。如果skip不为0，则ptr指向的是哪一个node，也就是页目录。总而言之，这个函数的作用就是建立起一个多级页表，最末尾的页表项表示的是MemoryRegionSection，这跟OS里面的页表是一个道理，而AddressSpaceDispatch中的phys_map域则相当于CR3寄存器，用来最开始的寻址。
+好了，我们已经分析好了register_multipage。现在看看register_subpage。
+为什么会有在一个页面内注册的需求呢，我的理解是这样的 我们来看一下io
+port的分布，很明显在一个page里面会有多个MemoryRegion，所以这些内存空间需要分开的MemroyRegionSection,但是呢，这种情况又不是很普遍的，对于内存来说，很多时候1页，2页都是同一个MemoryRegion，总不能对于所有的地址都来一个MemoryRegionSection，所以呢，才会有这么一个subpage，有需要的时候再创建，没有就是整个mutipage。
+    0000000000000000-0000000000000007 (prio 0, RW): dma-chan
+    0000000000000008-000000000000000f (prio 0, RW): dma-cont
+    0000000000000020-0000000000000021 (prio 0, RW): kvm-pic
+    0000000000000040-0000000000000043 (prio 0, RW): kvm-pit
+    0000000000000060-0000000000000060 (prio 0, RW): i8042-data
+    0000000000000061-0000000000000061 (prio 0, RW): pcspk
+    0000000000000064-0000000000000064 (prio 0, RW): i8042-cmd
+    0000000000000070-0000000000000071 (prio 0, RW): rtc
+有subpage的情况如下图：
+好了，有了上面的知识，我们可以来看对于kvm io exit之后的寻址过程了。
+    int kvm_cpu_exec(CPUState *cpu)
+    {
+            switch (run->exit_reason) {
+            case KVM_EXIT_IO:
+                DPRINTF("handle_ion");
+                /* Called outside BQL */
+                kvm_handle_io(run->io.port, attrs,
+                              (uint8_t *)run + run->io.data_offset,
+                              run->io.direction,
+                              run->io.size,
+                              run->io.count);
+                ret = 0;
+                break;
+            case KVM_EXIT_MMIO:
+                DPRINTF("handle_mmion");
+                /* Called outside BQL */
+                address_space_rw(&address_space_memory,
+                                 run->mmio.phys_addr, attrs,
+                                 run->mmio.data,
+                                 run->mmio.len,
+                                 run->mmio.is_write);
+                ret = 0;
+                break;
+    }
+这里我们以KVM_EXIT_IO为例说明
+    static void kvm_handle_io(uint16_t port, MemTxAttrs attrs, void *data, int direction,
+                              int size, uint32_t count)
+    {
+        int i;
+        uint8_t *ptr = data;
+        for (i = 0; i address_space_write->address_space_translate->address_space_translate_internal
+直接看最后一个函数
+    address_space_translate_internal(AddressSpaceDispatch *d, hwaddr addr, hwaddr *xlat,
+                                     hwaddr *plen, bool resolve_subpage)
+    {
+        MemoryRegionSection *section;
+        MemoryRegion *mr;
+        Int128 diff;
+        section = address_space_lookup_region(d, addr, resolve_subpage);
+        /* Compute offset within MemoryRegionSection */
+        addr -= section->offset_within_address_space;
+        /* Compute offset within MemoryRegion */
+        *xlat = addr + section->offset_within_region;
+        mr = section->mr;
+        if (memory_region_is_ram(mr)) {
+            diff = int128_sub(section->size, int128_make64(addr));
+            *plen = int128_get64(int128_min(diff, int128_make64(*plen)));
+        }
+        return section;
+    }
+最重要的当然是找到对应的MemroyRegionSection
+    static MemoryRegionSection *address_space_lookup_region(AddressSpaceDispatch *d,
+                                                            hwaddr addr,
+                                                            bool resolve_subpage)
+    {
+        MemoryRegionSection *section = atomic_read(&d->mru_section);
+        subpage_t *subpage;
+        bool update;
+        if (section && section != &d->map.sections[PHYS_SECTION_UNASSIGNED] &&
+            section_covers_addr(section, addr)) {
+            update = false;
+        } else {
+            section = phys_page_find(d->phys_map, addr, d->map.nodes,
+                                     d->map.sections);
+            update = true;
+        }
+        if (resolve_subpage && section->mr->subpage) {
+            subpage = container_of(section->mr, subpage_t, iomem);
+            section = &d->map.sections[subpage->sub_section[SUBPAGE_IDX(addr)]];
+        }
+        if (update) {
+            atomic_set(&d->mru_section, section);
+        }
+        return section;
+    }
+d->mru_section作为一个缓存，由于局部性原理，这样可以提高效率。我们看到phys_page_find，类似于一个典型的页表查询过程，通过addr一步一步查找到最后的MemoryRegionSection。
+    static MemoryRegionSection *phys_page_find(PhysPageEntry lp, hwaddr addr,
+                                               Node *nodes, MemoryRegionSection *sections)
+    {
+        PhysPageEntry *p;
+        hwaddr index = addr >> TARGET_PAGE_BITS;
+        int i;
+        for (i = P_L2_LEVELS; lp.skip && (i -= lp.skip) >= 0;) {
+            if (lp.ptr == PHYS_MAP_NODE_NIL) {
+                return &sections[PHYS_SECTION_UNASSIGNED];
+            }
+            p = nodes[lp.ptr];
+            lp = p[(index >> (i * P_L2_BITS)) & (P_L2_SIZE - 1)];
+        }
+        if (section_covers_addr(&sections[lp.ptr], addr)) {
+            return &sections[lp.ptr];
+        } else {
+            return &sections[PHYS_SECTION_UNASSIGNED];
+        }
+    }
+回到address_space_lookup_region，接着解析subpage，如果之前的subpage部分理解了，这里就很容易了。这样就返回了我们需要的MemoryRegionSection。
+**五. 总结**
+写这篇文章算是对qemu内存虚拟化的一个总结，参考了网上大神的文章，感谢之，当然，自己也有不少内容。这篇文章也有很多细节没有写完，比如从mr
+renader出FlatView，比如，根据前后的FlatView进行memory的commit，如果以后有时间补上。
+**六. 参考**
+1\. [六六哥的博客](http://blog.csdn.net/leoufung)
+2\. [OENHAN](http://www.oenhan.com/kvm-src-2-vm-run)
+**传送门**
+[**【系列分享】探索QEMU-KVM中PIO处理的奥秘**](http://bobao.360.cn/learning/detail/4079.html)

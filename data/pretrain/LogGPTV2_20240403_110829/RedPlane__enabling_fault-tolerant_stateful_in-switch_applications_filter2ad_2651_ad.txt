@@ -1,0 +1,232 @@
+new flow (e.g., to install a new translation mapping in a NAT), in
+which case the added overhead is minimal.
+Figure 6: Serializing out-of-order requests with sequencing.
+Counter values (cnt) in red and blue indicate the state on the
+switch and the state store, respectively.
+Reading or updating state (Step 2 or 3 in Fig. 5). Once the
+state has been initialized, the application can read the state value
+(i.e., the counter in our example) directly (Step 3 ). When it up-
+dates the state (i.e., the counter value), RedPlane sends a replication
+request with the new value to the state store. This message is gen-
+erated entirely through the data plane. The state store applies the
+update, and sends a replication reply message (Step 2 ).
+Piggybacking output packets. When the application updates the
+state, RedPlane should not allow an output packet to be released
+until the state has been recorded at the state store – otherwise, the
+update could be lost during a switch failure, violating correctness.
+This requires the output packet to be buffered until the replication
+reply is received.
+Unfortunately, the switch data plane does not have sufficient
+memory to buffer packets in this way (and various other constraints
+on how memory can be accessed make it unsuitable for storing
+complete packet contents). RedPlane instead piggybacks the packet
+onto its replication request message, and the state store returns it
+in its reply. When the reply is received, RedPlane decapsulates and
+releases the packet. In effect, this uses the network and the memory
+on the state store as a form of delay line memory – trading off
+network bandwidth, which is plentiful on a switch, for data plane
+memory, which is scarce.
+Note that it is possible to receive packets that read state when
+there are in-flight replication requests for the state. In this case, the
+packets are buffered in the same way through the network (with a
+special RedPlane request type) until a switch receives a response
+for the latest replication request.
+While our basic design provides correctness under the simplified
+assumptions, we find that in more realistic environments, it may not
+be able to guarantee correct behavior. In the following sections, we
+describe potential challenges, and how we extend the basic design
+to address them.
+5.2 Sequencing and Retransmission
+To guarantee correctness, replication requests must be successfully
+delivered and replicated in order at the state store. For example,
+the replication request (Step 2 in Fig. 5) must be delivered in
+order. However, successful in-order delivery is not guaranteed in a
+best-effort network between switches and the state store.
+Fig. 6a illustrates why such unreliability in the network can be
+problematic. We use the same per-flow counter as an example. Each
+229
+Switch-1State storeSwitch-2𝑝𝑘𝑡!"!𝑝𝑘𝑡!"!𝑝𝑘𝑡#"!𝑝𝑘𝑡#"!𝑝𝑘𝑡$"!Switch-1 fails!①State initialization②Update③Read𝑝𝑘𝑡%"!Init(key=f1)Ack(key=1)Repl(key=f1, cnt=1)Ack(key=1)Repl(key=f1, cnt=2)Ack(key=1)Init(key=f1)Ack (key=f1, cnt=2)④StateMigrationRepl(cnt=3)SwitchState store𝑝𝑘𝑡!"#𝑝𝑘𝑡$"#cnt=3cnt=4cnt=3cnt=4Inconsistent with switch stateRepl(cnt=4)timeSwitchState store𝑝𝑘𝑡!"#𝑝𝑘𝑡$"#cnt=3cnt=4cnt=3cnt=4Consistent with switch stateRepl(seq=1,cnt=3)Repl(seq=2,cnt=4)Not committedtimeSIGCOMM ’21, August 23–27, 2021, Virtual Event, USA
+Daehyeok Kim, Jacob Nelson, Dan R. K. Ports, Vyas Sekar, Srinivasan Seshan
+time the counter is incremented, RedPlane sends the new value to
+the state store. If the state store just processes updates in the order
+they are received, a reordering could cause a later counter value
+to be replaced with an earlier one. Request loss can cause a similar
+issue.
+A traditional replication system, like chain replication, might
+address this by relying on a reliable transport protocol like TCP.
+Unfortunately, it is not practical to implement a full TCP stack on
+the switch data plane – if it is possible at all, it would excessively
+consume data plane resources.
+Our approach. Instead of implementing a full-fledged reliable
+transport on a switch data plane, we choose to build a simpler
+UDP-based transport with mechanisms that deal with possible
+packet reordering and loss. First, to handle out-of-order state repli-
+cation request messages, we employ a mechanism called request
+sequencing [46], which assigns a per-flow monotonically increasing
+sequence number to each request message. The state store uses this
+sequence number to avoid applying updates out of order (Fig. 6b).
+Second, to cope with lost replication requests or responses, we
+develop a mechanism for request buffering. RedPlane buffers repli-
+cation requests and retransmits them if it does not receive a reply
+before a timeout. We implement this by repurposing the egress-to-
+egress packet mirroring capability of switch ASICs. When RedPlane
+sends a replication request, it mirrors a copy with the current times-
+tamp as metadata. When the mirrored request enters the egress
+pipeline and it has not been acknowledged by a response with the
+same or a higher sequence number, RedPlane checks whether the
+request has timed out by comparing the current timestamp to the
+timestamp in its metadata. If it has timed out, it resends the request
+to the state store. Otherwise, it mirrors the request again without
+ending the request to the state store.
+As discussed previously, buffering a full packet payload is chal-
+lenging on a switch due to memory limitations. Instead, RedPlane
+buffers only state updates (i.e., the RedPlane header) – not the pig-
+gybacked output packet by truncating the packet. This reduces the
+amount of data that needs to be mirrored. A consequence of this is
+that if a replication request or its response is dropped, the output
+packet will be lost. This is permitted by our linearizability-based
+correctness model: it is indistinguishable from the output packet
+being sent and dropped in the network. The state updates must be
+retransmitted, however, because subsequent packets processed by
+the switch may see the new version, and thus it must be durably
+recorded. We measure the overhead of request buffering in §7.4.
+5.3 Lease-based State Ownership
+What if multiple switches attempt to process packets for a particular
+flow at the same time, especially during failover or recovery? The
+protocol in §5.2 will not be correct in this case, when there are
+concurrent accesses to the same state. Fig. 7a illustrates why. After
+Switch-1 has a link failure (but does not lose its state, which is
+𝑐𝑛𝑡=2), packets are routed to an alternate, Switch-2. If Switch-1
+recovers, a packet may read its old state, a violation of linearizability.
+Our approach. RedPlane ensures that only one switch can process
+packets for a given flow at a time using leases, a classic mechanism
+for managing cached data in file systems [33] and replicated sys-
+tems [49, 57]. Fig. 7b illustrates this. If a packet wants to access
+230
+(a) Stale state access after a switch recovers from link failure.
+(b) Only one switch holds a lease (red key) on state at a time.
+Figure 7: Consistent state access for multiple switches.
+state, but the state is not available at the switch, it first requests a
+lease for the flow. The state store grants a lease for a specific time
+period (1 second in our prototype) only if no other switch holds an
+active lease on the same flow state. The lease time is renewed each
+time the switch sends a replication request for that flow; switches
+that frequently read but infrequently update state can send explicit
+lease renewal requests. Our prototype does so every 0.5 seconds.
+5.4 Periodic Snapshot Replication
+As described in §4, RedPlane offers bounded-inconsistency mode
+for write-centric applications that permit approximate results, e.g.,
+monitoring using sketches [72] or Bloom filters [76]. In this section,
+we describe how we realize it in the switch data plane.
+For such applications, RedPlane replicates snapshots of state
+asynchronously and periodically. Every 𝑇𝑠𝑛𝑎𝑝 seconds, a snapshot
+of the current state is sent to the state store, while output packets
+are released without waiting for replication to complete.
+However, realizing this approach entirely in the data plane is
+challenging. While data structures often consist of multiple entries
+(e.g., slots in sketches), the switch is architected, and the P4 language
+is designed, to allow access to a single entry per register array per
+packet. Also, building hardware that could atomically copy entire
+register arrays would be costly.
+To address this challenge, we employ a lazy snapshotting ap-
+proach. We maintain two copies of the data structure that are lazily
+synchronized with each other. These are interleaved in the switch’s
+register arrays so that each array index contains two entries, one
+from each copy. Two metadata registers are used to indicate which
+entry at each index is the active copy. The first, a 1-bit flag, is tog-
+gled when a snapshot is taken. The second, a 1-bit register array,
+represents whether that index has been updated since the current
+snapshot started.
+To take a snapshot, we flip the flag and read values from the
+now-inactive copy. Meanwhile, when packets arrive and update
+the array, one of two operations occur. The first packet to update
+an index synchronizes the two copies and then updates the active
+copy. Later packets simply update the active copy. This allows us to
+take a consistent snapshot of the entire structure while incoming
+packets continue to update it. Additional snapshots must wait for
+Switch-1State storeSwitch-2𝑝𝑘𝑡!"#Ack(key=f1)Repl(key=f1, cnt=4)𝑝𝑘𝑡$"#Recovered from link failurecnt=2Read stale state!Switch-1State storeSwitch-2𝑝𝑘𝑡!"#Ack(key=f1)Repl(key=f1, cnt=4)𝑝𝑘𝑡$"#Recovered from link failureInit(key=f1)𝑝𝑘𝑡%"#cnt=4Waitcnt=4Read correct stateRedPlane: Enabling Fault-Tolerant Stateful In-Switch Applications
+SIGCOMM ’21, August 23–27, 2021, Virtual Event, USA
+the current one to complete. We describe the pseudocode of our
+mechanism in Appendix A.
+Replication is achieved using the switch ASIC’s packet generator.
+We configure it to generate a batch of packets every 𝑇𝑠𝑛𝑎𝑝 seconds.
+To replicate a data structure with 𝑛 entries, we generate a batch of
+𝑛 packets, each with a unique ID 𝑝𝑖. The ID in each packet is used
+to address the 𝑖th entry in the data structure and copy its value into
+a RedPlane replication protocol header. Note that while RedPlane
+asynchronously replicates snapshots, it still guarantees successful
+replication with its sequencing and retransmission mechanisms.
+5.5 Protocol Correctness
+RedPlane’s replication protocol provides per-flow linearizability
+defined in §4. Due to space constraints, we give only a brief sketch
+of the reasoning here. The lease protocol ensures that at most one
+switch is executing a program for a particular flow at a time. The
+sequencing, retransmission, and buffering protocol ensure that an
+output packet is never sent unless the corresponding state update
+has been recorded and acknowledged by the state store.
+During non-failure periods, RedPlane provides per-flow lineariz-
+ability because the single switch processing packets for a flow
+operates linearizably, but some output packets may be lost (due
+to dropped replication traffic with piggybacked messages). After a
+failover, the new switch receives a state version at least as new as
+the most recent output packet from the old switch. This satisfies
+the linearizability requirement that any packet sent after these out-
+put packets were observed follow it in the apparent serial order of
+execution. We also wrote a TLA+ specification of the linearizable
+mode to model-check the above property (Appendix C).
+Our periodic snapshot replication guarantees that the system re-
+covers to a consistent state from within a time bound 𝜖 (i.e., bounded
+inconsistency) by tracking the time since the last successful repli-
+cation; if the time bound is exceeded, an application-specific action
+may be taken (e.g., dropping further packets or treating the switch
+as failed).
+6 Implementation
+Our prototype implementation is available in our repository [20].
+Data plane. We implement RedPlane’s data plane components in
+P4-16 [11] (≈1192 lines of code) and expose them as a library of P4
+control blocks [11, §13], which form the RedPlane APIs that devel-
+opers can use to make application state fault tolerant. We compile
+RedPlane-enabled applications to the Intel Tofino ASIC [14] with P4
+Studio 9.1.1 [12]. We implement key functions such as lease request
+generation, lease management, sequence number generation, and
+request timeout management, using a series of match-action ta-
+bles and register arrays. We evaluate the additional resource usage
+in §7.4. As mentioned in §5.2, we implement request buffering via
+the mirroring and truncation capabilities of the switch ASIC, which
+allows us to buffer only the replication protocol data and discard
+the original payload. We implement a basic sketch that supports
+lazy snapshotting; developers can modify it to implement similar
+data structures such as Bloom filters.
+Control plane. We implement the switch control plane in Python
+and C++. Its main function is to initialize and migrate (if available)
+state for the data plane by processing corresponding responses
+forwarded by the data plane component.
+State Store. Our contribution is in the fault tolerance protocol
+design and switch components. As such, our state store prototype
+is built based on readily available libraries and simple implemen-
+tations. We implement RedPlane’s state store in C++ for Linux
+servers. It uses Mellanox’s kernel-bypass raw packet interface [3]
+for optimized I/O performance. To ensure reliability in the pres-
+ence of server failures, we implement chain replication [74] using
+a group of 3 servers located in different racks.
+Applications. To demonstrate the applicability of RedPlane, we im-
+plement various applications in P4 described below. The simplified
+P4 code for NAT is available in Appendix B.
+(1) NAT: The NAT implementation uses RedPlane to implement a
+fault-tolerant per-5-tuple address translation table and available
+port pool. Since the port pool is a shared by different flows, it is
+sharded across state store servers and managed by them. The state
+is updated when a TCP connection is established from an internal
+network.
+(2) Firewall: The stateful firewall adds fault-tolerance to a per-5-
+tuple TCP connection state table using RedPlane. Its state is updated
+when a TCP connection is established from an internal network.
+(3) Load balancer: The load balancer maintains a per-5-tuple server
+mapping table; we make it fault-tolerant using RedPlane. It also
+uses a server IP pool, which is shared state. When a new TCP
+connection is established from an external network, the state is
+updated.
+(4) EPC-SGW: We also implement a simplified serving gateway
+(SGW) used in cellular networks, a mixed-read/write application. It
+maintains per-user tunnel endpoint ID state. The state is updated
+by signaling messages and read by data packets.

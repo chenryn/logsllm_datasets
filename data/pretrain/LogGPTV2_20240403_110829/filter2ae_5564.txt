@@ -1,0 +1,235 @@
+# 前言
+Inline hook是直接在以前的函数里面修改指令，用一个跳转或者其他指令来达到挂钩的目的。
+这是相对普通的hook来说，因为普通的hook只是修改函数的调用地址，而不是在原来的函数体里面做修改。一般来说，普通的hook比较稳定使用。 inline
+hook 更加高级一点，一般也跟难以被发现。ring3的Inline hook在之前已经实现过了，再看看ring0的Inline hook该如何实现。
+# 探究及实现
+这里本来调用链应该是`OpenFile -> ZwOpenFile`，这里在od里面应该可以看到，这里我就用windbg直接找到这个ring0函数。
+首先在windbg里面定位到`ZwOpenFile`函数，可以看到它的偏移为`0x74`
+通过SSDT表找到所有的内核函数地址，再通过`0x74`偏移定位到`ZwOpenFile`函数
+    kd> dd KeServiceDescriptorTable
+    kd> dd 80505450 + 74 * 4
+    kd> u 8057b182
+我这里因为windbg的原因没有显示函数名称，到pchunter里面确认一下，地址确实是一样的
+那么我们要实现Inline hook，无论是使用E8 call，还是E9
+jmp，都需要至少5个硬编码才能实现，所以这里我们找5个硬编码进行填入我们代码的操作，这里注意不能够找全局变量和重定位的地址，否则在进行还原的过程中可能地址已经发生改变导致程序不能够正常运行
+    mov ebp,esp
+    xor eax,eax
+    push eax
+首先我们写一个`FilterNtOpenFile`函数用来打印我们Inline
+hook后的一些信息，这里用到`PsGetCurrentProcess`获取进程的EPROCESS结构，在0x174偏移存放着进程名，我们通过打印进程名来查看一下哪些进程调用了`NtOpenFile`这个函数
+    char* p = "r0 InlineHook";
+    void FilterNtOpenFile(char* p)
+    {
+        KdPrint(("%s\r\n", p));
+        KdPrint(("name:%s\r\n", (char*)PsGetCurrentProcess() + 0x174));
+    }
+然后提供`ServiceDescriptorEntry`这个结构体并定义`KeServiceDescriptorTable`为 `ntoskrnl.exe`
+所导出的全局变量
+    typedef struct ServiceDescriptorEntry {
+        unsigned int* ServiceTableBase;
+        unsigned int* ServiceCounterTableBase; 
+        unsigned int NumberOfServices;
+        unsigned char* ParamTableBase;
+    } ServiceDescriptorTableEntry_t, * PServiceDescriptorTableEntry_t;
+    __declspec(dllimport) ServiceDescriptorTableEntry_t KeServiceDescriptorTable;
+这里我们再利用汇编来执行我们的汇编代码之后再jmp到原覆盖地址+5的地方，先用`pushad`跟`pushfd`保存寄存器
+    void _declspec(naked) NewNtOpenFile()
+    {
+        __asm
+        {
+            pushad
+            pushfd
+            push p
+            call FilterNtOpenFile
+            popfd
+            popad
+            mov ebp, esp
+            xor eax, eax
+            push eax
+            jmp ReAddress
+        }
+    }
+首先定义一个数组，用来存放E9jmp跳转的代码
+    UCHAR jmp_code[5] = "";
+然后因为我们在8057b185这个地址开始覆盖，函数的起始地址为8057b182，所以偏移为3
+    ULONG ChangeAddr = 3;
+然后通过`KeServiceDescriptorTable`的`ServiceTableBase`属性定位到`NtOpenFile`的起始地址，这里在`PCHunter`里面可以看到`NtOpenFile`的索引号为116
+    StartAddr = KeServiceDescriptorTable.ServiceTableBase[116];
+定义返回地址，用函数的开始地址+偏移+5即可得到返回地址
+    ReAddress = StartAddr + ChangeAddr + 5;
+通过E9 jmp的计算公式还需要计算我们自己定义的函数`newNtOpenKey`相对于`NtOpenFile`的偏移量
+    ULONG jmpAddr = (ULONG)NewNtOpenFile - StartAddr - ChangeAddr - 5;
+将跳转代码写入数组
+    jmp_code[0] = 0xE9;
+    *(ULONG*)&jmp_code[1] = jmpAddr;
+这里就需要写入内存了，这里需要关闭页的只读保护，定义一个`ShutPageProtect`函数将CR0寄存器的WP位置0
+    //关闭页只读保护
+    __asm
+        {
+            push eax;
+            mov eax, cr0;
+            and eax, ~0x10000;  // 与0x10000想与后取反
+            mov cr0, eax;
+            pop eax;
+            ret;
+        }
+关闭页保护之后首先将之前的硬编码保存，再进行覆盖
+    ShutPageProtect();
+    RtlCopyMemory(Old_code, (PVOID)(StartAddr + ChangeAddr), 5);
+    RtlCopyMemory((PVOID)(StartAddr + ChangeAddr), jmp_code, 5);
+写入内存完毕之后再定义一个`OpenPageProtect`函数将CR0寄存器的WP恢复为1
+    void _declspec(naked) OpenPageProtect()
+    {
+        __asm
+        {
+            push eax;
+            mov eax, cr0;
+            or eax, 0x10000;
+            mov cr0, eax;
+            pop eax;
+            ret;
+        }
+    }
+那么到这里我们的hook代码就已经完成，因为我们已经将原来的硬编码存入了`Old_code`这个数组，这里我们编写`UnHookNtOpenFile`时利用`RtlCopyMemory`写会到原内存即可
+    void UnHookNtOpenFile()
+    {
+        ULONG ChangeAddr = 3;
+        ShutPageProtect();
+        RtlCopyMemory((PVOID)(StartAddr + ChangeAddr), Old_code, 5);
+        OpenPageProtect();
+    }
+再就是加载驱动和卸载驱动，在加载驱动中调用`HookNtOpenFile`，在卸载驱动中调用`UnHookNtOpenFile`即可
+    //卸载驱动
+    void DriverUnload(DRIVER_OBJECT* obj)
+    {
+        //卸载钩子
+        UnHookNtOpenFile();
+        KdPrint(("驱动卸载成功！\n"));
+    }
+    /***驱动入口主函数***/
+    NTSTATUS DriverEntry(DRIVER_OBJECT* driver, UNICODE_STRING* path)
+    {
+        KdPrint(("驱动启动成功！\n"));
+        //安装钩子
+        HookNtOpenFile();
+        driver->DriverUnload = DriverUnload;
+        return STATUS_SUCCESS;
+    }
+完整代码如下
+    #include 
+    typedef struct ServiceDescriptorEntry {
+        unsigned int* ServiceTableBase;
+        unsigned int* ServiceCounterTableBase; 
+        unsigned int NumberOfServices;
+        unsigned char* ParamTableBase;
+    } ServiceDescriptorTableEntry_t, * PServiceDescriptorTableEntry_t;
+    __declspec(dllimport) ServiceDescriptorTableEntry_t KeServiceDescriptorTable;
+    // 关闭页只读保护
+    void ShutPageProtect();
+    // 开启页只读保护
+    void OpenPageProtect();
+    // 测试函数
+    void FilterNtOpenFile(char* p);
+    // 新NtOpenFile
+    void NewNtOpenFile();
+    // hook NtOpenFile
+    void HookNtOpenFile();
+    // unhook NtOpenFile
+    void UnHookNtOpenFile();
+    //关闭页只读保护
+    void _declspec(naked) ShutPageProtect()
+    {
+        __asm
+        {
+            push eax;
+            mov eax, cr0;
+            and eax, ~0x10000;
+            mov cr0, eax;
+            pop eax;
+            ret;
+        }
+    }
+    //开启页只读保护
+    void _declspec(naked) OpenPageProtect()
+    {
+        __asm
+        {
+            push eax;
+            mov eax, cr0;
+            or eax, 0x10000;
+            mov cr0, eax;
+            pop eax;
+            ret;
+        }
+    }
+    ULONG    StartAddr;
+    ULONG    ReAddress;
+    UCHAR    Old_code[5];
+    char* p = "r0 InlineHook";
+    void FilterNtOpenFile(char* p)
+    {
+        KdPrint(("%s\r\n", p));
+        KdPrint(("name:%s\r\n", (char*)PsGetCurrentProcess() + 0x174));
+    }
+    void _declspec(naked) NewNtOpenFile()
+    {
+        __asm
+        {
+            pushad
+            pushfd
+            push p
+            call FilterNtOpenFile
+            popfd
+            popad
+            mov ebp, esp
+            xor eax, eax
+            push eax
+            jmp ReAddress
+        }
+    }
+    void HookNtOpenFile()
+    {
+        // 存放跳转指令的数组
+        UCHAR jmp_code[5] = "";
+        // 在入口0x3处hook
+        ULONG ChangeAddr = 3;
+        // NtOpenFile函数的开始地址
+        StartAddr = KeServiceDescriptorTable.ServiceTableBase[116];
+        // 返回地址
+        ReAddress = StartAddr + ChangeAddr + 5;
+        // newNtOpenKey相对于NtOpenKey的偏移量
+        ULONG jmpAddr = (ULONG)NewNtOpenFile - StartAddr - ChangeAddr - 5;
+        // 使用jmp指令跳转，jmp = 0xE9
+        jmp_code[0] = 0xE9;
+        // 填入偏移地址
+        *(ULONG*)&jmp_code[1] = jmpAddr;
+        ShutPageProtect();
+        RtlCopyMemory(Old_code, (PVOID)(StartAddr + ChangeAddr), 5);
+        RtlCopyMemory((PVOID)(StartAddr + ChangeAddr), jmp_code, 5);
+        OpenPageProtect();
+    }
+    void UnHookNtOpenFile()
+    {
+        ULONG ChangeAddr = 3;
+        ShutPageProtect();
+        RtlCopyMemory((PVOID)(StartAddr + ChangeAddr), Old_code, 5);
+        OpenPageProtect();
+    }
+    //卸载驱动
+    void DriverUnload(DRIVER_OBJECT* obj)
+    {
+        //卸载钩子
+        UnHookNtOpenFile();
+        KdPrint(("驱动卸载成功！\n"));
+    }
+    /***驱动入口主函数***/
+    NTSTATUS DriverEntry(DRIVER_OBJECT* driver, UNICODE_STRING* path)
+    {
+        KdPrint(("驱动启动成功！\n"));
+        //安装钩子
+        HookNtOpenFile();
+        driver->DriverUnload = DriverUnload;
+        return STATUS_SUCCESS;
+    }
+实现效果如下
+欢迎关注公众号 **红队蓝军**

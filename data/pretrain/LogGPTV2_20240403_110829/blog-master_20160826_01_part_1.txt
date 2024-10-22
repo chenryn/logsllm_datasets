@@ -1,0 +1,241 @@
+## PostgreSQL 最佳实践 - 块级别增量备份(pg_rman baseon LSN)源码浅析与使用   
+##### [TAG 24](../class/24.md)
+### 作者   
+digoal    
+### 日期  
+2016-08-26    
+### 标签  
+PostgreSQL , pg_rman , 块级增量备份  
+----  
+## 背景    
+对于商业数据库来说，备份的功能一般都非常的全面。    
+比如Oracle，它的备份工具rman是非常强大的，很多年前就已经支持全量、增量、归档的备份模式，支持压缩等。    
+还支持元数据存储到数据库中，管理也非常的方便，例如保留多少归档，备份集的管理也很方便，例如要恢复到什么时间点，将此前的备份清除等等。    
+对于开源数据库来说，支持向商业版本这么丰富更能的比较少，PostgreSQL算是非常完善的一个。   
+PostgreSQL作为最高级的开源数据库，备份方面已经向商业数据库看齐。    
+目前PostgreSQL已经支持类似Oracle的rman备份工具的功能，支持全量、增量、归档三种备份模式，支持压缩，支持备份集的管理等。    
+有了块级增量备份，对于那种非常庞大的数据库，备份起来就不像只支持全量和归档的模式那么吃力了。    
+## PostgreSQL增量备份是怎么做到的呢？    
+一个数据页的框架如下    
+```  
+ * +----------------+---------------------------------+  
+ * | PageHeaderData | linp1 linp2 linp3 ...           |  
+ * +-----------+----+---------------------------------+  
+ * | ... linpN |                                      |  
+ * +-----------+--------------------------------------+  
+ * |               ^ pd_lower                         |  
+ * |                                                  |  
+ * |                     v pd_upper                   |  
+ * +-------------+------------------------------------+  
+ * |                     | tupleN ...                 |  
+ * +-------------+------------------+-----------------+  
+ * |       ... tuple3 tuple2 tuple1 | "special space" |  
+ * +--------------------------------+-----------------+  
+```  
+数据页头部的数据结构    
+```
+typedef struct PageHeaderData  
+{  
+        /* XXX LSN is member of *any* block, not only page-organized ones */  
+        PageXLogRecPtr pd_lsn;          /* LSN: next byte after last byte of xlog  
+                                         * record for last change to this page */  
+        uint16          pd_checksum;    /* checksum */   
+        uint16          pd_flags;               /* flag bits, see below */  
+        LocationIndex pd_lower;         /* offset to start of free space */  
+        LocationIndex pd_upper;         /* offset to end of free space */  
+        LocationIndex pd_special;       /* offset to start of special space */  
+        uint16          pd_pagesize_version;  
+        TransactionId pd_prune_xid; /* oldest prunable XID, or zero if none */  
+        ItemIdData      pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */  
+} PageHeaderData;  
+```
+因为如果对象是持久化的，那么它的所有变更都会记录REDO，数据页头部的pd_lsn表示该数据页最后一次变化时，变化产生的REDO在xlog file中的结束位置.    
+即如果xlog flush的xlog地址位 大于或等于 此页pd_lsn，那么这个页的更改就可以认为是可靠的。     
+```
+ *              pd_lsn          - identifies xlog record for last change to this page.  
+ *              pd_checksum - page checksum, if set.  
+ *              pd_flags        - flag bits.  
+ *              pd_lower        - offset to start of free space.  
+ *              pd_upper        - offset to end of free space.  
+ *              pd_special      - offset to start of special space.  
+ *              pd_pagesize_version - size in bytes and page layout version number.  
+ *              pd_prune_xid - oldest XID among potentially prunable tuples on page.  
+```
+好了，既然每次块的变化都包含了LSN的修改，那么也即是说，我们可以通过第一次备份开始时的全局LSN，以及当前需要备份的数据的page LSN来判断此页是否发生过修改。    
+如果修改了就备份，没修改，就不需要备份， 从而实现数据库的块级增量备份。    
+## pg_rman 介绍  
+pg_rman是一个开源的PostgreSQL备份管理软件，类似Oracle的RMAN。    
+https://github.com/ossc-db/pg_rman  
+http://ossc-db.github.io/pg_rman/index.html    
+pg_rman使用的是pg_start_backup(), copy, pg_stop_backup()的备份模式。    
+pg_rman跑的不是流复制协议，而是文件拷贝，所以pg_rman必须和数据库节点跑在一起。    
+如果在standby节点跑pg_rman，pg_rman则需要通过网络连接到主节点执行pg_start_backup和pg_stop_backup。    
+pg_rman的用法非常简单，支持以下几种运行模式。    
+```
+init  
+  Initialize a backup catalog.  
+backup  
+  Take an online backup.  
+restore  
+  Do restore.  
+show  
+  Show backup history. The detail option shows with additional information of each backups.  
+validate  
+  Validate backup files. Backups without validation cannot be used for restore and incremental backup.  
+delete  
+  Delete backup files.  
+purge  
+  Remove deleted backups from backup catalog.  
+```
+## 使用pg_rman的前提  
+开启归档    
+配置csvlog    
+建议的配置  
+```
+postgres=# show log_destination ;  
+ log_destination   
+-----------------  
+ csvlog  
+(1 row)  
+postgres=# SHOW log_directory ;  
+ log_directory  
+---------------  
+ pg_log  
+(1 row)  
+postgres=# SHOW archive_command ;  
+              archive_command  
+--------------------------------------------  
+ cp %p /data04/digoal/arc_log/%f  
+(1 row)  
+```
+## 初始化pg_rman backup catalog  
+首先需要初始化一个backup catalog，实际上就是需要一个目录，这个目录将用于存放备份的文件。    
+同时这个目录也会存放一些元数据，例如备份的配置文件，数据库的systemid，时间线文件历史等等。    
+初始化命令需要两个参数，分别为备份目标目录，以及数据库的$PGDATA    
+```
+$ mkdir /data05/digoal/pgbbk  
+$ /home/digoal/pgsql9.5/bin/pg_rman init -B /data05/digoal/pgbbk -D /data04/digoal/pg_root  
+INFO: ARCLOG_PATH is set to '/data04/digoal/arc_log'  
+INFO: SRVLOG_PATH is set to '/data04/digoal/pg_root/pg_log'  
+```
+生成备份元数据如下  
+```
+[digoal@iZ28tqoemgtZ ~]$ cd /data05/digoal/pgbbk/  
+[digoal@iZ28tqoemgtZ pgbbk]$ ll  
+total 16  
+drwx------ 4 digoal digoal 4096 Aug 26 19:29 backup  
+-rw-rw-r-- 1 digoal digoal   82 Aug 26 19:29 pg_rman.ini  
+-rw-rw-r-- 1 digoal digoal   40 Aug 26 19:29 system_identifier  
+drwx------ 2 digoal digoal 4096 Aug 26 19:29 timeline_history  
+```
+生成的配置文件  
+```
+$ cat pg_rman.ini   
+ARCLOG_PATH='/data04/digoal/arc_log'  
+SRVLOG_PATH='/data04/digoal/pg_root/pg_log'  
+```
+你可以把将来要使用的配置写在这个配置文件中，或者写在pg_rman的命令行中。  
+我后面的测试会直接使用命令行参数。  
+生成的数据库system id，用于区分备份的数据库是不是一个数据库，防止被冲。  
+```
+$ cat system_identifier   
+SYSTEM_IDENTIFIER='6318621837015461309'  
+```
+与控制文件中存储的system id一致。    
+**注意**  
+pg_rman只从postgresql.conf取log_directory和archive_command参数的值。      
+如果你的PostgreSQL的配置文件是include的或者配置在postgresql.auto.conf中。     
+这两个值将不准确。    
+所以建议你仅仅把参数配置在postgresql.conf中，而不要使用其他配置文件。    
+## pg_rman 命令行用法  
+```
+pg_rman manage backup/recovery of PostgreSQL database.  
+Usage:  
+  pg_rman OPTION init  
+  pg_rman OPTION backup  
+  pg_rman OPTION restore  
+  pg_rman OPTION show [DATE]  
+  pg_rman OPTION show detail [DATE]  
+  pg_rman OPTION validate [DATE]  
+  pg_rman OPTION delete DATE  
+  pg_rman OPTION purge  
+Common Options:  
+  -D, --pgdata=PATH         location of the database storage area  
+  -A, --arclog-path=PATH    location of archive WAL storage area  
+  -S, --srvlog-path=PATH    location of server log storage area  
+  -B, --backup-path=PATH    location of the backup storage area  
+  -c, --check               show what would have been done  
+  -v, --verbose             show what detail messages  
+  -P, --progress            show progress of processed files  
+Backup options:  
+  -b, --backup-mode=MODE    full, incremental, or archive  
+  -s, --with-serverlog      also backup server log files  
+  -Z, --compress-data       compress data backup with zlib  
+  -C, --smooth-checkpoint   do smooth checkpoint before backup  
+  -F, --full-backup-on-error   switch to full backup mode  
+                               if pg_rman cannot find validate full backup  
+                               on current timeline  
+      NOTE: this option is only used in --backup-mode=incremental or archive.  
+  --keep-data-generations=NUM keep NUM generations of full data backup  
+  --keep-data-days=NUM        keep enough data backup to recover to N days ago  
+  --keep-arclog-files=NUM   keep NUM of archived WAL  
+  --keep-arclog-days=DAY    keep archived WAL modified in DAY days  
+  --keep-srvlog-files=NUM   keep NUM of serverlogs  
+  --keep-srvlog-days=DAY    keep serverlog modified in DAY days  
+  --standby-host=HOSTNAME   standby host when taking backup from standby  
+  --standby-port=PORT       standby port when taking backup from standby  
+Restore options:  
+  --recovery-target-time    time stamp up to which recovery will proceed  
+  --recovery-target-xid     transaction ID up to which recovery will proceed  
+  --recovery-target-inclusive whether we stop just after the recovery target  
+  --recovery-target-timeline  recovering into a particular timeline  
+  --hard-copy                 copying archivelog not symbolic link  
+Catalog options:  
+  -a, --show-all            show deleted backup too  
+Delete options:  
+  -f, --force               forcibly delete backup older than given DATE  
+Connection options:  
+  -d, --dbname=DBNAME       database to connect  
+  -h, --host=HOSTNAME       database server host or socket directory  
+  -p, --port=PORT           database server port  
+  -U, --username=USERNAME   user name to connect as  
+  -w, --no-password         never prompt for password  
+  -W, --password            force password prompt  
+Generic options:  
+  -q, --quiet               don't show any INFO or DEBUG messages  
+  --debug                   show DEBUG messages  
+  --help                    show this help, then exit  
+  --version                 output version information, then exit  
+Read the website for details.   
+Report bugs to .  
+```
+## 全量备份  
+输入必要的参数或option  
+```
+$ export PGPASSWORD=postgres  
+$ /home/digoal/pgsql9.5/bin/pg_rman backup \  
+-B /data05/digoal/pgbbk \  
+-D /data04/digoal/pg_root \  
+-b full \  
+-s \  
+-Z \  
+-C \  
+--keep-data-days=10 \  
+--keep-arclog-files=15 \  
+--keep-arclog-days=10 \  
+--keep-srvlog-files=10 \  
+--keep-srvlog-days=15 \  
+-h 127.0.0.1 -p 1921 -U postgres -d postgres  
+```
+结果  
+```
+INFO: copying database files  
+NOTICE:  pg_stop_backup complete, all required WAL segments have been archived  
+INFO: copying archived WAL files  
+INFO: copying server log files  
+INFO: backup complete  
+HINT: Please execute 'pg_rman validate' to verify the files are correctly copied.  
+INFO: start deleting old archived WAL files from ARCLOG_PATH (keep files = 15, keep days = 10)  
+INFO: the threshold timestamp calculated by keep days is "2016-08-16 00:00:00"  
+INFO: start deleting old server files from SRVLOG_PATH (keep files = 10, keep days = 15)  
+INFO: the threshold timestamp calculated by keep days is "2016-08-11 00:00:00"  

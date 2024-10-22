@@ -1,0 +1,93 @@
+# 深入分析一个Pwn2Own的优质Webkit漏洞
+##### 译文声明
+本文是翻译文章，文章原作者 thezdi，文章来源：thezdi.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+今年的Pwn2Own比赛刚刚结束，在Pwn2Own温哥华站的比赛中，Fluoroacetate团队所使用的一个WebKit漏洞成功吸引了我的注意。这个漏洞是一个价值五万五千美金的漏洞利用链的一部分，在这篇文章中，我将会对这个漏洞进行深入分析，并对漏洞进行验证和研究。
+当然了，在开始深入分析之前，我们先把该漏洞的概念验证PoC提供给大家：
+首先，我们需要对受该漏洞影响的WebKit版本进行编译，即Safari v12.0.3版本，根据苹果的版本发布信息，该版本对应的是修订版v240322。
+`svn checkout -r 240322 https://svn.webkit.org/repository/webkit/trunk
+webkit_ga_asan`
+我们可以使用AddressSanitizer(ASAN)来完成编译操作，它可以允许我们在发生内存崩溃的时候第一时间检测到错误信息。
+`ZDIs-Mac:webkit_ga_asan zdi$ Tools/Scripts/set-webkit-configuration --asan
+ZDIs-Mac:webkit_ga_asan zdi$ Tools/Scripts/build-webkit # --jsc-only can be
+used here which should be enough`
+我们将使用lldb来进行调试，因为macOS本身就自带了这个工具。由于PoC中没有包含任何的呈现代码，因此我们需要在lldb中使用JavaScriptCore(JSC)来执行它。为了在lldb中执行jsc，我们需要调用它的二进制代码文件，而不是之前的脚本run-jsc。这个文件可以从 WebKitBuild/Release/jsc路径获取，并且需要正确设置环境变量。
+env DYLD_FRAMEWORK_PATH=/Users/zdi/webkit_ga_asan/WebKitBuild/Release
+我们可以在lldb中运行这条命令，或者把它放在一个文本文件中，然后传递到lldb -s中。
+`ZDIs-Mac:webkit_ga_asan zdi$ cat lldb_cmds.txt  
+env DYLD_FRAMEWORK_PATH=/Users/zdi/webkit_ga_asan/WebKitBuild/Releaser`
+好的，接下来，我们可以开始调试了：
+我们可以看到，代码在0x6400042d1d29处发生了崩溃：mov qword ptr [rcx + 8rsi],
+r8，经分析后我们确认为越界写入所导致的内存崩溃。栈追踪分析显示，它发生在虚拟机环境中，也就是编译过程或者JITed代码出了问题。我们还注意到的rsi索引，它包含了0x20000040，这个数字我们在PoC中是有见过的。
+__
+这个数字是bigarr! 的大小，即NUM_SPREAD_ARGS
+sizeof(a)。为了查看JITed代码，我们可以设置JSC_dumpDFGDisassembly环境变量，这样jsc就可以跳转到DFG和FTL的编译代码了。
+`ZDIs-Mac:webkit_ga_asan zdi$ JSC_dumpDFGDisassembly=true lldb -s
+lldb_cmds.txt WebKitBuild/Release/jsc ~/poc3.js`
+这将丢弃掉大量无关的代码集，那我们应该如何确定相关代码呢？
+我们知道崩溃事件发生在0x6400042d1d29处：mov qword ptr [rcx + 8rsi], r8。那我们为何不尝试搜索这个地址呢？
+没错，我们在DFG中找到了：
+__
+代码在使用DFG
+JIT的分布操作符来创建一个新数组时，调用了NewArrayWithSpread方法，整个行为发生在gen_func生成的一个函数f中，调用行为发生在一个循环中。
+在对源代码进行分析后，我们发现了Source/JavaScriptCore/dfg/DFGSpeculativeJIT.cpp文件中的SpeculativeJIT::compileNewArrayWithSpread函数。这是DFG代码的起始位置，启动代码意味着将JIT生成的机器代码写入内存以供以后执行。
+我们可以通过查看compileNewArrayWithSpread方法来理解其中的机器代码。我们看到compileAllocateNewArrayWithSize()负责分配具有特定大小的新数组，它的第三个参数sizeGPR将作为第二个参数传递给emitAllocateButterfly()，这意味着它将为数组分配一个新的butterfly（包含JS对象值的内存空间）。如果您不熟悉JSObject的butterfly，可以点击[【这里】](https://liveoverflow.com/the-butterfly-of-jsobject-browser-0x02/)了解更多信息。
+__
+跳转到EnITalListAtButoFuffE()，我们看到大小参数siZeGPR向左移动3位（乘以8），然后添加到常数sieof(IndexingHeader)。
+__
+方便起见，我们需要将实际的机器代码与我们在这个函数中的C++代码相匹配。m_jit字段的类型是JITCompiler。
+JITCompiler负责根据数据流图生成JIT代码。它通过委托给jit来实现，后者生成一个宏汇编程序（JITCompiler通过继承关系拥有该程序）。JITCompiler保存编译期间所需信息的引用，并记录链接中使用的信息（例如，要链接的所有调用的列表）。
+这意味着我们看到的调用，如m_jit.move()、m_jit.add32()等，是发出程序集的函数。通过跟踪每一个函数，我们将能够将其与C++对应的组件匹配。除了跟踪内存分配的malloc调试功能外，我们还根据自己对Intel程序集的偏好配置lldb。
+_`ZDIs-Mac:~ zdi$ cat ~/.lldbinit  
+settings set target.x86-disassembly-flavor intel  
+type format add --format hex long  
+type format add --format hex "unsigned long"  
+command script import lldb.macosx.heap  
+settings set target.env-vars  
+DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib  
+settings set target.env-vars MallocStackLogging=1  
+settings set target.env-vars MallocScribble=1`  
+_
+由于在启用Guard Malloc的情况下正在分配大容量，我们需要设置另一个允许此类分配的环境变量。
+_`ZDIs-Mac:webkit_ga_asan zdi$ cat lldb_cmds.txt  
+env DYLD_FRAMEWORK_PATH=/Users/zdi/webkit_ga_asan/WebKitBuild/Release env
+MALLOC_PERMIT_INSANE_REQUESTS=1  
+r`  
+_
+JSC_dumpDFGDisassembly将以AT&T格式转储程序集，因此我们运行deassembly-s 0x6400042d1c22-c
+70可以获得英特尔风格的程序集，结果如下：
+__
+让我们尝试匹配emitAllocateButterfly()中的一些代码。查看程序集列表，我们可以匹配以下内容：
+__
+接下来分析机器代码，此时需要设置断点。为此，我们在编译之前向jsc.cpp添加了一个dbg()函数。这将有助于在我们需要的时候进入JS代码。编译器报错显示未使用EncodedJSValue
+JSC_HOST_CALL
+functionDbg（ExecStateexec）函数中的exec，因此失败。为了解决这个问题，我们只添加了exec->argumentCount()；这不会影响执行。
+让我们在这里添加dbg()，因为实际的NewArrayWithSpread函数将在创建bigarr期间执行。
+再次JSC_dumpDFGDisassembly=true lldb -s lldb_cmds.txt WebKitBuild/Release/jsc
+~/poc3.js运行将会导出编译代码：
+在bigarr创建之前中断，您可以看到NewArrayWithSpread的机器代码。让我们在函数的开始处放置一个断点并继续执行。
+断点生效：
+接下来，我们需要仔细分析断点信息：
+那么这里到底发生了什么？还记得PoC中的下面这部分信息吗？
+mk_arr函数创建一个数组，第一个参数作为大小，第二个参数作为元素。大小为（0x20000000+0x40）/8=0x4000008，这将创建一个大小为0x4000008、元素值为0x41414141410000的数组。i2f函数用于将整数转换为浮点值，以便最终在内存中得到预期值。
+我们现在知道rcx指向对象a的butterfly-0x10，因为它的大小是rcx+8，这使得butterfly
+rcx+0x10。在这段代码的其余部分中，我们看到r8、r10、rdi、r9、rbx、r12和r13都指向对象a的一个副本-具体来说是八个副本，edx不断地添加每个副本的大小。
+此时，edx的值变成了0x20000040：
+那么这八个a拷贝到了哪里呢？值0x20000040代表的又是什么呢？
+重新看看PoC：
+这意味f变成了：
+f通过扩展NUM_SPREAD_ARGS（8）第一个参数的副本和第二个参数的单个副本来创建数组。用对象a（80×04000008）和c（长度1）调用f。当NewArrayWithSpread被调用时，它为8个a和1个c腾出了空间。
+最后一步到显示对象c的长度，这使得最终的edx值为0x20000041。
+__
+下一步应该是长度的分配，它发生在emitAllocateButterfly()中。
+__
+我们注意到shl
+r8d，0x3的溢出，其中0x20000041被封装到了0x208。当分配大小传递给emitAllocatevariableSize()时，它变为了0x210。
+__
+我们看到的越界读取访问冲突发生在mov qword
+ptr[rcx+8rsi]，r8的以下代码片段中。这个代码片段的问题是用错误的大小0x20000041反向迭代新创建的butterfly，而溢出后的实际大小是0x210。然后，它将每个元素归零，但由于内存中的实际大小远小于0x20000041，因此在ASAN构建中发生了了越界访问冲突。
+下面给出的是整个越界访问行为的流程图：
+## 总结
+在这篇文章中，我们对WebKit版本v240322中的一个越界访问漏洞进行了深入分析，这个漏洞是一个价值五万五千美金的漏洞利用链中的一部分。Pwn2Own上出现的漏洞往往都是行业内较为优质的漏洞，而本文所分析的这个漏洞也不例外。在日常的漏洞研究过程中，我也希望大家能够学会使用lldb，如果大家有更多关于该漏洞的想法，可以直接在我的推特上艾特我（[@ziadrb](https://github.com/ziadrb
+"@ziadrb")）。希望本文能够给大家提供帮助!

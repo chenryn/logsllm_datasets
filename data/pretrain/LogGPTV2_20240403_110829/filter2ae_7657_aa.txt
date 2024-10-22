@@ -1,0 +1,228 @@
+>
+> 一直想要入门chrome漏洞挖掘，于是就打算从一道[CTF题目](https://ctftime.org/task/6081)入手（其实也是一个真实的漏洞），这篇文章记录了我的学习过程，是一个总结，也希望能帮到同样在入门的朋友。
+# 调试环境
+  * Ubuntu16.04 x64
+  * [pwndbg](https://github.com/pwndbg/pwndbg)
+## v8调试环境搭建
+  * 这里主要参考了sakura师傅的教程
+    * 
+  * 以及最重要的一点，挂代理，这里我使用的是`polipo`
+    * 
+## 编译
+首先进入题目所给出的[链接](https://crbug.com/821137)，找到修复bug的commit。  
+然后可以找到包含漏洞的版本hash值和一个poc文件  
+然后通过parent的hash值回退到漏洞版本，并进行编译（debug模式）
+    git reset --hard 1dab065bb4025bdd663ba12e2e976c34c3fa6599
+    gclient sync
+    tools/dev/v8gen.py x64.debug 
+    ninja -C out.gn/x64.debug d8
+relase模式编译
+    tools/dev/v8gen.py x64.relase
+    ninja -C out.gn/x64.relase d8
+# v8基础简介
+# 分析与调试技巧
+> 这里先简单介绍一下我学习过程中用到的调试方法。
+  1. %DebugPrint()  
+这是一个极其常用的函数，可以通过该函数打印出对象的详细信息，如内存地址、属性、map等。运行时使用参数`--allow-natives-syntax`  
+如：
+        let arr = [];
+     %DebugPrint(arr);
+        ./d8 --allow-natives-syntax ./test.js
+  2. DebugBreak()  
+当分析v8源码时，遇到`CodeStubAssembler`编写的代码，可以在其中插入`DebugBreak();`，这相当于插入了一个断点(类似`int
+3`)，重新编译后使用调试器调试时，可以在插入处断下。
+  3. Print()  
+同样，遇到`CodeStubAssembler`编写的代码时，可以使用它来输出一些变量值，函数原型是
+        void CodeStubAssembler::Print(const char* prefix, Node* tagged_value)
+用法
+        //第二个参数是Node*型，可能需要强转
+     Print("array", static_cast(array.value()));
+重新编译后即可。
+  4. readline()  
+可以添加在js代码中，让程序停下来等待输入，方便使用gdb断下进行调试。该方法比写一个while死循环好在，让程序停下后，还可以让程序继续运行下去。
+  5. V8自带gdb调试命令  
+在/tools/目录下，可以找到gdbinit和gdb-v8-support.py。我将gdb-v8-support.py复制到了根目录下，然后修改自己的.gdbinit文件，将提供的gdbinit都复制过来。  
+就可以在gdb中使用v8自带调试命令了  
+具体命令可以在gdbinit中自己查阅，注释还是很友好的。我最常用的就是job。
+  6. [polyfill](https://github.com/inexorabletash/polyfill)  
+因为我没有系统学过js开发，不是太清楚ployfill在实际开发时的作用（似乎是用来补充一些浏览器缺少的api）。但是在学习v8的过程中对我有极大的帮助，在`ployfill`中使用js自身实现了许多js的原生函数，这意味着，在调试js原生函数的时候可以通过查看`polyfill`来了解函数实现细节。而且经过和v8中使用`CodeStubAssembler`实现的原生函数，可以发现实现逻辑基本一致。
+# 漏洞分析
+## POC分析
+    let oobArray = [];
+    let maxSize = 1028 * 8;
+    Array.from.call(function() { return oobArray }, {[Symbol.iterator] : _ => (
+      {
+        counter : 0,
+        next() {
+          let result = this.counter++;
+          if (this.counter > maxSize) {
+            oobArray.length = 0;
+            return {done: true};
+          } else {
+            return {value: result, done: false};
+          }
+        }
+      }
+    ) });
+    oobArray[oobArray.length - 1] = 0x41414141;
+运行该poc，触发crash（注意使用debug编译的d8）  
+简单的分析该`poc`  
+首先创建了一个数组oobArray  
+然后将`function() { return oobArray }`作为`this`参数传入`Array.from.call`。
+此处，我查阅了pollyfill中对`Array.from`的实现（这里对Array.from的分析其实是在下文分析漏洞时进行的，但为了描述的方便，先写在此处）  
+因为这里`Array.from.call`的this参数是一个函数，所以会调用`var a = new c()`  
+查询javascript中`new关键字`的返回值可知，当使用new关键字调用一个函数时，若函数返回一个非原始变量（如像object、array或function），那么这些返回值将取代原本应该返回的this实例。  
+这意味着这里调用`c()`会返回`oobArray`，并且此后的操作都将直接修改`oobArray`。
+回到`poc`中，在`iterator`中可以看到，在最后一次迭代时，将`oobArray`的长度修改为`0`。  
+最后的赋值语句触发crash
+通过poc可以猜测，可能是最后一次迭代时对`oobArray.length`的赋值时出现了bug,
+导致最后`oobArray`实际长度与`length的值`的不同，造成越界访问。  
+下面进行详细的分析。
+## 源码分析
+首先从`diff`入手，看看如何修复的该漏洞  
+注意到这里只修改了`GenerateSetLength`函数中的一个跳转语句，将`LessThan`修改为`NotEqual`，这说明极有可能是在`length_smi
+> old_length`时的处理出现了问题。但仍需进一步分析。
+### CodeStubAssembler简介
+这里分析将涉及到CodeStubAssembler代码，这里先简单介绍一下。
+>
+> v8为了提高效率，采用了CodeStubAssembler来编写js的原生函数，它是是一个定制的，与平台无关的汇编程序，它提供低级原语作为汇编的精简抽象，但也提供了一个扩展的高级功能库。
+这里我简单记录其中几个的语法，一些是我自己推测理解的，仅供参考。。
+  * TF_BUILTIN：创建一个函数
+  * Label：用于定义将要用到的标签名，这些标签名将作为跳转的目标
+  * BIND：用于绑定一个标签，作为跳转的目标
+  * Branch：条件跳转指令
+  * VARIABLE：定义一些变量
+  * Goto：跳转
+### 漏洞代码逻辑
+> 建议使用IDE之类来查看代码，方便搜索和跳转。
+首先查看`GenerateSetLength`函数
+    void GenerateSetLength(TNode array,
+                             TNode length) {
+        Label fast(this), runtime(this), done(this);
+        // Only set the length in this stub if
+        // 1) the array has fast elements,
+        // 2) the length is writable,
+        // 3) the new length is greater than or equal to the old length.
+        // 1) Check that the array has fast elements.
+        // TODO(delphick): Consider changing this since it does an an unnecessary
+        // check for SMIs.
+        // TODO(delphick): Also we could hoist this to after the array construction
+        // and copy the args into array in the same way as the Array constructor.
+        BranchIfFastJSArray(array, context, &fast, &runtime);
+        BIND(&fast);
+        {
+          TNode fast_array = CAST(array);
+          TNode length_smi = CAST(length);
+          TNode old_length = LoadFastJSArrayLength(fast_array);
+          CSA_ASSERT(this, TaggedIsPositiveSmi(old_length));
+          EnsureArrayLengthWritable(LoadMap(fast_array), &runtime);
+          // 3) If the created array already has a length greater than required,
+          //    then use the runtime to set the property as that will insert holes
+          //    into the excess elements and/or shrink the backing store.
+          GotoIf(SmiLessThan(length_smi, old_length), &runtime);
+          StoreObjectFieldNoWriteBarrier(fast_array, JSArray::kLengthOffset,
+                                         length_smi);
+          Goto(&done);
+        }
+        BIND(&runtime);
+        {
+          CallRuntime(Runtime::kSetProperty, context, static_cast(array),
+                      CodeStubAssembler::LengthStringConstant(), length,
+                      SmiConstant(LanguageMode::kStrict));
+          Goto(&done);
+        }
+        BIND(&done);
+      }
+    };
+首先判断是否具有[fast element](https://v8.dev/blog/fast-properties)，这里poc代码执行时会进入`&fast`分支
+随后若`length_smi  old_length`时出现问题，通过这里的分析，漏洞根源似乎更明了了。  
+当`length_smi >
+old_length`，程序不会执行`&runtime`去进行缩减内存等操作，而是会直接修改length的值。那么可以猜测是将较大的`length_smi`写入了数组的`length`，导致数组的长度属性值大于了实际长度，造成了越界访问。
+看到这里，感觉仍然没有完全分析透彻，不知道函数各个参数的具体来源都是什么，也不知道为什么`length_smi`会大于`old_length`。
+于是尝试寻找调用该函数的上层函数，搜索后定位到了`TF_BUILTIN(ArrayFrom,
+ArrayPopulatorAssembler)`，代码比较长，不过还是得慢慢看。  
+(之所以确定这个函数，是因为poc中确实正好调用了`Array.from`)  
+    // ES #sec-array.from
+    TF_BUILTIN(ArrayFrom, ArrayPopulatorAssembler) {
+      ...
+      TNode array_like = ToObject(context, items);
+      TVARIABLE(Object, array);
+      TVARIABLE(Number, length);
+      // Determine whether items[Symbol.iterator] is defined:
+      IteratorBuiltinsAssembler iterator_assembler(state());
+      Node* iterator_method =
+          iterator_assembler.GetIteratorMethod(context, array_like);
+      Branch(IsNullOrUndefined(iterator_method), &not_iterable, &iterable);
+      // 如果可以迭代
+      BIND(&iterable);
+      {
+        ...
+        // 返回一个数组，用于存储迭代后得到的结果
+        // Construct the output array with empty length.
+        array = ConstructArrayLike(context, args.GetReceiver());
+        ...
+        Goto(&loop);
+        //开始迭代
+        BIND(&loop);
+        {
+          // 判断迭代是否结束
+          // Loop while iterator is not done.
+          TNode next = CAST(iterator_assembler.IteratorStep(
+              context, iterator_record, &loop_done, fast_iterator_result_map));
+          TVARIABLE(Object, value,
+                    CAST(iterator_assembler.IteratorValue(
+                        context, next, fast_iterator_result_map)));
+          ...
+          // 将得到的结果存入array
+          // Store the result in the output object (catching any exceptions so the
+          // iterator can be closed).
+          Node* define_status =
+              CallRuntime(Runtime::kCreateDataProperty, context, array.value(),
+                          index.value(), value.value());
+          GotoIfException(define_status, &on_exception, &var_exception);
+          // 索引加1
+          index = NumberInc(index.value());
+          ...
+          Goto(&loop);
+        }
+        //迭代结束
+        BIND(&loop_done);
+        {
+          //将迭代次数赋值给length变量
+          length = index;
+          Goto(&finished);
+        }
+        ...
+      }
+      ...
+      BIND(&finished);
+      // 调用GenerateSetLength，将array和迭代次数作为参数
+      // Finally set the length on the output and return it.
+      GenerateSetLength(context, array.value(), length.value());
+      args.PopAndReturn(array.value());
+    }
+配合源码注释，可以基本了解函数流程。当然，这里还可以参考`polyfill`中的实现。
+在可以迭代的情况下，会使用`ConstructArrayLike`返回一个数组`array`，用于存储迭代输出的结果。配合前文分析的`polyfill`中的实现，这里返回的数组就是`oobArray`。  
+这里也可以通过输出调试信息来进行验证  
+然后会进入到`BIND(&loop)`块，这应该就是在使用`Symbol.iterator`在进行迭代，每次迭代所得到的值都会存入`array`
+迭代结束后将进入`&loop_done`，这里将`index`赋值给了`length`，也就是说`length`中存储的是`迭代次数`。
+最后调用了我们已经分析过的`GenerateSetLength`，三个参数分别是`context`，用于存储结果的`array`，迭代次数`length`
+## 漏洞原理总结
+结合前面`GenerateSetLength`的分析，我们就可以得出整个`array.from`的处理逻辑
+当在`Array.from`中迭代完成后调用了`GenerateSetLength`
+在`GenerateSetLength`中，若迭代次数
+**小于**`array`的长度，意味着`array`的长度大于了需求的长度，那么就需要对内存进行整理，释放多余的空间。
+>
+> 这里我的想法是，迭代时是按顺序依次遍历每个元素，那么`array`的前`length_smi`个元素一定是被迭代访问过的且也是仅访问过的，后面多出的元素都不是迭代得到的，所以可以去掉。
+然而开发者似乎忽略了 **传入的数组可以是初始数组本身** 的情况，从而认为数组长度应该不会小于迭代次数（因为每次迭代都会创建一个新的数组元素）
+所以若数组是初始数组，那么我们就可以在迭代途中修改数组的长度。将正在迭代的数组长度缩小，那么就会导致数组多余的空间被释放，但是在`GenerateSetLength`中，又将`array.length`直接改写为较大的`length_smi`（迭代次数），导致长度属性值大于实际长度，造成越界访问。
+# 漏洞利用
+## V8内存模型
+### Tagged Value
+在v8中，存在两种类型，一个是Smi((small integer)，一个是指针类型。由于对齐，所以指针的最低位总是0，`Tagged
+Value`就是利用了最低位来区别Smi和指针类型。当最低位为1时，表示这是一个指针，当最低位为0，那么这就是一个Smi。
+  * Smi  
+为了节约内存、加快运算速度等，实现了一个小整数类型，被称作Smi。  
+在32位环境中，Smi占据32位，其中最低位为标记位（为0），所以Smi只使用了31位来表示值。  
+在64位环境中，Smi占据64位，其中最低位为标记位（为0），但是只有高32位用于表示值，低32位都为0（包括标记位）
+  * 指针  

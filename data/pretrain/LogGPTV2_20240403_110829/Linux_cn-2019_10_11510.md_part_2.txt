@@ -1,0 +1,178 @@
+    stateCookieValue, err := cookieSigner.Encode("state", state)
+    if err != nil {
+        respondError(w, fmt.Errorf("could not encode state cookie: %v", err))
+        return
+    }
+    http.SetCookie(w, &http.Cookie{
+        Name:     "state",
+        Value:    stateCookieValue,
+        Path:     "/api/oauth/github",
+        HttpOnly: true,
+    })
+    http.Redirect(w, r, githubOAuthConfig.AuthCodeURL(state), http.StatusTemporaryRedirect)
+}
+```
+OAuth2 使用一种机制来防止 CSRF 攻击，因此它需要一个“状态”（`state`）。我们使用 `Nanoid()` 来创建一个随机字符串，并用这个字符串作为状态。我们也把它保存为一个 cookie。
+### OAuth 回调
+一旦用户授权我们访问他的个人信息，他将会被重定向到这个端点。这个 URL 的查询字符串上将会包含状态（`state`）和授权码（`code`）： `/api/oauth/github/callback?state=&code=`。
+```
+const jwtLifetime = time.Hour * 24 * 14
+type GithubUser struct {
+    ID        int     `json:"id"`
+    Login     string  `json:"login"`
+    AvatarURL *string `json:"avatar_url,omitempty"`
+}
+type User struct {
+    ID        string  `json:"id"`
+    Username  string  `json:"username"`
+    AvatarURL *string `json:"avatarUrl"`
+}
+func githubOAuthCallback(w http.ResponseWriter, r *http.Request) {
+    stateCookie, err := r.Cookie("state")
+    if err != nil {
+        http.Error(w, http.StatusText(http.StatusTeapot), http.StatusTeapot)
+        return
+    }
+    http.SetCookie(w, &http.Cookie{
+        Name:     "state",
+        Value:    "",
+        MaxAge:   -1,
+        HttpOnly: true,
+    })
+    var state string
+    if err = cookieSigner.Decode("state", stateCookie.Value, &state); err != nil {
+        http.Error(w, http.StatusText(http.StatusTeapot), http.StatusTeapot)
+        return
+    }
+    q := r.URL.Query()
+    if state != q.Get("state") {
+        http.Error(w, http.StatusText(http.StatusTeapot), http.StatusTeapot)
+        return
+    }
+    ctx := r.Context()
+    t, err := githubOAuthConfig.Exchange(ctx, q.Get("code"))
+    if err != nil {
+        respondError(w, fmt.Errorf("could not fetch github token: %v", err))
+        return
+    }
+    client := githubOAuthConfig.Client(ctx, t)
+    resp, err := client.Get("https://api.github.com/user")
+    if err != nil {
+        respondError(w, fmt.Errorf("could not fetch github user: %v", err))
+        return
+    }
+    var githubUser GithubUser
+    if err = json.NewDecoder(resp.Body).Decode(&githubUser); err != nil {
+        respondError(w, fmt.Errorf("could not decode github user: %v", err))
+        return
+    }
+    defer resp.Body.Close()
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        respondError(w, fmt.Errorf("could not begin tx: %v", err))
+        return
+    }
+    var user User
+    if err = tx.QueryRowContext(ctx, `
+        SELECT id, username, avatar_url FROM users WHERE github_id = $1
+    `, githubUser.ID).Scan(&user.ID, &user.Username, &user.AvatarURL); err == sql.ErrNoRows {
+        if err = tx.QueryRowContext(ctx, `
+            INSERT INTO users (username, avatar_url, github_id) VALUES ($1, $2, $3)
+            RETURNING id
+        `, githubUser.Login, githubUser.AvatarURL, githubUser.ID).Scan(&user.ID); err != nil {
+            respondError(w, fmt.Errorf("could not insert user: %v", err))
+            return
+        }
+        user.Username = githubUser.Login
+        user.AvatarURL = githubUser.AvatarURL
+    } else if err != nil {
+        respondError(w, fmt.Errorf("could not query user by github ID: %v", err))
+        return
+    }
+    if err = tx.Commit(); err != nil {
+        respondError(w, fmt.Errorf("could not commit to finish github oauth: %v", err))
+        return
+    }
+    exp := time.Now().Add(jwtLifetime)
+    token, err := jwtSigner.Encode(jwt.Claims{
+        Subject:    user.ID,
+        Expiration: json.Number(strconv.FormatInt(exp.Unix(), 10)),
+    })
+    if err != nil {
+        respondError(w, fmt.Errorf("could not create token: %v", err))
+        return
+    }
+    expiresAt, _ := exp.MarshalText()
+    data := make(url.Values)
+    data.Set("token", string(token))
+    data.Set("expires_at", string(expiresAt))
+    http.Redirect(w, r, "/callback?"+data.Encode(), http.StatusTemporaryRedirect)
+}
+```
+首先，我们会尝试使用之前保存的状态对 cookie 进行解码。并将其与查询字符串中的状态进行比较。如果它们不匹配，我们会返回一个 `418 I'm teapot`（未知来源）错误。
+接着，我们使用授权码生成一个令牌。这个令牌被用于创建 HTTP 客户端来向 GitHub API 发出请求。所以最终我们会向 `https://api.github.com/user` 发送一个 GET 请求。这个端点将会以 JSON 格式向我们提供当前经过身份验证的用户信息。我们将会解码这些内容，一并获取用户的 ID、登录名（用户名）和头像 URL。
+然后我们将会尝试在数据库上找到具有该 GitHub ID 的用户。如果没有找到，就使用该数据创建一个新的。
+之后，对于新创建的用户，我们会发出一个将用户 ID 作为主题（`Subject`）的 JSON 网络令牌，并使用该令牌重定向到前端，查询字符串中一并包含该令牌的到期日（`Expiration`）。
+这一 Web 应用也会被用在其他帖子，但是重定向的链接会是 `/callback?token=&expires_at=`。在那里，我们将会利用 JavaScript 从 URL 中获取令牌和到期日，并通过 `Authorization` 标头中的令牌以 `Bearer token_here` 的形式对 `/api/auth_user` 进行 GET 请求，来获取已认证的身份用户并将其保存到 localStorage。
+### Guard 中间件
+为了获取当前已经过身份验证的用户，我们设计了 Guard 中间件。这是因为在接下来的文章中，我们会有很多需要进行身份认证的端点，而中间件将会允许我们共享这一功能。
+```
+type ContextKey struct {
+    Name string
+}
+var keyAuthUserID = ContextKey{"auth_user_id"}
+func guard(handler http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        var token string
+        if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+            token = a[7:]
+        } else if t := r.URL.Query().Get("token"); t != "" {
+            token = t
+        } else {
+            http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+            return
+        }
+        var claims jwt.Claims
+        if err := jwtSigner.Decode([]byte(token), &claims); err != nil {
+            http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+            return
+        }
+        ctx := r.Context()
+        ctx = context.WithValue(ctx, keyAuthUserID, claims.Subject)
+        handler(w, r.WithContext(ctx))
+    }
+}
+```
+首先，我们尝试从 `Authorization` 标头或者是 URL 查询字符串中的 `token` 字段中读取令牌。如果没有找到，我们需要返回 `401 Unauthorized`（未授权）错误。然后我们将会对令牌中的申明进行解码，并使用该主题作为当前已经过身份验证的用户 ID。
+现在，我们可以用这一中间件来封装任何需要授权的 `http.handlerFunc`，并且在处理函数的上下文中保有已经过身份验证的用户 ID。
+```
+var guarded = guard(func(w http.ResponseWriter, r *http.Request) {
+    authUserID := r.Context().Value(keyAuthUserID).(string)
+})
+```
+### 获取认证用户
+```
+func getAuthUser(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    authUserID := ctx.Value(keyAuthUserID).(string)
+    var user User
+    if err := db.QueryRowContext(ctx, `
+        SELECT username, avatar_url FROM users WHERE id = $1
+    `, authUserID).Scan(&user.Username, &user.AvatarURL); err == sql.ErrNoRows {
+        http.Error(w, http.StatusText(http.StatusTeapot), http.StatusTeapot)
+        return
+    } else if err != nil {
+        respondError(w, fmt.Errorf("could not query auth user: %v", err))
+        return
+    }
+    user.ID = authUserID
+    respond(w, user, http.StatusOK)
+}
+```
+我们使用 Guard 中间件来获取当前经过身份认证的用户 ID 并查询数据库。
+这一部分涵盖了后端的 OAuth 流程。在下一篇帖子中，我们将会看到如何开始与其他用户的对话。
+* [源代码](https://github.com/nicolasparada/go-messenger-demo)
+---
+via: 
+作者：[Nicolás Parada](https://nicolasparada.netlify.com/) 选题：[lujun9972](https://github.com/lujun9972) 译者：[PsiACE](https://github.com/PsiACE) 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创编译，[Linux中国](https://linux.cn/) 荣誉推出

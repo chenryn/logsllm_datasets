@@ -1,0 +1,250 @@
+本篇主要以CSAW-2015-CTF的stringipc题目为例，分析了三种从内存任意读写到权限提升的利用方法。本人学习KERNEL
+PWN的时间也较短，如有差错，请指正。
+# 0 环境搭建与题目分析
+## 环境搭建
+题目环境由于比赛时间过去很久了，没有找到，所以选择自行编译。
+内核源码我选择了[linux-4.4.110版本](https://mirrors.edge.kernel.org/pub/linux/kernel/v4.x/linux-4.4.110.tar.gz)。  
+busybox采用[1.21.1版本](https://busybox.net/downloads/busybox-1.21.1.tar.bz2)。  
+stringipc的题目源码可以在[这里](https://github.com/mncoppola/StringIPC/blob/master/main.c)找到。  
+源码及busybox编译可以参考[这篇文章](https://www.anquanke.com/post/id/85837)进行编译，我就不赘述了。
+将stringipc的源码，放在内核源码目录下，并编写Makefile文件，执行make就可以编译成为符合内核源码的驱动文件string.ko。  
+相关环境及题目文件可在[此处](https://github.com/ret2p4nda/kernel-pwn)下载
+## 题目分析
+题目主要维护了一块由kzalloc(sizeof(*channel), GFP_KERNEL)创建的内存块，并可对内存块读、写、扩展或缩小。  
+此题漏洞存在于对漏洞扩展的函数realloc_ipc_channel中：
+    static int realloc_ipc_channel ( struct ipc_state *state, int id, size_t size, int grow )
+    {
+        struct ipc_channel *channel;
+        size_t new_size;
+        char *new_data;
+        channel = get_channel_by_id(state, id);
+        if ( IS_ERR(channel) )
+            return PTR_ERR(channel);
+        if ( grow )
+            new_size = channel->buf_size + size;
+        else
+            new_size = channel->buf_size - size;
+        new_data = krealloc(channel->data, new_size + 1, GFP_KERNEL);
+        if ( new_data == NULL )
+            return -EINVAL;
+        channel->data = new_data;
+        channel->buf_size = new_size;
+        ipc_channel_put(state, channel);
+        return 0;
+    }
+当krealloc返回值不为0时，可以通过验证，将返回值作为内存块起始地址。而krealloc(mm\slab_common.c
+1225)在实现中有一个不为0的错误代码ZERO_SIZE_PTR
+    /**
+     * krealloc - reallocate memory. The contents will remain unchanged.
+     * @p: object to reallocate memory for.
+     * @new_size: how many bytes of memory are required.
+     * @flags: the type of memory to allocate.
+     *
+     * The contents of the object pointed to are preserved up to the
+     * lesser of the new and old sizes.  If @p is %NULL, krealloc()
+     * behaves exactly like kmalloc().  If @new_size is 0 and @p is not a
+     * %NULL pointer, the object pointed to is freed.
+     */
+    void *krealloc(const void *p, size_t new_size, gfp_t flags)
+    {
+        void *ret;
+        if (unlikely(!new_size)) {
+            kfree(p);
+            return ZERO_SIZE_PTR;
+        }
+        ret = __do_krealloc(p, new_size, flags);
+        if (ret && p != ret)
+            kfree(p);
+        return ret;
+    }
+    EXPORT_SYMBOL(krealloc);
+而ZERO_SIZE_PTR定义在include\linux\slab.h 101
+    #define ZERO_SIZE_PTR ((void *)16)
+可知，当new_size = 0时，可返回该值，而构造该值时由于并没有对传入的size进行检查，恰好new_size = 0 - 1
+，即为0xffffffffffffffff，而此后的检测所定义的size值均为size_t 即unsize long
+long。所以通过题目中给出的seek、read、write功能就可以对内核及用户态地址任意读写。
+# 1 修改cred结构提升权限
+## cred结构体
+提及cred结构，做过权限提升的同学都不会陌生。这个结构体是用来标注某线程权限的结构体。
+首先，每一个线程在内核中都对应一个线程栈、一个线程结构块thread_info去调度，结构体里面同时也包含了线程的一系列信息。
+该thread_info结构体存放在线程栈的最低地址，对应的结构体定义(\arch\x86\include\asm\thread_info.h 55)是：
+    struct thread_info {
+        struct task_struct  *task;      /* main task structure */
+        __u32           flags;      /* low level flags */
+        __u32           status;     /* thread synchronous flags */
+        __u32           cpu;        /* current CPU */
+        mm_segment_t        addr_limit;
+        unsigned int        sig_on_uaccess_error:1;
+        unsigned int        uaccess_err:1;  /* uaccess failed */
+    };
+而在thread_info里，包含最重要信息的是task_struct结构体，定义在(\include\linux\sched.h 1390)
+    裁剪过后 
+    struct task_struct {
+        volatile long state;    /* -1 unrunnable, 0 runnable, >0 stopped */
+        void *stack;
+        atomic_t usage;
+        unsigned int flags; /* per process flags, defined below */
+        unsigned int ptrace;
+    ... ...
+    /* process credentials */
+        const struct cred __rcu *ptracer_cred; /* Tracer's credentials at attach */
+        const struct cred __rcu *real_cred; /* objective and real subjective task
+                         * credentials (COW) */
+        const struct cred __rcu *cred;  /* effective (overridable) subjective task
+                         * credentials (COW) */
+        char comm[TASK_COMM_LEN]; /* executable name excluding path
+                         - access with [gs]et_task_comm (which lock
+                           it with task_lock())
+                         - initialized normally by setup_new_exec */
+    /* file system info */
+        struct nameidata *nameidata;
+    #ifdef CONFIG_SYSVIPC
+    /* ipc stuff */
+        struct sysv_sem sysvsem;
+        struct sysv_shm sysvshm;
+    #endif
+    ... ... 
+    };
+而其中，cred结构体(\include\linux\cred.h
+118)表示的就是这个线程的权限。只要将这个结构的uid~fsgid全部覆写为0就可以把这个线程权限提升为root（root uid为0）
+    struct cred {
+        atomic_t    usage;
+    #ifdef CONFIG_DEBUG_CREDENTIALS
+        atomic_t    subscribers;    /* number of processes subscribed */
+        void        *put_addr;
+        unsigned    magic;
+    #define CRED_MAGIC  0x43736564
+    #define CRED_MAGIC_DEAD 0x44656144
+    #endif
+        kuid_t      uid;        /* real UID of the task */
+        kgid_t      gid;        /* real GID of the task */
+        kuid_t      suid;       /* saved UID of the task */
+        kgid_t      sgid;       /* saved GID of the task */
+        kuid_t      euid;       /* effective UID of the task */
+        kgid_t      egid;       /* effective GID of the task */
+        kuid_t      fsuid;      /* UID for VFS ops */
+        kgid_t      fsgid;      /* GID for VFS ops */
+        unsigned    securebits; /* SUID-less security management */
+        kernel_cap_t    cap_inheritable; /* caps our children can inherit */
+        kernel_cap_t    cap_permitted;  /* caps we're permitted */
+        kernel_cap_t    cap_effective;  /* caps we can actually use */
+        kernel_cap_t    cap_bset;   /* capability bounding set */
+        kernel_cap_t    cap_ambient;    /* Ambient capability set */
+    #ifdef CONFIG_KEYS
+        unsigned char   jit_keyring;    /* default keyring to attach requested
+                         * keys to */
+        struct key __rcu *session_keyring; /* keyring inherited over fork */
+        struct key  *process_keyring; /* keyring private to this process */
+        struct key  *thread_keyring; /* keyring private to this thread */
+        struct key  *request_key_auth; /* assumed request_key authority */
+    #endif
+    #ifdef CONFIG_SECURITY
+        void        *security;  /* subjective LSM security */
+    #endif
+        struct user_struct *user;   /* real user ID subscription */
+        struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+        struct group_info *group_info;  /* supplementary groups for euid/fsgid */
+        struct rcu_head rcu;        /* RCU deletion hook */
+    };
+这个结构体在线程初始化由prepare_creds函数创建，可以看到创建cred的方法是kmem_cache_alloc
+    struct cred *prepare_creds(void)
+    {
+        struct task_struct *task = current;
+        const struct cred *old;
+        struct cred *new;
+        validate_process_creds();
+        new = kmem_cache_alloc(cred_jar, GFP_KERNEL);
+        if (!new)
+            return NULL;
+        kdebug("prepare_creds() alloc %p", new);
+        old = task->cred;
+        memcpy(new, old, sizeof(struct cred));
+        atomic_set(&new->usage, 1);
+        set_cred_subscribers(new, 0);
+        get_group_info(new->group_info);
+        get_uid(new->user);
+        get_user_ns(new->user_ns);
+    #ifdef CONFIG_KEYS
+        key_get(new->session_keyring);
+        key_get(new->process_keyring);
+        key_get(new->thread_keyring);
+        key_get(new->request_key_auth);
+    #endif
+    #ifdef CONFIG_SECURITY
+        new->security = NULL;
+    #endif
+        if (security_prepare_creds(new, old, GFP_KERNEL) < 0)
+            goto error;
+        validate_creds(new);
+        return new;
+    error:
+        abort_creds(new);
+        return NULL;
+    }
+    EXPORT_SYMBOL(prepare_creds);
+## 漏洞利用
+这种漏洞利用方法非常简单粗暴，即利用内存任意读找到cred结构体，再利用内存任意写，将用于表示权限的数据位写为0，就可以完成提权。
+那如何找到这个结构体呢？在task_struct里有一个 char comm[TASK_COMM_LEN];
+结构，而这个结构可以通过prctl函数中的PR_SET_NAME功能，设置为一个小于16字节的字符串。[文档](http://man7.org/linux/man-pages/man2/prctl.2.html)
+    PR_SET_NAME (since Linux 2.6.9)
+                  Set the name of the calling thread, using the value in the
+                  location pointed to by (char *) arg2.  The name can be up to
+                  16 bytes long, including the terminating null byte.  (If the
+                  length of the string, including the terminating null byte,
+                  exceeds 16 bytes, the string is silently truncated.)  This is
+                  the same attribute that can be set via pthread_setname_np(3)
+                  and retrieved using pthread_getname_np(3).  The attribute is
+                  likewise accessible via /proc/self/task/[tid]/comm, where tid
+                  is the name of the calling thread.
+而通过设定这个值，并利用内存任意读即可找到这个预设的字符串，即可找到task_structure结构体，进一步找到cred结构体，就可以利用内存任意写来提权了。
+还有一个问题是，爆破的范围如何确定？这涉及到了如何得到一个task_struct，同样是kmem_cache_alloc_node，因此task_struct应该存在内核的动态分配区域。  
+(\kernel\fork.c 140)
+    static inline struct task_struct *alloc_task_struct_node(int node)
+    {
+        return kmem_cache_alloc_node(task_struct_cachep, GFP_KERNEL, node);
+    }
+根据内存映射图，爆破范围应该在0xffff880000000000~0xffffc80000000000
+    0xffffffffffffffff  ---+-----------+-----------------------------------------------+-------------+
+                           |           |                                               |+++++++++++++|
+        8M                 |           | unused hole                                   |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+    0xffffffffff7ff000  ---|-----------+------------| FIXADDR_TOP |--------------------|+++++++++++++|
+        1M                 |           |                                               |+++++++++++++|
+    0xffffffffff600000  ---+-----------+------------| VSYSCALL_ADDR |------------------|+++++++++++++|
+        548K               |           | vsyscalls                                     |+++++++++++++|
+    0xffffffffff577000  ---+-----------+------------| FIXADDR_START |------------------|+++++++++++++|
+        5M                 |           | hole                                          |+++++++++++++|
+    0xffffffffff000000  ---+-----------+------------| MODULES_END |--------------------|+++++++++++++|
+                           |           |                                               |+++++++++++++|
+        1520M              |           | module mapping space (MODULES_LEN)            |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+    0xffffffffa0000000  ---+-----------+------------| MODULES_VADDR |------------------|+++++++++++++|
+                           |           |                                               |+++++++++++++|
+        512M               |           | kernel text mapping, from phys 0              |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+    0xffffffff80000000  ---+-----------+------------| __START_KERNEL_map |-------------|+++++++++++++|
+        2G                 |           | hole                                          |+++++++++++++|
+    0xffffffff00000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        64G                |           | EFI region mapping space                      |+++++++++++++|
+    0xffffffef00000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        444G               |           | hole                                          |+++++++++++++|
+    0xffffff8000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        16T                |           | %esp fixup stacks                             |+++++++++++++|
+    0xffffff0000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        3T                 |           | hole                                          |+++++++++++++|
+    0xfffffc0000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        16T                |           | kasan shadow memory (16TB)                    |+++++++++++++|
+    0xffffec0000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+        1T                 |           | hole                                          |+++++++++++++|
+    0xffffeb0000000000  ---+-----------+-----------------------------------------------| kernel space|
+        1T                 |           | virtual memory map for all of struct pages    |+++++++++++++|
+    0xffffea0000000000  ---+-----------+------------| VMEMMAP_START |------------------|+++++++++++++|
+        1T                 |           | hole                                          |+++++++++++++|
+    0xffffe90000000000  ---+-----------+------------| VMALLOC_END   |------------------|+++++++++++++|
+        32T                |           | vmalloc/ioremap (1 << VMALLOC_SIZE_TB)        |+++++++++++++|
+    0xffffc90000000000  ---+-----------+------------| VMALLOC_START |------------------|+++++++++++++|
+        1T                 |           | hole                                          |+++++++++++++|
+    0xffffc80000000000  ---+-----------+-----------------------------------------------|+++++++++++++|
+                           |           |                                               |+++++++++++++|
+                           |           |                                               |+++++++++++++|
+                           |           |                                               |+++++++++++++|

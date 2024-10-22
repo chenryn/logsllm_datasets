@@ -1,0 +1,228 @@
+
+
+
+It was almost time to fix the inaccessible Consul node. The team
+connected in to one of the other nodes to monitor and watch logs.
+Suddenly, the second node started disconnecting people. It was behaving
+exactly like the inaccessible node had the previous day. 😱
+Suspiciously, it didn\'t disconnect everyone. Those who were still
+logged in noticed that `sshguard` was blocking access to some of the
+bastion servers that all of our ssh traffic flows through when accessing
+the internal nodes:
+[Infrastructure#7484](https://gitlab.com/gitlab-com/gl-infra/infrastructure/issues/7484).
+We have three bastion servers, and two were blocked because so many of
+us connected so many sessions so quickly. Disabling `sshguard` allowed
+everyone back in and that information was the hint we needed to manually
+find the one bastion which hadn\'t yet been blocked. It got us back into
+the original problem server. Disabling `sshguard` there left us with a
+fully functional node and with the ability to accept the `at` command to
+restart the Consul service at exactly the same time as the others.
+
+We verified that we had an accurate and instantaneous way to monitor the
+state of the services. Watching the output of the
+`consul operator raft list-peers` command every second gave us view that
+looked like this:
+
+    Node                Address          State     Voter  RaftProtocol
+    consul-01-inf-gprd  10.218.1.4:8300  follower  true   3
+    consul-03-inf-gprd  10.218.1.2:8300  leader    true   3
+    consul-05-inf-gprd  10.218.1.6:8300  follower  true   3
+    consul-04-inf-gprd  10.218.1.5:8300  follower  true   3
+    consul-02-inf-gprd  10.218.1.3:8300  follower  true   3
+
+
+Even the most thorough plans always miss something. At this point we
+realized that one of the three `pgbouncer` nodes which direct traffic to
+the correct database instance was not showing as healthy in the load
+balancer. One is normally in this state as a warm spare, but one of the
+side effects of disconnecting the `pgbouncer` nodes from Consul is that
+they would all fail their load balancer health checks. If all health
+checks are failing, GCP load balancers send requests to ALL nodes as a
+safety feature. This would lead to too many connections to our database
+servers, causing unintended consequences. We worked around this by
+removing the unhealthy node from the load balancer pool for the
+remainder of this activity.
+
+-   We checked that the lag on the database replicas was zero, and that
+    they weren\'t trying to replicate any large and time-consuming
+    transactions.
+-   We generated a text list of all of the nodes that run the Consul
+    client or server.
+-   We verified the time zone (UTC) and time synchronization on all of
+    those servers to ensure that when the `at` command executed the
+    restart, an unsynchronized clock wouldn\'t cause unintended
+    behavior.
+-   We also verified the `at` scheduler was running on all of those
+    nodes, and that `sudo` would not ask for a password.
+-   We verified the script that would edit the config files, and tested
+    it against the staging environment.
+-   We also made sure `sshguard` was disabled and wasn\'t going to lock
+    out the scripted process for behaving like a scripted process.
+
+This might seem like a lot of steps but without any of these
+prerequisites the whole process would fail. Once all of that was done,
+everything was ready to go.
+
+
+In the end, we scheduled a maintenance window and distilled all of the
+research and troubleshooting down to the [steps in this
+issue](https://gitlab.com/gitlab-com/gl-infra/production/issues/1042).
+
+Everything was staged and it was time to make the changes. This course
+of action included four key steps. First, we paused the Patroni database
+high availability subsystem. Pausing would freeze database failover and
+keep the high availability configuration static until we were done. It
+would have been bad if we had a database failure during this time so
+minimizing the amount of time in this state was important.
+
+Next, we ran a script on every machine that stopped the Chef client
+service and then changed the verify lines in the config files from true
+to false. It wouldn\'t help to have Chef trying to reconfigure anything
+as we made changes. We did this using `mussh` in batches of 20 servers
+at a time. Any more in parallel and our SSH agent and Yubikeys may not
+have been able to keep up. We were not expecting change in the state of
+anything from this step. The config files on disk should have the new
+values but the running services wouldn\'t change, and more importantly,
+no TCP connections would disconnect. That was what we got so it was time
+for some verification.
+
+Our third step was to check all of the servers and a random sampling of
+client nodes to make sure config files had been modified appropriately.
+It was also a good time to double-check that the Chef client was
+disabled. This check turned out to be a good thing to do, because there
+were a few nodes that still had the Chef client active. It turned out
+that those nodes were in the middle of a run when we disabled the
+service, and it reenabled the service for us when the run completed.
+Chef can be *so* helpful. We disabled it manually on the few machines
+that were affected. This delayed our maintenance window by a few
+minutes, so we were very glad we didn\'t schedule the `at` commands
+first.
+
+Finally, we needed to remove the inactive `pgbouncer` node from the load
+balancer, so when the load balancer went into its safety mode, it would
+only send traffic to the two that were in a known state. You might think
+that removing it from the load balancer would be enough, but since it
+also participates in a cluster via Consul the whole service needed to be
+shut down along with the health check, which the load balancer uses to
+determine whether to send it traffic. We made a note of the full command
+line from the process table, shut it down, and removed it from the pool.
+
+
+Now was the moment of truth. It was 02:10 UTC. We pushed the following
+command to every server (20 at a time, using `mussh`):
+`echo 'sudo systemctl restart consul.service' | at 02:20` -- it took
+about four minutes to complete. Then we waited. We monitored the Consul
+servers by running `watch -n 1 consul operator raft list-peers` on each
+of them in a separate terminal. We bit our nails. We watched the
+dashboards for signs of db connection errors from the frontend nodes. We
+all held our breath, and watched the database for signs of distress. Six
+minutes is a long time to think: \"It\'s 4am in Europe, so they won\'t
+notice\" and \"It\'s dinner time on the US west coast, maybe they won\'t
+notice\". Trust me, six minutes is a *really* long time: \"Sorry APAC
+users for your day, which we are about to ruin by missing something\".
+
+We counted down the last few seconds and watched. In the first second,
+the Consul servers all shut down, severing the connections that were
+keeping everything working. All 255 of the clients restarted at the same
+time. In the next second, we watched the servers return
+`Unexpected response code: 500`, which means \"connection refused\" in
+this case. The third second\... still returning \"panic now\" or maybe
+it was \"connection refused\"\... The fourth second all nodes returned
+`no leader found`, which meant that the connection was not being refused
+but the cluster was not healthy. The fifth second, no change. I\'m
+thinking, just breathe, they were probably all discovering each other.
+In the sixth second, still no change: Maybe they\'re electing a leader?
+Second seven was the appropriate time for worry and panic. Then, the
+eighth second brought good news `node 04 is the leader`. All other nodes
+healthy and communicating properly. In the ninth second, we let out a
+collective (and globally distributed) exhale.
+
+
+Now it was time to check what damage that painfully long eight seconds
+had done. We went through our checklist:
+
+-   The database was still processing requests, no change.
+-   The web and API nodes hadn\'t thrown any errors. They must have
+    restarted fast enough that the cached database addresses were still
+    being used.
+-   The most important metric -- the graph of 500 errors seen by
+    customers: There was no change.
+
+We expected to see a small spike in errors, or at least some
+identifiable change, but there was nothing but the noise floor. This was
+excellent news! 🎉
+
+Then we checked whether the database was communicating with the Consul
+servers. It was not. Everyone quickly turned their attention to the
+backend database servers. If they had been running normally and the high
+availability tool hadn\'t been paused, an unplanned failover would be
+the minimum outage we could have hoped for. It\'s likely that they would
+have gotten into a very bad state. We started to troubleshoot why it
+wasn\'t communicating with the Consul server, but about one minute into
+the change, the connection came up and everything synced. Apparently it
+just needed a little more time than the others. We verified everything,
+and when everyone was satisfied we turned the high availability back on.
+
+
+Now that everything in the critical path was working as expected, we
+released the tension from our shoulders. We re-enabled Chef and merged
+the MR pinning the Chef recipes to the newer version, and the MR\'s CI
+job pushed the newer version to our Chef server. After picking a few
+low-impact servers, we manually kicked off Chef runs after checking the
+`md5sum` of the Consul client config files. After Chef finished, there
+was no change to the file, and the Chef client service was running
+normally again. We followed the same process on the Consul servers with
+the same result, and manually implemented it on the database servers,
+just for good measure. Once those all looked good, we used `mussh` to
+kick off a Chef run on all of the servers using the same technique we
+used to turn them off.
+
+Now all that was left was to straighten everything out with `pgbouncer`
+and the database load balancer and then we could fully relax. Looking at
+the heath checks, we noticed that the two previously healthy nodes were
+not returning healthy. The health checks are used to tell the load
+balancer which `pgbouncer` nodes have a Consul lock and therefore which
+nodes to send the traffic. A little digging showed that after retrying
+to connect to the Consul service a few times, they gave up. This was not
+ideal, so we [opened an Infrastructure
+issue](https://gitlab.com/gitlab-com/gl-infra/infrastructure/issues/7612)
+to fix it later and restarted the health checks manually. Everything
+showed normal so we added the inactive node back to the load balancer.
+The inactive node\'s health check told the load balancer not to select
+it, and since the load balancer was no longer in failsafe mode (due to
+the other node\'s health checks succeeding) the load balancer refrained
+from sending it traffic.
+
+
+Simultaneously restarting all of the Consul components with the new
+configuration put everything back into its original state, other than
+the validation setting which we set to false, and the TCP sessions which
+we restarted. After this change, the Consul clients will still be using
+TLS encryption but will ignore the fact that our cert is now expired.
+This is still not an ideal state but it gives us time to get there in a
+thoughtful way rather than as a rushed workaround.
+
+Every once in a while we get into a situation that all of the fancy
+management tools just can\'t fix. There is no run book for situations
+such as the one we encountered. The question we were asked most
+frequently once people got up to speed was: \"Isn\'t there some
+instructional walkthrough published somewhere for this type of thing?\".
+For replacing a certificate from the same authority, yes definitely. For
+replacing a certificate on machines that can have downtime, there are
+plenty. But for keeping traffic flowing when hundreds of nodes need to
+change a setting and reconnect within a few seconds of each other\...
+that\'s just not something that comes up very often. Even if someone
+wrote up the procedure it wouldn\'t work in our environment with all of
+the peripheral moving parts that required our attention.
+
+In these types of situations there is no shortcut around thinking things
+through methodically. In this case, there were no tools or technologies
+that could solve the problem. Even in this new world of infrastructure
+as code, site reliability engineering, and cloud automation, there is
+still room for old fashioned system administrator tricks. There is just
+no substitute for understanding how everything works. We can try to
+abstract it away to make our day-to-day responsibilities easier, but
+when it comes down to it there will always be times when the best tool
+for the job is a solid plan.
+
+

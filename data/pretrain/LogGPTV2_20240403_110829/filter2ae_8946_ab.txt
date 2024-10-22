@@ -1,0 +1,80 @@
+                   Write-Output $obj
+               }
+           } catch {
+           }
+       }
+    }
+当执行此脚本时，将定义一个函数Test-ProtectedProcess。该函数获取一个可执行文件的路径，以指定的保护级别启动该可执行文件，并检查它是否成功。如果ProtectedType和ProtectedSigner参数为0，那么内核将决定“最佳”进程级别。这导致了一些恼人的问题，例如SVCHOST.EXE显式地标记为PPL，并将在PPL-windows级别上运行，但是由于它也是一个有符号的OS组件，内核将确定其最大级别为PP-Authenticode。另一个有趣的问题是使用本机进程创建api，可以将DLL作为主要可执行映像启动。由于大量的系统dll都嵌入了微软的签名，它们也可以作为PP-Authenticode启动，尽管这并不一定有用。将在PPL上运行的二进制文件列表和它们的最大签名级别如下所示：
+##### 将任意代码注入NGEN
+在仔细检查了以PPL我确定的方式运行的可执行程序列表之后  
+试图攻击前面提到的 .net NGEN二进制文件，MSCORSVW.EXE。我选择NGEN二进制的理由是:
+  * 其他大多数二进制文件都是服务二进制文件，它们可能需要管理员权限才能正确启动。
+  * 二进制文件很可能会加载复杂的功能，比如 .net框架，以及多个COM交互(我用来处理异常行为的技术)
+  * 在最坏的情况下，它仍然可能产生一个设备保护旁路，因为它作为PPL运行的原因是让它访问内核api来应用缓存的签名级别。即使我们不能让任意代码在PPL中运行，这个二进制文件操作中的任何错误都可以被利用
+但是NGEN二进制有一个问题，特别是它不符合我得到最高签名级别的标准-Windows
+TCB。然而，我知道，当微软修复了[1332号问题](https://bugs.chromium.org/p/project-zero/issues/detail?id=1332)时，他们留下了一个后门，如果调用过程是PPL，在签名过程中可以维护一个可写句柄，如下所示:
+    NTSTATUS CiSetFileCache(HANDLE Handle, ...) {
+     PFILE_OBJECT FileObject;
+     ObReferenceObjectByHandle(Handle, &FileObject);
+     if (FileObject->SharedWrite ||
+        (FileObject->WriteAccess && 
+         PsGetProcessProtection().Type != PROTECTED_LIGHT)) {
+       return STATUS_SHARING_VIOLATION;
+     }
+     // Continue setting file cache.
+    }
+如果我能在NGEN二进制文件中执行代码，我就可以重用这个后门来缓存一个可以加载到任何PPL的任意文件。然后我可以劫持一个完整的PPL-WindowsTCB进程来达到我的目标
+为了开始这个调查，我们需要确定如何使用MSCORSVW可执行文件。微软在任何地方都没有记录使用MSCORSVW，所以我们需要做一些挖掘。首先，这个二进制文件不应该直接运行，而是在创建一个NGEN'ed二进制文件时由NGEN调用。因此，我们可以运行NGEN二进制文件，并使用进程监视器等工具来捕获MSCORSVW进程使用的命令行。执行命令：
+`C:\> NGEN install c:\some\binary.dll`
+执行以下命令行的结果:
+`MSCORSVW -StartupEvent A -InterruptEvent B -NGENProcess C -Pipe D`
+A、B、C和D是NGEN确保在新进程启动之前继承到新进程的句柄。由于我们没有看到任何原始的NGEN命令行参数，它们似乎是通过IPC机制传递的。“Pipe”参数表示指定的管道用于IPC。深入研究MSCORSVW中的代码，我们发现方法ngenworkerembed，如下所示
+    void NGenWorkerEmbedding(HANDLE hPipe) {
+     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+     CorSvcBindToWorkerClassFactory factory;
+     // Marshal class factory.
+     IStream* pStm;
+     CreateStreamOnHGlobal(nullptr, TRUE, &pStm);
+     CoMarshalInterface(pStm, &IID_IClassFactory, &factory,
+                        MSHCTX_LOCAL, nullptr, MSHLFLAGS_NORMAL);
+     // Read marshaled object and write to pipe.
+     DWORD length;
+     char* buffer = ReadEntireIStream(pStm, &length);
+     WriteFile(hPipe, &length, sizeof(length));
+     WriteFile(hPipe, buffer, length);
+     CloseHandle(hPipe);
+     // Set event to synchronize with parent.
+     SetEvent(hStartupEvent);
+     // Pump message loop to handle COM calls.
+     MessageLoop();
+     // ...
+    }
+这段代码并不完全符合我的预期。它不为整个通信通道使用命名管道，而是仅用于将编组的COM对象传输回调用进程。COM对象是一个实体类，通常您会使用CoRegisterClassObject注册实体，但这将使它在同一安全级别上对所有进程都可访问，因此，通过使用封送处理的连接只能保留为私有，只有产生MSCORSVW的NGEN二进制文件才是私有的。一个使用COM的.net相关的过程让我很感兴趣，正如我之前在另一篇博客[文章](https://googleprojectzero.blogspot.com/2017/04/exploiting-net-managed-dcom.html)中描述的那样，你可以利用.net中实现的COM对象。如果幸运的话，这个COM对象是在.net中实现的，我们可以通过查询它的接口来确定它是否在.net中实现，例如我们在我的[OleViewDotNet
+PowerShell](https://www.powershellgallery.com/packages/OleViewDotNet)模块中使用Get-ComInterface命令，如下面的截图所示：
+不幸的是，这个对象没有在.net中实现，因为您至少会看到_Object接口的一个实例。只有一个ICorSvcBindToWorker接口实现了，让我们深入到这个接口，看看有没有什么可以利用的。
+有些东西引起了我的注意，在屏幕截图中有一个HasTypeLib列，对于ICorSvcBindToWorker，我们看到这个列设置为True。HasTypeLib表明，接口的代理代码不是使用预定义的NDR字节流来实现的，它是从类型库中动态生成的。我曾经滥用这个自动生成代理机制来提升到system权限，报告为问题[1112](https://bugs.chromium.org/p/project-zero/issues/detail?id=1112)。在这个问题中，我使用了系统的运行对象表(ROT)的一些有趣行为来强制系统COM服务中的类型混淆。虽然微软已经解决了用户到系统的问题，但是没有什么可以阻止我们使用类型混淆的技巧来利用MSCORSVW进程以PPL的身份在相同的权限级别上运行并获得任意代码执行。使用类型库的另一个优点是，一个普通的代理将作为DLL加载，这意味着它必须满足PPL签名级别的要求;然而，类型库只是数据，因此可以加载到PPL中，而不存在任何签名级别冲突。
+类型混淆是如何工作的?从类型库查看ICorSvcBindToWorker接口:
+    interface ICorSvcBindToWorker : IUnknown {
+       HRESULT BindToRuntimeWorker(
+                 [in] BSTR pRuntimeVersion, 
+                 [in] unsigned long ParentProcessID, 
+                 [in] BSTR pInterruptEventName, 
+                 [in] ICorSvcLogger* pCorSvcLogger, 
+                 [out] ICorSvcWorker** pCorSvcWorker);
+    };
+单个BindToRuntimeWorker接受5个参数，4个导入，1个导出。当试图从我们不可信的进程通过DCOM访问方法时，系统将自动为调用生成代理和存根。这将包括将COM接口参数编组到缓冲区，将缓冲区发送到远程进程，然后在调用实函数之前将编组解到指针。例如，假设有一个简单的函数，DoSomething只需要一个IUnknown指针。编组过程如下所示:
+方法调用的操作如下:
+  * 不受信任的进程在接口上调用DoSomething，该接口实际上是指向DoSomethingProxy的指针，该指针是由传递IUnknown指针参数的类型库自动生成的。
+  * DoSomethingProxy将IUnknown指针参数封送到缓冲区，并通过RPC在受保护的进程中调用存根
+  * COM运行时调用DoSomethingStub方法来处理调用。此方法将从缓冲区中反编排接口指针。注意，这个指针不是第1步的原始指针，它很可能是一个新的代理，它会调用不可信的进程
+  * 存根调用服务器内部实际实现的方法，传递未编组的接口指针。
+  * DoSomething使用接口指针，例如通过对象的VTable调用它的AddRef
+  * 我们该如何利用这一点?我们所需要做的就是修改类型库，这样我们就不用传递接口指针，而是传递其他任何东西。虽然类型库文件位于无法修改的系统位置，但我们可以将它的注册替换为当前用户的注册表单元，或者使用与问题1112之前相同的ROT trick。例如，如果我们修改类型库来传递一个整数而不是一个接口指针，我们会得到以下结果:
+这些排列操作改变如下:
+  * 不受信任的进程在接口上调用DoSomething，该接口实际上是指向DoSomethingProxy的指针，该指针由类型库自动生成，传递任意整数参数
+  * DoSomethingProxy将整数参数封送到缓冲区，并通过RPC在受保护的进程中调用存根
+  * COM运行时调用DoSomethingStub方法来处理调用。此方法将从缓冲区中解封送整数
+  * 存根调用服务器内部的实际实现方法，将整数作为参数传递。但是DoSomething没有改变，它仍然是接受接口指针的相同方法。由于COM运行时此时没有更多的类型信息，因此整数类型与接口指针混淆
+  * DoSomething使用接口指针，例如通过对象的VTable调用它的AddRef。由于这个指针完全受不可信进程的控制，这可能导致任意代码的执行
+通过将参数的类型从接口指针更改为整数，我们导致了类型混淆，这允许我们得到任意指针解除引用，从而导致任意代码执行。我们甚至可以通过向类型库添加以下结构来简化攻击：
+    struct FakeObject {

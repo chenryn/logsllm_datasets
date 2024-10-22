@@ -1,0 +1,158 @@
+本文是翻译文章，文章原作者 Andy Nguyen 文章来源 
+原文地址: 
+_BleedingTooth_ 是 Linux
+蓝牙子系统里零点击漏洞的一个集合，其可以允许未被授权的远程攻击者在近距离内对存在漏洞的设备以内核权限执行任意代码
+## 概述
+我注意到网络子系统已经通过 [syzkaller](https://github.com/google/syzkaller)
+进行了广泛的模糊测试。但是像蓝牙这样的子系统没有被很好的覆盖。总体而言，对蓝牙主机攻击面的研究似乎相当有限 ——
+大部分公开的蓝牙漏洞都只影响[固件](https://www.armis.com/bleedingbit/)或者其本身的[规范](https://knobattack.com/)，并且只允许攻击者窃听和/或操作信息。
+但是如果攻击者可以完全控制设备会怎么样？演示这个场景最出名的例子是
+[BlueBorne](https://www.armis.com/blueborne/) 和
+[BlueFrag](https://insinuator.net/2020/04/cve-2020-0022-an-android-8-0-9-0-bluetooth-zero-click-rce-bluefrag/)。我给自己定的目标是研究 Linux
+的蓝牙协议栈，拓展 BlueBorne 的发现，并且扩展 syzkaller 去 fuzz `/dev/vhci` 设备。
+这篇博文描述了我深入研究代码，发现多个高危漏洞以及最后在 x86-64 Ubuntu 20.04.1 的目标上构造一个成熟的 RCE
+漏洞利用链的过程（[Video](https://youtu.be/qPYrLRausSw)）。
+### 补丁，严重性和安全公告
+Google 直接联系了 [BlueZ](http://www.bluez.org/) 和 Linux 蓝牙子系统维护者（intel），而不是让 Linux
+内核安全团队去协调多方响应这一系列漏洞。Intel 随安全公告 [INTEL-SA-00435](https://www.intel.com/content/www/us/en/security-center/advisory/intel-sa-00435.html)发布了补丁，但是在信息披露的时候，此时补丁还没有包含在任何已发布的内核版本中。为了促进沟通，Linux
+内核安全团队应该被通知，以后这种类型的漏洞也应该报告给他们。沟通的时间表在文章底部。有关的漏洞补丁分别如下：
+  * [BadVibes](https://github.com/google/security-research/security/advisories/GHSA-ccx2-w2r4-x649)（CVE-2020-24490）在 2020 年 7 月 30 日于主线分支提交时被修复。[commit](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=a2ec905d1e160a33b2e210e45ad30445ef26ce0e)
+  * [BadChoice](https://github.com/google/security-research/security/advisories/GHSA-7mh3-gq28-gfrq)（CVE-2020-12352）和 [BadKarma](https://github.com/google/security-research/security/advisories/GHSA-h637-c88j-47wq)（CVE-2020-12351）在 2020 年 9 月 25 日于 bluetooth-next 被修复：commits [1](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=eddb7732119d53400f48a02536a84c509692faa8)，[2](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=f19425641cb2572a33cb074d5e30283720bd4d22)，[3](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=b176dd0ef6afcb3bca24f41d78b0d0b731ec2d08)，[4](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git/commit/?id=b560a208cda0297fef6ff85bbfd58a8f0a52a543)
+单独来看，这些漏洞的严重性从中危到高危，但是将它们合并在一起就意味着严重的安全风险。本文详细介绍了这些风险。
+## 漏洞
+让我们简单的描述下蓝牙协议栈。蓝牙芯片使用 HCI（Host Controller Interface）协议与主机（操作系统）通信。常见的封包如下：
+  * 指令封包 —— 由主机发送给控制器
+  * 事件封包 —— 由控制器发送给主机以通知事件
+  * 数据封包 —— 通常传输 L2CAP（逻辑链路控制与适配协议）封包，实现传输层。
+像 A2MP（AMP 管理协议）或 SMP（安全管理协议）这样的高级协议都是建立在 L2CAP 之上的。在 Linux
+的实现中，所有这些协议都是在没有身份认证的情况下公开的，由于这些协议都存在于内核之中因此相关的漏洞就显得至关重要。
+### BadVibes: 基于堆的缓冲区溢出漏洞（CVE-2020-24490）
+我通过手动检查 HCI 事件封包解析器发现了第一个漏洞（于 Linux 内核 4.19 引入）。HCI
+事件封包由蓝牙芯片精心构造并发出，通常并不能被攻击者所控制（除非他们也能控制蓝牙固件）。然而，有两个非常相似的方法，`hci_le_adv_report_evt()`
+和 `hci_le_ext_adv_report_evt()`，作用是解析来自远程设备的播报。这些报告大小不一。
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/hci_event.c
+    static void hci_le_adv_report_evt(struct hci_dev *hdev, struct sk_buff *skb)
+    {
+        u8 num_reports = skb->data[0];
+        void *ptr = &skb->data[1];
+        hci_dev_lock(hdev);
+        while (num_reports--) {
+            struct hci_ev_le_advertising_info *ev = ptr;
+            s8 rssi;
+            if (ev->length data[ev->length];
+                process_adv_report(hdev, ev->evt_type, &ev->bdaddr,
+                           ev->bdaddr_type, NULL, 0, rssi,
+                           ev->data, ev->length);
+            } else {
+                bt_dev_err(hdev, "Dropping invalid advertising data");
+            }
+            ptr += sizeof(*ev) + ev->length + 1;
+        }
+        hci_dev_unlock(hdev);
+    }
+    ...
+    static void hci_le_ext_adv_report_evt(struct hci_dev *hdev, struct sk_buff *skb)
+    {
+        u8 num_reports = skb->data[0];
+        void *ptr = &skb->data[1];
+        hci_dev_lock(hdev);
+        while (num_reports--) {
+            struct hci_ev_le_ext_adv_report *ev = ptr;
+            u8 legacy_evt_type;
+            u16 evt_type;
+            evt_type = __le16_to_cpu(ev->evt_type);
+            legacy_evt_type = ext_evt_type_to_legacy(hdev, evt_type);
+            if (legacy_evt_type != LE_ADV_INVALID) {
+                process_adv_report(hdev, legacy_evt_type, &ev->bdaddr,
+                           ev->bdaddr_type, NULL, 0, ev->rssi,
+                           ev->data, ev->length);
+            }
+            ptr += sizeof(*ev) + ev->length;
+        }
+        hci_dev_unlock(hdev);
+    }
+注意两个方法是怎么调用 `process_adv_report()` 的，后者没有检查 `ev->length` 是否小于或等于
+`HCI_MAX_AD_LENGTH=31`。函数 `process_adv_report()` 接着会传递事件数据和长度来调用
+`store_pending_adv_report()`：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/hci_event.c
+    static void process_adv_report(struct hci_dev *hdev, u8 type, bdaddr_t *bdaddr,
+                       u8 bdaddr_type, bdaddr_t *direct_addr,
+                       u8 direct_addr_type, s8 rssi, u8 *data, u8 len)
+    {
+        ...
+        if (!has_pending_adv_report(hdev)) {
+            ...
+            if (type == LE_ADV_IND || type == LE_ADV_SCAN_IND) {
+                store_pending_adv_report(hdev, bdaddr, bdaddr_type,
+                             rssi, flags, data, len);
+                return;
+            }
+            ...
+        }
+        ...
+    }
+最后，`store_pending_adv_report()` 子程序拷贝数据到 `d->last_adv_data` ：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/hci_event.c
+    static void store_pending_adv_report(struct hci_dev *hdev, bdaddr_t *bdaddr,
+                         u8 bdaddr_type, s8 rssi, u32 flags,
+                         u8 *data, u8 len)
+    {
+        struct discovery_state *d = &hdev->discovery;
+        ...
+        memcpy(d->last_adv_data, data, len);
+        d->last_adv_data_len = len;
+    }
+观察 `struct hci_dev`，我们可以看到缓冲区 `last_adv_data` 的长度与 `HCI_MAX_AD_LENGTH`
+的大小相同，都不足以容纳扩展的广播数据。解析器理论上可以接收最多 255 字节的数据包并将其路由到该方法。如果可能的话，我们可以溢出
+`last_adv_data` 并污染成员直到偏移 0xbaf。
+    // pahole -E -C hci_dev --hex bluetooth.ko
+    struct hci_dev {
+        ...
+        struct discovery_state {
+            ...
+            /* typedef u8 -> __u8 */ unsigned char      last_adv_data[31];           /* 0xab0  0x1f */
+            ...
+        } discovery; /* 0xa68  0x88 */
+        ...
+        struct list_head {
+            struct list_head * next;                                                 /* 0xb18   0x8 */
+            struct list_head * prev;                                                 /* 0xb20   0x8 */
+        } mgmt_pending; /* 0xb18  0x10 */
+        ...
+        /* size: 4264, cachelines: 67, members: 192 */
+        /* sum members: 4216, holes: 17, sum holes: 48 */
+        /* paddings: 10, sum paddings: 43 */
+        /* forced alignments: 1 */
+        /* last cacheline: 40 bytes */
+    } __attribute__((__aligned__(8)));
+然而，`hci_le_ext_adv_report_evt()`
+是否能够接收如此巨大的报告？巨大的播报很可能是预期内的，因为扩展广播解析器似乎有意显式删除了 31 字节的检查。另外，由于它在代码中很接近
+`hci_le_adv_report_evt()` ，这检查不太可能被错误的忘记。事实确实如此，查看规范后，我们可以看到从 31 字节扩展到 255
+字节是蓝牙五代的一个主要特性：
+> 回想起蓝牙 4.0，广播有效载荷最大长度为 31 字节。在蓝牙 5 中，我们通过添加额外的广播信道和新的广播 PDU，将有效载荷增加到了 255 字节。
+>
+> 来源: advertising/>
+因此该漏洞只有在受害者机器是蓝牙 5
+芯片（这相对来说是一个“新”技术，只有在较新的笔记本上可用）以及受害者积极扫描广播数据（例如打开蓝牙设置并且搜索周围的设备）时才会触发。
+使用两台支持蓝牙 5 的设备，我们可以很容易地确认漏洞并且观察到一个 panic报错类似于：
+    [  118.490999] general protection fault: 0000 [#1] SMP PTI
+    [  118.491006] CPU: 6 PID: 205 Comm: kworker/u17:0 Not tainted 5.4.0-37-generic #41-Ubuntu
+    [  118.491008] Hardware name: Dell Inc. XPS 15 7590/0CF6RR, BIOS 1.7.0 05/11/2020
+    [  118.491034] Workqueue: hci0 hci_rx_work [bluetooth]
+    [  118.491056] RIP: 0010:hci_bdaddr_list_lookup+0x1e/0x40 [bluetooth]
+    [  118.491060] Code: ff ff e9 26 ff ff ff 0f 1f 44 00 00 0f 1f 44 00 00 55 48 8b 07 48 89 e5 48 39 c7 75 0a eb 24 48 8b 00 48 39 f8 74 1c 44 8b 06  39 40 10 75 ef 44 0f b7 4e 04 66 44 39 48 14 75 e3 38 50 16 75
+    [  118.491062] RSP: 0018:ffffbc6a40493c70 EFLAGS: 00010286
+    [  118.491066] RAX: 4141414141414141 RBX: 000000000000001b RCX: 0000000000000000
+    [  118.491068] RDX: 0000000000000000 RSI: ffff9903e76c100f RDI: ffff9904289d4b28
+    [  118.491070] RBP: ffffbc6a40493c70 R08: 0000000093570362 R09: 0000000000000000
+    [  118.491072] R10: 0000000000000000 R11: ffff9904344eae38 R12: ffff9904289d4000
+    [  118.491074] R13: 0000000000000000 R14: 00000000ffffffa3 R15: ffff9903e76c100f
+    [  118.491077] FS:  0000000000000000(0000) GS:ffff990434580000(0000) knlGS:0000000000000000
+    [  118.491079] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [  118.491081] CR2: 00007feed125a000 CR3: 00000001b860a003 CR4: 00000000003606e0
+    [  118.491083] Call Trace:
+    [  118.491108]  process_adv_report+0x12e/0x560 [bluetooth]
+    [  118.491128]  hci_le_meta_evt+0x7b2/0xba0 [bluetooth]
+    [  118.491134]  ? __wake_up_sync_key+0x1e/0x30
+    [  118.491140]  ? sock_def_readable+0x40/0x70
+    [  118.491143]  ? __sock_queue_rcv_skb+0x142/0x1f0

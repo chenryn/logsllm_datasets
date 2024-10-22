@@ -1,0 +1,370 @@
+title:Disk\(|\)Crypt\(|\)Net: rethinking the stack for high-performance
+video streaming
+author:Ilias Marinos and
+Robert N. M. Watson and
+Mark Handley and
+Randall R. Stewart
+Disk|Crypt|Net: rethinking the stack for high-performance video
+streaming
+Ilias Marinos
+University of Cambridge
+Robert N.M. Watson
+University of Cambridge
+ABSTRACT
+Conventional operating systems used for video streaming employ
+an in-memory disk buffer cache to mask the high latency and low
+throughput of disks. However, data from Netflix servers show that
+this cache has a low hit rate, so does little to improve throughput.
+Latency is not the problem it once was either, due to PCIe-attached
+flash storage. With memory bandwidth increasingly becoming a bot-
+tleneck for video servers, especially when end-to-end encryption is
+considered, we revisit the interaction between storage and network-
+ing for video streaming servers in pursuit of higher performance.
+We show how to build high-performance userspace network ser-
+vices that saturate existing hardware while serving data directly from
+disks, with no need for a traditional disk buffer cache. Employing
+netmap, and developing a new diskmap service, which provides safe
+high-performance userspace direct I/O access to NVMe devices, we
+amortize system overheads by utilizing efficient batching of outstand-
+ing I/O requests, process-to-completion, and zerocopy operation. We
+demonstrate how a buffer-cache-free design is not only practical,
+but required in order to achieve efficient use of memory bandwidth
+on contemporary microarchitectures. Minimizing latency between
+DMA and CPU access by integrating storage and TCP control loops
+allows many operations to access only the last-level cache rather
+than bottle-necking on memory bandwidth. We illustrate the power
+of this design by building Atlas, a video streaming web server that
+outperforms state-of-the-art configurations, and achieves ~72Gbps
+of plaintext or encrypted network traffic using a fraction of the
+available CPU cores on commodity hardware.
+CCS CONCEPTS
+• Networks → Network services; • Software and its engineering
+→ Operating systems;
+KEYWORDS
+Network stacks; Storage stacks; Network Performance
+ACM Reference format:
+Ilias Marinos, Robert N.M. Watson, Mark Handley, and Randall R. Stew-
+art. 2017. Disk|Crypt|Net: rethinking the stack for high-performance video
+streaming. In Proceedings of SIGCOMM ’17, Los Angeles, CA, USA, August
+21-25, 2017, 14 pages. https://doi.org/10.1145/3098822.3098844
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+SIGCOMM ’17, August 21-25, 2017, Los Angeles, CA, USA
+© 2017 Copyright held by the owner/author(s). Publication rights licensed to Association
+for Computing Machinery.
+ACM ISBN 978-1-4503-4653-5/17/08. . . $15.00
+https://doi.org/10.1145/3098822.3098844
+Mark Handley
+Randall R. Stewart
+Netflix Inc.
+University College London
+1
+INTRODUCTION
+More than 50% of Internet traffic is now video streamed from ser-
+vices such as Netflix. How well suited are conventional operating
+systems to serving such content? In principle, this is an application
+that might be well served by off-the shelf solutions. Video streaming
+involves long-lived TCP connections, with popular content served
+directly from the kernel disk buffer cache using the OS sendfile
+primitive, so few context switches are required. The TCP stack it-
+self has been well tuned over the years, so this must be close to a
+best-case scenario for commodity operating systems.
+Despite this, Netflix has recently committed a number of signifi-
+cant changes to FreeBSD aimed at improving streaming from their
+video servers. Perhaps current operating systems are not achieving
+close to the capabilities of the underlying hardware after all?
+Previous work[18] has shown that a specialized stack can greatly
+outperform commodity operating systems for short web downloads
+of static content served entirely from memory. The main problem
+faced by the conventional stack for this workload was context switch-
+ing between the kernel and OS to accept new connections; this solu-
+tion achieves high performance by using a zero-copy architecture
+closely coupling the HTTP server and the TCP/IP stack in userspace,
+using netmap’s[29] batching API to reduce the number of context
+switches to fewer than one per connection.
+Such a workload is very different from video streaming; Netflix
+uses large servers with 12 or more cores and large amounts of RAM,
+but even so the buffer cache hit ratio is rather low - generally less than
+10% of content can be served from memory without going to disk. At
+the same time, hardware trends point in the opposite direction: SSDs
+have moved storage much closer to the CPU, particularly in the form
+of NVMe PCIe-attached drives, and future non-volatile memory may
+move it closer still. In addition, on recent Intel CPUs, DMA to and
+from both storage and network devices is performed using DDIO[10]
+directly to the L3 cache rather than RAM. Storage latencies are now
+lower than typical network latencies. If we no longer need a disk
+buffer cache to mask storage latencies, can we rethink how we build
+these servers that stream the majority of Internet content?
+We set out to answer this question. First we examine Netflix’s
+changes to the FreeBSD operating system to understand the prob-
+lems they faced building high-performance video servers. The story
+has become more complicated recently as the need for privacy has
+caused video providers to move towards using HTTPS for streaming.
+We examine the implications on the performance of the Netflix stack.
+We then designed a special purpose stack for video streaming
+that takes advantage of low-latency storage. Our stack places the
+SSD directly in the TCP control loop, closely coupling storage,
+encryption, and the TCP protocol implementation. Ideally, a chunk
+of video content would be DMAed to the CPU’s Last Level Cache
+(LLC), we could encrypt it in place to avoid thrashing the LLC and
+packetize it, then DMA it to the NIC, all without needing the data
+211
+SIGCOMM ’17, August 21-25, 2017, Los Angeles, CA, USA
+Ilias Marinos, Robert N.M. Watson, Mark Handley, and Randall R. Stewart
+to touch RAM. In practice, for the sort of high workloads Netflix
+targets, this ideal cannot quite be achieved. However we will show
+that it is possible to achieve approximately 70Gb/s of encrypted
+video streaming to anywhere between 6000 and 16000 simultaneous
+clients using just four CPU cores without using a disk buffer cache.
+This is 5% better than the Netflix stack can achieve using eight cores
+when all the content is already in the disk buffer cache, 50% better
+than the Netflix stack achieves when it has to fetch content from
+the SSD, and 130% more than stock FreeBSD/Nginx. Through a
+detailed analysis of PMC data from the CPU, we investigate the root
+causes of these performance improvements.
+2 THE VIDEO STREAMING PROBLEM
+Modern video streaming is rate-adaptive: clients on different net-
+works can download different quality versions of the content. A num-
+ber of standards exist for doing this, including Apple’s HTTP Live
+Streaming[14], Adobe HTTP Dynamic Streaming[2] and MPEG-
+DASH[20]. Although they differ in details, all these solutions place
+the rate-adaptive intelligence at the client. Video servers are a dumb
+Content Distribution Network (CDN) delivering video files over
+HTTP or HTTPS, though they are often accessed through a DNS-
+based front-end that manages load across servers and attempts to
+choose servers close to the customer. Once the client connects, a
+steady stream of HTTP requests is sent to the server, requesting
+chunks of video content. HTTP persistent connections are used, so
+relatively few long-lived TCP connections are needed.
+Video servers are, therefore, powerful and well-equipped general-
+purpose machines, at least in principle. All they do is repeatedly find
+the file or section of file corresponding to the chunk requested, and
+return the contents of that file over TCP. This should be a task for
+which conventional operating systems such as Linux and FreeBSD
+are well optimized. The main problem is simply the volume of data
+that needs to be served. How fast can a video server go?
+In December 2015 the BBC iPlayer streaming service was achiev-
+ing 20Gb/s[4] from a server using nginx on Linux, and featuring
+24 cores on two Intel Xeon E5-2680v3 processors, 512 GB DDR4
+RAM, and a 8.6TB RAID array of SSDs. This is expensive hardware,
+and 20Gb/s, while fast, is well below the memory bandwidth, disk
+bandwidth and network capacity. Is it possible to do better?
+2.1 Case Study: The Netflix Video Streamer
+Netflix is one of the largest video streaming providers in the world.
+During peak hours, Netflix along with YouTube video streaming
+traffic accounts for well over 50% of the US traffic [30]. To serve
+this traffic, Netflix maintains its own CDN infrastructure, located
+in PoPs and datacenters worldwide. Their server appliances use
+FreeBSD and the nginx web server, serving the video and audio
+components to their customers over HTTP [21] or, more recently,
+HTTPS. The servers run mostly a read-only workload while serving
+content; during scheduled content updates they serve fewer clients
+than normal.
+Historically, to respond to an HTTP request for static content,
+a web server application would have to invoke read and write
+system calls consecutively to transfer data from a file stored on disk
+to a network socket. In the best case scenario, the file would already
+be present in the disk buffer cache, and then the read would complete
+quickly; otherwise it would have to wait for the file to be fetched
+from disk and DMAed to RAM. This approach introduces significant
+overheads; the application spends a great deal of time blocking for
+I/O completion, and the contents of the file are redundantly copied
+to and from userspace, requiring high context switch rates, without
+the web server ever looking at the contents.
+Modern commodity webservers offload most of this work to the
+kernel. Nginx uses the sendfile system call to allow a zero-copy
+transfer of data from the kernel disk-buffer cache to the relevant
+socket buffers without the need to involve the user process. Since
+the Virtual File System (VFS) subsystem and the disk buffer cache
+are already responsible for managing the in-memory representation
+of files, this is also the right place to act as an interface between the
+network and storage stacks. Upon sendfile invocation, the kernel
+maps a file page to a sendfile buffer (sf_buf), attaches an mbuf
+header and enqueues it to the socket buffer. With this approach, un-
+necessary domain transitions and data copies are completely avoided.
+The BBC iPlayer servers used commodity software—nginx on
+Linux—using sendfile in precisely this way. Netflix, however, has
+devoted a great deal of resources to optimize further the performance
+of their CDN caches.
+Among the numerous changes Netflix has made, the most impor-
+tant key bottlenecks that have been addressed include:
+• The synchronous nature of sendfile.
+• Problems with VM scaling when thrashing the disk buffer cache.
+• Performance problems experienced at the presence of high
+• Performance problems when streaming over HTTPS.
+We will explore these changes in more detail, as they cast important
+light on how modern server systems scale.
+ingress packet rates.
+2.1.1 Asynchronous sendfile
+The sendfile system call optimizes data transfers, but requires
+blocking for I/O when a file page is not present in memory. This
+can greatly hinder performance with event-driven applications such
+as nginx. Netflix servers have large amounts of RAM—192GB is
+common—but the video catalog on each server is much larger. Buffer
+cache hit rates of less than 10% are common on most servers. This
+means that sendfile will often block, tying up nginx resources.
+Netflix implemented a more sophisticated approach known as
+asynchronous sendfile. The system call never blocks for I/O, but
+instead returns immediately before the I/O operation has completed.
+The sendfile buffers with the attached mbufs are enqueued to the
+socket, but the socket is only marked ready for transmission when
+all of the inflight I/O operations have completed successfully. Upon
+encountering a failed I/O operation the error is irrecoverable: the
+socket is marked accordingly so that the application receives an error
+at a subsequent system call and closes it.
+Netflix upstreamed their asynchronous sendfile implementa-
+tion to the mainline FreeBSD tree in early 2016.
+2.1.2 VM scaling
+With a catalogue that greatly exceeds the DRAM size, and with
+asynchronous sendfile being more aggressive, the VM subsystem
+became a bottleneck in performance. In particular, upon VM page
+212
+Disk|Crypt|Net: rethinking the stack for high-performance video streaming
+SIGCOMM ’17, August 21-25, 2017, Los Angeles, CA, USA
+exhaustion, all VM allocations were being blocked, waiting for pages
+to be reclaimed by the paging daemon, and stalling actual work.
+Netflix uses several techniques to mitigate this problem. First,
+DRAM is divided into smaller partitions, each assigned to different
+fake NUMA domains, with a smaller number of CPU cores given
+affinity to each domain. This gives more efficient scaling with multi-
+ple cores by reducing lock contention. Second, in situations where
+free memory hits a low watermark, proactive scans reclaim pages
+in the VM page allocation context, avoiding the need to wake the
+paging daemon. Finally, reclaimed pages are re-enqueued to the
+inactive memory queues in batches to amortize the lock overhead.
+2.1.3 RSS-assisted TCP LRO
+Large Receive Offload (LRO) is a common technique used to amor-
+tize CPU usage when experiencing high rate inbound TCP traffic.
+The LRO engine aggregates consecutive packets that belong to the
+same TCP session before handing them to the network stack. This
+way, per-packet processing costs can be significantly reduced. To
+be CPU-efficient, the coalescing window for LRO aggregation is
+usually bounded by a predefined timeout or a certain number of
+packets. With thousands of TCP connections, packets belonging to
+the same session are likely to arrive interleaved with many other
+packets, making LRO less effective.
+To tackle this problem, Netflix uses RSS-assisted LRO: it sorts
+incoming TCP packets into buckets based on their RSS (Receive
+Side Scaling) hash and the time at the end of the interrupt. This
+ordering brings packets from a flow that arrived widely separated
+in time together, so they appear to have arrived consecutively. As a
+result they can be successfully merged when they are fed to the LRO
+engine. This optimization helped reduce CPU utilization by ~5-30%,
+depending on the congestion control algorithm, and the interrupt
+coalescing tuning parameters.
+2.1.4 In-kernel TLS
+End-to-end encryption introduces a new challenge in building high-
+performance network services. Suddenly, optimized zerocopy in-
+terfaces such as sendfile are rendered useless, since they con-
+flict with the fundamental nature of encrypted traffic. The kernel
+is unaware of the TLS protocol and it is no longer possible to use
+zerocopy operations from storage to the network subsystem. To
+serve data over a TLS connection, the conventional stack needs to
+fall back to userspace using traditional POSIX reads and writes
+when performing encryption. This reintroduces overheads that have
+been completely eliminated in the case of plaintext transfers. Netflix
+initially reported that enabling TLS decreased throughput on their
+servers from 40Gb/s to 8.5Gb/s[33].
+To regain the advantages of sendfile for encrypted traffic,
+Netflix devised a hybrid approach to split work between kernel and
+userspace: the TLS session management, and negotiation remains in
+the userspace TLS library (openssl), but the kernel is now modified
+to include bulk data encryption in the sendfile pipeline. The
+TLS handshake is still handled by the userspace TLS library. Once
+the session keys are derived, nginx uses two new socket options to
+communicate the session key to the kernel, and to instruct the ker-
+nel to enable encryption on that socket. Once a ChangeCipherSuite
+message is sent from the application, the in-kernel TLS state ma-
+chine arms encryption on that particular socket. When sendfile
+is issued on a TLS socket, the kernel hands over the data to one of
+the dedicated TLS kernel threads for encryption, and only enqueues
+them to the socket buffer after encryption has been completed.
+This approach brings most of the original sendfile’s benefits,
+but the semantics are no longer the same as in the plaintext case:
+the kernel cannot perform in-place encryption of data, as this would
+invalidate the buffer cache entries. Instead of being zero-copy, once
+the file is in the buffer cache, sendfile then needs to clone the
+data to another buffer; this can then be used to hold the ephemeral
+encrypted data, and mapped to the socket buffer.
+2.2 Netflix Performance
+We have used the Netflix software stack in order to demonstrate the
+effectiveness of the aforementioned performance improvements. Our
+video server is equipped with an Intel Xeon E5-2667-v3 8-core CPU,
+128GB RAM, two dual-port Chelsio T580 40GbE NIC adaptors,
+and four Intel P3700 NVMe disks with 800GB capacity each. Our
+full test setup is described in more detail in §4. We stress-tested the
+system using HTTP persistent connections retrieving 300KB video
+chunks as we increase the number of simultaneous active clients.
+Figure 1 shows throughput (left) and CPU utilization (right) as
+the number of concurrent HTTP persistent connections is varied. We
+show curves for the Netflix stack and for the stock nginx/FreeBSD
+stack for both the case where all content is served from the disk
+buffer cache (100% BC) and where all content needs to be fetched
+from the SSDs (0% BC). Normal Netflix workloads are nearer the
+latter than the former.
+When all content is served from the buffer cache, there is no
+significant difference in performance, either in throughput or CPU
+utilization. This is expected, as the Netflix improvements do not
+tackle this easy case. When content has to be served from SSDs,
+the Netflix improvements show their effectiveness, almost doubling
+throughput from 39Gb/s to 72Gb/s. However, all eight cores are
+almost saturated at this workload.
+Figure 2 shows the equivalent throughput and CPU utilization
+curves for encrypted transfers. The Netflix stack gives substantial
+performance improvements over stock nginx/FreeBSD, but now the
+cores are all saturated, leading to a drop in performance. When all
+data must be fetched from SSD, performance drops to 47Gb/s, a
+reduction of 35% compared to unencrypted streaming, despite the
+kernel TLS implementation.
+Why does this performance reduction occur? Modern Intel CPUs
+use AESNI instructions and can reduce the encryption overhead to
+as low as 1 CPU cycle/byte, provided that the data are warm in the
+LLC. We used the CPU performance counters to understand further
+what is going on.
+When serving plaintext content from the buffer cache, we see that
+Netflix write memory throughput is low, 20Gb/s, but read memory
+throughput is around 100Gb/s. This is not unreasonable, as the data
+does not need to be DMAed from the disk. When fetching data from
+the SSD, write memory throughput rises by about 70Gb/s, as data is
+DMAed to RAM from disk, and read memory throughput increases
+to 120Gb/s. We also see a fairly high rate, 90 million/sec, of reads
+due to LLC misses. In principle it should be possible to serve this
+213
+SIGCOMM ’17, August 21-25, 2017, Los Angeles, CA, USA
+Ilias Marinos, Robert N.M. Watson, Mark Handley, and Randall R. Stewart
+Netflix 100%BC
+Netflix 0%BC
+Stock 100% BC
+Stock 0%BC
+2000 4000 6000 8000 10000 12000 14000 16000
+# Concurrent HTTP persistent connections
+)
+%
+(
+n
+o
+i
+t
+a
+z
+i
+l
+i
+t
+u
+U
+P
+C
+800
+600
+400
+200
+0
+Netflix 100%BC
+Netflix 0%BC
+Stock 100%BC

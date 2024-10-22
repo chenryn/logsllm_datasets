@@ -1,0 +1,247 @@
+network input. In this case, the kernel releases locks so that the thread does not block
+other threads from making progress, and ensures that its data structures are consistent
+before putting a thread in an interruptible sleep state. Only system call threads can sleep
+in an interruptible state, and they can be interrupted by sending a signal to the thread,
+in which case, the system call returns immediately with an EINTR error code. To avoid
+blocking indenitely, we save the state of system calls blocked in an interruptible sleep
+(below, we will call these blocked calls) and handle them during restore, as described in
+Section 3.3.
+We use the following steps to ensure that the kernel is quiescent before taking a
+1The quiescence conditions don't apply to the checkpoint thread because it is not checkpointed and
+it doesn't modify any kernel data structures
+Chapter 3. Approach
+16
+checkpoint:
+1. Stop other processors: We start the process by using the stop_machine function in
+Linux that allows waiting for interrupt handlers to nish executing on all processors,
+disables interrupts and pauses execution all other processors, and then returns
+control back to the calling processor where this code can continue running.
+2. Quiesce user threads: In this step, we wait until all user threads are quiesced. If
+a user thread is currently in user mode or is blocked, then it is not running any
+kernel code, and we say that it is quiesced. When all user threads are quiesced, we
+can proceed to Step 3, otherwise we perform the following steps:
+(a) Disable all further system calls: We need to let threads running in the kernel
+or sleeping in uninterruptible sleep continue execution. By disabling further
+system calls, we can guarantee quiescence of user threads. If a thread issues
+a system call, we block it in a special blocked state, so that we know that it
+simply needs to be restarted on restore.
+(b) Wait briey for quiescence: We enable the processors again by returning from
+stop_machine, wait for 20 ms, and restart the process by returning to step 1.
+While waiting, the kernel operates normally, allowing interrupts to occur and
+threads to exit the kernel or to block in interruptible sleep.
+3. Quiesce kernel threads: In this step, we wait until all kernel threads are quiesced.
+Kernel threads are used to perform deferred processing tasks, such as writing dirty
+le buers to disk. We separate quiescing user threads from quiescing kernel threads
+so that the existing deferred tasks can be completed before taking a checkpoint.
+Quiescing kernel threads proceeds in four steps:
+(a) Deferred processing: At this point, we have returned from the stop_machine
+function and all interrupts are enabled, and we can perform various deferred
+Chapter 3. Approach
+17
+processing tasks. We create hard links to temporary les and then save all
+dirty le buers by calling the system-wide sync operation to complete any
+buered IO, as described later in Section 4.1.3.
+(b) Reboot notication: Then, we send a standard reboot notication to all kernel
+threads so that these threads can prepare for devices to be shutdown.
+In
+particular, after the notication returns, the threads do not access any devices.
+For example, fast devices, such as the hard drive, will not serve any further
+requests because users threads are quiescent and the kernel threads have been
+notied about the reboot in this step.
+(c) Shutdown devices: Next, we shutdown all devices because many drivers as-
+sume upon startup that devices have previously been reset [5]. This shutdown
+process may wake up certain kernel threads (e.g., when the hard drive cache
+is ushed) and hence we cannot disable interrupts or suspend kernel threads
+until this point. However, since interrupts are enabled, certain slow devices,
+such as the keyboard, mouse, timer and the network may generate exogenous
+interrupts until the devices have been shutdown, but we prevent these inter-
+rupts from waking up sleeping user threads. Losing these exogenous interrupts
+will resemble a short system freeze, but without signicantly aecting applica-
+tions. For example, TCP packets will be retransmitted since we restore TCP
+state.
+(d) Wait briey for quiescence: After all the user threads are quiescent and all the
+devices have been shutdown, the kernel threads should not have any further
+work and they should not be running, i.e., they should be quiescent. At this
+point, we invoke stop_machine to disable interrupts again. For safety, we
+check if all the kernel threads are blocked, and if so, we can proceed to the
+next step. Otherwise, we return from stop_machine, wait for 20 ms, and
+repeat this step.
+Chapter 3. Approach
+18
+4. Take checkpoint: Now that the kernel is quiescent and all interrupts are disabled,
+we can checkpoint application-visible state. The checkpoint and restore process is
+described in Section 4. We ensure that the checkpoint accesses memory but not
+the disk, which has been shutdown in the previous step.
+3.3 Restarting System Calls
+After restoring the checkpoint in the new kernel, we need to resume thread execution,
+which requires handling system calls that were blocked. There are over 300 system calls
+in Linux, but only 57 of them are interruptible. 2 It is fortunate that we do not need to
+consider the uninterruptible calls because many of them modify kernel data structures
+and are not idempotent and thus are not easily restartable.
+For the interruptible calls, a simple solution would be to return the EINTR error code
+to the user thread, since this return value is part of the specication of what happens
+when a signal is sent to the thread. However, most applications do not handle interrupted
+system calls, specially if they don't use signals.
+Instead, we reissue the system calls that were blocked after the application is restored.
+To ensure correct behavior, we looked at the POSIX specication for restarting system
+calls upon a signal, since this specication is implemented by the Linux kernel. The
+kernel can already automatically restart some system calls when they are interrupted by
+a signal. It can restart these calls because they are idempotent when they are blocked,
+even if they are not idempotent otherwise. The system calls block in order to wait for
+external events. However, if the event has not occurred, then the system call has not done
+any work, and so it can be safely reissued. The POSIX specication disallows restarting
+some of the system calls on a signal, for two reasons: 1) a timeout is associated with
+the system call, or 2) the system call is used to wait for signals. In our case, we still
+2We found this number by manual analysis, and by cross correlating with the manual pages of the
+calls. Of the 57, several are variants of each other, such as the 32 and 64 bit versions of the call.
+Chapter 3. Approach
+19
+wish to restart these calls to avoid failing the application. For timeout related calls, they
+can be reissued after taking the timeout period into account, as discussed below. For
+signal related calls, they can be restarted, because a signal was never delivered in our
+system. However, they require adjusting the signal mask, as described below. We use
+ve methods to transparently resume all the blocked system calls after restoring a user
+thread. A few system calls require multiple methods.
+1. Restart: The system calls that are idempotent when they are blocked are restarted.
+This is exactly the same behavior the kernel already implements for these system
+calls when they are interrupted by a signal. Examples are open, wait and its vari-
+ants, futex, socket calls such as accept, connect, etc. There are 19 such restartable
+calls.
+2. Track progress: System calls that perform IO operations like read and write keep
+track of how much progress they have made. When these calls are interrupted by
+a signal, their current progress is returned to the user. We implement the same
+behavior, and after restoring the thread, we return the progress that the system call
+had made before the checkpoint was taken. We do not reissue this call to complete
+the operation (e.g., nish a partial read) because input may never arrive. It may
+appear that returning a partially-completed IO operation may cause certain appli-
+cations to malfunction. However, system call semantics require correctly designed
+applications to handle short reads and writes. For example, on a read, fewer bytes
+may be available than requested because the read is close to end-of-le, or because
+the read is from a pipe or a terminal. Similarly, network applications communicate
+with messages of predetermined length and reissue the calls until the full message
+is processed [21]. As a result, we have not observed any problems with returning
+partial results for reads and writes for the applications that we have tested. When
+no progress has occurred, we restart the system call, because returning a zero in-
+dicates that the communication has terminated (EOF) after which the application
+Chapter 3. Approach
+20
+may fail, when in fact our checkpoint maintains the communication channel. In
+this case, we can still safely reissue the call since it had not made any progress
+before being blocked. There are 23 calls that require progress tracking.
+3. Return success: System calls that close le descriptors like close or dup2 invalidate
+the descriptors if they block. For these calls, we return success because when the
+checkpoint is taken, the le descriptor is already invalidated and the resource will
+be reset once the kernel is restarted. There are 3 such calls.
+4. Update timeout: If the system call has a timeout associated with it, e.g., select, and
+it uses a short timeout compared to the time it takes to restart the kernel, we simply
+reissue the system call to avoid returning a spurious timeout. For long timeouts,
+we restart the system call after calculating the remaining time and subtracting the
+total time it took for the kernel to reboot and restore the thread. There are 11
+calls that require timeout handling.
+5. Undo modications: Certain system calls, like pselect and ppoll, make a copy of
+the process signal mask, and then temporarily modify it. Before restarting these
+system calls, the signal mask has to be restored from the copy to the original state.
+The pselect and ppoll calls also require timeout handling. There are 7 calls that
+require undo modications.
+3.4 Checkpoint Format and Code
+We checkpoint application-visible state, consisting of information exposed by the kernel to
+applications via system calls, such as memory layout and open les, and via the network,
+such as protocol state for network protocols implemented in the kernel. Checkpointing
+this state requires programmer eort proportional to the system call API rather than the
+size of the kernel implementation or the number of kernel updates. Furthermore, since
+Chapter 3. Approach
+21
+Structure Fields
+Notes
+In checkpoint
+vm_begin, vm_end
+Region of address space controlled by this vm_area_struct
+vm_page_prot
+Address space is writable, readable or executable
+vm_ags
+vm_le
+vm_pgo
+vm_private
+anon_vm
+Special attributes: for example direction the stack grows
+Name of the le mapped by a vm_area_struct
+Oset from the beginning of the le
+Used for mmap operations
+Species the type of reverse mapping used
+Not in checkpoint
+mm_struct
+Pointer to memory descriptor
+vm_next
+vm_rb
+vm_ops
+Pointer to the next vm_area of the process
+Tree node used to nd vm_area based on virtual address
+Pointer to functions operating on vm_area_struct
+vm_set, prio_tree_node
+Used to implement reverse mapping
+anon_vma_node, anon_vm Used to implement reverse mapping
+Table 3.1: Analysis of vm_area_struct
+the system call API and the network protocols are standardized and change relatively
+slowly over time, we expect that a carefully designed checkpoint format will evolve slowly.
+Our approach raises several issues: 1) what state should be saved, 2) the format in
+which it should be saved, 3) how sharing relationships between threads and their resources
+are expressed, and 4) how the code should be implemented. We save information available
+to the user space through system calls and via special lesystems like /proc and /sysfs.
+We also save network protocol state, including buered data, to ensure that a kernel
+update is transparent to network peers. For example, we store port numbers, sequence
+numbers and the contents of the retransmit queue for the TCP protocol.
+Chapter 3. Approach
+22
+The checkpoint consists of a list of entries, representing either a thread or a resource
+owned by the thread, such as open les and sockets, with each resource using a unique
+format. As an example, Table 3.1 shows all the elds in the vm_area_struct structure
+in the kernel and the elds that are saved in our checkpoint. This structure represents
+a region of an application's address space, and the elds saved in our checkpoint are
+exposed to applications via the smaps le in the /proc le system or when accessing
+memory. For example, this information determines whether a memory access will cause
+an exception or a memory mapped le to be read from disk. The data in the checkpoint
+allows recreating the virtual memory region correctly, while the rest of the elds relate
+to the data structures used to implement the regions. The implementation dependent
+elds are not visible to the user, and thus not included in the checkpoint. We expect
+that while these elds may change (and have changed) over time, the checkpoint elds
+are unlikely to change signicantly for backward compatibility.
+Since we are saving state visible at the system call API, we save it in the same format.
+Internally, the kernel may store this state in any implementation-dependent way, but it
+needs to convert it when communicating with user applications. For example, a le path
+is a string in user space, but the kernel represents it by a sequence of dentry, qstr and
+mnt_point structures. By using a string for a le, we expect that the checkpoint will
+not depend on the kernel version, and we can use existing kernel functions to convert
+to the correct implementation-dependent kernel versions of the le-related structures.
+For example, the do_lp_open function will convert a path name to a le descriptor,
+and since it is the same function used to implement the open system call, we expect it
+to perform any implementation dependent work required when opening a le. Besides
+various data structures that are stored in the checkpoint, as described later in Section 5.1,
+we also need to store the virtual memory state for each thread. To reuse existing pages
+and page tables, we only explicitly store the user-visible contents of the per-thread global
+page directory in the checkpoint, and we ensure that the new kernel does not clobber any
+Chapter 3. Approach
+23
+user-level pages and page tables. To do so, we also need to store the physical address of
+every used page.
+We represent sharing of resources with pointer relationships in the checkpoint. We
+use a single hash table to represent sharing of all resources between threads during
+checkpointing. The address of a resource is used as the key, and the address of its
+corresponding checkpoint entry as the value, which makes it simple to set up the pointer
+relationships in the checkpoint. During restore, we use a similar hash table, but the key
+and value are inverted, so that the address of the checkpoint entry is the key, and the
+address of the restored resource is used as the value, which makes it simple to assign a
+pointer to a shared recreated resource.
+Beside a portable checkpoint format, the checkpoint code must also be easy to port
+across dierent kernel versions for our update system to be practical. Ideally, the check-
+point mechanism would be implemented entirely in user space, relying only on the stable
+system call API. Unfortunately, some of the required functionality, such as page table
+information, and resource sharing relationships are only available in the kernel. Our
+code mostly uses functions exported to kernel modules, which evolve slower than internal
+kernel functions. We use as high-level functions available in the kernel as possible for
+saving and restoring state. For example to restore a pipe between two processes we call
+a high-level function do_pipe_ags which performs all the implementation dependent
+work needed to create a pipe. Afterwards, we use another high-level function to assign the
+newly created pipe to the two processes we are restoring. The high-level API takes care
+of all the details involved with maintaining the le descriptor tables of the two processes.
+Also, updates to the implementation of these functions will not aect our code. We also
+do not rely on any virtualization or any indirection mechanism,which would itself need

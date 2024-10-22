@@ -1,0 +1,254 @@
+## 阿里云ApsaraDB RDS for PostgreSQL 最佳实践 - 4 水平分库(plproxy) 之 节点扩展  
+##### [TAG 24](../class/24.md)
+### 作者                                                                             
+digoal                           
+### 日期                             
+2015-12-20                             
+### 标签                           
+PostgreSQL , 阿里云RDS          
+----                          
+## 背景                 
+RDS现在还欠缺一个功能，就是数据库克隆，你可以这么理解，给现有的数据库创建STANDBY，然后将这个STANDBY激活，就完成了对数据库的克隆。  
+(目前可以使用阿里云的开源软件RDS_DBSYNC来克隆，虽然复杂一点。 rds_dbsync支持mysql或pgsql克隆到pgsql)  
+https://github.com/aliyun/rds_dbsync  
+为什么我们需要数据库克隆功能呢？  
+这会使得数据库的扩容变得非常简单，比如我们这里的应用场景，如果要将16个RDS，变成32个RDS，那么克隆无疑是最好的办法。因为不需要做逻辑数据迁移的事情，只需要删除不需要的数据库，以及调整plproxy的cluster配置即可。  
+我们先假设RDS有创建STANDBYD的功能（相信未来会增加），看看如何来实现RDS的扩容。  
+假设主RDS1包含db0,db16两个库，现在要拆分为两个RDS，RDS1(db0), RDS2(db16)，分别包含db0和db16。  
+1\. 为需要拆分的主RDS创建standby RDS, 确认流复制正常，确认standby RDS到达catchup状态。  
+2\. 配置密码文件~/.pgpass，包含克隆库的认证信息。  
+3\. 调整plproxy cluster配置。使用只读事务连接需要迁移的数据库，避免写操作带来的主备不一致。  
+例如 :   
+```  
+alter server rds_pg_cluster options (set p16 'host=old_rds_hostname dbname=db16 port=3433 user=digoal keepalives_idle=30 keepalives_interval=10 keepalives_count=10 application_name=16 options=''-c default_transaction_read_only=true'' ');  
+```  
+4\. 确认主RDS需迁移的库(db16)没有连接，确认standby处于catchup状态。  
+5\. 激活standby。  
+6\. 调整plproxy cluster配置。原连接RDS1(db16)，修改为RDS2(db16)。  
+例如 :   
+```  
+alter server rds_pg_cluster options (set p16 'host=new_rds_hostname dbname=db16 port=3433 user=digoal keepalives_idle=30 keepalives_interval=10 keepalives_count=10 application_name=16');  
+```  
+7\. 删除主RDS节点已迁移的数据库(db16)，删除standby节点多余的数据库(db0)。  
+循环1-7，将所有RDS拆分。  
+回到现实，现实是目前RDS没有提供克隆功能。那么我们需要人工实现数据迁移，需迁移的东西还挺多，包括表，视图，函数，。。。。。可以用pg_dump，但是怎么实现增量呢？可以通过PostgreSQL的logical decoding来实现增量复制。现在阿里云RDS PG已经支持了逻辑复制的功能。  
+下面是人力扩容的例子：  
+源：  
+```  
+postgres=> select datname,pg_database_size(oid)/1024/1024 from pg_database;  
+  datname  | ?column?   
+-----------+----------  
+ template1 |        6  
+ template0 |        6  
+ postgres  |     3618  
+ digoal    |        6  
+ db7       |      179  
+ db23      |      179  
+(6 rows)  
+```  
+目标，把db23迁移到以下RDS：  
+```  
+postgres=> select datname,pg_database_size(oid)/1024/1024 from pg_database;  
+  datname  | ?column?   
+-----------+----------  
+ template1 |        6  
+ template0 |        6  
+ postgres  |        6  
+ digoal    |        6  
+ db8       |      179  
+ db24      |      179  
+(6 rows)  
+```  
+在目标RDS创建db23数据库：  
+```  
+postgres=> create database db23;  
+CREATE DATABASE  
+postgres=> \c db23  
+psql (9.4.3, server 9.4.1)  
+You are now connected to database "db23" as user "digoal".  
+```  
+创建schema和需要迁移的函数：  
+```  
+db23=> create schema digoal;  
+CREATE SCHEMA  
+db23=> CREATE OR REPLACE FUNCTION digoal.dy(sql text)  
+db23->      RETURNS SETOF record  
+db23->      LANGUAGE plpgsql  
+db23->      STRICT  
+db23->     AS $function$  
+db23$>       declare  
+db23$>         rec record;  
+db23$>       begin  
+db23$>         for rec in execute sql loop  
+db23$>           return next rec;  
+db23$>         end loop;  
+db23$>         return;  
+db23$>       end;  
+db23$>     $function$;  
+CREATE FUNCTION  
+db23=> CREATE OR REPLACE FUNCTION digoal.dy_ddl(sql text)  
+db23->      RETURNS VOID  
+db23->      LANGUAGE plpgsql  
+db23->      STRICT  
+db23->     AS $function$  
+db23$>       declare  
+db23$>       begin  
+db23$>         execute sql;  
+db23$>         return;  
+db23$>       exception when others then return;  
+db23$>       end;  
+db23$>     $function$;  
+CREATE FUNCTION  
+```  
+准备需要迁移的数据的外部表：  
+```  
+db23=> create extension postgres_fdw;  
+CREATE EXTENSION  
+CREATE SERVER db23  
+        FOREIGN DATA WRAPPER postgres_fdw  
+        OPTIONS (host 'old.pg.rds.aliyuncs.com', port '3433', dbname 'db23');  
+CREATE USER MAPPING FOR digoal  --  locale user  
+        SERVER db23  
+        OPTIONS (user 'digoal', password 'digoal');  --  remote user/password  
+CREATE FOREIGN TABLE digoal.ft_userinfo (  
+        dbid int default 23,  
+        userid int,  
+    info text  
+)  
+        SERVER db23  
+        OPTIONS (schema_name 'digoal', table_name 'userinfo');  
+CREATE FOREIGN TABLE digoal.ft_session (  
+        dbid int default 23,  
+        userid int,  
+    last_login timestamp without time zone  
+)  
+        SERVER db23  
+        OPTIONS (schema_name 'digoal', table_name 'session');  
+CREATE FOREIGN TABLE digoal.ft_tbl_small (  
+        userid int,  
+    info text  
+)  
+        SERVER db23  
+        OPTIONS (schema_name 'digoal', table_name 'tbl_small');   
+CREATE FOREIGN TABLE digoal.ft_login_log (  
+        dbid int default 23,  
+        userid int,  
+        db_user name,  
+        client_addr inet,  
+        client_port int,  
+        server_addr inet,  
+        server_port int,  
+        login_time timestamp without time zone  
+)  
+        SERVER db23  
+        OPTIONS (schema_name 'digoal', table_name 'login_log');  
+```  
+创建物化视图，日志表（日志数据不迁移）  
+```  
+CREATE MATERIALIZED VIEW digoal.userinfo (  
+        dbid ,  
+        userid ,  
+    info   
+) as select * from digoal.ft_userinfo;  
+set maintenance_work_mem='10GB';  --  超出RDS内存限制，可能会被杀掉  
+create unique index pk_userinfo on digoal.userinfo (userid);  
+CREATE MATERIALIZED VIEW digoal.session (  
+        dbid ,  
+        userid ,  
+    last_login   
+) as select * from digoal.ft_session;  
+set maintenance_work_mem='10GB';  --  超出RDS内存限制，可能会被杀掉  
+create unique index pk_session on digoal.session (userid);  
+CREATE MATERIALIZED VIEW digoal.tbl_small (  
+        userid ,  
+    info   
+) as select * from digoal.ft_tbl_small;  
+set maintenance_work_mem='10GB';  --  超出RDS内存限制，可能会被杀掉  
+create unique index pk_tbl_small on digoal.tbl_small (userid);  
+CREATE TABLE digoal.login_log (  
+        dbid int default 23,  
+        userid int,  
+        db_user name,  
+        client_addr inet,  
+        client_port int,  
+        server_addr inet,  
+        server_port int,  
+        login_time timestamp without time zone  
+);  
+```  
+创建需要迁移的函数：  
+```  
+CREATE OR REPLACE FUNCTION digoal.dy_generate_test_ddl()  
+     RETURNS VOID  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+        node int;  
+    sql text;  
+      begin  
+        select application_name::int into node from pg_stat_activity where pid=pg_backend_pid();  
+    sql := $a$insert into digoal.userinfo select $a$||node||$a$,generate_series($a$||node||$a$,32000000,32)$a$;  
+    execute sql;  
+    sql := $a$insert into digoal.session select dbid,userid from digoal.userinfo$a$;  
+    execute sql;  
+        return;  
+      exception when others then return;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION digoal.query_pk(IN i_userid int, OUT dbid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        select t.dbid,t.userid,t.info into dbid,userid,info from digoal.userinfo t where t.userid=i_userid;  
+        return;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION digoal.insert_log(IN i_userid int)  
+     RETURNS void  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        insert into digoal.login_log (userid,db_user,client_addr,client_port,server_addr,server_port,login_time)  
+        values (i_userid,current_user,inet_client_addr(),inet_client_port(),inet_server_addr(),inet_server_port(),now());  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION digoal.query_insert(IN i_userid int, OUT dbid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        select t.dbid,t.userid,t.info into dbid,userid,info from digoal.userinfo t where t.userid=i_userid;  
+        insert into digoal.login_log (userid,db_user,client_addr,client_port,server_addr,server_port,login_time)  
+        values (i_userid,current_user,inet_client_addr(),inet_client_port(),inet_server_addr(),inet_server_port(),now());  
+        return;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION digoal.update_pk(IN i_userid int)  
+     RETURNS void  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        update digoal.session t set last_login=now() where t.userid=i_userid;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION digoal.query_update_insert(IN i_userid int, OUT dbid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        select t.dbid,t.userid,t.info into dbid,userid,info from digoal.userinfo t where t.userid=i_userid;  
+        insert into digoal.login_log (userid,db_user,client_addr,client_port,server_addr,server_port,login_time)  
+        values (i_userid,current_user,inet_client_addr(),inet_client_port(),inet_server_addr(),inet_server_port(),now());  
+        update digoal.session t set last_login=now() where t.userid=i_userid;  

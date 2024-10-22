@@ -1,0 +1,76 @@
+	 当脏页占系统内存的比例超过/proc/sys/vm/dirty_background_ratio 的时候,write系统调用会唤醒pdflush回写dirty page,直到脏页比例低于/proc/sys/vm/dirty_background_ratio,但write系统调用不会被阻塞,立即返回.  
+	 当脏页占系统内存的比例超/proc/sys/vm/dirty_ratio的时候, write系统调用会被被阻塞,主动回写dirty page,直到脏页比例低于/proc/sys/vm/dirty_ratio  
+## 大数据量项目中的感触  
+1、  如果写入量巨大，不能期待系统缓存的自动回刷机制，最好采用应用层调用fsync或者sync。如果写入量大，甚至超过了系统缓存自动刷回的速度，就有可能导致系统的脏页率超过/proc/sys/vm/dirty_ratio， 这个时候，系统就会阻塞后续的写操作，这个阻塞有可能有5分钟之久，是我们应用无法承受的。因此，一种建议的方式是在应用层，在合适的时机调用fsync。  
+2、  对于关键性能，最好不要依赖于系统cache的作用，如果对性能的要求比较高，最好在应用层自己实现cache，因为系统cache受外界影响太大，说不定什么时候，系统cache就被冲走了。  
+3、  在logic设计中，发现一种需求使用系统cache实现非常合适，对于logic中的高楼贴，在应用层cache实现非常复杂，而其数量又非常少，这部分请求，可以依赖于系统cache发挥作用，但需要和应用层cache相配合，应用层cache可以cache住绝大部分的非高楼贴的请求，做到这一点后，整个程序对系统的io就主要在高楼贴这部分了。这种情况下，系统cache可以做到很好的效果。  
+4.   另一种思路是，先调用fdatasync，再调用fsync，来降低堵塞时间。fdatasync某些场景是不需要刷metadata的，但是某些场景依旧需要刷metadata(例如涉及到文件大小的改变)，所以这个解决办法并不适用于所有场景。  
+最终的思路都是让刷metadata尽量快，尽量避免刷metadata时其data还没有刷到磁盘，等待刷其data的时间。  
+在某些应用场景，例如使用cgroup限制了IOPS的场景，需要非常注意。(这种场景下，内核进程刷脏页就非常有效，因为一般不限制内核进程的IOPS)。  
+## 详解  
+```
+Data Mode  
+=========  
+There are 3 different data modes:  
+* writeback mode  
+In data=writeback mode, ext4 does not journal data at all.  This mode provides  
+a similar level of journaling as that of XFS, JFS, and ReiserFS in its default  
+mode - metadata journaling.  A crash+recovery can cause incorrect data to  
+appear in files which were written shortly before the crash.  This mode will  
+typically provide the best ext4 performance.  
+* ordered mode  
+In data=ordered mode, ext4 only officially journals metadata, but it logically  
+groups metadata information related to data changes with the data blocks into a  
+single unit called a transaction.  When it's time to write the new metadata  
+out to disk, the associated data blocks are written first.  In general,  
+this mode performs slightly slower than writeback but significantly faster than journal mode.  
+* journal mode  
+data=journal mode provides full data and metadata journaling.  All new data is  
+written to the journal first, and then to its final location.  
+In the event of a crash, the journal can be replayed, bringing both data and  
+metadata into a consistent state.  This mode is the slowest except when data  
+needs to be read from and written to disk at the same time where it  
+outperforms all others modes.  Enabling this mode will disable delayed  
+allocation and O_DIRECT support.  
+```  
+ext4支持使用额外的journal设备来存储journal，如果你确定要这么做的话，建议使用IOPS性能好的块设备作为journal设备。  
+这和数据库的REDO日志要使用低延迟的块设备是一样的道理。  
+mkfs.ext4时可以指定journal设备。  
+## 参考  
+1\. https://www.kernel.org/doc/Documentation/filesystems/ext4.txt  
+2\. http://0b4af6cdc2f0c5998459-c0245c5c937c5dedcca3f1764ecc9b2f.r43.cf2.rackcdn.com/11774-atc13-jeong.pdf  
+3\. man open  
+http://man7.org/linux/man-pages/man2/open.2.html  
+```  
+       O_DSYNC  
+              Write operations on the file will complete according to the  
+              requirements of synchronized I/O data integrity completion.  
+              By the time write(2) (and similar) return, the output data has  
+              been transferred to the underlying hardware, along with any  
+              file metadata that would be required to retrieve that data  
+              (i.e., as though each write(2) was followed by a call to  
+              fdatasync(2)).  See NOTES below.  
+```  
+2\.6\.33之前的内核不支持o_dsync，所以只能编程时使用先fdatasync再fsync的方式。  
+4\. man fsync  
+```  
+DESCRIPTION  
+       fsync()  transfers ("flushes") all modified in-core data of (i.e., modified buffer cache pages for) the file referred to by the file descriptor fd to the disk device (or other permanent storage device) where that file resides.  The call  
+       blocks until the device reports that the transfer has completed.  It also flushes metadata information associated with the file (see stat(2)).  
+       Calling fsync() does not necessarily ensure that the entry in the directory containing the file has also reached disk.  For that an explicit fsync() on a file descriptor for the directory is also needed.  
+       fdatasync() is similar to fsync(), but does not flush modified metadata unless that metadata is needed in order to allow a subsequent data retrieval to be correctly handled.  For example, changes to st_atime or  st_mtime  (respectively,  
+       time  of  last access and time of last modification; see stat(2)) do not require flushing because they are not necessary for a subsequent data read to be handled correctly.  On the other hand, a change to the file size (st_size, as made  
+       by say ftruncate(2)), would require a metadata flush.  
+       The aim of fdatasync() is to reduce disk activity for applications that do not require all metadata to be synchronized with the disk.  
+```  
+fsync会将脏data和metadata都刷到磁盘，fdatasync则只将脏data刷到磁盘（某些情况下也刷metadata）。  
+所以我们可以在调用fsync前，先调用fdatasync，将脏data刷到磁盘，再调用fsync，减少锁metadata的时间。  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

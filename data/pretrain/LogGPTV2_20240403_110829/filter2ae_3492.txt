@@ -1,0 +1,186 @@
+## 前言
+网上闲逛的时候，发现`github`有个开源的蓝牙协议栈项目
+    https://github.com/sj15712795029/bluetooth_stack
+看介绍支持`STM32`，网上支持嵌入式芯片的开源协议栈貌似很少，这里就简单分析一下，也能帮助助理解蓝牙协议栈，顺便给它找点漏洞。
+## 代码流程分析
+这个代码只支持HCI层以上的协议，比如L2CAP、ATT等，像HCI下层的协议比如LL则使用的 `CSR8311`
+芯片中自带的协议栈。程序收包的入口是`hci_acl_input`
+    void hci_acl_input(struct bt_pbuf_t *p)
+    {
+        ...............
+        ...............
+        if(link != NULL)
+        {
+            if(aclhdr->len)
+            {
+                l2cap_acl_input(p, &(link->bdaddr));
+            }
+        }
+函数经过简单的处理就会进入`l2cap_acl_input`处理`L2CAP`报文，再继续往下之前介绍一下程序中使用的存放蓝牙数据包的数据结构
+    struct bt_pbuf_t
+    {
+        /** 单链表中的下一个pbuf节点 */
+        struct bt_pbuf_t *next;
+        /** pbuf节点payload数据指针 */
+        void *payload;
+        /** pbuf单链表中本节点以及后续节点的数据总和 */
+        uint16_t tot_len;
+        /** 本pbuf节点的payload数据长度 */
+        uint16_t len;
+        /** pbuf类型 */
+        uint8_t  type;
+        /** pbuf标志 */
+        uint8_t flags;
+        /** pbuf引用次数 */
+        uint16_t ref;
+    };
+bt_pbuf_t结构体组成一个链表，其中payload表示当前pbuf的数据存放的地址，len表示payload的长度，tot_len表示整个链表里面所有pbuf的长度，这样可以方便的进行数据包的重组。
+`l2cap_acl_input`的代码如下
+    void l2cap_acl_input(struct bt_pbuf_t *p, struct bd_addr_t *bdaddr)
+    {
+        l2cap_seg_t *inseg = l2cap_reassembly_data(p,bdaddr,&can_contiue);
+        if(!can_contiue)
+            return;
+        /* Handle packet */
+        // inseg->l2caphdr = p->payload
+        switch(inseg->l2caphdr->cid)
+        {
+        case L2CAP_NULL_CID:
+            _l2cap_null_cid_process(inseg->p,bdaddr);
+            break;
+        case L2CAP_SIG_CID:
+            _l2cap_classical_sig_cid_process(inseg->p,inseg->l2caphdr,bdaddr);
+            break;
+        case L2CAP_CONNLESS_CID:
+            _l2cap_connless_cid_process(inseg->p,bdaddr);
+            break;
+        case L2CAP_ATT_CID:
+            _l2cap_fixed_cid_process(L2CAP_ATT_CID,p,bdaddr);
+            break;
+        default:
+            _l2cap_dynamic_cid_process(inseg->pcb,inseg->p,inseg->l2caphdr,bdaddr);
+            break;
+        }
+        bt_memp_free(MEMP_L2CAP_SEG, inseg);
+    }
+函数首先使用`l2cap_reassembly_data`处理`L2CAP`的分片，然后根据根据`l2cap`头部的字段选择相应的函数对数据包进行处理，比如如果是`signaling
+commands`的数据就会进入 `_l2cap_classical_sig_cid_process` 进行处理，其中入参的含义如下
+    inseg->p: 包含 L2CAP 数据包的 pbuf_t 结构体
+    inseg->l2caphdr: 指向L2CAP的头部
+    bdaddr： 数据包发送者的设备地址
+然后我们从`l2cap_acl_input`就可以开始进行漏洞挖掘了，可以重点关注涉及到变长数据结构的解析，此外我们可以根据BLE的协议规范来辅助理解代码，接下来以一些具体的漏洞来分析一些函数的流程。
+## 处理ATT报文时3处栈溢出漏洞
+处理ATT报文的函数为`_l2cap_fixed_cid_process`
+    static err_t _l2cap_fixed_cid_process(uint16_t cid,struct bt_pbuf_t *p,struct bd_addr_t *bdaddr)
+    {
+        bt_pbuf_header(p, -L2CAP_HDR_LEN);
+        for(l2cap_pcb = l2cap_active_pcbs; l2cap_pcb != NULL; l2cap_pcb = l2cap_pcb->next)
+        {
+            if(l2cap_pcb->fixed_cid == cid)
+            {
+                bd_addr_set(&(l2cap_pcb->remote_bdaddr),bdaddr);
+                L2CA_ACTION_RECV(l2cap_pcb,p,BT_ERR_OK);
+                break;
+            }
+        }
+函数首先使用`bt_pbuf_header`，让`p->payload` 跳过 `L2CAP` 的头部，即 `p->payload +=
+L2CAP_HDR_LEN`，然后函数会根据cid调用之前注册的处理函数，最终会调用到 `gatt_data_recv` 函数：
+    void gatt_data_recv(struct bd_addr_t *remote_addr,struct bt_pbuf_t *p)
+    {
+        uint8_t opcode = ((uint8_t *)p->payload)[0];
+        switch(opcode)
+        {
+        case ATT_REQ_MTU:
+        {
+            gatts_handle_mtu_req(NULL,p);
+            break;
+        }
+函数主要就是根据 opcode 来判断ATT数据的类型，然后调用相应的函数进行处理，存在栈溢出漏洞的函数
+    gatts_handle_find_info_value_type_req
+    gatts_handle_write_req
+    gatts_handle_write_cmd
+这里以`gatts_handle_write_req`为例，另外两个漏洞的成因类似，当opcode为`ATT_REQ_WRITE`时会调用`gatts_handle_write_req`进行处理
+    case ATT_REQ_WRITE:
+        {
+            gatts_handle_write_req(NULL,p);
+            break;
+        }
+`gatts_handle_write_req` 的关键代码如下
+    static err_t gatts_handle_write_req(struct bd_addr_t *bdaddr, struct bt_pbuf_t *p)
+    {
+        uint8_t req_buf_len = 0;
+        uint8_t req_buf[GATT_BLE_MTU_SIZE] = {0};
+        att_parse_write_req(p,&handle,req_buf,&req_buf_len);
+函数入口会调用att_parse_write_req解析传入的报文，req_buf为栈上的数组，大小为23字节
+    err_t att_parse_write_req(struct bt_pbuf_t *p,uint16_t *handle,uint8_t *att_value,uint8_t *value_len)
+    {
+        uint8_t *data = p->payload;
+        uint8_t data_len = p->len;
+        *handle = bt_le_read_16(data,1);
+        *value_len = data_len-3;
+        memcpy(att_value,data+3,*value_len);
+        return BT_ERR_OK;
+    }
+`att_parse_write_req`函数直接将 `payload+3` 的内容拷贝到 `att_value` ，如果 `value_len` 大于23
+就会栈溢出。
+## 处理avrcp报文时存在堆溢出漏洞
+漏洞出在`avrcp_controller_parse_get_element_attr_rsp`函数里面，函数调用关系如下
+    _l2cap_fixed_cid_process
+        avctp_data_input
+            avrcp_controller_data_handle
+                avrcp_controller_parse_vendor_dependent
+                    avrcp_controller_parse_get_element_attr_rsp
+关键代码如下
+    static err_t avrcp_controller_parse_get_element_attr_rsp(struct avctp_pcb_t *avctp_pcb,uint8_t *buffer,uint16_t buffer_len)
+    {
+        uint8_t index = 0;
+        uint16_t para_len = bt_be_read_16(buffer, 8);
+        uint8_t element_attr_num = buffer[10];
+        uint8_t *para_palyload = buffer + 11;
+        struct avrcp_pcb_t *avrcp_pcb = avrcp_get_active_pcb(&avctp_pcb->remote_bdaddr);
+        memset(&avrcp_pcb->now_playing_info,0,sizeof(now_playing_info_t));
+        for(index = 0; index now_playing_info.now_playing_title,para_palyload+8,attr_length);
+buffer
+中存放的是蓝牙数据，函数首先调用`avrcp_get_active_pcb`获取`avrcp_pcb`，然后调用`bt_be_read_16`从buffer里面取出两个字节作为`attr_length`，
+然后进行内存拷贝，如果`attr_length`过大就会导致堆溢出。
+## _l2cap_sig_cfg_rsp_process整数溢出导致越界读
+该函数用于处理 `L2CAP_CFG_RSP` 消息，其中关键代码如下
+    _l2cap_sig_cfg_rsp_process(l2cap_pcb_t *pcb,struct bt_pbuf_t *p,l2cap_sig_hdr_t *sighdr,l2cap_sig_t *sig)
+    {
+        uint16_t siglen;
+        siglen = sighdr->len;
+        siglen -= 6;
+        bt_pbuf_header(p, -6);
+        switch(result)
+        {
+        case L2CAP_CFG_UNACCEPT:
+            while(siglen > 0)
+            {
+                opthdr = p->payload;
+                ..................
+                ..................
+                ..................
+                bt_pbuf_header(p, -(L2CAP_CFGOPTHDR_LEN + opthdr->len));
+                siglen -= L2CAP_CFGOPTHDR_LEN + opthdr->len;
+            }
+其中`sighdr`为`L2CAP`的`SIGNALING` 包头，p里面存放着外部设备发送过来的蓝牙数据包。
+函数首先从`sighdr`里面取出`siglen`，然后 `siglen-=6`
+，最后根据`siglen`循环的去读取数据。如果`sighdr->len`小于6，由于`siglen`的类型为`uint16_t`，最后`siglen`的值为
+`0xFFFF-6`， 这是一个很大的数后面循环的时候就会一直读到很后面的数据。
+## avrcp_controller_parse_list_app_setting_rsp越界读
+函数关键代码如下
+    static err_t avrcp_controller_parse_list_app_setting_rsp(struct avctp_pcb_t *avctp_pcb,uint8_t *buffer,uint16_t buffer_len)
+    {
+        uint8_t app_setting_attr_num = buffer[10];
+        struct avrcp_pcb_t *avrcp_pcb = avrcp_get_active_pcb(&avctp_pcb->remote_bdaddr);
+        if(app_setting_attr_num > 0)
+        {
+            uint8_t *setting_attr = buffer+11;
+            for(index = 0; index < app_setting_attr_num; index++)
+            {
+                switch(setting_attr[index])
+                {
+首先从`buffer`里面取出`app_setting_attr_num`，然后将其作为循环条件访问`setting_attr`内存，这个过程没有校验访存是否超过了`buffer`的长度，会导致越界读。
+## 总结
+协议栈代码里面存在处理协议数据的典型问题，比如访问内存时没有检查长度，内存拷贝的时候没有校验拷贝长度是否大于目的内存的大小，以及数值运算也没有考虑整数溢出的情况，总体来说代码质量较低。
+此次分析过程的代码思维导图如下

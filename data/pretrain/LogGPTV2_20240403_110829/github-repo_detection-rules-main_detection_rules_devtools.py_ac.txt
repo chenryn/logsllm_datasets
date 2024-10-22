@@ -1,0 +1,293 @@
+    finally:
+        diff = git('--no-pager', 'diff', get_etc_path('version.lock.json'))
+        outfile = Path(get_path()).joinpath('lock-diff.txt')
+        outfile.write_text(diff)
+        click.echo(f'diff saved to {outfile}')
+        click.echo('reverting changes in version.lock')
+        git('checkout', '-f')
+        git('checkout', current_branch)
+@dev_group.command('package-stats')
+@click.option('--token', '-t', help='GitHub token to search API authenticated (may exceed threshold without auth)')
+@click.option('--threads', default=50, help='Number of threads to download rules from GitHub')
+@click.pass_context
+def package_stats(ctx, token, threads):
+    """Get statistics for current rule package."""
+    current_package: Package = ctx.invoke(build_release, verbose=False, release=None)
+    release = f'v{current_package.name}.0'
+    new, modified, errors = rule_loader.load_github_pr_rules(labels=[release], token=token, threads=threads)
+    click.echo(f'Total rules as of {release} package: {len(current_package.rules)}')
+    click.echo(f'New rules: {len(current_package.new_ids)}')
+    click.echo(f'Modified rules: {len(current_package.changed_ids)}')
+    click.echo(f'Deprecated rules: {len(current_package.removed_ids)}')
+    click.echo('\n-----\n')
+    click.echo('Rules in active PRs for current package: ')
+    click.echo(f'New rules: {len(new)}')
+    click.echo(f'Modified rules: {len(modified)}')
+@dev_group.command('search-rule-prs')
+@click.argument('query', required=False)
+@click.option('--no-loop', '-n', is_flag=True, help='Run once with no loop')
+@click.option('--columns', '-c', multiple=True, help='Specify columns to add the table')
+@click.option('--language', type=click.Choice(["eql", "kql"]), default="kql")
+@click.option('--token', '-t', help='GitHub token to search API authenticated (may exceed threshold without auth)')
+@click.option('--threads', default=50, help='Number of threads to download rules from GitHub')
+@click.pass_context
+def search_rule_prs(ctx, no_loop, query, columns, language, token, threads):
+    """Use KQL or EQL to find matching rules from active GitHub PRs."""
+    from uuid import uuid4
+    from .main import search_rules
+    all_rules: Dict[Path, TOMLRule] = {}
+    new, modified, errors = rule_loader.load_github_pr_rules(token=token, threads=threads)
+    def add_github_meta(this_rule: TOMLRule, status: str, original_rule_id: Optional[definitions.UUIDString] = None):
+        pr = this_rule.gh_pr
+        data = rule.contents.data
+        extend_meta = {
+            'status': status,
+            'github': {
+                'base': pr.base.label,
+                'comments': [c.body for c in pr.get_comments()],
+                'commits': pr.commits,
+                'created_at': str(pr.created_at),
+                'head': pr.head.label,
+                'is_draft': pr.draft,
+                'labels': [lbl.name for lbl in pr.get_labels()],
+                'last_modified': str(pr.last_modified),
+                'title': pr.title,
+                'url': pr.html_url,
+                'user': pr.user.login
+            }
+        }
+        if original_rule_id:
+            extend_meta['original_rule_id'] = original_rule_id
+            data = dataclasses.replace(rule.contents.data, rule_id=str(uuid4()))
+        rule_path = Path(f'pr-{pr.number}-{rule.path}')
+        new_meta = dataclasses.replace(rule.contents.metadata, extended=extend_meta)
+        contents = dataclasses.replace(rule.contents, metadata=new_meta, data=data)
+        new_rule = TOMLRule(path=rule_path, contents=contents)
+        all_rules[new_rule.path] = new_rule
+    for rule_id, rule in new.items():
+        add_github_meta(rule, 'new')
+    for rule_id, rules in modified.items():
+        for rule in rules:
+            add_github_meta(rule, 'modified', rule_id)
+    loop = not no_loop
+    ctx.invoke(search_rules, query=query, columns=columns, language=language, rules=all_rules, pager=loop)
+    while loop:
+        query = click.prompt(f'Search loop - enter new {language} query or ctrl-z to exit')
+        columns = click.prompt('columns', default=','.join(columns)).split(',')
+        ctx.invoke(search_rules, query=query, columns=columns, language=language, rules=all_rules, pager=True)
+@dev_group.command('deprecate-rule')
+@click.argument('rule-file', type=Path)
+@click.pass_context
+def deprecate_rule(ctx: click.Context, rule_file: Path):
+    """Deprecate a rule."""
+    version_info = default_version_lock.version_lock
+    rule_collection = RuleCollection()
+    contents = rule_collection.load_file(rule_file).contents
+    rule = TOMLRule(path=rule_file, contents=contents)
+    if rule.contents.id not in version_info:
+        click.echo('Rule has not been version locked and so does not need to be deprecated. '
+                   'Delete the file or update the maturity to `development` instead')
+        ctx.exit()
+    today = time.strftime('%Y/%m/%d')
+    deprecated_path = get_path('rules', '_deprecated', rule_file.name)
+    # create the new rule and save it
+    new_meta = dataclasses.replace(rule.contents.metadata,
+                                   updated_date=today,
+                                   deprecation_date=today,
+                                   maturity='deprecated')
+    contents = dataclasses.replace(rule.contents, metadata=new_meta)
+    new_rule = TOMLRule(contents=contents, path=Path(deprecated_path))
+    new_rule.save_toml()
+    # remove the old rule
+    rule_file.unlink()
+    click.echo(f'Rule moved to {deprecated_path} - remember to git add this file')
+@dev_group.command('update-navigator-gists')
+@click.option('--directory', type=Path, default=CURRENT_RELEASE_PATH.joinpath('extras', 'navigator_layers'),
+              help='Directory containing only navigator files.')
+@click.option('--token', required=True, prompt=get_github_token() is None, default=get_github_token(),
+              help='GitHub token to push to gist', hide_input=True)
+@click.option('--gist-id', default=NAVIGATOR_GIST_ID, help='Gist ID to be updated (must exist).')
+@click.option('--print-markdown', is_flag=True, help='Print the generated urls')
+def update_navigator_gists(directory: Path, token: str, gist_id: str, print_markdown: bool) -> list:
+    """Update the gists with new navigator files."""
+    assert directory.exists(), f'{directory} does not exist'
+    def raw_permalink(raw_link):
+        # Gist file URLs change with each revision, but can be permalinked to the latest by removing the hash after raw
+        prefix, _, suffix = raw_link.rsplit('/', 2)
+        return '/'.join([prefix, suffix])
+    file_map = {f: f.read_text() for f in directory.glob('*.json')}
+    try:
+        response = update_gist(token,
+                               file_map,
+                               description='ATT&CK Navigator layer files.',
+                               gist_id=gist_id,
+                               pre_purge=True)
+    except requests.exceptions.HTTPError as exc:
+        if exc.response.status_code == requests.status_codes.codes.not_found:
+            raise client_error('Gist not found: verify the gist_id exists and the token has access to it', exc=exc)
+        else:
+            raise
+    response_data = response.json()
+    raw_urls = {name: raw_permalink(data['raw_url']) for name, data in response_data['files'].items()}
+    base_url = 'https://mitre-attack.github.io/attack-navigator/#layerURL={}&leave_site_dialog=false&tabs=false'
+    # pull out full and platform coverage to print on top of markdown table
+    all_url = base_url.format(urllib.parse.quote_plus(raw_urls.pop('Elastic-detection-rules-all.json')))
+    platforms_url = base_url.format(urllib.parse.quote_plus(raw_urls.pop('Elastic-detection-rules-platforms.json')))
+    generated_urls = [all_url, platforms_url]
+    markdown_links = []
+    for name, gist_url in raw_urls.items():
+        query = urllib.parse.quote_plus(gist_url)
+        url = f'https://mitre-attack.github.io/attack-navigator/#layerURL={query}&leave_site_dialog=false&tabs=false'
+        generated_urls.append(url)
+        link_name = name.split('.')[0]
+        markdown_links.append(f'|[{link_name}]({url})|')
+    if print_markdown:
+        markdown = [
+            f'**Full coverage**: {NAVIGATOR_BADGE}',
+            '\n',
+            f'**Coverage by platform**: [navigator]({platforms_url})',
+            '\n',
+            '| other navigator links by rule attributes |',
+            '|------------------------------------------|',
+        ] + markdown_links
+        click.echo('\n'.join(markdown) + '\n')
+    click.echo(f'Gist update status on {len(generated_urls)} files: {response.status_code} {response.reason}')
+    return generated_urls
+@dev_group.command('trim-version-lock')
+@click.argument('stack_version')
+@click.option('--dry-run', is_flag=True, help='Print the changes rather than saving the file')
+def trim_version_lock(stack_version: str, dry_run: bool):
+    """Trim all previous entries within the version lock file which are lower than the min_version."""
+    stack_versions = get_stack_versions()
+    assert stack_version in stack_versions, \
+        f'Unknown min_version ({stack_version}), expected: {", ".join(stack_versions)}'
+    min_version = Version.parse(stack_version)
+    version_lock_dict = default_version_lock.version_lock.to_dict()
+    removed = {}
+    for rule_id, lock in version_lock_dict.items():
+        if 'previous' in lock:
+            prev_vers = [Version.parse(v, optional_minor_and_patch=True) for v in list(lock['previous'])]
+            outdated_vers = [f"{v.major}.{v.minor}" for v in prev_vers if v = the min version supplied as the new
+            # stack_version.
+            if dry_run:
+                outdated_minus_current = [str(v) for v in outdated_vers if v = stack_version:
+                    lock['previous'][str(Version(stack_version[:2]))] = popped
+            # remove the whole previous entry if it is now blank
+            if not lock['previous']:
+                lock.pop('previous')
+    if dry_run:
+        click.echo(f'The following versions would be collapsed to {stack_version}:' if removed else 'No changes')
+        click.echo('\n'.join(f'{k}: {", ".join(v)}' for k, v in removed.items()))
+    else:
+        new_lock = VersionLockFile.from_dict(dict(data=version_lock_dict))
+        new_lock.save_to_file()
+@dev_group.group('diff')
+def diff_group():
+    """Commands for statistics on changes and diffs."""
+@diff_group.command('endpoint-by-attack')
+@click.option('--pre', required=True, help='Tag for pre-existing rules')
+@click.option('--post', required=True, help='Tag for rules post updates')
+@click.option('--force', '-f', is_flag=True, help='Bypass the confirmation prompt')
+@click.option('--remote', '-r', default='origin', help='Override the remote from "origin"')
+@click.pass_context
+def endpoint_by_attack(ctx: click.Context, pre: str, post: str, force: bool, remote: Optional[str] = 'origin'):
+    """Rule diffs across tagged branches, broken down by ATT&CK tactics."""
+    if not force:
+        if not click.confirm(f'This will refresh tags and may overwrite local tags for: {pre} and {post}. Continue?'):
+            ctx.exit(1)
+    changed, new, deprecated = get_release_diff(pre, post, remote)
+    oses = ('windows', 'linux', 'macos')
+    def delta_stats(rule_map) -> List[dict]:
+        stats = defaultdict(lambda: defaultdict(int))
+        os_totals = defaultdict(int)
+        tactic_totals = defaultdict(int)
+        for rule_id, rule in rule_map.items():
+            threat = rule.contents.data.get('threat')
+            os_types = [i.lower() for i in rule.contents.data.get('tags') or [] if i.lower() in oses]
+            if not threat or not os_types:
+                continue
+            if isinstance(threat[0], dict):
+                tactics = sorted(set(e['tactic']['name'] for e in threat))
+            else:
+                tactics = ThreatMapping.flatten(threat).tactic_names
+            for tactic in tactics:
+                tactic_totals[tactic] += 1
+                for os_type in os_types:
+                    os_totals[os_type] += 1
+                    stats[tactic][os_type] += 1
+        # structure stats for table
+        rows = []
+        for tac, stat in stats.items():
+            row = {'tactic': tac, 'total': tactic_totals[tac]}
+            for os_type, count in stat.items():
+                row[os_type] = count
+            rows.append(row)
+        rows.append(dict(tactic='total_by_os', **os_totals))
+        return rows
+    fields = ['tactic', 'linux', 'macos', 'windows', 'total']
+    changed_stats = delta_stats(changed)
+    table = Table.from_list(fields, changed_stats)
+    click.echo(f'Changed rules {len(changed)}\n{table}\n')
+    new_stats = delta_stats(new)
+    table = Table.from_list(fields, new_stats)
+    click.echo(f'New rules {len(new)}\n{table}\n')
+    dep_stats = delta_stats(deprecated)
+    table = Table.from_list(fields, dep_stats)
+    click.echo(f'Deprecated rules {len(deprecated)}\n{table}\n')
+    return changed_stats, new_stats, dep_stats
+@dev_group.group('test')
+def test_group():
+    """Commands for testing against stack resources."""
+@test_group.command('event-search')
+@click.argument('query')
+@click.option('--index', '-i', multiple=True, help='Index patterns to search against')
+@click.option('--eql/--lucene', '-e/-l', 'language', default=None, help='Query language used (default: kql)')
+@click.option('--date-range', '-d', type=(str, str), default=('now-7d', 'now'), help='Date range to scope search')
+@click.option('--count', '-c', is_flag=True, help='Return count of results only')
+@click.option('--max-results', '-m', type=click.IntRange(1, 1000), default=100,
+              help='Max results to return (capped at 1000)')
+@click.option('--verbose', '-v', is_flag=True, default=True)
+@add_client('elasticsearch')
+def event_search(query, index, language, date_range, count, max_results, verbose=True,
+                 elasticsearch_client: Elasticsearch = None):
+    """Search using a query against an Elasticsearch instance."""
+    start_time, end_time = date_range
+    index = index or ('*',)
+    language_used = "kql" if language is None else "eql" if language is True else "lucene"
+    collector = CollectEvents(elasticsearch_client, max_results)
+    if verbose:
+        click.echo(f'searching {",".join(index)} from {start_time} to {end_time}')
+        click.echo(f'{language_used}: {query}')
+    if count:
+        results = collector.count(query, language_used, index, start_time, end_time)
+        click.echo(f'total results: {results}')
+    else:
+        results = collector.search(query, language_used, index, start_time, end_time, max_results)
+        click.echo(f'total results: {len(results)} (capped at {max_results})')
+        click.echo_via_pager(json.dumps(results, indent=2, sort_keys=True))
+    return results
+@test_group.command('rule-event-search')
+@single_collection
+@click.option('--date-range', '-d', type=(str, str), default=('now-7d', 'now'), help='Date range to scope search')
+@click.option('--count', '-c', is_flag=True, help='Return count of results only')
+@click.option('--max-results', '-m', type=click.IntRange(1, 1000), default=100,
+              help='Max results to return (capped at 1000)')
+@click.option('--verbose', '-v', is_flag=True)
+@click.pass_context
+@add_client('elasticsearch')
+def rule_event_search(ctx, rule, date_range, count, max_results, verbose,
+                      elasticsearch_client: Elasticsearch = None):
+    """Search using a rule file against an Elasticsearch instance."""
+    if isinstance(rule.contents.data, QueryRuleData):
+        if verbose:
+            click.echo(f'Searching rule: {rule.name}')
+        data = rule.contents.data
+        rule_lang = data.language
+        if rule_lang == 'kuery':
+            language_flag = None
+        elif rule_lang == 'eql':
+            language_flag = True
+        else:
+            language_flag = False
+        index = data.index or ['*']
+        ctx.invoke(event_search, query=data.query, index=index, language=language_flag,

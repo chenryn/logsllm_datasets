@@ -1,0 +1,60 @@
+现在GIN索引的查询性能还好，但是还是不如128独立列索引。  
+```  
+postgres=# explain analyze select count(*) from b where c1  Bitmap Heap Scan on b  (cost=22.01..23.12 rows=1 width=0) (actual time=3.060..3.060 rows=0 loops=1)  
+         Recheck Cond: ((c1   Bitmap Index Scan on idx_b_1  (cost=0.00..22.01 rows=1 width=0) (actual time=3.058..3.058 rows=0 loops=1)  
+               Index Cond: ((c1   Bitmap Heap Scan on c  (cost=29.59..1287.60 rows=1170 width=0) (actual time=18.299..20.091 rows=1078 loops=1)  
+         Recheck Cond: ((c1   Bitmap Index Scan on idx_c_1  (cost=0.00..29.30 rows=1170 width=0) (actual time=18.179..18.179 rows=1078 loops=1)  
+               Index Cond: ((c1   Bitmap Heap Scan on b  (cost=65.90..4556.98 rows=4176 width=0) (actual time=81.593..105.503 rows=4098 loops=1)  
+         Recheck Cond: ((c1   Bitmap Index Scan on idx_b_1  (cost=0.00..64.86 rows=4176 width=0) (actual time=81.067..81.067 rows=4098 loops=1)  
+               Index Cond: ((c1   Bitmap Heap Scan on a  (cost=2231.28..7561.98 rows=4959 width=0) (actual time=62.215..180.837 rows=4860 loops=1)  
+         Recheck Cond: ((c1   BitmapAnd  (cost=2231.28..2231.28 rows=4959 width=0) (actual time=61.461..61.461 rows=0 loops=1)  
+               ->  Bitmap Index Scan on idx_a_1  (cost=0.00..1090.57 rows=95192 width=0) (actual time=20.603..20.603 rows=95198 loops=1)  
+                     Index Cond: (c1   Bitmap Index Scan on idx_a_2  (cost=0.00..1137.98 rows=99314 width=0) (actual time=37.628..37.628 rows=95665 loops=1)  
+                     Index Cond: (c2   Index Scan using idx_c_1 on c  (cost=8.80..18614.25 rows=22757 width=0) (actual time=10.142..22.987 rows=22238 loops=1)  
+         Index Cond: (c1   Bitmap Heap Scan on b  (cost=684.51..63166.06 rows=82505 width=0) (actual time=57.762..131.941 rows=81741 loops=1)  
+         Recheck Cond: (c1   Bitmap Index Scan on idx_b_1  (cost=0.00..663.89 rows=82505 width=0) (actual time=48.058..48.058 rows=81741 loops=1)  
+               Index Cond: (c1   Index Only Scan using idx_a_1 on a  (cost=0.43..78221.80 rows=95192 width=0) (actual time=0.028..100.343 rows=95198 loops=1)  
+         Index Cond: (c1 < 100000000)  
+         Heap Fetches: 95198  
+ Planning Time: 0.614 ms  
+ Execution Time: 109.053 ms  
+(6 rows)  
+```  
+现在，性能最好的是RUM和独立列索引（性能差不多），其次是GIN索引。  
+## 小结  
+索引模式 | 写入速度 | 索引大小 | 单列查询性能（选择性好） | 单列查询性能（选择性不好）| 多列查询性能（单列选择性都不好，但是合并后选择性很好） | 多列查询性能（有些列选择性很好）  
+---|---|---|---|---|---|---  
+128列单个gin(fastupdate=on)索引 | 3.99万行/s | 最大 | 不好(pending tuples很大时) | 不好(选择性不好本身就不适合用索引过滤) | 不好(pending tuples很大时) | 不好(pending tuples很大时)   
+128列单个gin(fastupdate=off)索引 | 1.36万行/s | 最大 | 好 | 不好(选择性不好本身就不适合用索引过滤) | 好 | 一般  
+128列单个rum索引 | 0.378万行/s | 较小 | 很好 | 不好(选择性不好本身就不适合用索引过滤) | 一般 | 好  
+128列128个btree索引 | 1.59万行/s | 较小 | 很好 | 不好(选择性不好本身就不适合用索引过滤) | 一般 | 好  
+### 所以，建议使用每列独立的索引，来支撑任意列的组合查询，可以获得写入、读取较好的均衡。  
+选择性不好的列，建议不要使用索引，选择性通过pg_stats查看   
+```
+analyze c;
+postgres=# select schemaname,tablename,attname,n_distinct from pg_stats where tablename='c';
+ schemaname | tablename | attname | n_distinct 
+------------+-----------+---------+------------
+ public     | c         | c1      |         -1
+ public     | c         | c2      |  -0.999025
+ public     | c         | c3      |         -1
+...
+```
+[《PostgreSQL SQL自动优化案例 - 极简，自动推荐索引》](../201801/20180111_02.md)    
+[《自动选择正确索引访问接口(btree,hash,gin,gist,sp-gist,brin,bitmap...)的方法》](../201706/20170617_01.md)    
+### 为什么写入性能会是这样的结果？  
+同步模式BUILD索引，索引越多，写入的影响越大，本文对单表的测试可以看出，128个索引，写入只能达到1.59万行/s。如果硬件资源足够的话，可以通过使用分区表（多个表）来解决写入的瓶颈问题。    
+异步模式BUILD索引，（GIN开启fastupdate），写入吞吐可以提高，但是如果长时间处于高吞吐的写入下，由于一张表只有一个VACUUM WORKER进程合并pending tuples，所以可能导致PENDING TUPLES会越来越多，导致查询性能下降。解决办法是分区表，这样每个分区可以有1个vacuum worker参与合并，降低延迟。  
+### 为什么查询性能在几种情况下会是这样的结果？  
+选择性好的情况下，三种索引，性能都很好。  
+多列查询，如果所有条件的选择性都不好，但是最后所有条件的合并选择性如果很好时，GIN内置的BITMAP过滤，使得性能在RUM,GIN,BTREE多列三种情况下达到最好。  
+多列查询，如果所有条件的选择性都不好，并且最后所有条件合并后的选择性也不好时，所有索引的性能都一般。  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

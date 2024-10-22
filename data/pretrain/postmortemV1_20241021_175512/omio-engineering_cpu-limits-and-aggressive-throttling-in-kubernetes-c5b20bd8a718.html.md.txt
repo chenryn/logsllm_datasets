@@ -1,0 +1,261 @@
+# CPU limits and aggressive throttling in Kubernetes 
+
+Have you seen your application get stuck or fail to respond to health
+check requests, and you can't find any explanation? It might be because
+of the CPU quota limit. We will explain more here.
+
+> ***TL;DR:****\
+> ***We would highly recommend removing CPU Limits in Kubernetes (or
+> Disable CFS quota in Kublet) if you are using a kernel version with
+> CFS quota bug unpatched. There is a serious, known CFS bug in the
+> kernel that causes un-necessary throttling and stalls.**
+
+At Omio, we are **100% Kubernetes**. All our stateful and stateless
+workloads run completely on Kubernetes (hosted using Google's Kubernetes
+Engine). Since the last 6 months, we've been seeing random stalls.
+Applications stuck or failing to respond to health checks, broken
+network connections and so on. This sent us down a deep rabbit hole.
+
+This article covers the following topics.
+
+-   [A primer on containers & kubernetes]
+-   [How CPU request and limit is implemented]
+-   [How CPU limit works in multi-core environments]
+-   [How do you monitor CPU throttling]
+-   [How do you recover]
+
+# A primer on Containers & Kubernetes 
+
+Kubernetes (abbreviated as k8s) is pretty much a de-facto standard in
+the infrastructure world now. It is a container orchestrator.
+
+# Containers 
+
+In the past, we used to create artifacts such as Java JARs/WARs or
+Python Eggs or Executables, and throw them across the wall for someone
+to run them on servers. But to run them, there is more work ---
+application runtime (Java/Python) has to be installed, appropriate files
+inappropriate places, specific OSes and so on. It takes a lot of
+configuration management, and is a frequent source of pain between
+developers and sysadmins. **Containers change that**. Here, the artifact
+is a Container image**.** Imagine it as a fat executable with not only
+your program, but also the complete runtime (Java/Python/...), necessary
+files and packages pre-installed & ready to run. This can be shipped and
+run on a variety of servers without any further customized installations
+needed.
+
+Containers also run in their own sandboxed environment. They have their
+own virtual network adapter, their own restricted filesystem, their own
+process hierarchy, their own CPU and memory limits, etc. This is a
+kernel feature called namespaces.
+
+# Kubernetes 
+
+Kubernetes is a Container orchestrator. You give it a pool of machines.
+Then you tell it: "Hey kubernetes --- run 10 instances of my container
+image with 2 cpus and 3GB RAM each, and keep it running!". Kubernetes
+orchestrates the rest. It will run them wherever it finds free CPU
+capacity, restart them if they are unhealthy, do a rolling update if we
+change the versions, and so on.
+
+Essentially, Kubernetes abstracts away the concept of machines, and
+makes all of them a single deployment target.
+
+
+Layman's representation of Kubernetes
+
+# Understanding Kubernetes request and limit 
+
+OK, we understand what Containers and Kubernetes are. We also see that,
+multiple containers can fit inside the same machine.
+
+This is like flat sharing. You take some big flats (machines/nodes) and
+share it with multiple, diverse tenants (containers). Kubernetes is our
+rental broker. But how does it keep all those tenants from squabbling
+with each other? What if one of them takes over the bathroom for half a
+day? ;)
+
+This is where request and limit come into picture. CPU "**Request**" is
+just for scheduling purposes. It's like the container's wishlist, used
+mainly to find the best node suitable for it. Whereas CPU "**Limit**" is
+the rental contract. Once we find a node for the container, it
+absolutely **cannot** go over the limit.
+
+And here is where the problem arises...
+
+# How Kubernetes request & limit is implemented 
+
+Kubernetes uses **kernel throttling** to implement CPU limit. If an
+application goes above the limit, it gets throttled (aka fewer CPU
+cycles). Memory requests and limits, on the other hand, are implemented
+differently, and it's easier to detect. You only need to check if your
+pod's last restart status is OOMKilled. But CPU throttling is not easy
+to identify, because k8s only exposes usage metrics and not cgroup
+related metrics.
+
+# CPU Request 
+
+
+How CPU request is implemented
+
+For the sake of simplicity, let's discuss how it organized in a
+four-core machine.
+
+The k8s uses a cgroup to control the resource allocation(for both memory
+and CPU ). It has a hierarchy model and can only use the resource
+allocated to the parent. The details are stored in a virtual filesystem
+(`/sys/fs/cgroup`). In the case of CPU it's
+`/sys/fs/cgroup/cpu,cpuacct/*`.
+
+The k8s uses `cpu.share` file to allocate the
+CPU resources. In this case, the root cgroup inherits 4096 CPU shares,
+which are 100% of available CPU power(1 core = 1024; this is fixed
+value). The root cgroup allocate its share proportionally based on
+children's `cpu.share` and they do the same with
+their children and so on. In typical Kubernetes nodes, there are three
+cgroup under the root cgroup, namely `system.slice`, `user.slice`, and `kubepods`. The first two are used to allocate the resource for
+critical system workloads and non-k8s user space programs. The last one,
+`kubepods` is created by k8s to allocate the
+resource to pods.
+
+If you look at the above graph, you can see that first and second
+cgroups have **1024** share each, and the `kubepod` has **4096**. Now, you may be thinking that there is only **4096**
+CPU share available in the root, but the total of children's shares
+exceeds that value (**6144**). The answer to this question is, this
+value is logical, and the Linux scheduler (CFS) uses this value to
+allocate the CPU proportionally. In this case, the first two cgroups get
+**680** (16.6% of 4096) each, and kubepod gets the remaining **2736**.
+But in idle case, the first two cgroup would not be using all allocated
+resources. The scheduler has a mechanism to avoid the wastage of unused
+CPU shares. Scheduler releases the unused CPU to the global pool so that
+it can allocate to the cgroups that are demanding for more CPU power(it
+does in batches to avoid the accounting penalty). The same workflow will
+be applied to all grandchildren as well.
+
+This mechanism will make sure that CPU power is shared fairly, and no
+one can steal the CPU from others.
+
+# CPU Limit 
+
+Even though the k8s config for Limit and Requests looks similar, the
+implementation is entirely different; this is the **most misguiding**
+and less documented part.
+
+The k8s uses [CFS's quota
+mechanism](https://www.kernel.org/doc/Documentation/scheduler/sched-design-CFS.txt) to implement the limit.
+The config for the limit is configured in two files `cfs_period_us` and `cfs_quota_us`(next to
+`cpu.share`) under the cgroup directory.
+
+Unlike `cpu.share`, the quota is based on **time
+period** and not based on available CPU power. `cfs_period_us` is used to define the time period, it's always 100000us
+(100ms). k8s has an option to allow to change this value but still alpha
+and feature gated. The scheduler uses this time period to reset the used
+quota. The second file, `cfs_quota_us` is used
+to denote the allowed quota in the quota period.
+
+Please note that it also configured in `us`
+unit. Quota can exceed the quota period. Which means you can configure
+quota more than 100ms.
+
+Let's discuss two scenarios on 16 core machines (Omio's most common
+machine type).
+
+
+Scenario 1: 2 thread and 200ms limit. No throttling
+
+
+Scenario 2: 10 thread and 200ms limit. throttling starts after 20ms and
+only receive cpu power after 80ms.
+
+Let's say you have configured **2** core as CPU limit; the k8s will
+translate this to 200ms. That means the container can use a maximum of
+200ms CPU time without getting throttled.
+
+And here starts all misunderstanding. As I said above, the allowed quota
+is 200ms, which means if you are running **ten** parallel threads on 12
+core machine (see the second figure) where all other pods are idle, your
+quota will exceed the limit in 20ms (i.e. 10 \* 20ms = 200ms), and all
+threads running under that pod will get throttled for next 80ms (**stop
+the world**). To make the situation worse, the scheduler has a bug that
+is causing unnecessary throttling and prevents the container from
+reaching the allowed quota.
+
+# Checking the throttling rate of your pods 
+
+Just login to the pod and run `cat /sys/fs/cgroup/cpu/cpu.stat`.
+
+-   [`nr_periods` --- Total schedule
+    period]
+-   [`nr_throttled` --- Total throttled period
+    out of nr_periods]
+-   [`throttled_time` --- Total throttled time
+    in ns]
+
+
+# So what really happens? 
+
+We end up with a high throttle rate on multiple applications --- **up to
+50%** more than what we assumed the limits were set for!
+
+This cascades as various errors --- Readiness probe failures, Container
+stalls, Network disconnections and timeouts within service calls --- all
+in all leading to reduced latency and increased error rates.
+
+# Fix and Impact 
+
+Simple. We disabled CPU limits until the latest kernel with bugfix was
+deployed across all our clusters.
+
+Immediately, we found a huge reduction in error rates (HTTP 5xx) of our
+services:
+
+# HTTP Error Rates (5xx) 
+
+
+HTTP 5xx rates of a critical service
+
+# p95 Response time 
+
+
+p95 request latency of a critical service
+
+# Utilization costs 
+
+
+Number of instance hours utilized
+
+# What's the catch? 
+
+We said at the beginning of this article:
+
+> This is like flat sharing. Kubernetes is our rental broker. But how
+> does it keep all those tenants from squabbling with each other? What
+> if one of them takes over the bathroom for half a day? ;)
+
+This is the catch. We risk some containers hogging up all CPUs in a
+machine. If you have a good application stack in place (e.g. proper JVM
+tuning, Go tuning, Node VM tuning) --- then this is not a problem, you
+can live with this for a long time. But if you have applications that
+are either poorly optimized, or simply not optimized
+(`FROM java:latest`) --- then results can
+backfire. At Omio we have automated base Dockerfiles with sane defaults
+for our primary language stacks, so this was not an issue for us.
+
+Please do monitor [USE](http://www.brendangregg.com/usemethod.html) (Utilization,
+Saturation and Errors) metrics, API latencies and error rates, and make
+sure your results match expectations.
+
+This was a wild ride and discovery. The following resources helped us a
+lot in understanding:
+
+-   [[https://www.kernel.org/doc/Documentation/scheduler/sched-design-CFS.txt](https://www.kernel.org/doc/Documentation/scheduler/sched-design-CFS.txt)]
+-   [[https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt](https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt)]
+-   [[https://engineering.squarespace.com/blog/2017/understanding-linux-container-scheduling](https://engineering.squarespace.com/blog/2017/understanding-linux-container-scheduling)]
+-   [[https://www.linuxjournal.com/content/everything-you-need-know-about-linux-containers-part-i-linux-control-groups-and-process](https://www.linuxjournal.com/content/everything-you-need-know-about-linux-containers-part-i-linux-control-groups-and-process)]
+-   [[https://k8s.af/](https://k8s.af/) --- search for cpu
+    throttling.]
+-   [Kubernetes bug reports:
+    [https://github.com/kubernetes/kubernetes/issues/51135#issuecomment-373454012](https://github.com/kubernetes/kubernetes/issues/51135#issuecomment-373454012) \|
+    [https://github.com/kubernetes/kubernetes/issues/67577](https://github.com/kubernetes/kubernetes/issues/67577) \|
+    [https://gist.github.com/bobrik/2030ff040fad360327a5fab7a09c4ff1](https://gist.github.com/bobrik/2030ff040fad360327a5fab7a09c4ff1)]
+

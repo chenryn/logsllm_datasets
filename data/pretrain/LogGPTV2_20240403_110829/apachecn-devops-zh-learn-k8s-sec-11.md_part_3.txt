@@ -1,0 +1,156 @@
+   bound_service_account_names=app \
+   bound_service_account_namespaces=demo \
+   policies=app \
+   ttl=24h
+```
+Vault 可以利用 Kubernetes 的简单身份验证，然后将机密访问策略绑定到服务帐户。现在，名称空间演示中的服务帐户应用可以访问`postgres`机密。现在，让我们在`vault-app.yaml`文件中部署一个演示应用，如下所示:
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app: vault-agent-demo
+spec:
+  selector:
+    matchLabels:
+      app: vault-agent-demo
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+      labels:
+        app: vault-agent-demo
+    spec:
+      serviceAccountName: app
+      containers:
+      - name: app
+        image: jweissig/app:0.0.1
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app
+  labels:
+    app: vault-agent-demo
+```
+请注意，在前面的`.yaml`文件中，还没有添加注释，因此不会注入机密，也不会在应用创建时添加侧车容器。代码可以在下面的代码片段中看到:
+```
+$ kubectl get pods
+NAME                                    READY   STATUS    RESTARTS   AGE
+app-668b8bcdb9-js9mm                    1/1     Running   0          3m23s
+```
+接下来，我们将展示机密注射是如何工作的。
+## 供应和旋转机密
+我们在部署应用时不显示机密注入的原因是我们想向您展示注入到演示应用 pod 之前和之后的详细区别。现在，让我们用以下 Vault 注释来修补部署:
+```
+$ cat patch-template-annotation.yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-status: "update"
+        vault.hashicorp.com/agent-inject-secret-postgres: "secret/postgres"
+        vault.hashicorp.com/agent-inject-template-postgres: |
+          {{- with secret "secret/postgres" -}}
+          postgresql://{{ .Data.data.username }}:{{ .Data.data.password }}@postgres:5432/wizard
+          {{- end }}
+        vault.hashicorp.com/role: "myapp"
+```
+前面的注释规定了将注入哪个机密，以什么格式和使用哪个角色。一旦我们更新了演示应用部署，我们会发现机密已经被注入，如下所示:
+```
+$ kubectl get pods
+NAME                                    READY   STATUS    RESTARTS   AGE
+app-68d47bb844-2hlrb                    2/2     Running   0          13s
+$ kubectl -n demo exec -it app-68d47bb844-2hlrb -c app -- cat /vault/secrets/postgres
+postgresql://alice:pass@postgres:5432/wizard
+```
+让我们看看 pod 的规范(不是修补的部署)—与修补的部署规范相比，您会发现添加了以下内容(用粗体标记):
+```
+  containers:
+  - image: jweissig/app:0.0.1
+    ...
+    volumeMounts:
+    - mountPath: /vault/secrets
+      name: vault-secrets
+  - args:
+    - echo ${VAULT_CONFIG?} | base64 -d > /tmp/config.json && vault agent -config=/tmp/config.json
+    command:
+    - /bin/sh
+    - -ec
+    image: vault:1.3.2
+    name: vault-agent
+    volumeMounts:
+    - mountPath: /vault/secrets
+      name: vault-secrets
+ initContainers:
+  - args:
+    - echo ${VAULT_CONFIG?} | base64 -d > /tmp/config.json && vault agent -config=/tmp/config.json
+    command:
+    - /bin/sh
+    - -ec
+    image: vault:1.3.2
+    name: vault-agent-init
+    volumeMounts:
+    - mountPath: /vault/secrets
+      name: vault-secrets
+  volumes:
+   - emptyDir:
+      medium: Memory
+    name: vault-secrets
+```
+从前面列举的改动中值得一提的是:注入了一个名为`vault-agent-init`的`init`容器和一个名为`vault-agent`的边车容器，以及一个名为`vault-secrets`的`emptyDir`型容积。这就是为什么在补丁发布后，您会看到两个容器在演示应用窗格中运行。此外，`vault-secrets`卷安装在带有`/vault/secrets/`目录的`init`容器、`sidecar`容器和`app`容器中。机密存储在`vault-secrets`卷中。Pod 规格修改由`vault-agent-injector`Pod 通过预定义的突变网钩配置(通过`helm`安装)完成，如下所示:
+```
+apiVersion: admissionregistration.k8s.io/v1beta1
+kind: MutatingWebhookConfiguration
+metadata:
+  ...
+  name: vault-agent-injector-cfg
+webhooks:
+- admissionReviewVersions:
+  - v1beta1
+  clientConfig:
+    caBundle: 
+    service:
+      name: vault-agent-injector-svc
+      namespace: demo
+      path: /mutate
+  failurePolicy: Ignore
+  name: vault.hashicorp.com
+  namespaceSelector: {}
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pods
+    scope: '*'
+```
+在`kube-apiserver`注册的变异网钩配置基本上告诉`kube-apiserver`重定向任何 PODS，创建或更新请求到`demo`命名空间中的`vault-agent-injector-svc`服务。服务背后是`vault-agent-injector`号 Pod 。然后，`vault-agent-injector`Pod 将查找相关注释，并根据请求将`init`容器和`sidecar`容器以及存储机密的卷注入 Pod 的规范中。为什么我们需要一个`init`容器和一个`sidecar`容器？`init`容器用于预填充我们的机密，而`sidecar`容器用于在应用的整个生命周期中保持机密数据的同步。
+现在，让我们通过运行以下代码来更新这个机密，看看会发生什么:
+```
+vault kv put secret/postgres username=alice password=changeme
+```
+现在，密码已经从`vault`舱的`pass`更新为`changeme`。并且，在`demo`应用端，我们可以从下面的代码块中看到，在等待几秒钟之后，它也被更新了:
+```
+$ kubectl -n demo exec -it app-68d47bb844-2hlrb -c app -- cat /vault/secrets/postgres
+postgresql://alice:changeme@postgres:5432/wizard
+```
+Vault 是一个强大的机密管理解决方案，它的许多功能无法在单个部分中涵盖。我鼓励您阅读文档并尝试来更好地理解 Vault。接下来，让我们和法尔科谈谈 Kubernetes 中的 runt ime 威胁检测。
+# 用法尔科探测异常
+Falco 是 CNCF 的一个开源项目，它在云原生环境中检测异常行为或运行时威胁，比如 Kubernetes 集群。它是一个基于规则的运行时检测引擎，大约有 100 个现成的检测规则。在本节中，我们将首先概述 Falco，然后向您展示如何编写 Falco 规则，以便您可以构建自己的 Falco 规则来保护您的 Kubernetes 集群。
+## 法尔科概述
+Falco 被广泛用于检测云原生环境中的异常行为，尤其是在 Kubernetes 集群中。那么，什么是异常检测呢？基本上，它使用行为信号来检测安全异常，例如泄露的凭据或异常活动，并且行为信号可以从您对正常行为是什么的实体的了解中导出。
+### 面临的挑战
+识别 Kubernetes 集群中的正常行为并不容易。从运行应用的角度来看，我们可以将它们分为三类，如下所示:
+*   **Kubernetes 组件** : `kube-apiserver`、`kube-proxy`、`kubelet`、**容器运行时接口** ( **CRI** )插件、**容器联网接口** ( **CNI** )插件等等
+*   **自托管应用** : Java、Node.js、Golang、Python 等
+*   **供应商服务** : Cassandra、Redis、MySQL、nginx、Tomcat 等
+或者，从系统的角度来看，我们有以下类型的活动:
+*   文件活动，如打开、读取和写入
+*   过程活动，如`execve`和`clone`系统调用

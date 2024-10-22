@@ -1,0 +1,229 @@
+**作者：嘉然小狗的姐  
+本文为作者投稿，Seebug Paper 期待你的分享，凡经采用即有礼品相送！ 投稿邮箱：PI:EMAIL**
+## 前言
+psexec是`sysinternals`提供的众多windows工具中的一个，这款工具的初衷是帮助管理员管理大量的机器的，后来被攻击者用来做横向渗透。
+下载地址：
+要使用psexec，至少要满足以下要求：
+  1. 远程机器的 139 或 445 端口需要开启状态，即 SMB；
+  2. 明文密码或者 NTLM 哈希；
+  3. 具备将文件写入共享文件夹的权限；
+  4. 能够在远程机器上创建服务：SC_MANAGER_CREATE_SERVICE
+  5. 能够启动所创建的服务：SERVICE_QUERY_STATUS && SERVICE_START
+## psexec执行原理
+环境：
+  * Windows 10 -> 192.168.111.130
+  * Windows Server 2016 -> 192.168.111.132
+在windows 10上用psexec登录windows server 2016
+[
+原版的psexec只支持账户密码登录，但是在impacket版的psexec支持hash登录（很实用）
+psexec执行流程：
+  1. 将`PSEXESVC.exe`上传到`admin$`共享文件夹内；
+  2. 远程创建用于运行`PSEXESVC.exe`的服务；
+  3. 远程启动服务。
+`PSEXESVC`服务充当一个重定向器（包装器）。它在远程系统上运行指定的可执行文件（示例中的cmd.exe），同时，它通过主机之间来重定向进程的输入/输出（利用命名管道）。
+[
+## 流量分析
+  1. 使用输入的账户和密码，通过`SMB`会话进行身份验证；
+  2. 利用`SMB`访问默认共享文件夹`ADMIN$`，从而上传`PSEXESVC.exe`；
+[
+  3. 打开`svcctl`的句柄，与服务控制器（SCM）进行通信，使得能够远程创建/启动服务。此时使用的是`SVCCTL`服务，通过对`SVCCTL`服务的`DCE\RPC`调用来启动`Psexec`；
+  4. 使用上传的`PSEXESVC.exe`作为服务二进制文件，调用`CreateService`函数；
+  5. 调用`StartService`函数；
+[
+  6. 之后再创建命名管道来重定向`stdin（输入）`、`stdout（输出）`、`stderr（错误输出）`。
+[
+## 代码实现
+通过上面的分析，可以列一个代码的执行流程：
+  1. 连接SMB共享
+  2. 上传一个恶意服务文件到共享目录
+  3. 打开SCM创建服务
+  4. 启动服务
+  5. 服务创建输入输出管道
+  6. 等待攻击者连接管道
+  7. 从管道读取攻击者的命令
+  8. 输出执行结果到管道
+  9. 跳转到 3
+  10. 删除服务
+  11. 删除文件
+### 连接SMB共享
+连接SMB共享需要用到`WNetAddConnection`
+    The WNetAddConnection function enables the calling application to connect a local device to a network resource. A successful connection is persistent, meaning that the system automatically restores the connection during subsequent logon operations.
+`WNetAddConnection`只支持16位的Windows，更高位的需要使用`WNetAddConnection2`或`WNetAddConnection3`
+[WNetAddConnection2A](https://docs.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetaddconnection2a)
+    DWORD WNetAddConnection2A(
+      [in] LPNETRESOURCEA lpNetResource,    // 一个指向连接信息结构的指针
+      [in] LPCSTR         lpPassword,       // 密码
+      [in] LPCSTR         lpUserName,       // 用户名
+      [in] DWORD          dwFlags           // 选项
+    );
+接下来就可以实现一个连接SMB共享的函数`ConnectSMBServer`
+    DWORD ConnectSMBServer(LPCWSTR lpwsHost, LPCWSTR lpwsUserName, LPCWSTR lpwsPassword) {
+        // SMB shared resource.
+        PWCHAR lpwsIPC = new WCHAR[MAX_PATH];
+        // Return value
+        DWORD dwRetVal;
+        // Detailed network information
+        NETRESOURCE nr;
+        // Connection flags
+        DWORD dwFlags;
+        ZeroMemory(&nr, sizeof(NETRESOURCE));
+        swprintf(lpwsIPC, 100, TEXT("\\\\%s\\admin$"), lpwsHost);
+        nr.dwType = RESOURCETYPE_ANY;
+        nr.lpLocalName = NULL;
+        nr.lpRemoteName = lpwsIPC;
+        nr.lpProvider = NULL;
+        dwFlags = CONNECT_UPDATE_PROFILE;
+        dwRetVal = WNetAddConnection2(&nr, lpwsPassword, lpwsUserName, dwFlags);
+        if (dwRetVal == NO_ERROR) {
+            // success
+            wprintf(L"[*] Connect added to %s\n", nr.lpRemoteName);
+            return dwRetVal;
+        }
+        wprintf(L"[*] WNetAddConnection2 failed with error: %u\n", dwRetVal);
+        return -1;
+    }
+查看本地的网络连接，发现已经添加了对应的SMB共享
+[
+### 上传文件
+根据Rvn0xsy师傅的博客，他利用的是CIFS协议将网络文件共享映射为本地资源去访问，从而能够直接利用Windows文件相关的API来操作共享文件。
+CIFS (Common Internet File System)，Windows上的一个文件共享协议。该协议的功能包括：
+  1. 访问服务器本地文件并读取这些文件
+  2. 与其它用户一起共享一些文件块
+  3. 在断线时自动恢复与网络的连接
+  4. 使用Unicode文件名
+    BOOL CopyFile(
+      [in] LPCTSTR lpExistingFileName,
+      [in] LPCTSTR lpNewFileName,
+      [in] BOOL    bFailIfExists
+    );
+所以可以通过已有的SMB共享将本地文件拷贝至远程主机。
+    BOOL UploadFileBySMB(LPCWSTR lpwsSrcPath, LPCWSTR lpwsDstPath) {
+        DWORD dwRetVal;
+        dwRetVal = CopyFile(lpwsSrcPath, lpwsDstPath, FALSE);
+        return dwRetVal > 0 ? TRUE : FALSE;
+    }
+测试效果：
+[
+在`C:\windows\`下查看上传文件
+[
+### 编写服务程序
+    Microsoft Windows 服务（过去称为 NT 服务）允许用户创建可在其自身的 Windows 会话中长时间运行的可执行应用程序。 这些服务可在计算机启动时自动启动，可以暂停和重启，并且不显示任何用户界面。 这些功能使服务非常适合在服务器上使用，或者需要长时间运行的功能（不会影响在同一台计算机上工作的其他用户）的情况。 还可以在与登录用户或默认计算机帐户不同的特定用户帐户的安全性上下文中运行服务。
+Windows 服务被设计用于需要在后台运行的应用程序以及实现没有用户交互的任务，并且部分服务是以SYSTEM权限启动。
+服务控制管理器 (Service Control Manager,
+SCM)，对于服务有非常重要的作用，它可以把启动服务或停止服务的请求发送给服务。SCM是操作系统的一个组成部分，它的作用是与服务进行通信。
+关于服务程序，主要包含三个部分：主函数、ServiceMain函数、处理程序。
+  1. 主函数：程序的一般入口，可以注册多个 ServiceMain 函数；
+  2. ServiceMain函数：包含服务的实际功能。服务必须为所提供的每项服务注册一个 ServiceMain 函数；
+  3. 处理程序：必须响应来自 SCM 的事件（停止、暂停 或 重新开始）；
+Rvn0xsy师傅也给出了一个服务模板：
+    #include 
+    #include   
+    // Windows 服务代码模板
+    ////////////////////////////////////////////////////////////////////////////////////
+    // sc create Monitor binpath= Monitor.exe
+    // sc start Monitor
+    // sc delete Monitor
+    ////////////////////////////////////////////////////////////////////////////////////
+    /**********************************************************************************/
+    ////////////////////////////////////////////////////////////////////////////////////
+    // New-Service –Name Monitor –DisplayName Monitor –BinaryPathName "D:\Monitor\Monitor.exe" –StartupType Automatic
+    // Start-Service Monitor
+    // Stop-Service Monitor
+    ////////////////////////////////////////////////////////////////////////////////////
+    #define SLEEP_TIME 5000                          /*间隔时间*/
+    #define LOGFILE "D:\\log.txt"              /*信息输出文件*/
+    SERVICE_STATUS ServiceStatus;  /*服务状态*/
+    SERVICE_STATUS_HANDLE hStatus; /*服务状态句柄*/
+    void  ServiceMain(int argc, char** argv);
+    void  CtrlHandler(DWORD request);
+    int   InitService();
+    int main(int argc, CHAR * argv[])
+    {
+        WCHAR WserviceName[] = TEXT("Monitor");
+        SERVICE_TABLE_ENTRY ServiceTable[2];
+        ServiceTable[0].lpServiceName = WserviceName;
+        ServiceTable[0].lpServiceProc = (LPSERVICE_MAIN_FUNCTION)ServiceMain;
+        ServiceTable[1].lpServiceName = NULL;
+        ServiceTable[1].lpServiceProc = NULL;
+        StartServiceCtrlDispatcher(ServiceTable);
+        return 0;
+    }
+    int WriteToLog(const char* str)
+    {
+        FILE* pfile;
+        fopen_s(&pfile, LOGFILE, "a+");
+        if (pfile == NULL)
+        {
+            return -1;
+        }
+        fprintf_s(pfile, "%s\n", str);
+        fclose(pfile);
+        return 0;
+    }
+    /*Service initialization*/
+    int InitService()
+    {
+        CHAR Message[] = "Monitoring started.";
+        OutputDebugString(TEXT("Monitoring started."));
+        int result;
+        result = WriteToLog(Message);
+        return(result);
+    }
+    /*Control Handler*/
+    void CtrlHandler(DWORD request)
+    {
+        switch (request)
+        {
+        case SERVICE_CONTROL_STOP:
+            WriteToLog("Monitoring stopped.");
+            ServiceStatus.dwWin32ExitCode = 0;
+            ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+            SetServiceStatus(hStatus, &ServiceStatus);
+            return;
+        case SERVICE_CONTROL_SHUTDOWN:
+            WriteToLog("Monitoring stopped.");
+            ServiceStatus.dwWin32ExitCode = 0;
+            ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+            SetServiceStatus(hStatus, &ServiceStatus);
+            return;
+        default:
+            break;
+        }
+        /* Report current status  */
+        SetServiceStatus(hStatus, &ServiceStatus);
+        return;
+    }
+    void ServiceMain(int argc, char** argv)
+    {
+        WCHAR WserviceName[] = TEXT("Monitor");
+        int error;
+        ServiceStatus.dwServiceType =
+            SERVICE_WIN32;
+        ServiceStatus.dwCurrentState =
+            SERVICE_START_PENDING;
+        /*在本例中只接受系统关机和停止服务两种控制命令*/
+        ServiceStatus.dwControlsAccepted =
+            SERVICE_ACCEPT_SHUTDOWN |
+            SERVICE_ACCEPT_STOP;
+        ServiceStatus.dwWin32ExitCode = 0;
+        ServiceStatus.dwServiceSpecificExitCode = 0;
+        ServiceStatus.dwCheckPoint = 0;
+        ServiceStatus.dwWaitHint = 0;
+        hStatus = ::RegisterServiceCtrlHandler(
+            WserviceName,
+            (LPHANDLER_FUNCTION)CtrlHandler);
+        if (hStatus == (SERVICE_STATUS_HANDLE)0)
+        {
+            WriteToLog("RegisterServiceCtrlHandler failed");
+            return;
+        }
+        WriteToLog("RegisterServiceCtrlHandler success");
+        /* Initialize Service   */
+        error = InitService();
+        if (error)
+        {
+            /* Initialization failed  */
+            ServiceStatus.dwCurrentState =
+                SERVICE_STOPPED;
+            ServiceStatus.dwWin32ExitCode = -1;
+            SetServiceStatus(hStatus, &ServiceStatus);

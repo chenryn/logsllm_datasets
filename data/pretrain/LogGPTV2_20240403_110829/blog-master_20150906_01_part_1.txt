@@ -1,0 +1,263 @@
+## PostgreSQL pg_clog fsync 频率分析  
+### 作者                                                                  
+digoal                                                                  
+### 日期                                                                   
+2015-09-06                                                          
+### 标签                                                                  
+PostgreSQL , fsync , clog , pg_clog , 事务提交日志         
+----                                                                              
+## 背景       
+在前面介绍过PostgreSQL除了XLOG以外，还有一些操作是需要调用fsync的。  
+[《除了xlog，哪些操作可能还需要fsync ?》](../201509/20150904_01.md)    
+其中之一是pg_clog，本文主要分析一下pg_clog是在什么时候需要调用fsync的？  
+引用wiki里的一段pg_clog的介绍。  
+https://wiki.postgresql.org/wiki/Hint_Bits  
+Some details here are in src/backend/access/transam/README:  
+```  
+1. "pg_clog records the commit status for each transaction that has been assigned an XID."  
+2. "Transactions and subtransactions are assigned permanent XIDs only when/if they   
+first do something that requires one   
+--- typically, insert/update/delete a tuple, though there are a few other places   
+that need an XID assigned."  
+pg_clog is updated only at sub or main transaction end.   
+When the transactionid is assigned the page of the   
+clog that contains that transactionid is checked to see if it already exists and if not,   
+it is initialised.  
+pg_clog is allocated in pages of 8kB apiece(其实是和BLOCKSZ一致，所以不一定是8K，见后面的代码分析).   
+Each transaction needs 2 bits, so on an 8 kB page there is space for 4 transactions/byte * 8k bytes = 32k transactions.  
+On allocation, pages are zeroed, which is the bit pattern for "transaction in progress".   
+So when a transaction starts, it only needs to ensure that the pg_clog page   
+that contains its status is allocated, but it need not write anything to it.   
+In 8.3 and later, this happens not when the transaction starts, but when the Xid is assigned   
+(i.e. when the transaction first calls a read-write command).   
+In previous versions it happens when the first snapshot is taken, normally on the   
+first command of any type with very few exceptions.  
+This means that one transaction in every 32K writing transactions *does* have to   
+do extra work when it assigns itself an XID, namely create and zero out the next page of pg_clog.   
+And that doesn't just slow down the transaction in question, but the next few guys   
+that would like an XID but arrive on the scene while the zeroing-out is still in progress.   
+This probably contributes to reported behavior that the transaction execution time   
+is subject to unpredictable spikes.  
+每32K个事务，要扩展一个CLOG PAGE，每次扩展需要填充0，同时需要调用PG_FSYNC，这个相比FSYNC XLOG应该是比较轻量级的。  
+但是也可能出现不可预知的响应延迟，因为如果堵塞在扩展CLOG PAGE，所有等待clog PAGE的会话都会受到影响。  
+这里指当CLOG buffer没有空的SLOT时，会从所有的CLOG buffer SLOT选择一个脏页，将其刷出，这个时候才会产生pg_fsync。  
+CLOG pages don't make their way out to disk until the internal CLOG buffers are filled, at which point the least recently used buffer there is evicted to permanent storage.  
+```  
+下面从代码中分析一下pg_clog是如何调用pg_fsync刷脏页的。  
+每次申请新的事务ID时，都需要调用ExtendCLOG，如果通过事务ID计算得到的CLOG PAGE页不存在，则需要扩展，但是并不是每次扩展都需要调用pg_fsync，因为checkpoint会将clog buffer刷到磁盘，除非在申请新的CLOG PAGE时所有的clog buffer都没有刷出脏页，才需要主动选择一个page并调用pg_fsync刷出对应的pg_clog/file。  
+src/backend/access/transam/varsup.c  
+```  
+/*  
+ * Allocate the next XID for a new transaction or subtransaction.  
+ *  
+ * The new XID is also stored into MyPgXact before returning.  
+ *  
+ * Note: when this is called, we are actually already inside a valid  
+ * transaction, since XIDs are now not allocated until the transaction  
+ * does something.  So it is safe to do a database lookup if we want to  
+ * issue a warning about XID wrap.  
+ */  
+TransactionId  
+GetNewTransactionId(bool isSubXact)  
+{  
+......  
+        /*  
+         * If we are allocating the first XID of a new page of the commit log,  
+         * zero out that commit-log page before returning. We must do this while  
+         * holding XidGenLock, else another xact could acquire and commit a later  
+         * XID before we zero the page.  Fortunately, a page of the commit log  
+         * holds 32K or more transactions, so we don't have to do this very often.  
+         *  
+         * Extend pg_subtrans too.  
+         */  
+        ExtendCLOG(xid);  
+        ExtendSUBTRANS(xid);  
+......  
+```  
+ExtendCLOG(xid);扩展clog page，调用TransactionIdToPgIndex计算XID和CLOG_XACTS_PER_PAGE的余数，如果不为0，则不需要扩展。  
+src/backend/access/transam/clog.c  
+```  
+#define TransactionIdToPgIndex(xid) ((xid) % (TransactionId) CLOG_XACTS_PER_PAGE)  
+/*  
+ * Make sure that CLOG has room for a newly-allocated XID.  
+ *  
+ * NB: this is called while holding XidGenLock.  We want it to be very fast  
+ * most of the time; even when it's not so fast, no actual I/O need happen  
+ * unless we're forced to write out a dirty clog or xlog page to make room  
+ * in shared memory.  
+ */  
+void  
+ExtendCLOG(TransactionId newestXact)  
+{  
+        int                     pageno;  
+        /*  
+         * No work except at first XID of a page.  But beware: just after  
+         * wraparound, the first XID of page zero is FirstNormalTransactionId.  
+         */  
+        if (TransactionIdToPgIndex(newestXact) != 0 &&    // 余数不为0，说明不需要扩展。  
+                !TransactionIdEquals(newestXact, FirstNormalTransactionId))  
+                return;  
+        pageno = TransactionIdToPage(newestXact);  
+        LWLockAcquire(CLogControlLock, LW_EXCLUSIVE);  
+        /* Zero the page and make an XLOG entry about it */  
+        ZeroCLOGPage(pageno, true);  
+        LWLockRelease(CLogControlLock);  
+}  
+```  
+ZeroCLOGPage(pageno, true);，调用SimpleLruZeroPage，扩展并初始化CLOG PAGE，写XLOG日志。  
+```  
+/*  
+ * Initialize (or reinitialize) a page of CLOG to zeroes.  
+ * If writeXlog is TRUE, also emit an XLOG record saying we did this.  
+ *  
+ * The page is not actually written, just set up in shared memory.  
+ * The slot number of the new page is returned.  
+ *  
+ * Control lock must be held at entry, and will be held at exit.  
+ */  
+static int  
+ZeroCLOGPage(int pageno, bool writeXlog)  
+{  
+        int                     slotno;  
+        slotno = SimpleLruZeroPage(ClogCtl, pageno);  
+        if (writeXlog)  
+                WriteZeroPageXlogRec(pageno);  
+        return slotno;  
+}  
+```  
+SimpleLruZeroPage(ClogCtl, pageno);，调用SlruSelectLRUPage(ctl, pageno);，从clog shared buffer中选择SLOT。  
+src/backend/access/transam/slru.c  
+```  
+/*  
+ * Initialize (or reinitialize) a page to zeroes.  
+ *  
+ * The page is not actually written, just set up in shared memory.  
+ * The slot number of the new page is returned.  
+ *  
+ * Control lock must be held at entry, and will be held at exit.  
+ */  
+int  
+SimpleLruZeroPage(SlruCtl ctl, int pageno)  
+{  
+        SlruShared      shared = ctl->shared;  
+        int                     slotno;  
+        /* Find a suitable buffer slot for the page */  
+        slotno = SlruSelectLRUPage(ctl, pageno);  
+        Assert(shared->page_status[slotno] == SLRU_PAGE_EMPTY ||  
+                   (shared->page_status[slotno] == SLRU_PAGE_VALID &&  
+                        !shared->page_dirty[slotno]) ||  
+                   shared->page_number[slotno] == pageno);  
+        /* Mark the slot as containing this page */  
+        shared->page_number[slotno] = pageno;  
+        shared->page_status[slotno] = SLRU_PAGE_VALID;  
+        shared->page_dirty[slotno] = true;  
+        SlruRecentlyUsed(shared, slotno);  
+        /* Set the buffer to zeroes */  
+        MemSet(shared->page_buffer[slotno], 0, BLCKSZ);  
+        /* Set the LSNs for this new page to zero */  
+        SimpleLruZeroLSNs(ctl, slotno);  
+        /* Assume this page is now the latest active page */  
+        shared->latest_page_number = pageno;  
+        return slotno;  
+}  
+```  
+SlruSelectLRUPage(SlruCtl ctl, int pageno)，从clog buffer选择一个空的SLOT，如果没有空的SLOT，则需要调用SlruInternalWritePage(ctl, bestvalidslot, NULL);，写shared buffer page。  
+```  
+/*  
+ * Select the slot to re-use when we need a free slot.  
+ *  
+ * The target page number is passed because we need to consider the  
+ * possibility that some other process reads in the target page while  
+ * we are doing I/O to free a slot.  Hence, check or recheck to see if  
+ * any slot already holds the target page, and return that slot if so.  
+ * Thus, the returned slot is *either* a slot already holding the pageno  
+ * (could be any state except EMPTY), *or* a freeable slot (state EMPTY  
+ * or CLEAN).  
+ *  
+ * Control lock must be held at entry, and will be held at exit.  
+ */  
+static int  
+SlruSelectLRUPage(SlruCtl ctl, int pageno)  
+{  
+......  
+		/* See if page already has a buffer assigned */  先查看clog buffer中是否有空SLOT，有则返回，不需要调pg_fsync  
+		for (slotno = 0; slotno num_slots; slotno++)  
+		{  
+			if (shared->page_number[slotno] == pageno &&  
+				shared->page_status[slotno] != SLRU_PAGE_EMPTY)  
+				return slotno;  
+		}  
+......   
+		/*  如果没有找到空SLOT，则需要从clog buffer中选择一个使用最少的PAGE，注意他不会选择最近临近的PAGE，优先选择IO不繁忙的PAGE  
+		 * If we find any EMPTY slot, just select that one. Else choose a  
+		 * victim page to replace.  We normally take the least recently used  
+		 * valid page, but we will never take the slot containing  
+		 * latest_page_number, even if it appears least recently used.  We  
+		 * will select a slot that is already I/O busy only if there is no  
+		 * other choice: a read-busy slot will not be least recently used once  
+		 * the read finishes, and waiting for an I/O on a write-busy slot is  
+		 * inferior to just picking some other slot.  Testing shows the slot  
+		 * we pick instead will often be clean, allowing us to begin a read at  
+		 * once.  
+		 *    
+		 * Normally the page_lru_count values will all be different and so  
+		 * there will be a well-defined LRU page.  But since we allow  
+		 * concurrent execution of SlruRecentlyUsed() within  
+		 * SimpleLruReadPage_ReadOnly(), it is possible that multiple pages  
+		 * acquire the same lru_count values.  In that case we break ties by  
+		 * choosing the furthest-back page.  
+		 *  
+		 * Notice that this next line forcibly advances cur_lru_count to a  
+		 * value that is certainly beyond any value that will be in the  
+		 * page_lru_count array after the loop finishes.  This ensures that  
+		 * the next execution of SlruRecentlyUsed will mark the page newly  
+		 * used, even if it's for a page that has the current counter value.  
+		 * That gets us back on the path to having good data when there are  
+		 * multiple pages with the same lru_count.  
+		 */  
+		cur_count = (shared->cur_lru_count)++;  
+		for (slotno = 0; slotno num_slots; slotno++)  
+		{  
+			int			this_delta;  
+			int			this_page_number;  
+			if (shared->page_status[slotno] == SLRU_PAGE_EMPTY)  // 如果在此期间出现了空SLOT，返回这个slotno  
+				return slotno;  
+			this_delta = cur_count - shared->page_lru_count[slotno];  
+			if (this_delta page_lru_count[slotno] = cur_count;  
+				this_delta = 0;  
+			}  
+			this_page_number = shared->page_number[slotno];  
+			if (this_page_number == shared->latest_page_number)  
+				continue;  
+			if (shared->page_status[slotno] == SLRU_PAGE_VALID)  // IO不繁忙的脏页  
+			{  
+				if (this_delta > best_valid_delta ||  
+					(this_delta == best_valid_delta &&  
+					 ctl->PagePrecedes(this_page_number,  
+									   best_valid_page_number)))  
+				{  
+					bestvalidslot = slotno;  
+					best_valid_delta = this_delta;  
+					best_valid_page_number = this_page_number;  
+				}  
+			}  
+			else  
+			{  
+				if (this_delta > best_invalid_delta ||  
+					(this_delta == best_invalid_delta &&  
+					 ctl->PagePrecedes(this_page_number,  
+									   best_invalid_page_number)))  
+				{  
+					bestinvalidslot = slotno;  // 当所有页面IO都繁忙时，无奈只能从IO繁忙中选择一个.  
+					best_invalid_delta = this_delta;  
+					best_invalid_page_number = this_page_number;  
+				}  
+			}  
+		}  
+		/*  如果选择到的PAGE  
+		 * If all pages (except possibly the latest one) are I/O busy, we'll  
+		 * have to wait for an I/O to complete and then retry.  In that  
+		 * unhappy case, we choose to wait for the I/O on the least recently  
+		 * used slot, on the assumption that it was likely initiated first of  
+		 * all the I/Os in progress and may therefore finish first.  
+		 */  

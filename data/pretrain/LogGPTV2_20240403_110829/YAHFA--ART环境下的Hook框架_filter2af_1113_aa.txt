@@ -1,0 +1,105 @@
+# YAHFA--ART环境下的Hook框架
+##### 译文声明
+本文是翻译文章，文章原作者 刘瑞恺，文章来源：平安集团银河实验室
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+> 在Android
+> Dalvik时代，最流行的Hook框架非Xposed莫属了。各种功能强大的Xposed插件极大地丰富了Android的可玩性，而对于安全研究人员来说，hook则是应用逆向工作中的一项非常有效的手段。
+>
+>
+> 但是，进入到ART时代后，情况逐渐发生了变化。Xposed框架对系统进行了较大的改动，因此其安装适配难度显著提高；另一方面，随着近年来热修复技术的兴起，各大国内厂商也纷纷推出了自己的hook工具。但是，在实际试用过程中，我发现许多工具并不太适用于逆向分析。为此，在研究学习了ART方法调用机制和主要hook框架的基本原理后，我设计实现了一套新的ART环境hook框架：YAHFA(Yet
+> Another Hook Framework for ART)。
+本文将对YAHFA的工作原理进行介绍。
+##
+## 背景知识
+首先，我们对ART环境下方法的调用进行基本的介绍。如无特殊说明，以下内容均针对Android 6.0(API
+23)，架构x86。在ART环境下，每个方法对应于一个ArtMethod结构体。这个结构体包含的字段如下：
+    class ArtMethod {
+     // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses". 
+     // The class we are a part of. 
+     GcRoot declaring_class_; 
+     // Short cuts to declaring_class_->dex_cache_ member for fast compiled code access. 
+     GcRoot dex_cache_resolved_methods_;
+     // Short cuts to declaring_class_->dex_cache_ member for fast compiled code access. 
+     GcRoot> dex_cache_resolved_types_;
+     // Access flags; low 16 bits are defined by spec. 
+     uint32_t access_flags_;
+     /* Dex file fields. The defining dex file is available via declaring_class_->dex_cache_ */ 
+     // Offset to the CodeItem. 
+     uint32_t dex_code_item_offset_;
+     // Index into method_ids of the dex file associated with this method. 
+     uint32_t dex_method_index_;
+     /* End of dex file fields. */ 
+     // Entry within a dispatch table for this method. For static/direct methods the index is into 
+     // the declaringClass.directMethods, for virtual methods the vtable and for interface methods the ifTable. 
+     uint32_t method_index_;
+     // Fake padding field gets inserted here. 
+     // Must be the last fields in the method. 
+     // PACKED(4) is necessary for the correctness of 
+     // RoundUp(OFFSETOF_MEMBER(ArtMethod, ptr_sized_fields_), pointer_size). 
+     struct PACKED(4) PtrSizedFields {
+     // Method dispatch from the interpreter invokes this pointer which may cause a bridge into compiled code. 
+     void* entry_point_from_interpreter_;
+     // Pointer to JNI function registered to this method, or a function to resolve the JNI function. 
+     void* entry_point_from_jni_;
+     // Method dispatch from quick compiled code invokes this pointer which may cause bridging into the interpreter. 
+     void* entry_point_from_quick_compiled_code_;
+     } ptr_sized_fields_;
+    }
+根据用途，这些字段大致可分为三类：入口点，方法信息和解析缓存信息。
+####
+## 入口点
+ArtMethod结构体末尾处的entry_point_from_*，是不同条件下方法执行的入口点。entry_point_from_jni_通常没有用到，所以可以用来保存其他信息
+。我们最关心的是entry_point_from_quick_compiled_code_ 。
+例如，我们有如下java代码：
+    Log.e("tag", "msg");
+编译为dalvik字节码，对应如下：
+    invoke-static {v0, v1}, Landroid/util/Log;.e:(Ljava/lang/String;Ljava/lang/String;)I // method@0000
+而经过dex2oat，将其编译为机器码，则得到如下内容：
+    //
+    mov    0x10(%esp),%ecx ; 设置第1个参数
+    mov    0x14(%esp),%edx ; 设置第2个参数
+    mov    (%esp),%eax ; 栈顶保存了当前方法ArtMethod结构体的地址
+    mov    0x4(%eax),%eax ; 获取当前方法的dex_cache_resolved_methods_(偏移为4)
+    mov    0xc(%eax),%eax ; 获取dex_cache_resolved_methods_中的第一项，即method index为0的方法Log.e，后面会介绍
+    call   *0x24(%eax) ; 调用Log.e的entry_point_from_quick_compiled_code_(偏移为36)
+上述汇编代码中，我们布置完成栈和寄存器，通过dex_cache_resolved_methods_(后面会介绍)获取到要调用的方法，即callee，然后便直接跳转到callee的entry_point_from_quick_compiled_code_。结合Android源码中的注释可知，在caller调用callee之前，caller需要进行以下准备工作：
+  * 栈顶保存caller的`ArtMethod`地址
+  * 将参数依次保存在寄存器`ecx`, `edx`, `ebx`
+  * 如果有其他参数，将其依次保存在栈上
+  * 将callee的`ArtMethod`地址保存在`eax`
+需要注意的是，以上介绍的是直接调用方法的情况，即在ART中caller调用callee。而通过反射方式调用方法，即Method.invoke()，则相当于从ART外部进入ART中，此时就需要首先调用art_quick_invoke_stub，进行准备工作（比如通过`memcpy`，将传入的参数按照calling
+convention复制到栈上），随后才能跳转到entry_point_from_quick_compiled_code_。所以，比起直接调用方法，通过反射调用会带来额外的开销。
+到目前为止，我们了解了调用方法前的准备。那么，在进入entry_point_from_quick_compiled_code_后，又发生了什么呢？有些方法的entry_point_from_quick_compiled_code_指向的便是经编译后方法的机器码；但有些方法在调用时尚未解析（如静态方法等），这些方法的entry_point_from_quick_compiled_code_通常指向的是一段用于解析方法的指令：art_quick_resolution_trampoline，当解析完成后，会将entry_point_from_quick_compiled_code_更新为实际的机器码地址。接下来我们便介绍方法解析的相关内容。
+####
+## 方法信息
+`ArtMethod`中除了入口地址，还包括该方法本身的一些信息，例如方法所属于的类declaring_class_、在所属类中的方法编号method_index_，以及对应于原始dex文件的信息dex_code_item_offset_,
+dex_method_index_等。
+那么，什么时候需要这些信息呢？从目前看到的代码来看，在解析方法会被使用。例如，在函数`artQuickResolutionTrampoline`中，有如下代码：
+    uint32_t dex_pc = caller->ToDexPc(QuickArgumentVisitor::GetCallingPc(sp));
+    const DexFile::CodeItem* code;
+    called_method.dex_file = caller->GetDexFile();
+    code = caller->GetCodeItem();
+    CHECK_LT(dex_pc, code->insns_size_in_code_units_);
+    const Instruction* instr = Instruction::At(&code->insns_[dex_pc]);
+    Instruction::Code instr_code = instr->Opcode();
+这里，我们需要解析的是callee的机器码地址，具体操作则是从caller下手。回忆之前提到的calling
+convention，我们知道caller会将自己的`ArtMethod`结构体保存在栈上。从栈上得到该结构体后，通过其dex_code_item_offset_
+等dex相应信息，便可以回溯dalvik代码，找到caller调用callee的那一条dalvik字节码，从而获取调用方式和callee的dex
+method index。有了这些信息，便可通过ClassLinker的ResolveMethod完成方法解析。
+另一方面，通过反射获取方法时，也需要这些信息。一般地，通过反射获取方法，采取的是如下操作：
+  * 获取到类的结构体
+  * 获取这个类的方法数组，数组的每项对应于各方法的ArtMethod地址，方法在数组中的编号就保存在method_index_字段中
+  * 遍历数组，对每个方法，检查其名称和签名是否匹配
+但是，ArtMethod本身并不包含方法的名称、签名等信息，这些信息仍然保留在dex中。所以，需要从`dex_method_index_`获取到方法在dex中的index，进而通过declaring_class_所对应的dex获取这个方法的名称和签名信息。
+由上可知，ArtMethod结构体中的这些信息也是很重要的，如果随意修改，则会发生NoSuchMethodError等问题。
+####
+## 解析缓存信息
+最后，我们来看ArtMethod结构体中尚未介绍的字段：dex_cache_resolved_methods_和dex_cache_resolved_types_。
+dex_cache_resolved_methods_是一个指针数组，保存的是ArtMethod结构指针。回忆上文方法调用所对应的机器码，我们知道caller就是在dex_cache_resolved_methods_中找到callee的。顾名思义，这个数组用于缓存解析的方法。
+具体地，在dex文件加载时，数组dex_cache_resolved_methods_被初始化。此时，其保存的指针全部指向同一个ArtMethod。在文件dex_cache.cc中可看到如下代码：
+    if (runtime->HasResolutionMethod()) {
+        // Initialize the resolve methods array to contain trampolines for resolution.
+        Fixup(runtime->GetResolutionMethod(), pointer_size);
+      }
+    }

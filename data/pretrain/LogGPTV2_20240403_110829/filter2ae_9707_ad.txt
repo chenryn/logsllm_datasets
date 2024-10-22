@@ -1,0 +1,280 @@
+                && clazz != java.util.HashMap.class
+                && !expectClass.isAssignableFrom(clazz)) {
+            throw new JSONException("type not match. " + typeName + " -> " + expectClass.getName());
+        }
+        return clazz;
+    }
+那我们怎么才能从缓存中获取到class呢？答案其实前面也说了：
+    if (clazz == null && (autoTypeSupport || jsonType || expectClassFlag)) {
+        boolean cacheClass = autoTypeSupport || jsonType;
+        clazz = TypeUtils.loadClass(typeName, defaultClassLoader, cacheClass);
+    }
+对，没错，就是这里，我们只要开启了autoTypeSupport，绕后通过两次反序列化，在第一次反序列化时，虽然最后会抛出异常，但是在抛异常前，做了上述代码中的缓存class到mappings的处理，那么，在第二次反序列化该class的时候，我们就可以顺利的从缓存中取出了，从而绕过后面的判断。
+#### 4、反射调用
+反射调用，就是fastjson反序列化的最后一个阶段了，当经历了前面：词法解析、构造方法选择、缓存绕过阶段之后，我们离RCE就差最后的一步了，也就是反射调用，从而触发gadget
+chain的执行，最终实现RCE。
+接着，又回到DefaultJSONParser.parseObject来，也就是第2小节构造方法选择部分
+    ObjectDeserializer deserializer = config.getDeserializer(clazz);
+    Class deserClass = deserializer.getClass();
+    if (JavaBeanDeserializer.class.isAssignableFrom(deserClass)
+            && deserClass != JavaBeanDeserializer.class
+            && deserClass != ThrowableDeserializer.class) {
+        this.setResolveStatus(NONE);
+    } else if (deserializer instanceof MapDeserializer) {
+        this.setResolveStatus(NONE);
+    }
+    Object obj = deserializer.deserialze(this, clazz, fieldName);
+    return obj;
+前面也说了，大部分可利用的gadget chain，config.getDeserializer(clazz)最终都会走到
+    com.alibaba.fastjson.parser.ParserConfig#getDeserializer(java.lang.reflect.Type)
+    ->
+    com.alibaba.fastjson.parser.ParserConfig#getDeserializer(java.lang.Class, java.lang.reflect.Type)
+    ->
+    com.alibaba.fastjson.parser.ParserConfig#createJavaBeanDeserializer
+而反射调用，是选择setter还是getter方法调用，亦或者是直接反射field设值，它需要一系列的判断处理，最终确定下来在JavaBeanDeserializer中执行deserialze时，到底会做什么样的反射调用处理
+我们跟进JavaBeanInfo.build，前面一大段，我们在讲构造方法选择的时候已经简单讲过了，但是我们并没讲一个小地方，就是FieldInfo的创建和添加
+    if (creatorConstructor != null && !isInterfaceOrAbstract) { // 基于标记 JSONCreator 注解的构造方法
+        ...
+        if (types.length > 0) {
+            ...
+                FieldInfo fieldInfo = new FieldInfo(fieldName, clazz, fieldClass, fieldType, field,
+                        ordinal, serialzeFeatures, parserFeatures);
+                add(fieldList, fieldInfo);
+            ...
+        }
+        //return new JavaBeanInfo(clazz, builderClass, null, creatorConstructor, null, null, jsonType, fieldList);
+    } else if ((factoryMethod = getFactoryMethod(clazz, methods, jacksonCompatible)) != null) {
+        ...
+            Field field = TypeUtils.getField(clazz, fieldName, declaredFields);
+            FieldInfo fieldInfo = new FieldInfo(fieldName, clazz, fieldClass, fieldType, field,
+                    ordinal, serialzeFeatures, parserFeatures);
+            add(fieldList, fieldInfo);
+        ...
+    } else if (!isInterfaceOrAbstract) {
+        ...
+        if (paramNames != null
+                && types.length == paramNames.length) {
+            ...
+                FieldInfo fieldInfo = new FieldInfo(paramName, clazz, fieldClass, fieldType, field,
+                        ordinal, serialzeFeatures, parserFeatures);
+                add(fieldList, fieldInfo);
+            ...
+        }
+    }
+在省略大部分无关代码后，可以看到，对于这三种情况下的处理，最终都是实例化FieldInfo，然后直接调用add添加到集合fieldList中来，但是细心去看FieldInfo重载的构造方法可以发现，它存在多个构造方法，其中就有入参method的构造方法：
+    public FieldInfo(String name, // 
+                         Class declaringClass, // 
+                         Class fieldClass, // 
+                         Type fieldType, // 
+                         Field field, // 
+                         int ordinal, // 
+                         int serialzeFeatures, // 
+                         int parserFeatures)
+    public FieldInfo(String name, //
+                         Method method, //
+                         Field field, //
+                         Class clazz, //
+                         Type type, //
+                         int ordinal, //
+                         int serialzeFeatures, //
+                         int parserFeatures, //
+                         JSONField fieldAnnotation, //
+                         JSONField methodAnnotation, //
+                         String label)
+    public FieldInfo(String name, //
+                         Method method, //
+                         Field field, //
+                         Class clazz, //
+                         Type type, //
+                         int ordinal, //
+                         int serialzeFeatures, //
+                         int parserFeatures, //
+                         JSONField fieldAnnotation, //
+                         JSONField methodAnnotation, //
+                         String label,
+                         Map genericInfo)
+这种构造方法意味着什么？在后面执行JavaBeanDeserializer.deserialze时，会发现，具有method入参的字段，很有可能会触发方法的执行，从而可以触发gadget
+chain的执行。
+接着，后面就是一串惆怅的代码，无非就是根据setter方法名称智能提取出field名字...，其中会对所有的方法进行两次的遍历，我这边简单总结一下：
+  * 第一遍  
+```
+  * 静态方法跳过
+  * 返回值类型不为Void.TYPE和自身class类型的方法跳过
+  * 获取JSONField注解，确定字段field名称，然后和方法添加到集合中
+  * 没有JSONField则判断方法名长度是否大于4，不大于4则跳过
+  * 判断是否set前缀，不是则跳过
+  * 根据setter方法名从第四个字符开始确定字段field名称（需把第一个字符转小写），若是boolean类型，则需把字段第一个字符转大写，然后前面拼接is
+  * 根据字段名获取到字段Field后，判断是否注解了JSONField，获取JSONField注解，确定字段field名称，然后和方法添加到集合中
+  * 根据setter方法确定的字段名添加到集合  
+```
+  * 第二遍
+    1. 判断方法名长度是否大于4，不大于4则跳过
+    2. 静态方法跳过
+    3. 判断方法名称是否get前缀，并且第四个字符为大写，不符合则跳过
+    4. 方法有入参则跳过
+    5. 方法返回值不是Collection.class、Map.class、AtomicBoolean.class、AtomicInteger.class、AtomicLong.class或其子孙类则跳过
+    6. 获取方法上的注解JSONField，根据注解取字段名称
+    7. 根据getter方法名从第四个字符开始确定字段field名称（需把第一个字符转小写），若是boolean类型，则需把字段第一个字符转大写
+    8. 根据字段名获取到字段Field后，判断是否注解了JSONField，获取JSONField注解，确定字段field是否可以被反序列化，不可被反序列化则跳过
+    9. 根据字段名获取集合中是否已有FieldInfo，有则跳过
+    10. 根据getter方法确定的字段名添加到集合
+以上就是总结，从这些总结，我们就不难分析，fastjson反序列化时，class到底哪个方法能被触发。
+最后，对于这些添加到集合fieldList中的FieldInfo，会在JavaBeanDeserializer.deserialze中被处理
+    protected  T deserialze(DefaultJSONParser parser, // 
+                                   Type type, // 
+                                   Object fieldName, // 
+                                   Object object, //
+                                   int features, //
+                                   int[] setFlags) {
+        ...
+        try {
+            Map fieldValues = null;
+            if (token == JSONToken.RBRACE) {
+                lexer.nextToken(JSONToken.COMMA);
+                if (object == null) {
+                    object = createInstance(parser, type);
+                }
+                return (T) object;
+            }
+        ...
+        } finally {
+            if (childContext != null) {
+                childContext.object = object;
+            }
+            parser.setContext(context);
+        }
+    }
+从上述代码可以看到，配对"@type":"..."之后，如果下一个token不为"}"，即JSONToken.RBRACE，则获取反序列化器进行反序列化，根据前面扫描Field得到的信息以及json后续的key-value进行反序列化，如果下一个token为"}"，则直接反射实例化返回
+判断下一个token为"["，即JSONToken.LBRACKET，则进行数组处理
+    if (token == JSONToken.LBRACKET) {
+        final int mask = Feature.SupportArrayToBean.mask;
+        boolean isSupportArrayToBean = (beanInfo.parserFeatures & mask) != 0 //
+                                       || lexer.isEnabled(Feature.SupportArrayToBean) //
+                                       || (features & mask) != 0
+                                       ;
+        if (isSupportArrayToBean) {
+            return deserialzeArrayMapping(parser, type, fieldName, object);
+        }
+    }
+调用构造方法
+    if (beanInfo.creatorConstructor != null) {
+        ...
+        try {
+            if (hasNull && beanInfo.kotlinDefaultConstructor != null) {
+                object = beanInfo.kotlinDefaultConstructor.newInstance(new Object[0]);
+                for (int i = 0; i < params.length; i++) {
+                    final Object param = params[i];
+                    if (param != null && beanInfo.fields != null && i < beanInfo.fields.length) {
+                        FieldInfo fieldInfo = beanInfo.fields[i];
+                        fieldInfo.set(object, param);
+                    }
+                }
+            } else {
+                object = beanInfo.creatorConstructor.newInstance(params);
+            }
+        } catch (Exception e) {
+            throw new JSONException("create instance error, " + paramNames + ", "
+                                    + beanInfo.creatorConstructor.toGenericString(), e);
+        }
+        ...
+    }
+最后，通过FieldDeserializer对字段进行反序列化处理，其中，会利用到FieldInfo前面构建时，收集到的信息，例如method、getOnly等，进行判断是否调用某些方法
+    FieldDeserializer fieldDeserializer = getFieldDeserializer(entry.getKey());
+    if (fieldDeserializer != null) {
+        fieldDeserializer.setValue(object, entry.getValue());
+    }
+可以看到，对于method不为空的fieldInfo，若getOnly为false，则直接反射执行method，若getOnly为true，也就是只存在对应字段field的getter，而不存在setter，则会对其method的返回类型进行判断，若符合，才会进行反射执行该method
+    Method method = fieldInfo.method;
+    if (method != null) {
+        if (fieldInfo.getOnly) {
+            if (fieldInfo.fieldClass == AtomicInteger.class) {
+                AtomicInteger atomic = (AtomicInteger) method.invoke(object);
+                if (atomic != null) {
+                    atomic.set(((AtomicInteger) value).get());
+                }
+            } else if (fieldInfo.fieldClass == AtomicLong.class) {
+                AtomicLong atomic = (AtomicLong) method.invoke(object);
+                if (atomic != null) {
+                    atomic.set(((AtomicLong) value).get());
+                }
+            } else if (fieldInfo.fieldClass == AtomicBoolean.class) {
+                AtomicBoolean atomic = (AtomicBoolean) method.invoke(object);
+                if (atomic != null) {
+                    atomic.set(((AtomicBoolean) value).get());
+                }
+            } else if (Map.class.isAssignableFrom(method.getReturnType())) {
+                Map map = (Map) method.invoke(object);
+                if (map != null) {
+                    if (map == Collections.emptyMap()
+                            || map.getClass().getName().startsWith("java.util.Collections$Unmodifiable")) {
+                        // skip
+                        return;
+                    }
+                    map.putAll((Map) value);
+                }
+            } else {
+                Collection collection = (Collection) method.invoke(object);
+                if (collection != null && value != null) {
+                    if (collection == Collections.emptySet()
+                            || collection == Collections.emptyList()
+                            || collection.getClass().getName().startsWith("java.util.Collections$Unmodifiable")) {
+                        // skip
+                        return;
+                    }
+                    collection.clear();
+                    collection.addAll((Collection) value);
+                }
+            }
+        } else {
+            method.invoke(object, value);
+        }
+    }
+而对于method为空的情况，根本就不可能对method进行反射调用，除了构建实例时选择的构造方法
+    } else {
+        final Field field = fieldInfo.field;
+        if (fieldInfo.getOnly) {
+            if (fieldInfo.fieldClass == AtomicInteger.class) {
+                AtomicInteger atomic = (AtomicInteger) field.get(object);
+                if (atomic != null) {
+                    atomic.set(((AtomicInteger) value).get());
+                }
+            } else if (fieldInfo.fieldClass == AtomicLong.class) {
+                AtomicLong atomic = (AtomicLong) field.get(object);
+                if (atomic != null) {
+                    atomic.set(((AtomicLong) value).get());
+                }
+            } else if (fieldInfo.fieldClass == AtomicBoolean.class) {
+                AtomicBoolean atomic = (AtomicBoolean) field.get(object);
+                if (atomic != null) {
+                    atomic.set(((AtomicBoolean) value).get());
+                }
+            } else if (Map.class.isAssignableFrom(fieldInfo.fieldClass)) {
+                Map map = (Map) field.get(object);
+                if (map != null) {
+                    if (map == Collections.emptyMap()
+                            || map.getClass().getName().startsWith("java.util.Collections$Unmodifiable")) {
+                        // skip
+                        return;
+                    }
+                    map.putAll((Map) value);
+                }
+            } else {
+                Collection collection = (Collection) field.get(object);
+                if (collection != null && value != null) {
+                    if (collection == Collections.emptySet()
+                            || collection == Collections.emptyList()
+                            || collection.getClass().getName().startsWith("java.util.Collections$Unmodifiable")) {
+                        // skip
+                        return;
+                    }
+                    collection.clear();
+                    collection.addAll((Collection) value);
+                }
+            }
+        } else {
+            if (field != null) {
+                field.set(object, value);
+            }
+        }
+    }
+至此，四个关键点得分析就此结束！

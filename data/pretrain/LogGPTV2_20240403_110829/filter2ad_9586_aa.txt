@@ -1,0 +1,170 @@
+**作者：Zhuo Liang of Qihoo 360 Nirvan Team  
+博客：**
+### 1 介绍
+Apple 对于代码开放的态度一直为广大的安全研究员们所诟病，代码更新总是扭扭捏捏滞后很多于系统发版时间。比如当前 macOS 的最新版本为 Mojave
+10.14.1，而最新的代码还停留在 10.13.6。本文将要提到的是笔者在审计 10.13.6
+的代码时发现的一个内核漏洞，而在验证的时候发现在最新版本已经无法触发，经过分析发现这不是一个 0-day，而是一个已经在 macOS 10.14 和 iOS
+12.0 上已经修补了的问题。由于这个漏洞的触发没有权限限制和强制访问控制，漏洞本身也有一定代表性，特记录分享一下。
+### 2 背景知识
+#### 2.1 一切皆文件
+`*nix` 世界众多的优秀品质(所谓设计哲学)最广为人知的可能就是“一切皆文件”了。在这种设计理念下，在 `*nix` 下特别是在 Linux
+里，大部分内核对象，比如普通文件、socket、共享内存和信号量等，都是由内核给用户态暴露一个文件描述符，并提供对于文件描述符的统一操作，常见的比如
+read、write、close 和 select 等。
+很显然，内核对于这些文件描述符本身所代表的对象类型都是有标记的，通过类型将这些同样的系统调用分配到各自的回调函数中，这就是 C 语言里的多态。 Linux
+里另外一个重度依赖多态的模块就是 VFS，与本文要谈的漏洞无关，所以此处不谈。
+macOS 和 iOS 内核(以下统一称 XNU)的部分代码也遵循“一切皆文件”这条原则。在 XNU
+里，内核为每个进程维护一张文件描述符与文件表项的映射表`struct filedesc *
+p_fd`，每一个文件表项即为每一个与文件有关操作的第一步需要获取的对象，其定义如下：
+    // bsd/sys/file_internal.h
+    /*
+     * Kernel descriptor table.
+     * One entry for each open kernel vnode and socket.
+     */
+    struct fileproc {
+        unsigned int f_flags;
+        int32_t f_iocount;
+        struct fileglob * f_fglob;
+        void * f_wset;
+    };
+在这个结构体的成员中，最重要的一项即为 `struct fileglob * f_fglob`，其定义如下：
+    // bsd/sys/file_internal.h
+    struct fileglob {
+        LIST_ENTRY(fileglob) f_msglist; /* list of active files */
+        int32_t fg_flag;                /* see fcntl.h */
+        int32_t fg_count;               /* reference count */
+        int32_t fg_msgcount;            /* references from message queue */
+        int32_t fg_lflags;              /* file global flags */
+        kauth_cred_t fg_cred;           /* credentials associated with descriptor */
+        const struct fileops {
+            file_type_t fo_type; /* descriptor type */
+            int (*fo_read)(struct fileproc * fp, struct uio * uio, int flags, 
+                           vfs_context_t ctx);
+            int (*fo_write)(struct fileproc * fp, struct uio * uio, int flags, 
+                            vfs_context_t ctx);
+    #define FOF_OFFSET 0x00000001 /* offset supplied to vn_write */
+    #define FOF_PCRED 0x00000002  /* cred from proc, not current thread */
+            int (*fo_ioctl)(struct fileproc * fp, u_long com, caddr_t data, 
+                            vfs_context_t ctx);
+            int (*fo_select)(struct fileproc * fp, int which, void * wql, 
+                             vfs_context_t ctx);
+            int (*fo_close)(struct fileglob * fg, vfs_context_t ctx);
+            int (*fo_kqfilter)(struct fileproc * fp, struct knote * kn, 
+                               struct kevent_internal_s * kev, 
+                               vfs_context_t ctx);
+            int (*fo_drain)(struct fileproc * fp, vfs_context_t ctx);
+        } * fg_ops;
+        off_t fg_offset;
+        void * fg_data;    /* vnode or socket or SHM or semaphore */
+        void * fg_vn_data; /* Per fd vnode data, used for directories */
+        lck_mtx_t fg_lock;
+    #if CONFIG_MACF
+        struct label * fg_label; /* JMM - use the one in the cred? */
+    #endif
+    };
+在 `struct fileglob` 中，需要关注的几个成员如下：
+a) fg_flag 对于文件操作的权限，比如 FWRITE和FREAD，读写操作对应的不同类型的对象有不同的解释。
+b) fileops 文件操作定义，其中需要关注 fo_type 也就是对象类型，在 XNU 中目前存在的几种类型如下：
+    // bsd/sys/file_internal.h
+    /* file types */
+    typedef enum {
+        DTYPE_VNODE = 1, /* file */
+        DTYPE_SOCKET,    /* communications endpoint */
+        DTYPE_PSXSHM,    /* POSIX Shared memory */
+        DTYPE_PSXSEM,    /* POSIX Semaphores */
+        DTYPE_KQUEUE,    /* kqueue */
+        DTYPE_PIPE,      /* pipe */
+        DTYPE_FSEVENTS,  /* fsevents */
+        DTYPE_ATALK,     /* (obsolete) */
+        DTYPE_NETPOLICY, /* networking policy */
+    } file_type_t;
+c) `fg_data` 代表真正的对象以及上下文信息，`fileops` 里的 `fo_*` 回调函数最终都是操作对应的 `fg_data` 对象。
+下面以 socket 的创建为例说明上述大致流程。
+    // bsd/kern/uipc_syscall.c 
+    static int
+    socket_common(struct proc * p, int domain, int type, int protocol, pid_t epid, 
+        int32_t * retval, int delegate)
+    {
+        ...
+        error = falloc(p, &fp, &fd, vfs_context_current());
+        if (error) {
+            return (error);
+        }
+        fp->f_flag = FREAD | 
+            FWRITE; // [a]，这里的 f_flag 实际上是指向 fileops 的 fg_flag，下同。
+        fp->f_ops  = &socketops; // [b]
+        if (delegate)
+            error = socreate_delegate(domain, &so, type, protocol, epid);
+        else
+            error = socreate(domain, &so, type, protocol); // [c]
+        if (error) {
+            fp_free(p, fd, fp);
+        } else {
+            fp->f_data = (caddr_t)so; // [d]
+            ...
+        }
+        return (error);
+    }
+在用户态调用 socket(AF_INET, SOCK_STREAM, 0) 后，内核代码将进入如上流程，首先分配文件表项和 fileglob 对象，然后在
+[a] 处将 fg_flag 设置为可读可写，表示可以对这个 socket 进行发送和接收数据相关操作。在 [b] 处，将 fileops 设置为
+socketops，对于该变量的定义如下：
+    // bsd/kern/sys_socket.c
+    const struct fileops socketops = {
+        .fo_type     = DTYPE_SOCKET,
+        .fo_read     = soo_read,
+        .fo_write    = soo_write,
+        .fo_ioctl    = soo_ioctl,
+        .fo_select   = soo_select,
+        .fo_close    = soo_close,
+        .fo_kqfilter = soo_kqfilter,
+        .fo_drain    = soo_drain,
+    };
+该变量里设置的成员回调函数即为用户态的系统调用将会真正触发的函数。在 [c] 处， `socreate` 函数会根据 domain、type 和
+protocol 创建 `struct socket` 对象， 并在 [d] 处赋给 fg_data，即为真正的 backend object。
+#### 2.2 NECP
+NECP, Network Extension Control Policy，顾名思义是一种网络控制策略，下面是内核对其作出的解释：
+    // bsd/net/necp.c
+    /*
+     * NECP - Network Extension Control Policy database
+     * ------------------------------------------------     * The goal of this module is to allow clients connecting via a
+     * kernel control socket to create high-level policy sessions, which
+     * are ingested into low-level kernel policies that control and tag
+     * traffic at the application, socket, and IP layers.
+     */
+简单的说就是用户态程序可以通过 NECP 来创建一些策略并将其注入到内核网络流量处理的模块中，对于应用层、socket 层和 IP
+层的流量进行控制以及标记。本文不对与本漏洞无关的业务逻辑进行阐述，感兴趣的读者可以自行阅读内核代码。
+在谈 NECP 的同时可以简单的介绍一下 Kernrl Control，通过官网对 Kernel Control
+的[介绍](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/NKEConceptual/control/control.html
+"介绍")可以知道，Kernel Control 的主要作用就是用来使用户态程序有能力配置和控制内核以及内核扩展，这就是 NECP
+最开始提供给用户态访问的最原始的形式。具体而言，内核首先通过 Kernel Control 提供的 KPI 注册一种 socket
+类型，使用户态可以通过诸如 `socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)` 访问到。注册部分的代码如下：
+    // bsd/net/necp.c
+    static errno_t
+    necp_register_control(void)
+    {
+        struct kern_ctl_reg kern_ctl;
+        errno_t result = 0;
+        // Create a tag to allocate memory
+        necp_malloc_tag = OSMalloc_Tagalloc(NECP_CONTROL_NAME, OSMT_DEFAULT);
+        // Find a unique value for our interface family
+        result = mbuf_tag_id_find(NECP_CONTROL_NAME, &necp_family);
+        if (result != 0) {
+            NECPLOG(LOG_ERR, "mbuf_tag_id_find_internal failed: %d", result);
+            return (result);
+        }
+        bzero(&kern_ctl, sizeof(kern_ctl));
+        strlcpy(kern_ctl.ctl_name, NECP_CONTROL_NAME, sizeof(kern_ctl.ctl_name));
+        kern_ctl.ctl_name[sizeof(kern_ctl.ctl_name) - 1] = 0;
+        kern_ctl.ctl_flags                               = CTL_FLAG_PRIVILEGED; // Require root
+        kern_ctl.ctl_sendsize                            = 64 * 1024;
+        kern_ctl.ctl_recvsize                            = 64 * 1024;
+        kern_ctl.ctl_connect                             = necp_ctl_connect;
+        kern_ctl.ctl_disconnect                          = necp_ctl_disconnect;
+        kern_ctl.ctl_send                                = necp_ctl_send;
+        kern_ctl.ctl_rcvd                                = necp_ctl_rcvd;
+        kern_ctl.ctl_setopt                              = necp_ctl_setopt;
+        kern_ctl.ctl_getopt                              = necp_ctl_getopt;
+        result = ctl_register(&kern_ctl, &necp_kctlref);
+        if (result != 0) {
+            NECPLOG(LOG_ERR, "ctl_register failed: %d", result);
+            return (result);
+        }

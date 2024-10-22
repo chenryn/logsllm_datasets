@@ -1,0 +1,216 @@
+## PostgreSQL recovery target introduce  
+### 作者                                                                     
+digoal                   
+### 日期                     
+2013-01-30                     
+### 标签                   
+PostgreSQL , 时间点恢复 , PITR    
+----                  
+## 背景         
+QQ群里聊到的关于PostgreSQL 恢复点的话题.  
+本文涉及源码参考PostgreSQL 9.2.2版本.  
+我们知道PostgreSQL 支持PITR, 基于时间点的恢复. 通过配置recovery.conf可以指定3种恢复目标, 如下 :   
+```  
+recovery_target_name (string)  
+This parameter specifies the named restore point, created with pg_create_restore_point() to which recovery will proceed.   
+At most one of recovery_target_name, recovery_target_time or recovery_target_xid can be specified. The default is to recover to the end of the WAL log.  
+recovery_target_time (timestamp)  
+This parameter specifies the time stamp up to which recovery will proceed.   
+At most one of recovery_target_time, recovery_target_name or recovery_target_xid can be specified. The default is to recover to the end of the WAL log.   
+The precise stopping point is also influenced by recovery_target_inclusive.  
+recovery_target_xid (string)  
+This parameter specifies the transaction ID up to which recovery will proceed.   
+Keep in mind that while transaction IDs are assigned sequentially at transaction start, transactions can complete in a different numeric order.   
+The transactions that will be recovered are those that committed before (and optionally including) the specified one.   
+At most one of recovery_target_xid, recovery_target_name or recovery_target_time can be specified. The default is to recover to the end of the WAL log.   
+The precise stopping point is also influenced by recovery_target_inclusive.  
+```  
+其中recovery_target_time和recovery_target_xid可以指定recovery_target_inclusive参数, 如下 :   
+```  
+recovery_target_inclusive (boolean)  
+Specifies whether we stop just after the specified recovery target (true), or just before the recovery target (false).   
+Applies to both recovery_target_time and recovery_target_xid, whichever one is specified for this recovery.   
+This indicates whether transactions having exactly the target commit time or ID, respectively, will be included in the recovery.   
+Default is true.  
+```  
+默认为true取自src/backend/access/transam/xlog.c :   
+```  
+static bool recoveryTargetInclusive = true;  
+```  
+为什么recovery_target_name不能指定recovery_target_inclusive参数?, 而recovery_target_time和recovery_target_xid可以指定recovery_target_inclusive参数呢?  
+首先要解释一下, 什么情况下恢复可以截止. 只在三种情况恢复可以截止 :   
+COMMIT/ABORT/XLOG_RESTORE_POINT, 然后这些信息从哪里来呢? 它们都取自XLOG的头数据XLogRecord中的sl_rmid和xl_info :   
+src/include/access/xlog.h  
+```  
+/*  
+ * The overall layout of an XLOG record is:  
+ *              Fixed-size header (XLogRecord struct)  
+ *              rmgr-specific data  
+ *              BkpBlock  
+ *              backup block data  
+ *              BkpBlock  
+ *              backup block data  
+ *              ...  
+ *  
+ * where there can be zero to four backup blocks (as signaled by xl_info flag  
+ * bits).  XLogRecord structs always start on MAXALIGN boundaries in the WAL  
+ * files, and we round up SizeOfXLogRecord so that the rmgr data is also  
+ * guaranteed to begin on a MAXALIGN boundary.  However, no padding is added  
+ * to align BkpBlock structs or backup block data.  
+ *  
+ * NOTE: xl_len counts only the rmgr data, not the XLogRecord header,  
+ * and also not any backup blocks.      xl_tot_len counts everything.  Neither  
+ * length field is rounded up to an alignment boundary.  
+ */  
+typedef struct XLogRecord  
+{  
+        pg_crc32        xl_crc;                 /* CRC for this record */  
+        XLogRecPtr      xl_prev;                /* ptr to previous record in log */  
+        TransactionId xl_xid;           /* xact id */  
+        uint32          xl_tot_len;             /* total len of entire record */  
+        uint32          xl_len;                 /* total len of rmgr data */  
+        uint8           xl_info;                /* flag bits, see below */  
+        RmgrId          xl_rmid;                /* resource manager for this record */  
+        /* Depending on MAXALIGN, there are either 2 or 6 wasted bytes here */  
+        /* ACTUAL LOG DATA FOLLOWS AT END OF STRUCT */  
+} XLogRecord;  
+```  
+只有在这三个状态下, 恢复允许进入截止判断. COMMIT/ABORT/XLOG_RESTORE_POINT;  
+这个逻辑来自recoveryStopsHere函数 :   
+恢复截止的处理函数recoveryStopsHere中包含了这三个状态的判断, 如下 :   
+src/backend/access/transam/xlog.c  
+```  
+        /* We only consider stopping at COMMIT, ABORT or RESTORE POINT records */  
+        if (record->xl_rmid != RM_XACT_ID && record->xl_rmid != RM_XLOG_ID)  
+                return false;  
+        record_info = record->xl_info & ~XLR_INFO_MASK;  
+        if (record->xl_rmid == RM_XACT_ID && record_info == XLOG_XACT_COMMIT_COMPACT)  
+        {  
+                xl_xact_commit_compact *recordXactCommitData;  
+                recordXactCommitData = (xl_xact_commit_compact *) XLogRecGetData(record);  
+                recordXtime = recordXactCommitData->xact_time;  
+        }  
+        else if (record->xl_rmid == RM_XACT_ID && record_info == XLOG_XACT_COMMIT)  
+        {  
+                xl_xact_commit *recordXactCommitData;  
+                recordXactCommitData = (xl_xact_commit *) XLogRecGetData(record);  
+                recordXtime = recordXactCommitData->xact_time;  
+        }  
+        else if (record->xl_rmid == RM_XACT_ID && record_info == XLOG_XACT_ABORT)  
+        {  
+                xl_xact_abort *recordXactAbortData;  
+                recordXactAbortData = (xl_xact_abort *) XLogRecGetData(record);  
+                recordXtime = recordXactAbortData->xact_time;  
+        }  
+        else if (record->xl_rmid == RM_XLOG_ID && record_info == XLOG_RESTORE_POINT)  
+        {  
+                xl_restore_point *recordRestorePointData;  
+                recordRestorePointData = (xl_restore_point *) XLogRecGetData(record);  
+                recordXtime = recordRestorePointData->rp_time;  
+                strncpy(recordRPName, recordRestorePointData->rp_name, MAXFNAMELEN);  
+        }  
+        else  
+                return false;  
+```  
+COMMIT和ABORT很好理解, 就是事务结束时状态, RESOTRE POINT的信息则来自XLogRestorePoint函数,   
+src/backend/access/transam/xlog.c  
+```  
+/*  
+ * Write a RESTORE POINT record  
+ */  
+XLogRecPtr  
+XLogRestorePoint(const char *rpName)  
+{  
+        XLogRecPtr      RecPtr;  
+        XLogRecData rdata;  
+        xl_restore_point xlrec;  
+        xlrec.rp_time = GetCurrentTimestamp();  
+        strncpy(xlrec.rp_name, rpName, MAXFNAMELEN);  
+        rdata.buffer = InvalidBuffer;  
+        rdata.data = (char *) &xlrec;  
+        rdata.len = sizeof(xl_restore_point);  
+        rdata.next = NULL;  
+        RecPtr = XLogInsert(RM_XLOG_ID, XLOG_RESTORE_POINT, &rdata);  
+        ereport(LOG,  
+                        (errmsg("restore point \"%s\" created at %X/%X",  
+                                        rpName, RecPtr.xlogid, RecPtr.xrecoff)));  
+        return RecPtr;  
+}  
+```  
+在使用PostgreSQL内建的pg_create_restore_point函数创建还原点时用到XLogRestorePoint :   
+src/backend/access/transam/xlogfuncs.c  
+```  
+/*  
+ * pg_create_restore_point: a named point for restore  
+ */  
+Datum  
+pg_create_restore_point(PG_FUNCTION_ARGS)  
+{  
+        text       *restore_name = PG_GETARG_TEXT_P(0);  
+        char       *restore_name_str;  
+        XLogRecPtr      restorepoint;  
+        char            location[MAXFNAMELEN];  
+        if (!superuser())  
+                ereport(ERROR,  
+                                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),  
+                                 (errmsg("must be superuser to create a restore point"))));  
+        if (RecoveryInProgress())  
+                ereport(ERROR,  
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),  
+                                 (errmsg("recovery is in progress"),  
+                                  errhint("WAL control functions cannot be executed during recovery."))));  
+        if (!XLogIsNeeded())  
+                ereport(ERROR,  
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),  
+                         errmsg("WAL level not sufficient for creating a restore point"),  
+                                 errhint("wal_level must be set to \"archive\" or \"hot_standby\" at server start.")));  
+        restore_name_str = text_to_cstring(restore_name);  
+        if (strlen(restore_name_str) >= MAXFNAMELEN)  
+                ereport(ERROR,  
+                                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),  
+                                 errmsg("value too long for restore point (maximum %d characters)", MAXFNAMELEN - 1)));  
+        restorepoint = XLogRestorePoint(restore_name_str);  
+        /*  
+         * As a convenience, return the WAL location of the restore point record  
+         */  
+        snprintf(location, sizeof(location), "%X/%X",  
+                         restorepoint.xlogid, restorepoint.xrecoff);  
+        PG_RETURN_TEXT_P(cstring_to_text(location));  
+}  
+```  
+经过以上介绍以后, 我们知道recoveryStopsHere开头部分的逻辑决定了PITR恢复可以选择截止在:  
+1\. 事务结束时(COMMIT/ABORT);   
+2\. 或者是用户使用pg_create_restore_point创建的还原点;  
+recoveryStopsHere接下来的部分针对recovery.conf中的配置, 判断是否截止恢复.  
+在文章开头我们还提到了3个还原目标(target) :   
+```  
+(recovery_target_xid, recovery_target_time, recovery_target_name)  
+```  
+1\. 未设置目标, 只返回false, 所以不会停止  
+```  
+        /* Do we have a PITR target at all? */  
+        if (recoveryTarget == RECOVERY_TARGET_UNSET)  
+        {  
+                /*  
+                 * Save timestamp of latest transaction commit/abort if this is a  
+                 * transaction record  
+                 */  
+                if (record->xl_rmid == RM_XACT_ID)  
+                        SetLatestXTime(recordXtime);  
+                return false;  
+        }  
+```  
+RECOVERY_TARGET_UNSET 取自 src/include/access/xlog.h  
+```  
+/*  
+ * Recovery target type.  
+ * Only set during a Point in Time recovery, not when standby_mode = on  
+ */  
+typedef enum  
+{  
+        RECOVERY_TARGET_UNSET,  
+        RECOVERY_TARGET_XID,  
+        RECOVERY_TARGET_TIME,  
+        RECOVERY_TARGET_NAME  
+} RecoveryTargetType;  
+```  

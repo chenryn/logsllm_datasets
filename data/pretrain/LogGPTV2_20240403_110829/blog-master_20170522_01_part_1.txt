@@ -1,0 +1,164 @@
+## 行为、审计日志 (实时索引/实时搜索)建模 - 最佳实践 2    
+### 作者  
+digoal  
+### 日期  
+2017-05-16  
+### 标签  
+PostgreSQL , ES , 搜索引擎 , 全文检索 , 日志分析 , 倒排索引 , 优化 , 分区 , 分片 , 审计日志 , 行为日志 , schemaless  
+----  
+## 背景  
+在很多系统中会记录用户的行为日志，行为日志包括浏览行为、社交行为、操作行为等。            
+典型的应用例如：数据库的SQL审计、企业内部的堡垒机（行为审计）等。        
+前面写了一篇最佳实践，通过PostgreSQL来存储审计日志，同时对审计日志需要检索的字段建立全文索引。  
+SSD机器可以达到7万/s的写入（换算成全文索引条目，约280万/s的条目建立速度）。达到这个性能指标时，CPU，磁盘IO全部吃满。  
+全文如下：  
+[《行为、审计日志 (实时索引/实时搜索)建模 - 最佳实践 1》](../201705/20170516_01.md)    
+除了使用全文索引，还有其他方法呢？  
+本文将采用另一个角度来解决审计日志的检索和高速写入问题。  
+审计日志带三个维度的查询条件，一个是UID，一个是时间范围，最后是词条匹配。  
+1\. UID表示客户ID，用来区分不同用户产生的行为数据。  
+2\. TS字段，表示日志是什么时间点产生的。  
+3\. 行为数据字段，表示用户的行为。  
+优化思路：  
+1\. 将UID作为表名的一部分，每个UID一张表。  
+（好处：省一个字段，节约空间。同时在数据组织时不会混淆不同用户的数据，查询时消除了IO放大的问题，提升了查询效率。）  
+（缺点：每个UID一张表，表可能很多，元数据会变大。变更结构时，可能需要涉及较多表。）  
+2\. TS字段，采用BRIN块级索引，因为每个用户产生的行为数据，都是时间顺序的，所以堆存储与值顺序有非常强的线性相关性。  
+3\. 将数据打散存放，使用元数据记录UID对应的DB list，随机写入对应的DBs，查询时按TS范围查询，查询所有的DBs汇聚（应用层负责merge sort）后返回（行为字段不使用索引）。  
+![pic](20170522_01_pic_001.jpg)  
+PostgreSQL 10内置了merge sort的功能，所以你如果需要一个中间层来实现merge sort的话，PG也是个不错的选择。  
+只需要将所有的数据源配置为fdw子表即可。  
+例如  
+```  
+postgres=# explain select * from bptest where ts between now()-interval '20 min' and now()-interval '10 min' order by ts;  
+                                                     QUERY PLAN                                                        
+---------------------------------------------------------------------------------------------------------------------  
+ Merge Append  (cost=34.00..634325.20 rows=4808182 width=524)  
+   Sort Key: bptest.ts  
+   ->  Index Scan using idx_bptest_ts on bptest  (cost=0.14..3.15 rows=1 width=40)  
+         Index Cond: ((ts >= (now() - '00:20:00'::interval)) AND (ts   Index Scan using bptest_32_20170522_ts_idx on bptest_32_20170522  (cost=0.30..4802.19 rows=49918 width=524)  
+         Index Cond: ((ts >= (now() - '00:20:00'::interval)) AND (ts   Index Scan using bptest_64_20170522_ts_idx on bptest_64_20170522  (cost=0.30..4114.22 rows=42820 width=524)  
+         Index Cond: ((ts >= (now() - '00:20:00'::interval)) AND (ts   Index Scan using bptest_34_20170522_ts_idx on bptest_34_20170522  (cost=0.30..3984.00 rows=41459 width=524)  
+         Index Cond: ((ts >= (now() - '00:20:00'::interval)) AND (ts   Index Scan using bptest_37_20170522_ts_idx on bptest_37_20170522  (cost=0.30..4898.77 rows=50972 width=524)  
+         Index Cond: ((ts >= (now() - '00:20:00'::interval)) AND (ts   Index Scan using bptest_31_20170522_ts_idx on bptest_31_20170522  (cost=0.30..4682.19 rows=48668 width=524)  
+   .....................  
+```  
+## 设计  
+方案1：  
+GIN索引 BUILD全文索引的方式，6万tps时，基本榨干了CPU和IO资源。BCACHE GC或轻微的IO抖动，会导致比较严重的性能变化。  
+方案1详见  [《行为、审计日志 (实时索引/实时搜索)建模 - 最佳实践 1》](../201705/20170516_01.md)    
+方案2：  
+通过uid+ts_prefix分区，确保一个用户的数据在一份堆存储中，减少检索时的IO开销。  
+ts字段具备时序属性，通过brin块级索引降低索引大小。  
+当数据量达到一定程度时，自动触发PG10并行查询特性，提升查询性能。  
+由于UID数据已经分片，查询时会输入TS和文本匹配两个变量，数据分配到每个节点已经不多，使用模糊查询代替全文检索，加上PG10的多核并行，完全可以满足查询响应时延需求。  
+### 元数据表结构  
+create table db_meta   
+(  
+  dbid int primary key,  -- 每个数据库节点一条记录，表示一个数据库分片  
+  groupid int,           -- 每个分片属于一个分组  
+  conn_info text         -- 连接信息(URL)  
+);  
+create table uid_mapping  
+(  
+  uid int primary key,  -- 客户唯一标示  
+  dbgroupid int         -- 数据库分组，表示这个用户的数据随机写入这个分组的所有分片中。  
+);  
+行为数据保留一段时间后清除。  
+如果用户觉得这样设计比较麻烦，可以将所有的数据库作为一个大池，所有用户都随机写入这个大池。  
+这种设计就好像greenplum和hawq的设计理念。greenplum是大池思想，hawq是分而治之思想。  
+### 行为数据表结构  
+主表结构：  
+```  
+create table bptest  
+(  
+  ts timestamptz,   -- 行为发生时间  
+  content text    -- 行为内容  
+);        
+```  
+每个用户的表名为```bptest_$uid_$yyyymmdd```。  
+结构和索引与主表保持一致。  
+### 行为数据索引  
+ts字段的存储顺序与值的顺序有非常强的线性相关性，采用块级索引。  
+BRIN索引相比btree索引节省几百倍空间，同时提升写入性能。  
+```  
+create index idx_bptest_ts on bptest using brin(ts);  -- TS字段块级索引  
+```  
+### 数据分片设计  
+每个分片属于一个组，每个UID的数据随机的写入一个指定组的所有分片。  
+如果用户觉得这样设计比较麻烦，可以将所有的数据库作为一个大池，所有用户都随机写入这个大池。  
+就好像greenplum和hawq的设计理念。greenplum是大池思想，hawq是分而治之思想。  
+### 数据汇聚设计  
+当需要查询某个UID的行为数据时，并行查询所有分片的数据，按ts字段merge sort并返回。  
+merge sort可以放在数据库中实现，也可以在应用层实现。  
+### 数据merge sort设计（建议业务层实现，以提升性能）  
+如果merge sort放在数据库层实现，可以使用PostgreSQL 10的postgres_fdw，每个UID的每个分片对应一张FDW TABLE，挂在UID对应的父表中。  
+当查询父表时，按TS排序，会使用merge sort。  
+merge sort功能详见：  
+[《PostgreSQL 10.0 preview 性能增强 - mergesort(Gather merge)》](../201703/20170313_09.md)    
+![pic](20170522_01_pic_002.jpg)  
+排序下推功能详见：  
+[《PostgreSQL 10.0 preview sharding增强 - pushdown 增强》](../201703/20170312_20.md)    
+![pic](20170522_01_pic_003.jpg)  
+如果在应用层实现，方法与之类似，并行的查询UID对应的所有分片，每个分片都是有order by返回，在应用层使用merge sort的方法返回给客户端。  
+### 数据写入schema less设计（建议业务层实现，以提高性能）  
+由于每个UID对应若干张表```bptest_$uid_$yyyymmdd```，我们可以在数据库端设计类似mongo的schemaless写入风格：  
+有表时则插入，没有表时则创建后再插入。  
+实现方法详见  
+[《PostgreSQL schemaless 的实现(类mongodb collection)》](../201705/20170511_01.md)     
+创建一个自动建表的函数，用于自动创建目标表。    
+```    
+create or replace function create_schemaless(target name) returns void as $$    
+declare    
+begin    
+  execute format('create table if not exists %I (like bptest including all)', target);    
+exception when others then    
+  return;    
+end;    
+$$ language plpgsql strict;    
+```    
+创建一个插入数据的函数，使用动态SQL，如果遇到表不存在的错误，则调用建表函数进行建表。    
+```    
+create or replace function ins_schemaless(uid int, ts timestamptz, content text) returns void as $$    
+declare   
+  target name := 'bptest_'||uid||'_'||to_char(ts,'yyyymmdd');  
+begin    
+  execute format('insert into %I values (%L, %L)', target, ts, content);    
+  exception     
+    WHEN SQLSTATE '42P01' THEN     
+    perform create_schemaless(target);    
+    execute format('insert into %I values (%L, %L)', target, ts, content);     
+end;    
+$$ language plpgsql strict;    
+```    
+数据库端的schemaless会牺牲一部分性能，因为无法使用绑定变量。  
+建议业务层实现schemaless(自动拼接表名，自动建表)，以提高性能。  
+### 历史数据处理设计  
+历史数据，可以清除，直接DROP分表即可(bptest_$uid_$yyyymmdd)。  
+如果有保留数据的需求，可以通过阿里云RDS PostgreSQL的OSS_FDW接口将数据写入OSS对象存储永久保存，要读取时，通过FDW读取。  
+云端存储与计算分离用法：    
+[《RDS PostgreSQL : 使用 oss_fdw 读写OSS对象存储》](https://help.aliyun.com/document_detail/44461.html)    
+[《HybridDB PostgreSQL : 使用 oss_fdw 读写OSS对象存储》](https://help.aliyun.com/document_detail/35457.html)    
+### 分析需求  
+如果有审计日志的分析需求，可以将RDS PostgreSQL数据写入OSS，通过HybridDB for PostgreSQL进行分析。  
+## 性能测试  
+### 环境准备  
+与上文  [《行为、审计日志 (实时索引/实时搜索)建模 - 最佳实践》](../201705/20170516_01.md)  一样，使用同样的服务器，依旧是12个实例。  
+1\. 环境变量配置  
+```  
+vi env_pg10.sh   
+export PS1="$USER@`/bin/hostname -s`-> "  
+export PGPORT=$(($1+1920))  
+export PGDATA=/disk$1/digoal/pgdata/pg_root$(($1+1920))  
+export LANG=en_US.utf8  
+export PGHOME=/home/digoal/pgsql10_8k  
+export LD_LIBRARY_PATH=$PGHOME/lib:/lib64:/usr/lib64:/usr/local/lib64:/lib:/usr/lib:/usr/local/lib:$LD_LIBRARY_PATH  
+export LD_RUN_PATH=$LD_LIBRARY_PATH  
+export DATE=`date +"%Y%m%d%H%M"`  
+export PATH=$PGHOME/bin:$PATH:.  
+export MANPATH=$PGHOME/share/man:$MANPATH  
+export PGHOST=127.0.0.1  
+export PGUSER=postgres  
+export PGDATABASE=postgres  
+alias rm='rm -i'  
+alias ll='ls -lh'  

@@ -1,0 +1,189 @@
+## PostgreSQL in 与 = any 的SQL语法异同与性能优化  
+### 作者                                                             
+digoal                                                             
+### 日期                                                             
+2018-01-31                                                           
+### 标签                                                             
+PostgreSQL , in , = any (array()) , hash table , subplan , initplan    
+----                                                             
+## 背景          
+数据库SQL也算一门比较神奇的语言了，比如很多需求可以有不同的SQL来实现：  
+我之前有输出过一个IN的测试，这里面实际上也涉及到多个语法，实现同一个功能点。测试CASE是1亿 in 100万的多种写法的性能差异。  
+[《HTAP数据库 PostgreSQL 场景与性能测试之 25 - (OLTP) IN , EXISTS 查询》](../201711/20171107_26.md)    
+例如下面三个QUERY的语义就是一样的  
+```  
+select * from tbl where id in (select id from t);  
+select * from tbl where exists (select 1 from t where t.id=tbl.id);  
+select * from tbl where id = any (array( select id from t ));  
+```  
+但是不同的SQL，数据库可能会选择不一样的执行计划，并且执行效率可能千差万别。  
+## 几个例子  
+1、创建测试表，模拟1万 IN 100万的操作。  
+```  
+postgres=# create table t(id int);  
+CREATE TABLE  
+postgres=# insert into t select generate_series(1,100*10000);  
+INSERT 0 1000000  
+```  
+2、我们看一看不同写法的执行计划如何：  
+```  
+postgres=# explain select n = any(array(select id from t)) from generate_series(1,10000) as n;  
+                                   QUERY PLAN                                      
+---------------------------------------------------------------------------------  
+ Function Scan on generate_series n  (cost=14425.00..14447.50 rows=1000 width=1)  
+   InitPlan 1 (returns $0)  
+     ->  Seq Scan on t  (cost=0.00..14425.00 rows=1000000 width=4)  
+(3 rows)  
+postgres=# explain select n in (select id from t) from generate_series(1,10000) as n;  
+                                   QUERY PLAN                                      
+---------------------------------------------------------------------------------  
+ Function Scan on generate_series n  (cost=16925.00..16937.50 rows=1000 width=1)  
+   SubPlan 1  
+     ->  Seq Scan on t  (cost=0.00..14425.00 rows=1000000 width=4)  
+(3 rows)  
+```  
+3、你会发现两个语法用了不同的执行计划，一个是InitPlan, 一个是SubPlan.  
+对于IN的写法，work_mem参数会直接影响性能，work_mem的大小决定了subquery是否要装载到hash table。  
+```  
+postgres=# set work_mem ='1MB';  
+SET  
+postgres=# explain select n in (select id from t) from generate_series(1,10000) as n;  
+                                   QUERY PLAN                                     
+--------------------------------------------------------------------------------  
+ Function Scan on generate_series n  (cost=0.00..12916012.50 rows=1000 width=1)  
+   SubPlan 1  
+     ->  Materialize  (cost=0.00..23332.00 rows=1000000 width=4)  
+           ->  Seq Scan on t  (cost=0.00..14425.00 rows=1000000 width=4)  
+(4 rows)  
+postgres=# set work_mem ='100MB';  
+SET  
+postgres=# explain select n in (select id from t) from generate_series(1,10000) as n;  
+                                   QUERY PLAN                                      
+---------------------------------------------------------------------------------  
+ Function Scan on generate_series n  (cost=16925.00..16937.50 rows=1000 width=1)  
+   SubPlan 1  
+     ->  Seq Scan on t  (cost=0.00..14425.00 rows=1000000 width=4)  
+(3 rows)  
+```  
+```  
+                if (subquery)  
+                {  
+                        /* Generate Paths for the ANY subquery; we'll need all rows */  
+                        subroot = subquery_planner(root->glob, subquery,  
+                                                                           root,  
+                                                                           false, 0.0);  
+                        /* Isolate the params needed by this specific subplan */  
+                        plan_params = root->plan_params;  
+                        root->plan_params = NIL;  
+                        /* Select best Path and turn it into a Plan */  
+                        final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);  
+                        best_path = final_rel->cheapest_total_path;  
+                        plan = create_plan(subroot, best_path);  
+                        /* Now we can check if it'll fit in work_mem */  
+                        /* XXX can we check this at the Path stage? */  
+                        if (subplan_is_hashable(plan))  
+                        {  
+                                SubPlan    *hashplan;  
+                                AlternativeSubPlan *asplan;  
+                                /* OK, convert to SubPlan format. */  
+                                hashplan = castNode(SubPlan,  
+                                                                        build_subplan(root, plan, subroot,  
+                                                                                                  plan_params,  
+                                                                                                  ANY_SUBLINK, 0,  
+                                                                                                  newtestexpr,  
+                                                                                                  false, true));  
+                                /* Check we got what we expected */  
+                                Assert(hashplan->parParam == NIL);  
+                                Assert(hashplan->useHashTable);  
+                                /* build_subplan won't have filled in paramIds */  
+                                hashplan->paramIds = paramIds;  
+                                /* Leave it to the executor to decide which plan to use */  
+                                asplan = makeNode(AlternativeSubPlan);  
+                                asplan->subplans = list_make2(result, hashplan);  
+                                result = (Node *) asplan;  
+                        }  
+                }  
+```  
+```  
+/*  
+ * subplan_is_hashable: can we implement an ANY subplan by hashing?  
+ */  
+static bool  
+subplan_is_hashable(Plan *plan)  
+{  
+        double          subquery_size;  
+        /*  
+         * The estimated size of the subquery result must fit in work_mem. (Note:  
+         * we use heap tuple overhead here even though the tuples will actually be  
+         * stored as MinimalTuples; this provides some fudge factor for hashtable  
+         * overhead.)  
+         */  
+        subquery_size = plan->plan_rows *  
+                (MAXALIGN(plan->plan_width) + MAXALIGN(SizeofHeapTupleHeader));  
+        if (subquery_size > work_mem * 1024L)  
+                return false;  
+        return true;  
+}  
+```  
+代码里面注释中，针对in, exists, any的subplan优化器实现也有一些介绍，涉及到性能相关：  
+实际上exists这里有提到，匹配到第一条就结束，所以评估是否使用哈希表时可能需要的容量很小。  
+```  
+        /*  
+         * For an EXISTS subplan, tell lower-level planner to expect that only the  
+         * first tuple will be retrieved.  For ALL and ANY subplans, we will be  
+         * able to stop evaluating if the test condition fails or matches, so very  
+         * often not all the tuples will be retrieved; for lack of a better idea,  
+         * specify 50% retrieval.  For EXPR, MULTIEXPR, and ROWCOMPARE subplans,  
+         * use default behavior (we're only expecting one row out, anyway).  
+         *  
+         * NOTE: if you change these numbers, also change cost_subplan() in  
+         * path/costsize.c.  
+         *  
+         * XXX If an ANY subplan is uncorrelated, build_subplan may decide to hash  
+         * its output.  In that case it would've been better to specify full  
+         * retrieval.  At present, however, we can only check hashability after  
+         * we've made the subplan :-(.  (Determining whether it'll fit in work_mem  
+         * is the really hard part.)  Therefore, we don't want to be too  
+         * optimistic about the percentage of tuples retrieved, for fear of  
+         * selecting a plan that's bad for the materialization case.  
+         */  
+```  
+## in vs = any vs exists性能对比  
+1、in, work_mem装不下subquery  
+```  
+postgres=# set work_mem ='64kB';  
+postgres=# explain analyze select n in (select id from t) from generate_series(1,10000) as n;  
+                                                            QUERY PLAN                                                              
+----------------------------------------------------------------------------------------------------------------------------------  
+ Function Scan on generate_series n  (cost=0.00..12916012.50 rows=1000 width=1) (actual time=1.321..11484.646 rows=10000 loops=1)  
+   SubPlan 1  
+     ->  Materialize  (cost=0.00..23332.00 rows=1000000 width=4) (actual time=0.003..0.619 rows=5000 loops=10000)  
+           ->  Seq Scan on t  (cost=0.00..14425.00 rows=1000000 width=4) (actual time=0.014..1.800 rows=10000 loops=1)  
+ Planning time: 0.091 ms  
+ Execution time: 11485.905 ms  
+(6 rows)  
+```  
+2、in, work_mem装下了subquery  
+```  
+postgres=# set work_mem ='64MB';  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select n in (select id from t) from generate_series(1,10000) as n;  
+                                                                  QUERY PLAN                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------  
+ Function Scan on pg_catalog.generate_series n  (cost=16925.00..16937.50 rows=1000 width=1) (actual time=497.142..500.701 rows=10000 loops=1)  
+   Output: (hashed SubPlan 1)  
+   Function Call: generate_series(1, 10000)  
+   Buffers: shared hit=4425  
+   SubPlan 1  
+     ->  Seq Scan on public.t  (cost=0.00..14425.00 rows=1000000 width=4) (actual time=0.024..124.703 rows=1000000 loops=1)  
+           Output: t.id  
+           Buffers: shared hit=4425  
+ Planning time: 0.085 ms  
+ Execution time: 507.427 ms  
+(10 rows)  
+```  
+3、= any, work_mem很小无所谓，因为不涉及hashtable  
+```  
+postgres=# set work_mem ='64kB';  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select n = any(array(select id from t)) from generate_series(1,10000) as n;  

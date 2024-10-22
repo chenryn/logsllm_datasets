@@ -1,0 +1,163 @@
+                // 自旋锁锁住读者等待队列
+                spin_lock_irq(&pipe->rd_wait.lock);
+                head = pipe->head;
+                // 如果pipe已经被填满则进入下一次循环
+                if (pipe_full(head, pipe->tail, pipe->max_usage)) {
+                    spin_unlock_irq(&pipe->rd_wait.lock);
+                    continue;
+                }
+                // 先让头部指针指向下一个缓冲区
+                pipe->head = head + 1;
+                spin_unlock_irq(&pipe->rd_wait.lock);// 释放自旋锁
+                /* Insert it into the buffer array */
+                buf = &pipe->bufs[head & mask];
+                buf->page = page; //将之前分配的tmp_page赋值给buf->page
+                buf->ops = &anon_pipe_buf_ops;
+                buf->offset = 0;
+                buf->len = 0;
+                // 如果创建pipe时没有指定O_DIRECT选项，则将flags设置为PIPE_BUF_FLAG_CAN_MERGE
+                // 所以只要创建pipe时不指定flags，就能将buffer的PIPE_BUF_FLAG_CAN_MERGE置位
+                if (is_packetized(filp))
+                    buf->flags = PIPE_BUF_FLAG_PACKET;
+                else
+                    buf->flags = PIPE_BUF_FLAG_CAN_MERGE;
+                pipe->tmp_page = NULL; // tmp_page置空
+                // 拷贝一页大小的数据到page里
+                copied = copy_page_from_iter(page, 0, PAGE_SIZE, from);
+                if (unlikely(copied offset = 0;
+                buf->len = copied;
+                if (!iov_iter_count(from))
+                    break;
+            }
+            ......
+    }
+## splice
+splice系统调用主要由do_splice函数完成，do_splice根据输入的文件描述符进入不同的分支，在本次漏洞利用中因为in是普通文件，out是pipe，所以会进入`if
+(opipe)`这个分支
+    /*
+     * Determine where to splice to/from.
+     */
+    long do_splice(struct file *in, loff_t __user *off_in,
+            struct file *out, loff_t __user *off_out,
+            size_t len, unsigned int flags)
+    {
+        struct pipe_inode_info *ipipe;
+        struct pipe_inode_info *opipe;
+        loff_t offset;
+        long ret;
+        if (unlikely(!(in->f_mode & FMODE_READ) ||
+                 !(out->f_mode & FMODE_WRITE)))
+            return -EBADF;
+        ipipe = get_pipe_info(in, true);
+        opipe = get_pipe_info(out, true);
+        // in和out都是pipe
+        if (ipipe && opipe) {
+            ......
+        }
+        // 只有in是pipe
+        if (ipipe) {
+            ......
+        }
+        // 只有out是pipe
+        if (opipe) {
+            // 处理in和out的偏移
+            if (off_out)
+                return -ESPIPE;
+            if (off_in) {
+                if (!(in->f_mode & FMODE_PREAD))
+                    return -EINVAL;
+                if (copy_from_user(&offset, off_in, sizeof(loff_t)))
+                    return -EFAULT;
+            } else {
+                offset = in->f_pos;
+            }
+            if (out->f_flags & O_NONBLOCK)
+                flags |= SPLICE_F_NONBLOCK;
+            pipe_lock(opipe);
+            // 等待pipe有可用的缓冲区
+            ret = wait_for_space(opipe, flags);
+            if (!ret) {
+                unsigned int p_space;
+                /* Don't try to read more the pipe has space for. */
+                p_space = opipe->max_usage - pipe_occupancy(opipe->head, opipe->tail);// pipe可用空间
+                len = min_t(size_t, len, p_space  0)
+                wakeup_pipe_readers(opipe);
+            if (!off_in)
+                in->f_pos = offset;
+            else if (copy_to_user(off_in, &offset, sizeof(loff_t)))
+                ret = -EFAULT;
+            return ret;
+        }
+        return -EINVAL;
+    }
+在do_splice_to中又调用了输入文件的splice_read函数，之后又经过一系列的调用，最终由copy_page_to_iter_pipe完成关联page_cage和pipe缓冲区的工作
+    tatic size_t copy_page_to_iter_pipe(struct page *page, size_t offset, size_t bytes,
+                 struct iov_iter *i)
+    {
+        struct pipe_inode_info *pipe = i->pipe;
+        struct pipe_buffer *buf;
+        unsigned int p_tail = pipe->tail;
+        unsigned int p_mask = pipe->ring_size - 1;
+        unsigned int i_head = i->head;
+        size_t off;
+        if (unlikely(bytes > i->count))
+            bytes = i->count;
+        if (unlikely(!bytes))
+            return 0;
+        if (!sanity(i))
+            return 0;
+        off = i->iov_offset;
+        buf = &pipe->bufs[i_head & p_mask];
+        if (off) {
+            // 如果要求的offset和实际的offset相同，且头部的buffer指向的就是当前的page cache
+            // 则直接移动offset即可
+            if (offset == off && buf->page == page) {
+                /* merge with the last one */
+                buf->len += bytes;
+                i->iov_offset += bytes;
+                goto out;
+            }
+            i_head++;
+            buf = &pipe->bufs[i_head & p_mask];
+        }
+        if (pipe_full(i_head, p_tail, pipe->max_usage))
+            return 0;
+        buf->ops = &page_cache_pipe_buf_ops;
+        // 增加page的应用计数
+        get_page(page);
+        // 将pipe缓冲区的page指针指向文件的page cache
+        buf->page = page;
+        buf->offset = offset;
+        buf->len = bytes;
+        pipe->head = i_head + 1;
+        i->iov_offset = offset + bytes;
+        i->head = i_head;
+    out:
+        i->count -= bytes;
+        return bytes;
+    }
+可以看到copy_page_to_iter_pipe函数直接将page
+cache赋值给对应buffer的page指针，而没有对buffer的flags做初始化存在，使得之前被设置的`PIPE_BUF_FLAG_CAN_MERGE`仍然有效
+# 能真正地覆盖文件内容吗
+由上面的漏洞分析可知，最终完成的对page cache的覆写，而不是覆盖磁盘上的文件内容。当文件的page
+cache存在时，之后读取该文件都将直接从page cache中获取，所以只要该page
+cache存在，就相当于覆盖了文件内容。经测试，只要重启系统后page cache就会消失，此时再读取文件将会得到原文件内容。
+但是page cache不是有writeback机制吗，只要触发该机制是不是就能将覆写后的page cache写回磁盘呢？
+为了验证这个问题，我调用sync来手动触发writeback
+观察程序输出结果发现，调用sync之后读取文件内容仍然是篡改过后的内容，看起来sync似乎真的把page cache里写回到了磁盘里
+但当我重启系统之后发现文件内容又复原了，说明sync即没有把page
+cache写回到磁盘，也没有清除缓存中的内容，相当于直接忽略了这个被篡改过的page，这是为什么呢？
+经过调试发现，在向普通文件写入数据时，调用的是generic_file_write_iter函数
+经过如下图所示的调用，最终会调用set_page_dirty函数将该page置为dirty状态，所以最终会被writeback机制写回到磁盘中
+正如源码分析中所说的，向pipe中写入数据时调用的是pipe_write，这时我给set_page_dirty函数设置断点发现，程序之后都没有调用这个函数，这点从源码中也可以证明。
+这说明当我们利用漏洞修改page
+cache中的内容时，系统并没有将对应的page设置为dirty，所以这个修改对writeback机制来说是不可见的，自然会被忽略掉。
+那为什么重启系统文件内容又会恢复呢？那是因为重启系统将所有的缓存都回收了，执行`echo 1 >
+/proc/sys/vm/drop_caches`命令能手动回收缓存，也能将文件内容恢复
+# 参考资料
+[The Dirty Pipe Vulnerability](https://dirtypipe.cm4all.com/)
+[CVE-2022-0847-DirtyPipe-Exploit](https://github.com/Arinerron/CVE-2022-0847-DirtyPipe-Exploit)
+[Linux5.8.1源码](https://elixir.bootlin.com/linux/v5.8.1/source)
+[CVE-2022-0847 漏洞分析](https://www.anquanke.com/post/id/269886)
+[VFS源码分析-Page Cache
+Writeback机制](https://www.codeleading.com/article/63761592269/)

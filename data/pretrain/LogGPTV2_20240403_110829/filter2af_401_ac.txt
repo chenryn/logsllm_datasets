@@ -1,0 +1,160 @@
+    1223             }
+    1234         }
+    1235     }
+    1291 }
+`kbase_gpu_mmap()`主要逻辑看上去非常简单：将`kbase_mem_alias()`收集到的内存区域（line
+1210）映射到新的地址空间（line 1211）。如果成功建立映射，将相关的`reg->gpu_alloc`的`gpu_mappings`加1。
+至此，关于内存区域的两个重要操作介绍完毕，从上述分析看，相关操作准确、合理，没有明显的问题。
+### GPU映射物理页过程 – 改变属性
+前面我提到Mali驱动实现了KBASE_IOCTL_MEM_FLAGS_CHANGE命令，该命令可以修改内存区域属性。相关实现在`kbase_api_mem_flags_change()`中：
+    drivers/gpu/arm/b_r19p0/mali_kbase_core_linux.c
+    kbase_api_mem_flags_change()
+    |
+    |-> kbase_mem_flags_change()
+    drivers/gpu/arm/b_r19p0/mali_kbase_mem_linux.c
+    838 int kbase_mem_flags_change(struct kbase_context *kctx, u64 gpu_addr, unsigned int flags, unsigned int mask)
+    839 {
+    876     reg = kbase_region_tracker_find_region_base_address(kctx, gpu_addr);
+    877     if (kbase_is_region_invalid_or_free(reg))
+    878         goto out_unlock;
+    879 
+    880     /* Is the region being transitioning between not needed and needed? */
+    881     prev_needed = (KBASE_REG_DONT_NEED & reg->flags) == KBASE_REG_DONT_NEED;
+    882     new_needed = (BASE_MEM_DONT_NEED & flags) == BASE_MEM_DONT_NEED;
+    883     if (prev_needed != new_needed) {
+    884         /* Aliased allocations can't be made ephemeral */
+    885         if (atomic_read(&reg->cpu_alloc->gpu_mappings) > 1)
+    886             goto out_unlock;
+    887 
+    888         if (new_needed) {
+    889             /* Only native allocations can be marked not needed */
+    890             if (reg->cpu_alloc->type != KBASE_MEM_TYPE_NATIVE) {
+    891                 ret = -EINVAL;
+    892                 goto out_unlock;
+    893             }
+    894             ret = kbase_mem_evictable_make(reg->gpu_alloc);
+    895             if (ret)
+    896                 goto out_unlock;
+    897         } else {
+    898             kbase_mem_evictable_unmake(reg->gpu_alloc);
+    899         }
+    900     }
+    978 }
+这个函数主要功能是支持BASE_MEM_DONT_NEED操作，即应用不再需要某个内存区域上的物理页了，驱动可以将这些物理页缓存，待合适时机将其释放（line
+894）；同时，驱动也支持反向操作：应用继续使用这个内存区域，驱动需要将缓存的物理页找回来，如果已经释放，可以分配新的物理页（line 898）。
+上述操作的一个前提条件是`reg->cpu_alloc->gpu_mappings`不能大于1，大于1意味着这些页映射到多个虚拟地址上。Mali驱动不打算处理这种复杂情形。如果内存区域符合上述条件，`kbase_mem_evictable_make()`被调用，来进行清理操作：
+    drivers/gpu/arm/b_r19p0/mali_kbase_mem_linux.c
+    765 int kbase_mem_evictable_make(struct kbase_mem_phy_alloc *gpu_alloc)
+    766 {
+    767     struct kbase_context *kctx = gpu_alloc->imported.native.kctx;
+    768 
+    769     lockdep_assert_held(&kctx->reg_lock);
+    770 
+    771     kbase_mem_shrink_cpu_mapping(kctx, gpu_alloc->reg,
+    772             0, gpu_alloc->nents);
+    773 
+    774     mutex_lock(&kctx->jit_evict_lock);
+    775     /* This allocation can't already be on a list. */
+    776     WARN_ON(!list_empty(&gpu_alloc->evict_node));
+    777 
+    778     /*
+    779      * Add the allocation to the eviction list, after this point the shrink
+    780      * can reclaim it.
+    781     */
+    782     list_add(&gpu_alloc->evict_node, &kctx->evict_list);
+    783     mutex_unlock(&kctx->jit_evict_lock);
+    784     kbase_mem_evictable_mark_reclaim(gpu_alloc);
+    785 
+    786     gpu_alloc->reg->flags |= KBASE_REG_DONT_NEED;
+    787     return 0;
+    788 }
+`kbase_mem_evictable_make()`首先将之前建立的CPU映射取消（line
+771）。此时，应用再也无法通过虚拟地址访问这些物理页。之后，将`gpu_alloc`加入`kctx->evict_list`链表。这个链表实际上会被`kbase_mem_evictable_reclaim_scan_objects()`使用：
+    drivers/gpu/arm/b_r19p0/mali_kbase_mem_linux.c
+    627 unsigned long kbase_mem_evictable_reclaim_scan_objects(struct shrinker *s,
+    628         struct shrink_control *sc)
+    629 {
+    638     list_for_each_entry_safe(alloc, tmp, &kctx->evict_list, evict_node) {
+    639         int err;
+    640 
+    641         err = kbase_mem_shrink_gpu_mapping(kctx, alloc->reg,
+    642                 0, alloc->nents);
+    660         kbase_free_phy_pages_helper(alloc, alloc->evicted);
+    661         freed += alloc->evicted;
+    662         list_del_init(&alloc->evict_node);
+    673     }
+    678 }
+`kbase_mem_evictable_reclaim_scan_objects()`主要作用是遍历`kctx->evict_list`链表（line
+638），将之前建立的GPU映射撤销（line 641），最后释放所有的物理页（line 660）。
+至此，物理页整个生命周期已经分析完毕。漏洞实际上隐藏在KBASE_IOCTL_MEM_ALIAS命令和KBASE_IOCTL_MEM_FLAGS_CHANGE命令中。之前提到`kbase_mem_flags_change()`有一个前提：`reg->cpu_alloc->gpu_mappings`不能大于1。而别名操作是分两步实现的，`gpu_mappings`引用计数加1是在`kbase_gpu_mmap()`中。如果我们只调用`kbase_mem_alias()`，然后紧接着调用`kbase_mem_flags_change()`会如何？
+答案是我们可以映射释放的页！
+    1.1 kbase_api_mem_alloc()                         // 分配物理页
+    1.2 mmap()                                        // 映射到CPU和GPU地址空间
+    2.1 kbase_mem_alias()                             // 索引第1步创建的gpu_alloc
+    3     kbase_mem_flags_change()                    // 清除第1.2步中建立的CPU映射，gpu_alloc加入kctx->evict_list链表，但物理页没有被释放
+    2.2 mmap()                                        // 将物理页映射到新的CPU和GPU地址空间
+    4     kbase_mem_evictable_reclaim_scan_objects()  // 清除第1.2步中建立的GPU映射，物理页被回收，但第2.2步建立的CPU和GPU映射不会清除
+## 利用方法
+通过上述调用过程，我们可以将几乎所有内核可以分配的页映射到CPU和GPU地址空间。之前提到，别名映射要求是CPU只读，GPU可读写。我们可以在进程的虚拟地址空间中窃取这些页的内容，但不能修改。而GPU可以读写这些页，因此后面的分析主要集中在如何利用GPU读写物理页。
+### mesa
+针对高通的Adreno
+GPU，无论是KGSL驱动，还是freeadreno项目，你可以找到大量的GPU私有指令，从而实现GPU读写内存。针对ARM的Mali
+GPU，没有公开资料介绍它的指令集（商业机密）。唯一的线索是[Alyssa
+Rosenzweig](https://gitlab.freedesktop.org/alyssa)主导的Bifrost和Panfrost项目。我花费了很长时间试图能够手写一段可以直接在Mali
+GPU上运行的二进制代码。最后发现这条路困难重重。
+如果没有办法实现GPU读写物理页，这个漏洞只能实现信息泄露。我们真的无路可走了么？
+我们知道大部分的软件是典型的分层体系结构，通过不断地抽象，最终完成复杂的功能。具体到GPU，即便我们对指令集一无所知，我们还是可以让它绘制图形。这得益于OpenGL，它对底层进行了抽象，屏蔽了硬件之间的不同。但是，OpenGL更多地是面向图形，比如点、线、投影、剪裁等。我没有找到接口可以随意访问特定位置的内存。
+其实，现在的GPU已经不单单是绘制图形，它还可以用来进行密集计算。而在常规数学运算中，从内存读取某个变量值（读内存）和向内存写入计算结果（写内存）是基本操作，我们是不是可以通过上层封装的功能来实现GPU读写物理页？
+### OpenCL
+在浏览维基百科关于[OpenCL](https://en.wikipedia.org/wiki/OpenCL)的介绍时，我看到了希望：
+    OpenCL(Open Computing Language) is a framework for writing programs that execute across heterogeneous platforms consisting of central processing(CPUs), graphics processing units(GPUs), digital signal processors(DSPs), field-programmable gate arrays(FPGAs) and other processors or hardware accelerators.
+网上有很多OpenCL代码示例，这里不做详细介绍。仅展示下我实现的利用中使用的OpenCL代码。
+片段一：泄露内存地址
+    char *cl_code =
+            "__kernel void leak_mem_addr(__global unsigned long *addr) {"
+            "   *addr = (unsigned long)addr;"
+            "}";
+OpenCL库本身会分配相关内存，我需要知道它分配的内存地址。通过上述代码，我可以获取该地址。
+片段二：任意地址读
+    char *cl_code =
+        "__kernel void gpu_read(__global unsigned long *addr, int offset) {"
+        "   int idx = get_global_id(0);"
+        "   *(addr+idx) = addr[offset+idx];"
+        "}";
+上述代码实现了GPU任意地址读。由于映射的物理页非常多，我们可以通过并行编程加速这个过程;)
+相信你已经深得要领，这里就不展示任意地址写了。
+### ROOT提权
+由于我们可以映射大量的物理页，这些页有可能用于保存应用代码或者数据，也有可能保存内核代码或者数据。实际上，内核暴露了大量的数据结构，实现ROOT提权的方法多种多样。这里就不一一介绍了，下面是我在某手机上实现的本地提权（100%成功率）
+## 补丁
+漏洞发生的主要原因是别名操作中对`gpu_alloc->gpu_mappings`增加计数滞后，导致在`mmap`系统调用之前，相关的物理页加入待释放列表。补丁的思路是将`gpu_alloc->gpu_mappings`增加计数提前到`kbase_mem_alias()`：
+    drivers/gpu/arm/b_r19p0/mali_kbase_core_linux.c
+    1681 u64 kbase_mem_alias(struct kbase_context *kctx, u64 *flags, u64 stride,
+    1682             u64 nents, struct base_mem_aliasing_info *ai,
+    1683             u64 *num_pages)
+    1684 {
+    1762     for (i = 0; i > PAGE_SHIFT) gpu_alloc;
+    1812             reg->gpu_alloc->imported.alias.aliased[i].alloc = kbase_mem_phy_alloc_get(alloc);
+    1813             reg->gpu_alloc->imported.alias.aliased[i].length = ai[i].length;
+    1814             reg->gpu_alloc->imported.alias.aliased[i].offset = ai[i].offset;
+    +                /* Ensure the underlying alloc is marked as being
+    +                 * mapped at >1 different GPU VA immediately, even
+    +                 * though mapping might not happen until later.
+    +                 *
+    +                 * Otherwise, we would (incorrectly) allow shrinking of
+    +                 * the source region (aliasing_reg) and so freeing the
+    +                 * physical pages (without freeing the entire alloc)
+    +                 * whilst we still hold an implicit reference on those
+    +                 * physical pages.
+    +                 */
+    +                kbase_mem_phy_alloc_gpu_mapped(alloc);
+    1817         }
+    1818     }
+    1873 }
+## 总结
+本文详细分析位于ARM Mali GPU驱动中的一个逻辑漏洞。这个漏洞可以帮助攻击者：
+1 窃取其他APP运行时内存数据  
+2 修改其他APP代码  
+3 窃取内核运行时内存数据  
+4 稳定地获得ROOT权限
+在此之前，据我所知，没有公开资料介绍如何利用该漏洞。而本文指出了一种可行方法：借助OpenCL绕过GPU私有指令集，实现GPU读写任意内存。
+* * *

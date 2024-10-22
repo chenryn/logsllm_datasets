@@ -1,0 +1,125 @@
+作者：[rk700](https://rk700.github.io/)
+## Part 1：AFL内部实现细节小记
+AFL(American Fuzzy Lop)是一款开源的fuzzing工具。最近我对其代码进行了简要的阅读，大致总结了一些AFL的实现细节，在此记录整理。
+#### 代码插桩
+使用AFL，首先需要通过afl-gcc/afl-clang等工具来编译目标，在这个过程中会对其进行插桩。
+我们以afl-gcc为例。如果阅读文件afl-gcc.c便可以发现，其本质上只是一个gcc的wrapper。我们不妨添加一些输出，从而在调用`execvp()`之前打印全部命令行参数，看看afl-gcc所执行的究竟是什么：
+    gcc /tmp/hello.c -B /root/src/afl-2.52b -g -O3 -funroll-loops -D__AFL_COMPILER=1 -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1
+可以看到，`afl-gcc`最终调用`gcc`，并定义了一些宏，设置了一些参数。其中最关键的就是`-B
+/root/src/afl-2.52b`这条。根据`gcc
+--help`可知，`-B`选项用于设置编译器的搜索路径，这里便是设置成`/root/src/afl-2.52b`(是我设置的环境变量`AFL_PATH`的值，即AFL目录，因为我没有make
+install)。
+如果了解编译过程，那么就知道把源代码编译成二进制，主要是经过”源代码”->”汇编代码”->”二进制”这样的过程。而将汇编代码编译成为二进制的工具，即为汇编器assembler。Linux系统下的常用汇编器是`as`。不过，编译完成AFL后，在其目录下也会存在一个`as`文件，并作为符号链接指向`afl-as`。所以，如果通过`-B`选项为gcc设置了搜索路径，那么`afl-as`便会作为汇编器，执行实际的汇编操作。
+所以，AFL的代码插桩，就是在将源文件编译为汇编代码后，通过`afl-as`完成。
+接下来，我们继续阅读文件afl-as.c。其大致逻辑是处理汇编代码，在分支处插入桩代码，并最终再调用`as`进行真正的汇编。具体插入代码的部分如下：
+    fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32, R(MAP_SIZE));
+这里通过`fprintf()`将格式化字符串添加到汇编文件的相应位置。篇幅所限，我们只分析32位的情况，`trampoline_fmt_32`的具体内容如下：
+    static const u8* trampoline_fmt_32 =
+      "\n"
+      "/* --- AFL TRAMPOLINE (32-BIT) --- */\n"
+      "\n"
+      ".align 4\n"
+      "\n"
+      "leal -16(%%esp), %%esp\n"
+      "movl %%edi, 0(%%esp)\n"
+      "movl %%edx, 4(%%esp)\n"
+      "movl %%ecx, 8(%%esp)\n"
+      "movl %%eax, 12(%%esp)\n"
+      "movl $0x%08x, %%ecx\n"
+      "call __afl_maybe_log\n"
+      "movl 12(%%esp), %%eax\n"
+      "movl 8(%%esp), %%ecx\n"
+      "movl 4(%%esp), %%edx\n"
+      "movl 0(%%esp), %%edi\n"
+      "leal 16(%%esp), %%esp\n"
+      "\n"
+      "/* --- END --- */\n"
+      "\n";
+这一段汇编代码，主要的操作是：
+  * 保存`edi`等寄存器
+  * 将`ecx`的值设置为`fprintf()`所要打印的变量内容
+  * 调用方法`__afl_maybe_log()`
+  * 恢复寄存器
+`__afl_maybe_log`作为插桩代码所执行的实际内容，会在接下来详细展开，这里我们只分析`"movl $0x%08x,
+%%ecx\n"`这条指令。
+回到`fprintf()`命令：
+    fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32, R(MAP_SIZE));
+可知`R(MAP_SIZE)`即为上述指令将`ecx`设置的值，即为。根据定义，宏`MAP_SIZE`为64K，我们在下文中还会看到他；`R(x)`的定义是`(random()
+% (x))`，所以`R(MAP_SIZE)`即为0到MAP_SIZE之间的一个随机数。
+因此，在处理到某个分支，需要插入桩代码时，`afl-as`会生成一个随机数，作为运行时保存在`ecx`中的值。而这个随机数，便是用于标识这个代码块的key。在后面我们会详细介绍这个key是如何被使用的。
+#### fork server
+编译target完成后，就可以通过`afl-fuzz`开始fuzzing了。其大致思路是，对输入的seed文件不断地变化，并将这些mutated
+input喂给target执行，检查是否会造成崩溃。因此，fuzzing涉及到大量的fork和执行target的过程。
+为了更高效地进行上述过程，AFL实现了一套fork server机制。其基本思路是：启动target进程后，target会运行一个fork
+server；fuzzer并不负责fork子进程，而是与这个fork server通信，并由fork
+server来完成fork及继续执行目标的操作。这样设计的最大好处，就是不需要调用`execve()`，从而节省了载入目标文件和库、解析符号地址等重复性工作。如果熟悉Android的话，可以将fork
+server类比为zygote。
+接下来，我们来看看fork
+server的具体运行原理。首先，fuzzer执行`fork()`得到父进程和子进程，这里的父进程仍然为fuzzer，子进程则为target进程，即将来的fork
+server。
+    forksrv_pid = fork();
+而父子进程之间，是通过管道进行通信。具体使用了2个管道，一个用于传递状态，另一个用于传递命令：
+    int st_pipe[2], ctl_pipe[2];
+对于子进程（fork server），会进行一系列设置，其中包括将上述两个管道分配到预先指定的fd，并最终执行target：
+      if (!forksrv_pid) {
+    ...
+        if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
+        if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
+    ...
+        execv(target_path, argv);
+对于父进程（fuzzer），则会读取状态管道的信息，如果一切正常，则说明fork server创建完成。
+      fsrv_st_fd  = st_pipe[0];
+    ...
+      rlen = read(fsrv_st_fd, &status, 4);
+    ...
+      /* If we have a four-byte "hello" message from the server, we're all set.
+    Otherwise, try to figure out what went wrong. */
+      if (rlen == 4) {
+        OKF("All right - fork server is up.");
+        return;
+      }
+接下来，我们来分析fork server是如何与fuzzer通信的。
+fork server侧的具体操作，也是在之前提到的方法`__afl_maybe_log()`中。首先，通过写入状态管道，fork
+server会通知fuzzer，其已经准备完毕，可以开始fork了，而这正是上面提到的父进程等待的信息：
+      "__afl_forkserver:\n"
+      "\n"
+      " /* Enter the fork server mode to avoid the overhead of execve() calls. */\n"
+      "\n"
+      " pushl %eax\n"
+      " pushl %ecx\n"
+      " pushl %edx\n"
+      "\n"
+      " /* Phone home and tell the parent that we're OK. (Note that signals with\n"
+      " no SA_RESTART will mess it up). If this fails, assume that the fd is\n"
+      " closed because we were execve()d from an instrumented binary, or because\n"
+      " the parent doesn't want to use the fork server. */\n"
+      "\n"
+      " pushl $4 /* length */\n"
+      " pushl $__afl_temp /* data */\n"
+      " pushl $" STRINGIFY((FORKSRV_FD + 1)) " /* file desc */\n"
+      " call write\n"
+      " addl $12, %esp\n"
+      "\n"
+      " cmpl $4, %eax\n"
+      " jne __afl_fork_resume\n"
+接下来，fork server进入等待状态`__afl_fork_wait_loop`，读取命令管道，直到fuzzer通知其开始fork：
+      "__afl_fork_wait_loop:\n"
+      "\n"
+      " /* Wait for parent by reading from the pipe. Abort if read fails. */\n"
+      "\n"
+      " pushl $4 /* length */\n"
+      " pushl $__afl_temp /* data */\n"
+      " pushl $" STRINGIFY(FORKSRV_FD) " /* file desc */\n"
+      " call read\n"
+一旦fork server接收到fuzzer的信息，便调用`fork()`，得到父进程和子进程：
+      " call fork\n"
+      "\n"
+      " cmpl $0, %eax\n"
+      " jl __afl_die\n"
+      " je __afl_fork_resume\n"
+子进程是实际执行target的进程，其跳转到`__afl_fork_resume`。在这里会关闭不再需要的管道，并继续执行：
+      "__afl_fork_resume:\n"
+      "\n"
+      " /* In child process: close fds, resume execution. */\n"
+      "\n"
+      " pushl $" STRINGIFY(FORKSRV_FD) "\n"

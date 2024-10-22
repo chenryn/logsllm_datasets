@@ -1,0 +1,263 @@
+
+It\'s common to use both streaming replication
+and `archive_command` in combination. Streaming replication
+keeps your replicas in sync with the most recent changes,
+and `archive_command`/`restore_command` can be
+used to bootstrap nodes that are further behind by pulling in older WAL
+files from an archive external to the cluster (e.g. when you want to
+bootstrap a new node by restoring your last full backup then replaying
+WAL).
+
+So, what happened during the incident? It turned out that as a final
+act, the server with the RAID controller issue archived an invalid WAL
+file to our backup server. When the Postgres subprocess crash caused a
+restart on the synchronous replica, that Postgres instance came back up
+and ran its `restore_command`, pulling in the invalid WAL.
+
+Postgres\'s internal validation checks saw that the WAL file was
+invalid, and discarded it. In terms of the data, that didn\'t matter!
+That node [already] had a good copy of those writes, as it
+was doing streaming synchronous replication from the primary at the time
+of the failure.
+
+We matched the log line from the validation failure against the Postgres
+source code, and spent a lot of time reproducing the exact same type of
+invalid WAL in our local container setup. Keep in mind that it\'s a
+binary format, and the contents are fairly dynamic - not the easiest
+thing to break in a repeatable way!
+
+In the end, we figured out that it played no part in the Pacemaker
+cluster\'s inability to promote a new primary. At least we\'d learned a
+little more about the internals of Postgres!
+
+#### So then, what was it? 
+
+Through a process of elimination, we were able to remove steps from the
+script until we were left with three conditions that were necessary for
+the cluster to break:
+
+1.  Pacemaker setting: `default-resource-stickiness`
+
+    By default, Pacemaker doesn\'t assign a penalty to moving resources
+    (such as a Postgres database process, or a VIP) to different
+    machines. For services like Postgres, where moving a resource (e.g.
+    the VIP that the clients are connected to) causes disruption, this
+    isn\'t the behaviour we want. To combat this, we set
+    the `default-resource-stickiness `parameter to a
+    non-zero value, so that Pacemaker will consider other options before
+    moving a resource that is already running.
+
+2.  Pacemaker resource: Backup VIP
+
+    As part of another piece of work to reduce load on the primary node,
+    we\'d added another VIP to the cluster. The idea was that this VIP
+    would never be located on the primary, so the backup process would
+    always connect to a replica, freeing up capacity for read operations
+    on the primary. We set a constraint on this VIP so that it would
+    never run on the same server as the Postgres primary. In Pacemaker
+    terms, we set up a colocation rule with
+    a `-INF` (negative infinity) preference to locate the
+    Backup VIP and the Postgres primary on the same server.
+
+    At the time of the incident, the Backup VIP was running on the
+    synchronous replica - the node that Pacemaker should have promoted
+    to primary.
+
+3.  Failure condition: two processes crashing at once
+
+    Even with the configuration above, crashing the Postgres process on
+    the primary wasn\'t enough to reproduce our production incident. The
+    only way to get the cluster into a state where it would never elect
+    a new primary was to crash one of Postgres\' subprocesses on the
+    synchronous replica, which we saw in the production logs from the
+    incident.
+
+All three of these conditions were necessary to reproduce the failure.
+Removing the `default-resource-stickiness` or the Backup
+VIP led to the cluster successfully promoting a new primary, even with
+the two processes crashing almost simultaneously. Similarly, crashing
+only the Postgres process on the primary led to the cluster successfully
+promoting the synchronous replica.
+
+We spent some time testing different changes to our Pacemaker
+configuration, and ran into a surprising fix. Somehow,
+the `-INF` colocation rule between the Backup VIP and the
+Postgres primary was interfering with the promotion process, even though
+there was another node - the asynchronous replica - where the Backup VIP
+could run.
+
+It turned out that specifying the colocation rule for the Backup VIP the
+opposite way round worked just fine. Instead of specifying a rule with
+a `-INF`preference between the Backup VIP and the Postgres
+primary, we could specify an `INF` preference between the
+Backup VIP and a replica. When specified that way round, the cluster
+promotes the synchronous replica just fine under the same failure
+conditions.
+
+### Moving to a new database cluster 
+
+Whilst this investigation was going on, the other half of the team were
+figuring out how to migrate from our manually managed cluster to a new
+cluster managed once again by Pacemaker.
+
+Fortunately for us, we had some prior work we could turn to here.
+We\'ve [previously spoken
+about](https://www.youtube.com/watch?v=SAkNBiZzEX8)
+ our approach to performing zero-downtime failover within
+a cluster. The script that coordinates that is publicly available
+in [this GitHub
+repository](https://github.com/gocardless/our-postgresql-setup#running-a-zero-downtime-migration)
+.
+
+The talk goes into more detail, but the relevant part isn\'t too hard to
+describe.
+
+As well as Postgres and Pacemaker, we also run a copy of PgBouncer on
+each of the nodes in our database cluster. We introduce a second VIP as
+a layer of indirection. Clients (e.g. our Ruby on Rails applications)
+connect to this new PgBouncer VIP. PgBouncer, in turn, connects to the
+original Postgres VIP.
+
+![
+add-pgbouncer.png](https://images.ctfassets.net/40w0m41bmydz/7cVBOaJ0SLbSXBxc4GZQwb/cc75498da32549d79eef33586e251efd/postgres-outage-oct-2017_pgbouncer-intro_add-pgbouncer.png?w=1920&h=1080&q=50&fm=png)
+
+It\'s possible to pause all incoming queries at PgBouncer. When you do
+that, it puts them into a queue.
+
+![
+pgbouncer-pause.png](https://images.ctfassets.net/40w0m41bmydz/5MynCyhVjHoPnxgrfcnj6Y/3d022c72a48d420255e95df495d2996d/postgres-outage-oct-2017_pgbouncer-intro_pgbouncer-pause.png?w=1920&h=1080&q=50&fm=png)
+
+We can then promote a new primary and move the Postgres VIP to it. Note
+that the VIP the clients are connecting to - the PgBouncer VIP -
+doesn\'t need to move, so the clients experience no disruption.
+
+![
+move-vip.png](https://images.ctfassets.net/40w0m41bmydz/5hricByGirAJj4CzBBrFbX/57c813a83a8fd8ef67927fd06364e397/postgres-outage-oct-2017_pgbouncer-intro_move-vip.png?w=1920&h=1080&q=50&fm=png)
+
+Once the cluster has finished promoting the new node, we tell PgBouncer
+to resume traffic, and it sends the queued queries to the new primary.
+
+![
+pgbouncer-resume.png](https://images.ctfassets.net/40w0m41bmydz/4EKzeGxGvkJH6LELcjuPoZ/499f1160dbbe10d0e6b2f29cef189457/postgres-outage-oct-2017_pgbouncer-intro_pgbouncer-resume.png?w=1920&h=1080&q=50&fm=png)
+
+We needed to adapt this procedure a little. The automation that performs
+it is designed to migrate between different nodes in the same cluster,
+not two separate clusters.
+
+The subteam responsible for getting us into a new cluster spent the next
+couple of weeks making those adjustments and performing practice runs.
+Once they were totally comfortable, we put together a plan to do it in
+production.
+
+## Wrapping up the incident 
+
+With a plan in place, and the confidence that we\'d understood and fixed
+the issue which stopped our cluster from failing over on 10 October, we
+were ready to go. Even with all the testing we\'d done, we [announced a
+maintenance window](https://www.gocardless-status.com/incidents/g090g7s1hqwc)
+ as a precaution.
+
+Fortunately, everything went as planned on the night, and we migrated to
+our new database cluster without a hitch.
+
+We decommissioned the old cluster, and closed the incident.
+
+## What\'s next? 
+
+There\'s no getting away from the size of this incident.
+
+We feel an immense duty to everyone who trusts GoCardless as their
+payments provider. We took some time to think through what we\'d learned
+from this incident, with a focus on how we could improve our reliability
+in the future. Some of the key items we came up with were:
+
+-   [Seemingly simple Pacemaker configuration can lead to extremely
+    unusual behaviour]
+
+    On the surface, defining a rule that says two resources [must
+    not] run together seems like it would be the opposite
+    of defining a rule that says two resources [must] run
+    together. In reality, they cause the system to behave in entirely
+    different ways in certain failure conditions. We can take this
+    knowledge into any future work we do with Pacemaker.
+
+    Unrelatedly, but conveniently, we\'re about to move away from using
+    VIPs to direct traffic to specific Postgres instances. Instead
+    we\'ll be running proxies on the application servers that direct
+    traffic to the right node based on the state of the cluster. This
+    will drastically reduce the number of resources managed by
+    Pacemaker, in turn reducing the potential for weird behaviour in the
+    cluster.
+
+-   [Some bugs will only be surfaced through fault
+    injection]
+
+    A misconfiguration that only surfaces when two processes crash at
+    almost the same time isn\'t one that you\'re going to find through
+    basic tests or day-to-day operations. We\'ve done some fault
+    injection as part of our [game day
+    exercises](https://gocardless.com/blog/game-days-at-gc/)
+    , but there\'s always more you can do in that area.
+    Harsher tests of the Postgres cluster, and automation like [Chaos
+    Monkey](https://github.com/Netflix/SimianArmy/wiki/Chaos-Monkey)
+    that continually injects failure are both ideas
+    we\'re keen to pursue.
+
+-   [Automation erodes knowledge]
+
+    It turns out that when your automation successfully handles failures
+    for two years, your skills in manually controlling the
+    infrastructure below it atrophy. There\'s no \"one size fits all\"
+    here. It\'s easy to say \"just write
+    a [runbook](https://en.wikipedia.org/wiki/Runbook)
+    \", but if multiple years go by before you next need
+    it, it\'s almost guaranteed to be out-of-date.
+
+    There are definitely ways to combat this. One possibility we\'re
+    thinking of is adding arbitrary restrictions to some of our game day
+    exercises (e.g. \"this cluster is down, the automation has failed,
+    you can\'t diagnose the problem, and need to bring the service back
+    another way\").
+
+### The elephant in the room 
+
+We\'re sure some of you are asking why we even run our own Postgres
+instances when there are hosted options out there. We couldn\'t end this
+write-up without talking about that a little.
+
+We do periodically consider the options out there for managed Postgres
+services. Until recently, they were somewhat lacking in a few areas we
+care about. Without turning this article into a provider comparison,
+it\'s only a recent development for any provider to
+offer [zero-downtime patch upgrades of
+Postgres](https://aws.amazon.com/blogs/aws/amazon-aurora-update-spatial-indexing-and-zero-downtime-patching/)
+, which is something [we\'ve been
+doing](https://www.youtube.com/watch?v=SAkNBiZzEX8)
+ for a while.
+
+The other thing that\'s made us rule out managed Postgres services so
+far is that most of our our infrastructure is in a bare-metal hosting
+provider. The added latency between that provider\'s datacentres and a
+hosted Postgres service would cause some fairly drastic re-work for our
+application developers, who can currently assume a latency to Postgres
+of a millisecond or lower.
+
+Of course, nothing is set in stone. Our hosting situation can change
+over time, and so can the offerings of the various hosting providers out
+there. We\'ll keep our eyes on it, and perhaps one day wave goodbye to
+running Postgres clusters ourselves.
+
+## Closing thoughts 
+
+We\'d like to apologise one last time for this incident. We know how
+much trust people put in their payment providers, and we strive to run a
+reliable service that reinforces that trust.
+
+At the same time, we strongly believe in learning from failure when it
+does happen. It\'s encouraging to see that [blameless
+post-mortems](https://landing.google.com/sre/book/chapters/postmortem-culture.html)
+ are becoming increasingly common in operations
+disciplines (whether you happen to call that DevOps, SRE, or something
+else). We hope you\'ve found this one interesting and useful.
+
+

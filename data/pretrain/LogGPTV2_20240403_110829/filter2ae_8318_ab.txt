@@ -1,0 +1,99 @@
+如果能够在内存中找到这个阈值，我们就能用越界写入操作来定位这个模式。一旦在该位置成功触发相应的漏洞，就有机会覆盖WindowServer中任意受害者分配空间（"感兴趣的"对象）的前4个（或12个）字节：
+使用我们的ConnectionID（CID）来破坏相邻分配空间的第一个DWORD
+至此，我们还了解到，macOS用户模式的堆实现是基于[Hoard分配器](https://people.cs.umass.edu/~emery/pubs/berger-asplos2000.pdf
+"Hoard分配器")的。在Hoard风格的堆中，分配空间之间并没有堆的元数据。由于在堆上的WindowServer对象将相互刷新，因此，我们的跨块破坏活动会变得更加有趣。
+**基于DBI的漏洞利用**
+* * *
+为了提高搜索我们感兴趣的跨块破坏目标的速度，我们再次转向使用动态二进制插桩（DBI）解决方案。再次利用我们上一篇文章中讨论的进程内[fuzzer](https://blog.ret2.io/2018/07/25/pwn2own-2018-safari-sandbox/#in-process-fuzzing-with-frida
+"fuzzer")，我们编写了一个新的插桩脚本来模拟针对随机堆分配的跨块内存破坏过程。
+第一步是使用Frida跟踪WindowServer堆的分配情况。其中，我们的malloc/realloc挂钩代码是基于现有的[Gist](https://gist.github.com/n30m1nd/a926931a009e09236b07d7238670ad0a
+"Gist")的，并进行了相应的修改，使其记录每个分配空间的地址、大小和调用堆栈：
+    Interceptor.attach(Module.findExportByName(null, 'malloc'),
+    {
+        onEnter: function (args) {
+            while (lock == "free" || lock == "realloc") { Thread.sleep(0.0001); }
+            lock = "malloc";
+            this.m_size = args[0].toInt32();
+        },
+        onLeave: function (retval) {
+            console.log("malloc(" + this.m_size + ") -> " + hexaddr(retval));
+            allocations[retval] = this.m_size;
+            var callstack = "\n" + Thread.backtrace(this.context, Backtracer.ACCURATE).map(DebugSymbol.fromAddress).join("\n") + "\n";
+            callstacks[retval] = callstack;
+            lock = null;
+        }
+    });
+同样地，我们也hooked了用来废除我们跟踪的分配空间的引用的free函数:
+    Interceptor.attach(Module.findExportByName('libSystem.B.dylib', 'free'),
+    {
+        onEnter: function (args) {
+            while (lock == "malloc" || lock == "realloc"){ Thread.sleep(0.0001); }
+            lock = "free";
+            this.m_ptr = args[0];
+        },
+        onLeave: function (retval) {
+            console.log("free(" + hexaddr(this.m_ptr) + ")");
+            delete allocations[this.m_ptr];
+            lock = null;
+        }
+    });
+在基本的堆跟踪就位之后，最后一步就是模拟跨块破坏过程。
+每隔一段随机的时间(约10秒)，我们的插桩脚本将停止针对所有处于活动状态的分配空间的调查，并随机破坏少量前述分配空间的第一个DWORD :
+    function CorruptRandomAllocations() {
+        for(var address in allocations) {
+            var target = ptr(address)
+            // blacklist certain allocations from being corrupted (unusable crashes)
+            if(callstacks[target] == undefined) { continue; }
+            if(callstacks[target].includes("dlopen")) { continue; }
+            if(callstacks[target].includes("Metal")) { continue; }
+            // ... more
+            // only corrupt some allocations
+            if(Math.floor(Math.random() * 25) != 1) { continue; }
+            // save the allocation contents before corruption for crash logging
+            corrupted_contents[target] = hexdump(target, {
+              offset: 0,
+              length: allocations[address],
+              header: true,
+              ansi: false
+            });
+            corrupted_callstacks[target] = callstacks[target]
+            console.log("Corrupting " + hexaddr(address))
+            Memory.writeU32(target, 0x4141414F);
+        }
+    }
+通过随机破坏分配空间的第一个DWORD，我们预计WindowServer就会以新颖和有趣的方式崩溃。现有的模糊测试工具会记录这些崩溃，以及每次运行时我们破坏的分配空间对应的调用堆栈和内容。
+在理想情况下，我们希望能找到一个以指针开头的对象或分配空间，可以将指针部分损坏并指向我们控制的数据。通过在某个对象上强制实现一个悬空指针，则有望得到一个新的、具有较少约束条件的原语。
+**Tagged Pointer**
+* * *
+众所周知，如果攻击者完全控制了悬空Objective-C对象内容的话，他们就可以通过Objective-C方法调用实现代码执行。这在[Phrack](http://phrack.org/issues/69/9.html
+"Phrack")中已有记载，并且已经被[KEEN](https://keenlab.tencent.com/en/2016/07/28/WindowServer-The-privilege-chameleon-on-macOS-Part-2/ "KEEN")（以及其他人）利用过了。
+但是，在一个奇怪而不幸的巧合中，我们发现在模拟的破坏行为模糊测试期间，我们的部分覆盖值（一个WindowServer
+ConnectionID）总是设置其最后两位：
+在macOS上，总是设置所有mach端口号的最后两位
+ConnectionID的最后两位的值似乎是XNU
+mach端口创建代码中的屏蔽操作的产物。对于设置的mach端口的最后两位的值，我们至今没有发现它们与已定义的功能有任何关联，所以，我们认为这很可能是一个bug，尽管是无害的。
+问题是，在Objective-C/CoreFoundation内部，“指针”的底部位表示它是否应该作为可以解除引用的实际内存指针处理，还是应该作为一个内嵌对象数据的"[Tagged
+Pointer](https://www.mikeash.com/pyblog/friday-qa-2012-07-27-lets-build-tagged-pointers.html "Tagged Pointer")”来对待。在使用我们的跨块原语部分破坏Objective-C指针的时候，总是会将其转换为Tagged Pointer：
+使用WindowServer ConnectionID部分覆盖Objective-C指针
+我们一旦设置了最底部的位，就会从根本上改变Objective-C运行时对“指针”（现在是内联对象）的处理方式。仅这一点就使悬空objc_msgSend()技术无法通过简单的跨块破坏来实现代码执行。
+从这时起，我们才开始认识到，这个漏洞利用起来极不稳定。由于没有其他方法可以在不进行对齐的情况下执行写入操作，因此，我们不得不将破坏对象锁定为非CoreFoundation指针。
+**HotKey对象**
+* * *
+回到我们模拟内存破坏“模糊测试”所导致的崩溃，我们发现，WindowServer HotKey对象可以作为跨块破坏目标的候选分配空间。
+在macOS上，WindowServer似乎负责管理正在运行的应用程序所注册的热键。在系统内部，WindowServer
+HotKey对象是以链接列表的形式进行维护的。HotKey结构的第一个字段，恰好就是指向先前创建的热键（即hotkey->next）的指针。
+    (lldb) x/30gx 0x7fd186200ba0
+    0x7fd186200ba0: 0x00007fd15cfa8730 0x00007fd1f7d1f590 \
+    0x7fd186200bb0: 0x00000000ffffffff 0x0000000000000134  \
+    0x7fd186200bc0: 0x0000000000000000 0x0000000000000000   +- HotKey object
+    0x7fd186200bd0: 0x0000000000000001 0x00007fd15cfa8730  /
+    0x7fd186200be0: 0x0000000000000000 0x00be000043434242 /
+通过在攻击者控制的分配空间之后紧跟一个HotKey的分配空间，就能够通过我们的ConnectionID来破坏其hotkey->next指针低位的四个字节。通过堆喷射技术，这些遭到部分破坏的指针就会指向攻击者控制的数据了：
+通过破坏HotKey对象的第一个DWORD，可以创建一个指向攻击者控制的数据的悬空指针
+最重要的是，SkyLight已经公开了许多用来添加、删除、查看或操作HotKey对象的各个字段的API。利用这些API，我们就能够通过悬空HotKey来“泄漏”数据，或者通过位翻转，以一种更不受约束的方式来进一步破坏WindowServer堆：
+众多已公开的WindowServer函数，它们都可以用于HotKey对象
+经过一番思考之后，最终确立了一个自认为可行（但复杂）的路径，以便快速实现代码执行，毕竟当时是在参加Pwn2Own大赛。该漏洞利用过程需要借助多次堆喷射、极具风险的跨块堆破坏以及极其精确的位翻转。所以，这条路注定充满了艰难险阻，但我们相信，幸运之神定会眷顾勇者。
+**小结**
+* * *
+在本文中，我们首先提供了相应的POC，并介绍了现有漏洞的限制。接着，介绍用于发现与我们的漏洞兼容的破坏目标的工具和技术，在本文的下篇中，我们将为读者详细介绍为Pwn2Own
+2018所开发的漏洞利用程序。

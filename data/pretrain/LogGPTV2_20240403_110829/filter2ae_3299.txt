@@ -1,0 +1,69 @@
+# Chrome漏洞调试笔记1——CVE-2019-5768
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+2019年11月1日，Kaspersky的Blog 《Chrome 0-day exploit CVE-2019-13720 used in
+Operation
+WizardOpium》公布了他们捕获的一个Chrome在野漏洞CVE-2019-13720利用样本的部分内容。这也是2019年第二个被捕获的Chrome在野漏洞。可以看到随着IE浏览器逐渐被淘汰，Edge浏览器用户占有量远低于Chrome，Chrome将会成为黑客攻击的新目标。虽然Chrome的沙箱模块增加了远程代码执行的难度，但是攻击者仍然会通过类似CVE-2019-0808的内核漏洞或者Chrome自己的高权限模块漏洞绕过沙箱。由于CVE-2019-13720的技术细节仍未公布，笔者选择了同样在今年被发现的CVE-2019-5768作为Chrome漏洞调试笔记的第一篇。由于笔者水平有限，文中错误之处恳请斧正。
+## 0x0 Root Cause Analysis
+FileReader
+FileReader对象允许Web应用程序异步读取存储在用户计算机上的文件（或原始数据缓冲区）的内容，可以使用 Blob 对象指定要读取的数据。
+FileReader.readAsArrayBuffer() 方法读取指定的 Blob中的内容, 一旦完成, result 属性中保存的将是被读取内容的
+ArrayBuffer 数据对象。
+FileReader.onprogress 事件处理progress事件。该事件在读取Blob时触发。
+FileReader.onloadend 事件处理loadend事件。该事件在读取Blob结束时触发。
+一个典型的FileReader应用示例代码如下：
+这里申请了128MB的字符串保存到Blob对象中，通过FileReader.readAsArrayBuffer()
+方法读取到ArrayBuffer里，并绑定了FileReader.onprogress和FileReader.onloadend事件的回调，运行示例代码，Chrome控制台输出如下：
+需要注意的是最后两个onprogress事件触发时，Blob对象数据已经读取完毕。
+PoC
+CVE-2019-5768的补丁如下：
+这里修复的函数DOMArrayBuffer*
+FileReaderLoader::ArrayBufferResult()对应了js调用FileReader.readAsArrayBuffer()
+后FileReader.result属性的读取操作。
+观察该函数补丁前的代码，重点分析红框部分的代码，这里raw_data_是WTF::ArrayBufferBuilder的指针：
+WTF::ArrayBufferBuilder使用增量方式构造WTF::ArrayBuffer，并保存构造的WTF::ArrayBuffer指针，WTF::ArrayBuffer采用引用计数算法维护指向实际数据内存的生命周期：
+ArrayBufferBuilder::ToArrayBuffer()
+将WTF::ArrayBufferBuilder转换为WTF::ArrayBuffer：
+转换的逻辑是：当WTF::ArrayBufferBuilder保存的buffer空间被完全使用后，直接返回buffer，否则通过ArrayBuffer：：Slice()返回一个WTF::ArrayBuffer的副本。
+最后再回到FileReaderLoader::ArrayBufferResult()，分析DOMArrayBuffer::Create():
+可以看到这里DOMArrayBuffer::Create()只是将WTF::ArrayBuffer的指针做了转移，返回blink::
+DOMArrayBuffer指针保存至局部变量result。
+继续走到if代码，这里当finished_loading_ ==
+true时，将局部变量result赋值给成员变量array_buffer_result_作为后面再调用FileReader.result属性的返回结果，否则返回局部变量result。其中finished_loading变量由FileReaderLoader::OnFinishLoading()
+赋值true：
+我们再来梳理下完整的代码逻辑：当脚本调用FileReader.result属性时，c++代码调用DOMArrayBuffer*
+FileReaderLoader::ArrayBufferResult()函数返回一个blink::DOMArrayBuffer指针，指向由WTF::ArrayBufferBuilder创建的WTF::ArrayBuffer对象。当Blob对象数据未读取完时，FileReader.result指向WTF::ArrayBufferBuilder创建的WTF::ArrayBuffer对象的副本；当FileReader已读取完Blob对象数据时，FileReader.result指向WTF::ArrayBufferBuilder创建的WTF::ArrayBuffer自身。
+可以发现这里存在一个时序问题：finished_loading_未被置true时Blob对象数据可能已经读取完毕（回忆FileReader示例Chrome的控制台输出结果），此时FileReader.result将指向WTF::ArrayBufferBuilder创建的WTF::ArrayBuffer自身。也就是说，onprogress和onloadend事件回调中的FileReader.result返回不同的blink::DOMArrayBuffer指针指向同一个WTF::ArrayBuffer。那么就可以通过释放其中一个FileReader.result，使得另一个FileReader.result成为悬挂指针，PoC如下：
+这里ab1_ref和ab2_ref分别保存onprogress和onloadend事件回调中的FileReader.result返回值。当Blob对象数据读取完毕后，如果ab1_ref
+!= null && ab1_ref !=
+ab2_ref说明返回了两个不同的blink::DOMArrayBuffer指针并指向同一个ArrayBuffer。再通过Worker.postMessage转移ab1_ref和ab2_ref，当转移ab2_ref时，ab2_ref指向的ArrayBuffer已经被转移从而引发异常，使得ab2_ref成为悬挂指针。最后通过向ab2_ref写入数据触发crash：
+（漏洞利用部分的代码参考exodus的blog，可以在Win7 x86环境下稳定利用。）
+## 0x1 Read/Write Primitive
+UAF漏洞利用的关键是如何占位，而占位的前提条件是合理的内存布局。根据exodus的blog，在32位win7系统中通过申请1GB的ArrayBuffer，Chrome会尝试释放512MB保留内存，而分配失败的OOM异常可以被脚本捕获使得render进程不会crash，最终导致后面申请的128MB的ArrayBuffer在这块512MB内存上分配，不受隔离堆保护，释放后可以被其他js对象占位。
+具体步骤：
+  1. 申请1GB的ArrayBuffer，使得Chrome释放512MB的保留内存
+  2. 调用FileReader.readAsArrayBuffer(blob); 在512MB内存中创建读取Blob对象数据需要的ArrayBuffer
+  3. 触发漏洞，释放步骤2申请ArrayBuffer内存
+  4. 创建大量的js对象，尝试占用已经释放的ArrayBuffer内存
+  5. 利用悬挂指针ab2_ref通过一个Uint32Array指向已经释放的ArrayBuffer内存
+内存布局示意图：
+  6. 利用tarray搜索标记内存marker1, marker2, 并定位找到的spray[i][j]的地址和tarray data的首地址：
+（注意这里乘2是因为SMI在x86中使用高31位存放数据。）
+内存布局示意图：
+同时得到部分内存读写功能：
+  7. 利用找到的tarray[object_prop_taidx]定位spray[i][j]的索引i，j：
+内存布局示意图：
+通过一系列的搜索，spray[i][j].a和tarray[object_prop_taidx]指向同一块4字节的内存，从而实现了任意对象地址泄露功能：
+  8. 利用任意对象地址泄露功能和tarray的读写能力，寻找一个可篡改的TypedArray，实现任意地址读写能力：
+## 0x2 Remote Code Execution
+exodus的blog使用了WebAssembly执行shellcode。比起传统的利用ROP绕过DEP以及覆盖虚函数指针或者函数返回地址执行shellcode的方法，WebAssembly由于自带RWX属性内存以及执行函数，利用起来更加简单，具体步骤：
+  1. 初始化WebAssembly模块：
+  2. 根据JSFunction的内存布局找到RWX内存起始地址，用shellcode覆盖：
+  3. 执行WebAssembly导出函数wasm_func，触发shellcode执行：
+关闭Chrome的沙箱，运行利用代码，在Win7 x86环境成功弹出计算器：
+## 0x3 References
+  1. 
+  2. 
+  3. 
+  4. 

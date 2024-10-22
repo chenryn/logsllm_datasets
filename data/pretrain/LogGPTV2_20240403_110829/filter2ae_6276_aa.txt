@@ -1,0 +1,65 @@
+**作者：Flanker**  
+**公众号：[Flanker论安全](https://mp.weixin.qq.com/s?__biz=MzI3ODI4NDM2MA==&mid=2247483704&idx=1&sn=dc6eabe014090f174ca526f0a9817e18&chksm=eb58101fdc2f9909021d939b8421240ae5ec8d1dea736cc3ab3c615f18a563b8300e1e0539b1&mpshare=1&scene=1&srcid=&sharer_sharetime=1570849517150&sharer_shareid=e441301c3c77aafdcfee7b13b86b2e66&key=cf5b62dfad07411d2a252e4aa8b54574105e72178337af266f33c3ab10217738aa4ee892139f84c585afb51663cf7effb43ced61ca38552eb3d821c30f14cbfda927e80d2edc8110037197f605cd5061&ascene=1&uin=MzM5ODEzOTY3MQ%3D%3D&devicetype=Windows+10&version=62060833&lang=zh_CN&pass_ticket=SnW%2BVFm%2FV870RttB%2B14Y46REdDPzOD6cwq0VjGD23Uk1CaoT9lJweNxOZq22kyMK
+"的") **
+安卓生态多姿多彩，在AOSP之外各大厂商的binder
+service也同样各式各样。这些自行实现的service通常来说是闭源的，常常成为会被人忽略的提权攻击面。在这一系列文章中，我会先描述如何定位可能有问题的binder
+service进行后续研究，以及逆向中一些有意思的发现，随后会以之前发现的两个典型的CVE为例，讨论这些漏洞是如何产生的，如何发现它们，以及如何进行利用。
+## 寻找潜在的分析目标
+在Android N之前，所有的binder
+service都是在`servicemanager`中进行注册的，client通过`/dev/binder`与service进行通讯。Android
+N对binder服务引入了domain切分的概念，常规的服务依然使用/dev/binder，而vendor
+domain则转换为使用`/dev/vndbinder`, hardware
+domain转换为使用`/dev/hwbinder`。常规的untrusted_app访问被限制在了/dev/binder。
+通过`service list`，我们可以查看设备上注册了多少normal
+domain的service。AOSP设备一般会有100+，而各大厂商的设备均会达到200以上。其中大部分都是Java服务，虽说Java服务通常也会引入一些常见的逻辑问题，但暂时不属于本文的讨论范围。目前的范围内，我们只关注包含有native
+code，可能存在内存破坏漏洞的组件。 所以第一个问题出现了，如何确定哪些服务是通过native code处理的？根据binder服务的形式，存在如下可能：
+  * 该服务直接运行在native process中
+  * 该服务运行在JVM process中（例：注册于system_server中），但存在JNI调用
+无论分析哪种形式，我们都需要先确定该服务的host进程。在进程注册或打开binder服务的时候， debugfs中会留下相应的node entry或ref
+entry。Android Internals的作者数年前开源的工具bindump即通过遍历这个信息来获取服务的进程关系。其工作原理如下：
+  * tool process打开目标服务，获取本进程新增的ref id
+  * 遍历procfs, 通过ref id匹配各进程的node id，匹配到的进程即为该服务host process
+这个方法非常有效，不过随着Android的演进，原始的bindump工具现在遇到了如下问题：
+  * debugfs现在需要root权限才能打开，普通进程已经无法打开debugfs
+  * binder node现在具有了domain的概念，需要区分不同domain中的node
+  * 原始的bindump link到libbinder.so，但每个版本更新后symbol location会发生变化，导致原有的binary在新版本上无法运行，每个版本都会需要在AOSP source tree下重新编译（如果vendor改动了libbinder问题就更大了）
+为了解决问题2和3，我用Java重写了bindump，将其打包成可以忽略平台版本问题单独运行的jar包，相关代码和precompiled
+jar已经放在了[GitHub](https://github.com/flankerhqd/bindump4j "GitHub")上。
+在解决了以上问题之后，我们终于可以定位到运行在native process中的服务，并进行后续分析了。
+## CVE-2018-9143: buffer overflow in visiond service
+`media.air`是一个运行在Samsung设备系统进程`/system/bin/visiond`中的服务。`visiond`本身加载了多个动态执行库，包括`libairserviceproxy`,
+`libairservice`, `libair` 等, 并以system-uid运行。 相关服务的实现端，例如
+`BnAIRClient::onTransact, BnEngine::onTransact,
+BnAIRService::onTransact`等存在于`libairserviceproxy`中。
+### 虚表指针去哪里了？
+逆向C++库的关键准备之一是定位相应虚函数指针，并使用IDA脚本通过这些信息进行type
+reconstruction。但当我们在IDA中打开`media.air`服务的动态库时，却惊讶地发现，在原来应该有vtable表项指针的地方，除了top-offset和virtual-base offset还在，其他的指针大部分神秘地消失了，如下图所示
+而同样大版本的AOSP/Pixel/Nexus镜像的binary中并没有出现这样的问题。谁偷了我的虚表指针？
+乍一看可能会觉得三星在故意搞事，像国内厂商一样做了某种混淆来对抗静态分析，但实际上并不是。为了理解这种现象，我们先来回忆下虚表项指针的存储方式。
+首先，IDA给我们展示的rel section并不是ELF中实际的内容，而是处理过后的结果。虚表指针项并不直接存储在`.data.rel.ro`
+section，而是linker
+重定位之后的结果。它们的原始内容实际上存在于`.rela.dyn`中，以`R_AARCH64_RELATIVE`表项的形式存在。在library被加载时，linker会根据表项中的offset，将重定位后的实际地址写入对应的offset中，也就是vtable真正的地址。
+IDA和其他分析工具会模拟linker的功能预先对这些内容进行解析并写入，但如果IDA解析relocation
+table失败，那么这些地址会维持其在ELF中的原始内容，也就是0。
+但是什么导致了IDA解析失败？这是在N后引入的`APS2`重定位特性，最先应用在chromium上，如下所述：
+    Packed Relocations
+    All flavors of lib(mono)chrome.so enable “packed relocations”, or “APS2 relocations” in order to save binary size.
+    Refer to this source file for an explanation of the format.
+    To process these relocations:
+    Pre-M Android: Our custom linker must be used.
+    M+ Android: The system linker understands the format.
+    To see if relocations are packed, look for LOOS+# when running: readelf -S libchrome.so
+    Android P+ supports an even better format known as RELR.
+    We'll likely switch non-Monochrome apks over to using it once it is implemented in lld.
+APS2将重定向表以SLEB128的格式压缩编码，对于大型binary可以缩小ELF的体积。具体的编码解码实现可以在[这里](http://androidxref.com/9.0.0_r3/xref/bionic/tools/relocation_packer/src/delta_encoder.h
+"这里")找到。在运行时linker解压这个section，根据大小变化调整前后section的地址，将其恢复为一个正常的ELF进行加载。IDA尚不支持APS2
+encoding所以我们会看到大部分重定向信息都丢失了，可以用上述`relocation_packer`工具将其解码恢复。
+一个好消息: 在APS2引入两年之后，IDA 7.3终于增加了对其的支持，现在可以看到IDA已经可以正确地恢复虚表项地址了。
+    IDA Changelog:
+    File formats:
+    ...
+    + ELF: added support for packed android relocations (APS2 format)
+    ...
+## AirService copies in the air
+在解决了逆向的这个问题之后，我们回过头来分析下这个服务的相关结构。`media.air`中的`BnAirServiceProxy`提供了两个接收客户端传入的`AirClient`的初始化函数，其中一个以StrongBinder的形式接受输入，并返回一个指向`BnAir`服务的handle供客户端进程再次调用。当option参数为0时，该函数会创建一个FileSource线程，当option参数为1时其会创建一个CameraSourceThread线程。只有在CameraSourceThread线程中可以触发本漏洞。
+在获得服务端BnAir服务的handle后，客户端将可以进一步调用其实现的transaction。`libair.so`中提供的BnAIR服务实现了一个针对Frame的状态机，状态机的关键函数包括`configure`,

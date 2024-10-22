@@ -1,0 +1,305 @@
+            }
+        }
+        private Invocation createInvocation(Channel channel, URL url, String methodKey) {
+            String method = url.getParameter(methodKey);
+            if (method == null || method.length() == 0) {
+                return null;
+            }
+            RpcInvocation invocation = new RpcInvocation(method, new Class[0], new Object[0]);
+            invocation.setAttachment(Constants.PATH_KEY, url.getPath());
+            invocation.setAttachment(Constants.GROUP_KEY, url.getParameter(Constants.GROUP_KEY));
+            invocation.setAttachment(Constants.INTERFACE_KEY, url.getParameter(Constants.INTERFACE_KEY));
+            invocation.setAttachment(Constants.VERSION_KEY, url.getParameter(Constants.VERSION_KEY));
+            if (url.getParameter(Constants.STUB_EVENT_KEY, false)) {
+                invocation.setAttachment(Constants.STUB_EVENT_KEY, Boolean.TRUE.toString());
+            }
+            return invocation;
+        }
+    };
+但在bind的时候，因为默认SPI选择的是HeaderExchanger，分析它的bind方法，可以看到，其ExchangeHandler被进行了多层封装：
+    public class HeaderExchanger implements Exchanger {
+        public static final String NAME = "header";
+        @Override
+        public ExchangeClient connect(URL url, ExchangeHandler handler) throws RemotingException {
+            return new HeaderExchangeClient(Transporters.connect(url, new DecodeHandler(new HeaderExchangeHandler(handler))), true);
+        }
+        @Override
+        public ExchangeServer bind(URL url, ExchangeHandler handler) throws RemotingException {
+            return new HeaderExchangeServer(Transporters.bind(url, new DecodeHandler(new HeaderExchangeHandler(handler))));
+        }
+    }
+跟进Transporters.bind，可以看到，还是使用了SPI
+    public static Server bind(URL url, ChannelHandler... handlers) throws RemotingException {
+        if (url == null) {
+            throw new IllegalArgumentException("url == null");
+        }
+        if (handlers == null || handlers.length == 0) {
+            throw new IllegalArgumentException("handlers == null");
+        }
+        ChannelHandler handler;
+        if (handlers.length == 1) {
+            handler = handlers[0];
+        } else {
+            handler = new ChannelHandlerDispatcher(handlers);
+        }
+        return getTransporter().bind(url, handler);
+    }
+    public static Transporter getTransporter() {
+        return ExtensionLoader.getExtensionLoader(Transporter.class).getAdaptiveExtension();
+    }
+    @SPI("netty")
+    public interface Transporter {
+        /**
+         * Bind a server.
+         *
+         * @param url     server url
+         * @param handler
+         * @return server
+         * @throws RemotingException
+         * @see com.alibaba.dubbo.remoting.Transporters#bind(URL, ChannelHandler...)
+         */
+        @Adaptive({Constants.SERVER_KEY, Constants.TRANSPORTER_KEY})
+        Server bind(URL url, ChannelHandler handler) throws RemotingException;
+        /**
+         * Connect to a server.
+         *
+         * @param url     server url
+         * @param handler
+         * @return client
+         * @throws RemotingException
+         * @see com.alibaba.dubbo.remoting.Transporters#connect(URL, ChannelHandler...)
+         */
+        @Adaptive({Constants.CLIENT_KEY, Constants.TRANSPORTER_KEY})
+        Client connect(URL url, ChannelHandler handler) throws RemotingException;
+    }
+根据dubbo改造的SPI原理，因为我们并没有对Transporter的实现进行配置，所以，默认会选择注解[@SPI](https://github.com/SPI
+"@SPI")(“netty”)指定的NettyTransporter实现进行bind
+    public class NettyTransporter implements Transporter {
+        public static final String NAME = "netty";
+        @Override
+        public Server bind(URL url, ChannelHandler listener) throws RemotingException {
+            return new NettyServer(url, listener);
+        }
+        @Override
+        public Client connect(URL url, ChannelHandler listener) throws RemotingException {
+            return new NettyClient(url, listener);
+        }
+    }
+可以看到，其实服务提供者和消费者，默认最终bind和connect都执行到这里，bind创建了一个netty的服务，也就是tcp的监听器，说到netty，我们知道，一个netty服务，对于数据包的解析或者封装，都会用到pipe，而我们这篇文章的最核心点就在其中的pipe
+    public class NettyServer extends AbstractServer implements Server {
+        private static final Logger logger = LoggerFactory.getLogger(NettyServer.class);
+        private Map channels; // 
+        private ServerBootstrap bootstrap;
+        private org.jboss.netty.channel.Channel channel;
+        public NettyServer(URL url, ChannelHandler handler) throws RemotingException {
+            super(url, ChannelHandlers.wrap(handler, ExecutorUtil.setThreadName(url, SERVER_THREAD_POOL_NAME)));
+        }
+        @Override
+        protected void doOpen() throws Throwable {
+            NettyHelper.setNettyLoggerFactory();
+            ExecutorService boss = Executors.newCachedThreadPool(new NamedThreadFactory("NettyServerBoss", true));
+            ExecutorService worker = Executors.newCachedThreadPool(new NamedThreadFactory("NettyServerWorker", true));
+            ChannelFactory channelFactory = new NioServerSocketChannelFactory(boss, worker, getUrl().getPositiveParameter(Constants.IO_THREADS_KEY, Constants.DEFAULT_IO_THREADS));
+            bootstrap = new ServerBootstrap(channelFactory);
+            final NettyHandler nettyHandler = new NettyHandler(getUrl(), this);
+            channels = nettyHandler.getChannels();
+            // https://issues.jboss.org/browse/NETTY-365
+            // https://issues.jboss.org/browse/NETTY-379
+            // final Timer timer = new HashedWheelTimer(new NamedThreadFactory("NettyIdleTimer", true));
+            bootstrap.setOption("child.tcpNoDelay", true);
+            bootstrap.setPipelineFactory(new ChannelPipelineFactory() {
+                @Override
+                public ChannelPipeline getPipeline() {
+                    NettyCodecAdapter adapter = new NettyCodecAdapter(getCodec(), getUrl(), NettyServer.this);
+                    ChannelPipeline pipeline = Channels.pipeline();
+                    /*int idleTimeout = getIdleTimeout();
+                    if (idleTimeout > 10000) {
+                        pipeline.addLast("timer", new IdleStateHandler(timer, idleTimeout / 1000, 0, 0));
+                    }*/
+                    pipeline.addLast("decoder", adapter.getDecoder());
+                    pipeline.addLast("encoder", adapter.getEncoder());
+                    pipeline.addLast("handler", nettyHandler);
+                    return pipeline;
+                }
+            });
+            // bind
+            channel = bootstrap.bind(getBindAddress());
+        }
+        //...
+    }
+从上面的代码中，可以找到pipe链有两个分别是decoder和encoder，分别是对接收的数据进行解码，以及对响应数据进行编码。其中的解码和编码器实现，从NettyCodecAdapter获取，而NettyCodecAdapter中通过内部类的方式实现了解码和编码器，但真正的核心编解码还是交给了Codec2
+Codec2的构造，我们重新回到NettyServer的构造方法：
+    public NettyServer(URL url, ChannelHandler handler) throws RemotingException {
+        super(url, ChannelHandlers.wrap(handler, ExecutorUtil.setThreadName(url, SERVER_THREAD_POOL_NAME)));
+    }
+继续跟进其父类AbstractServer的父类AbstractEndpoint的构造方法，就能看到Codec2也是通过SPI的方式获取
+    public AbstractEndpoint(URL url, ChannelHandler handler) {
+        super(url, handler);
+        this.codec = getChannelCodec(url);
+        this.timeout = url.getPositiveParameter(Constants.TIMEOUT_KEY, Constants.DEFAULT_TIMEOUT);
+        this.connectTimeout = url.getPositiveParameter(Constants.CONNECT_TIMEOUT_KEY, Constants.DEFAULT_CONNECT_TIMEOUT);
+    }
+    protected static Codec2 getChannelCodec(URL url) {
+        String codecName = url.getParameter(Constants.CODEC_KEY, "telnet");
+        if (ExtensionLoader.getExtensionLoader(Codec2.class).hasExtension(codecName)) {
+            return ExtensionLoader.getExtensionLoader(Codec2.class).getExtension(codecName);
+        } else {
+            return new CodecAdapter(ExtensionLoader.getExtensionLoader(Codec.class)
+                    .getExtension(codecName));
+        }
+    }
+    @SPI
+    public interface Codec2 {
+        @Adaptive({Constants.CODEC_KEY})
+        void encode(Channel channel, ChannelBuffer buffer, Object message) throws IOException;
+        @Adaptive({Constants.CODEC_KEY})
+        Object decode(Channel channel, ChannelBuffer buffer) throws IOException;
+        enum DecodeResult {
+            NEED_MORE_INPUT, SKIP_SOME_INPUT
+        }
+    }
+那么，具体这个Codec2使用的是哪个实现？我们也没对其进行配置，SPI对于的接口类中注解也没有配置默认实现。
+其实，回到com.alibaba.dubbo.rpc.protocol.dubbo.DubboProtocol#createServer中，我们可以看到，在这个方法中执行了这样一行代码，为URL重添加了一个配置参数：
+    url = url.addParameter(Constants.CODEC_KEY, DubboCodec.NAME);
+所以，因为我们用的是dubbo协议，真正的Code2实现，是DubboCodec，位于module dubbo-rpc-dubbo中，包com.alibaba.dubbo.rpc.protocol.dubbo下。
+我们暂时只关注解码，从decodeBody方法，我们可以清晰看到，dubbo协议自己定义了协议通讯时的数据包头和体：
+    protected Object decodeBody(Channel channel, InputStream is, byte[] header) throws IOException {
+        byte flag = header[2], proto = (byte) (flag & SERIALIZATION_MASK);
+        // get request id.
+        long id = Bytes.bytes2long(header, 4);
+        if ((flag & FLAG_REQUEST) == 0) {
+            // decode response.
+            Response res = new Response(id);
+            if ((flag & FLAG_EVENT) != 0) {
+                res.setEvent(true);
+            }
+            // get status.
+            byte status = header[3];
+            res.setStatus(status);
+            try {
+                ObjectInput in = CodecSupport.deserialize(channel.getUrl(), is, proto);
+                if (status == Response.OK) {
+                    Object data;
+                    if (res.isHeartbeat()) {
+                        data = decodeHeartbeatData(channel, in);
+                    } else if (res.isEvent()) {
+                        data = decodeEventData(channel, in);
+                    } else {
+                        data = decodeResponseData(channel, in, getRequestData(id));
+                    }
+                    res.setResult(data);
+                } else {
+                    res.setErrorMessage(in.readUTF());
+                }
+            } catch (Throwable t) {
+                res.setStatus(Response.CLIENT_ERROR);
+                res.setErrorMessage(StringUtils.toString(t));
+            }
+            return res;
+        } else {
+            // decode request.
+            Request req = new Request(id);
+            req.setVersion(Version.getProtocolVersion());
+            req.setTwoWay((flag & FLAG_TWOWAY) != 0);
+            if ((flag & FLAG_EVENT) != 0) {
+                req.setEvent(true);
+            }
+            try {
+                ObjectInput in = CodecSupport.deserialize(channel.getUrl(), is, proto);
+                Object data;
+                if (req.isHeartbeat()) {
+                    data = decodeHeartbeatData(channel, in);
+                } else if (req.isEvent()) {
+                    data = decodeEventData(channel, in);
+                } else {
+                    data = decodeRequestData(channel, in);
+                }
+                req.setData(data);
+            } catch (Throwable t) {
+                // bad request
+                req.setBroken(true);
+                req.setData(t);
+            }
+            return req;
+        }
+    }
+下面是我对其协议的一些整理总结：
+header：
+    0-7位和8-15位：Magic High和Magic Low，类似java字节码文件里的魔数，用来判断是不是dubbo协议的数据包，就是一个固定的数字
+    16位：Req/Res：请求还是响应标识。
+    17位：2way：单向还是双向
+    18位：Event：是否是事件
+    19-23位：Serialization 编号
+    24-31位：status状态
+    32-95位：id编号
+    96-127位：body数据长度
+    128-…位：body
+body：
+    1.dubboVersion
+    2.path
+    3.version
+    4.methodName
+    5.methodDesc
+    6.paramsObject
+    7.map
+rpc tcp报文（ascii）：
+    ...           .G.2.0.20,com.threedr3am.learn.server.boot.DemoService.1.0.hello0$Lcom/threedr3am/learn/server/boot/A;C0"com.threedr3am.learn.server.boot.A..name`.xxxxH.path0,com.threedr3am.learn.server.boot.DemoService.activelimit_filter_start_time 1577081623564 interface0,com.threedr3am.learn.server.boot.DemoService.version.1.0.timeout.3000Z
+rpc tcp报文（hex）：
+    dabb c200 0000 0000 0000 0000 0000 0149
+    0532 2e30 2e32 302c 636f 6d2e 7468 7265
+    6564 7233 616d 2e6c 6561 726e 2e73 6572
+    7665 722e 626f 6f74 2e44 656d 6f53 6572
+    7669 6365 0331 2e30 0568 656c 6c6f 3024
+    4c63 6f6d 2f74 6872 6565 6472 3361 6d2f
+    6c65 6172 6e2f 7365 7276 6572 2f62 6f6f
+    742f 413b 4330 2263 6f6d 2e74 6872 6565
+    6472 3361 6d2e 6c65 6172 6e2e 7365 7276
+    6572 2e62 6f6f 742e 4191 046e 616d 6560
+    0678 7561 6e79 6848 0470 6174 6830 2c63
+    6f6d 2e74 6872 6565 6472 3361 6d2e 6c65
+    6172 6e2e 7365 7276 6572 2e62 6f6f 742e
+    4465 6d6f 5365 7276 6963 651d 6163 7469
+    7665 6c69 6d69 745f 6669 6c74 6572 5f73
+    7461 7274 5f74 696d 650d 3135 3737 3038
+    3332 3138 3432 3209 696e 7465 7266 6163
+    6530 2c63 6f6d 2e74 6872 6565 6472 3361
+    6d2e 6c65 6172 6e2e 7365 7276 6572 2e62
+    6f6f 742e 4465 6d6f 5365 7276 6963 6507
+    7665 7273 696f 6e03 312e 3007 7469 6d65
+    6f75 7404 3330 3030 5a
+接着，直奔我们这次最最核心的地方，CodecSupport.deserialize，它封装了输入流对象，并通过SPI选择对应的反序列化实现，在decode解码输入流时，对其数据进行反序列化：
+    public static ObjectInput deserialize(URL url, InputStream is, byte proto) throws IOException {
+        Serialization s = getSerialization(url, proto);
+        return s.deserialize(url, is);
+    }
+    public static Serialization getSerialization(URL url, Byte id) throws IOException {
+        Serialization serialization = getSerializationById(id);
+        String serializationName = url.getParameter(Constants.SERIALIZATION_KEY, Constants.DEFAULT_REMOTING_SERIALIZATION);
+        // Check if "serialization id" passed from network matches the id on this side(only take effect for JDK serialization), for security purpose.
+        if (serialization == null
+                || ((id == 3 || id == 7 || id == 4) && !(serializationName.equals(ID_SERIALIZATIONNAME_MAP.get(id))))) {
+            throw new IOException("Unexpected serialization id:" + id + " received from network, please check if the peer send the right id.");
+        }
+        return serialization;
+    }
+到这里，我们其实已经了解服务提供者service暴露的大概源码细节了，我这边就不再跟进消费者refer服务以及invoke时的源码细节了，因为大体流程其实也差不了多远，下一节，我们将浅析反序列化部分的源码实现，也是我们主要的关注点。
+## 0x03 hessian2反序列化
+上一节中，我们最终跟到了DubboCodec的decodeBody方法实现，这个方法会对使用了dubbo协议的数据包进行解析，根据包数据，判断是请求还是响应，接着根据SPI选择反序列化实现进行反序列化。
+在调用CodecSupport的deserialize方法时，我们可以看到它传入的第三个参数proto，这是从dubbo协议数据包的header部获取的数据，在header的19-23位，表示Serialization编号，在获取反序列化实现时，根据这个编号从ID_SERIALIZATION_MAP缓存中取出相应的反序列化实现
+CodecSupport：
+    public static Serialization getSerializationById(Byte id) {
+        return ID_SERIALIZATION_MAP.get(id);
+    }
+    public static Serialization getSerialization(URL url, Byte id) throws IOException {
+        Serialization serialization = getSerializationById(id);
+        String serializationName = url.getParameter(Constants.SERIALIZATION_KEY, Constants.DEFAULT_REMOTING_SERIALIZATION);
+        // Check if "serialization id" passed from network matches the id on this side(only take effect for JDK serialization), for security purpose.
+        if (serialization == null
+                || ((id == 3 || id == 7 || id == 4) && !(serializationName.equals(ID_SERIALIZATIONNAME_MAP.get(id))))) {
+            throw new IOException("Unexpected serialization id:" + id + " received from network, please check if the peer send the right id.");
+        }
+        return serialization;
+    }
+那也就是说，我们是否可以随意修改数据包中的Serialization编号编号，选择更容易被利用的反序列化实现？
+然而并不行，从上面代码，其实我们能看到有个if判断，如果编号为3、4、7或者编号取出的反序列化实现名称和服务提供者端配置的不一致，都会抛出异常。
+而在缺省配置下，默认dubbo协议的反序列化，使用的是hessian2实现。

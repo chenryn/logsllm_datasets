@@ -1,0 +1,111 @@
+           * Third double word block
+           *
+           * WARNING: bit 0 of the first word encode PageTail(). That means
+           * the rest users of the storage space MUST NOT use the bit to
+           * avoid collision and false-positive PageTail().
+           */
+          union {
+              struct list_head lru;   /* Pageout list, eg. active_list
+                           * protected by zone_lru_lock !
+                           * Can be used as a generic list
+                           * by the page owner.
+                           */
+         ...
+## 分配和释放
+终于讲到了重点。关于slub的分配和释放有很多文章介绍过，而且风格不同，有的是对着代码逐行分析，有的是画图介绍，这里我仅按照我自己的理解去说，如有谬误欢迎指出。
+对象的分配和释放涉及到几个指针，分别是：
+  * p1: 对象的虚拟地址(`void *`)
+  * p2: 对象地址所对应的page(`struct page*`)
+  * p3: 对象所属的slab(`struct page*`)
+  * p4: 对象所属的cache控制体(`struct kmem_cache*`)
+一个虚地址所对应的页首地址是是通过PAGE_MASK，因为页是对齐的，但需要注意页首地址并不是page指针所指向的地方。p1->p2的转换通过`virt_to_page`实现。
+p2->p4可以通过`page->slab_cache`得到，这也是p1->p4函数`virt_to_cache`的操作。
+### 分配
+对象的分配，不考虑特殊情况的话(比如超过N页的对象直接通过伙伴系统分配)，一般流程如下：
+  1. `kmem_cache_cpu->freelist`不为空，直接出链返回；
+  2. `kmem_cache_cpu->page->freelist`不为空，则出链，更新cpu_slab->freelist，然后返回；
+  3. `kmem_cache_cpu->partial`不为空，取出第一个slab，更新cpu_slab的freelist和page，取出对象然后返回；
+  4. `kmem_cache_node->partial`不为空，取出第一个，类似3更新cpu_slab的freelist和page并返回；
+  5. 上面都是空的，则通过伙伴系统分配新的slab，挂到kmem_cache_cpu中，然后goto 1；
+![
+](https://images.seebug.org/content/images/2020/03/a37a9987-1470-45f3-b7e9-14a7ac2bd29b.png-w331s)
+### 释放
+对象的释放相对复杂，和释放之前对象所处的位置以及释放后cache情况有关。假设待释放的object地址为p1，p1对应的page为p2，p1对应的slab为p3，参考上面的几个指针定义，大致有以下路径：
+  1. `p3`就是当前CPU的kmem_cache_cpu->freelist所对应的slab，即p1位于当前cpu的kmem_cache_cpu->freelist所在的page中(`p2 == cpu_slab->page`)，此时可以直接释放到freelist上并返回；
+  2. `p3`位于当前CPU的kmem_cache_cpu->partial链表中，或者其他CPU的kmem_cache_cpu->freelist/partial中。此slab处于冻结状态，将p1链入p3->freelist中；
+  3. `p3`位于kmem_cache_node->partial链表中，此时释放分为两种情况： 3.1 释放p1后，p3的状态为半满。此时正常将p1链入p3的freelist中。 3.2 释放p1后，p3的状态为全空。此时除了将p1链入p3的freelist以外，还需要判断node中slab数是否超过规定值(`node->nr_partial >= min_partial`)。如果超过则需要将p3移出node->partial链表，并将p3释放给伙伴系统。
+  4. `p3`是一个全满的slab，不被任何kmem_cache管理。释放后p3变成一个半满的slab(更新freelist)，同时p3会被加入到当前CPU的kmem_cache_cpu.partial中。加入之前需要判断cpu partial中的空闲对象是否超过了规定值(`partial.pobjects > cachep.cpu_partial`)，并进行相应的处理： 4.1 如果没超过，直接链入cpu partial即可 4.2 如果超过，则将cpu partial中所有slab解冻，将其中所有半满的slab交由node进行管理；将其中所有空的slab回收给伙伴系统；最后再将slab链入到partial中。
+其中3的判断是为了避免node partial中存放了太多空slab；4的判断是为了避免cpu partial中存放太多空slab以及加快搜索速度。
+![
+](https://images.seebug.org/content/images/2020/03/84a6c1cf-902a-4c0e-b843-728700e2ed50.png-w331s)
+slab分配和释放的过程大致就是这样，上面的图主要来自窝窝的smcdef大神，其中还有一张大图可以配合观看理解：
+## 调试
+slab分配器是如此复杂，因此Linux内核中提供了很多调试措施，开启特定的调试编译选项后可以在object前后加上red
+zone检测越界，也可以检测slab的引用错误。
+在用户态中，我们可以通过vfs进行调试。比如可以用`slabinfo`或者`slabtop`命令查看当前的slab分配情况，这些命令实际上是读取了`/proc/slabinfo`信息以及`/sys/kernel/slab/*`中的信息。
+slabtop输出示例：
+     Active / Total Objects (% used)    : 25864761 / 26174849 (98.8%)
+     Active / Total Slabs (% used)      : 661098 / 661098 (100.0%)
+     Active / Total Caches (% used)     : 93 / 158 (58.9%)
+     Active / Total Size (% used)       : 4921033.80K / 5046143.93K (97.5%)
+     Minimum / Average / Maximum Object : 0.01K / 0.19K / 295.08K
+      OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME
+    18380583 18380583 100%    0.10K 471297       39   1885188K buffer_head
+    1785462 1711901   0%    0.19K  42511       42    340088K dentry
+    1705350 1629533   0%    1.06K  56845       30   1819040K ext4_inode_cache
+    589064 567016   0%    0.57K  21038       28    336608K radix_tree_node
+    530112 495734   0%    0.06K   8283       64     33132K kmalloc-64
+    475728 429025   0%    0.04K   4664      102     18656K ext4_extent_status
+    357632 355306   0%    0.06K   5588       64     22352K pid
+    258944 245861   0%    0.03K   2023      128      8092K kmalloc-32
+    247494 246414   0%    0.20K   6346       39     50768K vm_area_struct
+    231794 230768   0%    0.09K   5039       46     20156K anon_vma
+    174780 169836   0%    0.13K   5826       30     23304K kernfs_node_cache
+    164224 159505   0%    0.25K   5132       32     41056K filp
+    146688 143610   0%    0.02K    573      256      2292K kmalloc-16
+    120480 117291   0%    0.66K   2510       48     80320K proc_inode_cache
+    101376  97721   0%    0.01K    198      512       792K kmalloc-8
+     86310  85793   0%    0.19K   2055       42     16440K cred_jar
+     78122  75197   0%    0.59K   1474       53     47168K inode_cache
+     48512  46984   0%    0.50K   1516       32     24256K kmalloc-512
+直接从实现角度分析也许理解得不是很深刻，下面就来看几个实际的攻击案例，它们都巧妙地利用了上面提到的slab分配器的特性进行内存布局。
+# 案例1：内核堆溢出漏洞利用
+第一种类型是内核堆溢出漏洞。假如我们使用kmalloc分配了一个大小为30字节的对象，根据配置不同很可能会使用到名为`kmalloc-32`的kmem_cache去进行分配。因此，如果我们使用对象时写入超过32字节的数据，就可能产生堆溢出。
+堆溢出的直接后果就是覆盖了slab中后面一个object块的数据，如果后面的object对象中被覆盖的部分包含函数指针，那么就有可能劫持内核控制流，跳转到任意地址。如下图所示：
+![
+](https://images.seebug.org/content/images/2020/03/895795b8-18e8-4578-9d93-99df41bce85e.png-w331s)
+这是最简单的情况。实践中的主要问题是，如何保证攻击者分配的含函数指针的对象(简称 victim obj)就在溢出对象(简称 vuln object)的后面。
+创建对象前slab的freelist可能是乱七八糟的，因此我们可以先申请足够多的object，在分配流程中进入到第5步，直接从伙伴系统分配，此时slab的freelist应该也是连续的。
+即便我们可以保证freelist连续，要知道内核分配对象可不是一个个分配的，可能一个函数中就有多处分配对象，也就是说分配vuln
+object的时候肯定有个object跟着，姑且称之为xo。这时候如何利用呢？一个办法就是自己构造freelist。具体来说，就是：
+  1. 依次分配3个object(同样的slab) A、B、C；此时freelist指向D的下一个object(D)；
+  2. 我们希望freelist为`A->C->B`，因此需要依次释放B、C、A
+  3. 这样，再次申请vuln object时其进入A，跟着的xo就进入到了C，我们的victim objcet就可以进入B，即在A的后面
+这样，只要有合适的堆占位对象(如tty_struct)，就能稳定利用这类堆溢出漏洞了。
+# 案例2：CVE-2018-9568(WrongZone)漏洞利用
+这里不涉及漏洞的详细细节，只需要知道这个漏洞的核心是类型混淆，即`Slab-A`中分配的对象，错误地用`Slab-B`进行了释放(这也是为什么这个漏洞名为WrongZone的原因)。
+在WrongZone漏洞中，Slab-B比Slab-A要大(实际上Slab-A存放的是TCPv4 socket，而Slab-B存放的是TCPv6
+socket，后者包含前者，并增加了一些额外字段)。而且因为RCU，Slab的free object中指向下一个free object的指针(x +
+offset)是包含在object末尾的。
+释放、链入freelist，实际上是将当前freelist的值写入`x +
+offset`，并且将freelist重新指向刚释放的object。由于错误释放，在修改objA的offset时，超出了范围，写到下一个对象里面了。开启KASAN或者`SLUB_DEBUG_ON/MEMCG_KMEM`可以看到出错信息，否则很难触发明显的异常。
+假设类型混淆对象为objA，从slabA中分配。实际的利用计划是这样的： 1\. 令objA在释放前所在的slabA为全满状态 2\.
+释放objA，根据上面的分析，此时slabA会被链入B的cpu partial中。这意味着后续从B分配对象时候会出现从SlabA取对象的时候 3\.
+依次释放slabA中的其他对象，令最后的布局如下：
+![
+](https://images.seebug.org/content/images/2020/03/f03ae205-17dd-4433-9079-a8ac6be320ad.png-w331s)
+follow_sk是位于objA后面的对象，我们不释放它，防止slab变空被回收。
+这样一来，再在Slab-B中分配对象时候，就可能出现读取fragment中的值作为下一个free对象的情况。fragment中的值可以通过堆喷方式填充，这样就有可能令其在分配时读取一个我们能控制的值作为slab_alloc的返回从而进行进一步提权，或者出现显式的kernel
+panic。
+这个利用的关键点就是对于全满slab中对象释放的处理，将slab链入cpu
+partial的时候并不会考虑slab是否正确，因为slab本身也只是一段连续的空间而已。当然该漏洞还有其他利用方法，比如将其转化为UAF，这里就不再赘述了。
+# 总结
+在我们平时学习相对复杂的系统时，仅仅了解实现文档只能算是走出第一步；阅读代码并且上机调试可以将理解加深一个层次，知道“what's
+inside“；不过，如果能从攻击者的角度去分析和利用(滥用)，那理解又会加深一个层次，真正做到”inside
+out“。魔鬼隐藏在细节之中，把一个知识点融会贯通，也是挺有趣的事情。
+# 参考文章
+  * [Buddy memory allocation](https://en.wikipedia.org/wiki/Buddy_memory_allocation)
+  * [图解SLUB/lukuen](https://blog.csdn.net/lukuen/article/details/6935068)
+  * [图解SLUB/smcdef](http://www.wowotech.net/memory_management/426.html)
+  * [WrongZone从利用到修复——百度安全实验室](https://mp.weixin.qq.com/s/LO65mqL6MWF7whFPai8blQ)
+* * *

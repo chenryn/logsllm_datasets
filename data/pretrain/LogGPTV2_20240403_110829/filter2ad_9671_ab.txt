@@ -1,0 +1,49 @@
+行693，要保证optlen不小于sizeof(int)。行696，将optval赋值到val中，这里optval是用户可控的。行703，switch分发optname，所以要保证optname为SO_RCVBUF。这样就可以保证顺利到达修改sk->rcvbuf的代码处。
+到这里，我们通过两种方式进行绕过netlink_attachskb函数中的第一个check。
+1) 通过netlink_sendmsg增加sk->sk_rmem_alloc的值。
+2) 通过sock_setsockopt尽可能地减小sk->rcvbuf的值。
+进入if语句后，看如下代码：
+这段代码会让当前线程进入等待状态，直接block。如果不想进入等待状态，只有设置sock_flag为SOCK_DEAD。但是如果把sock_flag设置成SOCK_DEAD，那后面也没有必要进行，因此这里是必然要进入等待状态的。一种巧妙的方法是直接调用wake_up_interruptible强行唤醒线程。那如何调用wake_up_interruptible呢？函数调用链非常简短：netlink_setsockopt->wake_up_interruptible。
+在Netlink_setsockopt函数中：
+行2182，调用wake_up_interruptible唤醒线程。行2178，case为NETLINK_NO_ENOBUFS。
+行2131，判断level必须为SOL_NETLINK，行2134，判断optname不能为NETLINK_RX_RING和NETLINK_TX_RING，同时保证optlen大于等于sizeof(int)。行2139，switch分发optname，这里要保证optname为NETLINK_NO_ENOBUFS。到这里，基本上就可以保证netlink_attachskb返回1。
+保证进入retry循环后，这个时候sock已经不为空。接下来要使retry循环中出错，直接跳转到out，代码如下：
+行1232，通过fdget获取notification.sigev_signo的fd。Notification.sigev_signo是用户态传进来的，因此完全可以在用户层直接close这个socket。在用户层close这个socket后，行1233，进入if逻辑，然后跳到out标签。
+这个时候sock是非空的，if判断为真，进入netlink_destachskb，接着就是free崩溃。
+### 3\. **漏洞复现**
+对于UAF类型的漏洞，通用方法就是使用堆喷射占位。本次漏洞中被多次释放的对象是netlink_sock对象。netlink_sock对象大小为0x3f0字节，即是1008byte。
+根据内核对象内存分配规则， netlink_sock对象应该从kmalloc-1024这个缓存中进行分配。
+slab分配器在分配对象时，遵守后进先出的规则。
+下面是slab分配器释放对象的过程。
+要释放的对象objp放在了ac->entry[]的末端。下面是slab分配器分配对象的过程：
+分配对象直接从ac->entry[]末端弹出一个对象。
+所以一个刚刚被释放的对象是排在链表末段，如果此时恰好在同一缓存中进行对象分配，那刚刚释放的对象就会被重新分配出去，这就出现两个指针指向同一块内存地址。要想保证申请的内存正好落在漏洞对象的内存位置中，需要把握住几点：
+  1. 堆喷对象使用的内核缓存应该和漏洞对象内存在同一个缓存中。即大小必须落在同一个kmalloc-X中。
+  2. ac本身是array_chche结构体，该结构体是本地高速缓存，每个CPU对应一个，所以还要保证堆喷申请的对象和漏洞对象在同一个CPU本地高速缓存中。
+  3. 如果堆喷申请的对象只是短暂驻留，当该函数返回时将申请的对象进行了释放，导致无法正确占位。所以要能保证申请的对象不被释放，至少保证在使用漏洞对象时不被释放，这里要采用驻留式内存占位，可以采取让某些系统调用过程阻塞。
+  4. slab缓存碎片化问题，这里要占位的对象大小为1008，对象尺寸比较大，占据四分之一页，比较整齐，应该没有碎片化问题。
+那么如何判断堆喷是否成功呢？
+通用情况下，在进行堆喷时候，构造堆喷对象时，有必要在对应漏洞对象的一些特殊成员域的内存偏移处设置magic
+value，然后可以采用系统调用去获取漏洞对象中相关数据进行判断。netlink_sock结构体几个关键的成员如下。
+采用getsockname系统调用获取数据，getsockname会调用netlink_getname。具体看一下netlink_getname函数：
+代码1576行，将netlink_sock对象中的portid复制给nladdr->nl_pid。代码1577行，如果nlk->group为0，将nladdr->nl_groups赋值为NULL，这里避免解引用nlk->groups指针，直接可以在构造堆喷对象时将groups域填零。而nladdr是从addr转换过来的，addr就是从用户层传入的缓冲区。
+堆喷成功如下：
+通常情况是覆盖结构体中的函数指针或者包含函数指针的结构体成员，这视情况而定。这里选择覆盖wait等待队列。netlink_sock结构体如下：
+wait_queue_haed_t结构体如下：
+task_list成员是一个双向循环链表头，task_list中链接的每一个成员都是需要处理的等待例程元素。那该如何使用这个成员？看如下代码。
+这是netlink_setsockopt函数中的代码片段，前面恢复线程复活分析过，这里将会调用netlink_sock对象中的等待例程，直接使用参数nlk->wait。继续深入分析：
+调用__wake_up_common函数：
+代码70行，宏list_for_each_entry_safe遍历q->task_list中的成员，返回到curr。代码68行，curr为wait_queue_t指针，说明q->task_list链表中存的是wait_queue_t类型的元素，wait_queue_t结构体如下：
+wait_queue_t结构体中有一个函数指针func。再看 **wake_up_common函数中，代码73行，直接执行curr
+>func函数，可以通过构造**wait_queue的func参数控制RIP。再回过头看list_for_each_entry_safe宏：
+pos是 **wait_queue元素，代码62行，对pos->member.next进行了解引用，这里的pos->member就是**wait_queue中的task_list。__wait_queue中的task_list也是一个链表头，需要指向一个list_head，所以还必须要构造一个假的list_head以便于该宏进行解引用。测试如下：
+接下来就是通过ROP链绕过SMEP执行提权代码。成功提权后如下所示：
+### 4\. **参考链接**
+[1] 
+[2] 
+[3] 
+[4] 
+* * *
+**启明星辰积极防御实验室（ADLab）**
+ADLab成立于1999年，是中国安全行业最早成立的攻防技术研究实验室之一，微软MAPP计划核心成员。截止目前，ADLab通过CVE发布Windows、Linux、Unix等操作系统安全或软件漏洞近400个，持续保持国际网络安全领域一流水准。实验室研究方向涵盖操作系统与应用系统安全研究、移动智能终端安全研究、物联网智能设备安全研究、Web安全研究、工控系统安全研究、云安全研究。研究成果应用于产品核心技术研究、国家重点科技项目攻关、专业安全服务等。
+* * *

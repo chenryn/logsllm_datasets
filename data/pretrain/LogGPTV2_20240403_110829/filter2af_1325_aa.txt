@@ -1,0 +1,178 @@
+作者: **启明星辰ADLab**
+#### 1\. About“Phoenix Talon”
+2017年5月9日，启明星辰ADLab发现 Linux 内核存在远程漏洞 “Phoenix Talon”（取凤凰爪四趾之意），涉及
+CVE-2017-8890、CVE-2017-9075、CVE-2017-9076、CVE-2017-9077，可影响几乎所有 Linux kernel
+2.5.69 ~Linux kernel 4.11 的内核版本、对应的发行版本以及相关国产系统。可导致远程 DOS，且在符合一定利用条件下可导致
+RCE，包括传输层的 TCP、DCCP、SCTP 以及网络层的 IPv4 和 IPv6 协议均受影响。实际上该漏洞在 Linux 4.11-rc8
+版本中已经被启明星辰ADLab发现，且后来的 Linux 4.11 stable 版同样存在此问题。经研究这些漏洞在 Linux
+内核中至少已经潜伏了11年之久，影响极为深远。
+启明星辰ADLab已第一时间将 “Phoenix Talon” 漏洞反馈给了 Linux 内核社区，漏洞上报后 Linux 社区在 Linux
+4.12-rc1 中合并了修复该问题的补丁。
+这些漏洞中以 CVE-2017-8890 最为严重（达到 Linux 内核漏洞两个评分标准的历史最高分，CVSS V2 评分达到满分 10.0，CVSS
+V3 评分是历史最高分9.8，NVD 上搜索历史上涉及 Linux 内核漏洞这样评分的漏洞不超过 20 个），以下分析以该漏洞为例，引用官方描述如下：
+“The inet_csk_clone_lock function in net/ipv4/inet_connection_sock.c in the
+Linux kernel through 4.10.15 allows attackers to cause a denial of service
+(double free) or possibly have unspecified other impact by leveraging use of
+the accept system call.”
+#### 2\. The Vulnerability
+CVE-2017-8890 本身是一个 double free 的问题，使用 `setsockopt()` 函数中
+`MCAST\_JOIN\_GROUP`选项，并调用 `accept()` 函数即可触发该漏洞。
+接着先看看几个组播相关的数据结构：
+    include/uapi/linux/in.h
+    struct ip_mreq  {
+            struct in_addr imr_multiaddr;   /* IP multicast address of group */
+            struct in_addr imr_interface;   /* local IP address of interface */
+    };
+该结构体的两个成员分别用于指定所加入的多播组的组IP地址和所要加入组的本地接口IP地址。 `ip_setsockopt()` 实现了该功能，它通过调用
+`ip_mc_join_group()` 把 socket 加入到多播组。
+    include/net/inet_sock.h
+    struct inet_sock {
+        /* sk and pinet6 has to be the first two members of inet_sock */
+        struct sock     sk;
+    #if IS_ENABLED(CONFIG_IPV6)
+        struct ipv6_pinfo   *pinet6;
+    #endif
+        /* Socket demultiplex comparisons on incoming packets. */
+    #define inet_daddr      sk.__sk_common.skc_daddr
+    #define inet_rcv_saddr  sk.__sk_common.skc_rcv_saddr   
+    #define inet_dport      sk.__sk_common.skc_dport
+    #define inet_num        sk.__sk_common.skc_num
+    [...]
+        __u8            tos;
+        __u8            min_ttl;
+        __u8            mc_ttl;                 
+        __u8            pmtudisc;
+        __u8            recverr:1,
+                    is_icsk:1,
+                    freebind:1,
+                    hdrincl:1,                   
+                    mc_loop:1,                   
+    [...]
+        int         uc_index;                     
+        int         mc_index;                     
+        __be32          mc_addr;                 
+        struct ip_mc_socklist __rcu *mc_list;     
+        struct inet_cork_full   cork;
+    };
+其中 `sk.__sk_common.skc_rcv_saddr`
+对于组播而言，只接收该地址发来的组播数据，对于单播而言，只从该地址所代表的网卡接收数据；`mc_ttl` 为组播的 `ttl` ；`mc_loop`
+表示组播是否发向回路；`mc_index` 表示组播使用的本地设备接口的索引；`mc_addr` 表示组播源地址；`mc_list` 为组播列表。
+    include/linux/igmp.h
+    /* ip_mc_socklist is real list now. Speed is not argument;
+       this list never used in fast path code
+     */
+    struct ip_mc_socklist {
+            struct ip_mc_socklist __rcu *next_rcu;
+            struct ip_mreqn         multi;
+            unsigned int            sfmode;         /* MCAST_{INCLUDE,EXCLUDE} */
+            struct ip_sf_socklist __rcu     *sflist;
+            struct rcu_head         rcu;
+    };
+`next_rcu` 指向链表的下一个节点；`multi` 表示组信息，即在哪一个本地接口上，加入到哪一个多播组；`sfmode` 是过滤模式，取值为
+`MCAST_INCLUDE` 或 `MCAST_EXCLUDE` ，分别表示只接收 `sflist` 所列出的那些源的多播数据报和不接收 `sflist`
+所列出的那些源的多播数据报；`sflist` 是源列表。
+下面分别从该漏洞内存分配的关键代码及二次释放的关键代码进行分析。
+  * The Allocate
+内存分配调用链：
+1.用户态
+    setsockopt() -> 
+                …
+2.内核态:
+    -> entry_SYSCALL_64_fastpath() -> SyS_setsockopt() -> SYSC_setsockopt() -> sock_common_setsockopt() -> tcp_setsockopt() -> ip_setsockopt() -> do_ip_setsockopt() -> do_ip_setsockopt() -> ip_mc_join_group() -> sock_kmalloc() -> [...]
+使用 `setsockopt()` 函数中的 `MCAST_JOIN_GROUP` 选项。
+**net/socket.c**
+    1777 SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
+    1778                 char __user *, optval, int, optlen)
+    1779 {
+    1780         int err, fput_needed;
+    1781         struct socket *sock;
+    1782
+    1783         if (optlen ops->setsockopt(sock, level, optname, optval,
+    1799                                                   optlen);
+    1800 out_put:
+    1801                 fput_light(sock->file, fput_needed);
+    1802         }
+    1803         return err;
+    1804 }
+进入内核调用 `SyS_setsockopt()` 函数，level 设置的不为 SOL_SOCKET 即可，一般设置为 SOL_IP ，在1798
+行处被调用。紧接着调用 `sock_common_setsockopt()` 函数。
+**net/ipv4/ip_sockglue.c**
+    1256 int ip_setsockopt(struct sock *sk, int level,
+    1257                 int optname, char __user *optval, unsigned int optlen)
+    1258 {
+    1259         int err;
+    1260
+    1261         if (level != SOL_IP)
+    1262                 return -ENOPROTOOPT;
+    1263
+    1264         err = do_ip_setsockopt(sk, level, optname, optval, optlen);
+    1265 #ifdef CONFIG_NETFILTER
+    1266         /* we need to exclude all possible ENOPROTOOPTs except default case */
+    1267         if (err == -ENOPROTOOPT && optname != IP_HDRINCL &&
+    1268                         optname != IP_IPSEC_POLICY &&
+    1269                         optname != IP_XFRM_POLICY &&
+    1270                         !ip_mroute_opt(optname)) {
+    1271                 lock_sock(sk);
+    1272                 err = nf_setsockopt(sk, PF_INET, optname, optval, optlen);
+    1273                 release_sock(sk);
+    1274         }
+    1275 #endif
+    1276         return err;
+    1277 }
+然后进入 `ip_setsockopt()` 函数，调用 `do_ip_setsockopt()` 函数（1264行代码）。
+**net/ipv4/ip_sockglue.c**
+    599 static int do_ip_setsockopt(struct sock *sk, int level,
+    600                             int optname, char __user *optval, unsigned int optlen)
+    601 {
+    602         struct inet_sock *inet = inet_sk(sk);
+    603         struct net *net = sock_net(sk);
+    604         int val = 0, err;
+    605         bool needs_rtnl = setsockopt_needs_rtnl(optname);
+    606
+    607         switch (optname) {
+          [...]
+    1009         case MCAST_JOIN_GROUP:
+    1011         {
+    1012                 struct group_req greq;
+    1013                 struct sockaddr_in *psin;
+    1014                 struct ip_mreqn mreq;
+    1015
+    1016                 if (optlen sin_family != AF_INET)
+    1023                         goto e_inval;
+    1024                 memset(&mreq, 0, sizeof(mreq));
+    1025                 mreq.imr_multiaddr = psin->sin_addr;
+    1026                 mreq.imr_ifindex = greq.gr_interface;
+    1027
+    1028                 if (optname == MCAST_JOIN_GROUP)
+    1029                         err = ip_mc_join_group(sk, &mreq);
+    1030                 else
+    1031                         err = ip_mc_leave_group(sk, &mreq);
+    1032                 break;
+    1033         }
+    [...]
+代码 1019～1021 行调用 `copy_from_user()` 将用户态的数据拷贝到内核态。之前已经将 option 设置为
+`MCAST_JOIN_GROUP`，紧接着调用 `ip_mc_join_group()` 函数：
+**net/ipv4/igmp.c**
+    2094 int ip_mc_join_group(struct sock *sk, struct ip_mreqn *imr)
+    2095 {
+    2096         __be32 addr = imr->imr_multiaddr.s_addr;
+    2097         struct ip_mc_socklist *iml, *i;
+    2098         struct in_device *in_dev;
+    2099         struct inet_sock *inet = inet_sk(sk);
+    2100         struct net *net = sock_net(sk);
+    2101         int ifindex;
+    2102         int count = 0;
+    2103         int err;
+    2104
+    2105         ASSERT_RTNL();
+    2106
+    2107         if (!ipv4_is_multicast(addr))
+    2108                 return -EINVAL;
+    2109
+    2110         in_dev = ip_mc_find_dev(net, imr);
+    2111
+    2112         if (!in_dev) {
+    2113                 err = -ENODEV;
+    2114                 goto done;
+    2115         }
+    2116

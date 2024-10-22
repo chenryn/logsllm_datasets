@@ -1,0 +1,178 @@
+我们已经使用 Kubernetes 部署了应用正常工作所需的全部服务。
+### 前端
+更进一步，可以使用简易的 Web 应用更好的显示数据库中的信息。这也是一个对外公开的服务，使用的参数可以参考接收器。
+部署后效果如下：
+![](/data/attachment/album/201807/30/182349h0s7o6yi9o8760ir.jpg)
+### 回顾
+到目前为止我们做了哪些操作呢？我一直在部署服务，用到的命令汇总如下：
+```
+kubectl apply -f mysql.yaml
+kubectl apply -f nsqlookup.yaml
+kubectl apply -f receiver.yaml
+kubectl apply -f image_processor.yaml
+kubectl apply -f face_recognition.yaml
+kubectl apply -f frontend.yaml
+```
+命令顺序可以打乱，因为除了图片处理器的 NSQ 消费者外的应用在启动时并不会建立连接，而且图片处理器的 NSQ 消费者会不断重试。
+使用 `kubectl get pods` 查询正在运行的 Pods，示例如下：
+```
+❯ kubectl get pods
+NAME                                          READY     STATUS    RESTARTS   AGE
+face-recog-6bf449c6f-qg5tr                    1/1       Running   0          1m
+image-processor-deployment-6467468c9d-cvx6m   1/1       Running   0          31s
+mysql-7d667c75f4-bwghw                        1/1       Running   0          36s
+nsqd-584954c44c-299dz                         1/1       Running   0          26s
+nsqlookup-7f5bdfcb87-jkdl7                    1/1       Running   0          11s
+receiver-deployment-5cb4797598-sf5ds          1/1       Running   0          26s
+```
+运行 `minikube service list`：
+```
+❯ minikube service list
+|-------------|----------------------|-----------------------------|
+|  NAMESPACE  |         NAME         |             URL             |
+|-------------|----------------------|-----------------------------|
+| default     | face-recog           | No node port                |
+| default     | kubernetes           | No node port                |
+| default     | mysql                | No node port                |
+| default     | nsqd                 | No node port                |
+| default     | nsqlookup            | No node port                |
+| default     | receiver-service     | http://192.168.99.100:30251 |
+| kube-system | kube-dns             | No node port                |
+| kube-system | kubernetes-dashboard | http://192.168.99.100:30000 |
+|-------------|----------------------|-----------------------------|
+```
+滚动更新
+----
+ 滚动更新   Rolling Update 过程中会发生什么呢？
+![](/data/attachment/album/201807/30/182422mewkb7dxw87rej8v.jpg)
+在软件开发过程中，需要变更应用的部分组件是常有的事情。如果我希望在不影响其它组件的情况下变更一个组件，我们的集群会发生什么变化呢？我们还需要最大程度的保持向后兼容性，以免影响用户体验。谢天谢地，Kubernetes 可以帮我们做到这些。
+目前的 API 一次只能处理一个图片，不能批量处理，对此我并不满意。
+### 代码
+目前，我们使用下面的代码段处理单个图片的情形：
+```
+// PostImage 对图片提交做出响应，将图片信息保存到数据库中
+// 并将该信息发送给 NSQ 以供后续处理使用
+func PostImage(w http.ResponseWriter, r *http.Request) {
+...
+}
+func main() {
+    router := mux.NewRouter()
+    router.HandleFunc("/image/post", PostImage).Methods("POST")
+    log.Fatal(http.ListenAndServe(":8000", router))
+}
+```
+我们有两种选择。一种是增加新接口 `/images/post` 给用户使用；另一种是在原接口基础上修改。
+新版客户端有回退特性，在新接口不可用时回退使用旧接口。但旧版客户端没有这个特性，故我们不能马上修改代码逻辑。考虑如下场景，你有 90 台服务器，计划慢慢执行滚动更新，依次对各台服务器进行业务更新。如果一台服务需要大约 1 分钟更新业务，那么整体更新完成需要大约 1 个半小时的时间（不考虑并行更新的情形）。
+更新过程中，一些服务器运行新代码，一些服务器运行旧代码。用户请求被负载均衡到各个节点，你无法控制请求到达哪台服务器。如果客户端的新接口请求被调度到运行旧代码的服务器，请求会失败；客户端可能会回退使用旧接口，（但由于我们已经修改旧接口，本质上仍然是调用新接口），故除非请求刚好到达到运行新代码的服务器，否则一直都会失败。这里我们假设不使用 粘性会话   sticky sessions 。
+而且，一旦所有服务器更新完毕，旧版客户端不再能够使用你的服务。
+这里，你可能会说你并不需要保留旧代码；某些情况下，确实如此。因此，我们打算直接修改旧代码，让其通过少量参数调用新代码。这样操作操作相当于移除了旧代码。当所有客户端迁移完毕后，这部分代码也可以安全地删除。
+### 新的接口
+让我们添加新的路由方法：
+```
+...
+router.HandleFunc("/images/post", PostImages).Methods("POST")
+...
+```
+更新旧的路由方法，使其调用新的路由方法，修改部分如下：
+```
+// PostImage 对图片提交做出响应，将图片信息保存到数据库中
+// 并将该信息发送给 NSQ 以供后续处理使用
+func PostImage(w http.ResponseWriter, r *http.Request) {
+    var p Path
+    err := json.NewDecoder(r.Body).Decode(&p)
+    if err != nil {
+      fmt.Fprintf(w, "got error while decoding body: %s", err)
+      return
+    }
+    fmt.Fprintf(w, "got path: %+v\n", p)
+    var ps Paths
+    paths := make([]Path, 0)
+    paths = append(paths, p)
+    ps.Paths = paths
+    var pathsJSON bytes.Buffer
+    err = json.NewEncoder(&pathsJSON).Encode(ps)
+    if err != nil {
+      fmt.Fprintf(w, "failed to encode paths: %s", err)
+      return
+    }
+    r.Body = ioutil.NopCloser(&pathsJSON)
+    r.ContentLength = int64(pathsJSON.Len())
+    PostImages(w, r)
+}
+```
+当然，方法名可能容易混淆，但你应该能够理解我想表达的意思。我将请求中的单个路径封装成新方法所需格式，然后将其作为请求发送给新接口处理。仅此而已。在 [滚动更新批量图片的 PR](https://github.com/Skarlso/kube-cluster-sample/pull/1) 中可以找到更多的修改方式。
+至此，我们使用两种方法调用接收器：
+```
+# 单路径模式
+curl -d '{"path":"unknown4456.jpg"}' http://127.0.0.1:8000/image/post
+# 多路径模式
+curl -d '{"paths":[{"path":"unknown4456.jpg"}]}' http://127.0.0.1:8000/images/post
+```
+这里用到的客户端是 curl。一般而言，如果客户端本身是一个服务，我会做一些修改，在新接口返回 404 时继续尝试旧接口。
+为了简洁，我不打算为 NSQ 和其它组件增加批量图片处理的能力。这些组件仍然是一次处理一个图片。这部分修改将留给你作为扩展内容。 :)
+### 新镜像
+为实现滚动更新，我首先需要为接收器服务创建一个新的镜像。新镜像使用新标签，告诉大家版本号为 v1.1。
+```
+docker build -t skarlso/kube-receiver-alpine:v1.1 .
+```
+新镜像创建后，我们可以开始滚动更新了。
+### 滚动更新
+在 Kubernetes 中，可以使用多种方式完成滚动更新。
+#### 手动更新
+不妨假设在我配置文件中使用的容器版本为 `v1.0`，那么实现滚动更新只需运行如下命令：
+```
+kubectl rolling-update receiver --image:skarlso/kube-receiver-alpine:v1.1
+```
+如果滚动更新过程中出现问题，我们总是可以回滚：
+```
+kubectl rolling-update receiver --rollback
+```
+容器将回滚到使用上一个版本镜像，操作简捷无烦恼。
+#### 应用新的配置文件
+手动更新的不足在于无法版本管理。
+试想下面的场景。你使用手工更新的方式对若干个服务器进行滚动升级，但其它人并不知道这件事。之后，另外一个人修改了模板文件并将其应用到集群中，更新了全部服务器；更新过程中，突然发现服务不可用了。
+长话短说，由于模板无法识别已经手动更新的服务器，这些服务器会按模板变更成错误的状态。这种做法很危险，千万不要这样做。
+推荐的做法是，使用新版本信息更新模板文件，然后使用 `apply` 命令应用模板文件。
+对于滚动扩展，Kubernetes 推荐通过部署结合副本组完成。但这意味着待滚动更新的应用至少有 2 个副本，否则无法完成 （除非将 `maxUnavailable` 设置为 1）。我在模板文件中增加了副本数量、设置了接收器容器的新镜像版本。
+```
+  replicas: 2
+...
+    spec:
+      containers:
+      - name: receiver
+        image: skarlso/kube-receiver-alpine:v1.1
+...
+```
+更新过程中，你会看到如下信息：
+```
+❯ kubectl rollout status deployment/receiver-deployment
+Waiting for rollout to finish: 1 out of 2 new replicas have been updated...
+```
+通过在模板中增加 `strategy` 段，你可以增加更多的滚动扩展配置：
+```
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+```
+关于滚动更新的更多信息，可以参考如下文档：[部署的滚动更新](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-back-a-deployment)，[部署的更新](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)， [部署的管理](https://kubernetes.io/docs/concepts/cluster-administration/manage-deployment/#updating-your-application-without-a-service-outage) 和 [使用副本控制器完成滚动更新](https://kubernetes.io/docs/tasks/run-application/rolling-update-replication-controller/)等。
+MINIKUBE 用户需要注意：由于我们使用单个主机上使用单节点配置，应用只有 1 份副本，故需要将 `maxUnavailable` 设置为 `1`。否则 Kubernetes 会阻止更新，新版本会一直处于 `Pending` 状态；这是因为我们在任何时刻都不允许出现没有（正在运行的） `receiver` 容器的场景。
+### 扩展
+Kubernetes 让扩展成为相当容易的事情。由于 Kubernetes 管理整个集群，你仅需在模板文件中添加你需要的副本数目即可。
+这篇文章已经比较全面了，但文章的长度也越来越长。我计划再写一篇后续文章，在 AWS 上使用多节点、多副本方式实现扩展。敬请期待。
+### 清理环境
+```
+kubectl delete deployments --all
+kubectl delete services -all
+```
+写在最后的话
+------
+各位看官，本文就写到这里了。我们在 Kubernetes 上编写、部署、更新和扩展（老实说，并没有实现）了一个分布式应用。
+如果你有任何疑惑，请在下面的评论区留言交流，我很乐意回答相关问题。
+希望阅读本文让你感到愉快。我知道，这是一篇相对长的文章，我也曾经考虑进行拆分；但整合在一起的单页教程也有其好处，例如利于搜索、保存页面或更进一步将页面打印为 PDF 文档。
+Gergely 感谢你阅读本文。
+---
+via: 
+作者：[hannibal](https://github.com/Skarlso) 译者：[pinewall](https://github.com/pinewall) 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创编译，[Linux中国](https://linux.cn/) 荣誉推出

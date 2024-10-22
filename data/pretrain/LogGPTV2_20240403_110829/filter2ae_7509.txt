@@ -1,0 +1,150 @@
+**作者：wzt  
+原文链接：**
+# 1 背景
+## 1.1 freebsd audit 简介
+`Freebsd
+audit`子系统是由`TrustBSD`项目从`Apple`的`XNU`内核移植过来的，在`freebsd6.2`系统中发布。`XNU`内核中的`audit`子系统最初是由`McAfee`公司给`apple`设计的，它遵循的是`solaris`发明的`BSM`框架。
+## 1.2 freebsd 与 linux audit 对比
+同样作为`audit`审计功能，`freebsd`的设计理念跟`linux`的有所不同。
+  * 1) 对于审计的对象， `linux`是每个系统调用，而`freebsd`定义的则是`event`事件，多个类似的`event`事件归属同一个`class`组。对于`linux`，在用户空间定义规则时就要指定某个具体的系统调用，`freebsd`则是指定的`class`组。
+  * 2) `linux`提供了更精确的`rule`规则列表，只针对在某种特定条件下才记录日志，它有一个规则匹配引擎，而`freebsd`没有提供这项功能，只是纯粹的记录日志。比如两个系统都能监控`socket`系统调用，`freebsd`会把所有的`socket`调用都记录，而`linux`可以做到只记录第一个参数`domain`为`AF_INET`，第二个参数`type`为`SOCK_STREAM`，第三个参数为`IPPROTO_TCP`的某次`socket`调用。当然`linux`的规则引擎也不完备，不能处理指针和结构体。规则数目较多时，系统会感到明显的卡顿，在敏感的系统调用路径里，规则审计应该做到越快越好，从这一点上来说，`freebsd`的做法似乎更纯粹一些。
+  * 3) 对于与用户层的通讯接口，`linux`使用的是`netlink socket`，而`freebsd`则是增加了若干系统调用以及`/dev/audit`和`/dev/audit_pipe`来做通讯。
+  * 4) 对于审计的入口，`freebsd`只在系统调用入口处处理，而`linux`还可以从进程`fork`以及文件系统等路径进行处理。
+  * 5) `Freebsd`没有对全部的系统调用进行审计，而`linux`则是全部都要审计。
+  * 6) 对于系统调用参数的记录是比较困难的， 因为不同的系统调用参数个数不同，每个参数的类型也不同，类型还可能包括指针和数据结构嵌套， 目前业界没有一个较好的算法能捕获这些参数。所以`freebsd`的做法是在内核大部分模块中都加入了`hook`，才可以保证系统调用参数的获取，而`linux`对这种支持很少。
+  * 7) `Freebsd`对`MAC`强制访问控制系统是不做审计的， 而`linux`对`MAC`甚至是`secomp`都做了审计操作。
+  * 8) `Freebsd`的日志格式采用的是工业界的标准`BSM(basic security model)`，`linux`采用的是自定义的格式。
+# 2 实现
+## 2.1 与用户层通讯接口
+`Freebsd` 增加了以下几个系统调用，用于从用户层与内核层的通讯，这些系统调用包括`audit`功能开启，参数配置等等。
+    sys_audit// 向内核传递用户层自定义的日志内容
+    sys_auditon// 用于参数和规则控制
+    sys_getauid// 获取audit session id
+    sys_setauid// 设置audit session id
+    sys_getaudit// 获取audit状态信息
+    sys_setaudit// 设置audit状态信息
+    sys_getaudit_addr// 获取audit状态信息， 包含一些额外信息
+    sys_setaudit_addr// 设置audit状态信息， 包含一些额外信息
+    sys_auditctl// 建立一个新的audit日志文件
+这几个系统调用的实现逻辑都比较简单，笔者不在本文进行讲解，读者朋友可以自己尝试阅读下源码。
+## 2.2 审计实现
+我们同样以`x86`体系为例，看下`freebsd audit`子系统的入口是如何进入的。
+    amd64/amd64/exception.S：
+    IDTVEC(fast_syscall)
+            call    amd64_syscall
+    amd64/amd64/trap.c：
+    amd64_syscall()->syscallenter
+    syscallenter(struct thread *td)
+    {
+        AUDIT_SYSCALL_ENTER(sa->code, td);[1]
+        error = (sa->callp->sy_call)(td, sa->args);[2]
+        AUDIT_SYSCALL_EXIT(error, td);[3]
+    }
+在执行具体的系统调用[2]之前，需要在[1] 处执行审计的预处理：
+    security/audit/audit.c：
+    void
+    audit_syscall_enter(unsigned short code, struct thread *td)
+    {
+            event = td->td_proc->p_sysent->sv_table[code].sy_auevent;[4]
+            auid = td->td_ucred->cr_audit.ai_auid;[5]
+            if (auid == AU_DEFAUDITID)
+                    aumask = &audit_nae_mask;
+            else
+                    aumask = &td->td_ucred->cr_audit.ai_mask;
+            class = au_event_class(event);[6]
+            if (au_preselect(event, class, aumask, AU_PRS_BOTH)) {[7]
+                    record_needed = 1;
+            } else if (audit_pipe_preselect(auid, event, class, AU_PRS_BOTH, 0)) {[8]
+                    record_needed = 1;
+            } else {
+                    record_needed = 0;
+            }
+            if (record_needed) {
+                    td->td_ar = audit_new(event, td);[9]
+    }
+`freebsd`在每个进程结构体里都保存一个系统调用数组指针`struct sysentvec`，它包含一个成员`struct sysent`：
+    struct sysent {                 /* system call table */
+            int     sy_narg;        /* number of arguments */
+            sy_call_t *sy_call;     /* implementing function */
+            au_event_t sy_auevent;  /* audit event associated with syscall */
+            systrace_args_func_t sy_systrace_args_func;
+                                    /* optional argument conversion function. */
+            u_int32_t sy_entry;     /* DTrace entry ID for systrace. */
+            u_int32_t sy_return;    /* DTrace return ID for systrace. */
+            u_int32_t sy_flags;     /* General flags for system calls. */
+            u_int32_t sy_thrcnt;
+    };
+`Sy_call` 保存的是具体的系统调用函数指针。
+前面讲过`freebsd
+audit`是基于`event`事件来驱动的，`sy_auevent`保存的就是`event`事件号。每个系统调用只有一个或没有`event`事件。如果没有`event`事件，那么在`audit`审计的时候就会被忽略。这一点与`linux`不同，
+`linux`是所有的系统调用都要被审计。我们可以看下`freebsd`的`init`进程的`struct sysent`的初始化表：
+    kern/init_sysent.c：
+    struct sysent sysent[] = {
+            { 0, (sy_call_t *)nosys, AUE_NULL, NULL, 0, 0, 0, SY_THR_STATIC },            
+            { AS(sys_exit_args), (sy_call_t *)sys_sys_exit, AUE_EXIT, NULL, 0, 0, SYF_CAPENABLED, SY_THR_STATIC },  
+            { 0, (sy_call_t *)sys_fork, AUE_FORK, NULL, 0, 0, SYF_CAPENABLED, SY_THR_STATIC },      
+            { AS(break_args), (sy_call_t *)sys_break, AUE_NULL, NULL, 0, 0, SYF_CAPENABLED, SY_THR_STATIC },
+            { compat(AS(ogetkerninfo_args),getkerninfo), AUE_NULL, NULL, 0, 0, 0, SY_THR_STATIC },  /* 63 = old getkerninfo */
+            { compat(0,getpagesize), AUE_NULL, NULL, 0, 0, SYF_CAPENABLED, SY_THR_STATIC }, /* 64 = old getpagesize */
+    }
+这里还是有很多空`event`事件的，那么这些系统调用都不会被`audit`审计到。`Freebsd`内核开发者应该是认为某些系统调用没有危险性，所以暂时不需要被审计到。
+在[5]处获取当前的会话`session id`，来判断是否使用内核的`class mask`还是进程的`class
+mask`。[6]处开始将`event`事件号，转化为对应的`class`组，前面提到`freebsd`将类似的`event`事件归并入一个`class`组。`Event`事件和`class`组是通过哈希表来管理的，
+`audit`子系统在初始化的时候把上述`init`进程的`sysent`数组中`event`号进行提取，然后归档到哈希表中。后续应用进程也可以通过`auditon`来进行动态添加。[7]处的`au_preselect`对`class
+mark`进行匹配，来判断是否需要进行本地审计。[9]处是否需要使用`/dev/audit_pipe`来与用户层进行实时交互。[9]处如果需要记录就通过`audit_new`动态分配一个`struct
+kaudit_record`数据结构。Linux的audit数据结构是在进程`fork`时就提前生成，笔者认为这样做的效率会高些。
+当[2]处具体的系统调用执行完毕后， 在[3]处开始做记录日志操作。
+    void
+    audit_syscall_exit(int error, struct thread *td)
+    {
+            audit_commit(td->td_ar, error, retval);
+    }
+    void
+    audit_commit(struct kaudit_record *ar, int error, int retval)
+    {
+            while (audit_q_len >= audit_qctrl.aq_hiwater)
+                    cv_wait(&audit_watermark_cv, &audit_mtx);
+            TAILQ_INSERT_TAIL(&audit_q, ar, k_q);
+            audit_q_len++;
+            audit_pre_q_len--;
+            cv_signal(&audit_worker_cv);
+    }
+与`linux`不同，
+`feebsd`的系统调用日志记录操作逻辑很清晰简单，因为没有`linux`的规则匹配引擎。`Linux`在进入系统调用之前只有一些简单的初始化操作，真正的判断是在系统调用返回时通过规则引擎来识别的，这是它们的不同之处。
+`Freebsd`是在进入系统调用之前就已经预判此次系统调用是否需要被审计，后续的`audit_commit`只管往日志队列里写数据，当队列长度超过高水位线时就进行休眠，否则将一个节点插入到队列里，并唤醒等待的`audit
+worker`进程。
+`Audit worker`进程是在`audit`子系统初始化被建立的：
+    static void
+    audit_worker(void *arg)
+    {
+            struct kaudit_queue ar_worklist;
+            struct kaudit_record *ar;
+            int lowater_signal;
+            TAILQ_INIT(&ar_worklist);[1]
+              while (1) {
+                    mtx_assert(&audit_mtx, MA_OWNED);
+                    while (TAILQ_EMPTY(&audit_q))[2]
+                            cv_wait(&audit_worker_cv, &audit_mtx);
+                    lowater_signal = 0;
+                    while ((ar = TAILQ_FIRST(&audit_q))) {[3]
+                            TAILQ_REMOVE(&audit_q, ar, k_q);
+                            audit_q_len--;
+                            if (audit_q_len == audit_qctrl.aq_lowater)
+                                    lowater_signal++;
+                            TAILQ_INSERT_TAIL(&ar_worklist, ar, k_q);
+                    }
+                    if (lowater_signal)[4]
+                            cv_broadcast(&audit_watermark_cv);
+                    mtx_unlock(&audit_mtx);
+                    while ((ar = TAILQ_FIRST(&ar_worklist))) {[5]
+                            TAILQ_REMOVE(&ar_worklist, ar, k_q);
+                            audit_worker_process_record(ar);[6]
+                            audit_free(ar);
+                    }
+                    mtx_lock(&audit_mtx);
+            }
+    }
+[1]处初始化一个临时的日志队列，[2]处判断`audit`日志队列是否为空，为空时就进入休眠状态，当再次被唤醒后，如果`audit`日志队列不为空，就将节点一个个取下来插入到临时队列里，同时判断`audit`日志队列长度在低水位线时，就要在[4]处通知`audit_commit`进行日志的补充。`Linux`的这部分操作没有使用临时队列，而是在持有锁的情况下进行队列节点的处理，而`freebsd`则是将节点插入临时队列后，马上释放锁，这样做做效率会更高些。
+[6]处的`audit_worker_process_record`首先将日志转化为`BSM`格式后，通过调用`audit_record_write`将日志写入到磁盘文件里，然后调用`audit_send_trigger`，将日志信息同步到一个队列里，
+这个队列是由`/dev/audit`进行操作，这样用户态程序可以通过读取`/dev/audit`获取到本次系统调用的日志内容。
+* * *

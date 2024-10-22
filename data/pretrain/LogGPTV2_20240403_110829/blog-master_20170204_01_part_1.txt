@@ -1,0 +1,189 @@
+## PostgreSQL GIN索引实现原理    
+### 作者           
+digoal            
+### 日期            
+2017-02-04                                      
+### 标签                                                                                                                            
+PostgreSQL , GIN , 内核 , 实现原理 , PostgreSQL数据库内核分析      
+----            
+## 背景    
+本文参考并扩展自如下文档，修正了一些内容(大多数是由于版本不同造成的差异)   
+《PostgreSQL数据库内核分析》 ( 成书较早,大量内容基于8.4的代码编写 )    
+以及    
+http://zisedeqing.blog.163.com/blog/static/95550871201621623458216/   ( 大量内容参考自 PostgreSQL数据库内核分析 )    
+## 术语  
+本文适用的一些术语  
+属性 - 可能取自pg_attribute，指的是列。  
+```  
+postgres=# \d pg_attribute  
+              Table "pg_catalog.pg_attribute"  
+    Column     |   Type    | Collation | Nullable | Default   
+---------------+-----------+-----------+----------+---------  
+ attrelid      | oid       |           | not null |   
+ attname       | name      |           | not null |   
+ atttypid      | oid       |           | not null |   
+ attstattarget | integer   |           | not null |   
+ attlen        | smallint  |           | not null |   
+ attnum        | smallint  |           | not null |   
+ attndims      | integer   |           | not null |   
+ attcacheoff   | integer   |           | not null |   
+ atttypmod     | integer   |           | not null |   
+ attbyval      | boolean   |           | not null |   
+ attstorage    | "char"    |           | not null |   
+ attalign      | "char"    |           | not null |   
+ attnotnull    | boolean   |           | not null |   
+ atthasdef     | boolean   |           | not null |   
+ attisdropped  | boolean   |           | not null |   
+ attislocal    | boolean   |           | not null |   
+ attinhcount   | integer   |           | not null |   
+ attcollation  | oid       |           | not null |   
+ attacl        | aclitem[] |           |          |   
+ attoptions    | text[]    |           |          |   
+ attfdwoptions | text[]    |           |          |   
+Indexes:  
+    "pg_attribute_relid_attnam_index" UNIQUE, btree (attrelid, attname)  
+    "pg_attribute_relid_attnum_index" UNIQUE, btree (attrelid, attnum)  
+```  
+元组 - tuple，指的是行(包括heap tuple, index tuple等，都可以叫元组)。  
+tid, ctid - 指行号(block_number, item pointer)，包括HEAP表的BLOCK NUMBER，以及在BLOCK中指向行的item pointer。  
+键值 - 指索引结构中的KEY  
+基表 - 创建索引的表  
+## 1 概述  
+GIN(Generalized Inverted Index, 通用倒排索引) 是一个存储对(key, posting list)集合的索引结构，其中key是一个键值，而posting list 是一组出现过key的位置。如(‘hello', '14:2 23:4')中，表示hello在14:2和23:4这两个位置出现过，在PG中这些位置实际上就是元组的tid(行号，包括数据块ID（32bit）,以及item point(16 bit) )。  
+在表中的每一个属性，在建立索引时，都可能会被解析为多个键值，所以同一个元组的tid可能会出现在多个key的posting list中。  
+通过这种索引结构可以快速的查找到包含指定关键字的元组，因此GIN索引特别适用于多值类型的元素搜索，比如支持全文搜索，数组中元素的搜索，而PG的GIN索引模块最初也是为了支持全文搜索而开发的。  
+说到这里，你可能会觉得GIN的结构有点像b+tree，包括KEY和对应的值(posting list)。别急，请继续往下看。      
+## 2 GIN索引的扩展开发  
+GIN是一个开放的索引接口，所以它不仅适用于已经存在的如数组、全文检索等数据类型，同样也可以扩展支持更多的数据类型。  
+请用户参考扩展指南如下，现在可能已经不止实现5种接口了。  
+https://www.postgresql.org/docs/9.6/static/gin-extensibility.html  
+GIN索引具有很好的可扩展性，允许在开发自定义数据类型时由该数据类型的领域专家（而非数据库专家）设计适当的访问方法，这些访问方法只需考虑对于数据类型本身的语义处理，GIN索引自身可以处理并发控制、日志记录、搜索树结构等操作。  
+定义一个GIN访问方法所要做的就是实现5个用户定义的方法，这些方法定义了键值、键值与键值之间的关系、被索引值、能够使用索引的查询以及部分匹配。  
+这些方法是：  
+1\. compare方法：比较两个键值a和b，然后返回一个整数值，返回负值表示a  b。  
+其函数原型如下：  
+```  
+int compare(Datum a, Datum b)  
+```  
+2\. extractValue方法：根据参数inputValue生成一个键值数组，并返回其指针，键值数组中元素的个数存放在另一个参数nkeys中。  
+其函数原型如下：  
+```  
+Datum *extractValue(Datum inputValue, int32 *nkeys)  
+```  
+3\. extractQuery方法：根据参数query生成一个用于查询的键值数组，并返回其指针。  
+函数原型如下：  
+```  
+Datum *extractQuery(Datum query, int32 *nkeys, StrategyNumber n, bool **pmatch, Pointer **extra_data)  
+```  
+extractQuery通过参数n指定的操作符策略号来决定query的数据类型以及需要提取的键值，返回键值数组的长度存放在nkeys参数中。  
+如果query中不包含键值，则nkeys可以为0或者-1：  
+nkeys = 0 表示索引中所有值都满足查询，将执行完全索引扫描(查询null时是这样); nkeys = -1 表示索引中没有键值满足查询，跳过索引扫描。  
+在部分匹配时，输出参数pmatch记录返回的键值数组中的每一个键值是否请求部分匹配。  
+输出参数extra_data用来向consistent和comparPartial方法传递用户自定义需要的数据。  
+4\. consistent方法：用于检查索引值是否满足查询，  
+其函数原型如下：  
+```  
+bool consistent(bool check[], StrategyNumber n, Datum query, int32 nkeys, Pointer extra_data[], bool *recheck)  
+```  
+如果索引值满足查询则返回true，如果recheck = true，则返回true的索引还需要进一步的检查。  
+recheck: 精确比较时recheck = false；否则recheck = true，通过索引找到的基表元组还需要进行是否满足操作符的检查（在TSVector类型时，如果key带有权值，则recheck = true）。  
+PS ：   
+如果索引KEY中区分了权值，则recheck依旧=false。 用户需要看看各个版本的release notes或者跟踪代码的迭代，比如PostgreSQL 9.6, postgrespro rum索引接口。     
+[《PostgreSQL 全文检索加速 快到没有朋友 - RUM索引接口(潘多拉魔盒)》](../201610/20161019_01.md)  
+[《从难缠的模糊查询聊开 - PostgreSQL独门绝招之一 GIN , GiST , SP-GiST , RUM 索引原理与技术背景》](../201612/20161231_01.md)  
+以查询 fat & (cat | dog)为例，consistent的执行：  
+![pic](20170204_01_pic_001.png)    
+PostgreSQL 9.4对GIN的扫描，存储都进行了优化，例如可以跳过一些posting list的检查或者一些ctid的检查。（从最短的posting tree/list开始，跳过其他更小的ctid），请参考  
+[《PostgreSQL GIN multi-key search 优化》](../201702/20170203_01.md)  
+5\. comparePartial方法：将部分匹配的查询与索引值进行比较，返回值为负值表示两者不匹配，但继续索引扫描；返回值为0表示两者匹配；返回值为正值表示停止扫描。  
+其函数原型如下：  
+```  
+int comparePartial(Datum partial_key, Datum key, StrategyNumber n, Pointer extra_data)  
+```  
+第6种接口为可选接口，用于partial match，类似lossy index.    
+```  
+int comparePartial(Datum partial_key, Datum key, StrategyNumber n, Pointer extra_data)  
+```  
+所以在PG中添加一种新的数据类型并且让GIN支持该数据类型，则需要完成以下步骤：  
+1\. 添加数据类型  
+2\. 为新数据类型实现并注册各种操作符所需要的函数，然后创建新类型的操作符  
+3\. 用CREATE OPERATOR CLASS为新的数据类型创建一个操作符类，该语句需要指定GIN索引所需要的5个支持函数  
+PG的GIN索引，内部实现了对于TSVector数据类型的支持，并提供了把TEXT类型转换成TSVector的接口，所以可以说PG的GIN索引支持TSVector和TEXT的数据类型。  
+## 3 GIN索引结构  
+### 逻辑结构  
+GIN索引在逻辑上可以看成一个relation，该relation有两种结构：  
+1\. 只索引基表的一列  
+key | value  
+---|---  
+Key1 | Posting list( or posting tree)  
+Key2 | Posting list( or posting tree)  
+… | …  
+2\. 索引基表的多列(复合、多列索引)  
+column_id | key | value  
+---|---|---  
+Column1 num | Key1 | Posting list( or posting tree)  
+Column2 num | Key1 | Posting list( or posting tree)  
+Column3 num | Key1 | Posting list( or posting tree)  
+... | ... | ...  
+这种结构，对于基表中不同列的相同的key，在GIN索引中也会当作不同的key来处理。  
+### 物理结构  
+GIN索引在物理存储上包含如下内容：  
+1\. Entry：GIN索引中的一个元素，可以认为是一个词位，也可以理解为一个key  
+2\. Entry tree：在Entry上构建的B树  
+3\. posting list：一个Entry出现的物理位置(heap ctid, 堆表行号)的链表  
+4\. posting tree：在一个Entry出现的物理位置链表(heap ctid, 堆表行号)上构建的B树，所以posting tree的KEY是ctid，而entry tree的KEY是被索引的列的值   
+5\. pending list：索引元组的临时存储链表，用于fastupdate模式的插入操作  
+从上面可以看出GIN索引主要由Entry tree和posting tree（or posting list）组成，其中Entry tree是GIN索引的主结构树，posting tree是辅助树。   
+entry tree类似于b+tree，而posting tree则类似于b-tree。   
+另外，不管entry tree还是posting tree，它们都是按KEY有序组织的。   
+#### 1 Entry tree  
+entry tree是一个B树，与Btree索引类似，用来组织和存储(key, posting list)对，其树结构如下：  
+![pic](20170204_01_pic_002.png)  
+从上图可以看出非叶子节点的每个元组都有一个指向孩子节点的指针(child pointer)，该指针由索引元组结构的tid(表示下层数据块ID，即下层GIN索引数据块ID)来表示，中间节点和叶子节点还有一个右兄弟节点指针，指向其右兄弟节点，该指针记录在GinPageOpaqueData的rightlink内(即索引页的special部分，在页面的尾部)。  
+src/include/access/gin_private.h  
+```  
+/*  
+ * Page opaque data in an inverted index page.  
+ *  
+ * Note: GIN does not include a page ID word as do the other index types.  
+ * This is OK because the opaque data is only 8 bytes and so can be reliably  
+ * distinguished by size.  Revisit this if the size ever increases.  
+ * Further note: as of 9.2, SP-GiST also uses 8-byte special space, as does  
+ * BRIN as of 9.5.  This is still OK, as long as GIN isn't using all of the  
+ * high-order bits in its flags word, because that way the flags word cannot  
+ * match the page IDs used by SP-GiST and BRIN.  
+ */  
+typedef struct GinPageOpaqueData  
+{  
+        BlockNumber rightlink;          /* next page if any */  
+        OffsetNumber maxoff;            /* number of PostingItems on GIN_DATA &  
+                                                                 * ~GIN_LEAF page. On GIN_LIST page, number of  
+                                                                 * heap tuples. */  
+        uint16          flags;                  /* see bit definitions below */  
+} GinPageOpaqueData;  
+typedef GinPageOpaqueData *GinPageOpaque;  
+#define GIN_DATA                  (1 << 0)  
+#define GIN_LEAF                  (1 << 1)  
+#define GIN_DELETED               (1 << 2)  
+#define GIN_META                  (1 << 3)  
+#define GIN_LIST                  (1 << 4)  
+#define GIN_LIST_FULLROW  (1 << 5)              /* makes sense only on GIN_LIST page */  
+#define GIN_INCOMPLETE_SPLIT (1 << 6)   /* page was split, but parent not  
+                                                                                 * updated */  
+#define GIN_COMPRESSED    (1 << 7)  
+/* Page numbers of fixed-location pages */  
+#define GIN_METAPAGE_BLKNO      (0)  // meta数据块固定为0号
+#define GIN_ROOT_BLKNO          (1)  // root数据块固定为1号
+```  
+entry tree的非叶子节点与普通的btree树的非叶子节点类似。  
+其叶子节点与普通btree的叶子节点不同，普通btree的叶子节点指向其索引的元组，而entry tree的叶子节点指向posting list，或者是posting tree。该指针用索引元组结构的tid表示。   
+具体如何区分posting list和posting tree将在页面结构中介绍。  
+从上图可以看出，如果posting list退化成单个item pointer，则GIN索引的结构就与B树索引完全一样(其实也不完全一样，如下)。  
+PS :   
+gin 的btree和PostgreSQL的nbtree不一样，相比nbtree更简化，(比如nbtree的同级PAGE包含了双向链接，而gin btree只有right link)。  
+参考  
+[《深入浅出PostgreSQL B-Tree索引结构》](../201605/20160528_01.md)  
+[《B-Tree和B+Tree》](../201606/20160610_01.md)    
+#### 2 posting tree  
+posting tree与entry tree 类似，也是一个B树，其树结构与entry tree完全一样，不同之处就是posting tree页面存储的元组内容与entry tree不同，如下：  
+![pic](20170204_01_pic_003.png)  

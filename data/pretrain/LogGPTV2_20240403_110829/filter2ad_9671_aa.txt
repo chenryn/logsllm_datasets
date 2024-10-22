@@ -1,0 +1,50 @@
+**作者：启明星辰ADLab  
+公众号：**
+### 1\. **漏洞背景**
+Linux内核中的POSIX
+消息队列实现中存在一个UAF漏洞CVE-2017-11176。攻击者可以利用该漏洞导致拒绝服务或执行任意代码。本文将从漏洞成因、补丁分析以及漏洞复现等多个角度对该漏洞进行详细分析。
+### 2\. **漏洞分析**
+Posix消息队列允许异步事件通知，当往一个空队列放置一个消息时，Posix消息队列允许产生一个信号或启动一个线程。这种异步事件通知调用mq_notify函数实现，mq_notify为指定队列建立或删除异步通知。由于mq_notify函数在进入retry流程时没有将sock指针设置为NULL，可能导致UAF漏洞。
+从补丁代码可知，将sock设置为NULL即可。
+接下来看看漏洞起因，这里以4.1.0版本源码为例。
+在mq_notify函数中，
+u_notification是从用户层传进来的，1193行判断u_notification是否为空，如果非空，通过copy_from_user将u_notification中
+的数据拷贝到notification中，这里将数据从用户层拷贝到了内核层。如果拷贝失败，直接退出。
+接下来，nc和sock分别置空。行1203，如果u_notification不为空，首先依次判断notification.sigev_notify必须为SIGEV_NONE或SIGEV_SIGNAL或SIGEV_THREAD。如果notification.sigev_notify为SIGEV_SIGNAL，就判断该信号是否合法。
+行1212，如果notification.sigev_notify为SIGEV_THREAD，进入关键代码块。行1216，通过alloc_skb创建一个notify_skb，用于接收数据。行1221，通过copy_from_user将notification.sigev_value.sival_ptr指向的数据拷贝到nc->data中。这里必须成功，不然直接退出；行1229，调用skb_put设置消息数据头部。行1231到行1248是retry循环体。行1232，调用fdget函数获取文件描述符。行1237，调用netlink_getsockbyfilp函数通过文件描述符获取netlink_sock，具体看一下netlink_getsockbyfilp函数。
+调用file_inode通过filp找到对应的inode节点，然后通过SOCK_I函数处理inode节点。
+这里通过宏container_of在socket_alloc结构体中找出socket成员。这里解释一下，SOCKET_I返回值是socket结构体。其实sock结构体中第一个成员sock_common也是socket类型，是一个迷你版socket。
+下面看一下sock_common结构体。
+行1609，获取到sock后，然后判断sock->sk_family是否等于AF_NETLINK。行1613，接着调用sock_hold增加引用计数。sock_hold函数如下：
+这里atomic_inc进行sk_refcnt加1。netlink_getsockbyfilp函数返回sock，这时sock的引用计数为1。接下来，行1246，调用netlink_attachskb。这是个关键函数，该函数功能是将skb绑定到netlink
+socket上，具体关键代码如下：
+行1683，调用sock_put减少引用计数一次，最后return 1，函数返回，直接goto到retry标签地方。
+这里行1237和行1246，这两处调用正好进行了引用计数抵消。行1247的if语句中并没有将sock置空，再看行1233，如果f.file为空，那就直接goto到out标签。out标签代码如下：
+行1306，判断sock是否为空，如果不为空，调用netlink_detachskb函数。
+释放skb，并减少sk引用计数，进行释放。
+那么就有问题了，如果我们创建A线程保持netlink_attachskb返回1，并重复retry逻辑，这个时候sock的引用计数是保持平衡的，一加一减，但是sock并不是为空。同时再创建B线程去关闭netlink
+socket对应的文件描述符。由于B线程关闭了netlink
+socket的文件描述符，那A线程在retry逻辑中，行1232，调用fdget时会失败，然后直接goto到out标签，进行释放，进行了二次释放，导致漏洞。这个漏洞是属于条件竞争型的二次释放漏洞，只在一个线程中，是无法触发漏洞。
+这个漏洞原理比较简单，但是如何触发这个漏洞还是比较复杂。首先，如何让netlink_attachskb返回1，从而顺利进入retry逻辑。再次回看netlink_attachskb的实现。
+行1657，通过nlk_sk函数通过sk获取netlink_sock。这里的nlk_sk如下。
+通过调用宏container_of获取netlink_sock。netlink_sock结构体如下：
+netlink_sock结构体第一个成员是sock类型，而sock结构体的第一个成员是socket。行1660，第一个if判断必须得进入。
+!netlink_skb_is_mmaped(skb)肯定返回true，关键是sk->sk_rmem_alloc>sk->sk_rcvbuf ||
+test_bit(NETLINK_CONGESTED, &nlk->state)结果必须是true。
+这里通过设置sk->sk_rmem_alloc的大小绕过check更为方便，代码如下。
+假如if判断不通过，接着调用netlink_skb_set_owner_r函数，如下所示。
+行878，调用宏atomic_add，该宏执行原子加操作。这行代码的含义是：在sk->sk_rmem_alloc的基础上加上skb->truesize。等同于sk->sk_rmem_alloc
++=
+skb->truesize。既然该函数里这行代码可以直接增加sk->sk_rmem_alloc的大小，那么可不可以多次调用netlink_skb_set_owner_r函数增加sk->rmem_alloc的值？理论上是完全可以的，看看如何从用户层到达这个函数。
+通过understand工具可以快速找到netlink_skb_set_owner_r的调用链：
+netlink_sendmsg->netlink_unicast->netlink_attachskb->netlink_skb_set_owner_r
+如何顺利的通过函数调用路径？这里需要分析如何从netlink_sendmsg到达netlink_skb_set_owner_r。
+netlink_sendmsg函数实现如下。
+行2285，首先判断msg->msg_flag不能为MSG_OOB，继续往下看。
+行2292，判断msg->msg_namelen的长度，这里必须不为空，当然也不会为空。进入if后，判断addr->nl_family是否等于AF_NETLINK。行2299，判断dst_group或dst_portid不为空，dst_group表示多播模式，dst_portid来自于addr->nl_pid，因此保证dst_portid不为空比较容易。接下来：
+行2320，判断了msg->msg_iter.iov->iov_base不能为空。并且len不可以大于sk->sk_sndbuf-32。
+其实整个函数中，用户层可控的只有这么多。直接看netlink_unicast的调用。
+netlink_unicast函数实现如下：
+整个函数中，用户能控制的不多。行1783，设置了timeo，这里要保证nonblock为msg->msg_flags&MSG_DONTWAIT，这样线程才不会被block。行1790，判断sk是否为内核版的sk，在用户层创建socket时应使用NETLINK_USERSOCK。行1793，判断是否有sk_filter，这里保证不进入该if语句，不要设置过滤器。行1800，直接调用netlink_attachskb，成功到达netlink_skb_set_owner_r函数。这算是通过调用netlink_sendmsg来增加sk->sk_rmem_alloc的过程。其实我们不光可以增加sk->sk_rmem_alloc，还可以减小sk->sk_rcvbuf。
+那么如何减小sk->sk_rcvbuf？在setsockopt函数中，找到sock_setsockopt函数中对sk->sk_rcvbuf的操作。
+行773，sk->sk_rcvbuf取val*2和SOCK_MIN_RCVBUF之间的最大值。行755，val取val和sysctl_rmem_max之间的最小值。行749，这个case为SO_RCVBUF。继续往上看。

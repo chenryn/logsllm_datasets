@@ -1,0 +1,132 @@
+作者：[Flanker@ 腾讯科恩实验室](https://blog.flanker017.me/racing-for-everyone-descriptor-describes-toctou-in-apple-core-cn/)
+来源：[ 腾讯科恩实验室](http://keenlab.tencent.com/zh/2017/01/09/Racing-for-everyone-descriptor-describes-TOCTOU-in-Apple-s-core/)，
+[drops.wiki](http://drops.wiki/index.php/2017/01/09/osx/)
+这篇文章是关于我们在苹果内核IOKit驱动中找到的一类新攻击面。之前写了个IDA脚本做了个简单扫描，发现了至少四个驱动都存在这类问题并报告给了苹果，苹果分配了3个CVE(CVE-2016-7620/4/5),
+见 
+后来我和苹果的安全工程师聊天，他们告诉我他们根据这个pattern修复了十多个漏洞，包括iOS内核中多个可以利用的漏洞。
+为了能更清楚地描述这类新漏洞，我们先来复习下IOKit的基础知识。
+## IOKit revisited
+在用户态, IOConnectCallMethod函数实现如下：
+    1709 kern_return_t
+    1710 IOConnectCallMethod(
+    1711    mach_port_t  connection,        // In
+    1712    uint32_t     selector,      // In
+    1713    const uint64_t  *input,         // In
+    1714    uint32_t     inputCnt,      // In
+    1715    const void  *inputStruct,       // In
+    1716    size_t       inputStructCnt,    // In
+    1717    uint64_t    *output,        // Out
+    1718    uint32_t    *outputCnt,     // In/Out
+    1719    void        *outputStruct,      // Out
+    1720    size_t      *outputStructCntP)  // In/Out
+    1721 {
+    //...
+    1736     if (inputStructCnt scalar_input, (const char *) scalar_input, 8 * scalar_inputCnt);
+    //...
+        if (inband_inputCnt > 4096) {
+            { return MIG_ARRAY_TOO_LARGE; }
+        }
+        (void)memcpy((char *) InP->inband_input, (const char *) inband_input, inband_inputCnt);
+    //...
+        InP->ool_input = ool_input;
+        InP->ool_input_size = ool_input_size;
+这段代码告诉我们，scala_input和大小小于4096的structinput是会被memcpy嵌入到传递入内核的machmsg中的，所以这里面似乎没有用户态再操作的空间。
+但是，如果struct_input的大小大于4096，那么这里就有特殊对待了。它会被保留为mach_vm_address且不会被更改。
+我们再继续追下去，看看这个mach_vm_address进入内核之后又会被如何处理
+    3701 kern_return_t is_io_connect_method
+    3702 (
+    3703    io_connect_t connection,
+    3704    uint32_t selector,
+    3705    io_scalar_inband64_t scalar_input,
+    3706    mach_msg_type_number_t scalar_inputCnt,
+    3707    io_struct_inband_t inband_input,
+    3708    mach_msg_type_number_t inband_inputCnt,
+    3709    mach_vm_address_t ool_input,
+    3710    mach_vm_size_t ool_input_size,
+    3711    io_struct_inband_t inband_output,
+    3712    mach_msg_type_number_t *inband_outputCnt,
+    3713    io_scalar_inband64_t scalar_output,
+    3714    mach_msg_type_number_t *scalar_outputCnt,
+    3715    mach_vm_address_t ool_output,
+    3716    mach_vm_size_t *ool_output_size
+    3717 )
+    3718 {
+    3719     CHECK( IOUserClient, connection, client );
+    3720 
+    3721     IOExternalMethodArguments args;
+    3722     IOReturn ret;
+    3723     IOMemoryDescriptor * inputMD  = 0;
+    3724     IOMemoryDescriptor * outputMD = 0;
+    3725 
+    //...
+    3736     args.scalarInput = scalar_input;
+    3737     args.scalarInputCount = scalar_inputCnt;
+    3738     args.structureInput = inband_input;
+    3739     args.structureInputSize = inband_inputCnt;
+    3740 
+    3741     if (ool_input)
+    3742    inputMD = IOMemoryDescriptor::withAddressRange(ool_input, ool_input_size,
+    3743                            kIODirectionOut, current_task());
+    3744 
+    3745     args.structureInputDescriptor = inputMD;
+    //...
+    3753     if (ool_output && ool_output_size)
+    3754     {
+    3755    outputMD = IOMemoryDescriptor::withAddressRange(ool_output, *ool_output_size,
+    3756                            kIODirectionIn, current_task());
+    //...
+    3774     return (ret);
+    3775 }
+在这里我们可以看出苹果和Linux内核在处理输入上的一些不同。在Linux内核中，用户态输入倾向于被copy_from_user到一个内核allocate的空间中。而苹果内核对于大于4096的用户输入，则倾向于用一个IOMemoryDescriptor对其作一个映射，然后在内核态访问。
+既然有映射存在，那么我们就要动歪脑筋了。我们能不能在IOKit调用进行的同时去在用户态修改这个映射呢？之前并没有人研究过这个问题，也没有相关的漏洞公布，似乎大家都默认，在发起调用后，这是用户态不可写的。真的是这样么？
+令人吃惊的是，测试表明，这居然是可写的！后来苹果的工程师告诉我们，他们在看到我的漏洞报告的时候，才发现之前连他们都没注意到这里居然还是用户态可写的。
+这就意味着，对于一个IOKit调用，如果内核处理输入的IOService接受MemoryDescriptor的话（绝大多数都接受），那么发起调用的用户态进程可以在输入被内核处理的时候去修改掉传入的参数内容，没有锁，也没有只读保护。由于连苹果的工程师都没有注意这个问题，这意味着他们在编写内核驱动的时候基本没有对这部分数据做保护处理，这不就是条件竞争漏洞的天堂么！
+我迅速回忆了一下之前逆向过的几个IOKit驱动，很快就有一个漏洞pattern出现。IOReportUserClient, IOCommandQueue,
+IOSurface在处理用户态传进来的inputStruct的时候，在里面取出了一个长度作为后续边界处理的条件，虽然开发者肯定都先校验了这个长度，但由于这个racecondition的存在，那么用户态还是可以改掉这个长度绕过检查，自然就触发了越界。其他的pattern还有更多，就是发挥想象力的时候了。我们先来分析下IOCommandQueue这个典型例子，也就是CVE-2016-7624.
+## IOCommandQueue内核服务中存在沙箱进程可以调用的越界读写漏洞
+在IOCommandQueue::submit_command_buffer这个函数中，存在如上所述的条件竞争漏洞。这个函数接受structureInput或者structureInputDescriptor，其中在特定的offset存储了一个长度，虽然长度在传入的时候被校验过，
+但利用这个条件竞争，攻击者依然可以控制长度，造成后续的越界读写。
+### 漏洞分析
+IOAccelCommandQueue::s_submit_command_buffers接受用户输入的IOExternalMethodArguments,
+如果structureInputDescriptor存在，那么descriptor会被用来映射为memorymap并翻译为原始地址.
+    __int64 __fastcall IOAccelCommandQueue::s_submit_command_buffers(IOAccelCommandQueue *this, __int64 a2, IOExternalMethodArguments *a3)
+    {
+      IOExternalMethodArguments *v3; // r12@1
+      IOAccelCommandQueue *v4; // r15@1
+      unsigned __int64 inputdatalen; // rsi@1
+      unsigned int v6; // ebx@1
+      IOMemoryDescriptor *v7; // rdi@3
+      __int64 v8; // r14@3
+      __int64 inputdata; // rcx@5
+      v3 = a3;
+      v4 = this;
+      inputdatalen = (unsigned int)a3->structureInputSize;
+      v6 = -536870206;
+      if ( inputdatalen >= 8
+        && inputdatalen - 8 == 3
+                             * (((unsigned __int64)(0x0AAAAAAAAAAAAAAABLL * (unsigned __int128)(inputdatalen - 8) >> 64) >> 1) & 0x7FFFFFFFFFFFFFF8LL) )
+      {
+        v7 = (IOMemoryDescriptor *)a3->structureInputDescriptor;
+        v8 = 0LL;
+        if ( v7 )
+        {
+          v8 = (__int64)v7->vtbl->__ZN18IOMemoryDescriptor3mapEj(v7, 4096LL);
+          v6 = -536870200;
+          if ( !v8 )
+            return v6;
+          inputdata = (*(__int64 (__fastcall **)(__int64))(*(_QWORD *)v8 + 280LL))(v8);
+          LODWORD(inputdatalen) = v3->structureInputSize;
+        }
+我们可以看到在offset+4, 一个DWORD被用来作为length和((unsigned **int64)(0x0AAAAAAAAAAAAAAABLL
+* (unsigned** int128)(inputdatalen - 8) >> 64) >> 1) & 0x7FFFFFFFFFFFFFF8LL)比较
+随后这个length在submit_command_buffer中再次被使用.
+    if ( *((_QWORD *)this + 160) )
+    {
+      v5 = (IOAccelShared2 *)*((_QWORD *)this + 165);
+      if ( v5 )
+      {
+        IOAccelShared2::processResourceDirtyCommands(v5);
+        IOAccelCommandQueue::updatePriority((IOAccelCommandQueue *)v2);
+        if ( *(_DWORD *)(input + 4) )
+        {
+          v6 = (unsigned __int64 *)(input + 24);

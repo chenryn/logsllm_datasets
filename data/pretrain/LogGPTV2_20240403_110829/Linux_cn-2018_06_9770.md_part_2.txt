@@ -1,0 +1,135 @@
+```
+抛出的异常并没有那么简单，Bcc 现在提升了 *许多*。直到写这篇文章的时候，有几个问题已经被处理了，但是并没有全部处理完。这个错误意味着内核检查器可以证实程序中的内存访问是正确的。看这个显式的类型转换。我们需要一点帮助，以使访问更加明确。我们将使用 `bpf_probe_read` 可信任的函数去读取一个任意内存位置，同时确保所有必要的检查都是用类似这样方法完成的：
+```
+// Explicit initialization. The "=0" part is needed to "give life" to the variable on the stack
+u16 lport = 0;
+// Explicit arbitrary memory access. Read it:
+//    Read into 'lport', 'sizeof(lport)' bytes from 'inet->inet_sport' memory location
+bpf_probe_read(&lport, sizeof(lport), &(inet->inet_sport));
+```
+读取 IPv4 边界地址和它基本上是相同的，使用 `inet->inet_rcv_saddr` 。如果我把这些一起放上去，我们将得到 backlog、端口和边界 IP：
+```
+from bcc import BPF  
+# BPF Program  
+bpf_text = """   
+#include   
+#include   
+#include   
+// Send an event for each IPv4 listen with PID, bound address and port  
+int kprobe__inet_listen(struct pt_regs *ctx, struct socket *sock, int backlog)  
+{  
+    // Cast types. Intermediate cast not needed, kept for readability  
+    struct sock *sk = sock->sk;  
+    struct inet_sock *inet = inet_sk(sk);  
+    // Working values. You *need* to initialize them to give them "life" on the stack and use them afterward  
+    u32 laddr = 0;  
+    u16 lport = 0;  
+    // Pull in details. As 'inet_sk' is internally a type cast, we need to use 'bpf_probe_read'  
+    // read: load into 'laddr' 'sizeof(laddr)' bytes from address 'inet->inet_rcv_saddr'  
+    bpf_probe_read(&laddr, sizeof(laddr), &(inet->inet_rcv_saddr));  
+    bpf_probe_read(&lport, sizeof(lport), &(inet->inet_sport));  
+    // Push event
+    bpf_trace_printk("Listening on %x %d with %d pending connections\\n", ntohl(laddr), ntohs(lport), backlog);  
+    return 0;
+};  
+"""  
+# Build and Inject BPF  
+b = BPF(text=bpf_text)  
+# Print debug output  
+while True:  
+  print b.trace_readline()
+```
+测试运行输出的内容像下面这样:
+```
+(bcc)ubuntu@bcc:~/dev/listen-evts$ sudo python tcv4listen.py 
+              nc-5024  [000] d... 25821.166286: : Listening on 7f000001 4242 with 1 pending connections
+```
+这证明你的监听是在本地主机上的。因为没有处理为友好的输出，这里的地址以 16 进制的方式显示，但是这是没错的，并且它很酷。
+注意：你可能想知道为什么 `ntohs` 和 `ntohl` 可以从 BPF 中被调用，即便它们并不可信。这是因为它们是宏，并且是从 “.h” 文件中来的内联函数，并且，在写这篇文章的时候一个小的 bug 已经 [修复了](https://github.com/iovisor/bcc/pull/453)。
+全部达成了，还剩下一些：我们希望获取相关的容器。在一个网络环境中，那意味着我们希望取得网络的命名空间。网络命名空间是一个容器的构建块，它允许它们拥有独立的网络。
+### 抓取网络命名空间：被迫引入的 perf 事件
+在用户空间中，网络命名空间可以通过检查 `/proc/PID/ns/net` 的目标来确定，它将看起来像 `net:[4026531957]` 这样。方括号中的数字是网络空间的 inode 编号。这就是说，我们可以通过 `/proc` 来取得，但是这并不是好的方式，我们或许可以临时处理时用一下。我们可以从内核中直接抓取 inode 编号。幸运的是，那样做很容易：
+```
+// Create an populate the variable
+u32 netns = 0;
+// Read the netns inode number, like /proc does
+netns = sk->__sk_common.skc_net.net->ns.inum;
+```
+很容易！而且它做到了。
+但是，如果你看到这里，你可能猜到那里有一些错误。它在：
+```
+bpf_trace_printk("Listening on %x %d with %d pending connections in container %d\\n", ntohl(laddr), ntohs(lport), backlog, netns);
+```
+如果你尝试去运行它，你将看到一些令人难解的错误信息：
+```
+(bcc)ubuntu@bcc:~/dev/listen-evts$ sudo python tcv4listen.py
+error: in function kprobe__inet_listen i32 (%struct.pt_regs*, %struct.socket*, i32)
+too many args to 0x1ba9108: i64 = Constant
+```
+clang 想尝试去告诉你的是 “嗨，哥们，`bpf_trace_printk` 只能带四个参数，你刚才给它传递了 5 个”。在这里我不打算继续追究细节了，但是，那是 BPF 的一个限制。如果你想继续去深入研究，[这里是一个很好的起点](http://lxr.free-electrons.com/source/kernel/trace/bpf_trace.c#L86)。
+去修复它的唯一方式是 … 停止调试并且准备投入使用。因此，让我们开始吧（确保运行在内核版本为 4.4 的 Linux 系统上）。我将使用 perf 事件，它支持传递任意大小的结构体到用户空间。另外，只有我们的读者可以获得它，因此，多个没有关系的 eBPF 程序可以并发产生数据而不会出现问题。
+去使用它吧，我们需要：
+1. 定义一个结构体
+2. 声明事件
+3. 推送事件
+4. 在 Python 端重新声明事件（这一步以后将不再需要）
+5. 处理和格式化事件
+这看起来似乎很多，其它并不多，看下面示例：
+```
+// At the begining of the C program, declare our event
+struct listen_evt_t {
+    u64 laddr;
+    u64 lport;
+    u64 netns;
+    u64 backlog;
+};
+BPF_PERF_OUTPUT(listen_evt);
+// In kprobe__inet_listen, replace the printk with
+struct listen_evt_t evt = {
+    .laddr = ntohl(laddr),
+    .lport = ntohs(lport),
+    .netns = netns,
+    .backlog = backlog,
+};
+listen_evt.perf_submit(ctx, &evt, sizeof(evt));
+```
+Python 端将需要一点更多的工作：
+```
+# We need ctypes to parse the event structure
+import ctypes
+# Declare data format
+class ListenEvt(ctypes.Structure):
+    _fields_ = [
+        ("laddr",   ctypes.c_ulonglong),
+        ("lport",   ctypes.c_ulonglong),
+        ("netns",   ctypes.c_ulonglong),
+        ("backlog", ctypes.c_ulonglong),
+    ]
+# Declare event printer
+def print_event(cpu, data, size):
+    event = ctypes.cast(data, ctypes.POINTER(ListenEvt)).contents
+    print("Listening on %x %d with %d pending connections in container %d" % (
+        event.laddr,
+        event.lport,
+        event.backlog,
+        event.netns,
+    ))
+# Replace the event loop
+b["listen_evt"].open_perf_buffer(print_event)
+while True:
+    b.kprobe_poll()
+```
+来试一下吧。在这个示例中，我有一个 redis 运行在一个 Docker 容器中，并且 `nc` 运行在主机上：
+```
+(bcc)ubuntu@bcc:~/dev/listen-evts$ sudo python tcv4listen.py
+Listening on 0 6379 with 128 pending connections in container 4026532165
+Listening on 0 6379 with 128 pending connections in container 4026532165
+Listening on 7f000001 6588 with 1 pending connections in container 4026531957
+```
+### 结束语
+现在，所有事情都可以在内核中使用 eBPF 将任何函数的调用设置为触发事件，并且你看到了我在学习 eBPF 时所遇到的大多数的问题。如果你希望去看这个工具的完整版本，像 IPv6 支持这样的一些技巧，看一看 。它现在是一个官方的工具，感谢 bcc 团队的支持。
+更进一步地去学习，你可能需要去关注 Brendan Gregg 的博客，尤其是 [关于 eBPF 映射和统计的文章](http://www.brendangregg.com/blog/2015-05-15/ebpf-one-small-step.html)。他是这个项目的主要贡献人之一。
+---
+via: 
+作者：[Jean-Tiare Le Bigot](https://blog.yadutaf.fr/about) 译者：[qhwdw](https://github.com/qhwdw) 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创编译，[Linux中国](https://linux.cn/) 荣誉推出

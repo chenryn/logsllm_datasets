@@ -1,0 +1,141 @@
+             const int64_t S1 = S0 + payment.amount;
+             const int64_t R0 = itr->total_rex.amount;
+             const int64_t R1 = (uint128_t(S1) * R0) / S0;
+             rex_received.amount = R1 - R0; ///计算能获得的rex
+             _rexpool.modify( itr, same_payer, [&]( auto& rp ) {
+                rp.total_lendable.amount = S1;
+                rp.total_rex.amount      = R1;
+                rp.total_unlent.amount   = rp.total_lendable.amount - rp.total_lent.amount;
+                check( rp.total_unlent.amount >= 0, "programmer error, this should never go negative" );
+             });
+          }
+          return rex_received;
+首先我们看下我们能购买到的 rex 是怎么计算的。当 rex_pool 迎来第一个购买 rex 的用户的时候，获得 rex
+的获取比例是1:10000，即1个 EOS 换10000个 rex，往后购买 rex 的用于按照公式（(uint128_t(S1) * R0) / S0)
+- R0计算能获取的 rex。看起来很复杂对不对？我们对公式进行分解下，首先进行以下转换，公式变为（S1 / S0 * R0) - R0,再代入
+S1，得到((S0 + payment) / S0 * R0) - R0，最后我们进行分解再去括号，得到 R0 + (payment / S0) * R0
+- R0。最后这个公式就变成了(payment / S0) * R0。再变一下，变成 payment * (R0 / S0),即用户用于购买 rex
+的资金乘以当前 rex_pool 中的 EOS 总资产与 rex_pool 中的 rex 的总量之间的比例。这个比例在没有第三方资金如账户竞拍费用，ram
+fee 等的干扰下是固定不变的，为1:10000。但是当有第三方资金入场的时候，作为分母的 S0 就会不断变大，那么这个比例就不断变小，同样的金额能买到的
+rex 就会越来越少。通过上面的分析，我们知道，在有第三方资金的参与下，rex 买得越早最早，能买到的数量就越多。`rex
+的价格与购买的人数无关，而与租借资源的数量，系统竞拍资源产生的收益，以及 ram fee有关`。
+## sellrex 函数
+那么，现在流程走到这里，剩下的就是计算收益的问题了。用于处理用户出租 EOS 资源产生收益的计算细节的实现全部在 sellrex 函数中。以下是
+sellrex 函数的具体实现。
+    void system_contract::sellrex( const name& from, const asset& rex )
+       {
+          require_auth( from );
+          runrex(2);
+          auto bitr = _rexbalance.require_find( from.value, "user must first buyrex" );
+          check( rex.amount > 0 && rex.symbol == bitr->rex_balance.symbol,
+                 "asset must be a positive amount of (REX, 4)" );
+          process_rex_maturities( bitr ); ///先收获成熟的rex
+          check( rex.amount matured_rex, "insufficient available rex" );///只能卖成熟的rex
+          auto current_order = fill_rex_order( bitr, rex );///拿到出租EOS得到的分红
+          asset pending_sell_order = update_rex_account( from, current_order.proceeds, current_order.stake_change );
+          //订单状态不成功
+          if ( !current_order.success ) {
+             /**
+              * REX order couldn't be filled and is added to queue.
+              * If account already has an open order, requested rex is added to existing order.
+              */
+             auto oitr = _rexorders.find( from.value );
+             if ( oitr == _rexorders.end() ) {
+                oitr = _rexorders.emplace( from, [&]( auto& order ) {
+                   order.owner         = from;
+                   order.rex_requested = rex;
+                   order.is_open       = true;
+                   order.proceeds      = asset( 0, core_symbol() );
+                   order.stake_change  = asset( 0, core_symbol() );
+                   order.order_time    = current_time_point();
+                });
+             } else {
+                _rexorders.modify( oitr, same_payer, [&]( auto& order ) {
+                   order.rex_requested.amount += rex.amount;
+                });
+             }
+             pending_sell_order.amount = oitr->rex_requested.amount; 
+          }
+          check( pending_sell_order.amount matured_rex, "insufficient funds for current and scheduled orders" );
+          // dummy action added so that sell order proceeds show up in action trace
+          if ( current_order.success ) {
+             dispatch_inline( null_account, "sellresult"_n, { }, std::make_tuple( current_order.proceeds ) );
+          }
+       }
+这个 sellrex
+函数有很多学问，完整说下来可能不是这篇短短的分析能写完的，但是可以分析我们最关心的问题，就是获得的收益是怎么计算出来的。首先我们不管其他细节，先看看在真正计算收益之前做了什么。主要分为以下几步：
+1、检查用户购买了 rex 没有，总不能没买就能卖对吧。  
+2、通过 process_rex_maturities 函数计算结束锁定的 rex，用户从购买的 rex 到卖 rex 需要4天的释放期。  
+3、检测需要卖出的 rex 的数量是否小于结束锁定的REX的数量。
+通过以上几步检查之后，就真正进入了结算函数。rex 的收益结算是通过 fill_rex_order 接口实现的。看下具体实现
+## fill_rex_order
+    rex_order_outcome system_contract::fill_rex_order( const rex_balance_table::const_iterator& bitr, const asset& rex )
+       {
+          auto rexitr = _rexpool.begin();
+          const int64_t S0 = rexitr->total_lendable.amount;
+          const int64_t R0 = rexitr->total_rex.amount;
+          const int64_t p  = (uint128_t(rex.amount) * S0) / R0; ///越多人借资源收益越高
+          const int64_t R1 = R0 - rex.amount; ///更新rex pool中rex的数量
+          const int64_t S1 = S0 - p; ///更新rex pool中EOS的数量
+          asset proceeds( p, core_symbol() ); ///获得的收益
+          asset stake_change( 0, core_symbol() );
+          bool  success = false; ///默认订单完成状态为0
+          check( proceeds.amount > 0, "proceeds are negligible" );
+          const int64_t unlent_lower_bound = rexitr->total_lent.amount;
+          //计算能未质押的rex pool中的EOS的数量，用于接下来观察是否足够支付用户产生的rex利润
+          const int64_t available_unlent   = rexitr->total_unlent.amount - unlent_lower_bound; // available_unlent vote_stake.amount;
+             const int64_t current_stake_value    = ( uint128_t(bitr->rex_balance.amount) * S0 ) / R0;
+             _rexpool.modify( rexitr, same_payer, [&]( auto& rt ) {
+                rt.total_rex.amount      = R1;///更新rex pool中的rex的数量
+                rt.total_lendable.amount = S1; ///更新lenableEOS数量
+                rt.total_unlent.amount   = rt.total_lendable.amount - rt.total_lent.amount; ///减少unlent数据
+             });
+             //对用户的rexbalance账户进行操作
+             _rexbalance.modify( bitr, same_payer, [&]( auto& rb ) {
+                rb.vote_stake.amount   = current_stake_value - proceeds.amount;
+                rb.rex_balance.amount -= rex.amount;
+                rb.matured_rex        -= rex.amount; ///减少已经成熟的rex的数量
+             });
+             stake_change.amount = bitr->vote_stake.amount - init_vote_stake_amount;
+             success = true;
+          ///不够钱支付的情况
+          } else {
+             proceeds.amount = 0;
+          }
+          return { success, proceeds, stake_change };
+       }
+同样的，类似
+add_to_rex_pool，我们也可以抛开其他细节，直击最核心的收益计算公式，即第6行的计算公式。（uint128_t(rex.amount) *
+S0）/ R0，这个函数虽然看起来同样的复杂，但是我们可以用相同的方法进行简化。首先我们对公式进行一些转换，变成 rex.amount / R0 *
+S0,加个括号，变成 rex.amount * (R0 / S0),即你能收益的 rex 是你要卖的 rex 乘以 rex_pool 中 rex 总量和
+rex_pool 中得总 EOS 总资产之间的比例，这个比例在没有第三方资金如 name bid 和 ram fee
+加入的情况下也是维持稳定不变的10000:1。
+## 我们知道了什么？
+一口气说了一大堆，看到这里的你可能还有点茫然，可能只是记住了两个公式的转化，不打紧。我来总结下这次看完文章的的收获。通过以上的分析，我们知道买 rex 和卖
+rex 都是根据 rex 总量和 rex_pool 中的 EOS 的总资金之间的比例进行计算的，也就是说`在没有第三方资金参与，用户的 EOS
+总是按1:10000的比例变成 rex，再按10000:1的比例再变成 EOS`。这说明，在没有第三方资源的情况下，rex 和 EOS
+总是按照一定的比例进行互换，这也是为什么 REX 号称稳赚不亏的原因。同时，在有第三方资金入场的时候，R0 / S0 的比例就会变小，也意味着 S0 /
+R0 的比例变大，虽然同样资金买到的 rex 变少了，但是，卖出去的比例就变大了，获得的收益就变得更多了。
+**整个参与的流程大致如下：**
+![
+](https://images.seebug.org/content/images/2019/05/90abc420-546e-4742-879f-e6e26b7f3ff8.jpg-w331s)
+## REX 安全性分析
+REX 作为 EOS 本身的系统合约，其安全防护必须要做到面面俱到，一旦出现问题，将造成灾难性的影响。REX 合约已经由 EOS Authority
+团队进行义务安全审计，但作为一名安全人员，笔者同时也对 REX
+的整个架构进行了深入的思考，文章将会陆续对每个文章提及到的接口进行分析，阐述其安全性或安全性增强建议。
+本文粗略介绍了四个接口，分别是deposit，withdraw，buyrex，sellrex。
+从函数实现上来看
+1、每个函数都有对 asset 参数的信息进行校验，包括数量，代币的符号信息是否与系统代币信息一致。防止可能的假充值问题和溢出问题。  
+2、用户的关键操作都有权限校验，防止越权操作。
+同时，文章内介绍的四个接口不存在 EOS 上常见的攻击手法如回滚攻击，排挤攻击，假通知攻击。
+但值得注意的是，在这几个函数中，sellrex 函数曾存在一个严重漏洞(现已修复)，导致用于可以从 REX 中盗取资产。
+详细信息如下：
+漏洞的成因在于进行 sellrex 操作的时候 REX
+系统可能会不够钱支付用户的收益，在这种情况下，用户的卖单就会挂起，如果没有校验订单，恶意用户就能在系统资金不足的情况下一直进行 sellrex
+操作，一直增加挂起订单的金额，直到有系统有足够的资源支付用户的收益
+## 结语
+REX 是一个庞大的系统，不存在三言两语将全部细节分析到位情况，文章没有分析太多的技术细节，只是大概分析了每个函数的大概作用，介绍了关于 REX
+收益最核心的地方。想要了解具体细节的朋友可以持续关注我们的系列文章～下一篇文章将会继续说明这些函数之间更加好玩的细节！文章可能有说得不对的地方，欢迎大家指点交流。
+## 声明
+本文仅用作技术参考，不构成任何投资建议。投资者应在充分了解相关风险的基础上进行理性投资。
+* * *

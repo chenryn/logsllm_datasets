@@ -1,0 +1,182 @@
+## PostgreSQL 向量化执行插件(瓦片式实现-vops) 10x提速OLAP    
+##### [TAG 16](../class/16.md)
+### 作者                                           
+digoal                                            
+### 日期                                            
+2017-02-20                                                                       
+### 标签                                                                                                                                                            
+PostgreSQL , OLAP , 向量化 , vector , postgrespro , tiles , 瓦片 , 瓦片索引 , map , reduce , 分组聚合 , 非分组聚合 , 分区键 , sort key , order by , brin , cpu Cache , projection , 行列变换              
+----                                            
+## 背景         
+在主流的OLTP数据库产品中，毫无疑问，PostgreSQL已经具备非常强大的竞争力（性能、功能、稳定性、成熟度、案例、跨行业应用等）。  
+[《数据库选型之 - 大象十八摸 - 致 架构师、开发者》](../201702/20170209_01.md)  
+[《数据库选型思考》](../201702/20170208_03.md)  
+[《数据库界的华山论剑 tpc.org》](../201701/20170125_01.md)    
+[《PostgreSQL 前世今生》](../201609/20160929_02.md)  
+在OLAP领域，PostgreSQL社区也是豪情万丈的，比如内核已经实现了基于CPU的多核并行计算、算子复用等。  
+在社区外围的插件如 GPU运算加速、LLVM、列存储、多机并行执行插件 等也层出不穷。  
+虽然如此，PostgreSQL在OLAP领域还有非常巨大的提升潜力。  
+![pic](20170225_01_pic_001.jpg)  
+## OLAP profiling 分析 (OLAP哪些过程最耗资源)  
+OLAP单个查询就会涉及大量数据的处理，与OLTP有非常鲜明的差别，那么数据库在OLAP场景会有哪些明显的瓶颈呢？  
+1\. unpack row(tuple) 带来的开销  
+在PostgreSQL中，数据以行存储，变长类型可能存储在TOAST中，由于它是变长的，当访问第N列的数据时，也需要unpack前N-1列的内容数据（不过这块有优化空间，比如在行头记录每列的OFFSET，但是这样又引入另一个问题，增加了OFFSET必然会增加空间开销）。  
+另一种优化方法是业务层面的，比如将定长类型和变长类型拆分成两张或多张表，或者将不怎么访问的大字段拆开到其他表，通过JOIN关联它们。  
+不要小看这笔开销，这笔开销是O(N)的，所以数据量越大，开销越大，比如TPCH的Q6，40%是ROW格式化带来的开销。  
+2\. 解释执行引入的开销  
+PostgreSQL的优化器通过构建树的方式来表述执行计划，所以执行器必须以递归的方式从树的最边缘节点一直往上执行。  
+解释执行的好处是弹性，容易改写，比如PG的customize scan ，GPU运算就用到了它。  
+通常解释执行比native code慢10倍，特别是在表达式非常多时。  
+你可以通过这种方式观察  
+```  
+postgres=# set debug_print_plan=true;  
+postgres=# set client_min_messages ='log';  
+postgres=# select 1;  
+LOG:  plan:  
+DETAIL:     {PLANNEDSTMT   
+   :commandType 1   
+   :queryId 0   
+   :hasReturning false   
+   :hasModifyingCTE false   
+   :canSetTag true   
+   :transientPlan false   
+   :planTree   
+      {RESULT   
+      :startup_cost 0.00   
+      :total_cost 0.01   
+      :plan_rows 1   
+      :plan_width 0   
+      :targetlist (  
+         {TARGETENTRY   
+         :expr   
+            {CONST   
+            :consttype 23   
+            :consttypmod -1   
+            :constcollid 0   
+            :constlen 4   
+            :constbyval true   
+            :constisnull false   
+            :location 7   
+            :constvalue 4 [ 1 0 0 0 0 0 0 0 ]  
+            }  
+         :resno 1   
+         :resname ?column?   
+         :ressortgroupref 0   
+         :resorigtbl 0   
+         :resorigcol 0   
+         :resjunk false  
+         }  
+      )  
+      :qual <>   
+      :lefttree <>   
+      :righttree <>   
+      :initPlan <>   
+      :extParam (b)  
+      :allParam (b)  
+      :resconstantqual <>  
+      }  
+   :rtable <>   
+   :resultRelations <>   
+   :utilityStmt <>   
+   :subplans <>   
+   :rewindPlanIDs (b)  
+   :rowMarks <>   
+   :relationOids <>   
+   :invalItems <>   
+   :nParamExec 0  
+   }  
+```  
+3\. 抽象层开销，PostgreSQL 的一个非常强悍的特性是允许用户自定义数据类型、操作符、UDF、索引方法等。为了支持这一特性，PostgreSQL将操作符与操作数剥离开来，通过调用FUNCTION的形式支持操作数的操作，譬如两个INT的加减运算，是通过调用FUNCTION来支持的。  
+```  
+a+b  
+```  
+可能就变成了  
+```  
+op1 func(a,b) {  
+  c=a+b  
+  return c   
+{  
+a op1 b  
+```  
+通过这种方式，支持了允许用户自定义数据类型、操作符。  
+通过函数调用的方式支持操作符，还引入了另一个问题，参数传递的memory copy操作。  
+所以，函数调用引入的overhead相比直接使用操作符（INT的加减乘除等）要大很多。  
+对于OLAP，不容小视。  
+4\. PULL模型引入的overhead，PostgreSQL的executor是经典的Volcano-style query执行模型 - pull模型。操作数的值是操作符通过pull的模式来获取的。这样简化了执行器和操作符的设计和工程实现。  
+但是对性能有一定的影响，比如从一个node跳到另一个node时(比如seqscan或index scan节点，每获取一条tuple，跳到操作符函数)，都需要保存或还原它们的上下文，对于OLAP，需要大批量的记录处理，这个开销放大就很厉害。  
+pull , push , pull on demand等模型，参考  
+https://www.infoq.com/news/2015/09/Push-Pull-Search  
+5\. 多版本并发控制，这个基本上任何OLTP RDBMS都支持的特性，多版本主要用来解决高并发数据处理的问题。也成为了OLAP场景的一个包袱。  
+因为多版本并发控制，需要在每个TUPLE头部增加一些信息，比如infomask等(大概有20几个字节)，通过infomask判断行的可见性。除了空间开销，同时判断行的可见性也引入了CPU的开销。  
+### 业界有哪些手段提升OLAP性能
+1\. 使用JIT(just in time)编译器，生成query的native code，消除tuple翻译瓶颈，即tuple deform的瓶颈，从而提高大批量数据处理的效率。  
+PostgreSQL-LLVM版本，就是使用的这种手段  
+[《分析加速引擎黑科技 - LLVM、列存、多核并行、算子复用 大联姻 - 一起来开启PostgreSQL的百宝箱》](../201612/20161216_01.md)  
+2\. 重写优化器，将pull模型改写为push模型。  
+3\. 面向OLAP，优化tuple的存储结构，提升deform tuple的效率。  
+4\. 将query execution plan转换为二进制执行代码，消除执行树递归调用的方式引入的效率问题。  
+以上方法均需要重写PostgreSQL代码，甚至大改PostgreSQL架构。  
+那么有没有更友好的方法呢，不修改PostgreSQL内核，不动它的架构呢：  
+向量化计算。  
+## 向量化执行 与 列存储  
+传统的QUERY执行器在处理表达式时，是一行一行的处理模式。  
+比如在处理(x+y)这个表达式时，首先读取一条记录的X值，然后读取这条记录的Y值，然后执行+操作符。然后将结果返回给上层node。  
+然而，向量化执行器，一个操作符可以处理多个值，比如(x+y) ，x, y并不是scalar值，而是一批值的向量，向量化执行的结果也不是scalar值，而是向量。  
+向量化执行模型的会引入一定的解释和函数调用overhead，但是对于OLAP场景的大批量数据处理，这个overhead可以忽略。  
+既然向量化执行倾向于每次处理大批量的数据，那么在数据存放方面，也需要注意，比如OLAP经常需要对单列进行处理，使用列存储可以更好的和向量化执行模型结合起来。  
+OLAP场景，列存储有以下几个好处  
+- 减少每次计算时，需要读取或载入的数据大小（原来是以行来读取和载入），现在只需要载入计算需要用到的列。  
+- 压缩比更高，因为列的属性（类型）是固定的，数据按列存储时，在对应数据文件中所有值的类型是一样的，压缩比相比行存储高很多。  
+- deform时，开销大大降低，不需要像行存储那样解释目标列以前的所有列（而且前面的列类型可能也不一致，引入更多的对应column 类型的deform的函数调用）。  
+- 可以使用CPU向量化指令（SIMD），处理批量数据  
+已经有一些数据库使用了列存储引擎，并且获得了很好的OLAP效率。比如Vertical, MonetDB。  
+既然向量化执行函数每次处理的是一类值的集合（向量），那么这个集合（向量）大小多大合适呢？  
+比如一张表有几亿条记录，我们需要计算sum((x+y)(x-y))，如果这几亿条记录作为一个（集合）向量，开始执行，会有什么后果呢？  
+因为CPU的CACHE大小是有限的，装不下这么大的数据，所以在算完一批数据的(x+y)后，再要算(x-y)时，前面的数据集合已经从CPU CACHE出去了，所以又要将数据LOAD一遍到CPU CACHE。  
+```  
+Table can be very large (OLAP queries are used to work with large data sets), so vector can also be very big and even doesn't fit in memory.  
+But even if it fits in memory, working with such larger vectors prevent efficient utilization of CPU caches (L1, L2,...).  
+Consider expression (x+y)(x-y).   
+Vector executor performs addition of two vectors : "x" and "y" and produces result vector "r1".  
+But when last element of vector "r" is produced, first elements of vector "r1" are already thrown from CPU cache, as well as first elements of "x" and "y" vectors.  
+So when we need to calculate (x-y) we once again have to load data for "x" and "y" from slow memory to fast cache.  
+Then we produce "r2" and perform multiplication of "r1" and "r2".   
+But here we also need first to load data for this vectors into the CPU cache.  
+```  
+将数据拆分成小的集合（chunk），分批运算是最好的，数据只需要进出CPU CACHE一遍。  
+也就是说，数据进入CPU CACHE后，算完所有的表达式，保存中间结果向量，然后再将下一批数据LOAD进CPU CACHE，继续运算。  
+CHUNK最好和CPU CACHE的大小匹配。  
+MonetDB x100上已经验证这种方法，性能提升了10倍。  
+https://www.monetdb.org/Home  
+```  
+So it is more efficient to split column into relatively small chunks (or tiles - there is no single notion for it accepted by everyone).  
+This chunk is a unit of processing by vectorized executor.  
+Size of such chunk is chosen to keep all operands of vector operations in cache even for complex expressions.  
+Typical size of chunk is from 100 to 1000 elements.  
+So in case of (x+y)(x-y) expression, we calculate it not for the whole column but only for 100 values (assume that size of the chunk is 100).  
+Splitting columns into chunks in successors of MonetDB x100 and HyPer allows to increase speed up to ten times.  
+```  
+## PostgreSQL 向量化之路  
+前面讲了，向量化执行是打开OLAP性能之门的金钥匙之一，而要让向量化发挥效果，首先要使用列存储。  
+PostgreSQL 有两个列存储引擎，分别是cstore_fdw和imcs。  
+首先说说cstore_fdw，它是基于PostgreSQL的FDW接口实现的列存储插件，可以有效的减少tuple deform的开销，但是它使用标准的PostgreSQL raw-based 执行器，所以无法使用向量化处理。  
+https://github.com/citusdata/cstore_fdw  
+在CitusData公司内部，有一个基于cstore_fdw列存储引擎的项目，该项目通过PostgreSQL执行器的钩子接口，开发了一套基于cstore列存储的向量化执行器。数据聚合有4到6倍的性能提升，分组聚合有3倍的性能提升。  
+https://github.com/citusdata/postgres_vectorization_test  
+另一个项目是imcs, in-memory columnar store, 基于内存打造的一个列存引擎，操作时需要使用imcs项目提供的函数接口，不能使用标准的SQL，IMCS提供了向量计算（通过数据瓦片(tile)实现），以及并行执行的支持。  
+https://github.com/knizhnik/imcs  
+cstore和imcs插件虽然挺好的，但是数据毕竟不是使用的PostgreSQL内部存储，一个是FDW一个是内存。  
+如果我们想让数据存在PostgreSQL中，同时还要它支持向量计算，必须要改造PostgreSQL现有的行存储。  
+那么到底有没有更好的方法呢？其实是有的，新增瓦片式数据类型，瓦片本身支持向量计算。  
+前面讲到了向量计算的本质是一次计算多个值，减少函数调用，上下文切换，尽量的利用CPU的缓存以及向量化执行指令提高性能。  
+而为了达到这个目的，列存储是最适合的，为什么这么说，本质上列存储只是将数据做了物理的聚合，在使用时不需要像行存那样deform该列前面的其他列。  
+瓦片式存储类型，和列存储类似，可以达到类似的目的，你可以理解为单行存储了多行的数据。（比如你将某个字段的多行记录，按分组聚合为一个数组或JSONB，这只是个比喻，效果类似）  
+PostgreSQL VOPS插件就是这么做的，为每个数据类型，新增了一个对应的瓦片数据类型，比如real类型对应新增了一个vops_float4类型，它可以表述最多64个real值。  
+为什么是64呢，PostgreSQL VOPS给出了如下理由  
+- 为了有效的访问瓦片，```size_of_tile * size_of_attribute * number_of_attributes```这几个属性相乘不能超过PostgreSQL单个数据块的大小。典型的一张表假设有10个字段即attribute，PostgreSQL默认的数据块为8KB。  
+- 我们需要用掩码来标记空值，64 BIT的整型来表示这个掩码效率是最高的，所以这也是一个瓦片最多存储64个VALUE的理由之一。  
+- 最后一点是和CPU CACHE有关的，通常CPU CACHE可以用来一次处理100到1000（经验值）个VALUE（向量化处理），所以瓦片的大小也要考虑这一点，一个瓦片最好能刚好吧CPU CACHE用尽。将来如果CPU CACHE做大了，我们可以再调整瓦片的大小。  
+PostgreSQL VOPS权衡了CSTORE和IMCS的弊端，在不改造PostgreSQL存储引擎，不改执行器，不使用钩子的情况下，利用瓦片式数据类型，有效的利用CPU CACHE以及向量化执行指令，将OLAP场景的性能提升了10倍。  
+新增的瓦片式类型，对应的还新增了对应的向量化执行操作符，所以使用VOPS和正常的使用SQL语法是一样的。  
+使用VOPS，总共分三步。  
+1\. 创建基础表的VOPS表（使用对应的瓦片类型）。  

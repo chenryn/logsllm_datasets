@@ -1,0 +1,223 @@
+            seqno_me-1, cookie);
+        continue;
+      }
+      /* verify: ignore duplicates  校验是否重复*/
+      if (dedup_is_duplicate(dedup, ip_them, port_them, ip_me, port_me))
+        continue;
+      /* keep statistics on number received 统计接收的数字*/
+      if (TCP_IS_SYNACK(px, parsed.transport_offset))
+        (*status_synack_count)++;
+      /*
+       * This is where we do the output
+       * 这是输出状态了
+       */
+      output_report_status(
+        out,
+        global_now,
+        status,
+        ip_them,
+        6, /* ip proto = tcp */
+        port_them,
+        px[parsed.transport_offset + 13], /* tcp flags */
+        parsed.ip_ttl,
+        parsed.mac_src
+      );
+      /*
+       * Send RST so other side isn't left hanging (only doing this in
+       * complete stateless mode where we aren't tracking banners)
+       */
+      // 发送rst给服务端，防止服务端一直等待。
+      if (tcpcon == NULL && !Masscan->is_noreset)
+        tcp_send_RST(
+        &parms->tmplset->pkts[Proto_TCP],
+        parms->packet_buffers,
+        parms->transmit_queue,
+        ip_them, ip_me,
+        port_them, port_me,
+        0, seqno_me);
+    }
+## Zmap源码分析
+Zmap官方有一篇[paper](https://Zmap.io/paper.pdf)，讲述了Zmap的原理以及一些实践。上文说到Zmap使用的发包技术和Masscan大同小异，高速模式下都是调用pf_ring的驱动进行，所以对这些就不再叙述了，主要说下其他与Masscan不同的地方，paper中对丢包问题以及扫描时间段有一些研究，简单整理下
+  1. 发送多个探针：结果表明，发送8个SYN包后，响应主机数量明显趋于平稳
+  2. 哪些时间更适合扫描
+    1. 我们观察到一个±3.1%的命中率变化依赖于日间扫描的时间。最高反应率在美国东部时间上午7时左右，最低反应率在美国东部时间下午7时45分左右。
+    2. 这些影响可能是由于整体网络拥塞和包丢失率的变化，或者由于只间断连接到网络的终端主机的总可用性的日变化模式。在不太正式的测试中，我们没有注意到任何明显的变化
+还有一点是Zmap只能扫描单个端口，看了一下代码，这个保存端口变量的作用也只是在最后接收数据包用来判断srcport用，不明白为什么还没有加上多端口的支持。
+### 宽带限制
+相比于Masscan用`rate=10000`作为限制参数，Zmap用`-B 10M`的方式来限制
+我觉得这点很好，因为不是每个使用者都能明白每个参数代表的原理。实现细节
+### 发包与解包
+Zmap不支持Windows，因为Zmap的发包默认用的是socket，在window下可能不支持tcp的组包(猜测)。相比之下Masscan使用的是pcap发包，在win/linux都有支持的程序。Zmap接收默认使用的是pcap。
+在构造tcp包时，附带的状态信息会填入到seq和srcport中
+在解包时，先判断返回dstport的数据
+再判断返回的ack中的数据
+## 用go写端口扫描器
+在了解完以上后，我就准备用go写一款类似的扫描器了，希望能解决丢包的问题，顺便学习go。
+在上面分析中知道了，Masscan和Zmap都使用了pcap，pfring这些组件来原生发包，值得高兴的是go官方也有原生支持这些的包
+，而且完美符合我们的要求。
+接口没问题，在实现了基础的无状态扫描功能后，接下来就是如何处理丢包的问题。
+### 丢包问题
+按照tcp协议的原理，我们发送一个数据包给目标机器，端口开放时返回`ack`标记，关闭会返回`rst`标记。
+但是通过扫描一台外网的靶机，发现扫描几个端口是没问题的，但是扫描大批量的端口(1-65535)，就可能造成丢包问题。而且不存在的端口不会返回任何数据。
+#### 控制速率
+刚开始以为是速度太快了，所以先控制下每秒发送的频率。因为发送和接收都是启动了一个goroutine,目标的传入是通过一个channel传入的(go的知识点)。
+所以控制速率的伪代码类似这样
+    rate := 300 // 每秒速度
+    var data = []int{1, 2, 3, 4, 5, 6，...,65535} // 端口数组
+    ports := make(chan int, rate)
+    go func() {
+            // 每秒将data数据分配到ports
+            index := 0
+            for {
+                OldTimestap := time.Now().UnixNano() / 1e6 // 取毫秒
+                for i := index; i < index+rate; i++ {
+                    if len(datas) <= index {
+                        break
+                    }
+                    index++
+                    distribution <- data[i]
+                }
+                if len(datas) <= index {
+                    break
+                }
+                Timestap := time.Now().UnixNano() / 1e6
+                TimeTick := Timestap - OldTimestap
+                if TimeTick < 1000 {
+                    time.Sleep(time.Duration(1000-TimeTick) * time.Millisecond)
+                }
+            }
+            fmt.Println("发送完毕..")
+        }()
+### 本地状态表
+即使将速度控制到了最小，也存在丢包的问题，后经过一番测试，发现是防火墙的原因。例如常用的`iptables`，其中拒绝的端口不会返回信息。将端口放行后再次扫描，就能正常返回数据包了。
+此时遇到的问题是有防火墙策略的主机如何进行准确扫描，一种方法是扫描几个端口后就延时一段时间，但这不符合快速扫描的设想，所以我的想法是维护一个本地的状态表，状态表中能够动态修改每个扫描结果的状态，将那些没有返回包的目标进行重试。
+Ps：这是针对一个主机，多端口(1-65535)的扫描策略，如果是多个IP，Masscan的`随机化地址扫描`策略就能发挥作用了。
+设想的结构如下
+    // 本地状态表的数据结构
+    type ScanData struct {
+        ip     string
+        port   int
+        time   int64 // 发送时间
+        retry  int   // 重试次数
+        status int   // 0 未发送 1 已发送 2 已回复 3 已放弃
+    }
+初始数据时`status`为0，当发送数据时，将`status`变更为1，同时记录发送时间`time`,接收数据时通过返回的标记，`dstport`,`seq`等查找到本地状态表相应的数据结构，变更`status`为2，同时启动一个监控程序，监控程序每隔一段时间对所有的状态进行检查，如果发现`stauts`为1并且当前时间-发送时间大于一定值的时候，可以判断这个ip+端口的探测包丢失了，准备重发，将`retry`+1，重新设置发送时间`time`后，将数据传入发送的channel中。
+### 概念验证程序
+因为只是概念验证程序，而且是自己组包发送，需要使用到本地和网关的mac地址等，这些还没有写自动化程序获取，需要手动填写。mac地址可以手动用wireshark抓包获得。
+如果你想使用该程序的话，需要修改全局变量中的这些值
+    var (
+        SrcIP  string           = "10.x.x.x" // 源IP
+        DstIp  string           = "188.131.x.x" // 目标IP
+        device string           = "en0" // 网卡名称
+        SrcMac net.HardwareAddr = net.HardwareAddr{0xf0, 0x18, 0x98, 0x1a, 0x57, 0xe8} // 源mac地址
+        DstMac net.HardwareAddr = net.HardwareAddr{0x5c, 0xc9, 0x99, 0x33, 0x37, 0x80} // 网关mac地址
+    )
+整个go语言源程序如下，单文件。
+    package main
+    import (
+        "fmt"
+        "github.com/google/gopacket"
+        "github.com/google/gopacket/layers"
+        "github.com/google/gopacket/pcap"
+        "log"
+        "net"
+        "sync"
+        "time"
+    )
+    var (
+        SrcIP  string           = "10.x.x.x" // 源IP
+        DstIp  string           = "188.131.x.x" // 目标IP
+        device string           = "en0" // 网卡名称
+        SrcMac net.HardwareAddr = net.HardwareAddr{0xf0, 0x18, 0x98, 0x1a, 0x57, 0xe8} // 源mac地址
+        DstMac net.HardwareAddr = net.HardwareAddr{0x5c, 0xc9, 0x99, 0x33, 0x37, 0x80} // 网关mac地址
+    )
+    // 本地状态表的数据结构
+    type ScanData struct {
+        ip     string
+        port   int
+        time   int64 // 发送时间
+        retry  int   // 重试次数
+        status int   // 0 未发送 1 已发送 2 已回复 3 已放弃
+    }
+    func recv(datas *[]ScanData, lock *sync.Mutex) {
+        var (
+            snapshot_len int32         = 1024
+            promiscuous  bool          = false
+            timeout      time.Duration = 30 * time.Second
+            handle       *pcap.Handle
+        )
+        handle, _ = pcap.OpenLive(device, snapshot_len, promiscuous, timeout)
+        // Use the handle as a packet source to process all packets
+        packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+        scandata := *datas
+        for {
+            packet, err := packetSource.NextPacket()
+            if err != nil {
+                continue
+            }
+            if IpLayer := packet.Layer(layers.LayerTypeIPv4); IpLayer != nil {
+                if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+                    tcp, _ := tcpLayer.(*layers.TCP)
+                    ip, _ := IpLayer.(*layers.IPv4)
+                    if tcp.Ack != 111223 {
+                        continue
+                    }
+                    if tcp.SYN && tcp.ACK {
+                        fmt.Println(ip.SrcIP, " port:", int(tcp.SrcPort))
+                        _index := int(tcp.DstPort)
+                        lock.Lock()
+                        scandata[_index].status = 2
+                        lock.Unlock()
+                    } else if tcp.RST {
+                        fmt.Println(ip.SrcIP, " port:", int(tcp.SrcPort), " close")
+                        _index := int(tcp.DstPort)
+                        lock.Lock()
+                        scandata[_index].status = 2
+                        lock.Unlock()
+                    }
+                }
+            }
+            //fmt.Printf("From src port %d to dst port %d\n", tcp.SrcPort, tcp.DstPort)
+        }
+    }
+    func send(index chan int, datas *[]ScanData, lock *sync.Mutex) {
+        srcip := net.ParseIP(SrcIP).To4()
+        var (
+            snapshot_len int32 = 1024
+            promiscuous  bool  = false
+            err          error
+            timeout      time.Duration = 30 * time.Second
+            handle       *pcap.Handle
+        )
+        handle, err = pcap.OpenLive(device, snapshot_len, promiscuous, timeout)
+        if err != nil {
+            log.Fatal(err)
+        }
+        defer handle.Close()
+        scandata := *datas
+        for {
+            _index := <-index
+            lock.Lock()
+            data := scandata[_index]
+            port := data.port
+            scandata[_index].status = 1
+            dstip := net.ParseIP(data.ip).To4()
+            lock.Unlock()
+            eth := &layers.Ethernet{
+                SrcMAC:       SrcMac,
+                DstMAC:       DstMac,
+                EthernetType: layers.EthernetTypeIPv4,
+            }
+            // Our IPv4 header
+            ip := &layers.IPv4{
+                Version:    4,
+                IHL:        5,
+                TOS:        0,
+                Length:     0, // FIX
+                Id:         0,
+                Flags:      layers.IPv4DontFragment,
+                FragOffset: 0,  //16384,
+                TTL:        64, //64,
+                Protocol:   layers.IPProtocolTCP,
+                Checksum:   0,
+                SrcIP:      srcip,

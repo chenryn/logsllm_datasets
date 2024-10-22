@@ -1,0 +1,185 @@
+```
+int
+FileSync(File file)
+{
+        int                     returnCode;
+        Assert(FileIsValid(file));
+        DO_DB(elog(LOG, "FileSync: %d (%s)",
+                           file, VfdCache[file].fileName));
+        returnCode = FileAccess(file);
+        if (returnCode < 0)
+                return returnCode;
+        // 调用pg_fsync
+	return pg_fsync(VfdCache[file].fd);
+}
+```
+16\. 调用pg_fsync  
+```
+/*
+ * pg_fsync --- do fsync with or without writethrough
+ */
+int
+pg_fsync(int fd)
+{
+        // 从代码分析 linux下面不会调用pg_fsync_writethrough
+	/* #if is to skip the sync_method test if there's no need for it */
+#if defined(HAVE_FSYNC_WRITETHROUGH) && !defined(FSYNC_WRITETHROUGH_IS_FSYNC)
+        if (sync_method == SYNC_METHOD_FSYNC_WRITETHROUGH)
+                return pg_fsync_writethrough(fd);
+        else
+#endif
+                return pg_fsync_no_writethrough(fd);
+}
+```
+17\. 调用pg_fsync_no_writethrough  
+```
+/*
+ * pg_fsync_no_writethrough --- same as fsync except does nothing if
+ *      enableFsync is off
+ */
+int
+pg_fsync_no_writethrough(int fd)
+{
+        if (enableFsync)
+                return fsync(fd);
+        else
+                return 0;
+}
+```
+18\. 调用 fsync 刷盘    
+## 检查点带来的不安定因素分析
+1\. 调用fsync前，操作系统不一定把dirty page都刷盘了。      
+因为调用的是异步的sync_file_range。      
+2\. 同时在此过程中，bgwrite, backend process还有可能将shared buffer中新产生的脏页写入os dirty page。    
+这些脏页也许涉及到接下来检查点需要fsync的文件。  
+因为这两个不安定因素的存在，同时加上环境中有多个PG实例，并且每个PG实例都限制了较小的DATA盘IO，导致fsync时刷盘非常的慢。    
+REDO的IO能力远大于DATA盘的IO能力时，checkpoint过程中可能又会产生很多热点脏页。    
+导致检查点在最后fsync收官时，需要刷dirty page，而同时又被实例的cgroup限制住，看起来就好像实例hang住一样。      
+## 检查点调度在什么阶段
+是在write阶段进行调度，在sync_file_range和fsync过程中都没有任何调度。    
+## 检查点抖动优化方法1  
+![pic1](20160928_01_pic_001.png)  
+1\. 解决不安定因素1 - 避免检查点过程中产生未刷盘的dirty page  
+在检查点过程中，bgwriter或backend process从shared buffer产生的脏页write out时，会调用write即buffer io。  
+进入检查点后，bgwriter或backend process从shared buffer产生的脏页write out时，同时记录该PAGE的ID到list(1或2)。  
+2\. checkpoint在最后阶段，即调用fsync前，插入一个阶段。  
+将list(1或2)的PAGE实行sync_file_range，等待其刷盘成功。  
+使用以下flag    
+```
+       SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE
+              Ensures that all pages in the specified range which were dirty when sync_file_range() was called are placed under write-out.  This is a start-write-for-data-integrity operation.
+或
+       SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER
+              This is a write-for-data-integrity operation that will ensure that all pages in the specified range which were dirty when sync_file_range() was called are committed to disk.
+```
+3\. 为了防止bgwrite或backend process 与checkpoint 的sync file range冲突。  
+使用两个list来交替记录检查点开始后的shared buffer evict pages。  
+4\. 新增一个GUC变量，配置当checkpoint最后一次sync file range的list page树少于多少时，进入fsync阶段。  
+允许用户根据IOPS的规格，配置这个GUC变量，从而减少最后FSYNC时需要等待的page数。  
+注意这个值也不能设得太小，否则可能造成漫长的很多轮list1和list2的sync file range过程。  
+需要修改PostgreSQL内核，动作较大。  
+5\. 解决不安定因素2 - 检查点最后的阶段，调用fsync前，确保fd的所有dirty page都已经write out。    
+目前checkpoint调用的pg_flush_data是异步的sync_file_range，我们需要将其修改为同步的模式。  
+建议只修改checkoint的调用，不要动到原有的逻辑。  
+```
+void
+(int fd, off_t offset, off_t nbytes)
+{
+...
+#if defined(HAVE_SYNC_FILE_RANGE)
+        {
+                int                     rc;
+                // 注意，如果脏页很多时，sync_file_range的异步模式也可能被堵塞。    
+		/*
+                 * sync_file_range(SYNC_FILE_RANGE_WRITE), currently linux specific,
+                 * tells the OS that writeback for the specified blocks should be
+                 * started, but that we don't want to wait for completion.  Note that
+                 * this call might block if too much dirty data exists in the range.
+                 * This is the preferable method on OSs supporting it, as it works
+                 * reliably when available (contrast to msync()) and doesn't flush out
+                 * clean data (like FADV_DONTNEED).
+                 */
+		// 调用sync_file_range  ， 修改如下  
+		rc = sync_file_range(fd, offset, nbytes,
+                                                         SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+                /* don't error out, this is just a performance optimization */
+                if (rc != 0)
+                {
+                        ereport(WARNING,
+                                        (errcode_for_file_access(),
+                                         errmsg("could not flush dirty data: %m")));
+                }
+                return;
+        }
+```
+6\. 从OS内核层面解决IO hang的问题。  
+阿里云RDS for PostgreSQL已从数据库内核层面完美的解决了这个问题，欢迎使用。  
+## 检查点抖动优化方法2  
+1\. 检查点柔性调度，减少FSYNC时的dirty pages，降低stall。  
+checkpoint_flush_after (integer)  
+```
+Whenever more than checkpoint_flush_after bytes have been written while performing a checkpoint, 
+attempt to force the OS to issue these writes to the underlying storage. 
+Doing so will limit the amount of dirty data in the kernel's page cache, 
+reducing the likelihood of stalls when an fsync is issued at the end of the checkpoint, 
+or when the OS writes data back in larger batches in the background. 
+Often that will result in greatly reduced transaction latency, but there also are some cases, 
+especially with workloads that are bigger than shared_buffers, but smaller than the OS's page cache, 
+where performance might degrade. 
+This setting may have no effect on some platforms. 
+The valid range is between 0, which disables controlled writeback, and 2MB. 
+The default is 256kB on Linux, 0 elsewhere. 
+(Non-default values of BLCKSZ change the default and maximum.) 
+This parameter can only be set in the postgresql.conf file or on the server command line.
+```
+2\. bgwrite bufferio柔性调度，降低stall。     
+bgwriter_flush_after (integer)    
+```
+Whenever more than bgwriter_flush_after bytes have been written by the bgwriter, 
+attempt to force the OS to issue these writes to the underlying storage. 
+Doing so will limit the amount of dirty data in the kernel's page cache, 
+reducing the likelihood of stalls when an fsync is issued at the end of a checkpoint, 
+or when the OS writes data back in larger batches in the background. 
+Often that will result in greatly reduced transaction latency, but there also are some cases, 
+especially with workloads that are bigger than shared_buffers, 
+but smaller than the OS's page cache, where performance might degrade. 
+This setting may have no effect on some platforms. 
+The valid range is between 0, which disables controlled writeback, and 2MB. 
+The default is 512kB on Linux, 0 elsewhere. 
+(Non-default values of BLCKSZ change the default and maximum.) This parameter can only be set in the postgresql.conf file or on the server command line.
+```
+3\. 当SHARED BUFFER中没有空闲页或者干净的页时，backend也会evict dirty page。  这是对backend process的调度。  
+backend_flush_after (integer)    
+```
+Whenever more than backend_flush_after bytes have been written by a single backend, 
+attempt to force the OS to issue these writes to the underlying storage. 
+Doing so will limit the amount of dirty data in the kernel's page cache, 
+reducing the likelihood of stalls when an fsync is issued at the end of a checkpoint, 
+or when the OS writes data back in larger batches in the background. 
+Often that will result in greatly reduced transaction latency, but there also are some cases, 
+especially with workloads that are bigger than shared_buffers, 
+but smaller than the OS's page cache, where performance might degrade. 
+This setting may have no effect on some platforms. 
+The valid range is between 0, which disables controlled writeback, and 2MB. 
+The default is 0 (i.e. no flush control). (Non-default values of BLCKSZ change the maximum.)
+```
+4\. 这个和shared buffer无关，是wal buffer的柔性调度。  
+wal_writer_flush_after (integer)  
+```
+Specifies how often the WAL writer flushes WAL. 
+In case the last flush happened less than wal_writer_delay milliseconds ago and less than wal_writer_flush_after bytes of WAL have been produced since, 
+WAL is only written to the OS, not flushed to disk. 
+If wal_writer_flush_after is set to 0 WAL is flushed every time the WAL writer has written WAL. 
+The default is 1MB. This parameter can only be set in the postgresql.conf file or on the server command line.
+```
+## 摘录sync_file_range分析  
+http://yoshinorimatsunobu.blogspot.com/2014/03/how-syncfilerange-really-works.html  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

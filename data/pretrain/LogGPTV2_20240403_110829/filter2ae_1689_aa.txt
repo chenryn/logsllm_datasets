@@ -1,0 +1,149 @@
+cve-2017-0263是一个win32k的UAF漏洞，我在参考了小刀师傅的文章之后进行了复现分析。因为小刀师傅珠玉在前，所以我的文章只是一个粗劣的模仿+踩坑记录，如果你觉得哪里不明白的话可以移步小刀师傅的文章，你应该会被师傅的知识的广度和条理性所折服。  
+传送门：[小刀师傅的博客](https://xiaodaozhi.com/)
+# 配置漏洞触发环境
+    [+] win7 x86 sp1
+    [+] windbg preview 1.0.2001.02001
+# BSOD分析
+## 基本信息收集
+将poc放入虚拟机之后运行，windbg断下来之后我们用`！analyze -v`查看漏洞类型。  
+`fe8733e8`这块幸运内存被释放了两次，成功造成了Double Free。接着再看看调用关系  
+问题就发生在这里，`nt!ExFreePoolWithTag`函数释放了一块已经释放过的内存，往上追溯看一下它的调用者`win32k!MNFreePopup`函数。  
+比较关键的地方是这俩，程序将唯一的参数直接传递给了`nt!ExFreePoolWithTag`，他也是个工具人，继续往上追溯到`win32k!xxxMNEndMenuState`，该函数用来清理菜单状态结构体，其中就包括调用`win32k!MNFreePopup`函数来释放弹出菜单对象和窗口对象。我们看一下windows
+2000中对应的代码
+    // 为了方便观看，我省略了部分内容。
+    void xxxMNEndMenuState (BOOL fFreePopup)
+    {
+        PTHREADINFO ptiCurrent = PtiCurrent();
+        PMENUSTATE pMenuState;
+        pMenuState = ptiCurrent->pMenuState;
+        if (pMenuState->pGlobalPopupMenu != NULL) {
+            if (fFreePopup) {
+                MNFreePopup(pMenuState->pGlobalPopupMenu);
+            } else {
+                pMenuState->pGlobalPopupMenu->fDelayedFree = FALSE;
+            }
+        }
+        UnlockMFMWFPWindow(&pMenuState->uButtonDownHitArea);
+        UnlockMFMWFPWindow(&pMenuState->uDraggingHitArea);
+        ptiCurrent->pMenuState = pMenuState->pmnsPrev;
+    }
+函数首先从当前线程信息`tagTHREADINFO`中获得`pMenuState`成员域指向的菜单状态结构体对象，接着判断`pMenuState`的`pGlobalPopupMenu`成员是否为空，不为空的话将其传递给`MNFreePopup`函数进行释放，`pGlobalPopupMenu`成员指向弹出菜单结构体`tagPOPMENU`对象。  
+但是注意后三行，虽然`pMenuState`成员域会被重置，连带着`pMenuState`的`pGlobalPopupMenu`成员也会完蛋，似乎是没什么利用的可能，但就在重置`pMenuState`之前，函数会对`pMenuState->uButtonDownHitArea`和`pMenuState->uDraggingHitArea`解锁和释放，如果我们可以构造特殊的菜单窗口对象，就可以让执行流回到用户进程中，在利用代码中我们可以为所欲为，我们可以对尚存的悬挂指针`pGlobalPopupMenu`成员再次进行释放，就可以导致BSOD的发生了。
+## 第一次释放
+为了追踪这两次释放，我们需要在`xxxMNEndMenuState`函数释放`pGlobalPopupMenu`成员的位置下断点：
+    ba e1 win32k!xxxMNEndMenuState+0x31 "r eax;.if((@eax & 0x0`ffffffff)==0xfe8733e8){}.else{.echo continue;g}"
+这个断点有一个需要注意的地方，那就是为什么要将条件设置为eax &
+0x0`ffffffff，他本来不就是32位的寄存器吗？这个地方还困了我挺久的，我之前一直断不下来，可以看看微软自己家的文档怎么说：
+> MASM 表达式计算器补符号位的高等于一寄存器。 当 **eax** 具有值 0xC0004321，将被视为 0xFFFFFFFF`C0004321
+> 中计算-即使 **eax** 仍将显示为 0xC0004321。 但是，数字 **0xc0004321**
+> 是带符号扩展在内核模式下，但不是在用户模式下。 因此前, 一个命令将无法正常工作在用户模式下。 如果掩码的高位 **eax** ，该命令将在内核模式下-> 正常工作，但现在它将在用户模式下失败
+下了断点之后开始运行，程序断下来之后看一下堆栈  
+`xxxMNEndMenuState`函数的调用者是`win32k!xxxMenuWindowProc`函数，该函数专门对Menu窗口的消息做出响应，当ring3代码调用SendMessage->NtUserMessageCall发送消息给Menu窗口，或者ring0调用xxxSendMessage发送消息给Menu窗口时，都会通过FNID函数封装后最终调用到该函数。  
+这里我们反汇编一下，看看`win32k!xxxMenuWindowProc`函数在收到什么消息的时候会调用`xxxMNEndMenuState`函数：  
+不难看出，当`win32k!xxxMenuWindowProc`函数收到未被文档化的MN_ENDMENU(0x1F3)消息且Menu为非模态（mode
+less）时，就会调用`xxxMNEndMenuState`函数来销毁`MenuState`。你可能会以为我们直接在用户进程中来一句SendMessage（）就可以销毁`MenuState`，但是弹出菜单的机制有点不太一样，接下来分析一下弹出菜单从诞生到销毁的大致流程。  
+在用户进程中，我们通过调用
+`TrackPopupMenuEx`函数来展示菜单，`TrackPopupMenuEx`函数又会调用`win32k!xxxTrackPopupMenuEx`函数，此函数会做以下几件事：
+  1. 通过`xxxCreateWindowEx`函数为弹出菜单对象创建了一个类型为`#32768`的窗口对象，在`tagWND`的末尾拓展区域存放了一个`tagPOPUPMENU`结构，并对`tagPOPUPMENU`进行初始化。
+  2. 调用 `xxxMNAllocMenuState`函数初始化菜单状态结构体的各个成员域，并将tagPOPMENU对象作为当前的根弹出菜单对象，其指针放置在pGlobalPopmenu中。
+  3. 接下来函数调用 `xxxSetWindowPos` 函数以设置目标菜单层叠窗口在屏幕中的位置并将其显示在屏幕中。在函数 `xxxSetWindowPos` 执行期间，相关窗口位置和状态已完成改变之后，系统在函数 `xxxEndDeferWindowPosEx` 中调用 `xxxSendChangedMsgs` 以发送窗口位置已改变的消息。在函数 `xxxSendChangedMsgs` 中，系统根据设置的 `SWP_SHOWWINDOW` 状态标志，为当前的目标菜单层叠窗口对象创建并添加关联的阴影窗口对象。两个窗口对象的关联关系在函数 `xxxAddShadow` 中被添加到 `gpshadowFirst` 阴影窗口关联表中。
+  4. 调用 `xxxWindowEvent` 函数以发送代表“菜单弹出开始”的 `EVENT_SYSTEM_MENUPOPUPSTART` 事件通知。如果先前在用户进程中设置了包含这种类型时间通知范围的窗口事件通知处理函数，那么系统将在线程信息循环处理期间分发调用这些通知处理函数。
+  5. 接下来菜单被选择或取消，退出循环并销毁PopupMenu、Menu窗口对象和MenuState结构(xxxxxEndMenuLoop、xxxMNEndMenuState等)。
+这个函数管的太多了，在我们的视角下就是只调了这一个API就已经把事情做完了，好像根本没有给我们和弹出菜单说句话的机会，也不会返回指向弹出菜单对象的指针，在内部就直接销毁了。你应该已经看到了，第4步说的很清晰了，如果我们可以注册处理`EVENT_SYSTEM_MENUPOPUPSTART`
+事件的hook，就可以为所欲为了。我们可以直接调用`SetWinEventHook`函数来注册针对于`EVENT_SYSTEM_MENUPOPUPSTART`
+事件的hook，这样我们就可以给他发送MN_ENDMENU(0x1F3)消息来销毁窗口。  
+现在这个堆栈的源头就很清晰了，虽然说poc我们有符号文件，但哪怕没有符号文件，我们依旧可以推断出这个函数就是针对于`EVENT_SYSTEM_MENUPOPUPSTART`
+事件的hook函数，该函数发送了MN_ENDMENU(0x1F3)消息来对内存块`fe8733e8`进行了第一次释放。
+## 第二次释放
+接着运行程序就可以来到下一处断点，也就是我们的第二次释放  
+和奔溃时的堆栈相比就知道，这次尚未发生的释放就是凶手，继续执行下去会导致BSOD的发生。如果你还记得前面分析过的`xxxMNEndMenuState`函数的功能的话，那你应该还记得我们的操作空间仅限如下
+    UnlockMFMWFPWindow(&pMenuState->uButtonDownHitArea);
+        UnlockMFMWFPWindow(&pMenuState->uDraggingHitArea);
+我们看一下`UnlockMFMWFPWindow`函数的实现
+    #define Unlock(ppobj)     HMAssignmentUnlock((PVOID *)ppobj)
+    void UnlockMFMWFPWindow (PULONG_PTR puHitArea)
+    {
+        if (IsMFMWFPWindow(*puHitArea)) {
+            Unlock(puHitArea);
+        } else {
+            *puHitArea = MFMWFP_OFFMENU;
+        }
+    }
+该函数对目标进行校验之后就调用`HMAssignmentUnlock`函数来对目标解锁，`HMAssignmentUnlock`函数清除赋值锁的过程会减小对象的锁计数，在锁计数减小为0时调用`HMUnlockObjectInternal`销毁对象，销毁时调用win32k!ghati对应表项的销毁例程，并最终调用`win32kfull!xxxDestroyWindow`对窗口对象进行释放。  
+而uButtonDownHitArea成员保存着当前鼠标按下的坐标区域所属的窗口对象地址，当系统对其解锁并销毁的时候，会同时消除与该对象关联的阴影窗口对象（关于阴影窗口何时被创建，请回顾前面对`TrackPopupMenuEx`函数的分析）。但是阴影窗口对象没有属于自己的窗口消息处理函数，所以我们如果将窗口对象的消息处理函数修改为我们自定义的消息处理函数，就可以再一次的取得控制权，第二次释放也就是在此时发生的，这一点可以从堆栈中看出。  
+至此，我们基本完成了对BSOD的分析，可以得到以下情报：
+    [+] win32k!xxxMNEndMenuState函数在释放根弹出菜单对象时，没有及时将该成员置零，导致出现了一个可以被利用的悬挂指针，可以造成UAF。
+    [+] poc中的第一次释放是正常释放，收到未被文档化的MN_ENDMENU(0x1F3)消息且Menu为非模态（mode less）时，就会调用xxxMNEndMenuState函数来调用MNFreePopup(pMenuState->pGlobalPopupMenu)。
+    [+] poc中的第二次释放是通过阴影窗口对象的机制，在调用hook了的消息处理函数时触发的win32k!xxxMNEndMenuState。
+# poc分析
+## 准备工作
+    LPCSTR szMenuItem = "item";
+        MENUINFO mi = { 0 };
+        mi.cbSize = sizeof(mi);
+        // MIM_STYLE 表明要设置 dwStyle 这个标志位
+        mi.fMask = MIM_STYLE;
+        // autodismiss 鼠标移到菜单窗口外面一会儿窗口会自动消失
+        // modeless 非模态
+        // dragdrop 拖放窗口
+        mi.dwStyle = MNS_AUTODISMISS | MNS_MODELESS | MNS_DRAGDROP;
+        HMENU hpopupMenu[2] = { 0 };
+        // 用 CreatePopupMenu 创建的菜单是空的，后面用 AppendMenu 来添加 items
+        hpopupMenu[0] = CreatePopupMenu();
+        hpopupMenu[1] = CreatePopupMenu();
+        SetMenuInfo(hpopupMenu[0], &mi);
+        SetMenuInfo(hpopupMenu[1], &mi);
+        AppendMenuA(hpopupMenu[0], MF_BYPOSITION | MF_POPUP, (UINT_PTR)hpopupMenu[1], szMenuItem);
+        AppendMenuA(hpopupMenu[1], MF_BYPOSITION | MF_POPUP, 0, szMenuItem);
+调用`CreatePopupMenu`函数创建两个非模态的可弹出菜单对象，参考MSDN的解释
+> Creates a drop-down menu, submenu, or shortcut menu. The menu is initially
+> empty. You can insert or append menu items by using the
+> [InsertMenuItem](https://docs.microsoft.com/en-> us/windows/desktop/api/winuser/nf-winuser-insertmenuitema) function. You can
+> also use the [InsertMenu](https://docs.microsoft.com/en-> us/windows/desktop/api/winuser/nf-winuser-insertmenua) function to insert
+> menu items and the [AppendMenu](https://docs.microsoft.com/en-> us/windows/desktop/menurc/u) function to append menu items.
+该函数创建带有`MFISPOPUP`标志位的tagMENU对象，而不是tagPOPUPMENU对象。tagPOPUPMENU用来描述菜单对象实体的弹出状态的对象，在菜单对象实际弹出时创建、菜单对象结束弹出状态时销毁。  
+因为这两个对象创建之初是空的，所以我们继续调用`AppendMenuA`函数添加菜单项，并且使得第二个菜单成为第一个菜单的子菜单。
+## 设置hook
+    WNDCLASSEXW wndClass = { 0 };
+        wndClass = { 0 };
+        wndClass.cbSize = sizeof(WNDCLASSEXW);
+        wndClass.lpfnWndProc = DefWindowProcW;
+        wndClass.cbWndExtra = 0;
+        wndClass.hInstance = GetModuleHandleA(NULL);
+        wndClass.lpszMenuName = NULL;
+        wndClass.lpszClassName = L"WNDCLASSMAIN";
+        RegisterClassExW(&wndClass);
+        HWND hWindowMain = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            L"WNDCLASSMAIN",
+            NULL,
+            WS_VISIBLE,
+            0,  // x
+            0,  // y
+            1,  // width
+            1,  // height
+            NULL,
+            NULL,
+            GetModuleHandleA(NULL),
+            NULL);
+创建一个普通的窗口对象作为后续菜单弹出时弹出菜单的拥有者窗口对象。
+    SetWindowsHookExW(WH_CALLWNDPROC, xxWindowHookProc,
+            GetModuleHandleA(NULL),
+            GetCurrentThreadId());
+        SetWinEventHook(EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPSTART,
+            GetModuleHandleA(NULL),
+            xxWindowEventProc,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            0);
+调用`SetWindowsHookExW`函数创建类型为WH_CALLWNDPROC关联当前线程的hook程序，这是因为在`xxxTrackPopupMenuEx`函数中，系统在调用对象指定的消息处理程序之前，还会调用
+xxxCallHook 函数用来调用先前由用户进程设定的 WH_CALLWNDPROC
+类型的挂钩处理程序，所以如果我们设置这种类型的挂钩会在每次线程将消息发送给窗口对象之前调用。  
+接着通过`SetWinEventHook`函数创建包含EVENT_SYSTEM_MENUPOPUPSTART的关联当前进程和线程的事件通知消息处理程序。至于为什么是EVENT_SYSTEM_MENUPOPUPSTART，可以回顾前面对于第一次释放的分析。
+## 第一次释放
+    TrackPopupMenuEx(hpopupMenu[0], 0, 0, 0, hWindowMain, NULL);
+调用`TrackPopupMenuEx`函数将我们创建的第一个可弹出菜单对象作为跟菜单在对象中弹出。  
+调用`TrackPopupMenuEx`函数会调用`win32k!xxxTrackPopupMenuEx`函数，首先通过`xxxCreateWindowEx`函数为弹出菜单对象创建了一个类型为`#32768`的窗口对象，如果创建成功的话就会发送WM_NCCREATE消息。在处理消息之前，会调用我们刚刚设置的WH_CALLWNDPROC
+类型的挂钩处理程序，即`xxWindowHookProc函数`。
+    // 弹出窗口和阴影窗口创建时都会调用到这个函数
+    LRESULT CALLBACK
+    xxWindowHookProc(INT code, WPARAM wParam, LPARAM lParam)
+    {

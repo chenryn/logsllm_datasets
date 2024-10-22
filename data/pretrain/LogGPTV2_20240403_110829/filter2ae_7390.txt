@@ -1,0 +1,144 @@
+# Golang TLS双向身份认证DoS漏洞分析（CVE-2018-16875）
+##### 译文声明
+本文是翻译文章，文章原作者 apisecurity，文章来源：apisecurity.io
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 一、前言
+如果程序源代码使用Go语言编写，并且用到了单向或者双向TLS认证，那么就容易受到CPU拒绝服务（DoS）攻击。Go语言的[crypto/x509](https://golang.org/pkg/crypto/x509/)标准库中的校验算法存在逻辑缺陷，攻击者可以精心构造输入数据，使校验算法在尝试验证客户端提供的TLS证书链时占用所有可用的CPU资源。
+为了保护正常服务，大家应立即[升级](https://golang.org/dl/)到G0 v1.10.6、v1.11.3或者更新版本。
+## 二、研究背景
+42Crunch的API Security平台后端采用的是微服务架构，而微服务使用Go语言编写。微服务之间通过`gRPC`相互通信，并且部署了REST
+API网关用于外部调用。为了确保安全性，我们遵循了“TLS everywhere”（处处部署TLS）原则，广泛采用了TLS双向认证机制。
+Go的标准库原生支持SSL/TLS认证，也支持大量与连接处理、验证、身份认证等方面有关的x509和TLS原语。这种原生支持可以避免外部依赖，使用标准化的、经过精心维护和审核的TLS库也能降低安全风险。
+因此42Crunch很有可能受此TLS漏洞影响，需要理解漏洞原理，保证42Crunch平台的安全性。
+[42Crunch](https://42crunch.com/?__hstc=78516299.9bfa945cadc784e497dec7184be754c2.1545287465739.1545287465739.1545287465739.1&__hssc=78516299.1.1545287465740&__hsfp=3096875632)安全团队针细致分析了该CVE，如下文所示。
+## 三、问题描述
+这个DoS问题最早由Netflixx发现，Golang在issue跟踪日志中提到：
+> `crypto/x509`包负责解析并验证X.509编码的密钥和证书，正常情况下会占用一定的资源来处理攻击者提供的证书链。
+>
+> `crypto/x509`包并没有限制验证每个证书链时所分配的工作量，攻击者有可能构造恶意输入，导致CPU拒绝服务。Go
+> TLS服务器在接受客户端证书或者TLS客户端在验证证书时会受此漏洞影响。
+该漏洞具体位于[crypto/x509
+Certificate.Verify()](https://golang.org/pkg/crypto/x509/#Certificate.Verify)函数的调用路径中，该函数负责证书认证及验证。
+## 四、漏洞分析
+###  背景知识
+为了便于漏洞分析，我们举个简单的例子：TLS客户端连接至TLS服务器，服务器验证客户端证书。
+TLS服务器在`8080`端口监听TLS客户端请求，验证客户端证书是否由证书颁发机构（CA）颁发：
+    caPool := x509.NewCertPool()
+    ok := caPool.AppendCertsFromPEM(caCert)
+    if !ok {
+            panic(errors.New("could not add to CA pool"))
+    }
+    tlsConfig := &tls.Config{
+            ClientCAs:  caPool,
+            ClientAuth: tls.RequireAndVerifyClientCert,
+    }
+    //tlsConfig.BuildNameToCertificate()
+    server := &http.Server{
+            Addr:      ":8080",
+            TLSConfig: tlsConfig,
+    }
+    server.ListenAndServeTLS(certWeb, keyWeb)
+在标准的TLS验证场景中，TLS客户端会连接到TLS服务器的`8080`端口，然后向服务器提供证书的“trust
+chain”（信任链），其中包括客户端证书、root
+CA证书以及中间所有CA证书。TLS服务器处理TLS握手，验证客户端证书，检查客户端是否可信（即客户端证书是否由服务器信任的CA签名）。通常TLS握手过程如下图所示：
+分析Go语言的`crypto/x509`库，最终我们会进入`x509/tls/handshake_server.go:doFullHandshake()`函数代码段：
+    ...
+    if c.config.ClientAuth >= RequestClientCert {
+            if certMsg, ok = msg.(*certificateMsg); !ok {
+                    c.sendAlert(alertUnexpectedMessage)
+                    return unexpectedMessageError(certMsg, msg)
+            }
+            hs.finishedHash.Write(certMsg.marshal())
+            if len(certMsg.certificates) == 0 {
+                    // The client didn't actually send a certificate
+                    switch c.config.ClientAuth {
+                    case RequireAnyClientCert, RequireAndVerifyClientCert:
+                            c.sendAlert(alertBadCertificate)
+                            return errors.New("tls: client didn't provide a certificate")
+                    }
+            }
+            pub, err = hs.processCertsFromClient(certMsg.certificates)
+            if err != nil {
+                    return err
+            }
+            msg, err = c.readHandshake()
+            if err != nil {
+                    return err
+            }
+    }
+    ...
+根据代码，服务器会处理收到的客户端证书，然后调用`x509/tls/handshake_server.go:processCertsFromClient()`函数。如果需要验证客户端证书，服务器就会创建一个[`VerifyOptions`](https://golang.org/pkg/crypto/x509/#VerifyOptions)结构，其中包含如下信息：
+  * root CA池，即已配置的一系列可信CA（由服务器控制），用来验证客户端证书
+  * 中间CA池，即服务端收到的一系列中间CA（由客户端控制）
+  * 已签名的客户端证书（由客户端控制）
+  * 其他字段（可选项）
+    if c.config.ClientAuth >= VerifyClientCertIfGiven && len(certs) > 0 {
+            opts := x509.VerifyOptions{
+                    Roots:         c.config.ClientCAs,
+                    CurrentTime:   c.config.time(),
+                    Intermediates: x509.NewCertPool(),
+                    KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+            }
+            for _, cert := range certs[1:] {
+                    opts.Intermediates.AddCert(cert)
+            }
+            chains, err := certs[0].Verify(opts)
+            if err != nil {
+                    c.sendAlert(alertBadCertificate)
+                    return nil, errors.New("tls: failed to verify client's certificate: " + err.Error())
+            }
+            c.verifiedChains = chains
+    }
+为了澄清问题机理，我们需要理解服务端如何管理证书池，以便通过高效的方式来验证证书。证书池实际上就是一个证书列表，可以根据实际需求通过3种不同的方式来访问。一种访问方式如下图所示：池中证书可以通过索引数组（这里为`Certs`）来访问，以`CN`,
+`IssuerName`, `SubjectKeyId`字段作为哈希字段。
+###  验证过程
+服务端使用`VerifyOptions`参数调用`Verify()`函数来处理客户端证书（即`chain:certs[0]`中的第一个证书）。
+然后`Verify()`会根据客户端提供的证书链来处理待验证的客户端证书，但首先需要使用`buildChains()`函数建立并检查整条验证链：
+    var candidateChains [][]*Certificate
+    if opts.Roots.contains(c) {
+            candidateChains = append(candidateChains, []*Certificate{c})
+    } else {
+            if candidateChains, err = c.buildChains(make(map[int][][]*Certificate), []*Certificate{c}, &opts); err != nil {
+                    return nil, err
+            }
+    }
+而`buildChains()`函数会依次调用占用CPU资源的一些函数，递归处理这条链上的每个元素。
+`buildChains()`函数依赖于`findVerifiedParents()`函数，而后者可以通过`IssuerName`或者`AuthorityKeyId`映射访问证书池，识别上级证书，,然后返回候选证书索引，以便后续根据客户端控制的证书池来验证该证书。
+在正常情况下，程序会提取`IssuerName`及`AuthorityKeyId`，并且认为这些值为唯一值，只会返回一个待验证的证书：
+    func (s *CertPool) findVerifiedParents(cert *Certificate) (parents []int, errCert *Certificate, err error) {
+        if s == nil {
+            return
+        }
+        var candidates []int
+        if len(cert.AuthorityKeyId) > 0 {
+            candidates = s.bySubjectKeyId[string(cert.AuthorityKeyId)]
+        }
+        if len(candidates) == 0 {
+            candidates = s.byName[string(cert.RawIssuer)]
+        }
+        for _, c := range candidates {
+            if err = cert.CheckSignatureFrom(s.certs[c]); err == nil {
+                parents = append(parents, c)
+            } else {
+                errCert = s.certs[c]
+            }
+        }
+        return
+    }
+`buildChains()`函数会在客户端发给TLS服务器的整条证书链上执行如下操作：
+  * 在（服务端）root CA池上调用`findVerifiedParents(client_certificate)`，查找待验证证书的签发机构（判断是否为root CA），然后根据`AuthorityKeyId`（如果不为`nil`）或者原始的issuer值（如果为`nil`）检查所有找到的证书的签名
+  * 在（客户端提供的）中间CA池上调用`findVerifiedParents(client_certificate)`，查找已验证证书的签发机构（判断是否为中间CA），然后根据`AuthorityKeyId`（如果不为`nil`）或者原始的`issuer`值（如果为`nil`）检查所有找到的证书的签名
+  * 获取上一级中间签名节点
+  * 在新发现的中间节点上调用`buildChains()`，然后重复前面描述的签名检查过程
+###  DoS攻击
+攻击者可以构造一种非预期场景，其中所有的中间CA证书使用的都是同一个名称，并且`AuthKeyId`值为`nil`，这样当调用`buildChains()`和`findVerifiedParent()`函数时，就会造成CPU
+DoS攻击效果。`findVerifiedParent()`函数会返回与该名称匹配的所有证书（这里返回的是整个证书池），然后检查所有证书的签名。检查完毕后，会再次递归调用`buildchains()`函数处理找到的上一级证书，最后处理到root
+CA为止。每一次检查过程实际上都会处理整个中间CA池，因此单单一个TLS连接就会耗尽所有可用的CPU资源。
+## 五、漏洞影响
+攻击者可以精心构造一条证书链，使客户端证书校验过程耗尽服务端所有CPU资源，降低目标主机响应速度。只需要1个连接就能导致这种攻击效果。根据Go的调度程序规则，只有两个CPU核心会受到影响，CPU使用率达到100%，攻击者可以创建新连接，强制调度程序分配更多资源来校验签名，最终导致目标服务或目标主机无响应。
+## 六、缓解措施
+Go语言社区已经通过[如下措施](https://go-review.googlesource.com/c/go/+/154105/)修复该问题：
+  * 在`findVerifiedParent()`证书池查找过程中移除签名检测逻辑
+  * 限制签名检测次数，最多检测100个中间CA（实际信任链中很难看到这种情况）
+如果向修复该漏洞，请立即[升级](https://golang.org/dl/)到G0 v1.10.6、v1.11.3或者更新版本。

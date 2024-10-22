@@ -1,0 +1,240 @@
+sPA is cached in the TLB. During a page table walk, given a guest
+CR3 (gCR3) and a host CR3 (hCR3), the hardware automatically
+translate a gVA to a sPA using the two-level page tables despite the
+gPT and the NPT are encrypted by different Kveks. AMD-SP uses
+ASID to uniquely identify the SEV-enabled VM and its Kvek. ASID
+is also part of the tag for both cache lines and TLB entries [17].
+3 UNDERSTANDING AND DEMYSTIFYING
+SEV’S TLB ISOLATION MECHANISMS
+In this section, we briefly sketch our understanding of TLB isolation
+mechanisms used in AMD Virtualization for both non-SEV VMs
+and SEV-enabled VMs. For some of the mechanisms that are not
+documented, we experimentally validated our conjectures.
+3.1 TLB Management for Non-SEV VMs
+To avoid frequent TLB flushes during VM world switches, AMD
+introduced ASID in TLB entries [1]. ASID 0 is reserved for the
+hypervisor and the rest of the ASID are used by the VM. The range
+of the ASID pool can be determined by CPUID 0x8000000a[EBX].
+TLB is tagged with the ASIDs of each VM and the hypervisor, which
+avoids flushing the entire TLB at the world switch and also prevents
+misuses of the TLB entries belonging to other entities.
+We explore the TLB management algorithm for non-SEV VMs
+by diving into the source code of AMD SVM [4]. Specifically, the
+hypervisor is responsible for maintaining the uniqueness and the
+freshness of the ASID in each logical core of the machine. For each
+logical core, the hypervisor stores the most recently used ASID in
+the svm_cpu_data data structure. Before each VMRUN of a vCPU of
+a non-SEV VM, the hypervisor checks whether the CPU affinity of
+the vCPU has changed by comparing the ASID stored in its VMCB
+with the most recently used ASID of this logical core. If a mismatch
+is observed, which means either the vCPU was not running on this
+logical core before the current VMEXIT or more than one vCPUs
+sharing the same logical core concurrently, the hypervisor assigns
+an incremental and unused ASID to this vCPU. In either of these
+cases, the increment of the ASID ensures the residual TLB entries
+cannot be reused. Otherwise, no TLB flushing is needed and the
+vCPU can keep its ASID and reuse its TLB entries after VMRUN.
+The hypervisor is in charge of enforcing TLB flushes under cer-
+tain conditions. For example, when the recently used ASID exceeds
+the max ASID range on the logical core, a complete TLB flush
+for all ASIDs is required. To flush TLBs, the hypervisor sets the
+TLB_CONTROL bits in TLB_CONTROL filed (058h) of the VMCB during
+VMEXITs. With different values of bits 39:32 of TLB_CONTROL, the
+hardware will perform the different operation on the TLB:
+• TLB_CONTROL_DO_NOTHING (00h). The hardware does nothing.
+• TLB_CONTROL_FLUSH_ALL_ASID (01h). The hardware flushes the
+entire TLB.
+• TLB_CONTROL_FLUSH_ASID (03h). The hardware flushes all TLB
+entries whose ASID is equal to the ASID in the VMCB.
+• TLB_CONTROL_FLUSH_ASID_LOCAL (07h). The hardware flushes
+this guest VM’s non-global TLB entries.
+• Other values. All other values are reserved, so other values may
+cause problems when resuming guest VMs.
+After each VMRUN, hardware checks these bits and performs
+the corresponding actions. The hypervisor is in charge of informing
+the hardware to flushes TLBs and maintain TLB isolation. Hard-
+ware may also automatically perform a partial TLB flush without
+triggering a special VMEXIT when observing context switches
+or MOV-to-CR3 instructions. In such cases, only the TLB entries
+tagged with the current ASID (either in guest ASID or the hypervi-
+sor ASID) are flushed [2].
+3.2 Demystifying SEV’s TLB management
+The TLB management for SEV VMs and non-SEV VMs is slightly
+different. The ASIDs of SEV VMs remain the same in their lifetime.
+Therefore, instead of dynamically assigning an ASID to a vCPU,
+all vCPUs of the same SEV VM have the same ASID. At runtime,
+TLB flush is still controlled by the hypervisor. Especially, KVM
+records the last resident CPU core of each vCPU. For each CPU
+logical core, it also records the VMCB of the last running vCPU
+(sev_vmcbs[asid]) for each ASID. Before the hypervisor resumes a
+vCPU via VMRUN, it sets the TLB control field in the VMCB to the
+value of TLB_CONTROL_FLUSH_ASID when (1) this vCPU was
+not run on this core before or (2) the last VMCB running on this
+core with the same ASID is not the current VMCB. This enforces
+the isolation between two vCPUs of the same SEV VM. The code
+is listed in Listing 1. However, if the hypervisor chooses not to set
+the TLB control field, no TLB entries will be flushed.
+struct svm_cpu_data * sd = per_cpu ( svm_data , cpu );
+int asid = sev_get_asid ( svm -> vcpu . kvm );
+pre_sev_es_run ( svm );
+svm -> vmcb -> control . asid = asid ;
+1
+2
+3
+4
+5 // No CPU affinity change and No VMCB change
+6
+7
+8
+9 // Otherwise , flush the TLB tagged with the ASID
+10
+11
+12
+13 }
+sd -> sev_vmcbs [ asid ] = svm -> vmcb ;
+svm -> vmcb -> control . tlb_ctl = TLB_CONTROL_FLUSH_ASID ;
+vmcb_mark_dirty ( svm -> vmcb , VMCB_ASID );
+if (sd -> sev_vmcbs [ asid ] == svm -> vmcb &&
+svm -> vcpu . arch . last_vmentry_cpu == cpu )
+return ;
+Listing 1: Code snippet of pre_sev_run().
+Experiments to demystify TLB tags. According to AMD man-
+ual [2], ASID is part of TLB tag. But is unclear what are the remain-
+ing parts of the tag. We conducted some experiments to explore
+611ACSAC ’21, December 6–10, 2021, Virtual Event, USA
+Mengyuan Li, Yinqian Zhang, Huibo Wang, Kang Li, and Yueqiang Cheng
+Table 1: TLB flush rules. The World column indicates whether the
+event happens in host world or the guest world; TLB tag represents
+the TLB entry’s ASID to be flushed—the host’s ASID is 0 and the SEV
+VM’s ASID is N; Forced indicates whether the TLB flush is forced
+by the hardware or controllable by the hypervisor. * highlights a
+special case, in which when the world switch happens between two
+vCPUs, the TLB tagged with 0 is forced to be flushed while the TLB
+tagged with N is flushed under the control of the hypervisor.
+World
+Host/Guest
+Host/Guest
+Host/Guest
+Host
+Host
+Host
+Host
+Host
+Host
+Events
+TLB Tag
+Forced
+MOV-to-CR3, Context-switch
+Update Cr0.PG
+Update CR4 (PGE, PAEm and PSE)
+Address transliation Registers
+Activate an ASID for SEV VM
+Deactivate an ASID for SEV VM
+ASID exceeds ASID pool range
+Two vCPUs switch
+Change vCPU’s CPU affinity
+0/N
+0/N
+0/N
+All
+N
+N
+All
+0+N*
+N
+✓
+✓
+✓
+✓
+✓
+✗
+✗
+✗
+✓+ ✗*
+the structure of TLB tags. Specifically, we checked whether vCPUs’
+TLB entries on the co-resident logical cores will influence each
+other and whether TLB entries from the different VM modes (non-
+SEV, SEV, or SEV-ES) will influence each other. The experiment
+settings are similar. To explore TLB isolation between co-resident
+logical cores, we manually set the ASID of two vCPUs to the two
+co-resident logical cores of the same physical core. To explore TLB
+isolation between VMs with different VM modes (e.g., SEV and non-
+SEV), we configured a non-SEV VM and a SEV/SEV-ES VM on the
+same logical core and set the non-SEV VM’s ASID to be identical
+to the SEV/SEV-ES VM’s ASID. In both cases, we skipped the TLB
+flush to check whether the TLB poison is observed (using steps
+in Section 4.2.1). In neither of two cases, TLB poison is observed.
+Therefore, we conclude:
+• ASID. ASID is part of the TLB tag, which provides TLB isolation
+for TLB entries with different ASID.
+• Logical Core ID. The Logical Core ID is also part of the TLB
+tag, which provides TLB isolation for TLB entries on the same
+physical core but different logical cores.
+• VM mode. VM mode is part of the TLB tag. Even a non-SEV VM
+may have the same ASID as a SEV or SEV-ES VM, however, the
+TLB tag field contains information about the VM’s mode, which
+isolates TLB entries from VMs under different modes.
+Besides these components, we have also conjectured that C-bits—
+the C-bit in the guest page table (gC-bit) and the C-bit in the nested
+page table (nC-bit)—are also part of the TLB tag. The reason is
+that when address translation bypasses the page table walk, the
+values of the gC-bit and nC-bit are still required for the processor to
+determine which ASID to present to AMD-SP if memory encryption
+is needed. However, there is no direct evidence for us to conclude
+the exact C-bit tag format in TLB entries. We have no way to
+empirically affirm that, for instance, whether both of the C-bits are
+in the TLB tag or only one C-bit is in the TLB tag.
+3.3 TLB Flush Rules for SEV VMs
+We summarize the TLB flush rules for SEV/SEV-ES VMs in both
+hardware-enforced TLB flush and the hypervisor-coordinated TLB
+flush in Table 1. The hardware-enforced TLB flush rules cannot
+be skipped, while the hypervisor-coordinated TLB flush can be
+Figure 1: TLB misuses across vCPUs.
+skipped by a malicious hypervisor, which is the root cause of the
+TLB Poisoning Attack.
+Hardware-enforced TLB flushes. All TLB entries are flushed
+when there is System Management Interrupt (SMI), Returning from
+System Management (RSM), Memory-Type Range Register (MTRR),
+and I/O Range Registers (IORR) modifications or MSRs access re-
+lated to address translation, no matter their ASIDs. At the same
+time, hardware will automatically flush TLB tagged with the current
+ASID when observing activities like MOV-to-CR3, context switches,
+updates of CR0.PG, CR4.PGE, CR4.PAEm and CR4.PSE. Hardware
+will also force a TLB flush when the hypervisor wants to activate
+an ASID for a SEV VM.
+Hypervisor-coordinated TLB flushes. There are mainly two
+cases where the hypervisor is coordinated in TLB management.
+(1) When different VMCB with the same ASID (different vCPUs of
+the same SEV VM) is to be run on the same logical core. (2) The
+VMCB to be run was executed on a different logical core prior to
+this VMRUN.
+4 ATTACK PRIMITIVES
+In this section, we discuss the threat models consider in this paper,
+and then introduce three attack primitives: TLB misuse across vC-
+PUs (Section 4.2), TLB misuse within the same vCPU (Section 4.3),
+and a covert data transmission channel between the hypervisor and
+a process in the victim VM that is under the adversary’s control
+(Section 4.4).
+4.1 Threat Model
+We consider a scenario where the platform is hosted by a hypervisor
+controlled by the adversary. The victim VM is a SEV-ES enabled
+VM and thus protected by all SEV-ES features. We assume the ASLR
+is enabled inside the victim VM.
+There is an unprivileged attacker process controlled by the ad-
+versary running in the victim VM. The attacker process does not
+have access to the kernel or learn sensitive information from procfs.
+The attacker process does not need to have capabilities to perform
+network communication. We note that the assumption of having
+an attacker process running inside the victim VM can be weakened
+(see Section 6). The victim process can be any process in the victim
+VM other than the attacker processes. We assume the adversary can
+learn the virtual address range of the victim VM via other attacks,
+such as CrossLine attacks [21].
+CPUCoreAttackervCPUVictimvCPUContextSwitchSkipTLBflushFillTLBLookupVA0TLBASIDVA5sPA5ASIDVA0sPA0ASIDVA1sPA1ASIDVA2sPA2ASIDVA3sPA3ASIDVA4sPA4TLBHit=>TrustTLBLookupVA6Miss=>PTwalk612TLB Poisoning Attacks on AMD Secure Encrypted Virtualization
+ACSAC ’21, December 6–10, 2021, Virtual Event, USA
+4.2 TLB Misuse across vCPUs
+When the victim VM has more than one vCPU, the attacker process
+and the victim process can run on different vCPUs. We call the
+vCPU running the attacker process the attacker vCPU and the
+vCPU running the victim process the victim vCPU. The adversary
+can misuse TLB entries by skipping the TLB flush during the context

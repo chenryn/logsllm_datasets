@@ -1,0 +1,305 @@
+## PostgreSQL 9.6 单元化,sharding (based on postgres_fdw) - 内核层支持前传
+### 作者           
+digoal            
+### 日期          
+2016-10-04           
+### 标签          
+PostgreSQL , 9.6 , 水平分库 , sharding , 单元化 , postgres_fdw , FDW , foreign data wrapper     
+----          
+## 背景    
+PostgreSQL 从 2011年的9.1版本引入FDW开始，发展到现在已经支持几乎所有的外部数据源读写操作，例如mysql,oracle,pgsql,redis,mongo,hive,jdbc,odbc,file,sqlserver,es,S3,......。  
+https://wiki.postgresql.org/wiki/Fdw  
+开放的接口，允许用户自己添加外部数据源的支持。  
+9.6针对postgres_fdw（即PostgreSQL外部数据源）再次增强，开始支持对sort, where, join的下推，支持remote cancel query, 用户使用FDW可以对应用透明的实现数据库的sharding，单元化需求。      
+内核层支持sharding，这种分片技术相比中间件分片技术的好处：  
+1\. 支持跨库JOIN    
+2\. 支持绑定变量    
+3\. 支持master(coordinator)节点水平扩展  
+4\. 支持segment(datanode)节点水平扩展  
+5\. 支持函数和存储过程    
+ps: 不支持分布式事务（需要用户干预2PC）  
+通常业务设计时需要规避跨库事务，或者用户能够容忍跨库事务的一致性问题。  
+## 一、FDW架构
+架构如图  
+![pic1](20161004_01_pic_001.png)  
+1\. 每种数据源，需要定义对应的fdw handler，例如mysql, oracle, pgsql都各自有各自的fdw handler。    
+本文接下来要讲的是pgsql 的fdw handler : postgres_fdw。      
+2\. 基于fdw handler，我们可以建立server，server代表你要访问的目标，在PostgreSQL这个数据源中，server的粒度为database。    
+换句话说一个server对应一个外部的postgresql database。     
+3\. 定义好server，我们可以创建外部表，映射到目标server中的可访问对象（外部表即一种到remote database中对象的映射关系，remote 对象可以是表，物化视图，视图，外部表等）。    
+4\. 创建好外部表之后，如何访问呢？  
+当本地用户访问一张外部表时，因为外部表代表的是目标SERVER的可访问对象，而server只是目标，并不包含访问目标server的认证信息。  
+认证信息在PostgreSQL的FDW中成为user mapping，是登陆到外部server的认证信息，local user对一个server只能存储一份认证信息。  
+例如本地用户为role_a, foreign server所在的数据库集群有3个用户分别为rmt_a, rmt_b, rmt_c。   
+role_a同一时间对一个foreign server只能存储一个认证关系，即要么使用rmt_a认证，要么使用rmt_b，要么使用rmt_c。  
+如果你要访问的远程表分别属于三个角色，那么建议创建三个foreign server，在每个foreign server下创建对应的外部表，以及建立相应的映射关系。  
+例子  
+外部数据源如下    
+用户  
+```
+rmt_a
+rmt_b
+rmt_c
+```
+表  
+```
+rmt_a owned: tbla
+rmt_b owned: tblb
+rmt_c owned: tblc
+```
+创建foreign server，目标一样，名字不一样    
+```
+foreign server: s1, s2, s3 (set same HOST, PORT, DBNAME)
+```
+创建外部表，ON 不同的foreign server   
+```
+foreign table: ft1 on s1
+foreign table: ft2 on s2
+foreign table: ft3 on s3
+```
+创建user mapping，每个foreign server对应不同的远程用户   
+```
+user mapping for s1 (rmt_a)
+user mapping for s2 (rmt_b)
+user mapping for s3 (rmt_c)
+```
+当然你还有另一种选择，在目标库创建一个用户，有这三张表的对应权限。    
+那么只需要一个foreign server，并且在建立USER MAPPING时使用这个远程用户认证，这样访问外部表的权限就正确了。    
+例如  
+```
+grant select on tbla,tblb,tblc to new_role;
+foreign server: s1;
+foreign table: ft1,ft2,ft3 on s1;
+user mapping for s1 (new_role);
+```
+postgres_fdw用法参考  
+https://www.postgresql.org/docs/9.6/static/postgres-fdw.html  
+https://www.postgresql.org/docs/9.6/static/sql-createforeigndatawrapper.html  
+https://www.postgresql.org/docs/9.6/static/sql-createserver.html  
+https://www.postgresql.org/docs/9.6/static/sql-createforeigntable.html  
+https://www.postgresql.org/docs/9.6/static/sql-createusermapping.html  
+下面是详解。   
+## 二、postgres_fdw支持的options
+### server
+1\. 语法  
+```
+CREATE SERVER server_name [ TYPE 'server_type' ] [ VERSION 'server_version' ]
+    FOREIGN DATA WRAPPER fdw_name
+    [ OPTIONS ( option 'value' [, ... ] ) ]
+```
+2\. create server时支持的options    
+与libpq支持的options一致(https://www.postgresql.org/docs/9.6/static/libpq-connect.html#LIBPQ-PARAMKEYWORDS)，除了以下   
+```
+user
+    在user mapping中设置
+password
+    在user mapping中设置
+client_encoding    
+fallback_application_name
+    (强制设置为postgres_fdw)    
+```
+3\. postgres_fdw额外支持的options  
+```
+use_remote_estimate = true | false(default)  
+    是否使用远程explain获得成本估算信息。(foreign table也支持这个option，并且优先级更高)      
+    如果false，建议使用analyze 分析外部表，并且外部表是相对比较静态的数据，这样保证本地的统计信息准确。  
+    false 可以减少外部表的执行计划带来的开销与时间。  
+fdw_startup_cost = 100(default)
+    该foreign server的启动成本，表示建立连接，parser and plan query on this server的成本。  
+fdw_tuple_cost = 0.01(default)
+    表示从该server每获取一条记录的额外传输成本，根据带宽调整设置。  
+extensions = 'xx,xxx'
+    表示远程数据库 也 安装了哪些extensions，当query中带有这些extensions中创建的immutable的function, operations时，可以push down。     
+    否则只有building immutable function, operations可以push down。(即PostgreSQL内置的immutable函数和操作符)    
+    因为extension是相对可控的，PostgreSQL社区认为用户可以也有责任保证远程数据库extension与本地数据库extension的版本是 一致的。      
+fetch_size = 100(default)
+    指一次fetch remote 对象操作的记录数。  foreign table级设置优先。    
+updatable = true(default)
+    指foreign 对象是否允许执行insert,update,delete操作。     foreign table级设置优先。    
+```
+4\. 用法举例   
+```
+postgres=# create server s3 foreign data wrapper postgres_fdw 
+OPTIONS (
+  extensions 'hstore,pageinspect', 
+  host '127.0.0.1', 
+  port '5281', 
+  dbname 'postgres'
+);
+CREATE SERVER
+```
+### foreign table
+1\. 语法  
+```
+CREATE FOREIGN TABLE [ IF NOT EXISTS ] table_name ( [
+  { column_name data_type [ OPTIONS ( option 'value' [, ... ] ) ] [ COLLATE collation ] [ column_constraint [ ... ] ]
+    | table_constraint }
+    [, ... ]
+] )
+[ INHERITS ( parent_table [, ... ] ) ]
+  SERVER server_name
+[ OPTIONS ( option 'value' [, ... ] ) ]
+where column_constraint is:
+[ CONSTRAINT constraint_name ]
+{ NOT NULL |
+  NULL |
+  CHECK ( expression ) [ NO INHERIT ] |
+  DEFAULT default_expr }
+and table_constraint is:
+[ CONSTRAINT constraint_name ]
+CHECK ( expression ) [ NO INHERIT ]
+```
+2\. create foreign table时支持的options  
+```
+schema_name
+    指定外部对象所属的 namespace.  
+table_name
+    指定外部对象名，如目标（表名，视图名，物化视图名，外部表名）
+column_name
+    column option, 指定本地列 对应的 外部对象的 列名。  
+```
+3\. postgres_fdw额外支持的options  
+```
+use_remote_estimate = true | false(default)
+    是否使用远程explain获得成本估算信息。(优先级高于foreign server设置的值)       
+fetch_size = 100(default)
+    指一次fetch remote 对象操作的记录数。  foreign table级设置优先。    
+updatable = true(default)
+    指foreign 对象是否允许执行insert,update,delete操作。   foreign table级设置优先。    
+```
+4\. 用法举例   
+```
+postgres=# create foreign table ft1 (
+  c1 int options (column_name 'id'), 
+  info text ) 
+server s1 
+options(
+  schema_name 'public', 
+  table_name 'tbl1', 
+  use_remote_estimate 'true', 
+  fetch_size '10'
+);
+CREATE FOREIGN TABLE
+```
+### user mapping
+1\. 语法    
+```
+CREATE USER MAPPING FOR { user_name | USER | CURRENT_USER | PUBLIC }
+    SERVER server_name
+    [ OPTIONS ( option 'value' [ , ... ] ) ]
+```
+2\. create user mapping时支持的options  
+```
+user
+    remote database中的用户
+password
+    remote database中的用户密码
+```
+3\. 用法举例  
+```
+postgres=# create user mapping for postgres server s1 options (user 'admin', password 'pwd');
+```
+注意，只有超级用户支持无秘钥认证，普通用户需要提供密码，所以当映射的远程用户为普通用户时，必须提供密码。   
+### import foreign schema
+import foreign schema语法用于快速的将远程数据库的对象创建为本地的外部访问对象。  
+1\. 语法  
+IMPORT FOREIGN SCHEMA remote_schema
+    [ { LIMIT TO | EXCEPT } ( table_name [, ...] ) ]
+    FROM SERVER server_name
+    INTO local_schema
+    [ OPTIONS ( option 'value' [, ... ] ) ]
+2\. options  
+```
+import_collate = 'true'(default)
+    是否将外部对象定义中的collate也在本地外部对象中使用同样的定义。  默认为true，通常在本地库与外部库所在的操作系统不一致，或者LC不一致时，可以设置为false。  
+import_default = 'false'(default)
+    是否将外部对象定义中的默认值也在本地外部对象中使用同样的定义。   默认为false，注意如果使用了序列，表达式或函数作为默认值，需要考虑远程和本地的一致性。  
+import_not_null = 'true'(default)
+    是否将外部的非空约束也在本地对象中定义。  
+```
+3\. 用法举例  
+将server s1的public schema中的table, view, foreign table, mview都import到本地schema ft中，作为外部表。  
+```
+postgres=# create schema ft;
+CREATE SCHEMA
+postgres=# import foreign schema public from server s1 into ft;
+IMPORT FOREIGN SCHEMA
+```
+## 三、postgres_fdw使用举例
+1\. 远程数据库介绍  
+数据库: rmt_db  
+用户: digoal  
+schema: digoal  
+表: tbl1, tbl2  
+视图，v1, v2  
+物化视图, mv1, mv2  
+```
+postgres=# create database rmt_db;
+CREATE DATABASE
+postgres=# create role digoal nosuperuser encrypted password 'digoal' login;
+CREATE ROLE
+postgres=# grant all on database rmt_db to digoal;
+GRANT
+postgres=# \c rmt_db digoal
+You are now connected to database "rmt_db" as user "digoal".
+rmt_db=> create schema digoal;
+CREATE SCHEMA
+rmt_db=> create table tbl1(id int, info text);
+CREATE TABLE
+rmt_db=> create table tbl2(id int, info text,crt_time timestamp);
+CREATE TABLE
+rmt_db=> create view v1 as select * from tbl1 where id create view v2 as select * from tbl2 where id create materialized view mv1 as select * from tbl1 where id create materialized view mv2 as select * from tbl2 where id>100 and id insert into tbl1 select generate_series(1,1000000);
+INSERT 0 1000000
+rmt_db=> insert into tbl2 select generate_series(1,1000000);
+INSERT 0 1000000
+rmt_db=> alter table tbl1 add constraint tbl1_pkey primary key(id);
+rmt_db=> alter table tbl2 add constraint tbl2_pkey primary key(id);
+rmt_db=> create unique index mv1_pkey on mv1(id);
+CREATE INDEX
+rmt_db=> create unique index mv2_pkey on mv2(id);
+CREATE INDEX
+rmt_db=> refresh materialized view CONCURRENTLY mv1;
+REFRESH MATERIALIZED VIEW
+rmt_db=> refresh materialized view CONCURRENTLY mv2;
+REFRESH MATERIALIZED VIEW
+```
+2\. 本地数据库介绍
+数据库: loc_db  
+用户: test  
+schema: ft  
+```
+postgres=# create database loc_db;
+CREATE DATABASE
+postgres=# create role test nosuperuser encrypted password 'test' login;
+CREATE ROLE
+postgres=# grant all on database loc_db to test;
+GRANT
+postgres=# \c loc_db test
+You are now connected to database "loc_db" as user "test".
+loc_db=> create schema ft;
+CREATE SCHEMA
+```
+3\. 创建server
+```
+loc_db=> \c loc_db postgres
+loc_db=# create extension postgres_fdw;
+CREATE EXTENSION
+loc_db=# create server s1 foreign data wrapper postgres_fdw OPTIONS (host '127.0.0.1', port '5281', dbname 'rmt_db', use_remote_estimate 'true');
+CREATE SERVER
+loc_db=# grant usage on FOREIGN server s1 to test;
+GRANT
+```
+4\. 创建user mapping  
+```
+loc_db=# \c loc_db test
+loc_db=> create user mapping FOR test SERVER s1 options (user 'digoal', password 'digoal');
+CREATE USER MAPPING
+```
+5\. import foreign schema  
+```
+loc_db=# \c loc_db test
+loc_db=> import foreign schema digoal from server s1 into ft;
+IMPORT FOREIGN SCHEMA
+loc_db=> \det+ ft.*
+                              List of foreign tables
+ Schema | Table | Server |                FDW Options                | Description 

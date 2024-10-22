@@ -1,0 +1,362 @@
+Press any key to exit...
+The trace collected in the last experiment demonstrates that
+memory-mapped I/O on DAX volumes doesn’t generate any
+paging I/O. No WriteFile or ReadFile events are visible on either
+the source or the target file:
+Block volumes
+Not all the limitations brought on by DAX volumes are acceptable in certain
+scenarios. Windows provides backward compatibility for PM hardware
+through block-mode volumes, which are managed by the entire legacy I/O
+stack as regular volumes used by rotating and SSD disk. Block volumes
+maintain existing storage semantics: all I/O operations traverse the storage
+stack on the way to the PM disk class driver. (There are no miniport drivers,
+though, because they’re not needed.) They’re fully compatible with all
+existing applications, legacy filters, and minifilter drivers.
+Persistent memory storage is able to perform I/O at byte granularity. More
+accurately, I/O is performed at cache line granularity, which depends on the
+architecture but is usually 64 bytes. However, block mode volumes are
+exposed as standard volumes, which perform I/O at sector granularity (512
+bytes or 4 Kbytes). If a write is in progress on a DAX volume, and suddenly
+the drive experiences a power failure, the block of data (sector) contains a
+mix of old and new data. Applications are not prepared to handle such a
+scenario. In block mode, the sector atomicity is guaranteed by the PM disk
+class driver, which implements the Block Translation Table (BTT) algorithm.
+The BTT, an algorithm developed by Intel, splits available disk space into
+chunks of up to 512 GB, called arenas. For each arena, the algorithm
+maintains a BTT, a simple indirection/lookup that maps an LBA to an
+internal block belonging to the arena. For each 32-bit entry in the map, the
+algorithm uses the two most significant bits (MSB) to store the status of the
+block (three states: valid, zeroed, and error). Although the table maintains the
+status of each LBA, the BTT algorithm provides sector atomicity by
+providing a flog area, which contains an array of nfree blocks.
+An nfree block contains all the data that the algorithm needs to provide
+sector atomicity. There are 256 nfree entries in the array; an nfree entry is 32
+bytes in size, so the flog area occupies 8 KB. Each nfree is used by one CPU,
+so the number of nfrees describes the number of concurrent atomic I/Os an
+arena can process concurrently. Figure 11-75 shows the layout of a DAX
+disk formatted in block mode. The data structures used for the BTT
+algorithm are not visible to the file system driver. The BTT algorithm
+eliminates possible subsector torn writes and, as described previously, is
+needed even on DAX-formatted volumes in order to support file system
+metadata writes.
+Figure 11-75 Layout of a DAX disk that supports sector atomicity (BTT
+algorithm).
+Block mode volumes do not have the
+GPT_BASIC_DATA_ATTRIBUTE_DAX flag in their partition entry. NTFS
+behaves just like with normal volumes by relying on the cache manager to
+perform cached I/O, and by processing non-cached I/O through the PM disk
+class driver. The Pmem driver exposes read and write functions, which
+performs a direct memory access (DMA) transfer by building a memory
+descriptor list (MDL) for both the user buffer and device physical block
+address (MDLs are described in more detail in Chapter 5 of Part 1). The BTT
+algorithm provides sector atomicity. Figure 11-76 shows the I/O stack of a
+traditional volume, a DAX volume, and a block volume.
+Figure 11-76 Device I/O stack comparison between traditional volumes,
+block mode volumes, and DAX volumes.
+File system filter drivers and DAX
+Legacy filter drivers and minifilters don’t work with DAX volumes. These
+kinds of drivers usually augment file system functionality, often interacting
+with all the operations that a file system driver manages. There are different
+classes of filters providing new capabilities or modifying existing
+functionality of the file system driver: antivirus, encryption, replication,
+compression, Hierarchical Storage Management (HSM), and so on. The DAX
+driver model significantly modifies how DAX volumes interact with such
+components.
+As previously discussed in this chapter, when a file is mapped in memory,
+the file system in DAX mode does not receive any read or write I/O requests,
+neither do all the filter drivers that reside above or below the file system
+driver. This means that filter drivers that rely on data interception will not
+work. To minimize possible compatibility issues, existing minifilters will not
+receive a notification (through the InstanceSetup callback) when a DAX
+volume is mounted. New and updated minifilter drivers that still want to
+operate with DAX volumes need to specify the
+FLTFL_REGISTRATION_SUPPORT_DAX_VOLUME flag when they
+register with the filter manager through FltRegisterFilter kernel API.
+Minifilters that decide to support DAX volumes have the limitation that
+they can’t intercept any form of paging I/O. Data transformation filters
+(which provide encryption or compression) don’t have any chance of
+working correctly for memory-mapped files; antimalware filters are impacted
+as described earlier—because they must now perform scans on every open
+and close, losing the ability to determine whether or not a write truly
+happened. (The impact is mostly tied to the detection of a file last update
+time.) Legacy filters are no longer compatible: if a driver calls the
+IoAttachDeviceToDevice Stack API (or similar functions), the I/O manager
+simply fails the request (and logs an ETW event).
+Flushing DAX mode I/Os
+Traditional disks (HDD, SSD, NVme) always include a cache that improves
+their overall performance. When write I/Os are emitted from the storage
+driver, the actual data is first transferred into the cache, which will be written
+to the persistent medium later. The operating system provides correct
+flushing, which guarantees that data is written to final storage, and temporal
+order, which guarantees that data is written in the correct order. For normal
+cached I/O, an application can call the FlushFileBuffers API to ensure that
+the data is provably stored on the disk (this will generate an IRP with the
+IRP_MJ_FLUSH_BUFFERS major function code that the NTFS driver will
+implement). Noncached I/O is directly written to disk by NTFS so ordering
+and flushing aren’t concerns.
+With DAX-mode volumes, this is not possible anymore. After the file is
+mapped in memory, the NTFS driver has no knowledge of the data that is
+going to be written to disk. If an application is writing some critical data
+structures on a DAX volume and the power fails, the application has no
+guarantees that all of the data structures will have been correctly written in
+the underlying medium. Furthermore, it has no guarantees that the order in
+which the data was written was the requested one. This is because PM
+storage is implemented as classical physical memory from the CPU’s point
+of view. The processor uses the CPU caching mechanism, which uses its own
+caching mechanisms while reading or writing to DAX volumes.
+As a result, newer versions of Windows 10 had to introduce new flush
+APIs for DAX-mapped regions, which perform the necessary work to
+optimally flush PM content from the CPU cache. The APIs are available for
+both user-mode applications and kernel-mode drivers and are highly
+optimized based on the CPU architecture (standard x64 systems use the
+CLFLUSH and CLWB opcodes, for example). An application that wants I/O
+ordering and flushing on DAX volumes can call RtlGetNonVolatileToken on
+a PM mapped region; the function yields back a nonvolatile token that can be
+subsequently used with the RtlFlushNonVolatileMemory or
+RtlFlushNonVolatileMemoryRanges APIs. Both APIs perform the actual
+flush of the data from the CPU cache to the underlying PM device.
+Memory copy operations executed using standard OS functions perform,
+by default, temporal copy operations, meaning that data always passes
+through the CPU cache, maintaining execution ordering. Nontemporal copy
+operations, on the other hand, use specialized processor opcodes (again
+depending on the CPU architecture; x64 CPUs use the MOVNTI opcode) to
+bypass the CPU cache. In this case, ordering is not maintained, but execution
+is faster. RtlWriteNonVolatileMemory exposes memory copy operations to
+and from nonvolatile memory. By default, the API performs classical
+temporal copy operations, but an application can request a nontemporal copy
+through the WRITE_NV_MEMORY_FLAG_NON_ TEMPORAL flag and thus
+execute a faster copy operation.
+Large and huge pages support
+Reading or writing a file on a DAX-mode volume through memory-mapped
+sections is handled by the memory manager in a similar way to non-DAX
+sections: if the MEM_LARGE_PAGES flag is specified at map time, the
+memory manager detects that one or more file extents point to enough
+aligned, contiguous physical space (NTFS allocates the file extents), and uses
+large (2 MB) or huge (1 GB) pages to map the physical DAX space. (More
+details on the memory manager and large pages are available in Chapter 5 of
+Part 1.) Large and huge pages have various advantages compared to
+traditional 4-KB pages. In particular, they boost the performance on DAX
+files because they require fewer lookups in the processor’s page table
+structures and require fewer entries in the processor’s translation lookaside
+buffer (TLB). For applications with a large memory footprint that randomly
+access memory, the CPU can spend a lot of time looking up TLB entries as
+well as reading and writing the page table hierarchy in case of TLB misses. In
+addition, using large/huge pages can also result in significant commit savings
+because only page directory parents and page directory (for large files only,
+not huge files) need to be charged. Page table space (4 KB per 2 MB of leaf
+VA space) charges are not needed or taken. So, for example, with a 2-TB file
+mapping, the system can save 4 GB of committed memory by using large and
+huge pages.
+The NTFS driver cooperates with the memory manager to provide support
+for huge and large pages while mapping files that reside on DAX volumes:
+■    By default, each DAX partition is aligned on 2-MB boundaries.
+■    NTFS supports 2-MB clusters. A DAX volume formatted with 2-MB
+clusters is guaranteed to use only large pages for every file stored in
+the volume.
+■    1-GB clusters are not supported by NTFS. If a file stored on a DAX
+volume is bigger than 1 GB, and if there are one or more file’s extents
+stored in enough contiguous physical space, the memory manager will
+map the file using huge pages (huge pages use only two pages map
+levels, while large pages use three levels).
+As introduced in Chapter 5, for normal memory-backed sections, the
+memory manager uses large and huge pages only if the extent describing the
+PM pages is properly aligned on the DAX volume. (The alignment is relative
+to the volume’s LCN and not to the file VCN.) For large pages, this means
+that the extent needs to start at at a 2-MB boundary, whereas for huge pages
+it needs to start at 1-GB boundary. If a file on a DAX volume is not entirely
+aligned, the memory manager uses large or huge pages only on those blocks
+that are aligned, while it uses standard 4-KB pages for any other blocks.
+In order to facilitate and increase the usage of large pages, the NTFS file
+system provides the FSCTL_SET_DAX_ALLOC_ALIGNMENT_HINT
+control code, which an application can use to set its preferred alignment on
+new file extents. The I/O control code accepts a value that specifies the
+preferred alignment, a starting offset (which allows specifying where the
+alignment requirements begin), and some flags. Usually an application sends
+the IOCTL to the file system driver after it has created a brand-new file but
+before mapping it. In this way, while allocating space for the file, NTFS
+grabs free clusters that fall within the bounds of the preferred alignment.
+If the requested alignment is not available (due to volume high
+fragmentation, for example), the IOCTL can specify the fallback behavior
+that the file system should apply: fail the request or revert to a fallback
+alignment (which can be specified as an input parameter). The IOCTL can
+even be used on an already-existing file, for specifying alignment of new
+extents. An application can query the alignment of all the extents belonging
+to a file by using the FSCTL_QUERY_FILE_REGIONS control code or by
+using the fsutil dax queryfilealignment command-line tool.
+EXPERIMENT: Playing with DAX file alignment
+You can witness the different kinds of DAX file alignment using
+the FsTool application available in this book’s downloadable
+resources. For this experiment, you need to have a DAX volume
+present on your machine. Open a command prompt window and
+perform the copy of a big file (we suggest at least 4 GB) into the
+DAX volume using this tool. In the following example, two DAX
+disks are mounted as the P: and Q: volumes. The Big_Image.iso
+file is copied into the Q: DAX volume by using a standard copy
+operation, started by the FsTool application:
+Click here to view code image
+D:\>fstool.exe /copy p:\Big_DVD_Image.iso q:\test.iso
+NTFS / ReFS Tool v0.1
+Copyright (C) 2018 Andrea Allievi (AaLl86)
+Copying "Big_DVD_Image.iso" to "test.iso" file... Success.
+   Total File-Copy execution time: 10 Sec - Transfer Rate: 
+495.52 MB/s.
+Press any key to exit...
+You can check the new test.iso file’s alignment by using the
+/queryalign command-line argument of the FsTool.exe application,
+or by using the queryFileAlignment argument with the built-in
+fsutil.exe tool available in Windows:
+Click here to view code image
+D:\>fsutil dax queryFileAlignment q:\test.iso
+  File Region Alignment:
+    Region        Alignment      StartOffset         
+LengthInBytes
+    0             Other          0                   
+0x1fd000
+    1             Large          0x1fd000            
+0x3b800000
+    2             Huge           0x3b9fd000          
+0xc0000000
+    3             Large          0xfb9fd000          
+0x13e00000
+    4             Other          0x10f7fd000         
+0x17e000
+As you can read from the tool’s output, the first chunk of the file
+has been stored in 4-KB aligned clusters. The offsets shown by the
+tool are not volume-relative offsets, or LCN, but file-relative
+offsets, or VCN. This is an important distinction because the
+alignment needed for large and huge pages mapping is relative to
+the volume’s page offset. As the file keeps growing, some of its
+clusters will be allocated from a volume offset that is 2-MB or 1-
+GB aligned. In this way, those portions of the file can be mapped
+by the memory manager using large and huge pages. Now, as in the
+previous experiment, let’s try to perform a DAX copy by
+specifying a target alignment hint:
+Click here to view code image
+P:\>fstool.exe /daxcopy p:\Big_DVD_Image.iso q:\test.iso 
+/align:1GB
+NTFS / ReFS Tool v0.1
+Copyright (C) 2018 Andrea Allievi (AaLl86)
+Starting DAX copy...
+   Source file path: p:\Big_DVD_Image.iso.
+   Target file path: q:\test.iso.
+   Source Volume: p:\ - File system: NTFS - Is DAX Volume: 
+True.
+   Target Volume: q:\ - File system: NTFS - Is DAX Volume: 
+False.
+   Source file size: 4.34 GB
+   Target file alignment (1GB) correctly set.
+Performing file copy... Success!
+   Total execution time: 6 Sec.
+   Copy Speed: 618.81 MB/Sec
+Press any key to exit...
+P:\>fsutil dax queryFileAlignment q:\test.iso
+  File Region Alignment:
+    Region        Alignment      StartOffset         
+LengthInBytes
+    0             Huge           0                   
+0x100000000
+    1             Large          0x100000000         
+0xf800000
+    2             Other          0x10f800000         
+0x17b000
+In the latter case, the file was immediately allocated on the next
+1-GB aligned cluster. The first 4-GB (0x100000000 bytes) of the
+file content are stored in contiguous space. When the memory
+manager maps that part of the file, it only needs to use four page
+director pointer table entries (PDPTs), instead of using 2048 page
+tables. This will save physical memory space and drastically
+improve the performance while the processor accesses the data
+located in the DAX section. To confirm that the copy has been
+really executed using large pages, you can attach a kernel debugger
+to the machine (even a local kernel debugger is enough) and use
+the /debug switch of the FsTool application:
+Click here to view code image
+P:\>fstool.exe /daxcopy p:\Big_DVD_Image.iso q:\test.iso 
+/align:1GB /debug
+NTFS / ReFS Tool v0.1
+Copyright (C) 2018 Andrea Allievi (AaLl86)
+Starting DAX copy...
+   Source file path: p:\Big_DVD_Image.iso.
+   Target file path: q:\test.iso.
+   Source Volume: p:\ - File system: NTFS - Is DAX Volume: 
+False.
+   Target Volume: q:\ - File system: NTFS - Is DAX Volume: 
+True.
+   Source file size: 4.34 GB
+   Target file alignment (1GB) correctly set.
+Performing file copy...
+ [Debug] (PID: 10412) Source and Target file correctly 
+mapped.
+         Source file mapping address: 0x000001F1C0000000 
+(DAX mode: 1).
+         Target file mapping address: 0x000001F2C0000000 
+(DAX mode: 1).
+         File offset : 0x0 - Alignment: 1GB.
+Press enter to start the copy...
+ [Debug] (PID: 10412) File chunk’s copy successfully 
+executed.
+Press enter go to the next chunk / flush the file...
+You can see the effective memory mapping using the debugger’s
+!pte extension. First, you need to move to the proper process
+context by using the .process command, and then you can analyze
+the mapped virtual address shown by FsTool:
+Click here to view code image
+8: kd> !process 0n10412 0
+Searching for Process with Cid == 28ac
+PROCESS ffffd28124121080
+    SessionId: 2  Cid: 28ac    Peb: a29717c000  ParentCid: 
+31bc
+    DirBase: 4cc491000  ObjectTable: ffff950f94060000  
+HandleCount:  49.
+    Image: FsTool.exe
+8: kd> .process /i ffffd28124121080
+You need to continue execution (press 'g' ) for the 
+context
+to be switched. When the debugger breaks in again, you will 
+be in
+the new process context.
+8: kd> g
+Break instruction exception - code 80000003 (first chance)
+nt!DbgBreakPointWithStatus:
+fffff804`3d7e8e50 cc              int     3
+8: kd> !pte 0x000001F2C0000000
+                                           VA 
+000001f2c0000000
+PXE at FFFFB8DC6E371018    PPE at FFFFB8DC6E203E58    PDE at 
+FFFFB8DC407CB000
+contains 0A0000D57CEA8867  contains 8A000152400008E7  
+contains 0000000000000000
+pfn d57cea8   ---DA--UWEV  pfn 15240000  --LDA--UW-V  LARGE 
+PAGE pfn 15240000
+PTE at FFFFB880F9600000
+contains 0000000000000000
+LARGE PAGE pfn 15240000
+The !pte debugger command confirmed that the first 1 GB of
+space of the DAX file is mapped using huge pages. Indeed, neither
+the page directory nor the page table are present. The FsTool
+application can also be used to set the alignment of already existing
+files. The FSCTL_SET_DAX_ALLOC_ALIGNMENT_HINT control
+code does not actually move any data though; it just provides a hint
+for the new allocated file extents, as the file continues to grow in
+the future:
+Click here to view code image
+D:\>fstool e:\test.iso /align:2MB /offset:0
+NTFS / ReFS Tool v0.1
+Copyright (C) 2018 Andrea Allievi (AaLl86)
+Applying file alignment to "test.iso" (Offset 0x0)... 
+Success.
+Press any key to exit...
+D:\>fsutil dax queryfileAlignment e:\test.iso
+  File Region Alignment:
+    Region        Alignment      StartOffset         
+LengthInBytes
+    0             Huge           0                   
+0x100000000
+    1             Large          0x100000000         
+0xf800000
+    2             Other          0x10f800000         
+0x17b000
+Virtual PM disks and storages spaces support
+Persistent memory was specifically designed for server systems and mission-
+critical applications, like huge SQL databases, which need a fast response
+time and process thousands of queries per second. Often, these kinds of

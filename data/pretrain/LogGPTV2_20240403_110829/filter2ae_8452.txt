@@ -1,0 +1,81 @@
+**作者： 启明星辰ADLab**  
+**公众号：**
+## 一、漏洞背景
+2019年6月18日，Redhat发布安全公告，Linux内核TCP/IP协议栈存在3个安全漏洞（CVE-2019-11477/CVE-2019-11478/CVE-2019-11479），这些漏洞与最大分段大小（MSS）和TCP选择性确认（SACK）功能相关，允许远程攻击者进行拒绝服务攻击。
+## 二、关键概念
+（一）数据包重传确认机制
+TCP数据包传输过程中，来自滑动窗口的数据包丢失可能对TCP吞吐量产生影响。TCP使用累积确认（ACK）方案解决该问题，其中不接收不在滑动窗口左边缘的接收段，这会强制发送方等待往返时间以找出每个丢失的数据包，或者不必要地重新传输已正确接收的段，从而降低整体吞吐量。
+选择性确认（SACK）是一种在多个丢弃的段的情况下解决此行为的策略。通过选择性确认，数据接收方可以向发送方通知已成功达到的所有段，因此发送方只需重新传输实际丢失的段。具体选择性确认过程，如下图所示。
+（二）最大分段大小（Max Segment Size）
+MSS（Maximum Segment
+Size，最大报文段大小）的概念是指TCP层所能够接收的最大分段大小，该值只包括TCP段的数据部分，不包括Option部分。另外，在TCP首部有一个MSS选项，在三次握手过程中，TCP发送端使用该选项告诉对方自己所能接受的最大分段大小。
+（三）TSO（TCP Segmentation Offload）
+TSO是一种利用网卡来对大数据包进行自动分段，降低CPU负载的技术。其主要是延迟分段。
+（四）GSO(Generic Segmentation Offload)
+GSO是协议栈是否推迟分段，在发送到网卡之前判断网卡是否支持TSO，如果网卡支持TSO则让网卡分段，否则协议栈分完段再交给驱动。如果TSO开启，GSO会自动开启。
+## 三、漏洞原理
+（一） CVE-2019-11477
+根据补丁可知，该漏洞是由一个16bit无符号数溢出导致的，该无符号数存在如下结构体中。
+该tcp_skb_cb结构体存放着TCP每个数据包的控制信息，根据注释可知，tcp_gso_segs/size只用于写队列过程中。
+Linux内核TCP/IP协议栈实现中，每个数据缓冲区是由一个sk_buff结构体统一管理的。在一个完整的数据缓冲区中skb_end后面紧跟着一个skb_shared_info结构体数据，skb_shared_info结构体如下所示：
+结构体最后一个成员是frags[MAX_SKB_FRAGS]数据。MAX_SKB_FRAGS声明如下所示：
+PAGE_SIZE为4KB情况下（即一个内存页面为4KB大小），MAX_SKB_FRAGS取值为65536/4096 +
+1即17，因此一个skb中最多容纳17个数据分片。对于x86系统，每个数据分片最多可以记录32KB数据的大小。
+数据分片skb_frag_struct结构体如下所示：
+在整个协议栈操作过程中，数据包既要进行IP被分片的，又要进行TCP分段。传输数据时，协议栈会根据GSO值，MSS值以及滑动窗口三者之间的大小关系判断是否进行分片。并通过tcp_set_skb_tso_segs()函数设置GSO，具体实现如下图所示：
+如果skb->len大于mss_now，行1207，将tcp_gso_segs设置为skb->len/mss_now。行1208，将tcp_gso_size设置为mss_now。
+如果启用了SACK，在发生丢包后，接收端会返回SACK块，SACK块中记录着丢失包的序列编号。发送端会解析SACK块中记录的丢失包序列编号，并重新传输，而且在一个滑动窗口中可能包含多个SACK块，SACK块中也可能包含多个skb队列。在TCP重传数据包过程中，可以将多个skb队列合并到一个skb队列中进行重传。
+tcp_shift_skb_data()函数实现这个功能。尝试将跨越多个skb的SACK块折叠为一个skb。关键代码如下：
+skb_shift()和tcp_shifted_skb()两个函数主要实现该功能。重传过程中多个skb队列合并到一个skb队列中，如果填充17个分片到最大容量，
+`17 * 32 * 1024/8=69632`，已经大于65535，导致无符号整数溢出。
+在skb_shift ()函数中，tcp_gso_segs溢出后，进入tcp_shifted_skb()函数后，如下所示：
+行1299，判断tcp_gso_segs和pcount的大小，如果tcp_gas_segs小于pcount，BUG_ON断言触发导致内核崩溃。
+根据补丁可知，skb_shift()被tcp_skb_shift()代替，只是加了两个判断，如下所示：
+补丁中分别判断了skb->len+shift_len不能大于65535*8字节和tcp_skb_pcount(to) +
+pcount不能大于65535。第一个判断，skb->len是表示sk_buff结构体中表示payload长度，shift_len表示要合并到skb中的payload。
+（二） CVE-2019-11478
+该漏洞也是整数溢出，在数据包重新传输过程中，将传输队列分段为多个微小的skbs，膨胀skb中写队列内存发生溢出。在处理SACK块中包含的skb并将其合并后，根据GSO判断进行是否分片，如果需要，调用tcp_fragement()函数进行分片。根据补丁可知：
+补丁在tcp_fragment()函数中加入了最小空间判断。Sk是sock结构体类型，每一个tcp链接对应一个。所以所有要发送的skb数据大小都要累加到sk->sk_wmem_queued中，sk->sk_wmem_queued表示为该套接字TCP写队列缓冲区大小。通常在使用时候需要判断该值是否够用。如下所示：
+根据注释可知，判断最新排队skb包所需的最小可写空间。补丁中，判断剩余发送缓存为大于等于当前发送队列占用空间的一半，即还有1/3以上的空余空间时，并且小于sk->sk_sndbuf发送上限才可以正常发送，否则就判定TCP写队列太大。
+（三） CVE-2019-11479
+?
+该漏洞由于过度消耗资源导致拒绝服务。如果恶意数据包将MSS选项设置成较小值，这将迫使协议栈花费非常高的网络或CPU资源发送数据包开销。Linux内核中将MSS_NOW硬编码为48。根据补丁可知：
+进行了max最大值判断，而不再是固定硬编码。这里的sysctl_tcp_min_snd_mss被设置为65535，如下所示：
+避免了攻击者使用极小MSS值。
+## 四、影响版本及补丁修复
+及时更新最新补丁或禁用SACK和过滤极小MSS的数据包。
+CVE-2019-11477
+|
+影响版本：
+Linux 2.6.29 ~ 4.19.13（stable kernel releases4.4.182, 4.9.182, 4.14.127,
+4.19.52, 5.1.11除外）
+RHEL 8 (kernel, kernel-rt)，RHEL 7 (kernel, kernel-rt)，RHEL 6  
+---|---  
+禁用sack：
+sudo sysctl -w net.ipv4.tcp_sack=0  
+补丁：
+CVE-2019-11478
+|
+影响版本：
+Linux 2.6.29 ~ 4.19.13（stable kernel releases4.4.182, 4.9.182, 4.14.127,
+4.19.52, 5.1.11除外）
+RHEL 8 (kernel, kernel-rt)，RHEL 7 (kernel, kernel-rt)，RHEL 6，RHEL 5  
+禁用sack：
+sudo sysctl -w net.ipv4.tcp_sack=0  
+补丁：
+[https://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git/commit/?id=f070ef2ac66716357066b683fb0baf55f8191a2e
+](https://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git/commit/?id=f070ef2ac66716357066b683fb0baf55f8191a2e)  
+CVE-2019-11479
+|
+影响版本：
+Linux 2.6.29 ~ 4.19.13（stable kernel releases4.4.182, 4.9.182, 4.14.127,
+4.19.52, 5.1.11除外）
+RHEL 8 (kernel, kernel-rt)，RHEL 7 (kernel, kernel-rt)，RHEL 6，RHEL 5  
+过滤命令：
+sudo iptables -A INPUT -p tcp -m tcpmss --mss 1:500 -j DROP
+关闭tcp_mtu_probing：
+sysctl net.ipv4.tcp_mtu_probing  
+补丁：
+[https://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git/commit/?id=967c05aee439e6e5d7d805e195b3a20ef5c433d6
+](https://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git/commit/?id=967c05aee439e6e5d7d805e195b3a20ef5c433d6)  
+* * *

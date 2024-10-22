@@ -1,0 +1,110 @@
+        __in_opt PALPC_MESSAGE_ATTRIBUTES SendMessageAttributes,
+        __inout_opt PPORT_MESSAGE ReceiveMessage,
+        __inout_opt PULONG BufferLength,
+        __inout_opt PALPC_MESSAGE_ATTRIBUTES ReceiveMessageAttributes,
+        __in_opt PLARGE_INTEGER Timeout
+        );
+找到PortHandle，用livekd来查看ALPC Port信息：
+    //启动livekd查看内核信息
+    livekd -k windbg路径
+    //根据进程ID找到rundll32的EPROCESS
+    !process {进程ID} 0
+    //找到PortHandle对应的ALPC端口对象
+    !handle {PortHandle} 3 {EPROCESS}
+    //查看ALPC对象信息
+    !alpc /p {AlpcPortObject}
+通过ALPC信息可知ConnectionPort是AudioClientRpc。
+继续查看ConnectionPort，可知Server端是svchost，并且开了两个IOCP
+Worker线程在处理ALPC通信，正处于Wait状态，同时能得到进程线程ID。
+    //切换到svchost进程地址空间
+    .process {svchost EPROCESS}
+    //重新加载符号和模块
+    .reload
+    //查看两个IOCP线程信息
+    !thread {ETHREAD}
+    //正在等待IOCP，线程栈如下：
+    nt!KiSwapContext+0x76
+    nt!KiSwapThread+0x501
+    nt!KiCommitThreadWait+0x13b
+    nt!KeRemoveQueueEx+0x262
+    nt!IoRemoveIoCompletion+0x99
+    nt!NtWaitForWorkViaWorkerFactory+0x334
+    nt!KiSystemServiceCopyEnd+0x13 (TrapFrame @ ffffca89`c2661b00)
+    ntdll!NtWaitForWorkViaWorkerFactory+0x14
+    ntdll!TppWorkerThread+0x536
+    KERNEL32!BaseThreadInitThunk+0x14
+    ntdll!RtlUserThreadStart+0x21
+另开windbg挂起对应的svchost.exe，在上述线程的ntdll!NtWaitForWorkViaWorkerFactory+0x14返回处下断点：
+    ~~[1118] bp 7ff8`07dd6866
+断下来后，使用wt跟踪，可大致知道调用关系，继续在NtAlpcSendWaitReceivePort下断点：
+    ~~[1118] bp ntdll!NtAlpcSendWaitReceivePort
+查看栈回溯，可知IOCP的Callback在处理ALPC调用：
+面对频繁的ALPC调用，如何才能定位是我们的Client发过来的？
+必然要找到Client和Server之间的关联，然后设置条件断点，那么关联在哪里？
+NtAlpcSendWaitReceivePort函数的参数ReceiveMessage是PPORT_MESSAGE，其包含MessageId和对端的进程线程ID，结构如下：
+    //from: https://github.com/processhacker/processhacker/blob/master/phnt/include/ntlpcapi.h
+    typedef struct _PORT_MESSAGE
+    {
+        union
+        {
+            struct
+            {
+                CSHORT DataLength;
+                CSHORT TotalLength;
+            } s1;
+            ULONG Length;
+        } u1;
+        union
+        {
+            struct
+            {
+                CSHORT Type;
+                CSHORT DataInfoOffset;
+            } s2;
+            ULONG ZeroInit;
+        } u2;
+        union
+        {
+            CLIENT_ID ClientId;
+            double DoNotUseThisField;
+        };
+        ULONG MessageId;
+        union
+        {
+            SIZE_T ClientViewSize; // only valid for LPC_CONNECTION_REQUEST messages
+            ULONG CallbackId; // only valid for LPC_REQUEST messages
+        };
+    } PORT_MESSAGE, *PPORT_MESSAGE;
+通过结构体推算ClientId结构偏移是+0x08，ReceiveMessage是第5个参数（上一篇讲过如何获取x64的参数值）
+可知rdi是ReceiveMessage，rdi是non volatile寄存器，因此设置条件断点：
+    //Tips：先让Client执行到NdrClientCall时再启用断点，防止中断到其它RPC函数。
+    bp {NtAlpcSendWaitReceivePort调用后} ".if(poi(@rdi+8)=={Client进程ID} and poi(@rdi+10)=={Client线程ID}){}.else{gc}"
+此时Client单步走过NdrClientCall，svchost会中断下来，由于这个RPC接口是阻塞的，因此Client会等到Server端的返回。
+接下里就是进入rpcrt4运行时，执行各种反序列化、内存分配拷贝等操作，最后通过rpcrt4!Invoke进入真正的接口函数，通过调用栈一目了然。
+## 调试音频服务
+找到Server端函数audiosrv!PolicyConfigSetDefaultEndpoint：
+    RPCRT4!Invoke+0x70:
+    00007ff8`078e4410 41ffd2          call    r10 {audiosrv!PolicyConfigSetDefaultEndpoint (00007fff`f81d2d10)}
+取消Client所有断点，开始跟踪audiosrv!PolicyConfigSetDefaultEndpoint，该函数调用失败返回80070005h（拒绝访问）。
+通过调试不难发现MMDevAPI!CSubEndpointDevice::SetRegValue调用失败（CFG导致截图看到的函数不直观，查看rax即可）。
+然而根本原因是因为操作注册表失败，如下图所示：
+参数信息如下：  
+HKEY_LOCAL_MACHINESOFTWAREMicrosoftWindowsCurrentVersionMMDevicesAudioRender{34bb9f66-ad6b-4d17-b74b-7aace4320530}  
+samDesired=0x20106(KEY_WRITE(0x20006) | KEY_WOW64_64KEY (0x0100))
+!token查看当前token信息，使用Sysinternals的PsGetsid查看GroupOwner的sid对应NT ServiceAudiosrv。
+    NT ServiceAudiosrv
+    NT ServiceAudioEndpointBuilder
+查看注册表键值，上面两个服务虚拟用户只有读取权限，删除自有权限，启用继承父键权限。Render键下还有几个设备也按同样的方式处理。
+关于MMDev可参考：  
+再次调试，注册表操作成功，audiosrv!PolicyConfigSetDefaultEndpoint返回S_OK，重启AudioService服务，问题解决。
+## 结束
+最后，每次解决问题后，应该反思每一个细节，目标是否明确，思路是否清晰，是否有更好的方式，不断总结优化。
+例如对于这类问题，可从符号入手定位问题，可从RPC运行时（rpcrt4）这一层去分析，亦可在rpcrt4!Invoke的监视，等等。。。
+Thanks for reading。
+    参考资料：
+    Google
+    MSDN
+    ProcessHacker
+    Windows Internals
+    Windbg Help
+    WRK

@@ -1,0 +1,95 @@
+>                            --58.24%--generic_file_read_iter    
+>                                      |--47.44%--ondemand_readahead    
+>                                      |           --46.88%--__do_page_cache_readahead    
+>                                      |                     |--32.67%--ext4_mpage_readpages    
+>     
+With all those 'readahead' calls it certainly makes one wonder if the    
+Linux kernel is reading more than just the block we're looking for    
+because it thinks we're doing a sequential read and will therefore want    
+the next few blocks when, in reality, we're going to skip past them,    
+meaning that any readahead the kernel is doing is likely just wasted    
+I/O.    
+> [..]     
+> Perf --no-children also triple confirms that there isn't any function that is burning a lot inside the worker:    
+>     
+> # Overhead       sys       usr  Command   Shared Object       Symbol    
+>      5.40%     0.00%     5.40%  postgres  [vdso]              [.] __vdso_clock_gettime    
+>      5.11%     0.00%     5.11%  postgres  postgres            [.] acquire_sample_rows    
+>             ---acquire_sample_rows    
+>      3.98%     0.00%     3.98%  postgres  postgres            [.] heapam_scan_analyze_next_tuple    
+>             ---heapam_scan_analyze_next_tuple    
+>      3.69%     3.69%     0.00%  postgres  [kernel.kallsyms]   [k] pvclock_clocksource_read    
+Sure, makes sense.    
+> My questions are:    
+> a) does anybody know if it is expected that getrusage() doesn't include readahead times  as current thread system time ? (I don't know by may be performed by other kernel threads?) ru_stime is defined as "This is the total amount of time spent executing in kernel mode". Maybe the "executing" is the keyword here? (waiting != executing?)    
+getrusage()'s user/system CPU times are reporting time-on-CPU, not    
+counting time blocking for i/o.  Waiting isn't the same as executing,    
+no.    
+> b) initially I've wanted to add a new pg_rusage_show_verbose() that would also add ru_inblock, but that wouldn't add much value to the end user. Also adding another timing directly around table_scan_analyze_next_block() seems like the bad idea as it involves locking underneah. So I've tried the most easy approach to simply log $pgStatBlockReadTime as strictly I/O time spent in pread() (ReadBuffer_common() already measures time). The attached patch for PgSQL14-devel in heavy I/O conditions (with track_io_timings=on) logs the following:     
+> "LOG:  automatic analyze of table "test.public.t1_default" system usage: IO read time 0.69 s, CPU: user: 0.18 s, system: 0.13 s, elapsed: 0.92 s"    
+That definitely seems like a useful thing to include and thanks for the    
+patch!  Please be sure to register it in the commitfest app:    
+https://commitfest.postgresql.org    
+> my interpretation would be that IO reading time was most limiting factor (69/92 = 75%), but *CPU* on kernel side was just 13s. It could give the enduser/DBA the information needed, the information where's the bottleneck given the autovacuum_vacuum_cost_delay=0. In autovacuum_vacuum_cost_delay>0 maybe it would make sense to include also time spent on sleeping?    
+Yeah, that would certainly be useful.    
+> c) I'm curious if anybody has any I/O related insights into analyze.c processing especially related to readaheads? E.g. maybe disabling readahead would help for PostgreSQL analyze.c usecase on NVMe? Is it worth given that only x% of blocks are needed? The only option I'm aware would be to e.g. hash-partition the table (to introduce parallelism by autovacuums and enable even workers). Any hints or comments?    
+I would think that, ideally, we'd teach analyze.c to work in the same    
+way that bitmap heap scans do- that is, use posix_fadvise to let the    
+kernel know what pages we're going to want next instead of the kernel    
+guessing (incorrectly) or not doing any pre-fetching.  I didn't spend a    
+lot of time poking, but it doesn't look like analyze.c tries to do any    
+prefetching today.  In a similar vein, I wonder if VACUUM should be    
+doing prefetching too today, at least when it's skipping through the    
+heap based on the visibility map and jumping over all-frozen pages.    
+> All of the above observations from PostgreSQL 12.4 on Linux kernel 4.14 with ext4/striped dm with 3x-4x NVMEs.    
+>     
+> -Jakub Wartak.    
+> diff --git a/src/backend/commands/analyze.c b/src/backend/commands/analyze.c    
+> index 8af12b5c6b..fea1bd6f44 100644    
+> --- a/src/backend/commands/analyze.c    
+> +++ b/src/backend/commands/analyze.c    
+> @@ -312,6 +312,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,    
+>  	Oid			save_userid;    
+>  	int			save_sec_context;    
+>  	int			save_nestlevel;    
+> +	PgStat_Counter startblockreadtime = 0;    
+>      
+>  	if (inh)    
+>  		ereport(elevel,    
+> @@ -347,6 +348,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,    
+>  	if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0)    
+>  	{    
+>  		pg_rusage_init(&ru0);    
+> +		startblockreadtime = pgStatBlockReadTime;    
+>  		if (params->log_min_duration > 0)    
+>  			starttime = GetCurrentTimestamp();    
+>  	}    
+> @@ -686,10 +688,11 @@ do_analyze_rel(Relation onerel, VacuumParams *params,    
+>  			TimestampDifferenceExceeds(starttime, GetCurrentTimestamp(),    
+>  									   params->log_min_duration))    
+>  			ereport(LOG,    
+> -					(errmsg("automatic analyze of table \"%s.%s.%s\" system usage: %s",    
+> +					(errmsg("automatic analyze of table \"%s.%s.%s\" system usage: IO read time %.2f s, %s",    
+>  							get_database_name(MyDatabaseId),    
+>  							get_namespace_name(RelationGetNamespace(onerel)),    
+>  							RelationGetRelationName(onerel),    
+> +							(double) (pgStatBlockReadTime - startblockreadtime)/1000000,    
+>  							pg_rusage_show(&ru0))));    
+>  	}    
+>      
+Haven't looked too closely at this but in general +1 on the idea and    
+this approach looks pretty reasonable to me.  Only thing I can think of    
+off-hand is to check how it compares to other places where we report IO    
+read time and make sure that it looks similar.    
+Thanks,    
+Stephen    
+```    
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

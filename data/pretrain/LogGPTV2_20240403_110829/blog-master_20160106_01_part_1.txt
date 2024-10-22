@@ -1,0 +1,127 @@
+## PostgreSQL on xfs 性能优化 - 1  
+### 作者                                                                             
+digoal                           
+### 日期                             
+2016-01-06                          
+### 标签                           
+PostgreSQL , xfs , 性能         
+----                          
+## 背景                         
+性能优化主要分4块，  
+1\. 逻辑卷优化部分  
+2\. XFS mkfs 优化部分  
+3\. XFS mount 优化部分  
+4\. xfsctl 优化部分  
+以上几个部分都可以通过man手册查看，了解原理和应用场景后着手优化。  
+```  
+man lvcreate  
+man xfs  
+man mkfs.xfs  
+man mount  
+man xfsctl  
+```  
+## 例子  
+1\. 逻辑卷优化部分  
+1\.1 创建PV前，将块设备对齐，前面1MB最好不要分配，从2048 sector开始分配。  
+```  
+fdisk -c -u /dev/dfa  
+start  2048  
+end + (2048*n) - 1  
+```  
+或者使用parted创建并对齐分区。  
+1\.2 主要指定2个参数，  
+条带数量，和pv数量一致即可  
+```  
+       -i, --stripes Stripes  
+              Gives the number of stripes.  This is equal to the number of physical volumes to scatter the logical volume.  
+```  
+条带大小，和数据库块大小一致，例如postgresql默认为 8KB。  
+```  
+       -I, --stripesize StripeSize  
+              Gives the number of kilobytes for the granularity of the stripes.  
+              StripeSize must be 2^n (n = 2 to 9) for metadata in LVM1 format.  For metadata in LVM2 format, the stripe size may be a larger power of 2 but must not exceed the physical extent size.  
+```  
+创建快照时，指定的参数  
+chunksize, 最好和数据库的块大小一致, 例如postgresql默认为 8KB。  
+```  
+       -c, --chunksize ChunkSize  
+              Power of 2 chunk size for the snapshot logical volume between 4k and 512k.  
+```  
+例如：  
+预留1%给xfs的LOG DEV (实际2GB就够了)  
+```  
+#lvcreate -i 3 -I 8 -n lv01 -L 2G vgdata01  
+  Logical volume "lv01" created  
+#lvcreate -i 3 -I 8 -n lv02 -l 100%FREE vgdata01  
+  Logical volume "lv02" created  
+#lvs  
+  LV   VG       Attr   LSize   Origin Snap%  Move Log Copy%  Convert  
+  lv02 vgdata01 -wi-a-  17.29t                                        
+  lv01 vgdata01 -wi-a-   2g   
+```  
+2\. XFS mkfs 优化部分  
+首先要搞清楚XFS的layout。  
+xfs包含3个section，data, log, realtime files。  
+默认情况下 log存在data里面，没有realtime。所有的section都是由最小单位block组成，初始化xfs是-b指定block size。  
+2\.1 data  
+包含 metadata(inode, 目录, 间接块), user file data, non-realtime files  
+data被拆分成多个allocation group，mkfs.xfs时可以指定group的个数，以及单个group的SIZE。  
+group越多，可以并行进行的文件和块的allocation就越多。你可以认为单个组的操作是串行的，多个组是并行的。  
+但是组越多，消耗的CPU会越多，需要权衡。对于并发写很高的场景，可以多一些组，（例如一台主机跑了很多小的数据库，每个数据库都很繁忙的场景下）  
+2\.2 log  
+存储metadata的log，修改metadata前，必须先记录log，然后才能修改data section中的metadata。  
+也用于crash后的恢复。  
+2\.3 realtime  
+被划分为很多个小的extents, 要将文件写入到realtime section中，必须使用xfsctl改一下文件描述符的bit位，并且一定要在数据写入前完成。在realtime中的文件大小是realtime extents的倍数关系。  
+2\.4所以mkfs.xfs时，我们能做的优化是：  
+#### data section：  
+allocation group count数量和AGSIZE相乘等于块设备大小。  
+AG count数量多少和用户需求的并行度相关。  
+同时AG SIZE的取值范围是16M到1TB，PostgreSQL 建议1GB左右。  
+选项 -b size=8192  与数据库块大小一致 （但不是所有的xfs版本都支持大于4K的block size，所以如果你发现mount失败并且告知只支持4K以下的BLOCK，那么请重新格式化）  
+选项 -d agcount=9000,sunit=16,swidth=48  
+假设有9000个并发写操作，使用9000个allocation groups  
+(单位512 bytes) 与lvm或RAID块设备的条带大小对齐  
+与lvm或RAID块设备条带跨度大小对齐，以上对应3*8 例如 -i 3 -I 8。  
+#### log section：  
+最好放在SSD上，速度越快越好。最好不要使用cgroup限制LOG块设备的iops操作。  
+#### realtime section:  
+不需要的话，不需要创建。  
+agsize绝对不能是条带宽度的倍数。(假设条带数为3，条带大小为8K，则宽度为24K。)  
+如果根据指定agcount算出的agsize是swidth的倍数，会弹出警告：  
+例如下面的例子，  
+agsize=156234 blks 是 swidth=6 blks 的倍数 26039。  
+给出的建议是减掉一个stripe unit即8K，即156234 blks -  sunit 2 blks = 156232 blks。  
+156232 blks换算成字节数= 156232*4096 = 639926272 bytes 或 156232*4 = 624928K  
+```  
+#mkfs.xfs -f -b size=4096 -l logdev=/dev/mapper/vgdata01-lv01,size=2136997888,sunit=16 -d agcount=30000,sunit=16,swidth=48 /dev/mapper/vgdata01-lv02  
+Warning: AG size is a multiple of stripe width.  This can cause performance  
+problems by aligning all AGs on the same disk.  To avoid this, run mkfs with  
+an AG size that is one stripe unit smaller, for example 156232.  
+meta-data=/dev/mapper/vgdata01-lv02 isize=256    agcount=30000, agsize=156234 blks  
+         =                       sectsz=4096  attr=2, projid32bit=1  
+         =                       crc=0        finobt=0  
+data     =                       bsize=4096   blocks=4686971904, imaxpct=5  
+         =                       sunit=2      swidth=6 blks  
+naming   =version 2              bsize=4096   ascii-ci=0 ftype=0  
+log      =/dev/mapper/vgdata01-lv01 bsize=4096   blocks=521728, version=2  
+         =                       sectsz=512   sunit=2 blks, lazy-count=1  
+realtime =none                   extsz=4096   blocks=0, rtextents=0  
+```  
+对于上面这个mkfs.xfs操作，改成以下  
+```  
+#mkfs.xfs -f -b size=4096 -l logdev=/dev/mapper/vgdata01-lv01,size=2136997888,sunit=16 -d agsize=639926272,sunit=16,swidth=48 /dev/mapper/vgdata01-lv02  
+或  
+#mkfs.xfs -f -b size=4096 -l logdev=/dev/mapper/vgdata01-lv01,size=2136997888,sunit=16 -d agsize=624928k,sunit=16,swidth=48 /dev/mapper/vgdata01-lv02  
+```  
+输出如下  
+```  
+meta-data=/dev/mapper/vgdata01-lv02 isize=256    agcount=30001, agsize=156232 blks  (约600MB)  
+         =                       sectsz=4096  attr=2, projid32bit=1  
+         =                       crc=0        finobt=0  
+data     =                       bsize=4096   blocks=4686971904, imaxpct=5  
+         =                       sunit=2      swidth=6 blks  
+naming   =version 2              bsize=4096   ascii-ci=0 ftype=0  
+log      =/dev/mapper/vgdata01-lv01 bsize=4096   blocks=521728, version=2  
+         =                       sectsz=512   sunit=2 blks, lazy-count=1  
+realtime =none                   extsz=4096   blocks=0, rtextents=0  

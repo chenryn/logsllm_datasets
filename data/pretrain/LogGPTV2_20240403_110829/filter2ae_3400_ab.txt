@@ -1,0 +1,73 @@
+    [] filemap_fault+0x23b/0x3f0
+    [] __do_fault+0x50/0xe0
+    [] handle_mm_fault+0xf8b/0x1820
+    [] __get_user_pages+0x135/0x620
+    [] get_user_pages+0x52/0x60
+    [] __access_remote_vm+0xe6/0x2d0
+    [] ? alloc_pages_current+0x8c/0x110
+    [] access_remote_vm+0x1f/0x30
+    [] environ_read+0x122/0x1a0
+    [...]
+关于错误的可达性：利用错误需要能够以`/proc/$pid`作为源来挂载ecryptfs文件系统。 安装ecryptfs-utils软件包（如果您在安装过程中启用了主目录加密，则Ubuntu会安装它），可以使用/sbin/mount.ecryptfs_private
+setuid helper来完成。 （它验证用户拥有源目录，但这不是问题，因为用户拥有他自己的进程的procfs目录。）
+# 漏洞利用
+下面的解释有时是特定在amd64架构下的。
+过去使用这样的漏洞非常简单：正如[Jon Oberheide's "The Stack is Back"
+slides](https://jon.oberheide.org/files/infiltrate12-thestackisback.pdf)的幻灯片所述，它曾经可能溢出到堆栈底部的thread_info结构中，在那里用适当的值覆盖restart_block或addr_limit，然后取决于哪一个受到攻击，要么从可执行用户控件映射执行代码，要么使用copy_from_user()和copy_to_user()来读写内核数据。
+但是，restart_block已移出thread_info结构，并且由于堆栈溢出由包含kernel_read（）帧的堆栈触发，addr_limit已经是KERNEL_DS，并且在返回时将被重置为USER_DS。另外，至少Ubuntu
+Xenial的发行版内核打开CONFIG_SCHED_STACK_END_CHECK内核配置选项，这导致直接在thread_info结构之上的金丝雀在调度程序被调用时被检查;如果Canary不正确，那么内核会递归地选择然后发生混乱（固定为[29d6455178a0](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=29d6455178a09e1dc340380c582b13356227e8df)
+中的直接恐慌）。
+由于很难再thread_info结构中找到任何值得定位的东西（并且因为它能很好地显示移出thread_info的东西不是一个足够的缓冲）我选择了一种不同的策略：将堆栈溢出到堆栈前的分配中，然后利用堆栈和其他分配重叠。这种方法的问题是，canary和thread_info结构的某些组件不能被覆盖。布局看起来是这样（绿色可以破坏，红色不可以被破坏，如果根据值贬值，黄色可能会不愉快）：  
+幸运的是，有堆栈框架包含洞 -如果递归的底部使用cmdline而不是environ，那么在递归过程中会有一个5-QWORD的洞没有被触及，这足以涵盖从STACK_END_MAGIC到flags的所有内容。在使用安全递归级别和调试帮助程序内核模块时，可以看到这一点，该模块使用标记喷射堆栈以使堆栈中的洞（绿色）可见：  
+下一个问题是，这个洞只出现在特定的堆栈深度，而为了成功的利用，它需要精确地处于正确的位置。 但是，有几个技巧可以一起用来对齐堆栈：
+  * 在每个递归级别上，可以选择是使用“environ”文件还是“cmdline”文件，并且它们的堆栈帧大小和洞的模式是不同的。
+  * 任何copy_from_user()都是页面错误的有效入口点。 更好的是，可以将任意写入系统调用与任意VFS写入处理程序组合起来，以便写入系统调用和VFS写入处理程序影响深度。 （并且可以计算组合深度，而无需测试每个变体。）
+在测试了各种组合之后，我结束了一系列的environ文件和cmdline文件，将write() 系统调用和uid_map的VFS写入处理程序。
+在这一点上，我们可以在不触及任何危险区域的情况下缓存到以前的分配中。现在，当堆栈指针指向前面的分配时，内核线程的执行必须暂停，堆栈指针指向的分配应该被新堆栈覆盖，然后应该继续执行内核代码。
+要在递归内部暂停内核线程，在设置映射链之后，可以用链接结尾处的匿名映射替换为FUSE映射（userfaultfd在这里不起作用;它不捕获远程内存访问）。
+对于前面的分配，我的漏洞利用管道。 当数据写入新分配的空管道时，将使用buddy分配器为该数据分配页面。
+我的漏洞利用管道页面简单地分配内存，同时创建使用clone()触发页面错误的进程。使用clone()而不是fork()的优点是，使用适当的flags，更少的信息会被复制，因此存储器分配噪声更少。  
+在clone()过程中，当在FUSE中暂停时，所有管道页面都被填充到（但不包括）递归过程的预期RSP后面的第一个保存的RIP。写入较少会导致第二个管道写入在实现RIP控制之前使用的clobber堆栈数据，这可能会导致内核崩溃。然后，当递归进程在FUSE中暂停时，将对所有管道执行第二次写入操作，以使用完全由攻击者控制的新堆栈覆盖保存的RIP及其后面的数据。  
+此时，最后一道防线应该是KASLR。
+正如其[安全功能页面](https://wiki.ubuntu.com/Security/Features)中所述，Ubuntu支持x86和amd64上的KASLR
+-但您必须手动启用它，因为这样会打破休眠。这个bug最近已经被[修复](https://lkml.org/lkml/2016/6/14/257)了，所以现在发行版应该可以默认开启KASLR
+-即使安全性好处并不是很大，开启这个功能也许是有意义的，因为它并没有真正花费任何东西。由于大多数机器可能未配置为在内核命令行上传递特殊参数，因此我假设KASLR在编译到内核中时处于非活动状态，因此攻击者知道内核文本和静态数据的地址。
+现在用ROP在内核中执行任意操作是微不足道的，有两种方法可以继续使用该漏洞。
+你可以使用ROP执行像commit_creds(prepare_kernel_cred(NULL))这样的等效操作。我选择了另一种方式。
+请注意，在堆栈溢出期间，保留了addr_limit的原始KERNEL_DS值。通过所有保存的堆栈图返回将最终将addr_limit重置为USER_DS——但如果我们直接返回到用户空间，addr_limit将保留KERNEL_DS。
+因此，我的漏洞利用下面的新堆栈，它或多或少是堆栈顶部数据的副本：
+    unsigned long new_stack[] = {
+      0xffffffff818252f2, /* return pointer of syscall handler */
+      /* 16 useless registers */
+      0x1515151515151515, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      (unsigned long) post_corruption_user_code, /* user RIP */
+      0x33, /* user CS */
+      0x246, /* EFLAGS: most importantly, turn interrupts on */
+      /* user RSP */
+      (unsigned long) (post_corruption_user_stack + sizeof(post_corruption_user_stack)),
+      0x2b /* user SS */
+    };
+通过杀死FUSE服务器进程恢复递归过程后，它将以post_corruption_user_code方法继续执行。
+该方法然后可以使用管道写入任意内核地址，因为copy_to_user（）中的地址检查被禁用：
+    void kernel_write(unsigned long addr, char *buf, size_t len) {
+      int pipefds[2];
+      if (pipe(pipefds))
+        err(1, "pipe");
+      if (write(pipefds[1], buf, len) != len)
+        errx(1, "pipe write");
+      close(pipefds[1]);
+      if (read(pipefds[0], (char*)addr, len) != len)
+        errx(1, "pipe read to kernelspace");
+      close(pipefds[0]);
+    }
+现在你可以舒适地执行任意读取和写入用户空间。如果您需要root
+shell，您可以覆盖存储在静态变量中的coredump处理程序，然后引发SIGSEGV以root权限执行coredump处理程序：
+    char *core_handler = "|/tmp/crash_to_root";
+      kernel_write(0xffffffff81e87a60, core_handler, strlen(core_handler)+1);
+# 漏洞修复
+该错误使用两个单独的修补程序修复：[2f36db710093](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2f36db71009304b3f0b95afacd8eba1f9f046b87)不允许在没有mmap处理程序的情况下通过ecryptfs打开文件，只是可以确定的是，[e54ad7f1ee26](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=e54ad7f1ee263ffa5a2de9c609d58dfa27b21cd9)不允许在procfs之上堆叠任何东西，因为procfs中存在很多magic值，并且没有任何理由在堆栈上堆叠任何东西。
+然而，我为这个并不完全广泛使用的bug编写了完整的root
+exploit的原因是，我想要证明Linux堆栈溢出可能以非常明显的方式发生，即使现有的缓解措施打开，它们仍然可以被利用。  
+在我的错误报告中，我要求内核安全列表向内核堆栈添加防护页，并从堆栈底部删除thread_info结构，以便更可靠地减轻此类错误，类似于其他操作系统和grsecurity已经在做的事情。
+Andy
+Lutomirski实际上已经开始着手这方面的工作，现在他已经发布了可以添加警戒页面的[补丁](https://lkml.org/lkml/2016/6/15/1064)

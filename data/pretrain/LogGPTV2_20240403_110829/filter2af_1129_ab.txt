@@ -1,0 +1,161 @@
+                            uint16_t chunk_size = tcp_chunk_size;
+                            /* check if this is the last frame */
+                            if (tcp_send_offset + tcp_chunk_size >= tcp_data_len)
+                            {
+                                is_last_frame = 1;
+                                chunk_size = tcp_data_len - tcp_send_offset;
+                            }
+                            ...
+                            if (tcp_send_offset)
+                            {
+                                memcpy((uint8_t*)p_tcp_hdr + tcp_hlen, (uint8_t*)p_tcp_hdr + tcp_hlen + tcp_send_offset, chunk_size);
+                            }
+                            ...
+                            rtl8139_transfer_frame(s, saved_buffer, tso_send_size,
+                                0, (uint8_t *) dot1q_buffer);
+可以看到因为eth包最大的发包长度有限，所以会将tcp数据按长度进行切割，每次发送固定长度的数据包，因为`ip_data_len`已经被覆盖成了负数（最大可为65535），因此后面的代码`memcpy((uint8_t*)p_tcp_hdr
++ tcp_hlen, (uint8_t*)p_tcp_hdr + tcp_hlen + tcp_send_offset,
+chunk_size);`会将`p_tcp_hdr`正常的数据以外的额外的数据拷贝出来，通过`rtl8139_transfer_frame`发送出去。
+再看`rtl8139_transfer_frame`函数，当Tx寄存器包含`TxLoopBack`标志位时，程序会调用`rtl8139_do_receive`函数降数据回发送回给自己：
+    static void rtl8139_transfer_frame(RTL8139State *s, uint8_t *buf, int size,
+        int do_interrupt, const uint8_t *dot1q_buf)
+    {
+        ...
+        if (TxLoopBack == (s->TxConfig & TxLoopBack))
+        {
+           ...
+            DPRINTF("+++ transmit loopback mode\n");
+            rtl8139_do_receive(qemu_get_queue(s->nic), buf, size, do_interrupt); 
+            ...
+            }
+        }
+        ...
+    }
+去看`rtl8139_do_receive`函数，当发送包（buf）的目标mac地址与网卡的地址一致且Rx寄存器标志位包含`AcceptMyPhys`标志时，会将发送出来的数据保存到相应的Rx缓冲区中，对应的代码为`pci_dma_write(d,
+rx_addr, buf, size)`，`rx_addr`为相应的`Rx-descriptor`中`buf_LO`与`buf_HI`组成的物理地址：
+    static ssize_t rtl8139_do_receive(NetClientState *nc, const uint8_t *buf, size_t size_, int do_interrupt)
+    {
+        ...
+        /* XXX: check this */
+        if (s->RxConfig & AcceptAllPhys) {
+            /* promiscuous: receive all */
+            ...
+        } else {
+            ...
+                    //发送包的目标mac地址与网卡地址对比
+            } else if (s->phys[0] == buf[0] &&
+                       s->phys[1] == buf[1] &&
+                       s->phys[2] == buf[2] &&
+                       s->phys[3] == buf[3] &&
+                       s->phys[4] == buf[4] &&
+                       s->phys[5] == buf[5]) {
+                /* match */
+                if (!(s->RxConfig & AcceptMyPhys))
+                {
+                    DPRINTF(">>> rejecting physical address matching packet\n");
+                    /* update tally counter */
+                    ++s->tally_counters.RxERR;
+                    return size;
+                }
+               ...
+            }
+        }
+        ...
+        if (rtl8139_cp_receiver_enabled(s))
+        {
+            if (!rtl8139_cp_rx_valid(s)) {
+                return size;
+            }
+            DPRINTF("in C+ Rx mode ================\n");
+            ...
+            int descriptor = s->currCPlusRxDesc;
+            dma_addr_t cplus_rx_ring_desc;
+            cplus_rx_ring_desc = rtl8139_addr64(s->RxRingAddrLO, s->RxRingAddrHI);
+            cplus_rx_ring_desc += 16 * descriptor;
+            DPRINTF("+++ C+ mode reading RX descriptor %d from host memory at "
+                "%08x %08x = "DMA_ADDR_FMT"\n", descriptor, s->RxRingAddrHI,
+                s->RxRingAddrLO, cplus_rx_ring_desc);
+            uint32_t val, rxdw0,rxdw1,rxbufLO,rxbufHI;
+            pci_dma_read(d, cplus_rx_ring_desc, &val, 4);
+            rxdw0 = le32_to_cpu(val);
+            pci_dma_read(d, cplus_rx_ring_desc+4, &val, 4);
+            rxdw1 = le32_to_cpu(val);
+            pci_dma_read(d, cplus_rx_ring_desc+8, &val, 4);
+            rxbufLO = le32_to_cpu(val);
+            pci_dma_read(d, cplus_rx_ring_desc+12, &val, 4);
+            rxbufHI = le32_to_cpu(val);
+            DPRINTF("+++ C+ mode RX descriptor %d %08x %08x %08x %08x\n",
+                descriptor, rxdw0, rxdw1, rxbufLO, rxbufHI);
+            if (!(rxdw0 & CP_RX_OWN))
+            {
+                ...
+            }
+            uint32_t rx_space = rxdw0 & CP_RX_BUFFER_SIZE_MASK;
+            ...
+            dma_addr_t rx_addr = rtl8139_addr64(rxbufLO, rxbufHI);
+            /* receive/copy to target memory */
+            if (dot1q_buf) {
+                ...
+            } else {
+                pci_dma_write(d, rx_addr, buf, size);
+            }
+            ...
+    }
+到此漏洞的原理可以大致弄清楚了：tx缓冲区中包含了要发送的数据包，在发送的过程中，因为没有对`ip->ip_len`进行检查，导致程序判定tcp的数据包长度超出了原有的长度，因此会将数据包进行切割将数据发送出去，导致了非预期的信息泄露；同时当Tx标志位包含`TxLoopBack`时，会将数据包发送给自己的网卡并且发送数据的mac地址为自身网卡以及rx标志位包含`AcceptAllPhys`时会将相应的数据保存到rx缓冲区中，因此构造好相应的数据我们就可以从rx缓冲区的数据中读取到信息泄露的数据。
+### 流程分析
+弄清楚了漏洞原理后，想进一步分析看如何才能够构造好相应的网卡以及触发漏洞，因此对该网卡进行一定的分析。
+`apt-get install pciutils`安装`lspci`工具，然后查看pci设备：
+    root@ubuntu:~# lspci
+    ...
+    00:04.0 Ethernet controller: Realtek Semiconductor Co., Ltd. RTL-8100/8101L/8139 PCI Fast Ethernet Adapter (rev 20)
+    root@ubuntu:~# lspci -v -s 00:04.0
+    00:04.0 Ethernet controller: Realtek Semiconductor Co., Ltd. RTL-8100/8101L/8139 PCI Fast Ethernet Adapter (rev 20)
+            Subsystem: Red Hat, Inc QEMU Virtual Machine
+            Flags: bus master, fast devsel, latency 0, IRQ 11
+            I/O ports at c000 [size=256]
+            Memory at febf1000 (32-bit, non-prefetchable) [size=256]
+            Expansion ROM at feb40000 [disabled] [size=256K]
+            Kernel driver in use: 8139cp
+    lspci: Unable to load libkmod resources: error -12
+pmio空间对应的端口地址为`0xc000`，大小为256。
+再去看网卡的`realize`函数：
+    static void pci_rtl8139_realize(PCIDevice *dev, Error **errp)
+    {
+        ...
+        memory_region_init_io(&s->bar_io, OBJECT(s), &rtl8139_io_ops, s,
+                              "rtl8139", 0x100);
+        ...
+    }
+可以看到pmio对应的操作为`rtl8139_io_ops`，其定义如下：
+    static const MemoryRegionOps rtl8139_io_ops = {
+        .read = rtl8139_ioport_read,
+        .write = rtl8139_ioport_write,
+        .impl = {
+            .min_access_size = 1,
+            .max_access_size = 4,
+        },
+        .endianness = DEVICE_LITTLE_ENDIAN,
+    };
+要设置网卡更多的关键为`rtl8139_ioport_write`，根据size的大小分成了`writeb`、`writew`以及`writel`函数，每个函数中根据addr可以设置网卡相应寄存器的值：
+    static void rtl8139_ioport_write(void *opaque, hwaddr addr,
+                                     uint64_t val, unsigned size)
+    {
+        switch (size) {
+        case 1:
+            rtl8139_io_writeb(opaque, addr, val);
+            break;
+        case 2:
+            rtl8139_io_writew(opaque, addr, val);
+            break;
+        case 4:
+            rtl8139_io_writel(opaque, addr, val);
+            break;
+        }
+    }
+然后去看漏洞函数调用路径，寻找如何触发漏洞。
+漏洞函数为`rtl8139_cplus_transmit_one`，查看它的引用：
+    static void rtl8139_cplus_transmit(RTL8139State *s)
+    {
+        int txcount = 0;
+        while (rtl8139_cplus_transmit_one(s))
+        {

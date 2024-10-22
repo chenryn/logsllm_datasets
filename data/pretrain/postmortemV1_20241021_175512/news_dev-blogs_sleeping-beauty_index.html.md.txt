@@ -1,0 +1,208 @@
+# Sleeping beauty - How one of the oldest bugs in EVE got hunted down and resolved 
+
+[2017-02-15 - By CCP Snorlax ]
+
+Sometimes a story of a bug is so intriguing you have to write it down -
+so if you are technically minded or just curious about the realities of
+development on EVE Online. Join me for a deep-dive into the technical
+depths of the EVE Online code base, as I recount how one of the oldest
+defects in the game got hunted down and resolved! 
+
+We\'re always working on improving EVE Online and our code base, and I
+hope you enjoy coming along on a journey of how this work can look.
+
+## How it all began
+
+A little while ago CCP karkur asked me if I could help with an issue she
+had been looking into with the drone window, where it sometimes would
+stop updating when drones are being recalled. Her investigation did not
+uncover any bugs in the code related to drones or the UI. Over the
+course of a few hours, she managed to repro the drone bug 3 times, each
+time adding more logging where the problem seemed to lie. After the last
+repro, it became clear that it was failing at the least expected line of
+code - the drone window simply started updating, then went to sleep for
+a bit, but never woke up again -  it seemed that tasklets were on
+occasion simply not returning from their sleep.
+
+The original bug was quite difficult to reproduce, but CCP karkur put
+together a script that generated 500,000 tasklets that simply sleep for
+some given time, with some tracking to identify tasklets that never
+finish. With this script, we\'ve been able to reproduce this sleeping
+disorder somewhat reliably. This script identified the tasklet that
+didn\'t wake up, and upon inspection it was clear that the tasklet was
+neither scheduled nor blocked - it was in some sort of limbo.
+
+My first attempts at reproducing the bug with CCP karkur\'s script were
+not successful - I was running in Jessica (our authoring/debugging tool)
+without the client and didn\'t seem to have any luck. Later I tried in
+the client with better luck, so it seemed there was more to it than
+simply having lots of tasklets. I started reading through the relevant
+C++ code to try to come up with theories.
+
+## Some background
+
+Tasklets (see [Stackless
+Python](//en.wikipedia.org/wiki/Stackless_Python) for more information)
+are run in PyScheduler::Run, by calling PyStackless_RunWatchdogEx. This
+method takes in a timeout value and runs any scheduled tasklets until
+the given time has passed. When a tasklet is created, it is scheduled
+and so will run when the PyScheduler::Run is called. When a tasklet
+sleeps, it calls Synchro::SleepWallclock, which is implemented by
+creating a channel and calling receive on the channel. This blocks the
+channel until somebody sends something on that channel. Synchro
+maintains a heap of sleepers - a sleeper is a simple object that holds
+the due time when the tasklet should wake up, and the channel.
+Synchro::Tick pulls sleepers from the top of the heap and sends a value
+on the channel. This in turn unblocks the tasklet and schedules it.
+
+My first idea was that there might be a bug in the heap code. It\'s our
+own code, it\'s old and there are no unit tests for it. I considered
+writing some tests for it, or even finding a suitable replacement, but
+then I realized the symptoms didn\'t match with the tasklet never being
+pulled from that heap. If that were the case, the tasklet would simply
+remain blocked forever. It\'s still on my to-do list to add tests for
+this code, though.
+
+My next idea came from looking at the documentation
+of [PyStackless_RunWatchdogEx](//stackless.readthedocs.io/en/latest/c-api/stackless.html#c.PyStackless_RunWatchdogEx).
+It can return a tasklet, that should either be killed or rescheduled.
+That turned out to be a dead end - this only applies when running in
+preemptive mode, where a tasklet can be interrupted.
+
+## Show me the code
+
+I had a hunch that killing tasklets might be a factor in this, but I
+couldn\'t see anything wrong with the code around that. Nevertheless, I
+couldn\'t convince myself that the reference counting of the channel was
+correct, so I decided to clean up the code a bit. It felt awkward how it
+was done.
+
+    PyObject* Synchro::SleepWallclock(int ms, const int64_t &due)
+    {
+        Sleeper sl;
+        sl.channel = PyChannel_New(NULL);
+        if (!sl.channel)
+            return 0;
+        PyChannel_SetPreference(sl.channel, 0); //just make runnable on wakeup
+        sl.due = due;
+
+        mWallclockSleepers.Insert(sl);
+
+        // Go to sleep and wake up! *(the sender releases the channel)
+        PyObject *ret = PyChannel_Receive(sl.channel);
+
+        if (!ret) {
+            //we were killed, so lets try and find us in the queue, to release resources.
+            RemoveSleeper( mWallclockSleepers, sl );
+        }
+        return ret;
+    }
+
+The SleepWallclock function creates the channel, stores it in the
+Sleeper object, puts the Sleeper object in the heap and calls receive on
+the channel. The receive call returns after Synchro::Tick has called
+send on the channel. That unblocks it, causing it to be scheduled. The
+tasklet could also be killed, in which case receive returns a nullptr.
+Let\'s take a look at a snippet from Synchro::Tick:
+
+    //gather sleepers for wakeup
+    std::vector sleepers;
+    while (mWallclockSleepers.size()) {
+        if (mWallclockSleepers.front().due > now)
+            break;
+        sleepers.push_back(mWallclockSleepers.Shift());
+    }
+    if (sleepers.size()) {
+        Be::Time nnow = BeOS->GetActualTime();
+        for(unsigned int i = 0; i < sleepers.size(); i++) {
+            Sleeper &s = sleepers[i];
+            if (PyChannel_GetBalance(s.channel)) {
+                int res = PyChannel_Send(s.channel, Py_None);
+                if (res)
+                    PyOS->PyError();
+            }
+            Py_DECREF(s.channel);
+        }
+    }
+
+This all looks correct - the channel could not pulled out from under the
+tasklet until after the Send call. What happens when a tasklet is
+killed?
+
+    void Synchro::RemoveSleeper( Heap &sleepers, Sleeper &sl )
+    {
+        SleeperIt it;
+        for( it = sleepers.begin(); it != sleepers.end(); ++it )
+        {
+            if( it->channel == sl.channel )
+            {
+                break;
+            }
+        }
+
+        if( it != sleepers.end() )
+        {
+            //Ok found us.  Let's delete us.
+            sleepers.Remove( it );
+            Py_DECREF( sl.channel );
+        }
+    }
+
+Again, it all looks alright - the tasklet is removed from the heap and
+the channel is released. Note that it is not an error if the tasklet
+can\'t be found on the heap - it could have woken up and been scheduled
+on the same tick as it is being killed, but in that case the channel
+will have been released in Tick.
+
+Let\'s examine this a bit further, though. Keep in mind that Py_DECREF
+frees the memory if the reference count goes to zero. The PyChannel_New
+call in SleepWallclock returns a PyChannelObject with a reference count
+of one. There are no references added, so the channel object is deleted
+in Tick when it calls Py_DECREF.  This should be fine, as there are no
+references to the channel in SleepWallclock after the receive call.
+Except\...
+
+In RemoveSleeper, which is called after a tasklet has been killed we\'re
+comparing channel objects. There should always be a one-to-one
+correspondence with tasklets and channels so we\'re effectively looking
+for a tasklet here, but since we needed to keep track of channels to
+wake them up, we just use the channels. I added a reference to the
+tasklet in the Sleeper object so that I could verify it here, and lo and
+behold, when running the scripts from CCP karkur I got a discrepancy - a
+tasklet was determined to be in the heap based on the channel, but the
+tasklet didn\'t match.
+
+## The Eureka moment
+
+When a channel object is deleted, its memory is now free and available
+for reuse. This implies that a tasklet that goes to sleep on the same
+tick as a tasklet is killed exactly when it wanted to wake up can get
+the same channel pointer as the killed tasklet. RemoveSleeper will in
+that case remove the wrong tasklet (the one that just called
+SleepWallclock) from the heap, kill it\'s channel, leaving it in a
+non-scheduled, non-blocked state.
+
+The fix is simple - move the Py_DECREF calls into SleepWallclock. This
+ensures that channel objects are not recycled prematurely, and in my
+opinion is actually cleaner, keeping the reference counting localized in
+one function.
+
+## Never assume
+
+EVE Online is almost 14 years old now and has seen many battles during
+its lifetime, and one can say the code base is thoroughly battle tested.
+However, that doesn\'t mean sneaky bugs might not be hiding there, but
+finding a bug in such a fundamental function was surprising, to say the
+least. I guess we can never assume that any part of our code base is
+absolutely 100% correct. CCP karkur and others have spent a considerable
+amount of time tracking this issue down so we had high confidence in the
+higher level code. This allowed me to go into this investigation on the
+assumption that Sleep was broken, being stubborn until I found this rare
+edge case.
+
+We have reason to believe that a few other bugs are symptoms of the same
+underlying issue - the overview not updating, for example, or the
+shield, armor and structure bars not updating. These bugs have always
+been nearly impossible to reproduce but nevertheless are reported
+occasionally, especially after mass tests or heavy fights on
+Tranquility.

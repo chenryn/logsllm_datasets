@@ -1,0 +1,307 @@
+## 起因
+想通过php扩展获取到页面返回的response
+## ob_start的源码实现
+先看看ob_start的实现  
+在`main/output.c`和`main/php_output.h`下
+    PHP_FUNCTION(ob_start)
+    {
+        zval *output_handler = NULL;
+        zend_long chunk_size = 0;
+        zend_long flags = PHP_OUTPUT_HANDLER_STDFLAGS;
+        if (zend_parse_parameters(ZEND_NUM_ARGS(), "|z/ll", &output_handler, &chunk_size, &flags) == FAILURE) {
+            return;
+        }
+        if (chunk_size level = zend_stack_push(&OG(handlers), &handler);
+        OG(active) = handler;
+        return SUCCESS;
+    }
+其中OG是一个叫`output_globals`的全局变量`ob_start()`后的缓冲区  
+经过调试,发现所有于输出有关的函数都会调用一个叫`php_output_op`的函数
+    static inline void php_output_op(int op, const char *str, size_t len)
+    {
+        php_output_context context;
+        ...
+        if (OG(active) && (obh_cnt = zend_stack_count(&OG(handlers)))) {
+            context.in.data = (char *) str;
+            context.in.used = len;
+            ...
+        } else {
+            context.out.data = (char *) str;
+            context.out.used = len;
+        }
+        ...
+    }
+通过判断`OG(active)`是否为NULL来决定进不进入缓存区  
+接着来看看字符串如何进入缓冲区
+    static inline int php_output_handler_append(php_output_handler *handler, const php_output_buffer *buf)
+    {
+        if (buf->used) {
+            OG(flags) |= PHP_OUTPUT_WRITTEN;
+            /* store it away */
+            //空间不够时会去申请
+            if ((handler->buffer.size - handler->buffer.used) used) {
+                size_t grow_int = PHP_OUTPUT_HANDLER_INITBUF_SIZE(handler->size);
+                size_t grow_buf = PHP_OUTPUT_HANDLER_INITBUF_SIZE(buf->used - (handler->buffer.size - handler->buffer.used));
+                size_t grow_max = MAX(grow_int, grow_buf);
+                handler->buffer.data = erealloc(handler->buffer.data, handler->buffer.size + grow_max);
+                handler->buffer.size += grow_max;
+            }
+            //将数据复制过去
+            memcpy(handler->buffer.data + handler->buffer.used, buf->data, buf->used);
+            handler->buffer.used += buf->used;
+            /* chunked buffering */
+            if (handler->size && (handler->buffer.used >= handler->size)) {
+                /* store away errors and/or any intermediate output */
+                return OG(running) ? 1 : 0;
+            }
+        }
+        return 1;
+    }
+## 编写插件
+### 思路
+可以和`output_globals.active->buffer`相似,创造一个全局的缓存区  
+在`MINIT`阶段初始化这个全局变量并hook各输出函数的`opcode`,写入缓冲区  
+在`RSHUTDOWN`阶段将全局变量的数据保存在文件内
+### 创建一个插件
+在php的源码下进入`ext`目录,输入  
+`./ext_skel --extname=myext`
+### 全局变量的定义与初始化
+编辑`php_hook_output_ext.h`  
+先来看一下`output_globals.active->buffer`的结构
+    typedef struct _php_output_buffer {
+        char *data;
+        size_t size;
+        size_t used;
+        uint free:1;
+        uint _reserved:31;
+    } php_output_buffer;
+在上文的`php_output_handler_append`函数中可看到只用了前3个  
+于是编写全局变量如下
+    ZEND_BEGIN_MODULE_GLOBALS(myext)
+        char *data; //缓存区
+        size_t size; //缓存区大小
+        size_t used; //数据长度
+    ZEND_END_MODULE_GLOBALS(myext)
+完成定义,在`hook_output_ext.c`下进行初始化与析构
+    static void php_myext_globals_ctor(zend_myext_globals *G TSRMLS_DC)
+    {
+        G->data = NULL;
+        G->size = 0;
+        G->used = 0;
+    }
+    static void php_myext_globals_dtor(zend_myext_globals *G TSRMLS_DC)
+    {
+        efree(G->data);
+    }
+并分别在`MINIT`阶段和`RSHUTDOWN`调用
+### hook opcode
+这里以`ZEND_ECHO`这条opcode为例  
+当php执行`echo xxxx;`时会调用这条opcode  
+关于如何hook具体可以参考  
+这里主要讲hook后数据的处理
+    static int get_data(char *str, size_t str_len)
+    {
+        if(str_len){
+            //size如果不够就申请更大的空间
+            if ((MYEXT_G(size) - MYEXT_G(used)) opline;
+        zval *z = EX_CONSTANT(opline->op1);
+        if (Z_TYPE_P(z) == IS_STRING) {
+            zend_string *str = Z_STR_P(z);
+            if (ZSTR_LEN(str) != 0) {
+                get_data(ZSTR_VAL(str), ZSTR_LEN(str));
+            }
+        } else {
+            zend_string *str = _zval_get_string_func(z);
+            if (ZSTR_LEN(str) != 0) {
+                get_data(ZSTR_VAL(str), ZSTR_LEN(str));
+            } 
+            zend_string_release(str);
+        }
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+可以看到`get_data`是直接根据`php_output_handler_append`改的  
+`hookecho`是根据`ZEND_ECHO`的一个hander编成的
+    static ZEND_OPCODE_HANDLER_RET ZEND_FASTCALL ZEND_ECHO_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+    {
+        USE_OPLINE
+        zval *z;
+        SAVE_OPLINE();
+        z = _get_zval_ptr_cv_undef(execute_data, opline->op1.var);
+        if (Z_TYPE_P(z) == IS_STRING) {
+            zend_string *str = Z_STR_P(z);
+            if (ZSTR_LEN(str) != 0) {
+                zend_write(ZSTR_VAL(str), ZSTR_LEN(str));
+            }
+        } else {
+            zend_string *str = _zval_get_string_func(z);
+            if (ZSTR_LEN(str) != 0) {
+                zend_write(ZSTR_VAL(str), ZSTR_LEN(str));
+            } else if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(z) == IS_UNDEF)) {
+                GET_OP1_UNDEF_CV(z, BP_VAR_R);
+            }
+            zend_string_release(str);
+        }
+        ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+    }
+### 文件的保存
+在`RSHUTDOWN`处保存,文件名可以根据时间\,如果是用apache或者nginx起的话,默认是要将文件放在web根目录里否则要更改相关配置
+## 代码(demo)
+    //php_myext.h
+    /*
+      +----------------------------------------------------------------------+
+      | PHP Version 7                                                        |
+      +----------------------------------------------------------------------+
+      | Copyright (c) 1997-2018 The PHP Group                                |
+      +----------------------------------------------------------------------+
+      | This source file is subject to version 3.01 of the PHP license,      |
+      | that is bundled with this package in the file LICENSE, and is        |
+      | available through the world-wide-web at the following url:           |
+      | http://www.php.net/license/3_01.txt                                  |
+      | If you did not receive a copy of the PHP license and are unable to   |
+      | obtain it through the world-wide-web, please send a note to          |
+      | PI:EMAIL so we can mail you a copy immediately.               |
+      +----------------------------------------------------------------------+
+      | Author:      lou00                                                   |
+      +----------------------------------------------------------------------+
+    */
+    /* $Id$ */
+    #ifndef PHP_MYEXT_H
+    #define PHP_MYEXT_H
+    extern zend_module_entry myext_module_entry;
+    #define phpext_myext_ptr &myext_module_entry
+    #define PHP_MYEXT_VERSION "0.1.0" /* Replace with version number for your extension */
+    #ifdef PHP_WIN32
+    #   define PHP_MYEXT_API __declspec(dllexport)
+    #elif defined(__GNUC__) && __GNUC__ >= 4
+    #   define PHP_MYEXT_API __attribute__ ((visibility("default")))
+    #else
+    #   define PHP_MYEXT_API
+    #endif
+    #ifdef ZTS
+    #include "TSRM.h"
+    #endif
+    /*
+        Declare any global variables you may need between the BEGIN
+        and END macros here:
+    ZEND_BEGIN_MODULE_GLOBALS(myext)
+        zend_long  global_value;
+        char *global_string;
+    ZEND_END_MODULE_GLOBALS(myext)
+    */
+    /* Always refer to the globals in your function as MYEXT_G(variable).
+       You are encouraged to rename these macros something shorter, see
+       examples in any other php module directory.
+    */
+    #if defined(ZTS) && defined(COMPILE_DL_MYEXT)
+    ZEND_TSRMLS_CACHE_EXTERN()
+    #endif
+    #endif  /* PHP_MYEXT_H */
+    /*
+     * Local variables:
+     * tab-width: 4
+     * c-basic-offset: 4
+     * End:
+     * vim600: noet sw=4 ts=4 fdm=marker
+     * vimdata = NULL;
+        G->size = 0;
+        G->used = 0;
+    }
+    static void php_myext_globals_dtor(zend_myext_globals *G TSRMLS_DC)
+    {
+        efree(G->data);
+    }
+    static int get_data(char *str, size_t str_len)
+    {
+        if(str_len){
+            //size如果不够就申请更大的空间
+            if ((MYEXT_G(size) - MYEXT_G(used)) opline;
+        zval *z = EX_CONSTANT(opline->op1);
+        if (Z_TYPE_P(z) == IS_STRING) {
+            zend_string *str = Z_STR_P(z);
+            if (ZSTR_LEN(str) != 0) {
+                get_data(ZSTR_VAL(str), ZSTR_LEN(str));
+            }
+        } else {
+            zend_string *str = _zval_get_string_func(z);
+            if (ZSTR_LEN(str) != 0) {
+                get_data(ZSTR_VAL(str), ZSTR_LEN(str));
+            } 
+            zend_string_release(str);
+        }
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    PHP_MINIT_FUNCTION(myext)
+    {
+    #ifdef ZTS
+        ts_allocate_id(&myext_globals_id,
+                            sizeof(zend_myext_globals),
+                            (ts_allocate_ctor)php_myext_globals_ctor,
+                            (ts_allocate_dtor)php_myext_globals_dtor);
+    #else
+        php_myext_globals_ctor(&myext_globals TSRMLS_CC);
+    #endif
+        zend_set_user_opcode_handler(ZEND_ECHO, hookecho);
+        return SUCCESS;
+    }
+    PHP_MSHUTDOWN_FUNCTION(myext)
+    {
+        /* uncomment this line if you have INI entries
+        UNREGISTER_INI_ENTRIES();
+        */
+        return SUCCESS;
+    }
+    PHP_RINIT_FUNCTION(myext)
+    {
+    #if defined(COMPILE_DL_MYEXT) && defined(ZTS)
+        ZEND_TSRMLS_CACHE_UPDATE();
+    #endif
+        //init_myext_global();
+        return SUCCESS;
+    }
+    PHP_RSHUTDOWN_FUNCTION(myext)
+    {
+        #ifndef ZTS
+            php_myext_globals_dtor(&myext_globals TSRMLS_CC);
+        #endif
+        FILE *fp;
+        fp = fopen("/web/php/log","a");
+        fwrite(MYEXT_G(data),MYEXT_G(used) , 1, fp );
+        fwrite("\n------------------\n",21 , 1, fp );
+        fclose(fp);
+        return SUCCESS;
+    }
+    PHP_MINFO_FUNCTION(myext)
+    {
+        php_info_print_table_start();
+        php_info_print_table_header(2, "myext support", "enabled");
+        php_info_print_table_end();
+        /* Remove comments if you have entries in php.ini
+        DISPLAY_INI_ENTRIES();
+        */
+    }
+    const zend_function_entry myext_functions[] = {
+        PHP_FE(confirm_myext_compiled,  NULL)       /* For testing, remove later. */
+        PHP_FE_END  /* Must be the last line in myext_functions[] */
+    };
+    zend_module_entry myext_module_entry = {
+        STANDARD_MODULE_HEADER,
+        "myext",
+        myext_functions,
+        PHP_MINIT(myext),
+        PHP_MSHUTDOWN(myext),
+        PHP_RINIT(myext),       /* Replace with NULL if there's nothing to do at request start */
+        PHP_RSHUTDOWN(myext),   /* Replace with NULL if there's nothing to do at request end */
+        PHP_MINFO(myext),
+        PHP_MYEXT_VERSION,
+        STANDARD_MODULE_PROPERTIES
+    };
+    #ifdef COMPILE_DL_MYEXT
+    #ifdef ZTS
+    ZEND_TSRMLS_CACHE_DEFINE()
+    #endif
+    ZEND_GET_MODULE(myext)
+    #endif
+## 结果
+访问前  
+不受ob_start的影响
+## 参考

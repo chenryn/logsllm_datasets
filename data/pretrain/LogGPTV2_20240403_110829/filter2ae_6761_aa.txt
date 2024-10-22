@@ -1,0 +1,199 @@
+## 一、前言
+lua是一种轻量级脚本语言，具有高可扩展性特点，搭配nginx可以实现对http请求包过滤的效果，本文通过分析一个开源lua-waf项目学习nginx从攻击检测到请求拦截的过程
+## 二、相关概念
+### 2.1 nginx
+#### 01 http请求生命周期
+nginx处理http请求的逻辑是先解析请求行、请求头，再处理http请求，最后将结果过滤返回给客户端
+#### 02 多阶段处理请求
+处理http请求分为11个阶段，每个阶段调用一个或多个模块共同工作
+名称 | 功能 | 相关模块 | 相关指令 | 注册函数  
+---|---|---|---|---  
+POST_READ | 接受完请求头后的第一个阶段，还未做处理可以获取到原始请求数据，如：读取`X-Real-IP`字段获得客户端ip |
+ngx_http_realip_module | set_real_ip_from、real_ip_header、real_ip_recursive | √  
+SERVER_REWRITE | 处理`server`块内`location`块外的重写命令 | ngx_http_rewrite_module |
+break、if、return、rewrite、set | √  
+FIND_CONFIG | 根据`rewrite`后的`uri`来匹配对应`location` | ngx_http_core_module |
+location | /  
+REWRITE | 处理`location`块内的重写命令 | ngx_http_rewrite_module |
+break、if、return、rewrite、set | √  
+POST_REWRITE | 检查上一阶段是否存在重写操作，存在则跳转至`FIND_CONFIG`阶段重新走流程 | / | / | /  
+PREACCESS | 限制客户端访问频率和访问数量 | http_limit_req_module、http_limit_conn_module |
+limit_req、limit_req_zone、limit_req_status、limit_conn、limit_conn_zone、limit_conn_status
+| √  
+ACCESS | 限制客户端访问，如：通过ip白名单、密码认证后才能访问 |
+ngx_http_access_module、ngx_http_auth_basic_module、ngx_http_auth_request_module
+| allow、deny、auth_basic、auth_basic_user_file、auth_request、auth_request_set | √  
+POST_ACCESS | 配合`access`阶段实现`satisfy`命令 | / | / | /  
+PRECONTENT | 生成结果前的预处理阶段，主要处理`try_files`和`mirror`两个模块的命令 |
+http_try_files_module、ngx_http_mirror_module | try_files、mirror | /  
+CONTENT | 整理处理结果，生成原始http响应数据 |
+ngx_http_concat_module、ngx_http_random_index_module、ngx_http_index_module、ngx_http_autoindex_module、ngx_http_static_module
+| root、alias、index、autoindex、concat | √  
+LOG | 根据配置文件，生成日志 | ngx_http_log_module | log_format、access_log、error_log | √  
+#### 03 filter输出过滤
+`CONTENT`阶段生成的数据存放在缓存中，经过filter处理后再发送给客户端，默认编译模块如下：
+名称 | 功能 | 相关指令  
+---|---|---  
+ngx_http_slice_filter_module | 用于nginx本地切片缓存待发送给客户端的大文件 | slice  
+ngx_http_not_modified_filter_module | 处理`If-Modified-Since`，判断客户端缓存文件时间与服务器本地文件最后修改时间是否相同，如果存在差异则返回最新文件内容，相同则返回304状态码 |
+if_modified_since  
+ngx_http_range_body_filter_module | 处理`Range`，根据客户端请求返回指定数据 | Range  
+ngx_http_copy_filter_module | 处理HTTP请求体，根据需求重新复制输出链表中的某些节点 | /  
+ngx_http_headers_filter_module | 处理http头部数据，如：添加任意名称请求头、响应头 |
+add_header、expires  
+ngx_http_userid_filter_module | 设置cookie |
+userid、userid_name、userid_domain、userid_path、userid_expires  
+ngx_http_gunzip_filter_module | 当客户端不支持gzip时，由nginx解压数据后再发送给客户端 |
+gunzip、gunzip_buffers  
+ngx_http_addition_filter_module | 在响应之前或者之后追加文本内容，如：在网站底部追加一个js或css |
+add_before_body、add_after_body、addition_types  
+ngx_http_sub_filter_module | 支持字符串替换 |
+sub_filter、sub_filter_once、sub_filter_types、sub_filter_last_modified  
+ngx_http_charset_filter_module | 配置响应头`Content-Type` |
+charset、charset_map、charset_types、override_charset、source_charset  
+ngx_http_ssi_filter_module | 支持ssi服务端嵌入功能 |
+ssi、ssi_last_modified、ssi_min_file_chunk、ssi_silent_errors、ssi_types、ssi_value_length  
+ngx_http_postpone_filter_module | 负责处理子请求和主请求数据的输出顺序 | /  
+ngx_http_gzip_filter_module | 支持gzip压缩 |
+gzip、gzip_min_length、gzip_proxied、gzip_types  
+ngx_http_range_header_filter_module | 处理range头 | /  
+ngx_http_v2_filter_module | 支持http2协议 |
+http2_body_preread_size、http2_chunk_size、http2_idle_timeout、http2_max_concurrent_pushes、http2_max_concurrent_streams、http2_max_field_size、http2_max_header_size、http2_max_requests、http2_push、http2_push_preload、http2_recv_buffer_size、http2_recv_timeout  
+ngx_http_chunked_filter_module | 支持chunked | /  
+ngx_http_header_filter_module | 拼接响应头 | /  
+ngx_http_write_filter_module | 发送http响应 | /  
+### 2.2 lua_nginx_module
+原生nginx不支持lua代码，需要手动添加三方模块`Lua-Nginx-Module`，该模块提供了指令和api支持，使得lua代码可以在nginx不同阶段执行，常见的指令和api如下：
+**指令：**
+指令 | 阶段 | 范围 | 功能  
+---|---|---|---  
+init_by_lua* | loading-config | http | nginx读取配置时执行，导入lua配置  
+set_by_lua* | rewrite | server、server if、location、location if | 设置lua变量  
+rewrite_by_lua* | rewrite tail | http、server、location、location if | 跳转、重定向相关  
+access_by_lua* | access tail | http、server、location、location if | 访问控制相关  
+content_by_lua* | content | location、location if | 内容生成阶段相关  
+header_filter_by_lua* | output-header-filter | http、server、location、location
+if | 修改http响应头数据  
+body_filter_by_lua* | output-body-filter | http、server、location、location if |
+修改http响应体数据  
+log_by_lua* | log | http、server、location、location if | 日志相关  
+**API：**
+API | 范围 | 功能  
+---|---|---  
+ngx.req.raw_header |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua |
+获取原始的http请求头  
+ngx.req.get_method |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、balancer_by_lua
+| 获取http请求方法，如：GET、POST  
+ngx.req.get_uri_args |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、body_filter_by_lua、log_by_lua、balancer_by_lua
+| 获取uri中全部的args，默认最大值100  
+ngx.req.get_body_data | rewrite_by_lua、access_by_lua、content_by_lua、log_by_lua
+| 从内存中获取http请求体  
+ngx.config.nginx_version |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、body_filter_by_lua、log_by_lua、init_by_lua、init_worker_by_lua
+| 获取nginx版本  
+ngx.var.xxxx |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、body_filter_by_lua、log_by_lua
+| 调用nginx变量  
+ngx.status |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、body_filter_by_lua、log_by_lua
+| 获取http响应状态码  
+ngx.md5 |
+set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、body_filter_by_lua、log_by_lua、balancer_by_lua、ssl_certificate_by_lua、ssl_session_fetch_by_lua、ssl_session_store_by_lua
+| 计算数据的md5哈希值  
+ngx.log |
+init_worker_by_lua、set_by_lua、rewrite_by_lua、access_by_lua、content_by_lua、header_filter_by_lua、body_filter_by_lua、log_by_lua、balancer_by_lua
+| 日志操作  
+## 三、环境搭建
+在nginx的环境下`--add-module`添加lua模块，同时导入[ngx_lua_waf](https://github.com/loveshell/ngx_lua_waf)项目
+  * centos 7.9
+  * nginx 1.20.1
+  * luajit 2.0.5
+  * lua-nginx-module 0.10.9
+  * ngx_devel_kit 0.3.0
+  * ngx_lua_waf 0.7.2
+### 3.1 添加lua模块
+#### 01 准备lua环境
+    # 下载并编译
+    wget http://luajit.org/download/LuaJIT-2.0.5.tar.gz 
+    tar -zxvf LuaJIT-2.0.5.tar.gz
+    cd LuaJIT-2.0.5
+    make install PREFIX=/usr/local/luajit
+    # 设置环境变量
+    vi /etc/profile
+    export LUAJIT_LIB=/usr/local/luajit/lib
+    export LUAJIT_INC=/usr/local/luajit/include/luajit-2.0
+    source /etc/profile
+    echo "/usr/local/luajit/lib" >> /etc/ld.so.conf
+    ldconfig
+#### 02 准备ndk模块
+    wget https://github.com/simpl/ngx_devel_kit/archive/v0.3.0.tar.gz
+    tar -zxvf v0.3.0.tar.gz
+#### 03 准备lnm模块
+    wget https://github.com/openresty/lua-nginx-module/archive/v0.10.9rc7.tar.gz
+    tar -zxvf v0.10.9rc7.tar.gz
+#### 04 添加lua模块
+    # 准备nginx安装包
+    wget http://nginx.org/download/nginx-1.20.1.tar.gz
+    tar -zxvf nginx-1.20.1.tar.gz
+    cd nginx-1.20.1
+    # 查看原始编译，在末尾处添加ndk、lnm文件路径
+    # --add-module=/waf/ngx_devel_kit-0.3.0
+    # --add-module=/waf/lua-nginx-module-0.10.9rc7
+    nginx -V
+    ./configure --prefix=/usr/share/nginx --sbin-path=/usr/sbin/nginx --modules-path=/usr/lib64/nginx/modules --conf-path=/etc/nginx/nginx.conf --error-log-path=/var/log/nginx/error.log --http-log-path=/var/log/nginx/access.log --http-client-body-temp-path=/var/lib/nginx/tmp/client_body --http-proxy-temp-path=/var/lib/nginx/tmp/proxy --http-fastcgi-temp-path=/var/lib/nginx/tmp/fastcgi --http-uwsgi-temp-path=/var/lib/nginx/tmp/uwsgi --http-scgi-temp-path=/var/lib/nginx/tmp/scgi --pid-path=/run/nginx.pid --lock-path=/run/lock/subsys/nginx --user=nginx --group=nginx --with-compat --with-debug --with-file-aio --with-google_perftools_module --with-http_addition_module --with-http_auth_request_module --with-http_dav_module --with-http_degradation_module --with-http_flv_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_image_filter_module=dynamic --with-http_mp4_module --with-http_perl_module=dynamic --with-http_random_index_module --with-http_realip_module --with-http_secure_link_module --with-http_slice_module --with-http_ssl_module --with-http_stub_status_module --with-http_sub_module --with-http_v2_module --with-http_xslt_module=dynamic --with-mail=dynamic --with-mail_ssl_module --with-pcre --with-pcre-jit --with-stream=dynamic --with-stream_ssl_module --with-stream_ssl_preread_module --with-threads --with-cc-opt='-O2 -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fexceptions -fstack-protector-strong --param=ssp-buffer-size=4 -grecord-gcc-switches -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -m64 -mtune=generic' --with-ld-opt='-Wl,-z,relro -specs=/usr/lib/rpm/redhat/redhat-hardened-ld -Wl,-E' --add-module=/waf/ngx_devel_kit-0.3.0  --add-module=/waf/lua-nginx-module-0.10.9rc7
+    systemctl stop nginx
+    # configure无法通过，补环境
+    error: SSL modules require the OpenSSL library
+        yum -y install openssl openssl-devel
+    error: the HTTP XSLT module requires the libxml2/libxslt libraries.
+        yum -y install libxslt-devel
+    error: the HTTP image filter module requires the GD library
+        yum -y install gd gd-devel
+    error: the Google perftools module requires the Google perftools library
+        yum -y install gperftools
+    # 编译
+    make
+    cd ./objs
+    # 备份原文件，拷贝新文件
+    which nginx
+    mv /usr/sbin/nginx /usr/sbin/nginx.old
+    cp nginx /usr/sbin/nginx
+    systemctl restart nginx
+#### 05 访问测试
+    # 测试使用content_by_lua响应http请求
+    vi /etc/nginx/nginx.conf
+    server {
+        listen       80;
+        listen       [::]:80;
+        server_name  _;
+        root         /usr/share/nginx/html;
+        location /lua {
+            default_type 'text/html';
+            content_by_lua 'ngx.say("hello lua")';
+        }
+    nginx -s reload
+    curl 127.0.0.1/lua
+### 3.2 加载lua-waf
+    # 下载文件
+    wget https://github.com/loveshell/ngx_lua_waf/archive/refs/tags/v0.7.2.tar.gz
+    tar -zxvf v0.7.2.tar.gz
+    cp -r ngx_lua_waf-0.7.2 /etc/nginx/conf.d/waf/
+    # 修改配置文件路径
+    vi /etc/nginx/conf.d/waf/config.lua
+    RulePath = "/etc/nginx/conf.d/waf/wafconf/" 
+    attacklog = "on"
+    logdir = "/var/log/nginx/attacklog/"
+    # 写入nginx
+    vi /etc/nginx/nginx.conf
+    http {
+        ...
+        # lua_waf
+        lua_package_path "/etc/nginx/conf.d/waf/?.lua";
+        lua_shared_dict limit 10m;
+        init_by_lua_file /etc/nginx/conf.d/waf/init.lua;
+        access_by_lua_file /etc/nginx/conf.d/waf/waf.lua;
+    }
+    nginx -s reload

@@ -1,0 +1,54 @@
+           NtMakeTemporaryObject(handle);
+           NtClose(handle);
+       }
+       if (enable_impersonation) { ④
+           CsrRevertToSelf();
+       }
+       // Create the symbolic link.
+       UNICODE_STRING target_name_ustr;
+       RtlInitUnicodeString(&target_name_ustr, lpTargetPath);
+       status = NtCreateSymbolicLinkObject(&handle, MAXIMUM_ALLOWED,
+                                   objattr, target_name_ustr); ⑤
+       if (enable_impersonation) { ⑥
+           CsrRevertToSelf();
+       }
+       if (NT_SUCCESS(status)) {
+           status = NtMakePermanentObject(handle); ⑦
+           NtClose(handle);
+       }
+       return status;
+    }
+如上所示，代码所做的第一件事就是构建设备名路径，然后尝试打开符号链接对象以便执行DELETE操作①。这是因为API支持重新定义现有的符号链接，因此，必须首先尝试删除原来的链接。如果我们使用相应链接并不位于其中的默认路径的话，将看到代码会将身份切换为调用者（在这种情况下为低权限用户）④，然后创建符号链接对象⑤，重新切换回原来的身份⑥，并在返回操作状态之前实现对象的永久化⑦。现在终于明白我们为什么可以创建任意符号链接了吧，因为所有代码都是在传递的设备名称前加上了“\??”。由于代码在执行所有重要操作时，都会将身份切换为调用者，因此，我们只能在用户具有写权限的位置创建链接。
+更值得关注的是中间的条件，即是否为DELETE操作打开了目标符号链接，这是调用NtMakeTemporaryObject所必需的。打开的句柄将传递给另一个函数②，即IsGlobalSymbolicLink，并根据该函数的结果设置禁用身份切换的标志，并使用全局DOS设备位置\GLOBAL??作为前缀来重建设备名称③。那么，IsGlobalSymbolicLink到底是做什么的呢？别急，先来看看下列代码。
+    void IsGlobalSymbolicLink(HANDLE handle, BOOLEAN* is_global) {
+       BYTE buffer[0x1000];
+       NtQueryObject(handle, ObjectNameInformation, buffer, sizeof(buffer));
+       UNICODE_STRING prefix;
+       RtlInitUnicodeString(&prefix, L"\\GLOBAL??\\");
+       // Check if object name starts with \GLOBAL??
+       *is_global = RtlPrefixUnicodeString(&prefix, (PUNICODE_STRING)buffer);
+    }
+上述代码首先会检查打开的对象的名称是否以\GLOBAL??\开头。如果是的话，就将is_global标志设为TRUE。这样的话，就会导致启用身份切换的标志被清空，同时，设备名称也将被重写。这就意味着，如果调用者具有对全局DOS设备目录内的符号链接的DELETE访问权限的话，则会在不进行身份切换的情况下重新创建符号链接，也就是说，将以SYSTEM用户身份来创建该链接。这本身并没有值得特别关注的地方，因为默认情况下，只有administrator用户才有权打开执行DELETE操作的全局符号链接。但是，如果我们可以在全局DOS设备目录下创建一个可由低权限用户写入的子目录的话，情况又会如何呢？可以打开该目录中的任何符号链接来执行DELETE操作，因为低权限用户可以随意指定访问权限，该代码可以将链接标记为全局链接，即使实际情况并非如此，同时，还能够禁用身份切换，并以SYSTEM
+身份来重建链接。您猜怎么着，我们获得了一个允许我们在全局DOS设备目录下创建任意对象目录的漏洞。
+同样，除非用于重写路径，否则，这个漏洞没有太大的利用价值。我们可以活用路径“\??\ABC”不同于“\GLOBAL??\ABC”这一事实，设法以SYSTEM身份在对象管理器命名空间中创建任意符号链接。但是，这对我们有什么帮助呢？如果您编写了一个指向KnownDlls的符号链接，那么，当DLL加载程序打开一个请求的节区时，内核将会使用该链接。因此，即使我们无法在KnownDlls中直接创建新的节区对象，我们仍然可以创建一个符号链接，让该链接指向该目录之外的低权限用户可以创建节区对象的位置。这样，我们就可以利用这种劫持方法，将任意DLL加载到特权进程内的内存空间中，从而达到提权的目的。
+综上所述，我们可以通过下列步骤来利用该漏洞：
+  1. 使用该漏洞创建目录“\GLOBAL??\KnownDlls”
+  2. 使用要劫持的DLL的名称（如TAPI32.DLL）在新目录中创建一个符号链接。注意，该链接的目标并不重要。
+  3. 在用户的DOS设备目录中创建一个名为“GLOBALROOT”的新符号链接，让其指向“\GLOBAL??”。当调用者通过用户的DOS设备目录访问它时，就会覆盖真正的GLOBALROOT符号链接对象。
+  4. 调用DefineDosDevice，指定一个设备名称“GLOBALROOT\KnownDlls\TAPI32.DLL”，同事，将一个用户可以在其中创建节区对象的位置作为目标路径。这将导致以下操作：
+  5. CSRSS打开符号链接“\??\GLOBALROOT\KnownDlls\TAPI32.DLL”，进而导致打开“\GLOBAL??\KnownDlls\TAPI32.DLL”。由于它是处于该用户的控制之下，因此打开成功，并且，该链接将被视为全局链接，其禁用身份切换。
+  6. CSRSS将路径重写为“\GLOBAL??\GLOBALROOT\KnownDlls\TAPI32.DLL”，然后在不进行身份切换的情况下调用NtCreateSymbolicLinkObject。这样的话，会使用真正的GLOBALROOT链接，从而会创建具有任意目标路径的符号链接“\KnownDlls\TAPI32.DLL”。
+  7. 在任意DLL的目标位置创建映像节区对象，然后强制将其加载到一个特权服务(如Diagnostics Hub)中，方法是让该服务使用一个指向TAPI32.DLL的路径调用LoadLibrary。
+  8. 实现提权。
+实际上，针对DefineDosDevice API的滥用还有另一种用途，那就是绕过Protected Process
+Light（PPL）保护。PPL进程仍然在使用KnownDlls，因此，如果您可以向该目录中添加内容的话，就可以将代码注入该受保护进程中。为了防御这种攻击，Windows使用进程信任标签来标记KnownDlls目录，该进程信任标签将阻止除最高级别PPL进程以外的所有进程对其进行写入，如下所示。
+那么，我们的漏洞利用的是如何得逞的呢？
+实际上，CSRSS是作为最高级别的PPL运行的，因此它具有KnownDlls目录的写权限。一旦身份切换被废除，该进程的身份就会一直被沿用，也就是说，一直拥有全部的访问权限。
+如果你想测试这个漏洞利用的话，可以从[这里](https://bugs.chromium.org/p/project-zero/issues/detail?id=1550#c5 "这里")下载新的PoC代码。
+**结束语**
+* * *
+您可能想知道我是否MSRC报告了DefineDosDevice的这种行为？我没有，主要是因为它本身并不是一个漏洞。即使能够从Administrator权限提升到PPL权限，MSRC也不会认为是一个值得兴师动众的事情（具体参见[这里](https://bugs.chromium.org/p/project-zero/issues/detail?id=1336
+"这里")）。当然，Windows开发人员可能会选择在将来修改该行为，如果它不会导致兼容性的重大倒退的话。这个功能自早期版本的Windows开始就已存在，至少可以追溯到Windows
+XP，因此，可能有些东西会依赖于它。我希望通过详细描述这个漏洞，给MS提供尽可能多的信息，以帮他们在将来克服这种漏洞利用技术。
+我确实向MSRC报告了这个漏洞，并且，该漏洞已经在2018年6月的补丁中得到修复。那么，Microsoft是如何修复该漏洞的呢？开发人员添加了一个新的API，CreateAppContainerTokenForUser，它在创建新的AppContainer令牌期间，会进行相应的身份切换。通过在令牌创建期间进行身份切换，代码可确保仅使用用户的权限来创建所有对象。由于它是一个新的API，必须修改现有代码才能使用它，因此，您仍有机会在易受攻击的模式中找到使用旧CreateAppContainerToken的代码。
+无论利用哪种平台上的漏洞，有时都需要深入了解不同组件的交互方式。在这个例子中，虽然最初的漏洞显然是一个安全问题，但尚不清楚如何进行充分利用。在逆向工程中遇到的有趣行为总是值得记录下来的，因为即使某些东西本身不是安全漏洞，但在利用另一个漏洞时，却可能帮上大忙。

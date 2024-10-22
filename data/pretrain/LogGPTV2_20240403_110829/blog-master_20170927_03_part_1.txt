@@ -1,0 +1,191 @@
+## PostgreSQL 在铁老大订单系统中的schemaless设计和性能压测  
+### 作者      
+digoal      
+### 日期       
+2017-09-27       
+### 标签      
+PostgreSQL , UDF , schemaless , 自动建表 , 自动分区 , 订单查询 , 用户订单查询 , 席别订单查询     
+----       
+## 背景      
+注意，schemaless一词来自mongodb的json，不需要设计表结构（这个PostgreSQL也支持, https://www.theguardian.com/info/2018/nov/30/bye-bye-mongo-hello-postgres ）。本文说的schemaless是不需要事先定义表（自动建表），这个也是类似Mongo的特性。   
+数据的流动孕育数据生态，在很多大型系统中，业务系统之间的数据流动是很常见的事情。  
+例如铁大哥的订单数据的流动，可能带动很多围绕订单的业务需求。比如说订单查询：  
+1、按用户查询，返回用户30天内的所有订单。  
+2、按坐席和乘车日期查询，返回这个坐席的售出记录，看看有没有退票、有没有中途票可以加塞等。  
+以预售30天为例，  
+假设有20000趟车，20节车厢，200个座位，平均每个座位卖10张票（算上中途票）。 每天的订单约8000万笔。  
+30天约24亿订单记录数据量。  
+用PostgreSQL来满足这类场景，如何设计呢？性能又如何呢？我们关注三个性能指标：  
+1、生成订单速度  
+2、按用户查询，返回用户的所有订单，平均返回2.4条。(30天，24亿记录，假设有10亿用户，平均每个用户2.4笔订单)  
+3、按坐席和乘车日期查询，平均返回10条记录。（每个座位平均每天卖出10张票）  
+PS：春运数据，2016年春运20天运送旅客3.26亿人次。实际上本例的PostgreSQL设计在这个业务中已经完全满足全年的最高峰需求。    
+https://baike.baidu.com/item/%E6%98%A5%E8%BF%90  
+![pic](20170927_03_pic_001.jpg)   
+![pic](20170927_03_pic_002.jpg)  
+## schemaless设计  
+这个场景是典型的读多写少的业务。写体现在下单、修改订单。读体现在查询。  
+几个需要关注的点：  
+1、订单数据保留30天。使用时间分区，清数据最方便。同时满足时间维度的查询性能要求。  
+2、高速写入，高速读取。  
+3、按用户查询，按坐席和乘车日期查询。按坐席和乘车日期查询，不需要特别设计，按时间分区即可。按用户查询要达到最好的性能，我们可以来一份冗余数据，按用户哈希。  
+采用schemaless的设计，解决自动建分区表，自动读写分区表的问题。  
+### 设计表结构  
+1、建表1，按get_on上车时间分区。  
+```  
+-- 序列，假设为订单号  
+create sequence seq cache 1000;  
+create table train_order (  
+  id int8,         -- 订单号  
+  train_id int,    -- 车次  
+  box_id int2,     -- 车厢  
+  site_id int2,    -- 座位号  
+  station_1 int2,  -- 上车站  
+  station_2 int2,  -- 下车站  
+  get_on date,     -- 乘车日期  
+  uid int8,        -- 用户ID  
+  pay_stat int2 default 1,   -- 付款状态  
+  charge float8,             -- 金额  
+  weight int2 default 0,     -- 排队号  
+  window_id int2 default 1,  -- 购买渠道  
+  crt_time timestamp default now(),  -- 订单创建时间  
+  mod_time timestamp                 -- 订单修改时间  
+);  
+-- 索引，提高按坐席查询的效率  
+create index idx_train_order_1 on train_order (train_id, box_id, site_id);  
+```  
+冗余一份数据，按用户哈希分区，提高按用户查询的效率。  
+2、建表2，按uid用户ID哈希分区。  
+```  
+create table train_order_u (  
+  id int8,         -- 订单号  
+  train_id int,    -- 车次  
+  box_id int2,     -- 车厢  
+  site_id int2,    -- 座位号  
+  station_1 int2,  -- 上车站  
+  station_2 int2,  -- 下车站  
+  get_on date,     -- 乘车日期  
+  uid int8,        -- 用户ID  
+  pay_stat int2 ,   -- 付款状态  
+  charge float8,    -- 金额  
+  weight int2 ,     -- 排队号  
+  window_id int2 ,  -- 购买渠道  
+  crt_time timestamp ,  -- 订单创建时间  
+  mod_time timestamp    -- 订单修改时间  
+) ;  
+-- 索引，提高按用户查询的效率  
+create index idx_train_order_u on train_order_u (uid);  
+```  
+3、预先建分区表，按用户哈希。   
+```  
+do language plpgsql $$  
+declare  
+begin  
+  for i in 0..31   
+  loop  
+    execute 'create table train_order_u'||i||' (like train_order_u including all , check (mod(uid,32)='||i||')) inherits (train_order_u)';   
+  end loop;  
+end;  
+$$;  
+```  
+4、创建订单函数  
+```  
+create or replace function create_order (  
+  v_id int8,         -- 订单号  
+  v_train_id int,    -- 车次  
+  v_box_id int2,     -- 车厢  
+  v_site_id int2,    -- 座位号  
+  v_station_1 int2,  -- 上车站  
+  v_station_2 int2,  -- 下车站  
+  v_get_on date,     -- 乘车日期  
+  v_uid int8,        -- 用户ID  
+  v_pay_stat int2,   -- 付款状态  
+  v_charge float8,   -- 金额  
+  v_weight int2,     -- 排队号  
+  v_window_id int2,  -- 购买渠道  
+  v_crt_time timestamp  
+) returns void as $$  
+declare  
+  sql1 text := '';  
+  sql2 text := '';  
+  tbl1 name := 'train_order_'||to_char(v_get_on,'yyyymmdd');  -- 自动写入分区表  
+  tbl2 name := 'train_order_u'||mod(v_uid,32);  
+begin  
+  -- 数据冗余，一条订单数据，同时写入用户分区表，以及日期分区表。  
+  sql1 := format (  
+            'insert into %I (id, train_id, box_id, site_id, station_1, station_2, get_on, uid, pay_stat, charge, weight, window_id, crt_time) values   
+            (%L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L)' ,   
+            tbl1, v_id, v_train_id, v_box_id, v_site_id, v_station_1, v_station_2, v_get_on, v_uid, v_pay_stat, v_charge, v_weight, v_window_id, v_crt_time  
+          );  
+  sql2 := format (  
+            'insert into %I (id, train_id, box_id, site_id, station_1, station_2, get_on, uid, pay_stat, charge, weight, window_id, crt_time) values   
+            (%L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L)' ,   
+            tbl2, v_id, v_train_id, v_box_id, v_site_id, v_station_1, v_station_2, v_get_on, v_uid, v_pay_stat, v_charge, v_weight, v_window_id, v_crt_time  
+          );  
+  execute sql1;  
+  execute sql2;  
+  exception when SQLSTATE '42P01' then  
+    execute format('create table %I (like train_order including all) inherits(train_order)', tbl1);  -- 自动建表  
+    execute sql1;  
+    execute sql2;  
+end;  
+$$ language plpgsql strict ;  
+```  
+5、修改订单函数  
+略，同上写法。  
+6、按用户查询，返回用户的所有订单，平均返回2.4条。  
+```  
+create or replace function get_user_order(v_uid int8) returns setof train_order_u as $$  
+declare  
+  tbl name := 'train_order_u'||mod(v_uid,32);  
+begin  
+  return query execute format('select * from %I where uid=%L', tbl, v_uid);  
+end;  
+$$ language plpgsql strict;  
+```  
+```  
+postgres=# select (get_user_order(100000000)).*;  
+     id     | train_id | box_id | site_id | station_1 | station_2 |   get_on   |    uid    | pay_stat |      charge      | weight | window_id |          crt_time          | mod_time   
+------------+----------+--------+---------+-----------+-----------+------------+-----------+----------+------------------+--------+-----------+----------------------------+----------  
+ 1557799015 |      125 |      4 |     189 |        79 |        16 | 2017-10-21 | 100000000 |        1 | 1197.33886221517 |      1 |         1 | 2017-09-27 18:14:19.076026 |   
+  811630684 |      997 |     18 |     179 |        41 |        12 | 2017-10-14 | 100000000 |        1 | 453.880406067241 |      1 |         1 | 2017-09-27 15:48:09.125487 |   
+  597179567 |      536 |      3 |     177 |         7 |         7 | 2017-10-07 | 100000000 |        1 | 7182.26095053926 |      1 |         1 | 2017-09-27 15:15:02.786637 |   
+(3 rows)  
+Time: 0.367 ms  
+```  
+7、按坐席和乘车日期查询，平均返回10条记录。  
+```  
+create or replace function get_site_order(v_get_on date, v_train_id int, v_box_id int2, v_site_id int2) returns setof train_order as $$  
+declare  
+  tbl name := 'train_order_'||to_char(v_get_on,'yyyymmdd');  
+begin  
+  return query execute format('select * from %I where train_id=%L and box_id=%L and site_id=%L', tbl, v_train_id, v_box_id, v_site_id);  
+end;  
+$$ language plpgsql strict;  
+```  
+```  
+postgres=# select (get_site_order('2017-10-09', 1999, 3::int2, 1::int2)).* ;  
+     id     | train_id | box_id | site_id | station_1 | station_2 |   get_on   |    uid    | pay_stat |      charge      | weight | window_id |          crt_time          | mod_time 
+------------+----------+--------+---------+-----------+-----------+------------+-----------+----------+------------------+--------+-----------+----------------------------+----------
+ 2300300781 |     1999 |      3 |       1 |        68 |        14 | 2017-10-09 | 419271707 |        1 |  7061.5369010889 |      1 |         1 | 2017-09-27 20:54:56.710393 | 
+ 2234878940 |     1999 |      3 |       1 |        85 |        45 | 2017-10-09 | 885259649 |        1 |  5214.0475622518 |      1 |         1 | 2017-09-27 20:41:22.906565 | 
+ 2107427991 |     1999 |      3 |       1 |        35 |        98 | 2017-10-09 | 985856266 |        1 | 8642.02400384098 |      1 |         1 | 2017-09-27 20:12:33.85781  | 
+ 1794488978 |     1999 |      3 |       1 |        94 |        20 | 2017-10-09 | 351055777 |        1 | 1718.21027540183 |      1 |         1 | 2017-09-27 19:06:43.643281 | 
+ 1374974043 |     1999 |      3 |       1 |        16 |        26 | 2017-10-09 | 923638283 |        1 | 4711.63916029176 |      1 |         1 | 2017-09-27 17:33:47.147368 | 
+ 1351805341 |     1999 |      3 |       1 |        85 |        74 | 2017-10-09 | 212355965 |        1 | 4541.93220470985 |      1 |         1 | 2017-09-27 17:28:20.974681 | 
+ 1182159676 |     1999 |      3 |       1 |        15 |        31 | 2017-10-09 | 567906740 |        1 | 8566.17715372145 |      1 |         1 | 2017-09-27 16:54:26.478221 | 
+   35506838 |     1999 |      3 |       1 |         1 |        47 | 2017-10-09 | 884099213 |        1 | 983.503066563047 |      1 |         1 | 2017-09-27 13:55:21.280078 | 
+(8 rows)
+Time: 0.391 ms  
+```  
+8、调度清理数据，由于数据只需要保留30天，所以自动清理。  
+8\.1 用户哈希表数据清理（清理7天以前的数据）  
+```  
+delete from train_order_u where get_on < current_date - 7;  
+vacuum train_order_u;  
+```  
+8\.2 时间分区订单表，清理7天前的分区。  
+```  
+drop table train_order_20170920;  
+.....  
+```  

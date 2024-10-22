@@ -1,0 +1,129 @@
+# 剖析脏牛4_madvise()与漏洞成因
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 测试程序
+    int fd;
+    struct stat st;
+    void *mem;
+    void processMem(void)
+    {
+        int f = open("/proc/self/mem", O_RDWR);
+        lseek(f, mem, SEEK_SET);
+        write(f, "BBB", 3);
+        printf("%s\n", (char*)mem);
+        madvise(mem ,100 ,MADV_DONTNEED);
+    }
+    int main(void)
+    {
+        fd = open("./test", O_RDONLY);
+        fstat(fd, &st);
+        mem = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        processMem();
+    }
+## sys_madvise()
+  * sys_madvise()首先进行简单的参数处理
+  * 如果需要的话获取mmap_sem信号量, 然后遍历[start, start+len)内所有的VMA, 对于每个VMA调用madvise_vma()进行处理. 这里我们只关注behavior = MADV_DONTNEED
+## madvise_vma()
+  * madvice_vma()根据behavior把请求分配到对应处理函数, 对于MADV_DONTNEED会调用madvise_dontneed()处理
+## madvise_dontneed()
+  * 排除掉一些无法丢弃的情况后, 会调用zap_page_range()处理
+## zap_page_range()
+  * zap_page_range()会遍历给定范围内所有的VMA, 对每一个VMA调用unmap_single_vma(…)
+  * 后续会沿着unmap_single_vma() => unmap_page_range() => zap_pud_range() => zap_pmd_range() => zap_pte_range()的路径遍历各级页表项, 最后调用zap_pte_range()遍历每一个PTE
+## zap_pte_range()
+  * zap_pte_range()会释放范围内所有的页, 函数头如下
+  * 然后遍历范围内所有页, 清空页表中对应的PTE, 并减少对应页的引用计数, 当页的引用计数为0时会被内核回收
+## dirty-COW漏洞
+  * 回想一下利用/proc/self/mem写入进程只读内存区的过程: access_remote_vm()会先调用 **get_user_pages()锁定要写入的页,** get_user_pages()会通过while( !follow_page_mask(foll_flag) ){ faultin_page(foll_flag); } 这个循环分配满足foll_flag要求的页
+  * __get_user_pages()第一次循环 
+    * faultin_page()判断属于写入只读区域的情况, 因此会调用do_cow_fault()
+    * do_cow_fault()会复制原始的文件缓存页到一个新页中, 并设置PTE映射到这个新页, 但由于VMA不可写入, 因此这个新页的PTE页没有设置RW标志
+  * __get_user_pages()第二次循环 
+    * 由于foll_flags中有FOLL_WRITE标志, 但是页对应的PTE没有RW标志, 因此follow_page_mask()判断权限有问题, 再次进入faultin_page()
+    * faultin_page()判断, 属于写入只读的已存在的页造成的问题, 因此会调用do_wp_page()处理
+    * do_wp_page()发现对应页是只有一个引用的匿名页,因此会调用wp_page_reuse()直接重用这个页
+    * wp_page_reuse()由于对应VMA只读, 因此只会给PTE设置一个Dirty标志, 而不会设置RW标志, 然后返回一个VM_FAULT_WRITE表示内核可以写入这个页
+    * 返回到faultin_page()中, 由于handle_mm_fault()返回了VM_FAULT_WRITE, 因此会去掉FOLL_WRITE标志, 含义为: 虽然此页对应PTE不可写入, 但是已经COW过了, 内核是可以写入的, 后续follow_page_mask()就不要检查能不能写入了
+  * 如果说在清除FOLL_WRITE标志之后, 第三次调用follow_page_mask()之前, 我们通过madivse()设置此页对应PTE为空会发生什么? 
+    * 首先follow_page_mask()会因为对应PTE为NULL而再次失败, 进入faultin_page(), 但是注意, 这次进入的时候没有FOLL_WRITE标志
+    * faultin_page()因此设置fault_flags时是没有FAULT_FALG_WRITE标志的, 也就是说faultin_page()对handle_mm_fault()承诺不会写入这个页
+    * handle_mm_fault()由于pte为none, 并且不要求写入, 因此最终会分派给do_read_fault()处理
+    * do_read_fault()会查找这片VMA映射的地址空间中, address对应的原始缓存页, 然后返回这个原始缓存页
+  * 如果是用户映射一片只读内存页到文件, 返回原始缓存页是没有问题的, 因为用户无权对其进行写入. 但是在这里access_remote_vm()后续会调用copy_to_user_page() 写入__get_user_pages()锁定的页, 由此污染了文件的原始缓存页.
+  * 一段时间后当进行磁盘同步时(sync, kflushd….)内核会把被污染的页面回写到磁盘中, 从而写入特权文件完成攻击
+  * 那么下一个问题这个条件竞争的时间窗口有多大? 由于faultin_page()返回之后会调用cond_resched()切换到别的任务, 因此时间窗口是非常大的
+  * 受攻击时对/proc/self/mem进行写入时的执行流程:
+  * EXP伪代码
+    Main:
+        fd = open(filename, O_RDONLY)        //打开一个文件
+        fstat(fd, &st)
+        map = mmap(NULL, st.st_size , PROT_READ, MAP_PRIVATE, fd, 0)    //把文件映射到map指向的内存区域
+        start Thread1
+        start Thread2
+    Thread1:
+        f = open("/proc/self/mem", O_RDWR)    //打开mem文件
+        while (1):
+            lseek(f, map, SEEK_SET)    //偏移到map映射的区域
+            write(f, shellcode, strlen(shellcode))    //写入
+    Thread2:
+        while (1):
+            madvise(map, 100, MADV_DONTNEED)    //取消映射
+## 反思
+  * 对于进程中的只读内存区域, 如果通过地址进行写入会得到一个段错误, 但是通过mem文件进行写入, 就会得到一个dirty的COW的只读页, 为什么会有这样的差异?
+  * 对于段错误, 这个很好理解, 但是通过mem文件写入一个进程的只读内存区, 破坏了进程的地址空间. 那么为什么内核还要引入这种外部访问机制呢? 这是为了方便调试器和一些跟踪程序而加入的设计
+  * 这个漏洞的修复也很简单, COW之后不去掉FOLL_WRITE标志, 而引入一个新的标志FOLL_COW. 
+    * 这样就算进入follow_page_mask()前这个PTE被设为nonoe ,但foll_flags保留了FOLL_WRITE标志, 仍然会要求faultin_page分配一个要写入的页.
+    * 在follow_page_mask()检查的时候如果foll_flags中设置了FOLL_WRITE要求写入, 那么下面两种情况都会被判断为页可写入 
+      * pte设置了RW标志, 表示页可写入
+      * flags设置了FOLL_COW标志, 表示这是一个COW之后的页面, 虽然PTE说不可写入, 但是内核实际可以写入
+  * 修复的diff如下
+    diff --git a/include/linux/mm.h b/include/linux/mm.h
+    index e9caec6..ed85879 100644
+    --- a/include/linux/mm.h
+    +++ b/include/linux/mm.h
+    @@ -2232,6 +2232,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
+     #define FOLL_TRIED    0x800    /* a retry, previous pass started an IO */
+     #define FOLL_MLOCK    0x1000    /* lock present pages */
+     #define FOLL_REMOTE    0x2000    /* we are working on non-current tsk/mm */
+    +#define FOLL_COW    0x4000    /* internal GUP flag */
+     typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+                 void *data);
+    diff --git a/mm/gup.c b/mm/gup.c
+    index 96b2b2f..22cc22e 100644
+    --- a/mm/gup.c
+    +++ b/mm/gup.c
+    @@ -60,6 +60,16 @@ static int follow_pfn_pte(struct vm_area_struct *vma, unsigned long address,
+         return -EEXIST;
+     }
+    +/*
+    + * FOLL_FORCE can write to even unwritable pte's, but only
+    + * after we've gone through a COW cycle and they are dirty.
+    + */
+    +static inline bool can_follow_write_pte(pte_t pte, unsigned int flags)
+    +{
+    +    return pte_write(pte) ||
+    +        ((flags & FOLL_FORCE) && (flags & FOLL_COW) && pte_dirty(pte));
+    +}
+    +
+     static struct page *follow_page_pte(struct vm_area_struct *vma,
+             unsigned long address, pmd_t *pmd, unsigned int flags)
+     {
+    @@ -95,7 +105,7 @@ retry:
+         }
+         if ((flags & FOLL_NUMA) && pte_protnone(pte))
+             goto no_page;
+    -    if ((flags & FOLL_WRITE) && !pte_write(pte)) {
+    +    if ((flags & FOLL_WRITE) && !can_follow_write_pte(pte, flags)) {
+             pte_unmap_unlock(ptep, ptl);
+             return NULL;
+         }
+    @@ -412,7 +422,7 @@ static int faultin_page(struct task_struct *tsk, struct vm_area_struct *vma,
+          * reCOWed by userspace write).
+          */
+         if ((ret & VM_FAULT_WRITE) && !(vma->vm_flags & VM_WRITE))
+    -        *flags &= ~FOLL_WRITE;
+    +            *flags |= FOLL_COW;
+         return 0;
+     }

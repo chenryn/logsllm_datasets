@@ -1,0 +1,153 @@
+# Chrome UAF漏洞模式浅析（三）：unique key容器emplace重复key
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 前序
+本篇提到的可能不是什么特别的漏洞模式，也不专有于chrome，但是因为笔者在做漏洞分析的时候，看过大概四五个一样的漏洞，所以权做分享。
+## 指针生命周期管理的一种常用范式
+如果所有的B实例，都是在A构造的时候构造出B，B中保存指向A的原始指针，A持有保存B的`unique_ptr`指针。此时当A析构的时候，`unique_ptr
+b_`被析构，于是b_保存的指向B的原始指针也被析构，从而B被析构。
+    class B;
+    class A {
+    public:
+        A() {
+            printf("A构造\n");
+            b_ = std::make_unique(this);
+        }
+        ~A(){
+            printf("A析构\n");
+        }
+        std::unique_ptr b_;
+    };
+    class B {
+    public:
+        B(A *a) {
+            printf("B构造\n");
+            a_ = a;
+        }
+        ~B(){
+            printf("B析构\n");
+        }
+        A *a_;
+    };
+    int main(){
+        A* a = new A();
+        delete a;
+        pause();
+    }
+    ...
+    ...
+    A构造
+    B构造
+    A析构
+    B析构
+## 漏洞分析
+###  例子1: CVE-2019-5788
+一般比较常见的生命周期管理就是让类A的对象通过容器C去保存类B的对象的指针，从而统一的进行B类型对象的删除。
+如下FileSystemOperationRunner通过`operations_`字段来管理所有被创建出来的FileSystemOperation对象。
+`operations_`就是`map>`，它会保存FileSystemOperation的一个unique_ptr指针。
+    OperationID FileSystemOperationRunner::BeginOperation(
+        std::unique_ptr operation) {
+      OperationID id = next_operation_id_++;
+      // TODO( https://crbug.com/864351 ): Diagnostic to determine whether OperationID
+      // wrap-around is occurring in the wild.
+      DCHECK(operations_.find(id) == operations_.end());
+      // ! If id already in operations_, this will free operation
+      operations_.emplace(id, std::move(operation));
+      return id;
+    }
+如下:
+在FileSystemOperation对象为了进行生命周期的管理，将其`unique_ptr`指针被map保存，然后又使用其原始指针调用Truncate方法。
+    OperationID FileSystemOperationRunner::Truncate(const FileSystemURL& url,
+                                                    int64_t length,
+                                                    StatusCallback callback) {
+      base::File::Error error = base::File::FILE_OK;
+      std::unique_ptr operation = base::WrapUnique(
+          file_system_context_->CreateFileSystemOperation(url, &error));
+      // ! take a raw pointer to the contents of the unique_ptr
+      FileSystemOperation* operation_raw = operation.get();
+      // ! call BeginOperation passing the move'd unique_ptr, freeing operation
+      OperationID id = BeginOperation(std::move(operation));
+      base::AutoReset beginning(&is_beginning_operation_, true);
+      if (!operation_raw) {
+        DidFinish(id, std::move(callback), error);
+        return id;
+      }
+      PrepareForWrite(id, url);
+      // ! use the raw free'd pointer here.
+      operation_raw->Truncate(url, length,
+                              base::BindOnce(&FileSystemOperationRunner::DidFinish,
+                                             weak_ptr_, id, std::move(callback)));
+      return id;
+    }
+这里有一个问题就是，OperationID是一个int类型的值，如果emplace的时候，该值因为装入的operation过多，而溢出，则可能导致用之前已经装入map的id，再次放入一个operation。  
+即
+    operations_.emplace(idA, std::move(op1));
+    operations_.emplace(idA, std::move(op2));
+在第二次装入的时候，因为`operations_`是一个unique_key的容器，它不允许key相同，所以第二次装入是失败的，op2这个`unique_ptr`被当场析构，且此时它里面保存的原始指针不为空，从而使得指针指向的FileSystemOperation也被析构，operation_raw变成悬空指针。
+之后通过`operation_raw`调用的时候，就UAF了。
+漏洞补丁就是加固了OperationID的范围，避免溢出。
+       using CopyOrMoveOption = FileSystemOperation::CopyOrMoveOption;
+       using GetMetadataField = FileSystemOperation::GetMetadataField;
+    -  using OperationID = int;
+    +  using OperationID = uint64_t;
+       virtual ~FileSystemOperationRunner();
+###  例子2: CVE-2020-6493
+  * issue url 
+    * 
+  * poc 
+        var i=0;
+    setInterval(function(){
+    i++;
+    console.log(i)
+    virtualAuthenticatorManager.createAuthenticator().then(() => {
+      return navigator.credentials.create({publicKey : customPublicKey});
+    });
+    },0.1)
+`navigator.credentials.create`最终会调到AuthenticatorAdded，用来添加一个新的authentication设备
+        void FidoRequestHandlerBase::AuthenticatorAdded(
+      FidoDiscoveryBase* discovery,
+      FidoAuthenticator* authenticator) {
+    DCHECK(authenticator &&
+           !base::Contains(active_authenticators(), authenticator->GetId()));
+    auto authenticator_state =
+        std::make_unique(authenticator);
+    auto* weak_authenticator_state = authenticator_state.get();
+    active_authenticators_.emplace(authenticator->GetId(),
+                                   std::move(authenticator_state));
+    //...
+    }
+注意到`active_authenticators_`是一个AuthenticatorMap.
+        using AuthenticatorMap =
+      std::map, std::less<>>;
+如果在向`active_authenticators_`里插入元素的时候，发生了key冲突，就会导致要插入的`unique_ptr
+authenticator_state`立刻析构掉它保存的AuthenticatorState对象的原始指针(其实是先进行一个右值拷贝给栈上的临时对象，然后临时对象因为插入失败，在函数结束的时候就析构掉了)，测试样例如下:
+    class A{
+    public:
+        A(){
+            cout , std::less<>>;
+    AMap ua_m;
+    void f(){
+        auto ua1 = std::make_unique();
+        std::string ua1_id = "1";
+        auto ua2 = std::make_unique();
+        std::string ua2_id = "1";
+        ua_m.emplace(ua1_id, std::move(ua1));
+        ua_m.emplace(ua2_id, std::move(ua2));
+        cout timer = std::make_unique();
+      authenticator_state->authenticator->InitializeAuthenticator(base::BindOnce(
+          &FidoRequestHandlerBase::DispatchRequest, weak_factory_.GetWeakPtr(),
+          authenticator_state->authenticator));//<--解引用被析构的authenticator_state
+    }
+## 模式总结
+要找到这样的漏洞，要满足几个条件  
+1 找到向map或者其他unique key容器里进行insert/emplace的点  
+2 在插入的时候，key是否是可重复的，要么可控制，要么可爆破随机数，要么可溢出。  
+3
+emplace进行析构的地方，和使用被析构对象的原始指针的地方，不能在同一个函数里（因为我们的测试证明要emplace所在函数结束才真正析构），要么是在外层函数，要么是将raw
+pointer传入其他函数进行回调。
+## 后记
+本系列至此暂时告一段落，本来还想写一篇RenderFrameHost生命周期相关的漏洞模式，但是因为之前写过了很详细的分析，感兴趣的师傅可以找一下我以前发的文章。  
+本系列涉及到的漏洞多是一年前的漏洞了，Chrome的安全性是快速迭代的，所以现在的Chrome
+UAF漏洞挖掘往往需要组合多个点，以及对对象的生命周期关系做一个比较明确的分析图。  
+希望本篇能给师傅们一些启发 : )

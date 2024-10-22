@@ -1,0 +1,195 @@
+attach模式。填入进程PID。下断点开启调试即可正常调试。
+    "configurations": [
+      {
+        "name": "Attach to Process",
+        "type": "go",
+        "request": "attach",
+        "mode": "local",
+        "processId": 6257
+      }
+    ]
+关于rails部分的调试环境使用[gitpod](https://mp.weixin.qq.com/s/AI0ucw-N-WECcvhQdTjrRQ
+"gdk一键搭建")云端一键搭建的GitLab Development
+Kit。首先fork仓库后选择指定分支点击gitpod即可进行搭建。rails参考[pry-shell](https://docs.gitlab.com/ee/development/pry_debugging.html "pry-shell")来进行调试。在gitpod中也可以进行workhorse的调试，同样根据提示安装全部go相关插件
+由于gitpod的vscode环境不是root，无法直接在其中Attach to Process进行调试，所以可以本地使用sudo起一个远程调试的环境
+    sudo /home/gitpod/.asdf/installs/golang/1.17.2/packages/bin/dlv-dap attach 38489 --headless --api-version=2 --log --listen=:2345
+相关调试配置
+    "configurations": [
+      {
+        "name": "Connect to server",
+        "type": "go",
+        "request": "attach",
+        "mode": "remote",
+        "remotePath": "${workspaceFolder}",
+        "port": 2345,
+        "host": "127.0.0.1"
+      }
+    ]
+### 漏洞代码分析-触发流程一
+#### workhorse路由匹配
+在workhorse的更新中涉及函数有`NewCleaner`，在存在漏洞的版本13.10.2中跟踪到该函数，其中调用到`startProcessing`来执行exiftool命令，具体内容可以看之前贴的代码
+    func NewCleaner(ctx context.Context, stdin io.Reader) (io.ReadCloser, error) {
+        c := &cleaner{ctx: ctx}
+        if err := c.startProcessing(stdin); err != nil {
+            return nil, err
+        }
+        return c, nil
+    }
+右键该方法浏览调用结构
+从上图中除去带test字样的测试函数，可以看出最终调用点只有两个，upload包下的Handler函数`Accelerate`，和artifacts包下的Handler函数`UploadArtifacts`。现在还暂时不确定是哪个函数，根据前面的漏洞描述信息我们知道对接口`/uploads/user`的处理是整个调用链的开始，所以直接在源码中全局搜索该接口
+由于请求会先经过GitLab
+Workhorse，我们可以直接在上图中确定位于`workhorse/internal/upstream/routes.go`路由文件中的常量`userUploadPattern`，下面搜索一下对该常量的引用
+在315行代码中发现进行了路由匹配，然后调用了`upload.Accelerate`。和前面调用点`Accelerate`吻合，这里的调用比较关键，接下来分析该函数：
+    func Accelerate(rails PreAuthorizer, h http.Handler, p Preparer) http.Handler {
+        return rails.PreAuthorizeHandler(func(w http.ResponseWriter, r *http.Request, a *api.Response) {
+            s := &SavedFileTracker{Request: r}
+            opts, _, err := p.Prepare(a)
+            if err != nil {
+                helper.Fail500(w, r, fmt.Errorf("Accelerate: error preparing file storage options"))
+                return
+            }
+            HandleFileUploads(w, r, h, a, s, opts)
+        }, "/authorize")
+    }
+可以看到函数返回值为`http.Handler`，说明了之前在ServeHTTP中进行了调用。我们可以尝试一下寻找前面的`ServeHTTP`调用点。
+首先可以看到路由注册在结构体`routeEntry`中，然后返回了一个数组赋值给`u.Routes`。
+`routeEntry`用于储存请求路径和对应handler。以下是路由注册方法`route`，接收者为`upstream`结构体。实现功能传入正则字符串形式路径和对应处理handler存入`routeEntry`
+    func (u *upstream) route(method, regexpStr string, handler http.Handler, opts ...func(*routeOptions)) routeEntry {
+      ...
+        //注册路由绑定handler
+        return routeEntry{
+            method:   method,
+            regex:    compileRegexp(regexpStr),
+            handler:  handler,
+            matchers: options.matchers,
+        }
+    }
+`upstream`结构体的成员`Routes`指向一个`routeEntry`数组。
+    type upstream struct {
+        config.Config
+        URLPrefix         urlprefix.Prefix
+        Routes            []routeEntry
+        RoundTripper      http.RoundTripper
+        CableRoundTripper http.RoundTripper
+        accessLogger      *logrus.Logger
+    }
+查看对该成员的操作位置，位于`upstream`的`ServeHTTP`方法中，这里通过遍历`u.Routes`调用`isMatch`对全局请求进行了路由匹配，最后调用相应的handler。
+    func (u *upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+      ...
+        // Look for a matching route
+        var route *routeEntry
+        for _, ro := range u.Routes {
+            if ro.isMatch(prefix.Strip(URIPath), r) {
+                route = &ro
+                break
+            }
+        }
+     ...
+     //调用相应handler
+        route.handler.ServeHTTP(w, r)
+    }
+`isMatch`方法如下，使用`regex.MatchString()`判断了请求路由是否匹配，cleanedPath为请求url。
+    func (ro *routeEntry) isMatch(cleanedPath string, req *http.Request) bool {
+      //匹配请求方式
+        if ro.method != "" && req.Method != ro.method {
+            return false
+        }
+      //匹配请求路由
+        if ro.regex != nil && !ro.regex.MatchString(cleanedPath) {
+            return false
+        }
+        ok := true
+        for _, matcher := range ro.matchers {
+            ok = matcher(req)
+            if !ok {
+                break
+            }
+        }
+        return ok
+    }
+#### workhorse认证授权
+`Accelerate`函数中有两个参数，一个是传入的handler，一个是原有的请求上加上接口`authorize`。文档中写到接口用于认证授权。
+函数内的`PreAuthorizeHandler`是`PreAuthorizer`接口的一个接口方法。该方法实现了一个中间件功能，作用是进行指定操作前的向rails申请预授权，授权通过将调用handler函数体内的`HandleFileUploads`上传文件。下面是`PreAuthorizer`接口定义。
+    type PreAuthorizer interface {
+        PreAuthorizeHandler(next api.HandleFunc, suffix string) http.Handler
+    }
+接口实现位于`internal\api\api.go:265`，以下贴出删减后的关键代码：
+    func (api *API) PreAuthorizeHandler(next HandleFunc, suffix string) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            httpResponse, authResponse, err := api.PreAuthorize(suffix, r)
+        //...
+            next(w, r, authResponse)
+        })
+    }
+其中使用了`http.HandlerFunc`将普通函数转换成了Handler类型，跟进`api.PreAuthorize(suffix, r)`，
+    func (api *API) PreAuthorize(suffix string, r *http.Request) (httpResponse *http.Response, authResponse *Response, outErr error) {
+        //组装请求头
+        authReq, err := api.newRequest(r, suffix)
+        ...
+        //发起请求得到响应
+        httpResponse, err = api.doRequestWithoutRedirects(authReq)
+      //解析httpResponse.Body到authResponse
+        authResponse = &Response{}
+      // The auth backend validated the client request and told us additional
+      // request metadata. We must extract this information from the auth
+      // response body.
+      if err := json.NewDecoder(httpResponse.Body).Decode(authResponse); err != nil {
+        return httpResponse, nil, fmt.Errorf("preAuthorizeHandler: decode authorization response: %v", err)
+      }
+        return httpResponse, authResponse, nil
+    }
+以上代码中`newRequest()`用于组装请求头，跟进如下：
+    func (api *API) newRequest(r *http.Request, suffix string) (*http.Request, error) {
+        authReq := &http.Request{
+            Method: r.Method,
+            URL:    rebaseUrl(r.URL, api.URL, suffix),
+            Header: helper.HeaderClone(r.Header),
+        }
+    ...
+    }
+`doRequestWithoutRedirects()`用于发起请求，跟进如下：
+    func (api *API) doRequestWithoutRedirects(authReq *http.Request) (*http.Response, error) {
+        signingTripper := secret.NewRoundTripper(api.Client.Transport, api.Version)
+        return signingTripper.RoundTrip(authReq)
+    }
+`doRequestWithoutRedirects()`第一行实例化使用一个`RoundTripper`，传入了http.Client的Transport类型。`RoundTripper`是一个接口，可以当做是基于http.Client的中间件，在每次请求之前做一些指定操作。实现其中的`RoundTrip`方法即可实现接口做一些请求前的操作。下面看看在`RoundTrip`方法中做了什么
+    func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+      //生成JWT令牌
+        tokenString, err := JWTTokenString(DefaultClaims)
+      ...
+        // Set a custom header for the request. This can be used in some
+        // configurations (Passenger) to solve auth request routing problems.
+      //设置Header头
+        req.Header.Set("Gitlab-Workhorse", r.version)
+        req.Header.Set("Gitlab-Workhorse-Api-Request", tokenString)
+        return r.next.RoundTrip(req)
+    }
+上图中添加了header头`Gitlab-Workhorse-Api-Request`，内容为JWT令牌，用于在rails中验证请求是否来自于workhorse。最后组成的请求为
+    POST /uploads/user/authorize HTTP/1.1
+    Host: 127.0.0.1:8080
+    X-Csrf-Token: Gx3AIf+UENPo0Q07pyvCgLZe30kVLzuyVqFwp8XDelScN7bu3g4xMIEW6EnpV+xUR63S2B0MyOlNFHU6JXL5zg==
+    Cookie: _gitlab_session=76a97094914fc3881c995992a9e22382
+    Gitlab-Workhorse-Api-Request: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRsYWItd29ya2hvcnNlIn0.R5N8IJRIiZUo5ML1rVbTw_HLbJ88tYCqxOeqJNFHfGw
+当得到响应后在`PreAuthorize`方法结尾通过`json.NewDecoder(httpResponse.Body).Decode(authResponse)`解析json数据httpResponse.Body到authResponse中，authResponse指向了`Response`结构体，定义如下：
+    type Response struct {
+        // GL_ID is an environment variable used by gitlab-shell hooks during 'git
+        // push' and 'git pull'
+        GL_ID string
+        // GL_USERNAME holds gitlab username of the user who is taking the action causing hooks to be invoked
+        GL_USERNAME string
+        // GL_REPOSITORY is an environment variable used by gitlab-shell hooks during
+        // 'git push' and 'git pull'
+        GL_REPOSITORY string
+        // GitConfigOptions holds the custom options that we want to pass to the git command
+        GitConfigOptions []string
+        // StoreLFSPath is provided by the GitLab Rails application to mark where the tmp file should be placed.
+        // This field is deprecated. GitLab will use TempPath instead
+        StoreLFSPath string
+        // LFS object id
+        LfsOid string
+        // LFS object size
+        LfsSize int64
+        // TmpPath is the path where we should store temporary files
+        // This is set by authorization middleware
+        TempPath string
+        // RemoteObject is provided by the GitLab Rails application

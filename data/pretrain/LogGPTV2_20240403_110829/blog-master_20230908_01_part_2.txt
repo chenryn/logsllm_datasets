@@ -1,0 +1,130 @@
+```  
+vi t2.sql  
+\set pid random(1,1000)  
+select * from tbl_path_detail where pid=:pid order by ts;  
+```  
+```  
+pgbench -M prepared -n -r -P 1 -f ./t2.sql -c 10 -j 10 -T 120  
+transaction type: ./t2.sql  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 10  
+number of threads: 10  
+duration: 120 s  
+number of transactions actually processed: 15979  
+latency average = 75.097 ms  
+latency stddev = 9.750 ms  
+initial connection time = 20.363 ms  
+tps = 133.126750 (without initial connection time)  
+statement latencies in milliseconds:  
+         0.001  \set pid random(1,1000)  
+        75.097  select * from tbl_path_detail where pid=:pid order by ts;  
+```  
+#### PolarDB|PG新方法1 设计和实验     
+在传统方法中, 平均一个轨迹有1万个点, 由于不同的轨迹点是并行写入的, 所以这1万个点非常可能分散在1万个数据块中, 导致查询1条轨迹要访问很多的数据块. 使得性能瓶颈在IO层面(如下这条轨迹消耗9538个IO).   
+```  
+postgres=# explain (analyze,verbose,timing,buffers,costs,settings,wal) select * from tbl_path_detail where pid=1 order by ts;  
+                                                                          QUERY PLAN                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------  
+ Index Scan using tbl_path_detail_pid_ts_idx on public.tbl_path_detail  (cost=0.43..10473.93 rows=9955 width=28) (actual time=0.060..24.022 rows=9937 loops=1)  
+   Output: pid, pos, ts  
+   Index Cond: (tbl_path_detail.pid = 1)  
+   Buffers: shared hit=9538  
+ Settings: enable_seqscan = 'off', max_parallel_workers_per_gather = '0', random_page_cost = '1.1'  
+ Planning Time: 0.183 ms  
+ Execution Time: 25.039 ms  
+(7 rows)  
+```  
+PG|PolarDB支持include index, 为了解决这个问题, 可以将要查询的字段放入索引的叶子结点内, 避免回表导致的IO.   
+1、创建include index, 把pos放入索引叶子结点:  
+```  
+create index on tbl_path_detail (pid,ts) INCLUDE (pos);  
+vacuum analyze tbl_path_detail;  
+```  
+2、此时使用新的index查询, 不需要回表, IO大幅度降低, 如下这条轨迹消耗66个IO:    
+```  
+postgres=# explain (analyze,verbose,timing,buffers,costs,settings,wal) select * from tbl_path_detail where pid=1 order by ts;  
+                                                                             QUERY PLAN                                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------  
+ Index Only Scan using tbl_path_detail_pid_ts_pos_idx on public.tbl_path_detail  (cost=0.56..241.93 rows=9958 width=28) (actual time=0.082..4.217 rows=9937 loops=1)  
+   Output: pid, pos, ts  
+   Index Cond: (tbl_path_detail.pid = 1)  
+   Heap Fetches: 0  
+   Buffers: shared hit=66  
+ Settings: enable_seqscan = 'off', max_parallel_workers_per_gather = '0', random_page_cost = '1.1'  
+ Planning Time: 0.536 ms  
+ Execution Time: 5.598 ms  
+(8 rows)  
+```  
+3、压测查询轨迹, 按轨迹ID查询, 按时间顺序返回轨迹的所有点.   
+```  
+vi t2.sql  
+\set pid random(1,1000)  
+select * from tbl_path_detail where pid=:pid order by ts;  
+```  
+```  
+pgbench -M prepared -n -r -P 1 -f ./t2.sql -c 10 -j 10 -T 120  
+transaction type: ./t2.sql  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 10  
+number of threads: 10  
+duration: 120 s  
+number of transactions actually processed: 113515  
+latency average = 10.570 ms  
+latency stddev = 2.942 ms  
+initial connection time = 18.558 ms  
+tps = 945.998467 (without initial connection time)  
+statement latencies in milliseconds:  
+         0.000  \set pid random(1,1000)  
+        10.570  select * from tbl_path_detail where pid=:pid order by ts;  
+```  
+#### PolarDB|PG新方法2 设计和实验     
+虽然使用了include index, 但是索引里面就要放所有要查的字段内容, 导致索引占用空间会变大一点.  
+为了更好的优化这个能力, 可以使用聚集字段来存储一条轨迹的内容, 例如array.  
+1、创建一张轨迹表, 使用array存储轨迹中每个点的时间、位置.    
+```  
+drop table if exists tbl_path_detail1;  
+create unlogged table tbl_path_detail1 (  -- 方便测试, 使用unlogged table.  
+  pid int,  -- 轨迹ID  
+  pos point[],  -- 位置数组  
+  ts timestamp[]  -- 时间数组  
+);  
+create index on tbl_path_detail1 (pid);  
+```  
+2、将原始轨迹写入新的轨迹表.  
+```  
+insert into tbl_path_detail1 select pid, array_agg(pos order by ts), array_agg(ts order by ts) from tbl_path_detail group by pid;  
+```  
+```  
+postgres=# select pid, pos[1:10], ts[1:10] from tbl_path_detail1 where pid=1;  
+-[ RECORD 1 ]------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------  
+pid | 1  
+pos | {"(0.9431799157631602,0.41223770583725994)","(0.029285214711183727,0.13121257852994006)","(0.47231141497136164,0.40519912875600994)","(0.18841309050989707,0.9120792659923715)","(0.1669935448355666,0.788043626909726)","(0.7680464170226315,0.02176761079732259)","(0.1806378616460016,0.17626971610524578)","(0.6905476714298793,0.21249186817883725)","(0.20480152830909404,0.36856166073248176)","(0.37764392812544045,0.5214349561346836)"}  
+ts  | {"2023-09-08 02:05:15.458977","2023-09-08 02:05:15.460392","2023-09-08 02:05:15.46647","2023-09-08 02:05:15.466755","2023-09-08 02:05:15.46993","2023-09-08 02:05:15.470127","2023-09-08 02:05:15.473513","2023-09-08 02:05:15.474446","2023-09-08 02:05:15.480445","2023-09-08 02:05:15.484117"}  
+```  
+应用层面, 未来在写入轨迹时也可以使用这个方法, 等轨迹完成一次性上传并写入新的轨迹表, 老的轨迹表就不需要了.   
+3、压测查询轨迹, 按轨迹ID查询, 按时间顺序返回轨迹的所有点.   
+```  
+vi t3.sql  
+\set pid random(1,1000)  
+select * from tbl_path_detail1 where pid=:pid;  
+```  
+```  
+pgbench -M prepared -n -r -P 1 -f ./t3.sql -c 10 -j 10 -T 120  
+transaction type: ./t3.sql  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 10  
+number of threads: 10  
+duration: 120 s  
+number of transactions actually processed: 65173  
+latency average = 18.410 ms  
+latency stddev = 5.716 ms  
+initial connection time = 23.213 ms  
+tps = 543.135449 (without initial connection time)  
+statement latencies in milliseconds:  
+         0.000  \set pid random(1,1000)  
+        18.410  select * from tbl_path_detail1 where pid=:pid;  
+```  
+或者也可以使用text存储轨迹点.  

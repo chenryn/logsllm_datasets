@@ -1,0 +1,251 @@
+The choice of partitions that beagle would consume from could cause problems. We started
+having a bit of a divide on the team, debating whether the problem was beagle or Kafka itself.
+Both looked like they under-utilized their resources and both could go faster, but they just would
+not.
+A few experiments over the day confirmed that the issue seemed to be around pairs of leaders.
+The Kafka cluster has a mostly random-looking leader assignment. Beagles’ consumer group
+9
+
+would however assign them sequentially. Whenever the same leading broker got some of its
+partitions assigned to a single beagle 2 or 3 times, its consuming performance got worse.
+This was hard to detect (because the data for both lives in different systems) but easy to test
+(just shuffle leaders). It explained why scaling up would often fix the problems, but also why
+sometimes scaling up or shuffling leaders made things worse even if balance was expected to
+be much better that way.
+This, we found out over the course of days, is because Kafka consumer groups always open
+only a single connection to any leader, regardless of how many partitions are going to be fed
+from it. In turn, this creates a point of contention where the connection buffers of the S arama
+library themselves (and the speed at which we consume them) bottleneck all traffic. This
+explains the behavior we saw of both sides of the equation sitting idle while there was more
+work to do. Many assignment strategies exist: range (the one we used), sticky, and round-robin.
+Rather than shifting the strategy, we tried various settings to increase buffers and throughput
+over a few days, which at this point seemed to hold up. We also had a back-up solution of using
+smaller Beagle instances and using them in a fixed pool of one per partition; we did not need to
+use it, but it was planned to buy us some peace after a rough operational month if we needed it.
+Scaling up retrievers
+What became apparent once we understood the beagle issues is that retrievers themselves
+were also having scaling problems, since both Kafka and beagle were individually explained. We
+planned a scale-up, adding roughly a quarter extra capacity by scaling horizontally on
+September 30.
+10
+
+Before then, we wanted to double-check whether scaling vertically would also make sense.
+Retriever had been way over-provisioned for over a year, and we had only scaled it up marginally
+earlier in 2021 to make sure we still knew how. So we weren’t quite sure where the limits were in
+the system, and it seemed we were hitting bad inflection points.
+We booted a single larger instance (m6gd.2xlarge → m6gd.4xlarge) and let it steep overnight to
+see if things would be better with it, but it proved inconclusive. While rolling out the instance, we
+also noticed something we named “blinking,” where retrievers would fall in and out of their
+partition assignment for a few seconds at a time, something that should never happen.
+We started following the steps to scaling out retriever that we had put in a runbook. One
+significant gotcha about this runbook was that at the time it was written, beagle did not yet
+exist. The scale-up steps were added after the fact, but never tried under production workloads
+with empty partitions, so we knew there could be a risk around it.
+Even before we got to the beagle steps that involve inserting a configuration for the missing
+partitions, we started seeing crashes and delays. We guessed that the most likely reason was
+that there was no data in beagle, and decided to complete the scale-out ASAP.
+In the hurry, we made many small mistakes. We were supposed to go to 56 partitions (0..55),
+but ended up setting only 53 of them up at first. This required a back and forth in scaling and
+record injection. Another one was that the runbook told to introduce records in the beagle SLO
+database:
+("beagle", "honeycomb-prod.retriever_mutation", <N>, 0, "manual")
+Unfortunately, the proper topic is "honeycomb-prod.retriever-mutation" with a -, not a _. We did
+not notice this when writing the runbook, when crafting the queries, when reviewing them before
+applying them, when applying them, and even when doing the first one or two audits of the table
+after things were going bad.
+The overall end result was that beagle struggled and crashed in a loop until we managed to
+stand up the whole pipeline end-to-end and data started flowing in, which caused an S LO
+processing delay outage. At some point, we corrected all the little oddities and traffic started
+flowing through.
+Once we caught up, we backfilled the SLO data and all customers’ service was reestablished
+properly.
+11
+
+All the new partitions, which had no enterprise customer that would use SLOs on them yet (the
+final rebalancing is still manual) showed over 4 hours worth of delay and were not recuperating.
+What we found out was that this was related to a lot of small issues we wouldn’t have
+encountered in other circumstances:
+● Partitions with no SLOs would not correctly mark their progress when consuming data
+● Some customers were doing heavy load testing, where they created hundreds of
+datasets, sent a high volume of messages, and then deleted them
+The latter in particular was problematic because we do look up datasets in a database, and then
+cache the results. But when a dataset is missing, we cache nothing. This is generally not a
+problem when the consumers are up to date because you don’t get messages for a very long
+time after their dataset is deleted. However, in this case we got backlogged by several hours on
+some partitions and this drastically slowed down the ability to consume anything at all. The bad
+behavior was invisible until other things were also going bad, and it made them worse.
+Pending patches, we created fake datasets in the database (attributed to our internal teams) to
+let beagle catch up by filling its cache, then deleted them again. We also created fake SLOs on
+all of our internal end-to-end datasets that are pinned to specific partitions.
+During the next hours, the patches to properly cope with each issues have made it to production
+and we got stable again. We also took the opportunity to migrate heavy partitions away from
+overloaded existing ones onto new ones. We would then do a trickle of smaller retriever
+rebalances over the next few days, and benefit from the improved capacity.
+12
+
+Final beagle instability
+Scaling up partitions meant that the new ones, all assigned in a series, were far less loaded than
+the older ones. This caused a severe imbalance where the last of the beagles would have no
+work to do, and drag down the average CPU consumption for the cluster, causing more
+autoscaling woes (on first the image below)
+We ended up fixing it by changing the allocation strategy to be round-robin, which at least would
+spread the load more equally across all Beagles, and things got back to being acceptable.
+We also scaled up the beagle cluster size to a fixed, larger size, which had proven stable
+regardless of the day of the week or time of the day. We have, however, found out that as we add
+instances to the cluster, rolling restarts cause larger disruptions to the consumer group that
+tries to shift load around, and are running experiments with a Sticky strategy to reduce
+interference. Finally, and more recently, we changed our deploy strategy to completely ignore
+rolling restarts. S ee this Twitter thread by one of our engineering managers about it.
+September stretches into October
+Things didn’t quite end there. After analyzing the gain on scaling, we saw that we mostly only
+gained one month of growth room, maybe less, depending on how fast our customers grow.
+We ended up having to cover a few extra issues in October already, all in its first week:
+● Horizontally scaling retrievers again to buy room rather than just be okay
+● Discussions around what the scaling strategy should be for datasets and bits of
+continuous expansions
+● A troublesome database migration that flushed indexes aggressively and caused blips
+13
+
+● More frequent request interruptions during retriever failures causing potential query
+problems for customers
+● Triggers reaching a point where they sometimes and inconsistently require a long time
+to work, which required further investigation and highlighted stuck SQL queries that
+we’re currently trying to pin down
+● Keeping on cycling retriever instances to avoid file system corruption issues, which was
+finished in the later weeks of October
+● More stress tests by some customers, causing surprises. Dataset deletion and
+re-creation could reset some limits and scale markers that could lead to overload:
+○ One interesting case happened while cycling retrievers: One would not
+successfully bootstrap because files were seen as missing when a partition had
+been manually deleted until its peer ran its backup task and cleaned up segments
+expectations
+○ Discovering limitations around the throttling and rate-limiting mechanisms
+applied to teams and/or datasets
+● Requiring emergency surgery on init files in production because an experiment to try and
+drain retriever connections more effectively on deploys went awry, and a regular deploy
+could have crashed the whole cluster
+● RDS CPU alerts firing and hinting at another vertical scale-up required there, which we
+ended up doing. Specifically, we ended up improving our ingest performance seemingly
+by a lot by scaling up, which indicated that we were starting to see it act as a chokepoint
+that could slow down some queries
+We’re now looking more stable than during late September, but it’s obvious we have more
+lessons to learn and more limits about our system to discover. For example, growing our
+container fleet has highlighted more stress in our usage of AWS’ SSM, with limits needing to be
+raised.
+Lessons learned and things
+to keep in mind
+Scaling of individual components
+We’ve had something close to 40% growth in ingest traffic between late August and the end of
+September. In hindsight, It looks like we haven’t been proactive enough, but my understanding of
+it is really that while some of us had ideas about what some of our scaling limits were, nobody
+had a clear, well-defined understanding of it, and of all the dimensions.
+14
+
+During the month, we ran into scale issues around:
+● Networking and throttling of data packets that were previously unknown and invisible
+to us
+● Limitations in the abilities and stability of the Kafka rebalancer
+● Surprising abilities of our production cluster to overload our dogfood cluster in ways that
+left longer-lasting impacts to production instrumentation (Kafka monitoring)
+● Bottlenecks and points of contention around consumer groups in our Kafka client
+libraries
+● Sequential bottleneck in retriever consumption
+● Memory and CPU limits around retriever’s ability to serve some particularly large queries
+● Manual rebalancing of partitions and tool-assisted rebalancing were nearing their toil
+acceptability levels
+● The frequency of deploys was increasing and their effect was inflated and, therefore,
+more visible in our SLOs
+If we’re lucky, we would hit these one at a time, but we unfortunately got in a situation where
+various types of pressures (likely a related to having to scale many different types of customers
+all at once) just showed up at once, and disguised themselves as each other.
+All of it came from rapid customer growth in a short time span.
+Overall traffic does not scale uniformly across customers, whose datasets aren’t uniformly
+distributed either and may have implications around other services. Beagle consumes all
+messages of all datasets, but the count and costs of SLO means the scaling shape is distinct
+than what retriever needs. Interactive queries hit lambdas often and can bottleneck there,
+whereas triggers are nearly fully on the hot sets and entirely within retrievers.
+15
+
+As we add features, a growth in customer ingest and querying patterns lead to distinct scaling
+patterns for various components. To add to the challenge, it’s sometimes unclear if the
+limitations highlighted in scaling are due to a bottleneck that would be solved more effectively
+by scaling vertically or horizontally (or based on some other dimension). This gives us a sort of
+scaling profile as follows over the last few months:
+For each component impacted, its own growth and ability to scale either vertically or
+horizontally is a function of both costs, awareness of bottlenecks, expected growth models, and
+so on. Lambda grew capacity in a very stepwise manner that changed volume downstream of it,
+even in different environments. Retriever’s throughput boundaries were mostly unknown, and we
+needed to experiment to see what would be most effective. Kafka is expected to be fixed in
+number since the Spring 2021 migration due to licensing structures, except when scaling up
+vertically, where, for safety, we boot a peer group of larger instances and migrate traffic off.
+Beagle stayed mostly stable and is now fixed in size because that seems reasonable, but could
+have gone smaller vertically to grow wider horizontally.
+Combinatorial scaling
+The real upcoming challenge we’re facing, aside from just scaling things in foreseeable
+directions (more customers mean more partitions) is having to consider when we’re going to
+have our future scaling plans run into each other and cancel each other:
+● Scaling retrievers horizontally on writes may make reads more costly or likely to hit high
+99th percentile values, which in turn means some larger customers’ datasets may need
+vertical scale
+16
+
+● Vertically scaling retrievers does not necessarily address load issue that beagle could
+one day see, and scaling horizontally does dilute its autoscaling metrics and require
+fancier approaches
+● Increasing scaling ability in one environment can cause ripple effects in other ones that
+are loosely coupled to them due to second-order effects, on entirely different dimensions
+with distinct failure modes
+● Extra indexing or internal logical partitioning of datasets would improve the ability to
+handle triggers and queries, but could cause more load on RDS instances that handle
+columns and make rate-limiting fuzzier
+● More large customers mean more edge cases exercised more frequently and more of
+these weird interplays clashing in the future
+● Deploying more often makes each deploy safer, but as deploys to retrievers cause minor
+interruptions, these accumulate to having a visible effect on our reliability as well
+● Our own observability tooling is running into new hurdles as GROUP BY limits in
+Honeycomb queries mean we can’t see the work of all our partitions or all hosts at once,
+and its accuracy will only shrink over time.
+These last few weeks are probably the clearest signal we have yet of where a lot of our limits lie
+and where we need to start planning growth adaptation in a composable approach, rather than a
+more local, per-service vision.
+Experience and tempo
+It has been surprising how often one of the new incidents highlighted something we did not
+understand in a previous one or that a previous incident held the keys to solving one of the new
+ones. This can sometimes feel like the s tory about the old Chinese farmer, but really should
+reinforce the idea that all incidents are learning opportunities.
+We believe maintaining the ability to adapt to production challenges comes from having a
+sustainable pace. Not too active, not too sparse, a bit like exercising to stay healthy. It is
+possible that a knee-jerk reaction where we over-scale the system to ensure we never have
+issues in the foreseeable future only gives us more time to forget about some operational
+issues, and makes it easier to turn a healthy amount of it into a dormant long memory.
+To put the analogy another way, seeing a piece of wood bend can be a good signal that it’s
+nearing its limits. As load increases, it’s useful to keep ourselves familiar with the signals and
+ways various loads bend the system.
+One of the things that was called out in the Platform Team weekly meeting was that we were
+running at a rather unsustainable pace during most of the month. Lots of work was dropped
+and, as the incidents recurred, they got longer and more frequent, and the amount of context
+17
+
+available and required to handle them increased dramatically. This in turn meant the people
+handling many of the incidents felt better equipped to handle the other ones that kept
+happening. We were entering a self-reinforcing loop in the worst way possible.
+We learned that the ability to have downtime and hand-offs that transfer that context from
+coworker to coworker does become necessary to keep operational burdens sustainable, and
+calling out such situations to force a shakeup can be effective.
+It’s worth pointing out that we do believe there is plenty of optimization potential in most of our
+code bases, which would let us do more with the same cluster and instance sizes. These
+optimizations generally take longer to put in place than scaling up does, so being caught in a
+situation where multiple components approach t he edge of their performance envelope at once
+means we can be forced to scale to buy time to optimize properly at a later point, but only if
+pressure lets up.
+If we operate too far from the edge, we lose sight of it, stop knowing where it is, and can’t
+anticipate when corrective work should be emphasized. But if we operate too close to it, then
+we are constantly stuck in high-stake risky situations and firefighting. This gets exhausting and
+we lose the capacity, both in terms of time and cognitive space, to be able study, tweak, and
+adjust behavior of the system. This points towards a dynamic, tricky balance to strike between
+being too close to the boundary and too far from it, seeking some sort of Goldilocks operational
+zone.
+While we don’t have a perfect recipe for this balancing act, we do believe that a focus on
+learning from all production woes plays an integral role in keeping that balance and maintaining
+long-term system (and our team’s mental) health.
+18

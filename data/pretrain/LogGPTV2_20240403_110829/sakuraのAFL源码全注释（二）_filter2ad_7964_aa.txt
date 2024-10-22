@@ -1,0 +1,166 @@
+# sakuraのAFL源码全注释（二）
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## afl-fast-clang中叙
+###  afl-llvm-rt
+AFL LLVM_Mode中存在着三个特殊的功能。这三个功能的源码位于afl-llvm-rt.o.c中。
+####  deferred instrumentation
+AFL会尝试通过仅执行一次目标二进制文件来优化性能。它会暂停控制流，然后复制该“主”进程以持续提供fuzzer的目标。该功能在某些情况下可以减少操作系统、链接与libc内部执行程序的成本。  
+选好位置后，将下述代码添加到该位置上，之后使用afl-clang-fast重新编译代码即可
+    #ifdef __AFL_HAVE_MANUAL_CONTROL
+      __AFL_INIT();
+    #endif
+`__AFL_INIT()`内部调用`__afl_manual_init`函数。该函数的源代码如下
+    void __afl_manual_init(void) {
+      static u8 init_done;
+      if (!init_done) {
+        __afl_map_shm();
+        __afl_start_forkserver();
+        init_done = 1;
+      }
+    }
+如果还没有被初始化，就初始化共享内存，然后开始执行forkserver，然后设置init_done为1。
+`__afl_map_shm`就是简单的通过读取环境变量`SHM_ENV_VAR`来获取共享内存，然后将地址赋值给`__afl_area_ptr`。否则，默认的`__afl_area_ptr`指向的是一个数组。
+`__afl_start_forkserver`的逻辑稍微复杂，分条叙述
+  * 首先设置`child_stopped`为0，然后通过`FORKSRV_FD + 1`向状态管道写入4个字节，告知AFL fuzz已经准备好了。
+  * 然后进入fuzz loop循环 
+    * 通过read从控制管道`FORKSRV_FD`读取4个字节，如果当前管道中没有内容，就会堵塞在这里，如果读到了，就代表AFL命令我们fork server去执行一次fuzz
+    * 如果`child_stopped`为0，则直接fork出一个子进程去进行fuzz 
+      * 然后此时对于子进程就会关闭和控制管道和状态管道相关的fd，然后return跳出fuzz loop，恢复正常执行。
+    * 如果`child_stopped`为1，这是对于persistent mode的特殊处理，此时子进程还活着，只是被暂停了，所以可以通过`kill(child_pid, SIGCONT)`来简单的重启，然后设置`child_stopped`为0。
+    * 然后fork server向状态管道`FORKSRV_FD + 1`写入子进程的pid，然后等待子进程结束，注意这里对于persistent mode，我们会设置waitpid的第三个参数为WUNTRACED，代表若子进程进入暂停状态，则马上返回。
+    * WIFSTOPPED(status)宏确定返回值是否对应于一个暂停子进程，因为在persistent mode里子进程会通过SIGSTOP信号来暂停自己，并以此指示运行成功，所以在这种情况下，我们需要再进行一次fuzz，就只需要和上面一样，通过SIGCONT信号来唤醒子进程继续执行即可，不需要再进行一次fuzz。 
+      * 设置`child_stopped`为1。
+    * 当子进程结束以后，向状态管道`FORKSRV_FD + 1`写入4个字节，通知AFL这次target执行结束了。
+####  persistent mode
+上面我们其实已经介绍过persistent
+mode的一些特点了，那就是它并不是通过fork出子进程去进行fuzz的，而是认为当前我们正在fuzz的API是无状态的，当API重置后，一个长期活跃的进程就可以被重复使用，这样可以消除重复执行fork函数以及OS相关所需要的开销。  
+所以的使用方法如下:
+    while (__AFL_LOOP(1000)) {
+      /* Read input data. */
+      /* Call library code to be fuzzed. */
+      /* Reset state. */
+    }
+    /* Exit normally */
+循环次数不能设置过大，因为较小的循环次数可以将内存泄漏和类似故障的影响降到最低。所以循环次数设置成1000是个不错的选择。
+接下来我们来解读一下源码，首先介绍一个`__attribute__ constructor`，demo如下，代表被此修饰的函数将在main执行之前自动运行
+    __attribute__((constructor(1))) void before_main1(){
+        printf("before_main1\n");
+    }
+    __attribute__((constructor(2))) void before_main2(){
+        printf("before_main2\n");
+    }
+    __attribute__((destructor(1))) void after_main1(){
+        printf("after_main1\n");
+    }
+    __attribute__((destructor(2))) void after_main2(){
+        printf("after_main2\n");
+    }
+    int main(){
+        printf("main\n");
+    }
+    ...
+    ...
+    before_main1
+    before_main2
+    main
+    after_main2
+    after_main1
+llvm mode里有一个函数`__attribute__((constructor(CONST_PRIO))) void
+__afl_auto_init(void)`，其逻辑如下
+  * 读取环境变量PERSIST_ENV_VAR的值，设置给is_persistent
+  * 读取环境变量DEFER_ENV_VAR的值，如果为1，就直接返回，这代表`__afl_auto_init`和deferred instrumentation不通用，这其实道理也很简单，因为deferred instrumentation会自己选择合适的时机，手动init，不需要用这个函数来init，所以这个函数只在没有手动init的时候会自动init。
+  * 执行`__afl_manual_init`函数，其含义见上文。
+宏定义`__AFL_LOOP`内部调用`__afl_persistent_loop`函数。  
+`__afl_persistent_loop(unsigned int max_cnt)`的逻辑如下
+  * 如果是第一次执行loop 
+    * 如果is_persistent为1 
+      * 清空`__afl_area_ptr`，设置`__afl_area_ptr[0]`为1，`__afl_prev_loc`为0
+    * 设置cycle_cnt的值为传入的max_cnt参数，然后直接返回1
+  * 如果不是第一次执行loop 
+    * 如果cycle_cnt减一（代表需要执行的循环次数减一）后大于0 
+      * 发出信号`SIGSTOP`来让当前进程暂停
+      * 设置`__afl_area_ptr[0]`为1，`__afl_prev_loc`为0，然后直接返回1
+    * 如果cycle_cnt为0 
+      * 设置`__afl_area_ptr`指向一个无关数组`__afl_area_initial`。
+我们将这些联系在一起，重新梳理一遍  
+假设我们是这么使用的:
+    while (__AFL_LOOP(1000)) {
+        fuzzAPI();
+    }
+  * 首先在main函数之前读取共享内容，然后以当前进程为fork server，去和AFL fuzz通信。
+  * 当AFL fuzz通知进行一次fuzz，由于此时child_stopped为0，则fork server先fork出一个子进程。
+  * 这个子进程会很快执行到`__AFL_LOOP`包围的代码，因为是第一次执行loop，所以会先清空`__afl_area_ptr`和设置`__afl_prev_loc`为0，并向共享内存的第一个元素写一个值，然后设置循环次数1000，随后返回1，此时`while(__AFL_LOOP)`满足条件，于是执行一次fuzzAPI。
+  * 然后因为是while循环，会再次进入`__AFL_LOOP`里，此时将循环次数减一，变成999，然后发出信号`SIGSTOP`来让当前进程暂停，因为我们设置了WUNTRACED，所以waitpid函数就会返回，fork server将继续执行。
+  * fork server在收到`SIGSTOP`信号后就知道fuzzAPI已经被成功执行结束了，就设置child_stopped为1，并告知AFL fuzz
+  * 然后当AFL fuzz通知再进行一次fuzz的时候，fork server将不再需要去fork出一个新的子进程去进行fuzz，只需要恢复之前的子进程继续执行，并设置child_stopped为0
+  * 因为我们是 **相当于重新执行一次程序** ，所以将`__afl_prev_loc`设置为0，并向共享内存的第一个元素写一个值，随后直接返回1，此时`while(__AFL_LOOP)`满足条件，于是执行一次fuzzAPI，然后因为是while循环，会再次进入`__AFL_LOOP`里，再次减少一次循环次数变成998，并发出信号暂停。
+  * 上述过程重复执行，直到第1000次执行时，先恢复执行，然后返回1，然后执行一次fuzzAPI，然后因为是while循环，会再次进入`__AFL_LOOP`里，再次减少一次循环次数变成0，此时循环次数cnt已经被减到0，就不会再发出信号暂停子进程，而是设置`__afl_area_ptr`指向一个无关数组`__afl_area_initial`，随后将子进程执行到结束。 
+    * **这是因为程序依然会向后执行并触发到instrument，这会向`__afl_area_ptr`里写值，但是此时我们其实并没有执行`fuzzAPI`，我们并不想向共享内存里写值，于是将其指向一个无关数组，随意写值。同理，在deferred instrumentation模式里，在执行`__afl_manual_init`之前，也是向无关数组里写值，因为我们将fork点手动设置，就代表在这个fork点之前的path我们并不关心。**
+    * 重新整理一下上面的逻辑 
+      * loop第一次执行的时候，会初始化，然后返回1，执行一次fuzzAPI，然后cnt会减到999，然后抛出信号暂停子进程。
+      * loop第二次执行的时候，恢复执行，清空一些值，然后返回1，执行一次fuzzAPI，然后cnt会减到998，然后抛出信号暂停子进程。
+      * loop第1000次执行的时候，恢复执行，清空一些值，然后返回1，执行一次fuzzAPI，然后cnt会减到0，然后就设置指向无关数组，返回0，while循环结束，程序也将执行结束。
+  * 此时fork server将不再收到SIGSTOP信号，于是child_stopped仍为0。
+  * 所以当AFL fuzz通知fork server再进行一次fuzz的时候，由于此时child_stopped为0，则fork server会先fork出一个子进程，然后后续过程和之前一样了。
+  * 有点绕，可以结合代码再读一下 
+        int __afl_persistent_loop(unsigned int max_cnt) {
+    static u8  first_pass = 1;
+    static u32 cycle_cnt;
+    if (first_pass) {
+      if (is_persistent) {
+        memset(__afl_area_ptr, 0, MAP_SIZE);
+        __afl_area_ptr[0] = 1;
+        __afl_prev_loc = 0;
+      }
+      cycle_cnt  = max_cnt;
+      first_pass = 0;
+      return 1;
+    }
+    if (is_persistent) {
+      if (--cycle_cnt) {
+        raise(SIGSTOP);
+        __afl_area_ptr[0] = 1;
+        __afl_prev_loc = 0;
+        return 1;
+      } else {
+        __afl_area_ptr = __afl_area_initial;
+      }
+    }
+    return 0;
+    }
+####  trace-pc-guard mode
+要使用这个功能，需要先通过`AFL_TRACE_PC=1`来定义DUSE_TRACE_PC宏，从而在执行afl-clang-fast的时候传入`-fsanitize-coverage=trace-pc-guard`参数，来开启这个功能，和之前我们的插桩不同，开启了这个功能之后，我们不再是仅仅只对每个基本块插桩，而是对每条edge都进行了插桩。
+    ifdef AFL_TRACE_PC
+      CFLAGS    += -DUSE_TRACE_PC=1
+    endif
+`__sanitizer_cov_trace_pc_guard`这个函数将在每个edge调用，该函数利用函数参数guard指针所指向的uint32值来确定共享内存上所对应的地址。  
+每个edge上都有应该有其不同(但其实可能相同，原因下述)的guard值
+    void __sanitizer_cov_trace_pc_guard(uint32_t* guard) {
+      __afl_area_ptr[*guard]++;
+    }
+而这个guard指针的初始化在`__sanitizer_cov_trace_pc_guard_init`函数里，llvm会设置guard其首末分别为start和stop。  
+它会从第一个guard开始向后遍历，设置guard指向的值，这个值是通过`R(MAP_SIZE)`设置的，定义如下，所以如果我们的edge足够多，而`MAP_SIZE`不够大，就有可能重复，而这个加一是因为我们会把0当成一个特殊的值，其代表对这个edge不进行插桩。  
+这个init其实很有趣，我们可以打印输出一下`stop-start`的值，就代表了llvm发现的程序里总计的edge数。
+    #  define R(x) (random() % (x))
+    ...
+    ...
+      *(start++) = R(MAP_SIZE - 1) + 1;
+      while (start < stop) {
+        if (R(100) < inst_ratio) *start = R(MAP_SIZE - 1) + 1;
+        else *start = 0;
+        start++;
+      }
+## afl-fuzz长叙
+###  初始配置
+####  setup_signal_handlers
+注册必要的信号处理函数
+  * [Linux进程间通信（一）：信号 signal()、sigaction()](https://www.cnblogs.com/52php/p/5813867.html)
+  * SIGHUP/SIGINT/SIGTERM 
+    * hangup/interrupt/software termination signal from kill
+    * 主要是”stop”的处理函数
+    * handle_stop_sig 
+      * 设置stop_soon为1
+      * 如果child_pid存在，向其发送SIGKILL终止信号，从而被系统杀死。
+      * 如果forksrv_pid存在，向其发送SIGKILL终止信号

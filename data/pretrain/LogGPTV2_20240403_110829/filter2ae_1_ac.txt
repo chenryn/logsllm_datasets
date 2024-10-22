@@ -1,0 +1,138 @@
+**说明** ：分析伙伴系统的原理是研究 page-level heap fengshui 的前提。
+### 2-1 page allocator
+页分配器的知识可以参见
+[page_alloc.c](https://elixir.bootlin.com/linux/latest/source/mm/page_alloc.c)
+源码。
+**简介** ：[Linux page
+allocator](https://www.kernel.org/doc/gorman/html/understand/understand009.html)
+管理内核底层的物理页，SLUB / SLAB / SLOB 内存分配器都在 Page allocator 之上。例如，当内核耗尽所有 kmalloc-4k
+slab之后，内存分配器会向 Page allocator 申请内存，由于 kmalloc-4k 位于 8-page slab （order 3），所以
+Page allocator 会申请 8-page 内存给内存分配器。
+**存储结构** ：Page allocator 采用
+[free_area](https://elixir.bootlin.com/linux/v5.16.14/source/include/linux/mmzone.h#L97)
+结构（[zone->free_area](https://elixir.bootlin.com/linux/v5.16.14/source/include/linux/mmzone.h#L617)
+数组，长度为 `MAX_ORDER == 1`，所以最大order为11）来保存空闲页，也就是个保存不同 order/size 页的数组，采用 order
+来区分不同大小的页（例如，N-order 表示大小为 `PAGE_SIZEfree_area[current_order]);
+            // Get the page from the free_list
+            page = get_page_from_free_area(area, migratetype);
+            // If no freed page in free_list, goes to high order to retrieve
+            if (!page)
+                continue;
+            del_page_from_free_list(page, zone, current_order);
+            expand(zone, page, order, current_order, migratetype);
+            set_pcppage_migratetype(page, migratetype);
+            return page;
+        }
+        return NULL;
+    }
+    static inline struct page *get_page_from_free_area(struct free_area *area,
+                            int migratetype)
+    {
+        return list_first_entry_or_null(&area->free_list[migratetype],
+                        struct page, lru);
+    }
+### 2-2 [shaping
+heap](https://googleprojectzero.blogspot.com/2017/05/exploiting-linux-kernel-via-packet.html)
+**页风水目标** ：现在讨论下如何为 OOB write 布局堆结构。现在已知在页分配器中，每种 order 的页都保存在
+`free_area->free_list` 中。由于不能保证在同一 `free_list`
+中的两个页是连续的，所以即便连续申请2个同一order的页，这2个页可能相隔很远。为了更好的控制堆布局，我们需要 **确保`free_list`
+中所有的页是连续**的。首先耗尽目标order的 `free_list`，迫使其向 `higher-order`
+取页，这样取过来的页会被划分成两段连续的内存。
+**缓解噪声（保证连续）** ：有些内核进程也会分配和释放页，影响了堆布局。回到本漏洞中来，我们的目标是布局连续的 `order-3` 的页，但是可能会有
+`order-3` 的页被划分到 `order-2` 或者有 `order-2` 的页被整合到 `order-3`。为了缓解噪声影响，可以采取以下步骤：
+（1）耗尽 order 0, 1, 2 的 `free_list`；（ **采用socket中的`ring_buffer` 来堆喷—页风水**）
+（2）分配大量的 order-2 对象 （假定为N个），这样，order-2 会向 order-3 取页；（
+**分10个进程，每个进程喷200个`4-page` 大小的 `ring_buffer`**）
+（3）释放第2步中一半的对象，这样，有 N/2 个对象会存入 order-2 的 `free_list`；
+（4）释放第1步所有的对象；
+第3步中，释放一半的 order-2 就避免其发生整合而被存入 order-3，这样 order-2 的 `free_list` 中就有 N/2
+个页可以使用了，之后就不会从 `order-3` 取页或者整合到 `order-3` 了。避免我们构造连续的 8-page 时受到影响。
+* * *
+## 3\. 漏洞利用
+### 3-1 泄露方法
+**思路一（失败）** ：利用 `msg_msg`，覆写 `msg_msg->m_ts` 构造越界读。但是测试时发现，漏洞的垃圾字节会覆写
+`msg_msg->next` 指针（`m_ts` 和 `next` 相邻），导致越界读失败。
+**思路二** ：利用
+[user_key_payload](https://elixir.bootlin.com/linux/v5.16.14/source/include/keys/user-type.h#L27) 结构（从 [ELOISE](https://zplin.me/papers/ELOISE.pdf)
+论文中找到）。可以看到，这个结构的 `datalen` 长度和数据在一起，这样即便垃圾字节会填到末尾，也不会破坏到指针了。
+    struct user_key_payload {
+        struct rcu_head rcu;        // rcu指针可以被设置为NULL
+        unsigned short  datalen;    /* length of this data */
+        char        data[] __aligned(__alignof__(u64)); /* actual data */
+    };
+**key长度限制** ：Ubuntu 上默认会限制key的数量和长度。问题是导致溢出的对象位于 8-page，我们在漏洞对象后面也要布置一个 8-page
+对象（暂时称为 `victim slab`），而在Ubuntu上，只有 kmalloc-2k / kmalloc-4k / kmalloc-8k 会从
+order-3 取页。所以至少要使key被分配在 kmalloc-2k 上，才能使key位于 8-page 的页中。
+    $ sudo cat /proc/sys/kernel/keys/maxbytes 
+    20000
+    $ sudo cat /proc/sys/kernel/keys/maxkeys 
+    200
+**victim个数限制** ：可以用8个 kmalloc-4k 对象来填充`victim slab`，采用长度为 2049 的
+`user_key_payload` 即可。这样 `user_key_payload` 总长度为 `2049*8=16392`，由于限制最多 20000
+字节的key，只剩下 1 个 `user_key_payload` 可用 — `((20000-16392)/2049 = 1)`，所以最多可以布置2个
+`victim slab`，条件非常严苛。
+**增大victim个数** ：可以每个 `victim slab` 放一个 `user_key_payload`
+对象，剩下的空间填充其他对象，`user_key_payload` 可以在 `victim slab` 中任意位置，因为本漏洞可以溢出覆盖整个
+`victim slab`。这样，我们就可以喷9个 `victim slab` 了，增大的泄露的成功几率。
+### 3-2 泄露内核基址
+**方法** ：其实本可以直接在 `victim slab` 后面放一个包含内核指针的对象，但是作者很想尝试
+[post](https://www.willsroot.io/2021/08/corctf-2021-fire-of-salvation-writeup.html) 中通过篡改 `msg_msg->next` 进行任意读写的技术。先通过 `user_key_payload` 越界读来泄露
+`msg_msg->next` 指针，然后伪造 `msg_msg->m_ts` & `msg_msg->next` （`msg_msg->security`
+在Ubuntu上没用，可覆盖为0）进行任意读。
+**泄露`msg_msg->next`**：堆上布局3个相邻的对象—— `vul object` -> `user_key_payload` ->
+`msg_msg`，注意 `msg_msg->next` 指向 kmalloc-32，并堆喷大量的 `struct seq_operations`
+对象。触发越界写来篡改 `user_key_payload->datalen`，通过 `user_key_payload` 越界读来泄露
+`msg_msg->next` 指针。为了增大成功几率，可以创建9对这种布局（3个相邻对象的堆布局）。
+**泄露内核基址** ：堆上布局2个相邻的对象——`vul object` -> `msg_msg`，触发越界写来篡改 `msg_msg->m_ts` &
+`msg_msg->next` ，通过 `msg_msg` 越界读来泄露 `struct seq_operations` 对象上的函数指针（因为之前泄露的
+`msg_msg->next` 指向 kmalloc-32，而kmalloc-32 上已经喷射了很多 `struct seq_operations`
+对象）。
+**总体步骤** ：（1）~（8）泄露 `msg_msg->next` ，（9）~（12）泄露内核基址。
+（1）分配大量8-page 页来耗尽 `order-3` 的 `free_list`，这样 `order-3` 就会从 `order-4`
+取页，保证内存连续性；
+（2）分配3个连续的 8-page dumy 对象（占位对象）；（ **占位对象采用`ring_buffer`**）
+（3）释放第2个占位对象，分配1个8-page slab，其中包含1个 `user_key_payload` 对象和7个其他对象（
+**这7个对象采用多个子线程调用`setxattr()`来堆喷**）；
+（4）释放第3个占位对象，分配1个8-page slab，填满大小在4056~4072之间的 `msg_msg`，使得 `msg_msgseg` 位于
+kmalloc-32；
+（5）喷射大量的 `struct seq_operations`，和第4步的 `msg_msgseg` 位于同一cache；
+（6）释放第1个占位对象，分配漏洞对象，触发越界写来修改 `user_key_payload->datalen`；
+（7）如果第（6）步成功，就能通过 `user_key_payload` 进行越界读；
+（8）如果第（7）步成功，就能泄露出 `msg_msg->next` 指针；
+（9）分配2个连续的 8-page dumy 对象（占位对象）；
+（10）释放第2个占位对象，分配1个8-page slab，填满 `msg_msg`；
+（11）释放第1个占位对象，分配漏洞对象，触发越界写来篡改 `msg_msg->m_ts` & `msg_msg->next` ；
+（12）如果第（11）步成功，就能越界读来泄露 `struct seq_operations` 对象上的函数指针。
+### 3-3 提权
+**任意写** ：还是利用 `msg_msg` 来进行任意写。由于普通用户需要 [specific
+capability](https://lwn.net/Articles/819834/) 才能使用userfaultfd，可以采用
+[CVE-2022-0185](https://www.willsroot.io/2022/01/cve-2022-0185.html)
+中的介绍的FUSE方法来进行任意写。通过FUSE可以实现用户空间文件系统，然后映射我们的内存地址，只要有读写访问到该地址就可以调用我们的页错误处理函数，这样可以控制当
+`msg_msg->next` 被篡改之后，再允许 `copy_from_user()` 继续访问用户空间的数据。
+**提权** ：利用任意写来篡改 `modprbe_path` 提权。后面方法和
+[CVE-2022-0185](https://www.willsroot.io/2022/01/cve-2022-0185.html) 一样。将
+`modprbe_path` 改为 `/tmp/get_rooot` （运行`chmod u+s /bin/bash`），这样提权后只要运行
+`/bin/bash` 即可提权。
+（1）分配2个连续的 8-page dumy 对象（占位对象）；
+（2）映射消息内容到FUSE，释放第2个占位对象，分配1个8-page slab，填满 `msg_msg`，线程会暂停在
+`copy_from_user()`；
+（3）释放第1个占位对象，分配漏洞对象，触发越界写来篡改 `msg_msg->next` 为 `modprobe_path` 地址；
+（4）执行一个错误格式的binary 触发 modprobe；
+（5）打开 `/bin/bash` 即可提权。
+**exp说明** ：
+  * 原exp中前1271行是设置环境，不重要（作者说，环境设置部分的代码是syzkaller自动生成的，非常复杂；只有利用部分，也即 `loop()` 函数是作者写的，我们需要重点研究该函数），需要用到几个符号：`single_start` / `single_next` / `single_stop` / `modprobe_path`，在原exploit的111行修改即可。
+  * exp中 main 函数设置完环境之后，调用 `clone()` 创建子进程执行 `loop()` 函数，`loop()` 函数实现主要利用过程。参见 [clone()分析](https://blog.csdn.net/ren18281713749/article/details/94769023)，不同于 `fork()` / `vfork()` ，`clone()` 克隆生成的子进程继续运行时不以调用处为起点，转而去调用以参数func所指定的函数；当函数func返回或者是调用 `exit()`（或者 `_exit()`）之后，克隆产生的子进程就会终止，父进程可以通过 `wait()` 一类函数来等待克隆子进程；调用者必须分配一块大小适中的内存空间供子进程的栈使用，同时将这块内存的指针置于参数 `child_stack` 中。
+      #define _GNU_SOURCE
+      #include 
+      int clone(int (*func)(void*),void *child_stack,int flags,void *func_arg,....
+                 /*pid_t *ptid,struct user_desc *tls,pid_t *ctid*/);
+                                           Return process ID of child on success,or -1 on error
+  * 页喷射对象：进行页风水和页占位的对象是`ring_buffer`，因为其size设置很灵活，适合页喷射。
+* * *
+### 参考
+[CVE-2022-27666: Exploit esp6 modules in Linux
+kernel](https://etenal.me/archives/1825)
+[exploit](https://github.com/plummm/CVE-2022-27666)
+[[漏洞分析] CVE-2022-27666 IPV6
+ESP协议页溢出内核提权](https://blog.csdn.net/Breeze_CAT/article/details/123922861)
+* * *

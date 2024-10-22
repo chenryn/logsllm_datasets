@@ -1,0 +1,191 @@
+## ZFS ARC & L2ARC zfs-$ver/module/zfs/arc.c  
+### 作者                                                                                                                                                                               
+digoal                                                                                                                                                                                 
+### 日期                                                                                                                                                                                                
+2014-06-25                                                                                                                                                                       
+### 标签                                                                                                                                                                             
+PostgreSQL , Linux , ZFS                                                                                                                                                                           
+----                                                                                                                                                                                       
+## 背景              
+可调参数, 含义以及默认值见arc.c或/sys/module/zfs/parameter/$parm_name  
+如果是freebsd或其他原生支持zfs的系统, 调整sysctl.conf.  
+```  
+parm:           zfs_arc_min:Min arc size (ulong)  
+parm:           zfs_arc_max:Max arc size (ulong)  
+parm:           zfs_arc_meta_limit:Meta limit for arc size (ulong)  
+parm:           zfs_arc_meta_prune:Bytes of meta data to prune (int)  
+parm:           zfs_arc_grow_retry:Seconds before growing arc size (int)  
+parm:           zfs_arc_shrink_shift:log2(fraction of arc to reclaim) (int)  
+parm:           zfs_arc_p_min_shift:arc_c shift to calc min/max arc_p (int)  
+parm:           zfs_disable_dup_eviction:disable duplicate buffer eviction (int)  
+parm:           zfs_arc_memory_throttle_disable:disable memory throttle (int)  
+parm:           zfs_arc_min_prefetch_lifespan:Min life of prefetch block (int)  
+parm:           l2arc_write_max:Max write bytes per interval (ulong)  
+parm:           l2arc_write_boost:Extra write bytes during device warmup (ulong)  
+parm:           l2arc_headroom:Number of max device writes to precache (ulong)  
+parm:           l2arc_headroom_boost:Compressed l2arc_headroom multiplier (ulong)  
+parm:           l2arc_feed_secs:Seconds between L2ARC writing (ulong)  
+parm:           l2arc_feed_min_ms:Min feed interval in milliseconds (ulong)  
+parm:           l2arc_noprefetch:Skip caching prefetched buffers (int)  
+parm:           l2arc_nocompress:Skip compressing L2ARC buffers (int)  
+parm:           l2arc_feed_again:Turbo L2ARC warmup (int)  
+parm:           l2arc_norw:No reads during writes (int)  
+```  
+L2ARC几点需要注意,   
+1\. L2ARC的内容是l2arc_feed_thread函数主动间歇性的从ARC读取的. 所以ARC里没有的内容, L2ARC也不可能有.  
+2\. L2ARC不存储脏数据, 所以也不需要回写到DISK. 鉴于这个因素, L2ARC不适合频繁变更的场景(如oltp中的频繁更新场景)  
+3\. 如果L2ARC中缓存的数据块在ARC变成脏数据了, 这部分数据会直接从L2ARC丢弃.  
+4\. L2ARC的优化参数(配置到/etc/modprobe.d/zfs.conf或动态变更/sys/module/zfs/parameters/$PARM_NAME)  
+```  
+ *      l2arc_write_max         max write bytes per interval, 一次l2arc feed的最大量.  
+ *      l2arc_write_boost       extra write bytes during device warmup  
+ *      l2arc_noprefetch        skip caching prefetched buffers  
+ *      l2arc_nocompress        skip compressing buffers  
+ *      l2arc_headroom          number of max device writes to precache  
+ *      l2arc_headroom_boost    when we find compressed buffers during ARC  
+ *                              scanning, we multiply headroom by this  
+ *                              percentage factor for the next scan cycle,  
+ *                              since more compressed buffers are likely to  
+ *                              be present  
+ *      l2arc_feed_secs         seconds between L2ARC writing, 如果要加快从arc导入l2arc的速度, 可缩短interval  
+```  
+参见  
+zfs-0.6.2/module/zfs/arc.c  
+ARC  
+```  
+/*  
+ * DVA-based Adjustable Replacement Cache  
+ *  
+ * While much of the theory of operation used here is  
+ * based on the self-tuning, low overhead replacement cache  
+ * presented by Megiddo and Modha at FAST 2003, there are some  
+ * significant differences:  
+ *  
+ * 1. The Megiddo and Modha model assumes any page is evictable.  
+ * Pages in its cache cannot be "locked" into memory.  This makes  
+ * the eviction algorithm simple: evict the last page in the list.  
+ * This also make the performance characteristics easy to reason  
+ * about.  Our cache is not so simple.  At any given moment, some  
+ * subset of the blocks in the cache are un-evictable because we  
+ * have handed out a reference to them.  Blocks are only evictable  
+ * when there are no external references active.  This makes  
+ * eviction far more problematic:  we choose to evict the evictable  
+ * blocks that are the "lowest" in the list.  
+ *  
+ * There are times when it is not possible to evict the requested  
+ * space.  In these circumstances we are unable to adjust the cache  
+ * size.  To prevent the cache growing unbounded at these times we  
+ * implement a "cache throttle" that slows the flow of new data  
+ * into the cache until we can make space available.  
+ *  
+ * 2. The Megiddo and Modha model assumes a fixed cache size.  
+ * Pages are evicted when the cache is full and there is a cache  
+ * miss.  Our model has a variable sized cache.  It grows with  
+ * high use, but also tries to react to memory pressure from the  
+ * operating system: decreasing its size when system memory is  
+ * tight.  
+ *  
+ * 3. The Megiddo and Modha model assumes a fixed page size. All  
+ * elements of the cache are therefor exactly the same size.  So  
+ * when adjusting the cache size following a cache miss, its simply  
+ * a matter of choosing a single page to evict.  In our model, we  
+ * have variable sized cache blocks (rangeing from 512 bytes to  
+ * 128K bytes).  We therefor choose a set of blocks to evict to make  
+ * space for a cache miss that approximates as closely as possible  
+ * the space used by the new block.  
+ *  
+ * See also:  "ARC: A Self-Tuning, Low Overhead Replacement Cache"  
+ * by N. Megiddo & D. Modha, FAST 2003  
+ */  
+/*  
+ * The locking model:  
+ *  
+ * A new reference to a cache buffer can be obtained in two  
+ * ways: 1) via a hash table lookup using the DVA as a key,  
+ * or 2) via one of the ARC lists.  The arc_read() interface  
+ * uses method 1, while the internal arc algorithms for  
+ * adjusting the cache use method 2.  We therefor provide two  
+ * types of locks: 1) the hash table lock array, and 2) the  
+ * arc list locks.  
+ *  
+ * Buffers do not have their own mutexes, rather they rely on the  
+ * hash table mutexes for the bulk of their protection (i.e. most  
+ * fields in the arc_buf_hdr_t are protected by these mutexes).  
+ *  
+ * buf_hash_find() returns the appropriate mutex (held) when it  
+ * locates the requested buffer in the hash table.  It returns  
+ * NULL for the mutex if the buffer was not in the table.  
+ *  
+ * buf_hash_remove() expects the appropriate hash mutex to be  
+ * already held before it is invoked.  
+ *  
+ * Each arc state also has a mutex which is used to protect the  
+ * buffer list associated with the state.  When attempting to  
+ * obtain a hash table lock while holding an arc list lock you  
+ * must use: mutex_tryenter() to avoid deadlock.  Also note that  
+ * the active state mutex must be held before the ghost state mutex.  
+ *  
+ * Arc buffers may have an associated eviction callback function.  
+ * This function will be invoked prior to removing the buffer (e.g.  
+ * in arc_do_user_evicts()).  Note however that the data associated  
+ * with the buffer may be evicted prior to the callback.  The callback  
+ * must be made with *no locks held* (to prevent deadlock).  Additionally,  
+ * the users of callbacks must ensure that their private data is  
+ * protected from simultaneous callbacks from arc_buf_evict()  
+ * and arc_do_user_evicts().  
+ *  
+ * It as also possible to register a callback which is run when the  
+ * arc_meta_limit is reached and no buffers can be safely evicted.  In  
+ * this case the arc user should drop a reference on some arc buffers so  
+ * they can be reclaimed and the arc_meta_limit honored.  For example,  
+ * when using the ZPL each dentry holds a references on a znode.  These  
+ * dentries must be pruned before the arc buffer holding the znode can  
+ * be safely evicted.  
+ *  
+ * Note that the majority of the performance stats are manipulated  
+ * with atomic operations.  
+ *  
+ * The L2ARC uses the l2arc_buflist_mtx global mutex for the following:  
+ *  
+ *      - L2ARC buflist creation  
+ *      - L2ARC buflist eviction  
+ *      - L2ARC write completion, which walks L2ARC buflists  
+ *      - ARC header destruction, as it removes from L2ARC buflists  
+ *      - ARC header release, as it removes from L2ARC buflists  
+ */  
+```  
+L2ARC  
+```  
+/*  
+ * Level 2 ARC  
+ *  
+ * The level 2 ARC (L2ARC) is a cache layer in-between main memory and disk.  
+ * It uses dedicated storage devices to hold cached data, which are populated  
+ * using large infrequent writes.  The main role of this cache is to boost  
+ * the performance of random read workloads.  The intended L2ARC devices  
+ * include short-stroked disks, solid state disks, and other media with  
+ * substantially faster read latency than disk.  
+ *  
+ *                 +-----------------------+  
+ *                 |         ARC           |  
+ *                 +-----------------------+  
+ *                    |         ^     ^  
+ *                    |         |     |  
+ *      l2arc_feed_thread()    arc_read()  
+ *                    |         |     |  
+ *                    |  l2arc read   |  
+ *                    V         |     |  
+ *               +---------------+    |  
+ *               |     L2ARC     |    |  
+ *               +---------------+    |  
+ *                   |    ^           |  
+ *          l2arc_write() |           |  
+ *                   |    |           |  
+ *                   V    |           |  
+ *                 +-------+      +-------+  
+ *                 | vdev  |      | vdev  |  
+ *                 | cache |      | cache |  
+ *                 +-------+      +-------+  
+ *                 +=========+     .-----.  
+ *                 :  L2ARC  :    |-_____-|  
+ *                 : devices :    | Disks |  

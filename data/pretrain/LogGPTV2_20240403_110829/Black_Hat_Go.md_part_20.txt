@@ -1,0 +1,389 @@
+decoding logic, allowing a type to maintain complete control
+over the way it’s handled.
+Forcing ASN.1 Encoding
+Let’s look at how to force your Foo type to be ASN.1 encoded,
+while leaving other fields in your Message struct as-is. To do
+this, you need to define the MarshalBinary() and UnmarshalBinary()
+functions on the type, as in Listing 6-4.
+func (f *Foo) MarshalBinary(meta *encoder.Metadata) ([]byte, error) {
+buf, err := asn1.Marshal(*f)❶
+if err != nil {
+return nil, err
+}
+return buf, nil
+}
+func (f *Foo) UnmarshalBinary(buf []byte, meta *encoder.Metadata) error {
+data := Foo{}
+if _, err := asn1.Unmarshal(buf, &data)❷; err != nil {
+return err
+}
+*f = data
+return nil
+}
+Listing 6-4: Implementing the BinaryMarshallable interface for ASN.1 encoding
+The methods don’t do much besides make calls to Go’s
+asn1.Marshal() ❶ and asn1.Unmarshal() ❷ functions. You can find
+variations of these functions within the gss package code at
+https://github.com/blackhat-go/bhg/blob/master/ch-
+6/smb/gss/gss.go. The only real difference between them is
+that the gss package code has additional tweaks to make Go’s
+asn1 encoding function play nicely with the data format defined
+within the SMB spec.
+The ntlmssp package at https://github.com/blackhat-
+go/bhg/blob/master/ch-6/smb/ntlmssp/ntlmssp.go contains an
+alternative implementation of the MarshalBinary() and
+UnmarshalBinary() functions. Although it doesn’t demonstrate
+ASN.1 encoding, the ntlmssp code shows how to handle
+encoding of an arbitrary data type by using necessary
+metadata. The metadata—the lengths and offsets of variable-
+length byte slices—is pertinent to the encoding process. This
+metadata leads us to the next challenge you need to address.
+Understanding Metadata and Referential Fields
+If you dig into the SMB specification a little, you’ll find that
+some messages contain fields that reference other fields of the
+same message. For example, the fields—taken from the
+Negotiate response message—refer to the offset and length of
+a variable-length byte slice that contains the actual value:
+SecurityBufferOffset (2 bytes): The offset, in bytes, from
+the beginning of the SMB2 header to the security buffer.
+SecurityBufferLength (2 bytes): The length, in bytes, of
+the security buffer.
+These fields essentially act as metadata. Later in the
+message spec, you find the variable-length field within which
+your data actually resides:
+Buffer (variable): The variable-length buffer that contains
+the security buffer for the response, as specified by
+SecurityBufferOffset and SecurityBufferLength. The buffer
+SHOULD contain a token as produced by the GSS protocol
+as specified in section 3.3.5.4. If SecurityBufferLength is 0,
+this field is empty and client-initiated authentication, with
+an authentication protocol of the client’s choice, will be
+used instead of server-initiated SPNEGO authentication, as
+described in [MS-AUTHSOD] section 2.1.2.2.
+Generally speaking, this is how the SMB spec consistently
+handles variable-length data: fixed-position length and offset
+fields depicting the size and location of the data itself. This is
+not specific to response messages or the Negotiate message,
+and often you’ll find multiple fields within a single message
+using this pattern. Really, anytime you have a variable-length
+field, you’ll find this pattern. The metadata explicitly instructs
+the message receiver on how to locate and extract the data.
+This is useful, but it complicates your encoding strategy
+because you now need to maintain a relationship between
+different fields within a struct. You can’t, for example, just
+marshal an entire message because some of the metadata fields
+—for example, length and offset—won’t be known until the
+data itself is marshaled or, in the case of the offset, all fields
+preceding the data are marshaled.
+Understanding the SMB Implementation
+The remainder of this subsection addresses some of the ugly
+details regarding the SMB implementation we devised. You
+don’t need to understand this information to use the package.
+We played around with a variety of approaches to handle
+referential data, eventually settling on a solution that utilizes a
+combination of structure field tags and reflection. Recall that
+reflection is a technique through which a program can inspect
+itself, particularly examining things like its own data types.
+Field tags are somewhat related to reflection in that they
+define arbitrary metadata about a struct field. You may recall
+them from previous XML, MSGPACK, or JSON encoding
+examples. For example, Listing 6-5 uses struct tags to define
+JSON field names.
+type Foo struct {
+A int `json:"a"`
+B string `json:"b"`
+}
+Listing 6-5: A struct defining JSON field tags
+Go’s reflect package contains the functions we used to
+inspect data types and extract field tags. At that point, it was a
+matter of parsing the tags and doing something meaningful
+with their values. In Listing 6-6, you can see a struct defined
+in the SMB package.
+type NegotiateRes struct {
+Header
+StructureSize uint16
+SecurityMode uint16
+DialectRevision uint16
+Reserved uint16
+ServerGuid []byte `smb:"fixed:16"`❶
+Capabilities uint32
+MaxTransactSize uint32
+MaxReadSize uint32
+MaxWriteSize uint32
+SystemTime uint64
+ServerStartTime uint64
+SecurityBufferOffset uint16 `smb:"offset:SecurityBlob"`❷
+SecurityBufferLength uint16 `smb:"len:SecurityBlob"`❸
+Reserved2 uint32
+SecurityBlob *gss.NegTokenInit
+}
+Listing 6-6: Using SMB field tags for defining field metadata (/ch-
+6/smb/smb/smb.go)
+This type uses three field tags, identified by the SMB key:
+fixed ❶, offset ❷, and len ❸. Keep in mind that we chose all
+these names arbitrarily. You aren’t obligated to use a specific
+name. The intent of each tag is as follows:
+fixed identifies a []byte as a fixed-length field of the provided size. In this case,
+ServerGuid is 16 bytes in length.
+offset defines the number of bytes from the beginning of the struct to the first
+position of a variable-length data buffer. The tag defines the name of the field—
+in this case, SecurityBlob—to which the offset relates. A field by this referenced
+name is expected to exist in the same struct.
+len defines the length of a variable-length data buffer. The tag defines the name
+of the field—in this case, SecurityBlob, to which the length relates. A field by
+this referenced name should exist in the same struct.
+As you might have noticed, our tags allow us not only to
+create relationships—through arbitrary metadata—between
+different fields, but also to differentiate between fixed-length
+byte slices and variable-length data. Unfortunately, adding
+these struct tags doesn’t magically fix the problem. The code
+needs to have the logic to look for these tags and take specific
+actions on them during marshaling and unmarshaling.
+Parsing and Storing Tags
+In Listing 6-7, the convenience function, called parseTags(),
+performs the tag-parsing logic and stores the data in a helper
+struct of type TagMap.
+func parseTags(sf reflect.StructField❶) (*TagMap, error) {
+ret := &TagMap{
+m: make(map[string]interface{}),
+has: make(map[string]bool),
+}
+tag := sf.Tag.Get("smb")❷
+smbTags := strings.Split(tag, ",")❸
+for _, smbTag := range smbTags❹ {
+tokens := strings.Split(smbTag, ":")❺
+switch tokens[0] { ❻
+case "len", "offset", "count":
+if len(tokens) != 2 {
+return nil, errors.New("Missing required tag data. Expecting key:val")
+}
+ret.Set(tokens[0], tokens[1])
+case "fixed":
+if len(tokens) != 2 {
+return nil, errors.New("Missing required tag data. Expecting key:val")
+}
+i, err := strconv.Atoi(tokens[1])
+if err != nil {
+return nil, err
+}
+ret.Set(tokens[0], i) ❼
+}
+Listing 6-7: Parsing structure tags (/ch-6/smb/smb/encoder/encoder.go)
+The function accepts a parameter named sf of type
+reflect.StructField ❶, which is a type defined within Go’s reflect
+package. The code calls sf.Tag.Get("smb") on the StructField variable
+to retrieve any smb tags defined on the field ❷. Again, this is
+an arbitrary name we chose for our program. We just need to
+make sure that the code to parse the tags is using the same key
+as the one we used in our struct’s type definition.
+We then split the smb tags on a comma ❸, in case we need
+to have multiple smb tags defined on a single struct field in the
+future, and loop through each tag ❹. We split each tag on a
+colon ❺—recall that we used the format name:value for our tags,
+such as fixed:16 and len:SecurityBlob. With the individual tag data
+separated into its basic key and value pairing, we use a switch
+statement on the key to perform key-specific validation logic,
+such as converting values to integers for fixed tag values ❻.
+Lastly, the function sets the data in our custom map named
+❼.
+ret
+Invoking the parseTags() Function and Creating a
+reflect.StructField Object
+Now, how do we invoke the function, and how do we create
+an object of type reflect.StructField? To answer these questions,
+look at the unmarshal() function in Listing 6-8, which is within
+the same source file that has our parseTags() convenience
+function. The unmarshal() function is extensive, so we’ll just
+piece together the most relevant portions.
+func unmarshal(buf []byte, v interface{}, meta *Metadata) (interface{}, error) {
+typev := reflect.TypeOf(v) ❶
+valuev := reflect.ValueOf(v) ❷
+--snip--
+r := bytes.NewBuffer(buf)
+switch typev.Kind() { ❸
+case reflect.Struct:
+--snip--
+case reflect.Uint8:
+--snip--
+case reflect.Uint16:
+--snip--
+case reflect.Uint32:
+--snip--
+case reflect.Uint64:
+--snip--
+case reflect.Slice, reflect.Array:
+--snip--
+default:
+return errors.New("Unmarshal not implemented for kind:" +
+typev.Kind().String()), nil
+}
+return nil, nil
+}
+Listing 6-8: Using reflection to dynamically unmarshal unknown types (/ch-
+6/smb/smb/encoder/encoder.go)
+The unmarshal() function uses Go’s reflect package to retrieve
+the type ❶ and value ❷ of the destination interface to which
+our data buffer will be unmarshaled. This is necessary because
+in order to convert an arbitrary byte slice into a struct, we need
+to know how many fields are in the struct and how many bytes
+to read for each field. For example, a field defined as uint16
+consumes 2 bytes, whereas a uint64 consumes 8 bytes. By using
+reflection, we can interrogate the destination interface to see
+what data type it is and how to handle the reading of data.
+Because the logic for each type will differ, we perform a switch
+on the type by calling typev.Kind() ❸, which returns a reflect.Kind
+instance indicating the kind of data type we’re working with.
+You’ll see that we have a separate case for each of the allowed
+data types.
+Handling Structs
+Let’s look at the case block, in Listing 6-9, that handles a struct
+type, since that is a likely initial entry point.
+case reflect.Struct:
+m := &Metadata{ ❶
+Tags: &TagMap{},
+Lens: make(map[string]uint64),
+Parent: v,
+ParentBuf: buf,
+Offsets: make(map[string]uint64),
+CurrOffset: 0,
+}
+for i := 0; i < typev.NumField(); i++ { ❷
+m.CurrField = typev.Field(i).Name❸
+tags, err := parseTags(typev.Field(i))❹
+if err != nil {
+return nil, err
+}
+m.Tags = tags
+var data interface{}
+switch typev.Field(i).Type.Kind() { ❺
+case reflect.Struct:
+data, err = unmarshal(buf[m.CurrOffset:],
+valuev.Field(i).Addr().Interface(), m)❻
+default:
+data, err = unmarshal(buf[m.CurrOffset:], valuev.Field(i).Interface(),
+m)❼
+}
+if err != nil {
+return nil, err
+}
+valuev.Field(i).Set(reflect.ValueOf(data)) ❽
+}
+v = reflect.Indirect(reflect.ValueOf(v)).Interface()
+meta.CurrOffset += m.CurrOffset ❾
+return v, nil
+Listing 6-9: Unmarshaling a struct type (/ch-6/smb/smb/encoder/encoder.go)
+The case block begins by defining a new Metadata object ❶, a
+type used to track relevant metadata, including the current
+buffer offset, field tags, and other information. Using our type
+variable, we call the NumField() method to retrieve the number
+of fields within the struct ❷. It returns an integer value that
+acts as the constraint for a loop.
+Within the loop, we can extract the current field through a
+call to the type’s Field(index int) method. The method returns a
+reflect.StructField type. You’ll see we use this method a few times
+throughout this code snippet. Think of it as retrieving an
+element from a slice by index value. Our first usage ❸
+retrieves the field to extract the field’s name. For example,
+SecurityBufferOffset and SecurityBlob are field names within the
+NegotiateRes struct defined in Listing 6-6. The field name is
+assigned to the CurrField property of our Metadata object. The
+second call to the Field(index int) method is inputted to the
+parseTags() function ❹ from Listing 6-7. We know this function
+parses our struct field tags. The tags are included in our Metadata
+object for later tracking and usage.
+Next, we use a switch statement to act specifically on the
+field type ❺. There are only two cases. The first handles
+instances where the field itself is a struct ❻, in which case, we
+make a recursive call to the unmarshal() function, passing to it a
+pointer to the field as an interface. The second case handles all
+other kinds (primitives, slices, and so on), recursively calling
+the unmarshal() function and passing it the field itself as an
+interface ❼. Both calls do some funny business to advance the
+buffer to start at our current offset. Our recursive call
+eventually returns an interface{}, which is a type that contains
+our unmarshaled data. We use reflection to set our current
+field’s value to the value of this interface data ❽. Lastly, we
+advance our current offset in the buffer ❾.
+Yikes! Can you see how this can be a challenge to
+develop? We have a separate case for every kind of input.
+Luckily, the case block that handles a struct is the most
+complicated.
+Handling uint16
+If you are really paying attention, you’re probably asking:
+where do you actually read data from the buffer? The answer
+is nowhere in Listing 6-9. Recall that we are making recursive
+calls to the unmarshal() function, and each time, we pass the inner
+fields to the function. Eventually we’ll reach primitive data
+types. After all, at some point, the innermost nested structs are
+composed of basic data types. When we encounter a basic data
+type, our code will match against a different case in the
+outermost switch statement. For example, when we encounter a
+uint16 data type, this code executes the case block in Listing 6-
+10.
+case reflect.Uint16:
+var ret uint16
+if err := binary.Read(r, binary.LittleEndian, &ret)❶; err != nil {
+return nil, err
+}
+if meta.Tags.Has("len")❷ {
+ref, err := meta.Tags.GetString("len")❸
+if err != nil {
+return nil, err
+}
+meta.Lens[ref]❹ = uint64(ret)
+}
+❺ meta.CurrOffset += uint64(binary.Size(ret))
+return ret, nil
+Listing 6-10: Unmarshaling uint16 data (/ch-6/smb/smb/encoder/encoder.go/)
+In this case block, we make a call to binary.Read() in order to
+read data from our buffer into a variable, ret ❶. This function
+is smart enough to know how many bytes to read, based off
+the type of the destination. In this case, ret is a uint16, so 2 bytes
+are read.
+Next, we check whether the len field tag is present ❷. If it
+is, we retrieve the value—that is, a field name—tied to that
+key ❸. Recall that this value will be a field name to which the
+current field is expected to refer. Because the length-
+identifying fields precede the actual data in the SMB
+messages, we don’t know where the buffer data actually
+resides, and so we can’t take any action yet.
+We’ve just acquired length metadata, and there’s no better
+place to store it than in our Metadata object. We store it within a
+map[string]uint64 that maintains a relationship of reference field
+names to their lengths ❹. Phrased another way, we now know
+how long a variable-length byte slice needs to be. We advance
+the current offset by the size of the data we just read ❺, and
+return the value read from the buffer.
+Similar logic and metadata tracking happen in the process
+of handling the offset tag information, but we omitted that code
+for brevity.
+Handling Slices
+In Listing 6-11, you can see the case block that unmarshals
+slices, which we need to account for both fixed- and variable-
+length data while using tags and metadata in the process.
+case reflect.Slice, reflect.Array:
+switch typev.Elem().Kind()❶ {
+case reflect.Uint8:
+var length, offset int ❷
+var err error
+if meta.Tags.Has("fixed") {
+if length, err = meta.Tags.GetInt("fixed")❸; err != nil {
+return nil, err
+}
+// Fixed length fields advance current offset
+meta.CurrOffset += uint64(length) ❹
+} else {
+if val, ok := meta.Lens[meta.CurrField]❺; ok {
+length = int(val)
+} else {
+return nil, errors.New("Variable length field missing length reference in
+struct")
+}
+if val, ok := meta.Offsets[meta.CurrField]❻; ok {
+offset = int(val)
+} else {
+// No offset found in map. Use current offset
+offset = int(meta.CurrOffset)
+}
+// Variable length data is relative to parent/outer struct.
+// Reset reader to point to beginning of data

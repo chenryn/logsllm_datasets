@@ -1,0 +1,171 @@
+发布端decode, output plugin压力较大，写入TPS达到18万时，延迟较严重  
+```  
+48096 digoal  20   0 38.3g 5.4g 2.1g R 100.0  1.1   1:40.37 postgres: bgworker: logical replication worker for subscription 24689                      
+48097 digoal  20   0 34.9g 5408 3856 S 40.3   0.0   0:38.24 postgres: wal sender process postgres 127.0.0.1(57452) idle  
+```  
+发布端  
+```  
+postgres=# select pg_size_pretty(pg_wal_location_diff(pg_current_wal_insert_location(), sent_location)), pg_size_pretty(pg_wal_location_diff(pg_current_wal_insert_location(), replay_location)), * from pg_stat_replication ;  
+-[ RECORD 1 ]----+------------------------------  
+pg_size_pretty   | 5072 MB  
+pg_size_pretty   | 5263 MB  
+pid              | 48097  
+usesysid         | 10  
+usename          | postgres  
+application_name | sub1_from_pub1  
+client_addr      | 127.0.0.1  
+client_hostname  |   
+client_port      | 57452  
+backend_start    | 2017-02-28 14:01:37.686917+08  
+backend_xmin     |   
+state            | streaming  
+sent_location    | 0/FC673B10  
+write_location   | 0/F0761CC0  
+flush_location   | 0/F075FB70  
+replay_location  | 0/F0761CC0  
+sync_priority    | 0  
+sync_state       | async  
+\watch 1  
+```  
+订阅端  
+```  
+postgres=# select pg_size_pretty(pg_wal_location_diff(received_lsn, latest_end_lsn)), * from pg_stat_subscription ;  
+-[ RECORD 1 ]---------+------------------------------  
+pg_size_pretty        | 68 MB  
+subid                 | 24689  
+subname               | sub1_from_pub1  
+pid                   | 48096  
+received_lsn          | 1/2F894A60  
+last_msg_send_time    |   
+last_msg_receipt_time | 2017-02-28 14:18:48.447466+08  
+latest_end_lsn        | 1/2B498FC8  
+latest_end_time       | 2017-02-28 14:18:38.431168+08  
+\watch 1  
+```  
+订阅端还可以查看pg_replication_origin_status，  
+remote_lsn指已复制到订阅者的发布者的LSN。  
+local_lsn指本地已持久化REDO的LSN，只有在这个LSN之前的DIRTY PAGE才能flush到磁盘。  
+```  
+dst=# select * from pg_replication_origin_status;  
+ local_id | external_id | remote_lsn | local_lsn    
+----------+-------------+------------+------------  
+        1 |             | 0/0        | 0/0  
+        3 | pg_24689    | 6/5931F948 | 7/A79CA450  
+(2 rows)  
+```  
+对应的数据结构  
+```  
+/*  
+ * Replay progress of a single remote node.  
+ */  
+typedef struct ReplicationState  
+{  
+        /*  
+         * Local identifier for the remote node.  
+         */  
+        RepOriginId roident;  
+        /*  
+         * Location of the latest commit from the remote side.  
+         */  
+        XLogRecPtr      remote_lsn;  
+        /*  
+         * Remember the local lsn of the commit record so we can XLogFlush() to it  
+         * during a checkpoint so we know the commit record actually is safe on  
+         * disk.  
+         */  
+        XLogRecPtr      local_lsn;  
+        /*  
+         * PID of backend that's acquired slot, or 0 if none.  
+         */  
+        int                     acquired_by;  
+        /*  
+         * Lock protecting remote_lsn and local_lsn.  
+         */  
+        LWLock          lock;  
+} ReplicationState;  
+```  
+延迟较大  
+物理流复制几乎0延迟，而逻辑复制带来的延迟是比较大的。  
+10\. 大事务压测  
+```  
+\c src  
+delete from t1;  
+DELETE 46844120  
+```  
+观测延迟  
+```  
+\c dst  
+select * from t1 limit 1;  
+\watch 1  
+开始时间  
+Tue 28 Feb 2017 04:04:08 PM CST (every 1s)  
+ id | info |          crt_time            
+----+------+----------------------------  
+  1 | test | 2017-02-28 14:04:03.120126  
+(1 row)  
+结束时间  
+Tue 28 Feb 2017 04:19:05 PM CST (every 1s)
+ id | info | crt_time 
+----+------+----------
+(0 rows)  
+```  
+延迟15分, 较大  
+## 逻辑复制实时性  
+实际上PostgreSQL的逻辑复制也是流式的，事务没有结束时，发布端事务过程中产生的变更会实时的同步并在订阅端APPLY。  
+但是逻辑复制始终是基于行的，延迟和块级复制还是差很大。  
+## 关于订阅端异步提交  
+订阅端如果开启了异步提交，那么哪些脏页（shared buffer）能flush到磁盘呢？  
+查看pg_replication_origin_status，  
+remote_lsn指已复制到订阅者的发布者的LSN。  
+local_lsn指本地已持久化REDO的LSN，只有在这个LSN之前的DIRTY PAGE才能flush到磁盘。（这样做可以保证可靠性和一致性）  
+```  
+dst=# select * from pg_replication_origin_status;  
+ local_id | external_id | remote_lsn | local_lsn    
+----------+-------------+------------+------------  
+        1 |             | 0/0        | 0/0  
+        3 | pg_24689    | 6/5931F948 | 7/A79CA450  
+(2 rows)  
+```  
+## 注意事项  
+1\. 如果被订阅的数据有主外键约束，请将其作为一个订阅。否则可能会有约束的问题  
+2\. 因为逻辑复制在订阅端实际上是逻辑写操作，请尽量避免锁冲突。比如truncate , alter table.  
+3\. 在订阅端，delete, update 不存在记录，不报错  
+4\. 目前PostgreSQL逻辑复制还有很多优化空间，比如分组，比如合并，提升复制效率。  
+5\. 相关系统表、视图、函数  
+```
+pg_publication
+pg_stat_replication
+pg_replication_slots
+pg_subscription
+pg_stat_subscription
+pg_replication_origin_status
+```
+6\. 相关语法  
+```
+CREATE PUBLICATION
+CREATE SUBSCRIPTION
+```
+7\. 相关参数  
+```
+postgresql.conf
+max_worker_processes = 128  
+max_logical_replication_workers = 32  
+max_wal_senders = 48  
+max_replication_slots = 48 
+pg_hba.conf
+host all all 0.0.0.0/0 md5
+host replication postgres 0.0.0.0/0 md5 
+```
+8\. 目前PostgreSQL逻辑复制不支持源、目标相同，但是"schema.表名"不完全相同的情形。  也不支持字段类型有不一致的源目标复制。  所以如果你想对一张大表修改表结构，或者处理数据，可以考虑用触发器的方式(俗称的ONLINE DDL)。     
+9\. 需要注意长事务（例如某些写事务，不关），这个事务之后的WAL在发布端不会被清除。   
+## 参考  
+https://www.postgresql.org/docs/devel/static/logical-replication.html  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

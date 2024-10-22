@@ -1,0 +1,174 @@
+**作者：knaithe@天玄安全实验室  
+原文链接：**
+> **漏洞描述** ：UAF类型的漏洞，通过伪造pool_rec内存池控制结构，可以篡改函数指针，从而达到任意命令执行。
+>
+> **漏洞修复**
+> ：
+>
+> **影响版本** ：小于v1.3.7rc3
+>
+> **测试版本** ：v1.3.7rc2
+>
+> **保护机制** ：Canary/NX/Full RelRO（ubuntu 18.04版本）
+## 环境搭建
+**调试环境/目标机器** ：ubuntu 18.04
+**ProFTPd源码编译及部署** ：
+    // 安装依赖
+    apt-get install -y build-essential net-tools git 
+    // 源码下载
+    git clone https://github.com/proftpd/proftpd.git
+    // 切换到存在漏洞分支
+    git checkout -b 1.3.7rc2 v1.3.7rc2
+    // 生成Makefile文件,带gdb调试信息
+    ./configure CFLAGS="-ggdb -O0" --with-modules=mod_copy --prefix=/usr --enable-openssl
+    // 编译
+    make -j4
+    // 打包
+    apt install -y checkinstall
+    // 含debug信息
+    checkinstall -D \
+    --pkgname='ProFTPd' \
+    --pkgversion="1.3.7rc2" \
+    --maintainer="PI:EMAIL" \
+    --install=no \
+    --strip=no \
+    --stripso=no
+**创建匿名用户** ：
+    groupadd ftp #添加ftp组
+    useradd ftp -g ftp -d /var/ftp #添加ftp用户
+    passwd ftp #设置匿名ftp用户密码为ftp
+**proftpd.conf匿名登录配置** ：如果没有`/usr/etc/proftpd.conf`这个文件，将以下内容写入。
+    # This is a basic ProFTPD configuration file (rename it to 
+    # 'proftpd.conf' for actual use.  It establishes a single server
+    # and a single anonymous login.  It assumes that you have a user/group
+    # "nobody" and "ftp" for normal operation and anon.
+    ServerName          "ProFTPD Default Installation"
+    ServerType          standalone
+    DefaultServer           on
+    # Port 21 is the standard FTP port.
+    Port                21
+    # Umask 022 is a good standard umask to prevent new dirs and files
+    # from being group and world writable.
+    Umask               022
+    # To prevent DoS attacks, set the maximum number of child processes
+    # to 30.  If you need to allow more than 30 concurrent connections
+    # at once, simply increase this value.  Note that this ONLY works
+    # in standalone mode, in inetd mode you should use an inetd server
+    # that allows you to limit maximum number of processes per service
+    # (such as xinetd).
+    MaxInstances            30
+    # Set the user and group under which the server will run.
+    User                nobody
+    Group               nogroup
+    # To cause every FTP user to be "jailed" (chrooted) into their home
+    # directory, uncomment this line.
+    #DefaultRoot ~
+    # Normally, we want files to be overwriteable.
+      AllowOverwrite        on
+    # A basic anonymous configuration, no upload directories.  If you do not
+    # want anonymous users, simply delete this entire  section.
+      User              ftp
+      Group             ftp
+      # We want clients to be able to login with "anonymous" as well as "ftp"
+      UserAlias         anonymous ftp
+      # Limit the maximum number of anonymous logins
+      MaxClients            10
+      # We want 'welcome.msg' displayed at login, and '.message' displayed
+      # in each newly chdired directory.
+      DisplayLogin          welcome.msg
+      #DisplayFirstChdir        .message
+      # Limit WRITE everywhere in the anonymous chroot
+      #
+      #  DenyAll
+      #
+如果有`/usr/etc/proftpd.conf`这个文件，则注释掉下面三行配置，允许匿名用户上传文件。
+      #
+      #  DenyAll
+      #
+**启动proftpd服务** ：
+    // 直接执行
+    /usr/sbin/proftpd
+**gdb调试**
+：关闭系统ASLR，同时注释掉exp里绕获取maps的连接的线程，让proftpd第一个子进程就是漏洞进程，暂时没有找到其它方法在多个子进程里打断点。
+    gdb /usr/sbin/proftpd \
+     -ex "set detach-on-fork on" \
+     -ex "set follow-fork-mode child" \
+     -ex "set breakpoint pending on" \
+     -ex "b xfer_stor" \
+     -ex "b pr_data_xfer" \
+     -ex "b pr_data_abort" \
+     -ex "b _exit"
+## 漏洞分析
+### ProFTPD介绍
+proftpd服务全程是Professional FTP
+daemon，是目前最为流行的FTP服务软件，相比于vsfptd，proftpd配置灵活，可配置选项更多，支持匿名、虚拟主机等多种环境部署，proftpd对中文环境兼容比vsftpd要好，相对于vsftpd使用效率要高很多，但是proftpd安全性相较vsfptd差一点。
+proftpd的内存管理是在原有的glibc内置的ptmalloc2内存分配器的基础上重新封装的一套内存池管理机制，根据proftpd自己的文档描述，该alloc_pool机制源于apache的开源项目，至于是源于apache哪个开源项目，proftpd文档里并没有说明，我也没有在apache的项目里找到该内存池源码，毕竟apache的项目成千上万。
+### 内存池分配器介绍
+#### 关键结构
+    #define CLICK_SZ (sizeof(union align))
+`CLICK_SZ`是一个宏，代表内存对齐的长度，64位系统的值为8。
+##### block_hdr
+    union block_hdr {
+      union align a;
+      /* Padding */
+    #if defined(_LP64) || defined(__LP64__)
+      char pad[32];
+    #endif
+      /* Actual header */
+      struct {
+        void *endp;
+        union block_hdr *next;
+        void *first_avail;
+      } h;
+    };
+每一个通过`alloc_pool()`或者`make_sub_pool()`函数分配的内存块，都一个`union
+block_hdr`，是用来描述当前内存块的状态。
+  * h->endp：指向当前内存块的末尾地址。
+  * h->next：指向内存块链表的下一个内存块。
+  * h->first_avail：指向当前内存块空闲区域的首地址。
+##### pool_rec
+    struct pool_rec {
+      union block_hdr *first;
+      union block_hdr *last;
+      struct cleanup *cleanups;
+      struct pool_rec *sub_pools;
+      struct pool_rec *sub_next;
+      struct pool_rec *sub_prev;
+      struct pool_rec *parent;
+      char *free_first_avail;
+      const char *tag;
+    };
+`struct pool_rec`是用来记录每一个pool状态的结构，关键成员变量的含义描述如下。
+first：当前pool链表中，第一个pool的指针。
+last：当前pool链表中，最后一个pool的指针。
+cleanups：指向cleanup_t结构体，该结构体在释放pool时会用到。
+sub_pools：指向当前pool的sub pool。
+sub_next：指向当前pool的后一个pool。
+sub_prev：指向当前pool的前一个pool。
+parent：指向当前pool的父pool。
+free_first_avail：指向当前pool内存块的可分配首地址。
+tag：可以理解为pool的标签或者名称，比如session pool、table pool。
+#### 关键函数
+##### alloc_pool
+alloc_pool()函数是palloc()、pallocsz()、pcalloc()、pcallocsz()、make_array()等等一系列
+**内存分配函数的底层核心函数** ，这些函数只对alloc_pool()函数做了简单的封装，我们还是重点介绍alloc_pool()核心函数。
+    static void *alloc_pool(struct pool_rec *p, size_t reqsz, int exact) {
+      // 根据请求分配内存大小reqsz的值，按CLICK_SZ对齐计算所需内存大小sz
+      /* Round up requested size to an even number of aligned units */
+      size_t nclicks = 1 + ((reqsz - 1) / CLICK_SZ);
+      size_t sz = nclicks * CLICK_SZ;
+      union block_hdr *blok;
+      char *first_avail, *new_first_avail;
+      /* For performance, see if space is available in the most recently
+       * allocated block.
+       */
+      // 从pool中取出最近可用的内存块，如果该pool为空，则函数返回NULL
+      blok = p->last;
+      if (blok == NULL) {
+        errno = EINVAL;
+        return NULL;
+      }
+      // 计算出当前pool最近有内存块的空闲区域首地址赋值给first_avail
+      first_avail = blok->h.first_avail;
+      // 如果请求分配内存大小reqsz为0，函数直接返回NULL
+      if (reqsz == 0) {

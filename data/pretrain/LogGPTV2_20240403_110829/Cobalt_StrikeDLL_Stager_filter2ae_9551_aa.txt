@@ -1,0 +1,59 @@
+# 剖析Cobalt Strike的DLL Stager
+NVISO最近监测到了针对其金融部门客户的作为目标的行动。根据员工关于可疑邮件的报告，该攻击在其开始阶段就被发现。虽然没有造成任何伤害，但我们通常会确定任何与之相关的指标，以确保对实施此行为者进行额外的监视。
+被报告邮件是申请公司其中一个公开招聘的职位，并试图发送恶意文档。除了利用实际的工作Offer,还引起我们注意的是恶意文档中还存在[execution-guardrails
+](https://attack.mitre.org/techniques/T1480/)。通过对该文档分析，发现了通过[Component Object
+Model
+Hijacking](https://attack.mitre.org/techniques/T1546/015/)（组件对象模型劫持)来维持Cobalt
+Strike Stager的意图
+在我空闲的时间里，我很享受分析NVISO标记的野外样本,因此进一步解剖 Cobalt Strike DLL
+payload，这篇博客文章将介绍有效载荷的结构，设计选择，并重点介绍如何减少日志足迹和缩短Shellcode的时间窗口。
+## 分析执行流
+为了了解，恶意代码是如何工作的，我们必须去分析其从开始到结束的行为。在本节中，我们将介绍一下流程。
+1.通过`DllMain`初始化执行
+2.通过`WriteBufferToPipe`,将加密shellcode发送到命名管道
+3.通过管道进行读取，通过`PipeDecryptExec`,解密shellcode并执行
+如前所述，恶意文档的DLL的载荷意图伪装为[COM in-process server](https://docs.microsoft.com/en-us/windows/win32/com/inprocserver32)。有了这些认识，我们可以着眼与DLL公开的一些已知的入口点。
+从技术层面来说，恶意代码可以发生在该8个函数中任意一个，但恶意代码通常驻留在`DllMain`给定的函数中，除了[TLS
+callbacks](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#tls-callback-functions),它是最可能执行的函数。
+>
+> `DllMain`：动态链接库（DLL）的可选入口点。当系统启动或终止进程或线程时，它将使用进程的第一个线程为每个已加载的DLL调用入口点函数。当使用`LoadLibrary`和`FreeLibrary`函数加载或卸载DLL时，系统也会调用DLL的入口点函数。
+>
+> [docs.microsoft.com/zh-> CN/windows/win32/dlls/dllmain](https://docs.microsoft.com/en-> us/windows/win32/dlls/dllmain)
+## DllMain 入口点
+从下面的捕获结果可以看到，该`DllMain`函数只是通过创建一个新线程来简单执行另一个函数。该线程函数我们命名为`DllMainThread`,它不需要提供任何参数即可执行。
+分析`DllMainThread`函数发现其实它是对我们将发现的恶意载荷的解密和执行函数的一个附加的包装.(被保护函数在捕获中被称为`DecryptBufferAndExec`)
+进一步深入,我们可以看到恶意逻辑的开始。具有Cobalt Strike经验的分析师会立马意识到这个众所周知的`MSSE-%d-server`特征。
+上面代码中发生了几件事:
+1.该示例开始通过[GetTickCount](https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount)获取tick计数,然后将其除以0x26AA。尽管获取的计数通常是时间的度量，但下一个操作仅仅将其作为随机数来使用
+2.然后该示例继续调用在`sprintf`函数周围的包装器。它的作用是格式化字符串为`PipeName`的缓冲区。如可以观察到，格式化字符串将是`\\.\pipe\MSSE-%d-server`其中`%d`为前面的除法计算的结果。(例如:`\\.\pipe\MSSE-1234-server`)。这个管道格式是有据可查的Cobalt
+Strike 威胁指标。
+3.通过在全局变量定义管道的名称，恶意代码将创建一个新线程以运行`WriteBufferToPipeThread`.此函数使我们接下来即将分析的。
+4.最后，在新的线程运行时,代码跳转到`PipeDecryptExec`例程。
+到目前为止,我们有了线性的从DllMain入口点到`DecryptBufferAndExec`函数的执行过程，我们可以绘制如下流程:
+如我们所见，两个线程现在将同时运行。让我们集中于其中写内容到管道 (`WriteBufferToPipeThread`)
+的线程，其次是与之对应`PipeDecryptExec`的内容。
+## WriteBufferToPipe线程
+写入生成的管道的线程是在`DecryptBufferAndExec`没有任何其他参数的情况下启动的。通过进入该函数，我们可以观察到它只是一个`WriteBufferToPipe`前的简单的包装器，此外传递如下从全局`Payload`变量(。(由`pPayload`指针指向))恢复的参数。
+1.shellcode的大小,存储在offset=0x4处
+2.指向包含加密shellcode缓冲区的指针，该缓冲区存储在offset=0x14处
+在`WriteBufferToPipe`函数中，我们可以注意到代码是通过创建新管道开始的。管道的名称是从`PipeName`全局变量中恢复的，如果您还记得的话，该全局变量先前是由`sprintf`函数填充的。
+代码创建了单个实例，通过调用[CreateNamedPipeA](https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea)导出管道((`PIPE_ACCESS_OUTBOUND`)),然后通过调用[ConnectNamedPipe](ConnectNamedPipe)将其连接到该实例。
+如果连接成功,`WriteBufferToPipe`函数只要有shellcode的字节需要写入到管道就继续循环调用`WriteFile` 来实现写入。
+值得注意的一个重要细节是,一旦shellcoode写到了管道中,先前打开管道的句柄就通过[CloseHandle](https://docs.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle)来关闭。这表明管道的唯一目的就是为了传输加密的shellcode。
+一旦``WriteBufferToPipe` `函数执行完毕,线程终止。总体而言，执行流程非常简单，可以如下绘制:
+## PipeDecryptExec 流程
+作为快速恢复部分,
+该`PipeDecryptExec`流程在创建`WriteBufferToPipe`线程后被立即执行。执行的一个任务是分配一个内存区域，接收要通过命名管道传输的shellcode。为此，将存储在全局Payload变量偏移0x4处的shellcode大小作为参数来执行[malloc](https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/malloc?view=msvc-160)调用。
+一旦缓冲区分配完成，代码将休眠1024毫秒(0x400),并将缓冲区位置和大小作为参数调用`FillBufferFromPipe`。如果该函数调用失败则返回`FALSE`
+(`0`),那么代码会再次循环至该[Sleep](https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleep)调用，并再次尝试操作，直到操作成功为止。这些调用和循环是必需的,因为多线程示例必须等待至shellcode写入到了管道中。
+一旦将shellcode写入到了分配的缓冲区中，`PipeDecryptExec`最终会通过`XorDecodeAndCreateThread`来解密并执行shellcode。
+要将加密的shellcode从管道传输到分配的缓冲区中,
+`FillBufferFromPipe`通过[CreateFileA](https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea)以只读的方式(`GENERIC_READ`))打开管道.就像创建管道一样，从全局`PipeName`变量中获取名称。如果访问管道失败，则函数将继续返回`FALSE`
+(`0`),而导致上述`Sleep`并重试的循环。
+一旦管道以只读模式打开，`FillBufferFromPipe`函数接着会继续复制shellcode直到分配缓冲区使用ReadFile填满为止。缓冲区填满后，`CloseHandle`关闭命名管道的句柄,并且`FillBufferFromPipe`函数返回`TRUE`
+(`1`).
+一旦`FillBufferFromPipe`成功完成，命名管道已经完成了它的任务和加密的shellcode已经从一个存储区域移动到另一个。
+回到调用者`PipeDecryptExec`函数中，一旦`FillBufferFromPipe`函数调用返回`TRUE`，`XorDecodeAndCreateThread`将使用以下参数进行调用：
+  1. 包含复制的shellcode的缓冲区。
+  2. shellcode的长度，存储在全局`Payload`变量的offset=`0x4`处。
+  3. 对称XOR解密密钥，存储在全局`Payload`变量的offset=`0x8`处。

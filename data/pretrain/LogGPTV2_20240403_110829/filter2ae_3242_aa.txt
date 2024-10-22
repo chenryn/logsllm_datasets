@@ -1,0 +1,136 @@
+**作者：HexRabbit**  
+**原文链接：**
+几天前在 Twitter 上看到 [@flatt_security](https://twitter.com/flatt_security
+"@flatt_security") 分享这个漏洞，感觉蛮有趣且加上我好久没写文，就拿来练习一下了，没想到时隔快一年，又挑到 Ryota Shiga
+([@Ga_ryo_](https://twitter.com/ga_ryo_ "@Ga_ryo_")) 大佬发的漏洞来练习
+这次是一个影响 Linux kernel v5.8 - v5.13.13 的 eBPF type confusion 漏洞
+基本上这会是个相对简短一点的文章， 如果对 eBPF 不熟的朋友们可以先去看看我的前一篇文
+[ZDI-20-1440-writeup](https://blog.hexrabbit.io/2021/02/07/ZDI-20-1440-writeup/
+"ZDI-20-1440-writeup")
+## TL;DR
+## Root cause analysis
+这次没有 blog post 可以看了，首先来看一下 [ZDI
+report](https://www.zerodayinitiative.com/advisories/ZDI-21-1148/ "ZDI
+report") 上面是怎么写的
+    The issue results from the lack of proper validation of user-supplied eBPF programs, 
+    which can result in a type confusion condition.
+虽然得知这是一个 type confusion 的漏洞，但这个叙述相当模糊，也不知道问题究竟是出在哪里，所以接著我去看了修正这个漏洞的
+[commit](https://github.com/torvalds/linux/commit/5b029a32cfe4600f5e10e36b41778506b90fd4de
+"commit")
+其中提到几个重点:
+在 `check_map_func_compatibility()`这个 function 当中，有针对 `map -> helper` 进行 type
+match，但缺少部分反向的 `helper -> map type match` 由于 1. 的问题，这导致 `bpf_ringbuf_*()` 一类的
+helper functions 可以接受使用者传入其他型别的 bpf map，也就是 `BPF_MAP_TYPE_RINGBUF` 以外的 map
+type，进而造成 type confusion
+> 为什么要设计成正反向各做一次 type matching 的原因我不是很清楚，由于这个设计，第一个 switch case 里面并没有包含所有的 map
+> type，且可以注意到 default case 不会触发 error
+    static int check_map_func_compatibility(struct bpf_verifier_env *env,
+        /* We need a two way check, first is from map perspective ... */
+        switch (map->map_type) {
+        case BPF_MAP_TYPE_RINGBUF:
+            if (func_id != BPF_FUNC_ringbuf_output &&
+                func_id != BPF_FUNC_ringbuf_reserve &&
+    -           func_id != BPF_FUNC_ringbuf_submit &&
+    -           func_id != BPF_FUNC_ringbuf_discard &&
+                func_id != BPF_FUNC_ringbuf_query)
+                goto error;
+            break;
+        }
+        /* ... and second from the function itself. */
+        switch (func_id) {
+    +   case BPF_FUNC_ringbuf_output:
+    +   case BPF_FUNC_ringbuf_reserve:
+    +   case BPF_FUNC_ringbuf_query:
+    +       if (map->map_type != BPF_MAP_TYPE_RINGBUF)
+    +           goto error;
+    +       break;
+        case BPF_FUNC_get_stackid:
+            if (map->map_type != BPF_MAP_TYPE_STACK_TRACE)
+                goto error;
+        ...
+        default:
+            break;
+        }
+        return 0;
+## Weaponize the bug
+至此我们可以得知这个漏洞存在于 verifier 当中，所以触发的方式基本上与过往的漏洞相似，要透过 bpf program
+进行攻击，但还不知道该如何利用这个看似相当强大的 type confusion，总之先看一下 `bpf_ringbuf_*()` 这些 helper
+function 可以做到些什么
+`bpf_ringbuf_*()` 等相关 helper function 被定义在
+[kernel/bpf/ringbuf.c](https://elixir.bootlin.com/linux/v5.13.13/source/kernel/bpf/ringbuf.c
+"kernel/bpf/ringbuf.c") 当中，其透过 `BPF_CALL_*`macro 定义并让 bpf program 可以直接透过
+`BPF_CALL` 进行呼叫，此外，用来给 verfier 检查的 argument 的型别资讯被放在 `bpf_ringbuf_*_proto`
+变数当中
+例如这是 `bpf_ringbuf_query` 的定义
+    BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
+    {
+        struct bpf_ringbuf *rb;
+        rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
+        switch (flags) {
+        case BPF_RB_AVAIL_DATA:
+            return ringbuf_avail_data_sz(rb);
+        case BPF_RB_RING_SIZE:
+            return rb->mask + 1;
+        case BPF_RB_CONS_POS:
+            return smp_load_acquire(&rb->consumer_pos);
+        case BPF_RB_PROD_POS:
+            return smp_load_acquire(&rb->producer_pos);
+        default:
+            return 0;
+        }
+    }
+    const struct bpf_func_proto bpf_ringbuf_query_proto = {
+        .func       = bpf_ringbuf_query,
+        .ret_type   = RET_INTEGER,
+        .arg1_type  = ARG_CONST_MAP_PTR,
+        .arg2_type  = ARG_ANYTHING,
+    };
+稍微研究一下便可以对于怎么利用这些 helper function 有个大概的轮廓:
+  * bpf_ringbuf_reserve  
+根据使用者传入的 size，回传一个大小为 size 的 buffer (verifier 会得知 size 资讯) 如果可以控到 `mask`,
+`consumer_pos`, `producer_pos` 便可以让他在 kernel heap 上 return 任意大小的
+buffer，便可以用来进行越界读写
+  * bpf_ringbuf_output  
+没啥用
+  * bpf_ringbuf_query  
+如果可以控到 mask，有机会透过 `BPF_RB_RING_SIZE` 这个 flag 去 leak heap 上的资料 `(rb->mask + 1)`
+仔细观察便会发现可以被用来进行 type confusion 的三个 function 皆会操作到 `bpf_ringbuf_map` 中的 `.rb`
+这个 field，他是一个型别为 `struct bpf_ringbuf *` 的指标，由于指标取值只要失败便会造成 kernel
+crash，所以首先必须得要先找到一个 structure 满足这个要求
+虽然说在 commit 当中提到“function 可以接受使用者传入其他型别的 bpf map，也就是 `BPF_MAP_TYPE_RINGBUF`
+以外的 map type”，但实际上我们能够选择的 map type 相当有限，因为 `check_map_func_compatibility()`
+在第一次的检查中就对不少 map type 和使用的 function id 进行配对了
+把被 `check_map_func_compatibility()` 的第一次 switch case 当中检查过的 map type
+剔除掉之后，我们还剩下以下几种选择:
+    BPF_MAP_TYPE_PERCPU_HASH
+    BPF_MAP_TYPE_PERCPU_ARRAY
+    BPF_MAP_TYPE_LPM_TRIE
+    BPF_MAP_TYPE_STRUCT_OPS
+    BPF_MAP_TYPE_LRU_HASH
+    BPF_MAP_TYPE_ARRAY
+    BPF_MAP_TYPE_LRU_PERCPU_HASH
+    BPF_MAP_TYPE_HASH
+    BPF_MAP_TYPE_UNSPEC
+透过筛选之后，最后我采用 `BPF_MAP_TYPE_LPM_TRIE` 这个 map type 作为触发 type confusion 时所使用的 map
+type，原因是
+  * `struct bpf_ringbuf *rb` 的位置上刚好有 `struct lpm_trie_node __rcu *root` 这个指标
+  * `struct lpm_trie_node` 的 `u8 data[]`; 是一个 user 完全可控的不定长度 array (大小可控)，透过他可以控制 `struct bpf_ringbuf` 当中的不少 field，让我们可以很轻易的操控 `bpf_ringbuf_*()` 的执行流程
+`bpf_ringbuf_map` v.s. `lpm_trie`
+    struct bpf_ringbuf_map {
+        struct bpf_map map;
+        struct bpf_ringbuf *rb;
+    };
+    struct lpm_trie {
+        struct bpf_map              map;
+        struct lpm_trie_node __rcu *root;
+        size_t                      n_entries;
+        size_t                      max_prefixlen;
+        size_t                      data_size;
+        spinlock_t                  lock;
+    };
+`bpf_ringbuf` v.s. `lpm_trie_node`
+    struct bpf_ringbuf {
+        wait_queue_head_t          waitq;                /*     0    24 */
+        struct irq_work            work;                 /*    24    24 */
+        u64                        mask;                 /*    48     8 */
+        struct page * *            pages;                /*    56     8 */

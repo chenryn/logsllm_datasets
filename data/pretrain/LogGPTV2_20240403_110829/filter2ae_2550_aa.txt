@@ -1,0 +1,175 @@
+原文：  
+译者：Serene
+#### 介绍
+由于去年掀起的物联网/可嵌入设备安全事件的浪潮，我开始有兴趣寻找附近和家中使用设备的漏洞。因为我知道大多数这些设备都存在安全和隐私问题，所以一开始我自己并没有很多这样的设备。我从一箱旧路由器中选择了D-Link DIR-615L，事实证明这是研究的一个很好的开始。
+在几周的尝试之后，我发现了一个通过发送GET请求到它的web服务器就能允许我重启路由器的漏洞，我决定重点研究这个漏洞，并试图找到漏洞出现的位置和根本原因。由于我对C语言和MIPS汇编了解的知识有限，这些尝试对我来说是很好的挑战和学习经验。总的来说，这是一个有趣的项目，并且我因此得到了第一个CVE，这是我第一次向厂商报告漏洞，D-Link很快作了回应并修复了这个漏洞，太让人高兴了。
+以下是我提交给D-Link的报告，包括我的发现以及漏洞的潜在成因。现在已经发布了补丁，我想将更新的可执行文件与有漏洞的可执行文件进行比较，明确补丁程序和修复程序的确切位置，之后会有一个后续的文章来讲这个分析结果。
+#### DIR-605L通过HTTP GET拒绝服务
+在尝试通过浏览器URL来访问web根目录下的已知文件时，服务器的响应挂在`http://192.168.1.1/common/`请求上，我注意到路由器正在自己重启/重置：连接完全断开了，系统LED灯在启动时闪烁。这个行为只有在目录尾部“/”被包含时，才会被触发。更进一步的测试表明，只有GET请求时会导致崩溃，HEAD请求会导致服务器的空的200
+OK响应，并不会崩溃。这些结果让我有理由相信，导致崩溃的原因在Boa web服务器的某个位置。
+##### 细节：
+  * 设备：D-Link DIR-605L, B型
+  * 有漏洞的固件版本：2.08UIB01及以前的版本。2.08UIBETA01版本得以修复。
+  * 攻击向量：未认证的HTTP GET请求
+  * 影响：拒绝服务
+  * CVE：CVE-2017-9675
+##### PoC：
+`curl http://192.168.1.1/common/`
+##### 静态代码分析：
+我从[官网](http://www.boa.org/)下载了Boa
+web服务器的匹配版本，路由器上服务器响应的“Server”字符串表明它使用的是0.94.14rc21版本。我知道这是一个修改后的版本，以`apmib.so`的自定义库和其它可能的修改构建，但这与我想要得到的源代码非常接近。路由器上存在的boa二进制文件的一些细节：
+    hyper@ubuntu:~/squashfs-root-0$ mips-linux-gnu-objdump -f bin/boa
+    bin/boa:     file format elf32-tradbigmips
+    architecture: mips:3000, flags 0x00000102:
+    EXEC_P, D_PAGED
+    start address 0x00407400
+因为漏洞只会由GET请求触发，我推测漏洞发生在处理GET的函数中的某个地方，并且只在那些处理目录GET的函数中，另外，只有包含尾部"/"的目录请求会触发漏洞，这意味着修改或使用URL字符串的函数可能是罪魁祸首。
+在提取下载的文件后，我开始阅读源代码，寻找可能包含处理请求的代码。果然，在src/目录中有一个命名为 request.c
+的文件，于是我从这里开始着手。这个文件中包含了很多处理请求的函数，它们大多数在src /
+globals.h中定义的`request`结构上运行。这里有存储请求的路径名和打开文件的文件描述符的成员变量，等等。
+###### process_requests()
+处理请求自然在`process_requests()`函数中开始，如果队列上有待处理的请求，那么另一个名为`get_request（）`的函数会被调用来从队列中提取请求。这个函数在返回一个到初始化req结构的指针之前，调用其它的一些函数来执行一些基本的清理和处理。如果在几次超时和错误检查之后所有都恢复正常，那么switch..case语句将开始迭代处理请求。
+    if (retval == 1) {
+                switch (current->status) {
+                case READ_HEADER:
+                case ONE_CR:
+                case ONE_LF:
+                case TWO_CR:
+                    retval = read_header(current);
+                    break;
+                case BODY_READ:
+                    retval = read_body(current);
+                    break;
+                case BODY_WRITE:
+                    retval = write_body(current);
+                    break;
+                case WRITE:
+                    retval = process_get(current);
+                    break;
+                case PIPE_READ:
+                    retval = read_from_pipe(current);
+                    break;
+                case PIPE_WRITE:
+                    retval = write_from_pipe(current);
+                    break;
+                case IOSHUFFLE:
+                [...]
+                }
+###### process_requests() -> read_header()
+第一次调用是read.c:`read_header(current)`，“current”是指向正在操作的请求结构的指针。在执行一些操作来读取请求的头部，并设置上面switch语句中用到的一些标志之后，指向“current”的指针被传递给位于request.c中的函数request.c：`process_logline()`。
+代码注释中的功能描述：
+    /*
+     * Name: process_logline
+     *
+     * Description: This is called with the first req->header_line received
+     * by a request, called "logline" because it is logged to a file.
+     * It is parsed to determine request type and method, then passed to
+     * translate_uri for further parsing.  Also sets up CGI environment if
+     * needed.
+     */
+request.c:`process_logline()`解析请求URI并处理错误，例如格式错误的请求或无效的URI长度等等。这个函数在处理请求URI，这引起了我的注意，因为只有在向函数的请求中包含了尾部“/”，才会触发该漏洞，所以我想这可能与URI/路径名解析函数有关。经过一段时间审视代码后，我得出结论，漏洞不是在这个函数中引起的，继续往前找。
+一旦`process_logline()`返回`read_header()`，下一个根据当前请求运行的函数是request.c:
+`process_header_end()`，因为req-> status之前已经被设置为BODY_READ。以下代码段来自`read_header()`：
+                } else {
+                    if (process_logline(req) == 0)
+                        /* errors already logged */
+                        return 0;
+                    if (req->http_version == HTTP09)
+                        return process_header_end(req);
+                }
+                /* set header_line to point to beginning of new header */
+                req->header_line = check;
+            } else if (req->status == BODY_READ) {
+    #ifdef VERY_FASCIST_LOGGING
+                int retval;
+                log_error_time();
+                fprintf(stderr, "%s:%d -- got to body read.\n",
+                        __FILE__, __LINE__);
+                retval = process_header_end(req);
+    #else
+                int retval = process_header_end(req);
+    #endif
+                /* process_header_end inits non-POST CGIs */
+###### process_requests() -> read_header() -> process_header_end()
+如代码注释中的描述所示，在调用get.c:`init_get()`之前，request.c:`process_header_end()`函数会对请求执行一些最终检查。这些测试中大多数是检查req->
+request_uri的无效字符或格式错误的输入。我看了一下这些函数，看看这个漏洞是否位于其中一个，但似乎并非如此。
+    /*
+     * Name: process_header_end
+     *
+     * Description: takes a request and performs some final checking before
+     * init_cgi or init_get
+     * Returns 0 for error or NPH, or 1 for success
+     */
+    int process_header_end(request * req)
+    {
+        if (!req->logline) {
+            log_error_doc(req);
+            fputs("No logline in process_header_end\n", stderr);
+            send_r_error(req);
+            return 0;
+        }
+        /* Percent-decode request */
+        if (unescape_uri(req->request_uri, &(req->query_string)) == 0) {
+            log_error_doc(req);
+            fputs("URI contains bogus characters\n", stderr);
+            send_r_bad_request(req);
+            return 0;
+        }
+        /* clean pathname */
+        clean_pathname(req->request_uri);
+        if (req->request_uri[0] != '/') {
+            log_error("URI does not begin with '/'\n");
+            send_r_bad_request(req);
+            return 0;
+        }
+        [...]
+        if (translate_uri(req) == 0) { /* unescape, parse uri */
+            /* errors already logged */
+            SQUASH_KA(req);
+            return 0;               /* failure, close down */
+        }
+        [...]
+        if (req->cgi_type) {
+            return init_cgi(req);
+        }
+        req->status = WRITE;
+        return init_get(req);       /* get and head */
+    }
+所有检查完成后，还有一个检查看'req-> cgi_type'是否已被初始化。由于没有设置这个变量，检查失败了，而是'req->
+status'被设置为WRITE，`init_get()`被调用，并且它的返回值被用作`process_header_end()`返回值。
+###### process_requests() -> read_header() -> process_header_end() ->
+init_get()
+从下面get.c:`init_get()`的描述中看，我可以说这个请求将遵循这个路径，因为它是一个非脚本GET请求。
+    /*
+     * Name: init_get
+     * Description: Initializes a non-script GET or HEAD request.
+     */
+    int init_get(request * req)
+    {
+        int data_fd, saved_errno;
+        struct stat statbuf;
+        volatile unsigned int bytes_free;
+        data_fd = open(req->pathname, O_RDONLY);
+        saved_errno = errno;        /* might not get used */
+        [...]
+        fstat(data_fd, &statbuf);
+一个整型变量被声明来保存打开路径的结果文件描述符和一个名为statbuf的stat结构。statbuf保存关于打开文件状态的信息，它被初始化调用`fstat()`。
+在测试看路径是否被成功打开后，接着检查看是否是一个目录，在触发漏洞的请求情况下这将为true。打开文件描述符是关闭的，然后执行检查来看请求的最后一个字符是不是“/”，这将为false，所以后面的代码会被跳过。
+        if (S_ISDIR(statbuf.st_mode)) { /* directory */
+            close(data_fd);         /* close dir */
+            if (req->pathname[strlen(req->pathname) - 1] != '/') {
+                char buffer[3 * MAX_PATH_LENGTH + 128];
+                unsigned int len;
+                [...]
+            }
+            data_fd = get_dir(req, &statbuf); /* updates statbuf */
+            if (data_fd  read_header() -> process_header_end() ->
+init_get() -> get_dir()
+这一点上，我认为get.c:`get_dir()`可能包含了导致崩溃的函数调用，因为直到这一点所有发生的事情都适用于非目录的请求。现有的常规文件没有请求触发崩溃，这意味着它一定在与打开目录有关的函数中。
+    /*
+     * Name: get_dir
+     * Description: Called from process_get if the request is a directory.
+     * statbuf must describe directory on input, since we may need its
+     *   device, inode, and mtime.
+     * statbuf is updated, since we may need to check mtimes of a cache.
+     * returns:

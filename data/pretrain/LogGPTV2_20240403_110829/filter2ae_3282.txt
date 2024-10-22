@@ -1,0 +1,184 @@
+**作者：Carl Yu@墨云科技VLab Team  
+原文链接：**
+10月28日，谷歌Chrome在发布95.0.4638.69版本时修复了天府杯上昆仑实验室提交的漏洞CVE-2021-38001。由于此漏洞的PoC非常简洁使得作者对V8引擎产生了强烈的兴趣，分析此漏洞也是作者对V8的一次学习。V8是谷歌用C++编写的JavaScript和WebAssembly引擎，在Chrome和Node.js中都有使用。
+# 内联缓存
+该漏洞与内联缓存（Inline Caching）有关，内联缓存是一种运行时环境（runtime
+environment）的优化技巧。由于动态语言必须在运行时进行方法绑定（method binding），此优化手法对于动态语言来说十分重要，举一个例子：
+    def foo(a,b):
+      a.func(b)
+这段代码的Python bytecode如下：
+    Disassembly of ", line 2>:
+      3           0 LOAD_FAST                0 (a)
+                  2 LOAD_METHOD              0 (func)
+                  4 LOAD_FAST                1 (b)
+                  6 CALL_METHOD              1
+                  8 POP_TOP
+                 10 LOAD_CONST               0 (None)
+                 12 RETURN_VALUE
+在执行时，`LOAD_METHOD`会去确认`a`的类型，然后利用`a`的类型寻找`add`。
+如果没有IC，那第二次执行`a.func(b)`时就必须重复做同样的事情（在同样的context下）。这样做逻辑上是比较严谨的，但是执行效率会很低，那么有没有什么方法可以提速呢？其实，程序员写代码时，大概率会写成下面的形式：
+    def foo(a,...):
+      a.func(b)
+      a.func(c)
+      ...
+      a.func(z)
+在上面代码中，`a`的类型是不变的。Deutsch和Schiffman在他们的文章（）中提到：'在代码执行的某个时点，接收者（receiver）的类型通常和上次此时点的类型一样'。比如说上面例子中，`a`的类型并未发生变化，所以这里可以将`a`的类型进行缓存以便后面使用。
+V8使用的是Data-driven
+IC，这种IC将属性的加载存储信息编码成数据结构。其他函数（例如`LoadIC`和`StoreIC`）会读取这个结构然后执行相应的操作。以下是V8之前的Patching
+IC和现在的Data-Driven IC的区别。
+这里右边的图中的FeedbackVector的功能是记录和管理所有执行反馈，此数据结构对于JavaScript的执行效率提升十分关键。同时，在图中可以发现有Fast-path，Slow-path和Miss。Miss很好理解，即需要运行时确认类型。那么Slow-path和Fast-path分别对应了什么情况呢？通过以下例子可以理解：
+    let a = {foo:3}
+    let b = {foo:4}
+这里`a`和`b`的架构一样，在处理上就没有必要为这两个对象建立不同的架构。V8的处理方式是将对象的架构与值分成对象的形状（Object
+Shapes）和一个带有值的vector,对象形状在V8中被称为Maps。上面例子中，V8会先创造一个形状`Map[a]`。此形状拥有属性`foo`位于偏移0，在对应`vector[0]`的值为3。在创建对象`b`的时候，只需将`b`的Map指向`Map[a]`,然后让对应的`vector[0]=4`即可。这个即为Fast-path。
+假设后面是
+    a.foo1 = 4
+那么V8会新建一个`Map[a1]`并将`a`的Maps改为`Map[a1]`。`Map[a1]`拥有属性`foo1`位于偏移1并指向`Map[a]`，同时将对应的`vector[1]`设为4。即为Slow-path。
+以下例子将会包含以上三种情况：
+    function load(a) {
+      return a.key;
+    }
+    //IC of load: [{ slot: 0, icType: LOAD, value: UNINIT }]
+    let first = { key: 'first' } // shape A
+    let fast = { key: 'fast' }   // the same shape A
+    let slow = { foo: 'slow' }   // new shape B
+    load(first) //IC of load: [{ slot: 0, icType: LOAD, value: MONO(A) }] --> Miss
+    load(fast) //IC of load: [{ slot: 0, icType: LOAD, value: MONO(A) }]  --> Fast
+    load(slow) //IC of load: [{ slot: 0, icType: LOAD, value: POLY[A,B] }]  --> Slow. Now it needs to check 2 shapes. 
+# 漏洞成因
+该漏洞的修复Commit修改了两个函数`HandleLoadICSmiHandlerLoadNamedCase`和`ComputeHandler`。对这两个函数进行追踪可以发现以下调用链：
+    ComputeHandler
+                  ^
+    UpdateCaches
+                  ^
+    Load
+                  ^
+    Runetime_LoadWithReceiverIC_Miss
+和
+    HandleLoadICSmiHandlerLoadNamedCase 
+                  ^
+    HandleLoadICSmiHandlerCase
+                  ^
+    HandleLoadICHandlerCase
+                  ^
+    GenericPropertyLoad
+从函数名可以看出，这里是在加载属性，那么可以联想到在了解IC时讨论的属性加载的问题。通过查看bytecode，可以发现属性加载是通过`LdaNamedProperty`来实现的。通过搜索发现以下代码：
+    // LdaNamedProperty   
+    //
+    // Calls the LoadIC at FeedBackVector slot  for  and the name at
+    // constant pool entry .
+    IGNITION_HANDLER(LdaNamedProperty, InterpreterAssembler) {
+      TNode feedback_vector = LoadFeedbackVector();
+      // Load receiver.
+      TNode recv = LoadRegisterAtOperandIndex(0);
+      // Load the name and context lazily.
+      LazyNode lazy_slot = [=] {
+        return BytecodeOperandIdxTaggedIndex(2);
+      };
+      LazyNode lazy_name = [=] {
+        return CAST(LoadConstantPoolEntryAtOperandIndex(1));
+      };
+      LazyNode lazy_context = [=] { return GetContext(); };
+      Label done(this);
+      TVARIABLE(Object, var_result);
+      ExitPoint exit_point(this, &done, &var_result);
+      AccessorAssembler::LazyLoadICParameters params(lazy_context, recv, lazy_name,
+                                                     lazy_slot, feedback_vector);
+      AccessorAssembler accessor_asm(state());
+      accessor_asm.LoadIC_BytecodeHandler(&params, &exit_point);
+    .....
+    }
+注意最后一行，追踪`LoadIC_BytecodeHandler`发现此函数处理了所有关于属性访问的情况。第一次访问时并不会`FeedbackVector`所以会进入`LoadIC_NoFeedBack`函数。
+    void AccessorAssembler::LoadIC_NoFeedback(const LoadICParameters* p,
+                                              TNode ic_kind) {
+      Label miss(this, Label::kDeferred);
+      TNode lookup_start_object = p->receiver_and_lookup_start_object();
+      GotoIf(TaggedIsSmi(lookup_start_object), &miss);
+      TNode lookup_start_object_map = LoadMap(CAST(lookup_start_object));
+      GotoIf(IsDeprecatedMap(lookup_start_object_map), &miss);
+      TNode instance_type = LoadMapInstanceType(lookup_start_object_map);
+      {
+        // Special case for Function.prototype load, because it's very common
+        // for ICs that are only executed once (MyFunc.prototype.foo = ...).
+        Label not_function_prototype(this, Label::kDeferred);
+        GotoIfNot(IsJSFunctionInstanceType(instance_type), &not_function_prototype);
+        GotoIfNot(IsPrototypeString(p->name()), &not_function_prototype);
+        GotoIfPrototypeRequiresRuntimeLookup(CAST(lookup_start_object),
+                                             lookup_start_object_map,
+                                             &not_function_prototype);
+        Return(LoadJSFunctionPrototype(CAST(lookup_start_object), &miss));
+        BIND(&not_function_prototype);
+      }
+      GenericPropertyLoad(CAST(lookup_start_object), lookup_start_object_map,
+                          instance_type, p, &miss, kDontUseStubCache);
+      BIND(&miss);
+      {
+        TailCallRuntime(Runtime::kLoadNoFeedbackIC_Miss, p->context(),
+                        p->receiver(), p->name(), ic_kind);
+      }
+    }
+在这里找到了`GenericPropertyLoad`。同时发现无论如何都会执行`Runtime::kLoadNoFeedbackIC_Miss`。这个函数其实就是`RUNTIME_FUNCTION(Runtime_LoadWithReceiverIC_Miss)`。
+至此完整的调用链已经找到了，那根据此调用链，可以发现在第一次访问属性时，由于没有`FeedbackVector`，会调用`LoadIC_NoFeedback`。假设`lookup_start_object`不是小整数且没有被淘汰（被回收），那么就会调用`GenericPropertyLoad`，随后再调用`LoadNoFeedbackIC_Miss`。在`ComputeHandler`中,发现修改的判断分支检查了`holder`是否在`IsJSModuleNamespace`，但是在`HandleLoadICSmiHandlerLoadNamedCase`中却加载的是`receiver`，此对象并不在`JSModuleNamespace`中。所以当`FeedbackVector`被创建后，内部的IC中的类型记录可能与真正调用时的类型不符，假设此时使用IC中储存的对象类型调用`JSModuleNamespace`中的某些属性，那么V8会根据`FastPath`使用IC中存储的类型，但是由于`receiver`不是此类型，就会导致类型混淆。
+综上所述，复现此漏洞需要以下条件：
+  1. 在`JSModuleNamespace`中放置一个可以随时调用的属性/函数
+此条件可以通过export文件中的函数或属性即可，比如说在“一个文件”中：
+    export let foo = {}
+    //或者（笔者使用的方法）
+    export function foo()
+    {
+      ....
+    }
+在“另一个文件”中：
+    import * as foo from "一个文件.mjs";
+    %DebugPrint(foo)
+会有以下结果：
+    /*
+    DebugPrint: 000003BF080496D9: [JSModuleNamespace]
+     - map: 0x03bf082077f9  [DictionaryProperties]
+     - prototype: 0x03bf08002235 
+     - elements: 0x03bf08003295  [DICTIONARY_ELEMENTS]
+     - module: 0x03bf081d3229 
+     - properties: 0x03bf080496ed 
+     - All own properties (excluding elements): {
+       0x03bf08005669 : 0x03bf080049f5  (data, dict_index: 1, attrs: [___])
+       f: 0x03bf081d3349  (accessor, dict_index: 2, attrs: [WE_])
+     }
+     - elements: 0x03bf08003295  {
+       - max_number_key: 0
+     }
+    000003BF082077F9: [Map]
+     - type: JS_MODULE_NAMESPACE_TYPE
+     - instance size: 16
+     - inobject properties: 0
+     - elements kind: DICTIONARY_ELEMENTS
+     - unused property fields: 0
+     - enum length: invalid
+     - dictionary_map
+     - may_have_interesting_symbols
+     - non-extensible
+     - prototype_map
+     - prototype info: 0x03bf081d3369 
+     - prototype_validity cell: 0x03bf08142405 
+     - instance descriptors (own) #0: 0x03bf080021c1 
+     - prototype: 0x03bf08002235 
+     - constructor: 0x03bf081c3bed 
+     - dependent code: 0x03bf080021b9 
+     - construction counter: 0
+     */
+  1. 在另一个文件中创建一个对象，并使得此对象的`lookup_start_object`和`holder`不同并符合`holder`为`JSModuleNamespaceType`。之后，调用“一个文件”中的函数（访问属性），以触发`LoadWithReceiverIC_Miss`导致的`UpdateCaches`。
+    import * as foo from "一个文件.mjs";
+    class Test(){}
+    class Test1(){}
+    let tmp = new Test();
+    Test.prototype.__proto__=Test1;//修改lookup_start_object
+    Test.prototype.__proto__.__proto__=foo;//修改holder
+  1. 重复以上步骤直到IC开始使用FeedbackVector中的信息。由于
+      TNode module =
+            LoadObjectField(CAST(p->receiver()), JSModuleNamespace::kModuleOffset);
+认为这里会提供一个`foo`，但是`p->receiver`并不是`foo`。此时便会触发类型混淆。
+# 修复方案
+修复该漏洞只需保证`ic.cc`和`accessor-assembler.cc`中使用的对象类型是相同的即可，V8选择的方式为在`HandleLoadICSmiHandlerLoadNamedCase`中使用`holder`（而不是`receiver`）作为Load的参数。并在`ComputeHandler`中为`smi`类别单独开分了一个判断分支，以确保在处理`HandleLoadICSmiHandlerLoadNmaedCase`中一定会拿到`smi_handler`。
+修复Commit内容如下：
+近期Google官方修复了包括在天府杯中披露的和已发现存在在野利用的多个高危漏洞，建议Chrome用户积极将程序升级到最新稳定版以免受到攻击，目前最新稳定版本为96.0.4664.77。
+**参考链接**
+* * *

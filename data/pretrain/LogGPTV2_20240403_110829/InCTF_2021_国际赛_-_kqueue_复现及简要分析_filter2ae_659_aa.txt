@@ -1,0 +1,222 @@
+# InCTF 2021 国际赛 - kqueue 复现及简要分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00.一切开始之前
+InCTF 国际赛据称为印度的“强网杯”，比赛时笔者所在的战队没有报名所以未能参加，赛后笔者看到了[Scupax0s 师傅的
+WP](https://bbs.pediy.com/thread-269031.htm)后把其中一道kernel pwn简单复现了一下，感觉还是挺不错的一道
+kernel pwn 入门题
+> 原题下载地址在[这里](https://github.com/teambi0s/InCTFi/tree/master/2021/Pwn/Kqueue)，
+>
+> 这道题的文件系统用 Buildroot 进行构建， **登入用户名为 ctf，密码为 kqueue** ，笔者找了半天才在官方 GitHub 里的
+> Admin 中打远程用的脚本找到的这个信息…
+>
+> 还有个原因不明的问题，本地重打包后 **运行根目录下 init 时的 euid 为 1000** ，笔者只好拉一个别的 kernel pwn
+> 的文件系统过来暂时顶用…
+## 0x01.题目分析
+###  保护分析
+查看启动脚本，只开启了 kaslr 保护，没开 KPTI 也没开 smap&smep，还是给了我们 ret2usr 的机会的
+    #!/bin/bash
+    exec qemu-system-x86_64 \
+        -cpu kvm64 \
+        -m 512 \
+        -nographic \
+        -kernel "bzImage" \
+        -append "console=ttyS0 panic=-1 pti=off kaslr quiet" \
+        -monitor /dev/null \
+        -initrd "./rootfs.cpio" \
+        -net user \
+        -net nic
+###  源码分析
+题目给出了源代码，免去了我们逆向的麻烦
+在 `kqueue.h` 中只定义了一个 ioctl 函数
+    static long kqueue_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+    static struct file_operations kqueue_fops = {.unlocked_ioctl = kqueue_ioctl};
+ioctl 的函数定义位于 `kqueue.c` 中，如下：
+    static noinline long kqueue_ioctl(struct file *file, unsigned int cmd, unsigned long arg){
+        long result;
+        request_t request;
+        mutex_lock(&operations_lock);
+        if (copy_from_user((void *)&request, (void *)arg, sizeof(request_t))){
+            err("[-] copy_from_user failed");
+            goto ret;
+        }
+        switch(cmd){
+            case CREATE_KQUEUE:
+                result = create_kqueue(request);
+                break;
+            case DELETE_KQUEUE:
+                result = delete_kqueue(request);
+                break;
+            case EDIT_KQUEUE:
+                result = edit_kqueue(request);
+                break;
+            case SAVE:
+                result = save_kqueue_entries(request);
+                break;
+            default:
+                result = INVALID;
+                break;
+        }
+    ret: 
+        mutex_unlock(&operations_lock);
+        return result;
+    }
+我们要传入的结构体应当为 `request_t` 类型，如下：
+    typedef struct{
+        uint32_t max_entries;
+        uint16_t data_size;
+        uint16_t entry_idx;
+        uint16_t queue_idx;
+        char* data;
+    }request_t;
+在 ioctl 中定义了比较经典的增删改查操纵，下面逐个分析
+***err**
+笔者发现在其定义的一系列函数当中都有一系列的检查，若检查不通过则会调用 `err` 函数，如下：
+    static long err(char* msg){
+        printk(KERN_ALERT "%s\n",msg);
+        return -1;
+    }
+也就是说 **所有的检查没有任何的实际意义，哪怕不通过检查也不会阻碍程序的运行** ，经笔者实测确乎如此
+**create_kqueue**
+主要是进行队列的创建，限制了队列数量与大小
+    static noinline long create_kqueue(request_t request){
+        long result = INVALID;
+        if(queueCount > MAX_QUEUES)
+            err("[-] Max queue count reached");
+        /* You can't ask for 0 queues , how meaningless */
+        if(request.max_entriesMAX_DATA_SIZE)
+            err("[-] kqueue data size exceed");
+        /* Initialize kqueue_entry structure */
+        queue_entry *kqueue_entry;
+        /* Check if multiplication of 2 64 bit integers results in overflow */
+        ull space = 0;
+        if(__builtin_umulll_overflow(sizeof(queue_entry),(request.max_entries+1),&space) == true)
+            err("[-] Integer overflow");
+        /* Size is the size of queue structure + size of entry * request entries */
+        ull queue_size = 0;
+        if(__builtin_saddll_overflow(sizeof(queue),space,&queue_size) == true)
+            err("[-] Integer overflow");
+        /* Total size should not exceed a certain limit */
+        if(queue_size>sizeof(queue) + 0x10000)
+            err("[-] Max kqueue alloc limit reached");
+        /* All checks done , now call kzalloc */
+        queue *queue = validate((char *)kmalloc(queue_size,GFP_KERNEL));
+        /* Main queue can also store data */
+        queue->data = validate((char *)kmalloc(request.data_size,GFP_KERNEL));
+        /* Fill the remaining queue structure */
+        queue->data_size   = request.data_size;
+        queue->max_entries = request.max_entries;
+        queue->queue_size  = queue_size;
+        /* Get to the place from where memory has to be handled */
+        kqueue_entry = (queue_entry *)((uint64_t)(queue + (sizeof(queue)+1)/8));
+        /* Allocate all kqueue entries */
+        queue_entry* current_entry = kqueue_entry;
+        queue_entry* prev_entry = current_entry;
+        uint32_t i=1;
+        for(i=1;inext = NULL;
+            current_entry->idx = i;
+            current_entry->data = (char *)(validate((char *)kmalloc(request.data_size,GFP_KERNEL)));
+            /* Increment current_entry by size of queue_entry */
+            current_entry += sizeof(queue_entry)/16;
+            /* Populate next pointer of the previous entry */
+            prev_entry->next = current_entry;
+            prev_entry = prev_entry->next;
+        }
+        /* Find an appropriate slot in kqueues */
+        uint32_t j = 0;
+        for(j=0;jMAX_QUEUES)
+            err("[-] No kqueue slot left");
+        /* Assign the newly created kqueue to the kqueues */
+        kqueues[j] = queue;
+        queueCount++;
+        result = 0;
+        return result;
+    }
+其中一个 queue 结构体定义如下，大小为 0x18：
+    typedef struct{
+        uint16_t data_size;
+        uint64_t queue_size; /* This needs to handle larger numbers */
+        uint32_t max_entries;
+        uint16_t idx;
+        char* data;
+    }queue;
+我们有一个全局指针数组保存分配的 queue
+    queue *kqueues[MAX_QUEUES] = {(queue *)NULL};
+在这里用到了 [gcc 内置函数](https://gcc.gnu.org/onlinedocs/gcc/Integer-Overflow-Builtins.html) `__builtin_umulll_overflow`，主要作用就是将前两个参数相乘给到第三个参数，发生溢出则返回
+true，`__builtin_saddll_overflow` 与之类似不过是加法
+那么这里虽然 queue 结构体的成员数量似乎是固定的，但是在 kmalloc 时传入的 size 为 `((request.max_entry + 1)
+* sizeof(queue_entry)) + sizeof(queue)`，其剩余的空间用作 queue_entry 结构体，定义如下：
+    struct queue_entry{
+        uint16_t idx;
+        char *data;
+        queue_entry *next;
+    };
+在这里存在一个 **整型溢出漏洞** ：如果在
+`__builtin_umulll_overflow(sizeof(queue_entry),(request.max_entries+1),&space)`
+中我们传入的 `request.max_entries` 为 `0xffffffff`，加一后变为0，此时便能通过检测，但 space
+最终的结果为0，从而在后续进行 kmalloc 时便只分配了一个 queue 的大小，但是存放到 queue 的 max_entries 域的值为
+`request.max_entries`
+        queue->data_size   = request.data_size;
+        queue->max_entries = request.max_entries;
+        queue->queue_size  = queue_size;
+这里有一个移动指针的代码看得笔者比较疑惑，因为在笔者看来可以直接写作 `(queue_entry *)(queue + 1)`，
+~~不过阿三的代码懂的都懂~~
+    kqueue_entry = (queue_entry *)((uint64_t)(queue + (sizeof(queue)+1)/8));
+在分配 queue->data 时给 kmalloc 传入的大小为 `request.data_size`，限制为 0x20
+    queue->data = validate((char *)kmalloc(request.data_size,GFP_KERNEL));
+接下来会为每一个 queue_entry 的 data 域都分配一块内存，大小为 `request.data_size`，且 queue_entry
+从低地址向高地址连接成一个单向链表
+    uint32_t i=1;
+        for(i=1;inext = NULL;
+            current_entry->idx = i;
+            current_entry->data = (char *)(validate((char *)kmalloc(request.data_size,GFP_KERNEL)));
+            /* Increment current_entry by size of queue_entry */
+            current_entry += sizeof(queue_entry)/16;
+            /* Populate next pointer of the previous entry */
+            prev_entry->next = current_entry;
+            prev_entry = prev_entry->next;
+        }
+在最后会在 kqueue 数组中找一个空的位置把分配的 queue 指针放进去
+        uint32_t j = 0;
+        for(j=0;jMAX_QUEUES)
+            err("[-] No kqueue slot left");
+        /* Assign the newly created kqueue to the kqueues */
+        kqueues[j] = queue;
+        queueCount++;
+        result = 0;
+        return result;
+**delete_kqueue**
+常规的删除功能，不过这里有个 bug 是先释放后再清零，笔者认为会把 free object 的next 指针给清掉，有可能导致内存泄漏？
+    static noinline long delete_kqueue(request_t request){
+        /* Check for out of bounds requests */
+        if(request.queue_idx>MAX_QUEUES)
+            err("[-] Invalid idx");
+        /* Check for existence of the request kqueue */
+        queue *queue = kqueues[request.queue_idx];
+        if(!queue)
+            err("[-] Requested kqueue does not exist");
+        kfree(queue);
+        memset(queue,0,queue->queue_size);
+        kqueues[request.queue_idx] = NULL;
+        return 0;
+    }
+**edit_kqueue**
+主要是从用户空间拷贝数据到指定 queue_entry->size，如果给的 entry_idx为 0 则拷到 queue->data
+    static noinline long edit_kqueue(request_t request){
+        /* Check the idx of the kqueue */
+        if(request.queue_idx > MAX_QUEUES)
+            err("[-] Invalid kqueue idx");
+        /* Check if the kqueue exists at that idx */
+        queue *queue = kqueues[request.queue_idx];
+        if(!queue)
+            err("[-] kqueue does not exist");
+        /* Check the idx of the kqueue entry */
+        if(request.entry_idx > queue->max_entries)
+            err("[-] Invalid kqueue entry_idx");
+        /* Get to the kqueue entry memory */
+        queue_entry *kqueue_entry = (queue_entry *)(queue + (sizeof(queue)+1)/8);
+        /* Check for the existence of the kqueue entry */
+        exists = false;
+        uint32_t i=1;

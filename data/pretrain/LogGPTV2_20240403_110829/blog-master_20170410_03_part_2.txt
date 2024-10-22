@@ -1,0 +1,75 @@
+```  
+postgres=# show hot_standby_feedback;  
+ hot_standby_feedback   
+----------------------  
+ off  
+(1 row)  
+postgres=# select count(*) from test ;  
+  count     
+----------  
+ 10000000  
+(1 row)  
+postgres=# select * from test limit 10;  
+FATAL:  terminating connection due to conflict with recovery  
+DETAIL:  User query might have needed to see row versions that must be removed.  
+HINT:  In a moment you should be able to reconnect to the database and repeat your command.  
+server closed the connection unexpectedly  
+        This probably means the server terminated abnormally  
+        before or while processing the request.  
+The connection to the server was lost. Attempting reset: Succeeded.  
+```  
+### 复现方法2 主库vacuum_defer_cleanup_age > 0  
+略，复现方法一样。  
+## 小结与优化  
+为了尽量的避免物理备库的QUERY与apply的冲突，PostgreSQL提供了几种方法，但是这些方法要么会伤害主库，要么会伤害备库。都有一定代价。  
+1\. vacuum_defer_cleanup_age > 0  
+代价1，主库膨胀，因为垃圾版本要延迟若干个事务后才能被回收。  
+代价2，重复扫描垃圾版本，重复耗费垃圾回收进程的CPU资源。（n_dead_tup会一直处于超过垃圾回收阈值的状态，从而autovacuum 不断唤醒worker进行回收动作）。  
+当主库的 autovacuum_naptime=很小的值，同时autovacuum_vacuum_scale_factor=很小的值时，尤为明显。  
+代价3，如果期间发生大量垃圾，垃圾版本可能会在事务到达并解禁后，爆炸性的被回收，产生大量的WAL日志，从而造成WAL的写IO尖刺。  
+2\. hot_standby_feedback=on  
+如果备库出现了LONG QUERY，或者Repeatable Read的长事务，并且主库对备库还需要或正查询的数据执行了更新并产生了垃圾时，主库会保留这部分垃圾版本（与vacuum_defer_cleanup_age效果类似）。  
+代价，与vacuum_defer_cleanup_age > 0 一样。  
+3\. max_standby_archive_delay， max_standby_streaming_delay  
+代价，如果备库的QUERY与APPLY（恢复进程）冲突，那么备库的apply会出现延迟，也许从备库读到的是N秒以前的数据。  
+4\. 引申，还有一些行为可能会导致垃圾记录(dead tuple)无法被回收，一旦dead tuple无法被回收，那么每次autovacuum worker都是干的无用功。同样会引发和本文类似的问题（autovacuum不停被唤醒）。 例如    
+4\.1 主库有LONG XACT，无法回收该事务ID后产生的垃圾。(9.6可以设置snapshot too old，针对只读事务，如果事务超过配置的时间（或者XID），可能遇到快照过旧的错误，从而避免一直无法垃圾回收的问题。)     
+4\.2 主库有LONG 2PC XACT，无法回收该事务ID后产生的垃圾。(9.6可以设置snapshot too old，针对只读事务，如果事务超过配置的时间（或者XID），可能遇到快照过旧的错误，从而避免一直无法垃圾回收的问题。)      
+紧急解决这个问题的办法很简单，cancel long query,xact,2pc xact即可。  
+5\. 如何判断是否本文提及的原因导致主库负载升高，XLOG增多，备库recovery startup进程CPU 100%？   
+[《从redo日志分析数据库的profile》](../201705/20170504_02.md)  
+### 优化  
+1\. 不建议设置 vacuum_defer_cleanup_age > 0  
+2\. 如果备库有LONG query，同时需要实时性，可以设置hot_standby_feedback=on，同时建议将主库的autovacuum_naptime，autovacuum_vacuum_scale_factor设置为较大值（例如60秒，0.1），主库的垃圾回收唤醒间隔会长一点，如果突然产生很多垃圾，可能会造成一定的膨胀。  
+3\. 如果备库有LONG QUERY，并且没有很高的实时性要求，建议设置设置hot_standby_feedback=off, 同时设置较大的max_standby_archive_delay， max_standby_streaming_delay。  
+建议参数如下:   
+```
+hot_standby_feedback = off 
+autovacuum_naptime=45s
+vacuum_freeze_min_age = 50000000
+vacuum_freeze_table_age = 1300000000
+vacuum_multixact_freeze_min_age = 50000000
+vacuum_multixact_freeze_table_age = 1300000000
+autovacuum_freeze_max_age = 1500000000
+autovacuum_multixact_freeze_max_age = 1500000000
+```
+4\. 以此类推，还有哪些配置会导致AUTOVACUUM不停发起呢，但是又不回收垃圾呢？  
+当存在长事务时，当设置了延迟回收垃圾时，当备库设置了hot_standby_feedback=on，同时备库的QUERY的快照很老(导致主库不能回收垃圾)时(快照很老、或者备库LONG SQL，快照很老可能是备库APPLY延迟导致的)。   
+如果这样的前提存在，并且主库有些表存在垃圾，并且这些垃圾的年龄不足以被回收（参考以上前提导致某些版本无法回收），那么AUTOVACUUM每次被触发后，扫描到这些BLOCK只是空扫，不会回收。  
+现象就是AUTOVACUUM进程CPU很高，但是IO很低。   
+解决办法，把这些前提干掉，同时降低AUTOVACUUM触发频率。   
+5\. 备库配置recovery.conf中如果设置了使用SLOT，也可能导致主库wal堆积，导致主库的dead tuple不清理（对应SLOT备库需要的不清理）。  
+https://www.postgresql.org/docs/10/static/warm-standby.html#STREAMING-REPLICATION-SLOTS   
+Replication slots provide an automated way to ensure that the master does not remove WAL segments until they have been received by all standbys, and that the master does not remove rows which could cause a recovery conflict even when the standby is disconnected.   
+## 参考  
+https://www.postgresql.org/docs/9.6/static/runtime-config-replication.html  
+[《PostgreSQL slot failover》](../201805/20180516_01.md)   
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

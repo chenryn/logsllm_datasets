@@ -1,0 +1,154 @@
+# 背景
+看了@Tri0mphe大哥对jdbc反序列化的研究后稍微深入一些研究了下，都是个人理解，如果有什么不对的地方，希望各位大哥指出
+# 分析
+先看 [大哥的分析](https://xz.aliyun.com/t/8159 "大哥的分析")，然后对照源码去分析，很容易得到反序列化的入口点
+    public Object getObject(int columnIndex) throws SQLException {
+        Field field = this.columnDefinition.getFields()[columnIndexMinusOne];
+        switch (field.getMysqlType()) {
+            case BIT:
+                if (field.isBinary() || field.isBlob()) {
+                    byte[] data = getBytes(columnIndex);
+                    if (this.connection.getPropertySet().getBooleanProperty(PropertyDefinitions.PNAME_autoDeserialize).getValue()) {
+                        Object obj = data;
+                        if ((data != null) && (data.length >= 2)) {
+                            if ((data[0] == -84) && (data[1] == -19)) {
+                                try {
+                                    ByteArrayInputStream bytesIn = new ByteArrayInputStream(data);
+                                    ObjectInputStream objIn = new ObjectInputStream(bytesIn);
+                                    obj = objIn.readObject();
+                                    objIn.close();
+                                    bytesIn.close();
+                                }
+                            }
+                        }
+                        return obj;
+                    }
+                    return data;
+                }
+                ..............
+通过触发拦截器可触发反序列化，触发拦截器需要执行一条sql查询
+在JDBC连接数据库的过程中，会触发一系列查询 如`SET NAMES utf`、`set autocommit=1`等
+触发反序列化的链比较简单，但是poc写起来没那么简单，个人认为需要注意的几个点
+这里一次读入两个object，所以后面需要发送两个结果集
+触发反序列化的数据类型需要为BLOB并且设置autoDeserialize为true
+检测了前两个字节，-84，-19就是java 反序列化对象的标志
+然后通过@fnmsd大哥的文章可以得到如下的利用链
+>
+> mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor#preProcess/postprocess  
+>
+> com.mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor#populateMapWithSessionStatusValues  
+>  com.mysql.cj.jdbc.util.ResultSetUtil#resultSetToMap  
+>  com.mysql.cj.jdbc.result.ResultSetImpl#getObject
+## fnmsd大哥总结的可用的连接串
+ServerStatusDiffInterceptor触发：
+8.x:jdbc:mysql://127.0.0.1:3306/test?autoDeserialize=true&queryInterceptors=com.mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor
+6.x(属性名不同):jdbc:mysql://127.0.0.1:3306/test?autoDeserialize=true&statementInterceptors=com.mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor
+5.1.11及以上的5.x版本（包名没有了cj）:
+jdbc:mysql://127.0.0.1:3306/test?autoDeserialize=true&statementInterceptors=com.mysql.jdbc.interceptors.ServerStatusDiffInterceptor
+5.1.10及以下的5.1.X版本： 同上，但是需要连接后执行查询。
+5.0.x: 还没有ServerStatusDiffInterceptor这个东西detectCustomCollations触发：
+5.1.41及以上: 不可用
+5.1.29-5.1.40:jdbc:mysql://127.0.0.1:3306/test?detectCustomCollations=true&autoDeserialize=true
+5.1.28-5.1.19：jdbc:mysql://127.0.0.1:3306/test?autoDeserialize=true
+5.1.18以下的5.1.x版本： 不可用
+5.0.x版本不可用
+## 利用链总结
+总结以上利用链和大哥们的文章，得到以下几点条件
+1.Jdbc连接url可控
+2.返回的结果集可控
+=> 如何连接url可控，可编写一个恶意mysql服务端返回自定义的结果集，达到反序列化的目的，那么就需要了解mysql的私有协议
+# mysql私有协议分析
+先看一个 **基本数据包格式**
+Type | Name | Description  
+---|---|---  
+int | payload_length(包数据长度) | 具体数据包的内容长度，从出去头部四个字节后开始的内容  
+int | sequence_id(包序列id) | 每个包的序列id，总数据内容大于16MB时需要用，从0开始，依次增加，新的命令执行会重载为0  
+string | payload(具体数据) | 包中除去头部后的具体数据内容  
+举个例子，server返回的Response ok 响应包（mysql 为小端序 所以070000表示7）
+再来看到最重要的 **结果集数据包格式**
+由五个部分组成， **但是**
+，经过我反复抓包对比，似乎这个格式在高版本mysql（印象中是5.1.x以上，写了有点久记不清楚了）中是有问题的，所以Tri0mphe大哥在写poc的时候中间加了个EOF包会执行失败（这里看了很多分析都是以这个格式为准，mysql官方手册上也是这样，但在我自己抓包对比的时候只能在结尾看到一个eof包）
+正确的包序应该是这样的，如果用新格式发送给老客户端，将永远等不到第二个EOF包
+同时，新格式支持用OK包替换EOF包
+内容 | 含义  
+---|---  
+Result Set Header | 返回数据的列数量  
+Field | 返回数据的列信息（多个）  
+Row Data | 行数据（多个）  
+EOF | 数据结束  
+继续分析
+## Result Set Header 结构比较简单
+## Field
+1a0000 | 数据长度  
+---|---  
+02 | 序号  
+03646566 | def  
+00 | schema  
+01 63 | 表别名 01表示长度  
+01 63 | 表名  
+01 63 | 列别名  
+01 63 | 列名  
+0c | 标识位通常为12，表示接下去的12个字节是具体的field内容  
+3f00 | field的编码 这里表示binary  
+ffff0000 | 表示field的类型  
+fc | 表示类型为blob  
+8000 | flags  
+00 | 精确度 只对DECIMAL和NUMERIC类型有效  
+0000 | 默认值，该字段用在数据表定义中，普通的查询结果中不会出现  
+类型对照，fc表示blob，与上面提到的blob类型才能反序列化要对应
+0x00 | FIELD_TYPE_DECIMAL  
+---|---  
+0x01 | FIELD_TYPE_TINY  
+0x02 | FIELD_TYPE_SHORT  
+0x03 | FIELD_TYPE_LONG  
+0x04 | FIELD_TYPE_FLOAT  
+0x05 | FIELD_TYPE_DOUBLE  
+0x06 | FIELD_TYPE_NULL  
+0x07 | FIELD_TYPE_TIMESTAMP  
+0x08 | FIELD_TYPE_LONGLONG  
+0x09 | FIELD_TYPE_INT24  
+0x0A | FIELD_TYPE_DATE  
+0x0B | FIELD_TYPE_TIME  
+0x0C | FIELD_TYPE_DATETIME  
+0x0D | FIELD_TYPE_YEAR  
+0x0E | FIELD_TYPE_NEWDATE  
+0x0F | FIELD_TYPE_VARCHAR (new in MySQL 5.0)  
+0x10 | FIELD_TYPE_BIT (new in MySQL 5.0)  
+0xF6 | FIELD_TYPE_NEWDECIMAL (new in MYSQL 5.0)  
+0xF7 | FIELD_TYPE_ENUM  
+0xF8 | FIELD_TYPE_SET  
+0xF9 | FIELD_TYPE_TINY_BLOB  
+0xFA | FIELD_TYPE_MEDIUM_BLOB  
+0xFB | FIELD_TYPE_LONG_BLOB  
+0xFC | FIELD_TYPE_BLOB  
+0xFD | FIELD_TYPE_VAR_STRING  
+0xFE | FIELD_TYPE_STRING  
+0xFF | FIELD_TYPE_GEOMETRY  
+Tri0mphe大哥分析的flags大于128就是表示0x0080，即是表示是个binary
+0x0001 | NOT_NULL_FLAG  
+---|---  
+0x0002 | PRI_KEY_FLAG  
+0x0004 | UNIQUE_KEY_FLAG  
+0x0008 | MULTIPLE_KEY_FLAG  
+0x0010 | BLOB_FLAG  
+0x0020 | UNSIGNED_FLAG  
+0x0040 | ZEROFILL_FLAG  
+0x0080 | BINARY_FLAG  
+0x0100 | ENUM_FLAG  
+0x0200 | AUTO_INCREMENT_FLAG  
+0x0400 | TIMESTAMP_FLAG  
+0x0800 | SET_FLAG  
+## Row Data
+没啥好说的就是payload 数据包总长度 + 包序 + 类型 + payload长度 + payload
+## EOF
+07000006fe000022000100
+## 总结
+通过如上表格加上大哥们的分析就很容易写出并且理解poc，在分析mysql私有协议的时候踩了很多坑，对于这种比较生涩的东西，更应该相信最直接能看到的，直接抓个包对照
+# 一些小坑
+powershell在生成反序列化对象的时候会出现奇怪的问题，解决方法
+java -jar ysoserial-0.0.6-SNAPSHOT-all.jar CommonsCollections5 calc | Out-File
+-Encoding default payload.ser
+写poc最后需要响应一个show warning，否则会报错，这里后面没有深入研究下去了，猜测是返回的结果集不符合客户端解析的规则
+# 写在最后
+后来因为show
+warning的问题和fnmsd大哥交流了下，大哥人真好，解答了不少问题，可以直接用线程的mysql服务端去响应，其实就绕开了mysql私有协议的分析。最后感谢各位大哥的研究

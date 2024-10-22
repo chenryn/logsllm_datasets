@@ -1,0 +1,138 @@
+        /*
+         * If first fragment to arrive, create a reassembly queue.
+         */
+        if (fp == NULL) {
+            struct mbuf *t = m_get(slirp);
+            ...
+如果传入的数据包被分段，则使用新的`mbuf`对象来存储数据包（fp），直到所有片段都到达为止。当下一部分到达时，它们将被放入该列表，以进行排队。
+这为我们提供了一个很好的原语，借助它，我们可以根据堆大小( > 0x608
+)来分配受控的内存块。要记住的几件事情是，对于每个数据包，都会为其分配mbuf（0x670）缓冲区，如果它是第一个片段，还将分配另一个mbuf（fp：分段队列）。
+    malloc(0x670)
+    if(pkt_len + TCPIPHDR_DELTA + 2 > 0x608)
+       malloc(pkt_len + TCPIPHDR_DELTA + 2)
+    if(ip->ip_off & IP_MF)
+       malloc(0x670)
+我们可以使用它执行堆喷射操作，这样后面的内存分配都将在顶部内存块中进行，这就给我们提供了一个可预测的堆状态。
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Getting-controlled-write-on-heap "Getting controlled
+write on heap")实现堆的受控写操作
+这样，我们就可以控制堆了。让我们看看如何使用这个漏洞来覆盖某些有用的东西。
+    q = fp->frag_link.next; // Points to first fragment
+        if (m->m_flags & M_EXT) {
+            int delta = (char *)q - m->m_dat;
+            q = (struct ipasfrag *)(m->m_ext + delta);
+        }
+假设堆的布局如下所示：
+    +------------+
+                |     q      |
+                +------------+
+                |            |
+                |            |
+                |  padding   |
+                |            |
+                |            |
+                +------------+
+                |   m->m_dat |
+                +------------+
+现在，`delta`将会`-padding`，然后与`m->m_ext`相加，这样我们就可以向该偏移量处执行写操作了。因此，只要能够控制这个padding，我们就能够控制delta。
+当所有片段都到达时，它们会通过`m_cat`函数连接成一个`mbuf`对象。
+    slirp/src/muf.c
+    void m_cat(struct mbuf *m, struct mbuf *n)
+    {
+        /*
+         * If there's no room, realloc
+         */
+        if (M_FREEROOM(m) m_len)
+            m_inc(m, m->m_len + n->m_len);
+        memcpy(m->m_data + m->m_len, n->m_data, n->m_len);
+        m->m_len += n->m_len;
+        m_free(n);
+    }
+    slirp/src/muf.c
+    void m_inc(struct mbuf *m, int size)
+    {
+        ...
+        if (m->m_flags & M_EXT) {
+            gapsize = m->m_data - m->m_ext;
+            m->m_ext = g_realloc(m->m_ext, size + gapsize);
+        ...
+    }
+函数`m_inc`会调用`realloc`函数，而realloc函数将返回相同的内存块，如果它可以容纳所请求的内存大小的话。因此，即使在重组数据包之后，我们也可以访问第一个数据包的m->m_ext缓冲区。注意，m_ext缓冲区将被分配给第一个分段数据包，而`q`将指向该缓冲区。并且，`-padding`也将相对于`q`而言的。这只是为了让事情变得更轻松。
+    +------------+
+                |  target    |
+                +------------+
+                |            |
+                |            |
+                |  padding   |
+                |            |
+                |            |
+    m-m_ext  -> +------------+  // q = m->m_ext + -padding  will point to target
+                |     q      |  // delta = -paddig
+                +------------+
+                |            |
+                |            |
+                |  padding   |
+                |            |
+                |            |
+                +------------+
+                |   m->m_dat |
+                +------------+
+因此，在完成指针运算后，`q`将指向`target`
+    slirp/src/ip_input.c:ip_reass
+        ip = fragtoip(q);
+        ...
+        ip->ip_src = fp->ipq_src;
+        ip->ip_dst = fp->ipq_dst;
+由于我们可以控制`fp->ipq_src`和`fp->ipq_dst`了（即数据包的源和目标ip），所以，我们自然可以覆盖目标内容了。
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Arbitrary-Write "Arbitrary Write")任意写操作
+我的初始目标是覆盖`m_data`字段，这样我们就可以使用完成数据包重组的`m_cat()`函数来执行任意写操作了。不过，由于某些对齐和偏移问题，这似乎是难以完成的。
+    slirp/src/muf.c:m_cat
+        memcpy(m->m_data + m->m_len, n->m_data, n->m_len);
+不过，我们却能够覆盖对象的`m_len`字段。由于没有对`m_cat`函数进行相应的检查，所以，我们可以使用`m_len`来执行相对于`m_data`的任意写操作。这样的话，我们就可以无视对齐的问题了——我们可以这种方法来覆盖不同对象的`m_data`以执行任意写操作。
+  * 发送一个id为“0xdead”且MF位为1的数据包
+  * 发送一个id为“0xcafe”且且MF位为1的数据包
+  * 触发漏洞，从而覆盖`0xcafe`数据包的m_len，使m_data+m_len指向`0xdead`数据包的m_data
+  * 发送一个id为“0xcafe”且MF位为0的数据包，以触发重组过程并用目标地址覆盖“0xdead”数据包的m_data
+  * 发送一个id为“0xdead”且MF位为0的数据包，该数据包会将其内容写入m_data。
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Getting-Leaks "Getting Leaks")实现数据泄露
+我们需要借助数据泄漏来绕过ASLR和PIE防御机制。为此，我们需要借助一些方法将数据传回给客户机。事实证明，有一个非常常见的服务非常适合用于完成这项任务：ICMP回应请求。我们知道，SLiRP网关会响应ICMP回应请求，以指出数据包的有效载荷（payload）没有发生变化。
+我们已经找到了实现任意写操作的方法，但是具体将数据写到哪里呢？这需要通过泄漏某些重要的数据来确定。
+我们可以部分覆盖`m_data`并在堆上写入数据。
+通过数据泄漏，我们可以：
+  * 通过任意写操作在堆上创建伪ICMP报头
+  * 发送设置了MF位的ICMP请求。
+  * 部分覆盖`m_data`，使其指向堆上伪造的报头
+  * 通过发送MF位为0的数据包来结束ICMP请求。
+  * 接收从宿主机泄漏的重要数据。
+### [](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/#Getting-Code-Execution "Getting Code Execution")实现代码执行
+定时器（更准确地说是QEMUTimers）为我们提供了一种在经过一段时间间隔后调用给定例程（回调函数）的方法，为此，只需传递一个指向该例程的不透明指针即可。
+    struct QEMUTimer {
+        int64_t expire_time;        /* in nanoseconds */
+        QEMUTimerList *timer_list;
+        QEMUTimerCB *cb;
+        void *opaque;
+        QEMUTimer *next;
+        int scale;
+    };
+    struct QEMUTimerList {
+        QEMUClock *clock;
+        QemuMutex active_timers_lock;
+        QEMUTimer *active_timers;
+        QLIST_ENTRY(QEMUTimerList) list;
+        QEMUTimerListNotifyCB *notify_cb;
+        void *notify_opaque;
+        QemuEvent timers_done_ev;
+    };
+main_loop_tlg是bss中的一个数组，其中包含与不同定时器关联的`QEMUTimerList`。它们实际上就是存放`QEMUTimer`结构的列表。qemu会循环遍历这些定时器，以检查是否有到期的，如果有的话，则使用参数`opaque`来调用`cb`函数。
+RIP可以控制：
+  * 创建伪造的QEMUTimer，赋予回调函数system权限，以opaque为其参数
+  * 创建伪造的QEMUTImerList，其中包含我们伪造的QEMUTimer
+  * 使用伪造的QEMUTimerList覆盖main_loop_tlg的元素
+您可以在[CVE-2019-14378]（
+演示视频：
+### 参考文献
+  * [QEMU Networking](https://wiki.qemu.org/Documentation/Networking)
+  * [IP Fragmentation](https://en.wikipedia.org/wiki/IP_fragmentation)
+  * [Internet Header Format](https://tools.ietf.org/html/rfc791#section-3.1)
+  * [Virtunoid: A KVM Guest - Host privilege](https://media.blackhat.com/bh-us-11/Elhage/BH_US_11_Elhage_Virtunoid_WP.pdf)
+  * [CVE-2019-6778](https://github.com/Kira-cxy/qemu-vm-escape)
+[原文地址](https://blog.bi0s.in/2019/08/20/Pwn/VM-Escape/2019-07-29-qemu-vm-escape-cve-2019-14378/)

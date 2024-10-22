@@ -1,0 +1,159 @@
+        return false;
+    }
+    #endif
+如上是老版本源代码，现在的代码已经有所改变。最新版代码中[dyld.cpp](https://opensource.apple.com/source/dyld/dyld-635.2/src/dyld.cpp.auto.html)看起来稍微复杂一点，但基本原理是相同的。相关的代码片段如下所示，其中configureProcessRestrictions用来设置限制条件，processIsRestricted返回结果值：
+    static void configureProcessRestrictions(const macho_header* mainExecutableMH)
+    {
+        uint64_t amfiInputFlags = 0;
+    #if TARGET_IPHONE_SIMULATOR
+        amfiInputFlags |= AMFI_DYLD_INPUT_PROC_IN_SIMULATOR;
+    #elif __MAC_OS_X_VERSION_MIN_REQUIRED
+        if ( hasRestrictedSegment(mainExecutableMH) )
+           amfiInputFlags |= AMFI_DYLD_INPUT_PROC_HAS_RESTRICT_SEG;
+    #elif __IPHONE_OS_VERSION_MIN_REQUIRED
+        if ( isFairPlayEncrypted(mainExecutableMH) )
+           amfiInputFlags |= AMFI_DYLD_INPUT_PROC_IS_ENCRYPTED;
+    #endif
+        uint64_t amfiOutputFlags = 0;
+        if ( amfi_check_dyld_policy_self(amfiInputFlags, &amfiOutputFlags) == 0 ) {
+           gLinkContext.allowAtPaths              = (amfiOutputFlags & AMFI_DYLD_OUTPUT_ALLOW_AT_PATH);
+           gLinkContext.allowEnvVarsPrint         = (amfiOutputFlags & AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS);
+           gLinkContext.allowEnvVarsPath          = (amfiOutputFlags & AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS);
+           gLinkContext.allowEnvVarsSharedCache   = (amfiOutputFlags & AMFI_DYLD_OUTPUT_ALLOW_CUSTOM_SHARED_CACHE);
+           gLinkContext.allowClassicFallbackPaths = (amfiOutputFlags & AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS);
+           gLinkContext.allowInsertFailures       = (amfiOutputFlags & AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION);
+        }
+        else {
+    #if __MAC_OS_X_VERSION_MIN_REQUIRED
+           // support chrooting from old kernel
+           bool isRestricted = false;
+           bool libraryValidation = false;
+           // any processes with setuid or setgid bit set or with __RESTRICT segment is restricted
+           if ( issetugid() || hasRestrictedSegment(mainExecutableMH) ) {
+               isRestricted = true;
+           }
+           bool usingSIP = (csr_check(CSR_ALLOW_TASK_FOR_PID) != 0);
+           uint32_t flags;
+           if ( csops(0, CS_OPS_STATUS, &flags, sizeof(flags)) != -1 ) {
+               // On OS X CS_RESTRICT means the program was signed with entitlements
+               if ( ((flags & CS_RESTRICT) == CS_RESTRICT) && usingSIP ) {
+                  isRestricted = true;
+               }
+               // Library Validation loosens searching but requires everything to be code signed
+               if ( flags & CS_REQUIRE_LV ) {
+                  isRestricted = false;
+                  libraryValidation = true;
+               }
+           }
+           gLinkContext.allowAtPaths                = !isRestricted;
+           gLinkContext.allowEnvVarsPrint           = !isRestricted;
+           gLinkContext.allowEnvVarsPath            = !isRestricted;
+           gLinkContext.allowEnvVarsSharedCache     = !libraryValidation || !usingSIP;
+           gLinkContext.allowClassicFallbackPaths   = !isRestricted;
+           gLinkContext.allowInsertFailures         = false;
+    #else
+           halt("amfi_check_dyld_policy_self() failed\n");
+    #endif
+        }
+    }
+    bool processIsRestricted()
+    {
+    #if __MAC_OS_X_VERSION_MIN_REQUIRED
+        return !gLinkContext.allowEnvVarsPath;
+    #else
+        return false;
+    #endif
+    }
+如果满足如下条件，代码就会将gLinkContext.allowEnvVarsPath设置为false：
+1、主执行程序中包含受限segment；
+2、设置了suid/guid位；
+3、启用SIP（可能有人想知道CSR_ALLOW_TASK_FOR_PID是否是SIP启动配置标志，但我对此并不是特别了解）且程序设置了CS_RESTRICT标志（在OSX上即程序使用entitlements签名）。
+然而如果设置了CS_REQUIRE_LV，就会清空这个标志。那么CS_REQUIRE_LV标志有什么作用？如果主程序设置了该标志，则意味着加载器会识别载入应用程序中的每个dylib，判断这些dylib是否使用与主程序相同的密钥进行签名。这一点也能够理解，我们只能将dylib注入同一个开发者开发的应用程序中。只有我们有权访问代码签名证书，才能滥用这一点（其实不一定，后面我们再分析）。
+还有另一种保护应用程序的方案，那就是启用[Hardened
+Runtime](https://developer.apple.com/documentation/security/hardened_runtime_entitlements)，然后我们可以根据需要确定是否启用[DYLD环境变量](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_allow-dyld-environment-variables)。上述代码似乎可以追溯到2013年，而这个选项从Mojave（10.14）才开始引入，该系统版本于去年发布（2018年），因此这也是为什么我们在源码中没有找到相关信息的原因所在。
+CS标志对应的值如下所示（参考自[cs_blobs.h](https://opensource.apple.com/source/xnu/xnu-4903.221.2/osfmk/kern/cs_blobs.h.auto.html)）：
+    #define CS_RESTRICT      0x0000800  /* tell dyld to treat restricted */
+    #define CS_REQUIRE_LV       0x0002000  /* require library validation */
+    #define CS_RUNTIME       0x00010000  /* Apply hardened runtime policies */
+以上都是理论研究，我们可以来实际试一下。我创建了一个Xcode项目，根据需要修改了配置信息。首先我们来测试一下SUID位的效果，如下所示：
+    #setting ownership
+    $ sudo chown root test
+    $ ls -l test
+    -rwxr-xr-x  1 root  staff  8432 Jul  8 16:46 test
+    #setting suid flag, and running, as we can see the dylib is not run
+    $ sudo chmod +s test
+    $ ls -l test
+    -rwsr-sr-x  1 root  staff  8432 Jul  8 16:46 test
+    $ ./test 
+    Hello world
+    $ DYLD_INSERT_LIBRARIES=inject.dylib ./test
+    Hello world
+    #removing suid flag and running
+    $ sudo chmod -s test
+    $ ls -l test
+    -rwxr-xr-x  1 root  staff  8432 Jul  8 16:46 test
+    $ DYLD_INSERT_LIBRARIES=inject.dylib ./test
+    Hello from dylib!
+    Hello world
+有趣的是之前有个LPE（本地提权）bug，没有正确处理其中某个环境变量以及SUID文件，我们可以借此实现权限提升，大家可以详细参考[这篇文章](https://www.sektioneins.de/blog/15-07-07-dyld_print_to_file_lpe.html)。
+我创建了一个空白的Cocoa App用来测试其他防护效果，我也导出了环境变量，因此不需要每次都在命令行中指定：
+    export DYLD_INSERT_LIBRARIES=inject.dylib
+编译程序后，以默认状态运行，可以看到dylib会被注入其中：
+    $ ./HelloWorldCocoa.app/Contents/MacOS/HelloWorldCocoa 
+    Hello from dylib!
+如果想设置受限section，可以转到Build Settings -> Linking -> Other linker flags进行设置，具体值如下：
+    -Wl,-sectcreate,__RESTRICT,__restrict,/dev/null
+重新编译后，我们可以看到一大堆错误，提示dylib已被忽略，如下所示：
+    dyld: warning, LC_RPATH @executable_path/../Frameworks in /Users/csaby/Library/Developer/Xcode/DerivedData/HelloWorldCocoa-apovdjtqwdvhlzddnqghiknptqqb/Build/Products/Debug/HelloWorldCocoa.app/Contents/MacOS/HelloWorldCocoa being ignored in restricted program because of @executable_path
+    dyld: warning, LC_RPATH @executable_path/../Frameworks in /Users/csaby/Library/Developer/Xcode/DerivedData/HelloWorldCocoa-apovdjtqwdvhlzddnqghiknptqqb/Build/Products/Debug/HelloWorldCocoa.app/Contents/MacOS/HelloWorldCocoa being ignored in restricted program because of @executable_path
+我们的dylib并没有被加载，这也符合我们的预期。我们可以通过size命令验证应用中存在相关segment，如下所示：
+    $ size -x -l -m HelloWorldCocoa.app/Contents/MacOS/HelloWorldCocoa
+    Segment __PAGEZERO: 0x100000000 (vmaddr 0x0 fileoff 0)
+    Segment __TEXT: 0x2000 (vmaddr 0x100000000 fileoff 0)
+        Section __text: 0x15c (addr 0x1000012b0 offset 4784)
+        Section __stubs: 0x24 (addr 0x10000140c offset 5132)
+        Section __stub_helper: 0x4c (addr 0x100001430 offset 5168)
+        Section __objc_classname: 0x2d (addr 0x10000147c offset 5244)
+        Section __objc_methname: 0x690 (addr 0x1000014a9 offset 5289)
+        Section __objc_methtype: 0x417 (addr 0x100001b39 offset 6969)
+        Section __cstring: 0x67 (addr 0x100001f50 offset 8016)
+        Section __unwind_info: 0x48 (addr 0x100001fb8 offset 8120)
+        total 0xd4f
+    Segment __DATA: 0x1000 (vmaddr 0x100002000 fileoff 8192)
+        Section __nl_symbol_ptr: 0x10 (addr 0x100002000 offset 8192)
+        Section __la_symbol_ptr: 0x30 (addr 0x100002010 offset 8208)
+        Section __objc_classlist: 0x8 (addr 0x100002040 offset 8256)
+        Section __objc_protolist: 0x10 (addr 0x100002048 offset 8264)
+        Section __objc_imageinfo: 0x8 (addr 0x100002058 offset 8280)
+        Section __objc_const: 0x9a0 (addr 0x100002060 offset 8288)
+        Section __objc_ivar: 0x8 (addr 0x100002a00 offset 10752)
+        Section __objc_data: 0x50 (addr 0x100002a08 offset 10760)
+        Section __data: 0xc0 (addr 0x100002a58 offset 10840)
+        total 0xb18
+    Segment __RESTRICT: 0x0 (vmaddr 0x100003000 fileoff 12288)
+        Section __restrict: 0x0 (addr 0x100003000 offset 12288)
+        total 0x0
+    Segment __LINKEDIT: 0x6000 (vmaddr 0x100003000 fileoff 12288)
+    total 0x100009000
+此外我们也可以使用otool -l [path to the binary]命令完成同样任务，输出结果稍微有点不同。
+接下来就是设置应用启用[hardened
+runtime](https://developer.apple.com/documentation/security/hardened_runtime_entitlements)。我们可以通过Build
+Settings -> Signing -> Enable Hardened
+Runtime或者Capabilities来设置。设置完成并重新编译后，运行该程序会看到如下错误信息：
+    dyld: warning: could not load inserted library 'inject.dylib' into hardened process because no suitable image found.  Did find:
+        inject.dylib: code signature in (inject.dylib) not valid for use in process using Library Validation: mapped file has no cdhash, completely unsigned? Code has to be at least ad-hoc signed.
+        inject.dylib: stat() failed with errno=1
+但如果使用相同的证书来签名dylib，运行结果如下：
+    codesign -s "Mac Developer: PI:EMAIL (RQGUDM4LR2)" inject.dylib
+    $ codesign -dvvv inject.dylib 
+    Executable=inject.dylib
+    Identifier=inject
+    Format=Mach-O thin (x86_64)
+    CodeDirectory v=20200 size=230 flags=0x0(none) hashes=3+2 location=embedded
+    Hash type=sha256 size=32
+    CandidateCDHash sha256=348bf4f1a2cf3d6b608e3d4cfd0d673fdd7c9795
+    Hash choices=sha256
+    CDHash=348bf4f1a2cf3d6b608e3d4cfd0d673fdd7c9795
+    Signature size=4707
+    Authority=Mac Developer: PI:EMAIL (RQGUDM4LR2)
+    Authority=Apple Worldwide Developer Relations Certification Authority

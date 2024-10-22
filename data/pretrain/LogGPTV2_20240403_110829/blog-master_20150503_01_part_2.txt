@@ -1,0 +1,119 @@
+ * Note: xidWrapLimit and oldestXidDB are not "active" values, but are  
+ * used just to generate useful messages when xidWarnLimit or xidStopLimit  
+ * are exceeded.  
+ */  
+typedef struct VariableCacheData  
+{  
+        /*  
+         * These fields are protected by OidGenLock.  
+         */  
+        Oid                     nextOid;                /* next OID to assign */  
+        uint32          oidCount;               /* OIDs available before must do XLOG work */  
+        /*  
+         * These fields are protected by XidGenLock.  
+         */  
+        TransactionId nextXid;          /* next XID to assign */  
+        TransactionId oldestXid;        /* cluster-wide minimum datfrozenxid */  
+        TransactionId xidVacLimit;      /* start forcing autovacuums here */  
+        TransactionId xidWarnLimit; /* start complaining here */  
+        TransactionId xidStopLimit; /* refuse to advance nextXid beyond here */  
+        TransactionId xidWrapLimit; /* where the world ends */  
+        Oid                     oldestXidDB;    /* database with minimum datfrozenxid */  
+        /*  
+         * These fields are protected by ProcArrayLock.  
+         */  
+        TransactionId latestCompletedXid;       /* newest XID that has committed or  这就是集群中最新的已提交事务号  
+                                                                                 * aborted */  
+} VariableCacheData;  
+typedef VariableCacheData *VariableCache;  
+HeapTupleSatisfiesVacuum什么情况下会返回HEAPTUPLE_RECENTLY_DEAD？  
+        if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)    // 如果记录是被multi-xact事务操作  
+        {  
+                TransactionId xmax;  
+                if (MultiXactIdIsRunning(HeapTupleHeaderGetRawXmax(tuple)))  // 如果multi-xacts事务还未结束  
+                {  
+                        /* already checked above */  
+                        Assert(!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask));  
+                        xmax = HeapTupleGetUpdateXid(tuple);  
+                        /* not LOCKED_ONLY, so it has to have an xmax */  
+                        Assert(TransactionIdIsValid(xmax));  
+                        if (TransactionIdIsInProgress(xmax))  
+                                return HEAPTUPLE_DELETE_IN_PROGRESS;  
+                        else if (TransactionIdDidCommit(xmax))  // 如果xmax对应的事务已提交  
+                                /* there are still lockers around -- can't return DEAD here */  
+                                return HEAPTUPLE_RECENTLY_DEAD;  
+                        /* updating transaction aborted */  
+                        return HEAPTUPLE_LIVE;  
+                }  
+                Assert(!(tuple->t_infomask & HEAP_XMAX_COMMITTED));  
+                xmax = HeapTupleGetUpdateXid(tuple);  
+                /* not LOCKED_ONLY, so it has to have an xmax */  
+                Assert(TransactionIdIsValid(xmax));  
+                /* multi is not running -- updating xact cannot be */  
+                Assert(!TransactionIdIsInProgress(xmax));  
+                if (TransactionIdDidCommit(xmax))   // 如果xmax对应的事务已提交  
+                {  
+                        if (!TransactionIdPrecedes(xmax, OldestXmin))    // 如果xmax事务号是在OldestXmin之后申请的  
+                                return HEAPTUPLE_RECENTLY_DEAD;  
+                        else  
+                                return HEAPTUPLE_DEAD;  
+                }  
+                /*  
+                 * Not in Progress, Not Committed, so either Aborted or crashed.  
+                 * Remove the Xmax.  
+                 */  
+                SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);  
+                return HEAPTUPLE_LIVE;  
+        }  
+......  
+        /*  
+         * Deleter committed, but perhaps it was recent enough that some open  
+         * transactions could still see the tuple.  
+         */  
+        if (!TransactionIdPrecedes(HeapTupleHeaderGetRawXmax(tuple), OldestXmin))  //   // 如果xmax事务号是在OldestXmin之后申请的  
+                return HEAPTUPLE_RECENTLY_DEAD;  
+```  
+从这里可以了解到，如果记录是在OldestXmin之后申请的事务中变成垃圾的，就是HEAPTUPLE_RECENTLY_DEAD。  
+也就是说，PostgreSQL垃圾回收时，只是判断TUPLE是否是在当前数据库中的最小的未提交事务或最小的事务快照号之后产生的，如果是，那么就不回收。  
+在另一篇文章中有介绍如何重现：  
+[《PostgreSQL 垃圾回收原理以及如何预防膨胀 - How to prevent object bloat in PostgreSQL》](../201504/20150429_02.md)  
+要解决这个容易膨胀的问题，我们需要知道数据库中存在的最老的未提交的repeatable read或serializable隔离级别的事务号。  
+用这个事务号作为判断HEAPTUPLE_RECENTLY_DEAD的依据。  
+例如，当A库中存在级别repeatable read或serializable的最小未结束事务号为Xa, 那么A库中Xa后产生的垃圾不能回收，但是其他库Xa后产生的垃圾能否回收和其他库中的最小repeatable read或serializable未结束事务号有关，和A库无关。  
+## 参考  
+1\. [《PostgreSQL 垃圾回收原理以及如何预防膨胀 - How to prevent object bloat in PostgreSQL》](../201504/20150429_02.md)  
+2\. src/include/storage/proc.h  
+```  
+/*  
+ * Prior to PostgreSQL 9.2, the fields below were stored as part of the  
+ * PGPROC.  However, benchmarking revealed that packing these particular  
+ * members into a separate array as tightly as possible sped up GetSnapshotData  
+ * considerably on systems with many CPU cores, by reducing the number of  
+ * cache lines needing to be fetched.  Thus, think very carefully before adding  
+ * anything else here.  
+ */  
+typedef struct PGXACT  
+{  
+        TransactionId xid;                      /* id of top-level transaction currently being  
+                                                                 * executed by this proc, if running and XID  
+                                                                 * is assigned; else InvalidTransactionId */  
+        TransactionId xmin;                     /* minimal running XID as it was when we were  
+                                                                 * starting our xact, excluding LAZY VACUUM:  
+                                                                 * vacuum must not remove tuples deleted by  
+                                                                 * xid >= xmin ! */  
+        uint8           vacuumFlags;    /* vacuum-related flags, see above */  
+        bool            overflowed;  
+        bool            delayChkpt;             /* true if this proc delays checkpoint start;  
+                                                                 * previously called InCommit */  
+        uint8           nxids;  
+} PGXACT;  
+```  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

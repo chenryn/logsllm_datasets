@@ -1,0 +1,230 @@
+## PostgreSQL 检查点性能影响及源码分析 - 3    
+### 作者                     
+digoal                      
+### 日期                    
+2015-05-06                        
+### 标签                    
+PostgreSQL , 检查点 , 性能影响 , full page write , FPW , 可靠性                                                    
+----                    
+## 背景      
+数据库可靠性从何而来？        
+数据库崩溃后如何恢复，从什么位置开始恢复？        
+数据库检查点是什么？        
+检查点要干些什么？        
+为什么脏数据较多时，检查点会对性能有一定的影响？        
+什么是full page write？        
+相信这些问题是搞数据库的同学都想搞明白的。        
+接下里的一系列文章，围绕检查点展开讲解，讲一讲检查点的原理，以及为什么脏数据较多是，它会对数据库产生一定的性能影响。          
+## 正文      
+接着上一篇，  
+http://blog.163.com/digoal@126/blog/static/1638770402015463252387/  
+这篇主要谈一下CheckPointBuffers(flags).  
+CheckPointBuffers(flags)@src/backend/storage/buffer/bufmgr.c  
+```
+/*  
+ * CheckPointBuffers  
+ *  
+ * Flush all dirty blocks in buffer pool to disk at checkpoint time.  
+ *  
+ * Note: temporary relations do not participate in checkpoints, so they don't  
+ * need to be flushed.  
+ */  
+void  
+CheckPointBuffers(int flags)  
+{  
+        TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);  // buffer checkpoint开始探针  
+        CheckpointStats.ckpt_write_t = GetCurrentTimestamp();  
+        BufferSync(flags);  //  这个是重量级操作, 需要全扫描1次BUFFER, 锁buffer头, 设置标记。 再扫描一次buffer,将前面标记过的脏块flush到磁盘。  
+        CheckpointStats.ckpt_sync_t = GetCurrentTimestamp();  
+        TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();   // buffer checkpoint sync开始探针  
+        smgrsync();  // sync操作  
+        CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();  
+        TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();   // buffer checkpoint 结束探针  
+}   
+```
+BufferSync是一个比较重的操作。  
+第一次全扫描buffer区，将脏数据块头部设置为本次checkpoint需要flush的块。  
+第二次扫描，将前面设置为本次需要checkpoint的块FLUSH到磁盘。  
+但是需要注意，第一次设置为need checkpoint的块，有一个计数，第二次在刷数据块时，可能提前到达这个计数，所以第二次刷脏块的动作可能不需要扫全缓存区域。  
+但是，第一次被标记的脏块，也可能在这期间被其他进程如bgwriter写掉了，所以第二次扫描时无法达到计数，则还是需要全扫描整个缓存区。  
+（为什么不在第一次设置时同时记住脏块的内存位置，第二次直接去FLUSH这些位置的块呢？还需要重复再扫一次）  
+BufferSync@src/backend/storage/buffer/bufmgr.c  
+```
+/*  
+ * BufferSync -- Write out all dirty buffers in the pool.  
+ *  
+ * This is called at checkpoint time to write out all dirty shared buffers.  
+ * The checkpoint request flags should be passed in.  If CHECKPOINT_IMMEDIATE  
+ * is set, we disable delays between writes; if CHECKPOINT_IS_SHUTDOWN,  
+ * CHECKPOINT_END_OF_RECOVERY or CHECKPOINT_FLUSH_ALL is set, we write even  
+ * unlogged buffers, which are otherwise skipped.  The remaining flags  
+ * currently have no effect here.  
+ */  
+static void  
+BufferSync(int flags)  
+{  
+        int                     buf_id;  
+        int                     num_to_scan;  
+        int                     num_to_write;  
+        int                     num_written;  
+        int                     mask = BM_DIRTY;  // 脏块掩码  
+        /* Make sure we can handle the pin inside SyncOneBuffer */  
+        ResourceOwnerEnlargeBuffers(CurrentResourceOwner);  
+        /*  
+         * Unless this is a shutdown checkpoint or we have been explicitly told,  
+         * we write only permanent, dirty buffers.  But at shutdown or end of  
+         * recovery, we write all dirty buffers.  
+         */  
+        if (!((flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY |  
+                                        CHECKPOINT_FLUSH_ALL))))  
+                mask |= BM_PERMANENT;  // 持久对象掩码  
+        /*  
+         * Loop over all buffers, and mark the ones that need to be written with  
+         * BM_CHECKPOINT_NEEDED.  Count them as we go (num_to_write), so that we  
+         * can estimate how much work needs to be done.  
+         *  
+         * This allows us to write only those pages that were dirty when the  
+         * checkpoint began, and not those that get dirtied while it proceeds.  
+         * Whenever a page with BM_CHECKPOINT_NEEDED is written out, either by us  
+         * later in this function, or by normal backends or the bgwriter cleaning  
+         * scan, the flag is cleared.  Any buffer dirtied after this point won't  
+         * have the flag set.  
+         *  
+         * Note that if we fail to write some buffer, we may leave buffers with  
+         * BM_CHECKPOINT_NEEDED still set.  This is OK since any such buffer would  
+         * certainly need to be written for the next checkpoint attempt, too.  
+         */  
+        num_to_write = 0;  // BM_CHECKPOINT_NEEDED计数  
+        for (buf_id = 0; buf_id flags & mask) == mask)   // 将包含脏块掩码或者并且包含持久化掩码的缓存增加标记BM_CHECKPOINT_NEEDED  
+                {  
+                        bufHdr->flags |= BM_CHECKPOINT_NEEDED;    
+                        num_to_write++;  
+                }  
+                UnlockBufHdr(bufHdr);  
+        }  
+        if (num_to_write == 0)  
+                return;                                 /* nothing to do */  
+        TRACE_POSTGRESQL_BUFFER_SYNC_START(NBuffers, num_to_write);  // 刷缓存开始,探针  
+        /*  
+         * Loop over all buffers again, and write the ones (still) marked with  
+         * BM_CHECKPOINT_NEEDED.  In this loop, we start at the clock sweep point  
+         * since we might as well dump soon-to-be-recycled buffers first.  
+         *  
+         * Note that we don't read the buffer alloc count here --- that should be  
+         * left untouched till the next BgBufferSync() call.  
+         */  
+        buf_id = StrategySyncStart(NULL, NULL);  
+        num_to_scan = NBuffers;  
+        num_written = 0;  
+        while (num_to_scan-- > 0)  // 需要sync的buffer块计数递减  
+        {  
+                volatile BufferDesc *bufHdr = &BufferDescriptors[buf_id];  
+                /*  
+                 * We don't need to acquire the lock here, because we're only looking  
+                 * at a single bit. It's possible that someone else writes the buffer  
+                 * and clears the flag right after we check, but that doesn't matter  
+                 * since SyncOneBuffer will then do nothing.  However, there is a  
+                 * further race condition: it's conceivable that between the time we  
+                 * examine the bit here and the time SyncOneBuffer acquires lock,  
+                 * someone else not only wrote the buffer but replaced it with another  
+                 * page and dirtied it.  In that improbable case, SyncOneBuffer will  
+                 * write the buffer though we didn't need to.  It doesn't seem worth  
+                 * guarding against this, though.  
+                 */  
+                if (bufHdr->flags & BM_CHECKPOINT_NEEDED)  // 判断掩码，如果包含BM_CHECKPOINT_NEEDED，则刷  
+                {  
+                        if (SyncOneBuffer(buf_id, false) & BUF_WRITTEN)  // 调用SyncOneBuffer刷缓存  
+                        {  
+                                TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);  //  表示该数据块刷新成功  
+                                BgWriterStats.m_buf_written_checkpoints++;  
+                                num_written++;  
+                                /*  
+                                 * We know there are at most num_to_write buffers with  
+                                 * BM_CHECKPOINT_NEEDED set; so we can stop scanning if  
+                                 * num_written reaches num_to_write.  
+                                 *  
+                                 * Note that num_written doesn't include buffers written by  
+                                 * other backends, or by the bgwriter cleaning scan. That  
+                                 * means that the estimate of how much progress we've made is  
+                                 * conservative, and also that this test will often fail to  
+                                 * trigger.  But it seems worth making anyway.  
+                                 */  
+                                if (num_written >= num_to_write)  // 如果提前完成刷新，不需要扫全缓存区，退出  
+                                        break;  
+                                /*  
+                                 * Sleep to throttle our I/O rate.  
+                                 */  
+                                CheckpointWriteDelay(flags, (double) num_written / num_to_write);   // 将目前刷缓存完成比例传给CheckpointWriteDelay，如果达到休息点，则会触发一个100毫秒的等待。  
+                                //  假设一共有1000个需要刷的块（num_to_write），目前已经刷了100个（num_written ）。  
+                                //   CheckpointWriteDelay(flags, 0.1); , 假设CheckPointCompletionTarget为默认的0.5  
+                               //    IsCheckpointOnSchedule里, progress *= CheckPointCompletionTarget; = 0.1*0.5 = 0.05  
+                               //   elapsed_xlogs = (((double) (recptr - ckpt_start_recptr)) / XLogSegSize) / CheckPointSegments  
+                               //   如果 progress = NBuffers)  
+                        buf_id = 0;  
+        }  
+        /*  
+         * Update checkpoint statistics. As noted above, this doesn't include  
+         * buffers written by other backends or bgwriter scan.  
+         */  
+        CheckpointStats.ckpt_bufs_written += num_written;  
+        TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_write);  // 标记为BM_CHECKPOINT_NEEDED的脏块已全部flush完  
+}  
+```
+刷单个BUFFER，返回bitmask，BUF_WRITTEN表示已写入磁盘。  
+SyncOneBuffer@src/backend/storage/buffer/bufmgr.c  
+```
+/*  
+ * SyncOneBuffer -- process a single buffer during syncing.  
+ *  
+ * If skip_recently_used is true, we don't write currently-pinned buffers, nor  
+ * buffers marked recently used, as these are not replacement candidates.  
+ *  
+ * Returns a bitmask containing the following flag bits:  
+ *      BUF_WRITTEN: we wrote the buffer.  
+ *      BUF_REUSABLE: buffer is available for replacement, ie, it has  
+ *              pin count 0 and usage count 0.  
+ *  
+ * (BUF_WRITTEN could be set in error if FlushBuffers finds the buffer clean  
+ * after locking it, but we don't care all that much.)  
+ *  
+ * Note: caller must have done ResourceOwnerEnlargeBuffers.  
+ */  
+static int  
+SyncOneBuffer(int buf_id, bool skip_recently_used)  
+{  
+        volatile BufferDesc *bufHdr = &BufferDescriptors[buf_id];  
+        int                     result = 0;  
+        /*  
+         * Check whether buffer needs writing.  
+         *  
+         * We can make this check without taking the buffer content lock so long  
+         * as we mark pages dirty in access methods *before* logging changes with  
+         * XLogInsert(): if someone marks the buffer dirty just after our check we  
+         * don't worry because our checkpoint.redo points before log record for  
+         * upcoming changes and so we are not required to write such dirty buffer.  
+         */  
+        LockBufHdr(bufHdr);  
+        if (bufHdr->refcount == 0 && bufHdr->usage_count == 0)     
+                result |= BUF_REUSABLE;  
+        else if (skip_recently_used)  
+        {  
+                /* Caller told us not to write recently-used buffers */  
+                UnlockBufHdr(bufHdr);  
+                return result;  
+        }  
+        if (!(bufHdr->flags & BM_VALID) || !(bufHdr->flags & BM_DIRTY))  
+        {  
+                /* It's clean, so nothing to do */  
+                UnlockBufHdr(bufHdr);  
+                return result;  
+        }  
+        /*  
+         * Pin it, share-lock it, write it.  (FlushBuffer will do nothing if the  
+         * buffer is clean by the time we've locked it.)  
+         */  
+        PinBuffer_Locked(bufHdr);  
+        LWLockAcquire(bufHdr->content_lock, LW_SHARED);  
+        FlushBuffer(bufHdr, NULL);  // 调用FlushBuffer刷buffer  
+        LWLockRelease(bufHdr->content_lock);  
+        UnpinBuffer(bufHdr, true);  
+        return result | BUF_WRITTEN;  

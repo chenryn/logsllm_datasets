@@ -1,0 +1,134 @@
+# Linux下动态链接流程简要分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+在CTF
+PWN中对于Linux底层的考察是很多的，而应用程序如何进行动态链接对于新手来说算是一个小考验，本篇文章主要记录Linux下动态链接的过程以及CTF中关于动态链接的注意点，还有Glibc版本不兼容的坑
+## 内核加载ELF
+我们都知道应用程序要从C语言代码变成机器可以直接执行的代码要经过编译链接的步骤。在链接中有两种方式，一种是静态链接，一种是动态链接。
+  * 1.静态链接指的就是程序在链接的过程中，将需要用到的库文件的二进制代码拷贝到程序二进制文件的映像中。
+  * 2.动态链接指的就是程序在链接的时候并不把库函数链接进程序的映像而是将库函数的映像一起交给用户，用户在运行的时候使用一个叫解释器的东西形如：ld.linux.so的文件进行动态的加载库函数  
+Linux下编译链接过程：  
+在Linux中，启动和加载ELF文件必须在内核中完成，而动态链接在用户空间（glibc），所以我们第一步就是看Linux内核空间如何加载ELF
+###  可执行文件类型的注册机制
+内核对所支持的每种可执行的程序类型都有个struct linux_binfmt的结构体
+    /*
+      * This structure defines the functions that are used to load the binary formats that
+      * linux accepts.
+      */
+    struct linux_binfmt {
+        struct list_head lh;
+        struct module *module;
+        int (*load_binary)(struct linux_binprm *);
+        int (*load_shlib)(struct file *);
+        int (*core_dump)(struct coredump_params *cprm);
+        unsigned long min_coredump;     /* minimal dump size */
+     };
+在上面的代码中我们可以看到Linux内核提供了3种方法来加载和执行可执行程序
+函数 | 描述  
+---|---  
+load_binary | 通过读存放在可执行文件中的信息为当前进程建立一个新的执行环境  
+load_shlib | 用于动态的把一个共享库捆绑到一个已经在运行的进程, 这是由uselib()系统调用激活的  
+core_dump | 在名为core的文件中, 存放当前进程的执行上下文. 这个文件通常是在进程接收到一个缺省操作为”dump”的信号时被创建的,
+其格式取决于被执行程序的可执行类型  
+要支持ELF文件的运行，则必须向内核登记注册elf_format这个linux_binfmt类型的数据结构
+    static struct linux_binfmt elf_format = {
+        .module      = THIS_MODULE,
+        .load_binary = load_elf_binary,
+        .load_shlib      = load_elf_library,
+        .core_dump       = elf_core_dump,
+        .min_coredump    = ELF_EXEC_PAGESIZE,
+        .hasvdso     = 1
+    };
+> 结构体名称前加小数点是一种对结构体初始化的方法，还有一些别的初始化方法，但是在内核中广泛使用的是这种方法
+内核提供两个函数来完成这个功能，一个注册，一个注销，即：
+    int register_binfmt(struct linux_binfmt * fmt)
+    int unregister_binfmt(struct linux_binfmt * fmt)
+当需要运行一个程序时，则扫描这个队列，依次调用各个数据结构所提供的load处理程序来进行加载工作，ELF中加载程序即为load_elf_binary，内核中已经注册的可运行文件结构linux_binfmt会让其所属的加载程序load_binary逐一前来认领需要运行的程序binary，如果某个格式的处理程序发现相符后，便执行该格式映像的装入和启动.
+###  load_elf_binary函数
+load_elf_binary函数处理的流程主要有以下几步：
+  * 填充并且检查目标程序ELF头部
+  * load_elf_phdrs加载目标程序的程序头表
+  * 如果需要动态链接, 则寻找和处理解释器段
+  * 检查并读取解释器的程序表头
+  * 装入目标程序的段segment
+  * create_elf_tables填写目标文件的参数环境变量等必要信息
+  * start_kernel宏准备进入新的程序入口
+####  填充并且检查目标程序ELF头部
+    struct pt_regs *regs = current_pt_regs();
+    struct {
+        struct elfhdr elf_ex;
+        struct elfhdr interp_elf_ex;
+    } *loc;
+    struct arch_elf_state arch_state = INIT_ARCH_ELF_STATE;
+    loc = kmalloc(sizeof(*loc), GFP_KERNEL);
+    if (!loc) {
+        retval = -ENOMEM;
+        goto out_ret;
+    }
+    /* Get the exec-header
+        使用映像文件的前128个字节对bprm->buf进行了填充  */
+    loc->elf_ex = *((struct elfhdr *)bprm->buf);
+    retval = -ENOEXEC;
+    /* First of all, some simple consistency checks
+        比较文件头的前四个字节
+        。*/
+    if (memcmp(loc->elf_ex.e_ident, ELFMAG, SELFMAG) != 0)
+        goto out;
+    /*  还要看映像的类型是否ET_EXEC和ET_DYN之一；前者表示可执行映像，后者表示共享库  */
+    if (loc->elf_ex.e_type != ET_EXEC && loc->elf_ex.e_type != ET_DYN)
+        goto out;
+####  通过load_elf_phdrs加载目标程序的程序头表
+    elf_phdata = load_elf_phdrs(&loc->elf_ex, bprm->file);
+    if (!elf_phdata)
+        goto out;
+    /**
+     * load_elf_phdrs() - load ELF program headers
+     * @elf_ex:   ELF header of the binary whose program headers should be loaded
+     * @elf_file: the opened ELF binary file
+     *
+     * Loads ELF program headers from the binary file elf_file, which has the ELF
+     * header pointed to by elf_ex, into a newly allocated array. The caller is
+     * responsible for freeing the allocated data. Returns an ERR_PTR upon failure.
+     */
+    static struct elf_phdr *load_elf_phdrs(struct elfhdr *elf_ex,
+                                       struct file *elf_file)
+    {
+        struct elf_phdr *elf_phdata = NULL;
+        int retval, size, err = -1;
+        /*
+         * If the size of this structure has changed, then punt, since
+         * we will be doing the wrong thing.
+         */
+        if (elf_ex->e_phentsize != sizeof(struct elf_phdr))
+                goto out;
+        /* Sanity check the number of program headers... */
+        if (elf_ex->e_phnum e_phnum > 65536U / sizeof(struct elf_phdr))
+                goto out;
+        /* ...and their total size. */
+        size = sizeof(struct elf_phdr) * elf_ex->e_phnum;
+        if (size > ELF_MIN_ALIGN)
+                goto out;
+        elf_phdata = kmalloc(size, GFP_KERNEL);
+        if (!elf_phdata)
+                goto out;
+        /* Read in the program headers */
+        retval = kernel_read(elf_file, elf_ex->e_phoff,
+                             (char *)elf_phdata, size);
+        if (retval != size) {
+                err = (retval elf_ex.e_phnum; i++) {
+            /*  3.1  检查是否有需要加载的解释器  */
+            if (elf_ppnt->p_type == PT_INTERP) {
+                /* This is the program interpreter used for
+                 * shared libraries - for now assume that this
+                 * is an a.out format binary
+                 */
+                /*  3.2 根据其位置的p_offset和大小p_filesz把整个"解释器"段的内容读入缓冲区  */
+                retval = kernel_read(bprm->file, elf_ppnt->p_offset,
+                             elf_interpreter,
+                             elf_ppnt->p_filesz);
+                if (elf_interpreter[elf_ppnt->p_filesz - 1] != '')
+                    goto out_free_interp;
+                /*  3.3 通过open_exec()打开解释器文件 */
+                interpreter = open_exec(elf_interpreter);
+                /* Get the exec headers 

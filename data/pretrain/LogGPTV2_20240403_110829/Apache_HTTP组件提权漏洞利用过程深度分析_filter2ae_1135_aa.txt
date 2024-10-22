@@ -1,0 +1,127 @@
+# Apache HTTP组件提权漏洞利用过程深度分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00 前言
+前段时间Apache HTTP
+被发现存在本地提权漏洞（CVE-2019-0211），漏洞作者在第一时间就给出了漏洞WriteUp[1]和EXP[2]，阿尔法实验室也对EXP进行了深入分析，在此将分析的笔记整理分享出来，希望对大家理解该漏洞有所帮助。本文内容主要按着EXP的执行步骤一步步讲解，同时详细解释了利用过程中几个比较难理解的点：
+  * PHP UAF漏洞的具体利用细节
+  * all_buckets[bucket]是如何指向SHM中伪造的结构以及堆喷的问题
+  * 如何让apr_proc_mutex_t和zend_array、prefork_child_bucket和zend_object这些结构体叠加的
+## 0x01 漏洞成因
+作者的WriteUp中对导致漏洞代码已经有了介绍，这里就只是简单提一下，并省略了大部分的源码以减轻阅读负担。
+在Apache的MPM
+prefork模式中，以root权限运行主服务器进程，同时管理一个低特权工作进程（worker）池，用于处理HTTP请求。主进程和worker之间通过一个共享内存（SHM）进行通信。
+1\. 当Apache
+httpd服务器优雅重启（graceful）时，httpd主进程会杀死旧worker并用新worker替换它们，这就会调用prefork_run()函数产生新的worker：
+    //server/mpm/prefork/prefork.c
+    static int prefork_run(apr_pool_t *_pconf, apr_pool_t *plog, server_rec *s){
+      /* ... */
+         make_child(ap_server_conf, child_slot,
+                 ap_get_scoreboard_process(child_slot)->bucket);
+      /* ... */
+    }
+2\.
+在该函数中调用make_child()，并使用ap_get_scoreboard_process(child_slot)->bucket作为参数。make_child()函数会创建新的子进程，同时根据bucket索引读取all_buckets数组到my_bucket：
+    //server/mpm/prefork/prefork.c
+    static int make_child(server_rec *s, int slot, int bucket){
+      /* ... */
+      my_bucket = &all_buckets[bucket];
+      /* ... */
+        child_main(slot, bucket);
+      /* ... */
+3\.
+调用child_main()，如果Apache侦听多个端口，那么SAFE_ACCEPT()宏中的将会执行，这里apr_proc_mutex_child_init()将会执行：
+    //server/mpm/prefork/prefork.c
+    static void child_main(int child_num_arg, int child_bucket){
+      /* ... */
+      status = SAFE_ACCEPT(apr_proc_mutex_child_init(&my_bucket->mutex,
+                                                 apr_proc_mutex_lockfile(my_bucket->mutex),
+                                                  pchild));
+      /* ... */
+4\. 上述函数进一步调用(*mutex)->meth->child_init(mutex, pool, fname):
+    //apr-1.7.0//locks/unix/proc_mutex.c
+    APR_DECLARE(apr_status_t) apr_proc_mutex_child_init(apr_proc_mutex_t **mutex,
+                                                        const char *fname,
+                                                        apr_pool_t *pool){
+        return (*mutex)->meth->child_init(mutex, pool, fname);
+    }
+整个简化的流程如下：
+    prefork_run()
+      make_child(bucket)
+        my_bucket = &all_buckets[bucket];
+        child_main(bucket)
+        SAFE_ACCEPT(apr_proc_mutex_child_init)
+          apr_proc_mutex_child_init(my_bucket->mutex)
+            mutex->meth->child_init(&my_bucket->mutex)//覆盖child_init()的指针来指向代码
+如果我们在共享内存中伪造一个prefork_child_bucket结构（即all_buckets数组的元素），并修改all_buckets数组的索引bucket，就可以在第三行处的代码控制my_bucket指向该结构。
+进而在后续代码执行my_bucket->mutex->meth->child_init(mutex, pool,
+fname)，meth结构包含指向多个函数的指针，因此，将其中的child_init函数的指针覆盖为我们想要执行函数的指针，就可以达到漏洞利用的目的，并且此时进程还是处于root权限的，后面才降低自身的权限。
+## 0x02 漏洞利用
+作者在其WriteUp中将利用过程分为四个大步骤，但实际的exp要比他写得更繁琐一点，在顺序上也稍微有些不同。以下是根据exp执行步骤整理的流程，补充了一些细节：
+  1. 利用PHP读取worker的/proc/self/maps文件，进而定位一些漏洞利用所需模块和函数的地址
+  2. 枚举/proc/*/cmdline和/proc/*/status文件，得到所有worker进程的PID
+  3. 利用一个PHP的UAF漏洞，在worker进程中获取读/写SHM的权限
+  4. 遍历Apache的内存，根据内存模式匹配找到与all_buckets数组地址
+  5. 因为优雅重启后，all_buckets的位置会改变，因此需要计算一个”适当”的bucket索引，保证all_buckets[bucket]仍然指向伪造的prefork_child_bucket结构
+  6. 在SHM中构造payload
+  7. 喷射payload之后剩余的SHM区域，确保第5步中all_buckets[bucket]指向这片区域后，能转跳到payload
+  8. 将process_score->bucket修改为第5步中计算的bucket。此外为了进一步提高成功率，还可以枚举SHM区域所有的process_score结构，将每个worker的process_score->pid与第2步得到的PID的相比较，匹配上的就是正确的process_score结构，将每个worker的process_score->bucket都进行修改。
+  9. 等待Apache优雅重启触发漏洞（每天早上6:25会自动执行，也可手动重启验证结果）
+具体的细节如下图：
+### 2.1 EXP概述
+get_all_addresses()、get_workers_pids()函数分别取得几个关键内存地址、worker的PID放入全局变量$addresses和$worker_pids中，以便在随后的利用中使用。需要注意如果执行exp时无法解析shm和apache的地址，可能是因为你的环境中shm的大小与exp中查找的范围不一致，可以自己查看一下maps文件，然后修改if
+($msize >= 0x10000 && $msize  &$y]);
+    }
+    class Z implements JsonSerializable{
+      public function jsonSerialize(){    ...  }  ... 
+    }  
+    ...
+    function get_all_addresses(){
+      ...  
+    }  
+    function get_workers_pids(){
+      ...  
+    }  
+    $addresses = get_all_addresses();
+    $workers_pids = get_workers_pids();
+    real();
+接下来具体看看jsonSerialize()中的代码。
+### 2.2 利用PHP UAF漏洞获取SHM读写权限
+还是先概括的讲一讲PHP这个UAF漏洞原理：
+    class Z implements JsonSerializable{
+      public function jsonSerialize(){
+        global $y, $addresses, $workers_pids;
+        ...
+        $this->abc = ptr2str(0, 79);
+          //ptr2str在这里等同于创建一个字符串
+        ...
+        unset($y[0]);
+        ...
+        $x = new DateInterval('PT1S');
+        ...
+      }}
+  1. 我们在Z中定义了一个字符串$this->abc（PHP内部使用zend_string表示），就好比C中malloc一块内存
+  2. 接着unset($y[0])（Z的实例），就像”free”掉刚才分配的内存
+  3. 然后再请求分配一个和刚才释放大小相同的内存块，这里使用的是DateInterval（PHP的对象内部实现往往由几个结构体组成，这里其实是DateInterval中的timelib_rel_time和zend_string大小相同），于是DateInterval就占据了原来字符串的位置，如下图所示：
+  4. 此时$this->abc仍然可用并指向原来的位置，于是我们可以通过修改DateInterval来控制字符串$this->abc。
+PHP字符串的内部实现如下，用一个zend_string表示，通过成员变量len来判断字符串长度，从而实现二进制安全。我们修改DateInterval的属性间接修改len的大小就可以通过this->abc读写SHM区域了。当然，为了能够成功利用漏洞，还有许多细节需要考虑。
+    struct _zend_string {
+        zend_refcounted   gc;
+        zend_ulong        h;
+        size_t            len;
+              char              val[1];
+    };
+**2.2.1 填充空闲内存块**
+在脚本运行之前可能发生了大量的分配/释放，因此同时实例化的两个变量也不一定是连续的，为解决这个问题，实例化几个DateInterval对象填充不连续空闲块，以确保后面分配的内存是连续的：
+    $contiguous = [];
+    for($i=0;$iabc，也就是一个zend_string结构，通过对它进行UAF，进而读写共享内存。
+    $this->abc = ptr2str(0, 79);
+    $p = new DateInterval('PT1S');
+创建$p的目的是为了保护$this->abc，前面说过，一个PHP对象往往由许多结构组成，而DateInterval中的timelib_rel_time结构大小就刚好为78，这就是前面为何要创建大小78的zend_string的原因。
+此时的内存布局如下图所示，这里和下面的所有图示都是为了方便大家理解，因为PHP各种变量、对象都是由好几个结构组成，所以实际的PHP堆内存排布肯定比此复杂。
+**2.2.4 触发UAF并验证**
+接着unset当前对象$y[0]和$p，unset掉$p意味着释放了DateInterval的timelib_rel_time结构。
+    unset($y[0]);unset($p);
+此时内存布局如下：
+然后我们将分配一个与其大小相同的字符串（$protector），由于PHP堆LIFO的特点，因此字符串将取代timelib_rel_time结构的位置。

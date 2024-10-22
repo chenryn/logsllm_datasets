@@ -1,0 +1,65 @@
+            }
+            SOME_STRUCT list = SrvNetBufferLookasides[LookasideListIndex];
+            Result = /* fetch result from list */;
+        }
+        // Initialize some Result fields...
+        return Result;
+    }
+从上面的代码可以看出，根据请求的字节数不同，分配函数会执行不同的操作。如果请求字节数大于约16MB，请求失败；在约1MB至约16MB之间，使用`SrvNetAllocateBufferFromPool`函数进行分配；小于约1MB则返回后备列表中的空间。
+注：函数中还使用了一个`SrvDisableNetBufferLookAsideList`标志，同样会影响函数的功能，这个标志由未记录的注册表设置，默认禁用，因此在这里不做考虑。
+后备列表是为驱动程序保留的一组可重用，固定大小的缓冲区，其功能之一就是为管理缓冲区定义了一组自定义的分配和释放函数。通过查看`SrvNetBufferLookasides`数组的引用，可以发现它是在`SrvNetCreateBufferLookasides`函数中被初始化的，从初始化的过程中，我们有以下几点发现：
+  * 自定义的分配函数叫做`SrvNetBufferLookasideAllocate`，它调用了`SrvNetAllocateBufferFromPool`函数；
+  * 通过Python的快速计算，9个后备列表的大小分别为：
+    >>> [hex((1 OriginalCompressedSegmentSize) {
+        SrvNetFreeBuffer(Alloc);
+        return STATUS_BAD_DATA;
+    }
+在条件判断中，`OriginalCompressedSegmentSize`是一个极大值，而`FinalCompressedSize`表示解压缩后的真实字节数，因此条件符合，会执行`SrvNetFreeBuffer`函数，返回`STATUS_BAD_DATA`，程序会执行失败。因此我们分析了`SrvNetFreeBuffer`函数，想要把参数替换为其他值，让释放函数尝试释放它，之后再引用这个值时可以实现use-after-free或者类似漏洞。但让我们惊讶的是，崩溃竟然发生在`memcpy`函数，这挺让人高兴的，因为我们本来没想到程序会执行到这里，无论如何，还是检查一下发生这种情况的原因。可以在`SmbCompressionDecompress`函数中找到解释：
+    NTSTATUS SmbCompressionDecompress(
+        USHORT CompressionAlgorithm,
+        PUCHAR UncompressedBuffer,
+        ULONG  UncompressedBufferSize,
+        PUCHAR CompressedBuffer,
+        ULONG  CompressedBufferSize,
+        PULONG FinalCompressedSize)
+    {
+        // ...
+        NTSTATUS Status = RtlDecompressBufferEx2(
+            ...,
+            FinalUncompressedSize,
+            ...);
+        if (Status >= 0) {
+            *FinalCompressedSize = CompressedBufferSize;
+        }
+        // ...
+        return Status;
+    }
+从以上代码可以看出，如果解压缩成功，函数会直接把`CompressedBufferSize`的值赋值给`FinalCompressedSize`，而`CompressedBufferSize`就是`OriginalCompressedSegmentSize`。根据这一步的赋值操作，以及已分配缓冲区的分布情况，我们可以很容易地利用这个漏洞。
+因为程序一直执行到复制RawData的步骤，我们先回顾一下这部分的代码：
+    memcpy(
+        Alloc->UserBuffer,
+        (PUCHAR)Header + sizeof(COMPRESSION_TRANSFORM_HEADER),
+        Header->Offset);
+目标地址`Alloc->UserBuffer`是从`ALLOCATION_HEADER`结构中获取的，可以在解压缩步骤中被我们覆盖重写，而缓冲区的内容以及大小即RawData也由我们控制，至此，我们就可以实现内核上的远程任意内存覆盖(Remote
+write-what-where)。
+## 远程任意内存覆盖的代码实现
+我们用Python实现了一个[Write-What-Where CVE-2020-0796
+Exploit](https://github.com/ZecOps/CVE-2020-0796-LPE-POC/blob/master/write_what_where.py)，代码简单直接，是根据[maxpl0it](https://twitter.com/maxpl0it)的CVE-2020-0796
+DoS PoC写出的。
+## 本地权限提升
+那么我们可以用这个exploit做些什么呢？显然我们可以使系统崩溃，或者虽然还没有找到实际的方法，但是我们也可能触发远程代码执行。如果我们在本地使用该exploit，可以泄露额外的信息，那么就可以用来提升本地权限，目前已经有多种技术证明了这种方法的可行性。
+我们使用的第一种技术来自2017年Morten Schenk在Black
+Hat上的[演讲](https://www.blackhat.com/docs/us-17/wednesday/us-17-Schenk-Taking-Windows-10-Kernel-Exploitation-To-The-Next-Level%E2%80%93Leveraging-Write-What-Where-Vulnerabilities-In-Creators-Update.pdf)，此技术会覆盖重写`win32kbase.sys`驱动程序的`.data`段中的一个函数指针，然后从用户模式中调用适当的函数来实现代码执行。j00ru在2018年的WCTF上写了一篇关于如何使用此技术的优秀文章，并且提供了exploit代码。我们对这段代码进行了修改，并应用到我们的任意内存覆盖exploit中，但是并不起作用，因为处理SMB消息的线程不是GUI线程，因此不会映射`win32kbase.sys`文件，也就无法使用此技术（除非能找到一种方法把它变成GUI线程，而我们对此并无研究）。
+我们最终使用了一个[cesarcer](https://twitter.com/cesarcer)在2012年的Black
+Hat演讲“[轻松实现本地Windows内核利用](https://media.blackhat.com/bh-us-12/Briefings/Cerrudo/BH_US_12_Cerrudo_Windows_Kernel_WP.pdf)”中提出的著名的技术。这项技术会用`NtQuerySystemInformation(SystemHandleInformation)`
+API泄露并覆盖当前进程令牌地址，授予当前进程令牌权限并可用于之后的权限提升。 Bryan Alexander
+([dronesec](https://twitter.com/dronesec))和Stephen Breen
+([breenmachine](https://twitter.com/breenmachine))在“[EoP中的令牌权限滥用](https://github.com/hatRiot/token-priv/blob/master/abusing_token_eop_1.0.txt)”中给出了多种使用不同令牌权限进行权限提升的方法。
+根据[Alexandre
+Beaulieu](https://segfault.me/)在他的文章“[用任意写实现权限提升](https://segfault.me/2019/05/24/exploiting-an-arbitrary-write-to-escalate-privileges/)”中给出的代码，我们重写了自己的exploit。通过将一个DLL文件注入到`winlogon.exe`中，我们修改了进程的令牌权限并实现了权限提升，使用这个DLL文件是为了启动一个有特权模式的`cmd.exe`程序。你可以在[这里](https://github.com/ZecOps/CVE-2020-0796-LPE-POC)获取完整的本地权限提升PoC，此PoC仅用于科研与防御研究。
+## 总结
+在这篇文章中，我们证明了CVE-2020-0796漏洞可以用来实现本地权限提升，但是注意，我们的exploit只处于中等的完整性级别，因为它依赖的API调用在更低的完整性级别中不可用。如果进行更深的研究，或许我们可以实现更强的功能，毕竟已分配的缓冲区中还有很多区域可以被覆盖，也许其中的某个区域就可以帮助我们实现更多有趣的功能，例如远程代码执行。
+[POC源码](https://github.com/ZecOps/CVE-2020-0796-LPE-POC)
+## 防御与修复
+  1. 我们建议将服务器和主机升级到Windows的最新版本，如果可能的话，在更新完成前关闭445端口。事实上，无论是否有CVE-2020-0796漏洞，我们都建议在可能的情况下启用主机隔离。
+  2. 尽可能禁用SMBv3.1.1的压缩功能，以避免触发此漏洞。不过还是建议在可能的情况下进行完整的更新。

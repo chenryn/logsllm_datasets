@@ -1,0 +1,89 @@
+8开始，在LFH分配空间会被随机化处理，因此使用这种方法再也不能让Rar1解码器对象与任何其他对象保持恒定的距离。因此，我们会尽量避免使用LFH，将我们的对象放置在常规堆上。整个空间分配策略大概如下所示：
+1、创建大约18个待分配的空间，其大小小于Rar1解码器对象的大小。这样就会激活LFH，避免这类小空间分配操作摧毁我们干净的堆结构。
+2、分配替代对象然后释放这个对象，确保该对象被我们前面分配的空间所包围（因此不会与其他空闲块合并）。
+3、分配Rar3解码器（替代对象并没有被重用，因为Rar3解码器比Rar1解码器要大）。
+4、分配Rar1解码器（重用替代对象）。
+需要注意的是，在为Rar1解码器分配空间时，我们无法避免先分配一些解码器，这是因为只有通过这种方式，`solidStart`标志才会被设置为`false`，导致下一个解码器无法被正确初始化（见前文描述）。
+如果一切按计划运行，Rar1解码器就会重用我们的替代对象，Rar3解码器对象在堆上将位于Rar1解码器对象之后，并且保持某个恒定的偏移距离。
+###  在堆上分配并释放
+显然，如上分配策略需要我们能够以合理可控的方式在堆上分配空间。翻遍了RAR处理函数的所有源码，我无法找到很多较好的方法来对默认进程堆动态分配空间，以满足攻击者所需的大小要求并往其中存储攻击者可控的数据。事实上，完成这种动态分配任务的貌似只能通过压缩文档item的名称来实现。接下来我们看一下具体方法。
+当程序打开某个压缩文档时，[NArchive::NRar::CHandler::Open2](https://landave.io/2018/05/7-zip-from-uninitialized-memory-to-remote-code-execution/#fn:1)方法就会读取压缩文档的所有item，具体代码如下（经过适当简化）：
+    CItem item;
+    for (;;)
+    {
+      // some code omitted
+      bool filled;
+      archive.GetNextItem(item, getTextPassword, filled, error);
+      // some more code omitted
+      if (!filled) {
+        // some more code omitted
+        break;
+      }
+      if (item.IgnoreItem()) { continue; }
+      bool needAdd = true;
+      // some more code omitted
+      _items.Add(item);
+    }
+`CItem`类有一个`AString`类型的成员变量`Name`，该变量在一个堆分配的缓冲区中存储了对应item的（ASCII）名。
+不幸的是，item的名称通过[NArchive::NRar::CInArchive::ReadName](https://landave.io/2018/05/7-zip-from-uninitialized-memory-to-remote-code-execution/#fn:1)来设置，代码如下：
+    for (i = 0; i  _limit)
+      {
+        char *newBuf = new char[len + 1];
+        delete []_chars;
+        _chars = newBuf;
+        _limit = len;
+      }
+      if (len != 0)
+        memcpy(_chars, s, len);
+      _chars[len] = 0;
+      _len = len;
+    }
+如你所见，这个方法总是会以一个null字节来结束字符串。此外，我们发现只要字符串大小大于一定值，`AString`就会在底层开辟一个缓冲区。这就让我产生这样一个想法：假设我们想把`DEAD00BEEF00BAAD00`这些十六进制字节写入堆上分配的某个缓冲区，那么我们只需要构造一个压缩包，其中item的文件名如下（按照列出的顺序来）：
+    DEAD55BEEF55BAAD
+    DEAD55BEEF
+    DEAD
+这样我们就能让`SetFrom`帮我们写入我们需要的所有null字节。请注意，现在我们已经将数据中的null字节替换成一些非零的字节（这里为`0x55`这个字节），确保将整个字符串写入缓冲区中。
+这个方法非常好，我们可以写入任意字节序列，但存在两个限制。首先，我们必须要用一个null字节来结束这个序列；其次，在字节序列中我们不能使用太多个null字节，因为这样会导致压缩文档过大。幸运的是，在这个场景中我们可以轻松绕过这些限制条件。
+现在请注意我们可以使用两种类型的分配操作：
+1、分配带有`item.IgnoreItem()==true`属性的一些item。这些item不会被添加到`_items`列表中，因此属于临时item。这些分配的空间具备特殊属性，最终会被释放，并且我们可以（使用上述技术）往其中填充任意字节序列（几乎可以不受限制）。由于这些内存分配操作都是通过同一个栈分配对象item来完成，因此使用的是相同的`AString`对象，这类分配操作在大小上需要严格递增。我们主要使用这类分配操作来将替代对象放置在堆上。
+2、分配带有`item.IgnoreItem()==false`属性的一些item。这些item会被添加到`_items`列表中，生成对应名称的副本。通过这种方式，我们可以获得许多待分配的、特定大小的空间，激活LFH。需要注意的是，复制的字符串中不能包含任何null字节，这对我们来说毫无压力。
+综合利用上面提到的方法，我们可以构造一个压缩文档，满足我们前面描述的堆分配策略。
+###  ROP
+由于`7zG.exe`主执行程序不具备ASLR机制，因此我们可以使用一个ROP链来绕过DEP。7-Zip不会去调用`VirtualProtect`，因此我们可以从导入表（IAT）中读取`VirtualAlloc`、`memcpy`以及`exit`的地址，写入如下ROP链：
+    // pivot stack: xchg rax, rsp;
+    exec_buffer = VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    memcpy(exec_buffer, rsp+shellcode_offset, 0x1000);
+    jmp exec_buffer;
+    exit(0);
+由于我们的工作环境为x86_64系统（其中大多数指令的编码长度比x86系统要长），并且二进制程序也不是特别大，因此我们无法找到特别好的gadget来执行我们所需的一些操作。这并不是一个太大的难题，但会让我们的ROP链看上去没那么完美。比如，在调用`VirtualAlloc`之前，为了将R9寄存器设置为`PAGE_EXECUTE_READWRITE`，我们需要使用如下gadget链：
+    0x40691e, #pop rcx; add eax, 0xfc08500; xchg eax, ebp; ret; 
+    PAGE_EXECUTE_READWRITE, #value that is popped into rcx
+    0x401f52, #xor eax, eax; ret; (setting ZF=1 for cmove)
+    0x4193ad, #cmove r9, rcx; imul rax, rdx; xor edx, edx; imul rax, rax, 0xf4240; div r8; xor edx, edx; div r9; ret;
+###  演示
+我们的演示环境为全新安装的Windows 10 RS4（Build 17134.1）64位系统，安装了7-Zip 18.01
+x64，利用过程如下图所示。前文提到过，我们的利用场景使用的是右键菜单来提取压缩文件，具体菜单路径为“7-Zip->Extract
+Here”以及“7-Zip->Extract to subfolder”。
+###  可靠性研究
+仔细调整堆分配大小后，整个利用过程现在已经非常可靠且稳定。
+为了进一步研究漏洞利用的可靠性，我编写了一小段脚本，按照右键菜单释放文件的方式重复调用`7zG.exe`程序来释放我们精心构造的压缩文档。此外，该脚本会检查`calc.exe`是否被顺利启动，并且`7zG.exe`进程的退出代码是否为0。在不同的操作系统上运行这个脚本后（所有操作系统均打全最新补丁），测试结果如下：
+1、Windows 10 RS4（Build
+17134.1）64位：100,000次利用中有[17次](https://landave.io/2018/05/7-zip-from-uninitialized-memory-to-remote-code-execution/#fn:5)利用失败。
+2、Windows 8.1 64位：100,000次利用中有12次利用失败。
+3、Windows 7 SP1 64位：100,000次利用中有90次利用失败。
+需要注意的是，所有的操作系统使用的都是同一个压缩文档。整个测试结果比较理想，可能时由于Windows 7以及Windows
+10在堆的LFH实现上面有些区别，因此这两个系统上的测试结果差别较大，其他情况下差别并不是特别大。此外，相同数量的待分配内存仍然会触发LFH。
+不可否认的是，我们很难凭经验去判断利用方法的可靠性。不过我认为上面的测试过程至少比单纯跑几次利用过程要靠谱得多。
+## 七、总结
+在我看来，之所以出现这个错误，原因在于程序设计上（部分）继承了UnRAR的具体实现。如果某个类需要依赖它的使用者以正确方式来使用它，以避免使用未经初始化的类成员，那么这种方式注定会以失败告终。
+经过本文的分析，我们亲眼见证了如何将（乍看之下）人畜无害的错误转换成可靠的、武器化的代码执行利用方法。由于主执行程序缺乏ASLR，因此利用技术上唯一的难题就是如何在受限的RAR提取场景中精心布置堆结构。
+幸运的是，新版的7-Zip 18.05不仅修复了这个漏洞，也在所有主执行文件上启用了ASLR。
+如果大家有意见或者建议，欢迎通过[此页面](https://landave.io/about/)上的联系方式给我发邮件。
+此外，大家也可以加入[HackerNews](https://news.ycombinator.com/item?id=16985460)或者[/r/netsec](https://www.reddit.com/r/netsec/comments/8g7x2k/7zip_from_uninitialized_memory_to_remote_code/)一起来讨论。
+## 八、时间线
+  * 2018-03-06 – 发现漏洞
+  * 2018-03-06 – 报告漏洞
+  * 2018-04-14 – MITRE为此漏洞分配了编号：[CVE-2018-10115](https://cve.mitre.org/cgi-bin/cvename.cgi?name=2018-10115)
+  * 2018-04-30 – 7-Zip 18.05[发布](https://sourceforge.net/p/sevenzip/discussion/45797/thread/adc65bfa/)，修复了CVE-2018-10115漏洞，在可执行文件上启用了ASLR。
+## 九、致谢
+感谢Igor Pavlov修复此漏洞并且为7-Zip部署缓解措施避免被进一步攻击。

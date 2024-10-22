@@ -1,0 +1,200 @@
+**作者：Gengjia Chen of IceSword Lab, qihoo 360  
+博客：[IceSword Lab](https://www.iceswordlab.com/2019/11/28/CVE-2019-13272/
+"IceSword Lab")**
+[PTRACE_TRACEME 漏洞](https://bugs.chromium.org/p/project-zero/issues/detail?id=1903) 是 Jann Horn 201907 月发现的内核提权漏洞,
+漏洞发现和利用的思路有很多值得学习的地方, 本文记录了个人的学习过程
+## 漏洞补丁
+我们从漏洞补丁 [ptrace: Fix ->ptracer_cred handling for
+PTRACE_TRACEME](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=6994eefb0053799d2e07cd140df6c2ea106c41ee)
+入手分析
+    Fix two issues:
+    // 第一个问题，是 cred 的 rcu reference 问题
+    When called for PTRACE_TRACEME, ptrace_link() would obtain an RCU   
+    reference to the parent's objective credentials, then give that pointer
+    to get_cred().  However, the object lifetime rules for things like
+    struct cred do not permit unconditionally turning an RCU reference into
+    a stable reference.
+    // 第二个问题，tracee 记录的 tracer 的 cred 的问题
+    PTRACE_TRACEME records the parent's credentials as if the parent was 
+    acting as the subject, but that's not the case.  If a malicious
+    unprivileged child uses PTRACE_TRACEME and the parent is privileged, and
+    at a later point, the parent process becomes attacker-controlled
+    (because it drops privileges and calls execve()), the attacker ends up
+    with control over two processes with a privileged ptrace relationship,
+    which can be abused to ptrace a suid binary and obtain root privileges.
+    Fix both of these by always recording the credentials of the process
+    that is requesting the creation of the ptrace relationship:
+    current_cred() can't change under us, and current is the proper subject
+    for access control.
+以上是补丁的描述，以下是补丁的代码
+    diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+    index 8456b6e..705887f 100644
+    --- a/kernel/ptrace.c
+    +++ b/kernel/ptrace.c
+    @@ -79,9 +79,7 @@ void __ptrace_link(struct task_struct *child, struct task_struct *new_parent,
+      */
+     static void ptrace_link(struct task_struct *child, struct task_struct *new_parent)
+     {
+    -   rcu_read_lock();
+    -   __ptrace_link(child, new_parent, __task_cred(new_parent));
+    -   rcu_read_unlock();
+    +   __ptrace_link(child, new_parent, current_cred());
+     }
+从补丁的描述来看，一共修复了 2 个问题
+  * 1 是 rcu reference 的问题，对应的代码是删除了 rcu 锁;
+  * 2 是 tracee 记录 tracer 进程的 cred 引发的问题
+本文不关心第一个问题，只分析可以用于本地提权的第二个问题
+从补丁描述看第二个问题比较复杂，我们后面再分析，补丁对应的代码倒是非常简单， 将 ‘__task_cred(new_parent)’ 换成了
+‘current_cred()’, 也就是说记录的 cred 从 tracer 进程的 cred 换成了当前进程的 cred
+## 漏洞分析
+[ptrace](http://man7.org/linux/man-pages/man2/ptrace.2.html)
+是一个系统调用，它提供了一种方法来让进程 (tracer) 可以观察和控制其它进程 (tracee) 的执行，检查和改变其核心映像以及寄存器,
+主要用来实现断点调试和系统调用跟踪
+    1    396  kernel/ptrace.c >
+              ptrace_link(task, current);  // link 的双方分别是要 trace 的目标进程 'task' 
+              //  和发动 trace 的当前进程 'current'
+    2    469  kernel/ptrace.c >
+              ptrace_link(current, current->real_parent);  // link 的双方分别是发动 trace 的
+                      // 当前进程 ‘current’ 和当前进程的
+                      // 父进程 ' current->real_parent'
+trace 关系的建立有 2 种方式
+  * 1 是进程调用 fork 函数然后子进程主动调用 PTRACE_TRACEME, 这是由 tracee 发起的, 对应内核函数 ptrace_traceme
+  * 2 是进程调用 PTRACE_ATTACH 或者 PTRACE_SEIZE 去主动 trace 其他进程, 这是由 tracer 发起的, 对应内核函数 ptrace_attach
+不管是哪种方式，最后都会调用 ptrace_link 函数去建立 tracer 和 tracee 之间的 trace 关系
+  * ptrace_attach 关联的双方是 ‘task’ (tracee) 和 ‘current’ (tracer)
+  * ptrace_traceme 关联的双方是 ‘current’ (tracee) 和 ‘current->real_parent’ (tracer)
+这里我们要仔细记住上面 2 种模式下 tracer 和 tracee 分别是什么，因为这就是漏洞的关键
+    static void ptrace_link(struct task_struct *child, struct task_struct *new_parent)
+    {
+            rcu_read_lock();
+            __ptrace_link(child, new_parent, __task_cred(new_parent));
+            rcu_read_unlock();
+    }
+    void __ptrace_link(struct task_struct *child, struct task_struct *new_parent,
+                       const struct cred *ptracer_cred)
+    {
+            BUG_ON(!list_empty(&child->ptrace_entry));
+            list_add(&child->ptrace_entry, &new_parent->ptraced); // 1. 将自己加入父进程的 ptraced 队列
+            child->parent = new_parent; // 2. 将父进程地址保存在 parent 指针
+            child->ptracer_cred = get_cred(ptracer_cred); // 3. 保存 ptracer_cred, 我们只关注这个变量
+    }
+建立 trace 关系的关键是由 tracee 记录 tracer 的 cred, 保存在 tracee 的 ‘ptracer_cred’
+变量，这个变量名很顾名思义
+ptracer_cred 这个概念是由 2016 年的一个补丁 [ptrace: Capture the ptracer’s creds not
+PT_PTRACE_CAP](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=64b875f7ac8a5d60a4e191479299e931ee949b67)
+引入的, 引入 ptracer_cred 的目的是用于当 tracee 执行 exec 去加载 [setuid
+executable](https://www.computerhope.com/jargon/s/setuid.htm) 时做安全检测
+为什么需要这个安全检测呢?
+[exec](http://man7.org/linux/man-pages/man3/exec.3.html) 函数族可以更新进程的镜像,
+如果被执行文件的 [setuid 位](https://en.wikipedia.org/wiki/Setuid) 置位，则运行这个可执行文件时，进程的
+[euid](https://en.wikipedia.org/wiki/User_identifier) 会被修改成该可执行文件的所有者的 uid,
+如果可执行文件的所有者权限比调用 exec 的进程高, 运行这类 [setuid
+executable](https://www.computerhope.com/jargon/s/setuid.htm) 会有提权的效果
+假如执行 exec 的进程本身是一个 tracee, 当它执行了 [setuid
+executable](https://www.computerhope.com/jargon/s/setuid.htm) 提权之后，由于 tracer
+可以随时修改 tracee 的寄存器和内存，这时候低权限的 tracer 就可以控制 tracee 去执行越权操作
+作为内核，显然是不允许这样的越权行为存在的，所以当 trace 关系建立时, tracee 需要保存 tracer 的 cred (即
+ptracer_cred), 然后在执行 exec 过程中, 如果发现执行的可执行程序是 [setuid
+位](https://en.wikipedia.org/wiki/Setuid) 置位的， 则会判断 ‘ptracer_cred’ 的权限，
+如果权限不满足，将不会执行 [setuid 位](https://en.wikipedia.org/wiki/Setuid) 的提权，
+而是以原有的进程权限执行这个 [setuid
+executable](https://www.computerhope.com/jargon/s/setuid.htm)
+这个过程的代码分析如下(本文的代码分析基于 v4.19-rc8)
+    do_execve
+      -> __do_execve_file
+      -> prepare_binprm 
+          -> bprm_fill_uid
+          -> security_bprm_set_creds
+              ->cap_bprm_set_creds
+            -> ptracer_capable
+              ->selinux_bprm_set_creds
+              ->(apparmor_bprm_set_creds)
+              ->(smack_bprm_set_creds)
+              ->(tomoyo_bprm_set_creds)
+如上，execve 权限相关的操作主要在函数 ‘prepare_binprm’ 里
+    1567 int prepare_binprm(struct linux_binprm *bprm)
+    1568 {
+    1569         int retval;
+    1570         loff_t pos = 0;
+    1571 
+    1572         bprm_fill_uid(bprm); // called_set_creds = 1;
+    1579 
+    1580         memset(bprm->buf, 0, BINPRM_BUF_SIZE);
+    1581         return kernel_read(bprm->file, bprm->buf, BINPRM_BUF_SIZE, &pos);
+    1582 }
+如上，先调用 ‘bprm_fill_uid’ 初步填充新进程的 cred, 再调用 ‘security_bprm_set_creds’ 做安全检测并修改新的
+cred
+    1509 static void bprm_fill_uid(struct linux_binprm *bprm)
+    1510 {
+    1511         struct inode *inode;
+    1512         unsigned int mode;
+    1513         kuid_t uid;
+    1514         kgid_t gid;
+    1515 
+    1516         /*
+    1517          * Since this can be called multiple times (via prepare_binprm),
+    1518          * we must clear any previous work done when setting set[ug]id
+    1519          * bits from any earlier bprm->file uses (for example when run
+    1520          * first for a setuid script then again for its interpreter).
+    1521          */
+    1522         bprm->cred->euid = current_euid(); // cred->egid = current_egid();
+    1524 
+    1525         if (!mnt_may_suid(bprm->file->f_path.mnt))
+    1526                 return;
+    1527 
+    1528         if (task_no_new_privs(current))
+    1529                 return;
+    1530 
+    1531         inode = bprm->file->f_path.dentry->d_inode;
+    1532         mode = READ_ONCE(inode->i_mode);
+    1533         if (!(mode & (S_ISUID|S_ISGID))) // i_mode;
+    1541         uid = inode->i_uid; // i_gid;
+    1543         inode_unlock(inode);
+    1544 
+    1545         /* We ignore suid/sgid if there are no mappings for them in the ns */
+    1546         if (!kuid_has_mapping(bprm->cred->user_ns, uid) ||
+    1547                  !kgid_has_mapping(bprm->cred->user_ns, gid))
+    1548                 return;
+    1549 
+    1550         if (mode & S_ISUID) {
+    1551                 bprm->per_clear |= PER_CLEAR_ON_SETID;
+    1552                 bprm->cred->euid = uid; // per_clear |= PER_CLEAR_ON_SETID;
+    1557                 bprm->cred->egid = gid;
+    1558         }
+    1559 }
+如上， 主要看两行
+  * 1522 行, 将当前的 euid 赋值新的 euid, 所以大部分执行了 execve 的进程的权限跟原来的一样
+  * 1552 行，如果带有 suid bit, 则将可执行文件的所有者的 uid 赋值新的 euid, 这就是所谓 setuid 的实现， 新的 euid 变成了它执行的可执行文件所有者的 uid， 如果所有者是特权用户， 这里就实现了提权
+但是，这里的 euid 依然不是最终的结果， 还需要进入函数 security_bprm_set_creds 做进一步的安全检测
+security_bprm_set_creds 函数调用的是
+[LSM](https://en.wikipedia.org/wiki/Linux_Security_Modules) 框架
+在我分析的内核版本上, 实现 ‘bprm_set_creds’ 这个 hook 点安全检测的 lsm 框架有 5 种, 检测函数如下,
+  * cap_bprm_set_creds
+  * selinux_bprm_set_creds
+  * apparmor_bprm_set_creds
+  * smack_bprm_set_creds
+  * tomoyo_bprm_set_creds
+这里哪些 hook 检测函数会被执行，其实是跟具体的内核配置有关的, 理论上把所有 lsm 框架都启用的话，上述所有这些实现了
+‘bprm_set_creds’ hook 检测的函数都会被执行
+在我的分析环境里实际运行的检测函数只有 cap_bprm_set_creds 和 selinux_bprm_set_creds 这俩
+其中， 对 euid 有影响的是 ‘cap_bprm_set_creds’ 这个函数
+        815 int cap_bprm_set_creds(struct linux_binprm *bprm)
+        816 {
+        817         const struct cred *old = current_cred();
+        818         struct cred *new = bprm->cred;
+        819         bool effective = false, has_fcap = false, is_setid;
+        820         int ret;
+        821         kuid_t root_uid;
+        ===================== skip ======================
+        838         /* Don't let someone trace a set[ug]id/setpcap binary with the revised
+        839          * credentials unless they have the appropriate permit.
+        840          *
+        841          * In addition, if NO_NEW_PRIVS, then ensure we get no new privs.
+        842          */
+        843         is_setid = __is_setuid(new, old) || __is_setgid(new, old);  
+        844 
+        845         if ((is_setid || __cap_gained(permitted, new, old)) && // unsafe & ~LSM_UNSAFE_PTRACE) || 
+        847              !ptracer_capable(current, new->user_ns))) { // user_ns, CAP_SETUID) ||
+        850                     (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS)) {
+        851                         new->euid = new->uid; // egid = new->gid;
+        853                 }

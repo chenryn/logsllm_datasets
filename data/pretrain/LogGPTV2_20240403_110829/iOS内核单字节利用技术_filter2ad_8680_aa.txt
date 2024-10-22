@@ -1,0 +1,88 @@
+# iOS内核单字节利用技术
+##### 译文声明
+本文是翻译文章，文章原作者 googleprojectzero，文章来源：googleprojectzero.blogspot.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x01 简介
+在过去的几年里，几乎所有的iOS内核利用都遵循相同的流程:内存破坏和伪造Mach port被用来访问内核task
+port，从而为用户空间提供完美的内核读/写原语。最近的iOS内核漏洞缓解措施，比如PAC和zone_require，似乎是为了打破常见的利用流程，但是，这些iOS内核利用从高层次上看是相同的，这引发了一个问题：针对内核task
+port真的是最好的漏洞利用流程吗？还是这种策略的趋势掩盖了其他可能更有趣的技术?现有的iOS内核缓解措施是否对其他未被发现的开发流是否同样有效?
+在这篇文章中，我将介绍一种新的iOS内核利用技术，它将控制一个字节的堆溢出直接转换为任意物理地址的读/写原语，同时完全避开当前的缓解措施，如KASLR、PAC和zone_require。通过读取一个特殊的硬件寄存器，可以在物理内存中定位到内核并构建一个内核读/写原语，而无需伪造内核task
+port。最后，我将讨论各种iOS缓解措施在阻止这一技术方面的效果，并对iOS内核利用的最新进展进行总结。您可以在这里找到[Poc](https://bugs.chromium.org/p/project-zero/issues/detail?id=1986#c7)代码。
+## 0x02 前置知识
+###  power 结构
+在查看XNU的源代码时，我经常关注一些对象（objects），方便在将来利用它进行操作或破坏。在发现
+[CVE-2020-3837](https://bugs.chromium.org/p/project-zero/issues/detail?id=1986)(oob_timestamp漏洞)后，我偶然发现了`vm_map_copy_t`的定义:
+    struct vm_map_copy {
+            int                     type;
+    #define VM_MAP_COPY_ENTRY_LIST          1
+    #define VM_MAP_COPY_OBJECT              2
+    #define VM_MAP_COPY_KERNEL_BUFFER       3
+            vm_object_offset_t      offset;
+            vm_map_size_t           size;
+            union {
+                    struct vm_map_header    hdr;      /* ENTRY_LIST */
+                    vm_object_t             object;   /* OBJECT */
+                    uint8_t                 kdata[0]; /* KERNEL_BUFFER */
+            } c_u;
+    };
+我觉得这值得关注，有几个原因：
+  * 1.这个结构在头部有一个`type`字段，因此越界写入可能会将其从一种类型更改为另一种类型，从而导致类型混淆。因为iOS是小端(little-endian)，因此最低有效字节在内存中排在首位，这意味着即使是一个单字节溢出也足以将类型设置为三个值中的任何一个。
+  * 2.该类型区分任意可控数据（kdata）和内核指针（hdr和object）之间的交集。因此，破坏type可以让我们直接伪造指向内核对象的指针，而不需要执行任何重新分配。
+  * 3.我记得曾经读过关于`vm_map_copy_t`在以前的漏洞利用中（在iOS 10之前）被用作原语的内容，但我不记得在哪里或如何使用它。Ian Beer 也曾使用过vm_map_copy对象:[Splitting atoms in XNU](https://googleprojectzero.blogspot.com/2019/04/splitting-atoms-in-xnu.html)。
+通过对`osfmk/vm/vm_map.c`的深入研究，我发现vm_map_copyout_internal（）确实以非常有趣的方式使用了copy对象。但首先，让我们先介绍一下vm_map_copy是什么以及它如何工作。
+vm_map_copy表示进程虚拟地址空间的写时拷贝，它已经packaged，准备插入到另一个虚拟地址空间中。有三种内部表示形式：作为vm_map_entry对象的列表、作为vm_object或作为直接复制到目标中内联字节数组。我们将重点讨论类型1和3。
+基本上 `ENTRY_LIST` 类型是最强大且最通用的表示形式，而 `KERNEL_BUFFER`
+类型则是一种严格的优化。`vm_map_entry`列表由多个分配和多个间接层组成:每个`vm_map_entry` 描述了一个虚拟地址范围`[
+vme_start ，vme_end ）`，该范围由特定的 `vm_object` 映射，而该列表又包含一个 vm_page
+的列表，该列表描述vm_object支持的物理页面。
+同时，如果要插入的数据不是共享内存，并且大小大约为两个pages或更少，则只需简单地分配 vm_map_copy
+即可将数据内容内联在同一分配中，而无需进行间接或其他分配。
+通过这种优化，vm_map_copy对象偏移0x20处的8个字节可以是指向vm_map_entry列表头的指针，也可以是完全由攻击者控制的数据，所有这些都取决于头部的type字段。因此，破坏vm_map_copy对象的第一个字节会导致内核将任意可控数据解释为vm_map_entry指针。
+了解vm_map_copy的内部原理后，让我们回到vm_map_copyout_internal()。这个函数负责获取一个vm_map_copy并将其插入目标地址空间(由vm_map_t类型表示)。当进程之间共享内存时，它可以通过Mach消息发送一个外部内存描述符来实现:外部内存以vm_map_copy的形式存储在内核中，而vm_map_copyout_internal()是将其插入到接收进程中的函数。
+事实证明，如果vm_map_copyout_internal()处理一个损坏的vm_map_copy，其中包含一个指向伪造的vm_map_entry的指针，事情会变得相当令人兴奋。特别要考虑的是，如果伪造的vm_map_entry
+声称已连接，这会导致该函数立即尝试在page中进行错误操作:
+    kern_return_t
+    vm_map_copyout_internal(
+        vm_map_t                dst_map,
+        vm_map_address_t        *dst_addr,      /* OUT */
+        vm_map_copy_t           copy,
+        vm_map_size_t           copy_size,
+        boolean_t               consume_on_success,
+        vm_prot_t               cur_protection,
+        vm_prot_t               max_protection,
+        vm_inherit_t            inheritance)
+    {
+    ...
+        if (copy->type == VM_MAP_COPY_OBJECT) {
+    ...
+        }
+    ...
+        if (copy->type == VM_MAP_COPY_KERNEL_BUFFER) {
+    ...
+        }
+    ...
+        vm_map_lock(dst_map);
+    ...
+        adjustment = start - vm_copy_start;
+    ...
+        /*
+         *    Adjust the addresses in the copy chain, and
+         *    reset the region attributes.
+         */
+        for (entry = vm_map_copy_first_entry(copy);
+            entry != vm_map_copy_to_entry(copy);
+            entry = entry->vme_next) {
+    ...
+            entry->vme_start += adjustment;
+            entry->vme_end += adjustment;
+    ...
+            /*
+             * If the entry is now wired,
+             * map the pages into the destination map.
+             */
+            if (entry->wired_count != 0) {
+    ...
+                object = VME_OBJECT(entry);
+                offset = VME_OFFSET(entry);
+    ...

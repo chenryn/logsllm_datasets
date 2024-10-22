@@ -1,0 +1,362 @@
+used in the infrastructure that provides the Azure cloud.
+File’s block cloning (snapshot support) and sparse
+VDL
+Traditionally, storage systems implement snapshot and clone functionality at
+the volume level (see dynamic volumes, for example). In modern datacenters,
+when hundreds of virtual machines run and are stored on a unique volume,
+such techniques are no longer able to scale. One of the original goals of the
+ReFS design was to support file-level snapshots and scalable cloning support
+(a VM typically maps to one or a few files in the underlying host storage),
+which meant that ReFS needed to provide a fast method to clone an entire file
+or even only chunks of it. Cloning a range of blocks from one file into a
+range of another file allows not only file-level snapshots but also finer-
+grained cloning for applications that need to shuffle blocks within one or
+more files. VHD diff-disk merge is one example.
+ReFS exposes the new FSCTL_DUPLICATE_EXTENTS_TO_FILE to
+duplicate a range of blocks from one file into another range of the same file
+or to a different file. Subsequent to the clone operation, writes into cloned
+ranges of either file will proceed in a write-to-new fashion, preserving the
+cloned block. When there is only one remaining reference, the block can be
+written in place. The source and target file handle, and all the details from
+which the block should be cloned, which blocks to clone from the source,
+and the target range are provided as parameters.
+As already seen in the previous section, ReFS indexes the LCNs that make
+up the file’s data stream into the extent index table, an embedded B+ tree
+located in a row of the file record. To support block cloning, Minstore uses a
+new global index B+ tree (called the block count reference table) that tracks
+the reference counts of every extent of blocks that are currently cloned. The
+index starts out empty. The first successful clone operation adds one or more
+rows to the table, indicating that the blocks now have a reference count of
+two. If one of the views of those blocks were to be deleted, the rows would
+be removed. This index is consulted in write operations to determine if write-
+to-new is required or if write-in-place can proceed. It’s also consulted before
+marking free blocks in the allocator. When freeing clusters that belong to a
+file, the reference counts of the cluster-range is decremented. If the reference
+count in the table reaches zero, the space is actually marked as freed.
+Figure 11-88 shows an example of file cloning. After cloning an entire file
+(File 1 and File 2 in the picture), both files have identical extent tables, and
+the Minstore block count reference table shows two references to both
+volume extents.
+Figure 11-88 Cloning an ReFS file.
+Minstore automatically merges rows in the block reference count table
+whenever possible with the intention of reducing the size of the table. In
+Windows Server 2016, HyperV makes use of the new cloning FSCTL. As a
+result, the duplication of a VM, and the merging of its multiple snapshots, is
+extremely fast.
+ReFS supports the concept of a file Valid Data Length (VDL), in a similar
+way to NTFS. Using the $$ZeroRangeInStream file data stream, ReFS keeps
+track of the valid or invalid state for each allocated file’s data block. All the
+new allocations requested to the file are in an invalid state; the first write to
+the file makes the allocation valid. ReFS returns zeroed content to read
+requests from invalid file ranges. The technique is similar to the DAL, which
+we explained earlier in this chapter. Applications can logically zero a portion
+of file without actually writing any data using the FSCTL_SET_ZERO_DATA
+file system control code (the feature is used by HyperV to create fixed-size
+VHDs very quickly).
+EXPERIMENT: Witnessing ReFS snapshot support
+through HyperV
+In this experiment, you’re going to use HyperV for testing the
+volume snapshot support of ReFS. Using the HyperV manager, you
+need to create a virtual machine and install any operating system on
+it. At the first boot, take a checkpoint on the VM by right-clicking
+the virtual machine name and selecting the Checkpoint menu item.
+Then, install some applications on the virtual machine (the example
+below shows a Windows Server 2012 machine with Office
+installed) and take another checkpoint.
+If you turn off the virtual machine and, using File Explorer,
+locate where the virtual hard disk file resides, you will find the
+virtual hard disk and multiple other files that represent the
+differential content between the current checkpoint and the
+previous one.
+If you open the HyperV Manager again and delete the entire
+checkpoint tree (by right-clicking the first root checkpoint and
+selecting the Delete Checkpoint Subtree menu item), you will
+find that the entire merge process takes only a few seconds. This is
+explained by the fact that HyperV uses the block-cloning support
+of ReFS, through the FSCTL_DUPLICATE_EXTENTS_TO_FILE
+I/O control code, to properly merge the checkpoints’ content into
+the base virtual hard disk file. As explained in the previous
+paragraphs, block cloning doesn’t actually move any data. If you
+repeat the same experiment with a volume formatted using an
+exFAT or NTFS file system, you will find that the time needed to
+merge the checkpoints is much larger.
+ReFS write-through
+One of the goals of ReFS was to provide close to zero unavailability due to
+file system corruption. In the next section, we describe all of the available
+online repair methods that ReFS employs to recover from disk damage.
+Before describing them, it’s necessary to understand how ReFS implements
+write-through when it writes the transactions to the underlying medium.
+The term write-through refers to any primitive modifying operation (for
+example, create file, extend file, or write block) that must not complete until
+the system has made a reasonable guarantee that the results of the operation
+will be visible after crash recovery. Write-through performance is critical for
+different I/O scenarios, which can be broken into two kinds of file system
+operations: data and metadata.
+When ReFS performs an update-in-place to a file without requiring any
+metadata mutation (like when the system modifies the content of an already-
+allocated file, without extending its length), the write-through performance
+has minimal overhead. Because ReFS uses allocate-on-write for metadata,
+it’s expensive to give write-through guarantees for other scenarios when
+metadata change. For example, ensuring that a file has been renamed implies
+that the metadata blocks from the root of the file system down to the block
+describing the file’s name must be written to a new location. The allocate-on-
+write nature of ReFS has the property that it does not modify data in place.
+One implication of this is that recovery of the system should never have to
+undo any operations, in contrast to NTFS.
+To achieve write-through, Minstore uses write-ahead-logging (or WAL).
+In this scheme, shown in Figure 11-89, the system appends records to a log
+that is logically infinitely long; upon recovery, the log is read and replayed.
+Minstore maintains a log of logical redo transaction records for all tables
+except the allocator table. Each log record describes an entire transaction,
+which has to be replayed at recovery time. Each transaction record has one or
+more operation redo records that describe the actual high-level operation to
+perform (such as insert [key K / value V] pair in Table X). The transaction
+record allows recovery to separate transactions and is the unit of atomicity
+(no transactions will be partially redone). Logically, logging is owned by
+every ReFS transaction; a small log buffer contains the log record. If the
+transaction is committed, the log buffer is appended to the in-memory
+volume log, which will be written to disk later; otherwise, if the transaction
+aborts, the internal log buffer will be discarded. Write-through transactions
+wait for confirmation from the log engine that the log has committed up until
+that point, while non-write-through transactions are free to continue without
+confirmation.
+Figure 11-89 Scheme of Minstore’s write-ahead logging.
+Furthermore, ReFS makes use of checkpoints to commit some views of the
+system to the underlying disk, consequently rendering some of the previously
+written log records unnecessary. A transaction’s redo log records no longer
+need to be redone once a checkpoint commits a view of the affected trees to
+disk. This implies that the checkpoint will be responsible for determining the
+range of log records that can be discarded by the log engine.
+ReFS recovery support
+To properly keep the file system volume available at all times, ReFS uses
+different recovery strategies. While NTFS has similar recovery support, the
+goal of ReFS is to get rid of any offline check disk utilities (like the Chkdsk
+tool used by NTFS) that can take many hours to execute in huge disks and
+require the operating system to be rebooted. There are mainly four ReFS
+recovery strategies:
+■    Metadata corruption is detected via checksums and error-correcting
+codes. Integrity streams validate and maintain the integrity of the
+file’s data using a checksum of the file’s actual content (the checksum
+is stored in a row of the file’s B+ tree table), which maintains the
+integrity of the file itself and not only on its file-system metadata.
+■    ReFS intelligently repairs any data that is found to be corrupt, as long
+as another valid copy is available. Other copies might be provided by
+ReFS itself (which keeps additional copies of its own metadata for
+critical structures such as the object table) or through the volume
+redundancy provided by Storage Spaces (see the “Storage Spaces”
+section later in this chapter).
+■    ReFS implements the salvage operation, which removes corrupted
+data from the file system namespace while it’s online.
+■    ReFS rebuilds lost metadata via best-effort techniques.
+The first and second strategies are properties of the Minstore library on
+which ReFS depends (more details about the integrity streams are provided
+later in this section). The object table and all the global Minstore B+ tree
+tables contain a checksum for each link that points to the child (or director)
+nodes stored in different disk blocks. When Minstore detects that a block is
+not what it expects, it automatically attempts repair from one of its duplicated
+copies (if available). If the copy is not available, Minstore returns an error to
+the ReFS upper layer. ReFS responds to the error by initializing online
+salvage.
+The term salvage refers to any fixes needed to restore as much data as
+possible when ReFS detects metadata corruption in a directory B+ tree.
+Salvage is the evolution of the zap technique. The goal of the zap was to
+bring back the volume online, even if this could lead to the loss of corrupted
+data. The technique removed all the corrupted metadata from the file
+namespace, which then became available after the repair.
+Assume that a director node of a directory B+ tree becomes corrupted. In
+this case, the zap operation will fix the parent node, rewriting all the links to
+the child and rebalancing the tree, but the data originally pointed by the
+corrupted node will be completely lost. Minstore has no idea how to recover
+the entries addressed by the corrupted director node.
+To solve this problem and properly restore the directory tree in the salvage
+process, ReFS needs to know subdirectories’ identifiers, even when the
+directory table itself is not accessible (because it has a corrupted director
+node, for example). Restoring part of the lost directory tree is made possible
+by the introduction of a volume global table, called called the parent-child
+table, which provides a directory’s information redundancy.
+A key in the parent–child table represents the parent table’s ID, and the
+data contains a list of child table IDs. Salvage scans this table, reads the child
+tables list, and re-creates a new non-corrupted B+ tree that contains all the
+subdirectories of the corrupted node. In addition to needing child table IDs,
+to completely restore the corrupted parent directory, ReFS still needs the
+name of the child tables, which were originally stored in the keys of the
+parent B+ tree. The child table has a self-record entry with this information
+(of type link to directory; see the previous section for more details). The
+salvage process opens the recovered child table, reads the self-record, and
+reinserts the directory link into the parent table. The strategy allows ReFS to
+recover all the subdirectories of a corrupted director or root node (but still not
+the files). Figure 11-90 shows an example of zap and salvage operations on a
+corrupted root node representing the Bar directory. With the salvage
+operation, ReFS is able to quickly bring the file system back online and loses
+only two files in the directory.
+Figure 11-90 Comparison between the zap and salvage operations.
+The ReFS file system, after salvage completes, tries to rebuild missing
+information using various best-effort techniques; for example, it can recover
+missing file IDs by reading the information from other buckets (thanks to the
+collating rule that separates files’ IDs and tables). Furthermore, ReFS also
+augments the Minstore object table with a little bit of extra information to
+expedite repair. Although ReFS has these best-effort heuristics, it’s important
+to understand that ReFS primarily relies on the redundancy provided by
+metadata and the storage stack in order to repair corruption without data loss.
+In the very rare cases in which critical metadata is corrupted, ReFS can
+mount the volume in read-only mode, but not for any corrupted tables. For
+example, in case that the container table and all of its duplicates would all be
+corrupted, the volume wouldn’t be mountable in read-only mode. By
+skipping over these tables, the file system can simply ignore the usage of
+such global tables (like the allocator, for example), while still maintaining a
+chance for the user to recover her data.
+Finally, ReFS also supports file integrity streams, where a checksum is
+used to guarantee the integrity of a file’s data (and not only of the file
+system’s metadata). For integrity streams, ReFS stores the checksum of each
+run that composes the file’s extent table (the checksum is stored in the data
+section of an extent table’s row). The checksum allows ReFS to validate the
+integrity of the data before accessing it. Before returning any data that has
+integrity streams enabled, ReFS will first calculate its checksum and
+compares it to the checksum contained in the file metadata. If the checksums
+don’t match, then the data is corrupt.
+The ReFS file system exposes the FSCTL_SCRUB_DATA control code,
+which is used by the scrubber (also known as the data integrity scanner). The
+data integrity scanner is implemented in the Discan.dll library and is exposed
+as a task scheduler task, which executes at system startup and every week.
+When the scrubber sends the FSCTL to the ReFS driver, the latter starts an
+integrity check of the entire volume: the ReFS driver checks the boot section,
+each global B+ tree, and file system’s metadata.
+ Note
+The online Salvage operation, described in this section, is different from
+its offline counterpart. The refsutil.exe tool, which is included in
+Windows, supports this operation. The tool is used when the volume is so
+corrupted that it is not even mountable in read-only mode (a rare
+condition). The offline Salvage operation navigates through all the
+volume clusters, looking for what appears to be metadata pages, and uses
+best-effort techniques to assemble them back together.
+Leak detection
+A cluster leak describes the situation in which a cluster is marked as
+allocated, but there are no references to it. In ReFS, cluster leaks can happen
+for different reasons. When a corruption is detected on a directory, online
+salvage is able to isolate the corruption and rebuild the tree, eventually losing
+only some files that were located in the root directory itself. A system crash
+before the tree update algorithm has written a Minstore transaction to disk
+can lead to a file name getting lost. In this case, the file’s data is correctly
+written to disk, but ReFS has no metadata that point to it. The B+ tree table
+representing the file itself can still exist somewhere in the disk, but its
+embedded table is no longer linked in any directory B+ tree.
+The built-in refsutil.exe tool available in Windows supports the Leak
+Detection operation, which can scan the entire volume and, using Minstore,
+navigate through the entire volume namespace. It then builds a list of every
+B+ tree found in the namespace (every tree is identified by a well-known
+data structure that contains an identification header), and, by querying the
+Minstore allocators, compares the list of each identified tree with the list of
+trees that have been marked valid by the allocator. If it finds a discrepancy,
+the leak detection tool notifies the ReFS file system driver, which will mark
+the clusters allocated for the found leaked tree as freed.
+Another kind of leak that can happen on the volume affects the block
+reference counter table, such as when a cluster’s range located in one of its
+rows has a higher reference counter number than the actual files that
+reference it. The lower-case tool is able to count the correct number of
+references and fix the problem.
+To correctly identify and fix leaks, the leak detection tool must operate on
+an offline volume, but, using a similar technique to NTFS’ online scan, it can
+operate on a read-only snapshot of the target volume, which is provided by
+the Volume Shadow Copy service.
+EXPERIMENT: Use Refsutil to find and fix leaks on a
+ReFS volume
+In this experiment, you use the built-in refsutil.exe tool on a ReFS
+volume to find and fix cluster leaks that could happen on a ReFS
+volume. By default, the tool doesn’t require a volume to be
+unmounted because it operates on a read-only volume snapshot. To
+let the tool fix the found leaks, you can override the setting by
+using the /x command-line argument. Open an administrative
+command prompt and type the following command. (In the
+example, a 1 TB ReFS volume was mounted as the E: drive. The /v
+switch enables the tool’s verbose output.)
+Click here to view code image
+C:\>refsutil leak /v e:
+Creating volume snapshot on drive \\?\Volume{92aa4440-51de-
+4566-8c00-bc73e0671b92}...
+Creating the scratch file...
+Beginning volume scan... This may take a while...
+Begin leak verification pass 1 (Cluster leaks)...
+End leak verification pass 1. Found 0 leaked clusters on the 
+volume.
+Begin leak verification pass 2 (Reference count leaks)...
+End leak verification pass 2. Found 0 leaked references on 
+the volume.
+Begin leak verification pass 3 (Compacted cluster leaks)...
+End leak verification pass 3.
+Begin leak verification pass 4 (Remaining cluster leaks)...
+End leak verification pass 4. Fixed 0 leaks during this 
+pass.
+Finished.
+Found leaked clusters: 0
+Found reference leaks: 0
+Total cluster fixed  : 0
+Shingled magnetic recording (SMR) volumes
+At the time of this writing, one of the biggest problems that classical rotating
+hard disks are facing is in regard to the physical limitations inherent to the
+recording process. To increase disk size, the drive platter area density must
+always increase, while, to be able to read and write tiny units of information,
+the physical size of the heads of the spinning drives continue to get
+increasingly smaller. In turn, this causes the energy barrier for bit flips to
+decrease, which means that ambient thermal energy is more likely to
+accidentally flip flip bits, reducing data integrity. Solid state drives (SSD)
+have spread to a lot of consumer systems, large storage servers require more
+space and at a lower cost, which rotational drives still provide. Multiple
+solutions have been designed to overcome the rotating hard-disk problem.
+The most effective is called shingled magnetic recording (SMR), which is
+shown in Figure 11-91. Unlike PMR (perpendicular magnetic recording),
+which uses a parallel track layout, the head used for reading the data in SMR
+disks is smaller than the one used for writing. The larger writer means it can
+more effectively magnetize (write) the media without having to compromise
+readability or stability.
+Figure 11-91 In SMR disks, the writer track is larger than the reader track.
+The new configuration leads to some logical problems. It is almost
+impossible to write to a disk track without partially replacing the data on the
+consecutive track. To solve this problem, SMR disks split the drive into
+zones, which are technically called bands. There are two main kinds of
+zones:
+■    Conventional (or fast) zones work like traditional PMR disks, in
+which random writes are allowed.
+■    Write pointer zones are bands that have their own “write pointer” and
+require strictly sequential writes. (This is not exactly true, as host-
+aware SMR disks also support a concept of write preferred zones, in
+which random writes are still supported. This kind of zone isn’t used
+by ReFS though.)
+Each band in an SMR disk is usually 256 MB and works as a basic unit of
+I/O. This means that the system can write in one band without interfering
+with the next band. There are three types of SMR disks:
+■    Drive-managed: The drive appears to the host identical to a
+nonshingled drive. The host does not need to follow any special
+protocol, as all handling of data and the existence of the disk zones
+and sequential write constraints is managed by the device’s firmware.
+This type of SMR disk is great for compatibility but has some
+limitations–the disk cache used to transform random writes in
+sequential ones is limited, band cleaning is complex, and sequential
+write detection is not trivial. These limitations hamper performance.
+■    Host-managed: The device requires strict adherence to special I/O
+rules by the host. The host is required to write sequentially as to not
+destroy existing data. The drive refuses to execute commands that
+violate this assumption. Host-managed drives support only sequential
+write zones and conventional zones, where the latter could be any
+media including non-SMR, drive-managed SMR, and flash.
+■    Host-aware: A combination of drive-managed and host-managed, the
+drive can manage the shingled nature of the storage and will execute
+any command the host gives it, regardless of whether it’s sequential.
+However, the host is aware that the drive is shingled and is able to
+query the drive for getting SMR zone information. This allows the
+host to optimize writes for the shingled nature while also allowing the
+drive to be flexible and backward-compatible. Host-aware drives
+support the concept of sequential write preferred zones.
+At the time of this writing, ReFS is the only file system that can support
+host-managed SMR disks natively. The strategy used by ReFS for supporting
+these kinds of drives, which can achieve very large capacities (20 terabytes
+or more), is the same as the one used for tiered volumes, usually generated by
+Storage Spaces (see the final section for more information about Storage
+Spaces).
+ReFS support for tiered volumes and SMR
+Tiered volumes are similar to host-aware SMR disks. They’re composed of a
+fast, random access area (usually provided by a SSD) and a slower sequential
+write area. This isn’t a requirement, though; tiered disks can be composed by
+different random-access disks, even of the same speed. ReFS is able to
+properly manage tiered volumes (and SMR disks) by providing a new logical
+indirect layer between files and directory namespace on the top of the volume
+namespace. This new layer divides the volume into logical containers, which

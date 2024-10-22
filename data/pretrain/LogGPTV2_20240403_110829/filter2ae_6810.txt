@@ -1,0 +1,118 @@
+# Laravel v8.x反序列化漏洞
+## 环境搭建
+使用composer一键安装最新版Laravel
+    composer create-project --prefer-dist laravel/laravel laravel
+在app\Http\Controllers中添加Test控制器，加入反序列化点，如下图。
+在routes\web.php中添加以下路由。
+注释掉app\Kernel.php中关于CSRF验证的部分（第38行）。
+当访问首页与/hello正常时，环境搭建完毕。
+## 漏洞分析
+反序列化利用链如下。
+    Illuminate\Testing\PendingCommand->__destruct()
+    Illuminate\Testing\PendingCommand->run()
+    Illuminate\Container\Container->make()
+    Illuminate\Container\Container->resolve()
+先看命令执行的点，`Illuminate\Container\Container->resolve()`，当`$extender`与`$object`可控时，可以进行代码执行。
+    protected function resolve($abstract, $parameters = [], $raiseEvents = true)
+        {
+            ···略···
+            // If we defined any extenders for this type, we'll need to spin through them
+            // and apply them to the object being built. This allows for the extension
+            // of services, such as changing configuration or decorating the object.
+            foreach ($this->getExtenders($abstract) as $extender) {
+                $object = $extender($object, $this);
+            }
+           ···略···
+            return $object;
+        }
+    /**
+    * php system函数原型
+    * system(string $command, int &$return_var = ?): string
+    */
+再看链首`Illuminate\Testing\PendingCommand->__destruct()`
+当`hasExecuted`不为真时，进入`Illuminate\Testing\PendingCommand->run()`，关键部分代码如下。
+跟进`make`方法，可以看到实现该方法的子类有两个。
+其中包含了`Illuminate\Container\Container`，又由于`$this->app`可控，故在此可跟进到`Illuminate\Container\Container->make()`
+在第一次进入到`Illuminate\Container\Container->make()`方法时，`$abstract`不可控，并且为`Kernel::class`，漏洞方法`resolve()`出现，继续跟进`Illuminate\Container\Container->resolve()`
+    protected function resolve($abstract, $parameters = [], $raiseEvents = true)
+        {
+            $abstract = $this->getAlias($abstract);
+            if ($raiseEvents) {
+                $this->fireBeforeResolvingCallbacks($abstract, $parameters);
+            }
+            $concrete = $this->getContextualConcrete($abstract);
+            $needsContextualBuild = ! empty($parameters) || ! is_null($concrete);
+            if (isset($this->instances[$abstract]) && ! $needsContextualBuild) {
+                return $this->instances[$abstract];
+            }
+            $this->with[] = $parameters;
+            if (is_null($concrete)) {
+                $concrete = $this->getConcrete($abstract);
+            }
+            if ($this->isBuildable($concrete, $abstract)) {
+                $object = $this->build($concrete);
+            } else {
+                $object = $this->make($concrete);
+            }
+            foreach ($this->getExtenders($abstract) as $extender) {
+                $object = $extender($object, $this);
+            }
+            if ($this->isShared($abstract) && ! $needsContextualBuild) {
+                $this->instances[$abstract] = $object;
+            }
+            if ($raiseEvents) {
+                $this->fireResolvingCallbacks($abstract, $object);
+            }
+            $this->resolved[$abstract] = true;
+            array_pop($this->with);
+            return $object;
+        }
+为使后面讲述的时候不太绕，我们先讲`$abstract =
+$this->getAlias($abstract)`，跟进到`$this->getAlias()`
+`$this->aliases`可控，当设置了`$this->aliases[$abstract]`变量时，会再调用一次该方法，当未设置该变量时则直接返回`$abstract`的值。
+前面我们说到，第一次调用`make()`时，传入的`$abstract`不可控，并且为`Kernel::class`，故我们可以通过设置`Illuminate\Container\Container->aliases[Kernel::class]=>"可控值"`的方式来控制`$this->getAlias($abstract)`。
+所以，在经过了`$abstract = $this->getAlias($abstract)`处理之后，`$abstract`便是可控的了。
+即`$abstract=$this->aliases[Kernel::class]`
+现在，只要控制了`$extender`与`$object`便能rce，`$extender`来自`$this->getExtenders($abstract)`，跟进`Illuminate\Container\Container->getExtenders()`
+因为`$this->extenders`可控，`$this->getAlias($abstract)`可控，所以`$extender`可控。
+下面看`$object`变量的获取部分。
+    if ($this->isBuildable($concrete, $abstract)) {
+                $object = $this->build($concrete);
+            } else {
+                $object = $this->make($concrete);
+            }
+两个方式都可以获得`$object`，分别跟进`$this->build()`与`$this->make()`后，不太想看`$this->build()`，故分析第二个方式能否返回可控值。
+这是第二次调用`make()`并且传入的值为`$concrete`，再次跟进`resolve()`，这次我们着重看`resolve()`中`return`的地方。
+第一次`return`的部分如下。
+再看看`$needsContextualBuild`如何取得。
+这里的`$parameters`是在调用`make()`时传入的，默认为空数组，此时我们能够想到，倘若这里的`$abstract`也即是传入的`$concrete`可控，我们就能控制第二次调用`make()`的返回值，也即是控制`$object`。
+回看`$concrete`是如何取得的，同样是两个地方。
+    $concrete = $this->getContextualConcrete($abstract);
+                    ···略···
+    if (is_null($concrete)) {
+         $concrete = $this->getConcrete($abstract);
+    }
+先跟进`$this->getConcrete()`
+可以知道，当这里传入的`$abstract`可控时，`$concrete`就可控了。而这里的`$abstract`是进入`resolve()`方法进行一次处理后得到的，即`$this->aliases[Kernel::class]`
+至此，我们知道`$concrete可控`->`$this->make($concrete)返回值可控`->`$object`可控。
+所以，此时我们只要保证`if ($this->isBuildable($concrete, $abstract))`为`false`即可。
+跟进`$this->isBuildable()`
+`$abstract`可控，这里的`$concrete`是经过`$concrete =
+$this->getContextualConcrete($abstract)`处理的，只要我们未做特殊的配置（也即是通过修改各个属性去改变`$this->getContextualConcrete()`的返回值），那么它处理后的`$concrete=null`
+最终`isBuildable`的返回值就为`false`。
+至此，我们先做一个小结。
+    在Illuminate\Testing\PendingCommand类中，需要做如下设置：
+    $this->hasExecuted = false;
+    $this->app = Illuminate\Container\Container对象;
+    在Illuminate\Container\Container类中，需要做如下设置:
+    $this->aliases = array(Kernel::class=>"4ny0ne");
+    $this->bindings = array("4ny0ne"=>array("concrete"=>"4ut15m"));
+    $this->instances = array("4ut15m"=>"命令");
+    $this->extenders = array("4nyone"=>"system");
+在简单编写EXP之后可以发现，提交payload之后会出现一个异常，而这个异常，则是在`Illuminate\Testing\PendingCommand->mockConsoleOutput()`中抛出的。
+调试跟进，发现异常抛出的位置。
+所以，我们需要使得`Illuminate\Testing\PendingCommand->text`为一个拥有`expectedOutput`属性的对象，全局搜索`expectedOutput`，在一个trait类`InteractsWithConsole`中找到该属性。
+全局搜索使用了该`trait`的类，找到一个接口`TestCase`。
+最后找到该接口的一个实现类`ExampleTest`，修改最终EXP，执行命令如下。
+## EXP
+见[anyserial](https://gitee.com/any0ne-sec/anyserial)

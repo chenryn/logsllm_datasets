@@ -1,0 +1,136 @@
+    kd> r r14
+    r14=144d0c018000d000
+    kd> g//命中软中断
+    Break instruction exception - code 80000003 (first chance)
+    0033:00007ff7`9dd222b0 cc              int     3
+    kd> g
+    Break instruction exception - code 80000003 (first chance)
+    0033:00007ff7`9dd222b0 cc              int     3
+    kd> dd ffffe28d12cb2080+300 L4//修改后，通过SetBitmap写入偏移
+    ffffe28d`12cb2380  8000d000 164d0c01 a1beb1e1 01d288e0
+这里我采用了Win7零页分配的方法，handle选择0xffffffffffffffff，但是发现在Win10中，会调用ObpReferenceObjectByHandleWithTag函数Check
+handle，如果不是一个有效的handle，则直接返回，NTSTATUS直接报错。
+    kd> p
+    nt!MiAllocateVirtualMemory+0x7b8:
+    fffff801`7cee27c8 498bca          mov     rcx,r10
+    kd> p //ObpReferenceObjectByHandleWithTag check handle
+    nt!MiAllocateVirtualMemory+0x7bb:
+    fffff801`7cee27cb e8a0070100      call    nt!ObpReferenceObjectByHandleWithTag (fffff801`7cef2f70)
+    kd> p
+    nt!MiAllocateVirtualMemory+0x7c0:
+    fffff801`7cee27d0 89442464        mov     dword ptr [rsp+64h],eax
+    kd> r eax//没有这个handle则返回NTSTATUS
+    eax=c0000008
+    // ObpReferenceObjectByHandleWithTag 检查逻辑
+      if ( (BugCheckParameter1 & 0x80000000) != 0i64 )
+      {
+        if ( BugCheckParameter1 == -1i64 )//如果handle值为0xfff....ff
+        {
+          if ( v9 != PsProcessType && v9 )
+          {
+            LODWORD(v12) = -1073741788;
+          }
+          else
+          {
+            v37 = *(_QWORD *)(v8 + 184);
+            if ( v11 & 0xFFE00000 && a4 )
+            {
+              LODWORD(v12) = -1073741790;
+            }
+            ……
+          }
+          return (unsigned int)v12;                 // C0000008
+        }
+        if ( BugCheckParameter1 == -2i64 )
+        {
+        }
+      }
+这样，我们就只能修改代码通过OpenProcess获得当前进程handle，并且将VdmAllowed置1，但是发现即使NTSTATUS返回0，也就是STATUS_SUCCESS，内存状态可写，只需要memset初始化内存即可。
+    kd> !process
+    PROCESS ffffe28d12fb0080
+        SessionId: 1  Cid: 10b0    Peb: 00ddb000  ParentCid: 1124
+        DirBase: 51685000  ObjectTable: ffffa709d9138200  HandleCount: 
+        Image: Stop_by_win10.exe
+    kd> dt nt!_EPROCESS VdmAllowed ffffe28d12fb0080 //当前VdmAllowed为1
+       +0x304 VdmAllowed : 0y1
+    kd> p
+    0033:00007ff7`16e7204c ff55a0          call    qword ptr [rbp-60h]
+    kd> p
+    0033:00007ff7`16e7204f 0f28b424e0040000 movaps  xmm6,xmmword ptr [rsp+4E0h]
+    kd> p
+    0033:00007ff7`16e72057 85c0            test    eax,eax
+    kd> r eax//NTSTATUS返回0，也就是STATUS_SUCCESS
+    eax=0
+    kd> dd 4600000000//等待初始化的内存
+    00000046`00000000  ???????? ???????? ???????? ????????
+    00000046`00000010  ???????? ???????? ???????? ????????
+同样，我们修改Win32k为1，这样就禁用了win32k调用，可以发现，在禁用后，会阻止win32k的调用，从而无法初始化cmd。关于win32k调用的逻辑后面会讲到。
+**回归Win8看防护之NtAllocateVirtualMemory**
+接下来我们回到Win8 x86，来看一下NtAllocateVirtualMemory的防护到底是怎样的。这里请使用文末我修改后的适用于win8
+x86的代码。首先是禁用零页申请内存。我们首先在禁用零页时调试，首先进入内核态，从ntdll进入nt。
+    kd> p
+    001b:77d4f04d e803000000    call    77d4f055//调用NtAllocateVirtualMemory
+    kd> t
+    001b:77d4f055 8bd4            mov     edx,esp
+    001b:77d4f055 8bd4            mov     edx,esp
+    001b:77d4f057 0f34            sysenter//x86下用sysenter进入内核态
+    001b:77d4f059 c3              ret
+在nt!NtAllocateVirtualMemory下断点跟踪，在入口处会先将Handle、BaseAddress等内容传入寄存器（用于各种检查，比如对Handle检查合法性，在之前已经提过），接下来会通过fs:[0x124]获取到_KTHRAD结构
+    kd> p
+    nt!NtAllocateVirtualMemory+0x34://获取KTHREAD结构
+    81a891a2 648b3d24010000  mov     edi,dword ptr fs:[124h]
+    kd> p
+    nt!NtAllocateVirtualMemory+0x3b:
+    81a891a9 897da8          mov     dword ptr [ebp-58h],edi
+    kd> r edi
+    edi=86599bc0
+    kd> dt nt!_KTHREAD 86599bc0
+       +0x000 Header           : _DISPATCHER_HEADER
+       +0x010 SListFaultAddress : (null)
+之后会将_KTHREAD+0x80偏移的值交给eax寄存器，偏移加0x80实际上就是EPROCESS结构，这个位置属于APC域，这个位置在KTHREAD+0x70的位置，而EPROCESS又保存在KAPC_STATE+0x10的位置
+    kd> p//edi是KTHREAD，eax的值是EPROCESS
+    nt!NtAllocateVirtualMemory+0x3e:
+    81a891ac 8b8780000000    mov     eax,dword ptr [edi+80h]
+    kd> p
+    nt!NtAllocateVirtualMemory+0x44:
+    81a891b2 8945b0          mov     dword ptr [ebp-50h],eax
+    kd> r eax
+    eax=85a44040
+    kd> !process
+    PROCESS 85a44040  SessionId: 1  Cid: 0860    Peb: 7f74d000  ParentCid: 0f08
+        DirBase: 3df14300  ObjectTable: 8c173740  HandleCount: 
+        Image: Stop_by_win10.exe
+    kd> dt nt!_KTHREAD ApcState//偏移加0x70
+       +0x070 ApcState : _KAPC_STATE
+    kd> dt nt!_KAPC_STATE//偏移加0x10，一共是0x80，对应的位置是EPROCESS
+       +0x000 ApcListHead      : [2] _LIST_ENTRY
+       +0x010 Process          : Ptr32 _KPROCESS
+接下来我们单步跟踪，到达一处判断，这里会将BaseAddress和0x10000作比较，小于则跳转到另一处判断
+    kd> p
+    nt!NtAllocateVirtualMemory+0x9b7:
+    81a89b25 3bd0            cmp     edx,eax
+    kd> r edx
+    edx=00000060
+    kd> r eax
+    eax=00010000
+    kd> p
+    nt!NtAllocateVirtualMemory+0x9b9://如果申请地址值小于0x1000，则跳转
+    81a89b27 0f8257781200    jb      nt! ?? ::NNGAKEGL::`string'+0x19d1a (81bb1384)
+    kd> p
+    nt! ?? ::NNGAKEGL::`string'+0x19d1a:
+    81bb1384 f787c400000000000001 test dword ptr [edi+0C4h],1000000h
+    kd> dd edi+c4 L1//edi+0C4就是Flags
+    85a44104  144d0c01
+    kd> p
+    nt! ?? ::NNGAKEGL::`string'+0x19d24://这里会将VdmAllowed值作比较判断
+    81bb138e 0f859987edff    jne     nt!NtAllocateVirtualMemory+0x9bf (81a89b2d)
+这个值很有意思，就是_EPROCESS.Flags2的值，来看一下，而这里判断的就是Flags2中的一个比特位VdmAllowed
+    kd> dt nt!_EPROCESS Flags 85a44040
+       +0x0c4 Flags : 0x144d0c01
+    kd> dt nt!_EPROCESS VdmAllowed 85a44040
+       +0x0c4 VdmAllowed : 0y0
+这里值为0，也就是禁用零页分配，因此这里分配不成功将会进入处理，返回C00000F0
+    kd> p
+    nt! ?? ::NNGAKEGL::`string'+0x19d2a:
+    81bb1394 bef00000c0      mov     esi,0C00000F0h
+    kd> p

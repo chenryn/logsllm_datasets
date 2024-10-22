@@ -1,0 +1,190 @@
+# 前言
+​ 对一些有趣的堆相关的漏洞的利用做一个记录，如有差错，请见谅。
+​ 文中未做说明 均是指 `glibc 2.23`
+​ 相关引用已在文中进行了标注，如有遗漏，请提醒。
+# 简单源码分析
+​ 本节只是简单跟读了一下 `malloc` 和 `free` 的源码， 说的比较简单，很多细节还是要自己拿一份源代码来读。
+## 堆中的一些数据结构
+### **堆管理结构**
+    struct malloc_state {
+     mutex_t mutex;                 /* Serialize access. */
+     int flags;                       /* Flags (formerly in max_fast). */
+     #if THREAD_STATS
+     /* Statistics for locking. Only used if THREAD_STATS is defined. */
+     long stat_lock_direct, stat_lock_loop, stat_lock_wait;
+     #endif
+     mfastbinptr fastbins[NFASTBINS];    /* Fastbins */
+     mchunkptr top;
+     mchunkptr last_remainder;
+     mchunkptr bins[NBINS * 2];
+     unsigned int binmap[BINMAPSIZE];   /* Bitmap of bins */
+     struct malloc_state *next;           /* Linked list */
+     INTERNAL_SIZE_T system_mem;
+     INTERNAL_SIZE_T max_system_mem;
+     };
+  * `malloc_state`结构是我们最常用的结构，其中的重要字段如下：
+  * `fastbins`：存储多个链表。每个链表由空闲的`fastbin`组成，是`fastbin freelist`。
+  * `top` ：`top chunk`，指向的是`arena`中剩下的空间。如果各种`freelist`都为空，则从`top chunk`开始分配堆块。
+  * `bins`：存储多个双向链表。意义上和堆块头部的双向链表一样，并和其组成了一个双向环状空闲列表（freelist）。这里的bins位于freelist的结构上的头部， **后向指针（bk）指向freelist逻辑上的第一个节点** 。分配`chunk`时从逻辑上的第一个节点分配寻找合适大小的堆块。
+### **堆块结构**
+    struct malloc_chunk {
+      INTERNAL_SIZE_T      prev_size;  /* Size of previous chunk (if free).  */
+      INTERNAL_SIZE_T      size;       /* Size in bytes, including overhead. */
+      struct malloc_chunk* fd;         /* double links -- used only if free. */
+      struct malloc_chunk* bk;
+      /* Only used for large blocks: pointer to next larger size.  */
+      struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
+      struct malloc_chunk* bk_nextsize;
+    };
+  * `prev_size`： **相邻的前一个堆块大小** 。这个字段只有在前一个堆块（且该堆块为`normal chunk`）处于 **释放状态** 时才有意义。这个字段最重要（甚至是唯一）的作用就是用于 **堆块释放时快速和相邻的前一个空闲堆块融合** 。该字段不计入当前堆块的大小计算。在前一个堆块不处于空闲状态时，数据为前一个堆块中用户写入的数据。libc这么做的原因主要是可以节约4个字节的内存空间，但为了这点空间效率导致了很多安全问题。
+  * `size`：本堆块的长度。长度计算方式： **size字段长度+用户申请的长度+对齐** 。libc以 **size_T 长度*2** 为粒度对齐。例如 **32bit** 以 4 _2= **8byte** 对齐， **64bit** 以 **8\_2=0×10 **对齐。因为最少以8字节对齐，所以size一定是8的倍数，** 故size字段的最后三位恒为0 **，libc用这三个bit做标志flag。比较关键的是最后一个bit（pre_inuse），用于指示相邻的前一个堆块是alloc还是free。如果正在使用，则 bit=1。libc判断** 当前堆块是否处于free状态的方法 **就是 判断下一个堆块的** pre_inuse** 是否为 1 。这里也是 `double free` 和 `null byte offset` 等漏洞利用的关键。
+  * `fd &bk`：双向指针，用于组成一个双向空闲链表。故这两个字段 **只有在堆块free后** 才有意义。堆块在alloc状态时，这两个字段内容是用户填充的数据。 **两个字段可以造成内存泄漏（libc的bss地址），Dw shoot等效果** 。
+  * 值得一提的是，堆块根据大小，libc使用fastbin、chunk等逻辑上的结构代表，但其存储结构上都是malloc_chunk结构，只是各个字段略有区别，如fastbin相对于chunk，不使用bk这个指针，因为fastbin freelist是个单向链表。
+**来源**  
+[Libc堆管理机制及漏洞利用技术](http://www.freebuf.com/articles/system/91527.html)
+## Malloc 源码分析
+用户调用 `malloc` 时会先进入 `__libc_malloc`
+    void *
+    __libc_malloc (size_t bytes)
+    {
+      mstate ar_ptr;
+      void *victim;
+      void *(*hook) (size_t, const void *)
+        = atomic_forced_read (__malloc_hook);
+      if (__builtin_expect (hook != NULL, 0))// 如果设置了 __malloc_hook 就执行然后返回
+        return (*hook)(bytes, RETURN_ADDRESS (0));
+      arena_get (ar_ptr, bytes);
+      victim = _int_malloc (ar_ptr, bytes);
+      return victim;
+    }
+如果设置了 `__malloc_hook` 就执行它然后返回， 否则进入 `_int_malloc` 这个函数就是 `malloc` 的具体实现
+    static void *
+    _int_malloc (mstate av, size_t bytes)
+    {
+       /*
+         计算出实际需要的大小，大小按照 2 * size_t 对齐， 64位： 0x10
+         所以如个 malloc(0x28) ----> nb = 0x30, 0x10 header + 0x20 当前块 + 0x8 下一块的 pre_size
+       */
+      checked_request2size (bytes, nb);
+      /* 
+        如果是第一次触发 malloc, 就会调用 sysmalloc---> mmap 分配内存返回
+         */
+      if (__glibc_unlikely (av == NULL))
+        {
+          void *p = sysmalloc (nb, av);
+          if (p != NULL)
+        alloc_perturb (p, bytes);
+          return p;
+        }
+首先把传入的 `bytes` 转换为 `chunk` 的实际大小，保存到 `nb` 里面。然后如果是第一次调用 `malloc` , 就会进入
+`sysmalloc` 分配内存。
+### 搜索Fastbin
+接着会看申请的 `nb` 是不是在 `fastbin` 里面，如果是进入 `fastbin` 的处理流程
+    if ((unsigned long) (nb) fd, victim))
+                 != victim);
+          if (victim != 0) //如果 fastbin 非空，就进入这里
+            {
+              if (__builtin_expect (fastbin_index (chunksize (victim)) != idx, 0))// 判断大小是否满足 fastbin相应bin的大小要求
+                {
+                  errstr = "malloc(): memory corruption (fast)";
+                errout:
+                  malloc_printerr (check_action, errstr, chunk2mem (victim), av);
+                  return NULL;
+                }
+              check_remalloced_chunk (av, victim, nb);
+              void *p = chunk2mem (victim);
+              alloc_perturb (p, bytes);
+              return p;
+            }
+        }
+首先根据 `nb` 找到该大小对应的 `fastbin` 的项， 然后看看该 `fastbin` 是不是为空，如果非空，就分配该 `fastbin`
+的第一个 `chunk` 给用户。
+分配过程还会检查待分配的 `chunk` 的 `size` 是不是满足在该 `fastbin` 项的限制。
+    fastbin_index (chunksize (victim)) != idx
+### 搜索Smallbin
+如果 `fastbin` 为空或者 `nb` 不在 `fastbin` 里面，就会进入 `smallbin` 和 `largebin` 的处理逻辑
+    if (in_smallbin_range (nb))
+        {
+          idx = smallbin_index (nb);//  找到 smallbin 索引
+          bin = bin_at (av, idx);
+          if ((victim = last (bin)) != bin) // 判断 bin 中是不是有 chunk
+            {
+              if (victim == 0) /* initialization check */
+                malloc_consolidate (av);
+              else
+                {
+                  bck = victim->bk;
+        if (__glibc_unlikely (bck->fd != victim)) // 链表检查
+                    {
+                      errstr = "malloc(): smallbin double linked list corrupted";
+                      goto errout;
+                    }
+                  set_inuse_bit_at_offset (victim, nb); //设置下一个chunk的 in_use 位
+                  bin->bk = bck;
+                  bck->fd = bin;
+                  if (av != &main_arena)
+                    victim->size |= NON_MAIN_ARENA;
+                  check_malloced_chunk (av, victim, nb);
+                  void *p = chunk2mem (victim);
+                  alloc_perturb (p, bytes);
+                  return p;
+                }
+            }
+        }
+      /*
+         大内存分配，进入 malloc_consolidate
+       */
+      else
+        {
+          idx = largebin_index (nb);
+          if (have_fastchunks (av))
+            malloc_consolidate (av);
+        }
+如果申请的 `nb` 位于 `smallbin` 的范围，就会 `fastbin` 一样去找对应的项，然后判断 `bin` 是不是为空，如果不空,
+分配第一个 `chunk` 给用户，分配之前还会校验该 `chunk` 是不是正确的。如果为空，就会进入 `unsorted bin` 的处理了。
+    __glibc_unlikely (bck->fd != victim)
+如果 `nb` 不满足 `smallbin` ，就会触发 `malloc_consolidate` . 然后进入 `unsorted bin`
+### 搜索Unsorted bin
+    int iters = 0;
+          while ((victim = unsorted_chunks (av)->bk) != unsorted_chunks (av)) // 遍历 unsorted bin
+            {
+              bck = victim->bk;
+              size = chunksize (victim);
+              if (in_smallbin_range (nb) &&
+                  bck == unsorted_chunks (av) &&
+                  victim == av->last_remainder &&
+                  (unsigned long) (size) > (unsigned long) (nb + MINSIZE))
+                {
+                  /* split and reattach remainder */
+                  remainder_size = size - nb;
+                  remainder = chunk_at_offset (victim, nb);
+                  unsorted_chunks (av)->bk = unsorted_chunks (av)->fd = remainder;
+                  av->last_remainder = remainder;
+                  remainder->bk = remainder->fd = unsorted_chunks (av);
+                  if (!in_smallbin_range (remainder_size))
+                    {
+                      remainder->fd_nextsize = NULL;
+                      remainder->bk_nextsize = NULL;
+                    }
+                  set_head (victim, nb | PREV_INUSE |
+                            (av != &main_arena ? NON_MAIN_ARENA : 0));
+                  set_head (remainder, remainder_size | PREV_INUSE);
+                  set_foot (remainder, remainder_size);
+                  check_malloced_chunk (av, victim, nb);
+                  void *p = chunk2mem (victim);
+                  alloc_perturb (p, bytes);
+                  return p;
+                }
+遍历 `unsorted bin` ， 如果此时的 `unsorted bin` 只有一项，且他就是 `av->last_remainder`
+,同时大小满足
+    (unsigned long) (size) > (unsigned long) (nb + MINSIZE)
+就对当前 `unsorted bin` 进行切割，然后返回切割后的 `unsorted bin` 。
+否则就先把该 `unsorted bin` 从 `unsorted list` 中移除下来，这里用了一个 类似 `unlink` 的操作，不过没有检查
+`chunk` 的指针
+    /*先摘下该 unsorted bin  */
+              unsorted_chunks (av)->bk = bck;
+              bck->fd = unsorted_chunks (av);
+              // 如果申请的大小和该 unsorted bin的大小刚好相等，就直接返回
+              if (size == nb)
+                {
+                  set_inuse_bit_at_offset (victim, size);

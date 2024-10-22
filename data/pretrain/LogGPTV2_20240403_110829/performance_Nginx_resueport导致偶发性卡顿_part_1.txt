@@ -1,0 +1,115 @@
+# 背景
+从2018年开始，我们有个业务陆续接到反馈 Nginx 线上集群经常出现不响应或者偶发性的“超慢”请求。这种卡顿每天都有少量出现。而只有多个集群中的一个出现，其他压力更大的集群皆未出现。
+业务结构比较简单：LVS->Nginx->后端，如图
+![img](Nginx%20reuseport%20导致偶发性卡顿/arch.jpg)
+一些观察到的现象：
+- 出问题前不久升级 Nginx 配置，打开了 reuseport 功能
+- 在压力大的后端（upstream）服务环境不容易出现，后端压力轻对应的Nginx卡顿概率更高
+- 关闭 reuseport 后 问题少了很多
+- 失败的请求响应时间都是 0ms（Nginx日志不靠谱了）
+- 从 Nginx 日志上看，所有失败的健康检查请求都是0ms 的499 错误码（健康检查设置超时是2秒），但实际出问题的时候有5s-2分钟没有任何日志输出（Nginx卡了这么久）要么是Nginx卡住没去accept，要么是accept了没响应
+- 所有超时来自同一个worker(一个Nginx服务一般按照机器核数开启多个worker)  
+并且已知，卡顿的原因是打开 reuseport 后，新进来的请求可以由内核 hash 派发给一个 Nginx woker ，避免了锁争抢以及惊群。但如果网络条件足够好，压力足够低，Nginx worker 一直来不及读完 receive buffer 中的内容时，就无法切换并处理其他的 request，于是在新请求的客户端会观测不间断的卡顿，而压力大的后端由于网络传输慢，经常卡顿，Nginx worker 反而有时间能处理别的请求。在调小 receive buffer 人为制造卡顿后该问题得以解决。
+# 目标
+由于所述场景比较复杂，缺乏直接证据，打算通过构造一个较简单的环境来复现这个问题，并且在这个过程中抓包、观测Nginx worker的具体行为，验证这个假设。
+# 术语
+## 快连接和慢连接
+- 快连接：通常是传输时间短、传输量小的连接，耗时通常是ms级别
+- 慢连接：通常是传输时间长、传输量大的连接，可以维持传输状态一段时间（如30s, 1min）  
+在本次场景复现过程中，这两种连接都是短连接，每次请求开始前都需要三次握手建立连接，结束后都需要四次挥手销毁连接
+## Epoll
+Nginx使用了epoll模型，epoll 是多路复用的一种实现。在多路复用的场景下，一个task（process）会批量处理多个socket，哪个来了数据就去读那个。这就意味着要公平对待所有这些socket，不能阻塞在任何socket的”数据读”上，也就是说不能在阻塞模式下针对任何socket调用recv/recvfrom。  
+epoll 每次循环为O(1) 操作，循环前会得到一个就绪队列，其中包含所有已经准备好的 socket stream（有数据可读），不需要循环全部 socket stream 读取数据，在循环后会将被读取数据的 stream 重新放回睡眠队列。睡眠队列中的 socket stream 有数据可读时，再唤醒加入到 就绪队列中。
+epoll 伪代码 （不包含唤醒、睡眠）
+```
+while(true) {  
+    streamArr = getEpollReadyStream(); // 找到准备好的stream
+    for(Stream i: streamArr) {         // 循环准备好的stream
+        doSomething();
+    }
+}
+```
+## reuseport与惊群
+Nginx reuseport 选项解决惊群的问题：在 TCP 多进程/线程场景中（B 图），服务端如果所有新连接只保存在一个 listen socket 的全连接队列中，那么多个进程/线程去这个队列里获取（accept）新的连接，势必会出现多个进程/线程对一个公共资源的争抢，争抢过程中，大量资源的损耗，也就会发生惊群现象。  
+![img](Nginx%20reuseport%20导致偶发性卡顿/reuseport-explained.jpg)
+而开启reuseport后（C 图），有多个 listener 共同 bind/listen 相同的 IP/PORT，也就是说每个进程/线程有一个独立的 listener，相当于每个进程/线程独享一个 listener 的全连接队列，新的连接请求由内核hash分配，不需要多个进程/线程竞争某个公共资源，能充分利用多核，减少竞争的资源消耗，效率自然提高了。  
+但同时也是由于这个分配机制，避免了上下文切换，在服务压力不大，网络情况足够好的情况下，进程/线程更有可能专注于持续读取某个慢连接数据而忽视快连接建立的请求，从而造成快连接方卡顿。  
+# 复现过程
+## 思路
+1. 整体的架构是N个client->1个Nginx->N个server。因为卡顿原因和reuseport机制有关，和server数量无关，server数量设为任意数字都能复现，这里为了方便设成1。client数量设为2，为了将快连接和慢连接区分开便于抓包观测
+2. 用慢连接制造卡顿环境，用快连接观测卡顿。在快连接客户端进行观测和抓包
+3. 进程数量要足够少，使得同一个 worker 有几率分配到多个连接 `worker_processes 2`
+4. 连接数目要足够多，慢连接数目>=进程数量，使得快连接在分配时，有一定概率分配到一个正在处理慢连接的worker上
+5. reuseport: 这个配置要开启，卡顿现象才能观测到。`listen 8000 reuseport`
+## 环境
+linux kernal version: 6.1  
+linux image: amazon/al2023-ami-2023.0.20230419.0-kernel-6.1-x86_64  
+instance type:  
+1X AWS t2.micro (1 vCPU, 1GiB RAM) – Nginx client(fast request)  
+3X AWS t3.micro (2 vCPU, 1GiB RAM) – Http server, Nginx server, Nginx client(slow request)  
+## 操作
+1. 在server instance上放置一个 2GiB 大文件（0000000000000000.data）和一个 3MiB 小文件（server.pcap），并开启一个http server
+```
+nohup python -m http.server 8000
+```
+2. 在Nginx instance上安装、配置好Nginx，并启动Nginx (注意要绑核！)
+```
+# install
+sudo yum install nginx
+# config (/etc/nginx/nginx.conf)
+user nginx;
+worker_processes 2;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+include /usr/share/nginx/modules/*.conf;
+events {
+    worker_connections 1024;
+}
+http {
+    log_format  main  '$remote_addr [$time_local] "$request" '
+                      'status=$status body_bytes_sent=$body_bytes_sent '
+                      'rt=$request_time uct="$upstream_connect_time" uht="$upstream_header_time" urt="$upstream_response_time"';
+    access_log  /var/log/nginx/access.log  main;
+    sendfile            on;
+    tcp_nopush          on;
+    keepalive_timeout   60;
+    types_hash_max_size 4096;
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+    # Load modular configuration files from the /etc/nginx/conf.d directory.
+    # See http://nginx.org/en/docs/ngx_core_module.html#include
+    # for more information.
+    include /etc/nginx/conf.d/*.conf;
+    server {
+        listen       8000 reuseport;
+        server_name  server1;
+        root         /usr/share/nginx/html;
+        # Load configuration files for the default server block.
+        include /etc/nginx/default.d/*.conf;
+        location / {
+        proxy_pass http://172.31.86.252:8000; # server ip
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        }
+        error_page 404 /404.html;
+        location = /404.html {
+        }
+        error_page 500 502 503 504 /50x.html;
+        location = /50x.html {
+        }
+    }
+}
+# start nginx
+sudo taskset -c 0 nginx
+```
+3. 启动慢连接client，开启4个下载进程并计时，测试脚本[在此](./Nginx%20reuseport%20%E5%AF%BC%E8%87%B4%E5%81%B6%E5%8F%91%E6%80%A7%E5%8D%A1%E9%A1%BF/script/get_big_file.sh)
+4. 启动快连接client，开启1个下载进程并计时，抓包，测试脚本[在此](./Nginx%20reuseport%20%E5%AF%BC%E8%87%B4%E5%81%B6%E5%8F%91%E6%80%A7%E5%8D%A1%E9%A1%BF/script/get_small_file.sh)
+需要注意的是此处使用了curl --max-time 1，意味着即使1s内文件没有下载完，也会自动终止。
+5. 进入Nginx instance观察access.log
+6. 关掉reuseport或者调小recv buffer大小，重试一次
+## 结果
+ip maping:
+```
+172.31.86.252: http server
+172.31.89.152: nginx server
+172.31.91.109: 快连接 client

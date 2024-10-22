@@ -1,0 +1,376 @@
+is necessary to detect the uninitialized padding bytes. Second, union
+is widely used in kernel data structures and byte-level tracking can
+help resolve the issue introduced by field alias. Finally, byte-level
+detection can precisely filter out safe bytes, so that the instrumen-
+tation module can selectively initialize only the unsafe ones, thus
+further reducing the runtime performance overhead.
+To perform the byte-level analysis, we use a buffer to record the
+initialization and sinking status of every byte in a tracked alloca-
+tion. Whenever an object is allocated, a buffer of the same size
+is created. Currently, we only use two bits of the corresponding
+byte in the buffer to represent the initialization and sinking status of
+each byte in the original object. To keep track of which bytes are
+being accessed, at every GEPOperator (an instruction or expression
+for type-safe pointer arithmetic to access elements of arrays and
+structs) node in LLVM IR, we calculate the offset (into the base
+of the object) and the size of the obtained element. In our current
+design, we do not perform range analysis, so if any of the indices
+of the GEPOperator node are not constants, we cannot statically
+calculate the resulting element. In this case, we conservatively treat
+all bytes of the allocation as uninitialized and pause the initialization
+analysis—as long as the reachability analysis determines that the
+allocation can leave the kernel space, we assume it is unsafe. Since
+non-constant indices are not common in GEPOperator node, our
+byte-level analysis works well in most cases.
+4.1.6 Eliminating False Negatives
+As a prevention tool, UniSan aims to eliminate potential false
+negatives. Clearly, aggressively initializing all stack and heap al-
+locations can guarantee no false negative; however, such a naive
+approach will introduce unnecessary performance overhead, since
+most allocations will either never leave kernel space or be properly
+initialized. To make UniSan more efficient, our principle is to elim-
+%i = alloca i32store i32 0, i32* %icall @put_user(i32* %i, i8* %u)int *i;if (p == NULL)    i = 0;put_user(&i, u);source codeuser-graphinate as many false positives as possible while ensuring no false
+negative; and whenever we encounter an undecidable problem or an
+unhandled corner case, we always sacrifice the detection accuracy
+and assume the tracked allocation is unsafe. In this subsection, we
+summarize cases that may introduce false negatives and describe
+how we handle them.
+Complete call graph. LLVM’s built-in call graph pass does not
+find callees of indirect calls. As described in §4.1.2, we adopt a
+conservative type-analysis to find indirect call targets to build a
+complete and global call graph.
+Conservative path merging. There are often many paths from the
+allocation site to the sink points. And in different paths, the allocated
+object can be initialized differently. In LLVM IR, the most common
+cases that can introduce multiple paths include: 1) load and store
+instructions. These instructions copy the tracked value to somewhere
+else, creating a new data-flow; 2) indirect call instructions; 3) return
+instructions; 4) branch instructions. To ensure that no leaks will be
+missed, UniSan always tracks each path independently and merges
+the tracking results (when tracking of a path returns) by calculating
+the union of all unsafe bytes; in other words, a byte is deemed unsafe
+as long as it is unsafe in one path.
+Propagation to alias. Our reachability and initialization analyses
+are performed in a forward manner (i.e., from source to sink). When-
+ever an alias of the tracked value is created (e.g., by CastInst or
+GetElementPtr instructions), we further track the alias by merging
+its users into the user-graph of the current tracked value. Therefore,
+we do not need alias analysis for this case. However, when the
+tracked value is stored to another value, we need a backward slicing
+analysis to find the possible aliases of the store-to value, which is
+difficult for some cases (e.g., global variable). To handle this, we
+employ the simple basic alias analysis [21]. Additionally, we en-
+force two conservative policies to eliminate potential false negatives:
+1) if we find that the aliases are pointing to a non-stack object (e.g.,
+global variable or heap object), whose data-flow is hard to follow,
+we assume the tracked value is unsafe; 2) if we find the aliases is a
+returned value of a function call or a parameter of current function,
+we also assume the tracked value is unsafe.
+Inline assembly. To improve performance, kernel developers com-
+monly write inline assembly. Since inline assembly is not compiled
+into LLVM IR, our detection cannot be directly applied. To handle
+inline assembly, we manually whitelisted some safe inline assembly
+that will not leak the tracked value or store the tracked value to
+other places. All other inline assembly functions are conservatively
+treated as sinks.
+4.2
+Instrumenting Unsafe Allocations
+After identifying all unsafe allocations, the initializer module
+of UniSan further instruments the kernel to initialize the identified
+unsafe allocations by zeroing the unsafe bytes. In particular, the
+initialization code is inserted right after the allocation (e.g., the
+stack Alloca and kmalloc). Since the detection module reports
+unsafe allocation at the byte-level, in many cases, we do not have
+to initialize the whole allocated object but only the unsafe bytes.
+In particular, for stack allocation, we use StoreInst to zero the
+unsafe bytes if they have a continuous size of less than or equal to
+8; otherwise, memset is used for zeroing the bytes. Heap allocation
+is also initialized in a similar way except that the __GFP_ZERO flag
+is passed to the heap allocator to initialize the memory if all bytes
+are unsafe. With the initialization, all possible uninitialized leaks
+cannot disclose any meaningful entropy from the kernel space, and
+thus can be prevented.
+5.
+IMPLEMENTATION
+In this section, we present the implementation details that read-
+ers may be interested in. UniSan is built on the LLVM compiler
+infrastructure with version 3.7.1. The unsafe allocation detector is
+implemented as two analysis module passes. One is for building the
+complete call graph iteratively and maintaining all necessary global
+context information (e.g., defined functions); the other performs
+the initialization and reachability analyses based on the built call
+graph. The unsafe allocation initializer is implemented as a transfor-
+mation function pass, invoked after the detection pass. Both passes
+are inserted after all optimization passes. To compile the kernel
+into LLVM IR, we leverage the LLVMLinux project [23]. Because
+llvm-link has a symbol renaming problem, instead of merging all
+bitcode files into a single module, we adopt the iterative algorithm
+from KINT [43] to process individual bitcode files. So the input of
+the analysis phase is just a list of bitcode files. UniSan is easy to
+use:
+$ CC=unisan-cc make
+$ unisan @bitcode.list
+5.1 Bookkeeping of the Analysis
+For each tracked allocation, we use a dedicated data structure to
+record its tracking results along the propagation paths. This data
+structure mainly includes the initialization and sinking information
+of each byte. The tracking history is also included to avoid repeat-
+edly tracking a user—we do not need to track a user multiple times
+if the status of the tracked value is not changed.
+As mentioned in §4.1.4, UniSan maintains the user-graph for the
+tracked value. The users in the graph may access different elements
+of the tracked value. To know which part of the tracked value is
+being initialized or sunk during the tracking, element information is
+also kept in each node of the user-graph.
+Moreover, we maintain reference hierarchy for pointers. The ref-
+erence hierarchy is to understand if a pointer is directly or indirectly
+(recursively) pointing to the tracked allocation. To better understand
+it, let us see this example: store i8* %A, i8** %B stores value
+A to the memory pointed to by B but not B itself. To differentiate
+whether the storing operation is targeting the tracked allocation or
+its reference, the referencing relationship between them is required,
+and thus we maintain the reference hierarchy. Our reference hier-
+archy is straightforward: the “indirectness” is decreased by one by
+LoadInst; but increased by one by StoreInst. To tackle the alias
+problem, if StoreInst stores to non-stack memory, we assume it is
+sinking and stop tracking. Certainly, point-to analyses can achieve
+the same goal, but they are heavyweight—analyzing the kernel may
+take many hours.
+The initialization status is updated when the tracked value is
+assigned another value by StoreInst, while the sinking status is
+updated when the tracked value is stored to a non-stack value in
+StoreInst or it is passed to sink functions in CallInst.
+5.2 Tracking Different Users
+Analyses are carried out by traversing the user-graph. UniSan
+handles different kinds of users accordingly. After handling a user,
+the next users of the current user will be further tracked. In this
+section, we detail how the handling of each type of user is imple-
+mented.
+LoadInst.
+LoadInst loads the data pointed to by the tracked
+value to the target value. We independently track both values and
+merge (i.e., the union operation) the unsafe bytes when both track-
+ing processes return. Since LoadInst is essentially dereferencing
+the tracked value that is a pointer, we also increase the reference
+hierarchy by one in the tracking of the target value.
+StoreInst.
+StoreInst stores the tracked value to the memory
+pointed to by the target value. Let us see store i8* %A, i8** %B
+again. When the tracked value is A (i.e., it is the value operand),
+we first use the conservative basic alias analysis (§4.1.6) to find
+the aliases of B. If not all aliases can be found or some aliases
+are from non-stack memory, we assume A is sunk and update its
+sinking status; otherwise, we further track aliases independently
+and merge all unsafe bytes. Since the target value is a reference of
+the stored value, the reference hierarchy is decreased by one in the
+tracking of aliases. When the tracked value is B, we first consult the
+reference hierarchy (§5.1) to see if B is the tracked allocation (but
+not its reference); if yes, we record that the corresponding bytes of
+the tracked allocation are initialized.
+CallInst. When the tracked value is passed to callees via argument,
+we recursively track the arguments in callees independently and
+merge all unsafe bytes. Inline assembly is conservatively handled as
+shown in §4.1.6. If the called function is a sink, we record that the
+corresponding bytes are sunk.
+GEPOperator.
+GEPOperator statements get the pointer of an
+element of the tracked value, which essentially creates an alias of
+the tracked value. The offset of the target element into the base
+of the tracked value and its size are calculated and maintained in
+the user-graph. The users of the target element are merged into the
+user-graph of the tracked value. The element information is the key
+to implement the byte-level analyses; however, when the indices
+of GEPOperator are not constants, we will not be able to obtain
+the element information. In this case, we stop the initialization
+analysis and only continue the reachability analysis, since we cannot
+statically decide which bytes will be initialized.
+ReturnInst. ReturnInst is an instruction that returns a value from
+a function. We first use the global call-graph to find all CallInsts
+that call the current function containing the ReturnInst. Then these
+CallInsts are independently tracked, and unsafe bytes are merged.
+CastInst, SelectInst, and PHINode.
+The definitions of these
+statements can be found at [1]. These cases are generating alias of
+the tracked values. We find their users and merge the users to the
+user-graph of the tracked value.
+CmpInst, SwitchInst, BranchInst. The definitions of these state-
+ments can be found at [1]. We skip the handling for these cases,
+since they do not operate the tracked value.
+Others. Any other cases are conservatively treated as sinks, so all
+uninitialized bytes in the tracked value are assumed to be unsafe.
+5.3 Modeling Basic Functions
+Similar to traditional static program analyses, we also modeled
+some basic functions. Specifically, we modeled string-related func-
+tions that typically use loops to process strings, to improve the
+efficiency of tracking. Moreover, we modeled some frequently used
+LLVM intrinsic functions (e.g., llvm.memset) that do not have func-
+tion bodies in LLVM IR. In total, we modeled 62 simple functions
+by summarizing how they propagate and initialize the arguments.
+5.4 Dynamic Allocations
+Dynamic allocations create objects with a dynamic size. They are
+common (about 40%, according to our study) in heap. In general,
+we do not perform initialization analysis for dynamic allocations,
+because we cannot determine which bytes are being accessed at
+compiling time. As a result, we conservatively consider the whole
+allocation as uninitialized and only perform reachability analysis.
+With one exception, during the initialization analysis we will record
+the size value (in LLVM IR) of the dynamic allocation; if the al-
+location is later initialized by a basic function (e.g., memset) using
+the same size value as recorded, we consider that it is fully initial-
+ized and safe. In the instrumentation module, extra instructions
+are inserted to compute the size at runtime for dynamic allocations
+on stack, which is then passed to memset to initialize the memory.
+For dynamic allocation on heap, we utilize the __GFP_ZERO flag for
+initialization.
+6. EVALUATION
+We systematically evaluated UniSan to answer the following
+questions:
+• The accuracy of UniSan, i.e., to what extent can UniSan filter
+out safe allocations?
+• The effectiveness of UniSan, i.e., whether it can prevent
+known and detect previously unknown uninitialized data leaks?
+• The efficiency of UniSan, i.e., what is the performance over-
+head of the secured kernel?
+Experimental setup. We applied UniSan to both x86_64 and
+AArch64 kernels. For x86_64, we used the latest mainline Linux
+(with version 4.6.0-Blurry Fish Butt) with patches from the
+LLVMLinux projects [23]. x86_64 kernels were tested in a desktop
+machine equipped with an Intel(R) Xeon(R) CPU E5-1620 v2 @
+3.70GHz processor and 32GB RAM. The OS is the 64-bits Ubuntu
+14.04. For AArch64, we used the latest Android kernel (with ver-
+sion tegra-flounder-3.10-n-preview-2) from the Android Open
+Source Project, with patches from [38]. The Android kernels were
+tested in the Nexus 9 device that has a duo-core ARMv8 processor
+and 2GB RAM. We used the default configurations for both kernels.
+6.1 Accuracy of Unsafe Allocation Detector
+We first conducted the statistical analysis on the accuracy of the
+unsafe allocation detector—how many allocations are reported as un-
+safe. The results are shown in Table 1. In particular, there are around
+2k modules (i.e., bitcode files) enabled by the default kernel config-
+uration. It is worth noting that LLVM’s optimizations aggressively
+inline functions and significantly opt-out most allocations—there
+were 156,065 functions and 413,546 static stack allocations before
+the optimizations. UniSan is accurate in detecting unsafe stack allo-
+cations: only 8.4% and 9.5% stack allocations are detected as unsafe
+for x86_64 and AArch64, respectively. Since dynamic allocation is
+common for a heap object, UniSan’s detection rate is higher for heap
+allocations—13.2% for x86_64 and 14.9% for AArch64. UniSan
+performs byte-level detection, so we also report the total number
+of statically allocated bytes and the detected unsafe bytes. These
+statistic results show that UniSan can filter out most safe allocations
+to avoid unnecessary initializations.
+To understand how initialization analysis and reachability analysis
+individually help in filtering out safe allocations, we further counted
+the number of unsafe allocations when we disable one of them.
+Specifically, in x86_64, if we disable the initialization analysis, there
+are 3,380 unsafe stack allocations. If we disable the reachability
+analysis (i.e., assuming all function calls as sinks), there are 14,094
+unsafe stack allocations. In AArch64, the numbers are 2,961 and
+11,209, respectively.
+6.2 Effectiveness of Preventing Leaks
+Preventing known leaks. Conservative policies (§4.1.6) have
+been enforced to eliminate potential false negatives of UniSan. To
+confirm that UniSan does not miss uninitialized data leaks in prac-
+tice, we selected 43 recent kernel uninitialized data leaks reported
+after 2013. All these leaks have been assigned with CVE identifiers.
+Arch
+Module Function
+x86_64
+AArch64
+2,152
+2,030
+92,954
+93,067
+Dyn.
+Static
+Static
+Dyn. Unsafe Unsafe
+Alloca Alloca Malloc Malloc Alloca Malloc
+17,854
+386
+451
+15,596
+1,768
+1,790
+1,493
+1,485
+1,161
+1,233
+24
+32
+Static
+Bytes
+3,588,095
+11,525,808
+Unsafe
+Bytes
+863,455
+3,351,181
+Table 1: Detection accuracy of UniSan, measured by how many allocations are detected as unsafe. Alloca represents stack allocations, while Malloc represents
+different heap allocations. Please note that only the code (about 10% of the whole kernel code) enabled by the default kernel configuration is included.
+Leak Cause UniSan
+Bytes
+<4096
+< 28
+4
+2
+2
+4
+CVE
+Mem.
+Sink
+CVE-2015-5697
+CVE-2015-7884
+CVE-2015-7885
+CVE-2014-1444
+CVE-2014-1445
+CVE-2014-1446
+CVE-2014-1690
+CVE-2014-1739
+CVE-2013-4515
+CVE-2013-3235
+CVE-2013-3234
+CVE-2013-3233
+CVE-2013-3232
+CVE-2013-3230
+CVE-2013-3223
+CVE-2013-2636
+CVE-2013-2636
+CVE-2013-2636
+CVE-2013-2636
+CVE-2013-2635
+CVE-2013-2634
+CVE-2013-2634
+CVE-2013-2634
+CVE-2013-2634
+CVE-2013-2634
+CVE-2013-2634
+CVE-2013-2547
+CVE-2013-2547
+CVE-2013-2237
+CVE-2013-2234
+CVE-2013-2148
+CVE-2013-2141
+CVE-2012-6549
+CVE-2012-6548
+CVE-2012-6547
+CVE-2012-6546
+CVE-2012-6545
+CVE-2012-6544
+CVE-2012-6543
+CVE-2012-6541
+CVE-2012-6540
+CVE-2012-6539
+CVE-2012-6537
+heap
+stack
+stack
+stack
+stack
+stack
+stack
+stack
+stack
+stack
+stack
+stack

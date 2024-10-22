@@ -1,0 +1,167 @@
+在之前的记录基础上，再插入一批记录。      
+```      
+postgres=# insert into a select id, id*2 from generate_series(1,100000) t(id);      
+INSERT 0 100000      
+```      
+这部分数据id, c1字段的相关性为1。(局部相关性)      
+```      
+postgres=# select ctid from a offset 1000000 limit 1;      
+    ctid          
+------------      
+ (1113,877)      
+(1 row)      
+postgres=# select corr(c1,id) from (select row_number() over(order by c1) c1, row_number() over(order by id) id from a where ctid >'(1113,877)') t;      
+ corr       
+------      
+    1      
+(1 row)      
+```      
+全局相关性一下也提升了不少      
+```      
+postgres=# select corr(c1,id) from (select row_number() over(order by c1) c1, row_number() over(order by id) id from a) t;      
+       corr              
+-------------------      
+ 0.182542794451908      
+(1 row)      
+```      
+### 局部按需改命法  
+数据散落存储，带来的问题：即使访问少量数据，也会造成大量的IO读取，原理如下：  
+[《索引顺序扫描引发的堆扫描IO放大背后的统计学原理与解决办法》](../201404/20140426_01.md)    
+数据存储是上天注定的（写入时就决定了），但是我们可以按需改命，例如有个业务是运营商的通话流水，查询需求通常是按某个手机号码查询一个月的流水。而实际上数据是产生时即时写入数据库的，所以存放散乱。查询时耗费大量IO。  
+例子  
+用户通话数据即时写入，用户数据呈现布朗分布。  
+```  
+create table phone_list(phone_from char(11), phone_to char(11), crt_time timestamp, duration interval);  
+create index idx_phone_list on phone_list(phone_from, crt_time);  
+insert into phone_list   
+select   
+  lpad((random()*1000)::int8::text, 11, '1'),   
+  lpad((random()*1000)::int8::text, 11, '1'),   
+  now()+(id||' second')::interval,  
+  ((random()*1000)::int||' second')::interval  
+from generate_series(1,10000000) t(id);  
+postgres=# select * from phone_list limit 10;  
+ phone_from  |  phone_to   |          crt_time          | duration   
+-------------+-------------+----------------------------+----------  
+ 14588832692 | 11739044013 | 2017-08-11 10:17:04.752157 | 00:03:25  
+ 15612918106 | 11808103578 | 2017-08-11 10:17:05.752157 | 00:11:33  
+ 14215811756 | 15983559210 | 2017-08-11 10:17:06.752157 | 00:08:05  
+ 13735246090 | 15398474974 | 2017-08-11 10:17:07.752157 | 00:13:18  
+ 19445131039 | 17771201972 | 2017-08-11 10:17:08.752157 | 00:00:10  
+ 11636458384 | 16356298444 | 2017-08-11 10:17:09.752157 | 00:06:30  
+ 15771059012 | 14717265381 | 2017-08-11 10:17:10.752157 | 00:13:45  
+ 19361008150 | 14468133189 | 2017-08-11 10:17:11.752157 | 00:05:58  
+ 13424293799 | 16589177297 | 2017-08-11 10:17:12.752157 | 00:16:29  
+ 12243665890 | 13538149386 | 2017-08-11 10:17:13.752157 | 00:16:03  
+(10 rows)  
+```  
+查询效率低下，按手机查询通话记录，返回29937条记录需要26毫秒。  
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from phone_list where phone_from='11111111111' order by crt_time;  
+                                                                   QUERY PLAN                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------  
+ Index Scan using idx_phone_list on public.phone_list  (cost=0.56..31443.03 rows=36667 width=48) (actual time=0.016..24.348 rows=29937 loops=1)  
+   Output: phone_from, phone_to, crt_time, duration  
+   Index Cond: (phone_list.phone_from = '11111111111'::bpchar)  
+   Buffers: shared hit=25843  
+ Planning time: 0.082 ms  
+ Execution time: 25.821 ms  
+(6 rows)  
+```  
+改命方法，局部按需调整。  
+需求是高效的按手机和月查询通话详单，所以我们需要将用户一个月的数据（通常是按月分区）进行重排即可。  
+分区表用法见：[《PostgreSQL 10.0 preview 功能增强 - 内置分区表》](../201612/20161215_01.md)    
+```  
+postgres=# cluster phone_list using idx_phone_list ;  
+```  
+查询效率骤然提升，改命成功。  
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from phone_list where phone_from='11111111111' order by crt_time;  
+                                                                  QUERY PLAN                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------  
+ Index Scan using idx_phone_list on public.phone_list  (cost=0.56..31443.03 rows=36667 width=48) (actual time=0.012..4.590 rows=29937 loops=1)  
+   Output: phone_from, phone_to, crt_time, duration  
+   Index Cond: (phone_list.phone_from = '11111111111'::bpchar)  
+   Buffers: shared hit=432  
+ Planning time: 0.038 ms  
+ Execution time: 5.968 ms  
+(6 rows)  
+```  
+你就是上帝之手，数据的命运掌握在你的手中。  
+### 如何提升每一列的过滤性 - 存储编排      
+为了获得最好的过滤性（每个列都能很好的过滤），采用全局排序满足不了需求。      
+实际上需要局部排序，例如前面的例子，前面100万行，按C1排序，后面10万行再按ID排序。      
+这样的话有10万记录的ID的过滤性很好，有110万记录的C1的过滤性也很好。      
+但是数都是有命理的，就好像人的姓名也分为五格。       
+![pic](20170809_02_pic_001.jpg)        
+通过后天的补救，可以改运。道理和数据编排一样，数据重排，可以影响全局过滤性，局部过滤性，是不是很有意思呢？       
+**根据你的查询目标需求，重排数据，一起来改运吧。**      
+### 复合排序 多列相对线性相关性      
+多列如何做到每列都具备良好的聚集性呢？   
+1、最土的方法，多列排序，但是效果其实并不一定好。为了达到更好的效果，需要调整列的顺序，算法如下：   
+我记得以前写过一篇这样的文档：      
+[《一个简单算法可以帮助物联网,金融 用户 节约98%的数据存储成本 (PostgreSQL,Greenplum帮你做到)》](../201604/20160404_01.md)        
+这里讲的实际上也是存储编排的精髓，通过排列组合，计算每两列的线性相关性，根据这个找出最佳的多列排序组合，从而提高整体相关性（提高压缩比）。      
+同样适用于本文提到的提高所有列的过滤性。      
+2、k-means算法，针对多列进行聚集计算，完成最佳的局部分布，这样做就能达到每个列的过滤性都很赞了。    
+[《K-Means 数据聚集算法》](../201508/20150817_01.md)  
+## 精髓      
+1、局部、全局 两列相对相关性。决定了按某列排序后，另一列的离散度。      
+2、编排的目的是，可以尽可能的让更多的列有序的存储，从而可以过滤最多的行。      
+3、全局相关性，决定了按某一列排序时，另一列的离散度。      
+4、局部相关性，决定了在某些记录中，两列的线性相关性。      
+5、按局部相关性编排，可以尽可能的让更多的列有序的存储，从而可以过滤最多的行。但是算法较复杂，需要算出什么样的行在一起，按什么排序存放才能获得最佳过滤性。         
+6、关于多列（或数组）的数据编排，方法1，通过排列组合，计算每两列（元素）的线性相关性，根据这个找出最佳的多列排序组合，从而提高整体相关性（提高压缩比）。      
+7、编排后，与存储（行号）线性相关性差的列，如果选择性较好（DISTINCT VALUE较多）时，并且业务有过滤数据的需求，建议还是需要建索引。      
+8、关于多列（或数组）的数据编排，方法2，通过kmean，算出数据归为哪类，每类聚合存放，从而提高数据的局部聚集性，过滤性。这个方法是最优雅的。      
+9、经过编排，结合PG的BRIN索引，就可以实现任意列的高效过滤。  
+## 给数据改命的案例  
+1、多列改命  
+低级方法，[《一个简单算法可以帮助物联网,金融 用户 节约98%的数据存储成本 (PostgreSQL,Greenplum帮你做到)》](../201604/20160404_01.md)        
+高级方法，[《K-Means 数据聚集算法》](../201508/20150817_01.md)  
+![pic](20170809_02_pic_005.jpg)  
+![pic](20170809_02_pic_006.gif)  
+![pic](20170809_02_pic_007.jpg)  
+高级方法举例  
+```
+-- 写入 1亿 记录
+-- 天命，各列散落，五行紊乱，查询效率低下。 
+postgres=# create table tab(c1 int, c2 int, c3 int, c4 int, c5 int);
+CREATE TABLE
+postgres=# insert into tab select * from (select id,100000000-id,50000000-id, sqrt(id*2), sqrt(id) from generate_series(1,100000000) t(id)) t order by random();
+INSERT 0 100000000
+postgres=# select ctid,* from tab limit 10;
+  ctid  |    c1    |    c2    |    c3     |  c4   |  c5  
+--------+----------+----------+-----------+-------+------
+ (0,1)  | 76120710 | 23879290 | -26120710 | 12339 | 8725
+ (0,2)  | 98295593 |  1704407 | -48295593 | 14021 | 9914
+ (0,3)  | 56133647 | 43866353 |  -6133647 | 10596 | 7492
+ (0,4)  |   787639 | 99212361 |  49212361 |  1255 |  887
+ (0,5)  | 89844299 | 10155701 | -39844299 | 13405 | 9479
+ (0,6)  | 92618459 |  7381541 | -42618459 | 13610 | 9624
+ (0,7)  | 93340303 |  6659697 | -43340303 | 13663 | 9661
+ (0,8)  | 17164665 | 82835335 |  32835335 |  5859 | 4143
+ (0,9)  |  2694394 | 97305606 |  47305606 |  2321 | 1641
+ (0,10) | 41736122 | 58263878 |   8263878 |  9136 | 6460
+(10 rows)
+-- 改命，按K-MEAN聚集调整五行，采用BRIN索引实现任意列高效率过滤。
+-- 让每列在各个方向上保持一致，例如(a,b) (1,100)(2,101), (100,9)(105,15)，如果归为两类，在过滤A字段时选择性很好，过滤B字段时选择性也很好。  
+postgres=# create table tbl1(like tab);
+CREATE TABLE
+-- 由于数据按块存储，BRIN索引最小粒度为块，所以我们的聚类数最多可以为表的块数即可。例如636943个数据块，那么我们可以归类为636943类。
+-- 归为超过636943类就没有意义了，归类为更少是可以的，例如BRIN索引每10个连续的数据块存储一个元信息，那么我们可以选择归为63694类。  
+postgres=# select relpages from pg_class where relname='tab';
+ relpages 
+----------
+    636943
+(1 row)
+postgres=# insert into tbl1 select c1,c2,c3,c4,c5 from (select kmeans(array[c1,c2,c3,c4,c5],63694) over() km, * from tab) t order by km;
+-- 创建任意列BRIN索引
+create index idx_tab_1 on tab using brin(c1,c2,c3) with (pages_per_range=1);
+create index idx_tbl1_1 on tbl1 using brin(c1,c2,c3) with (pages_per_range=1);
+```
+使用BRIN索引，在给数据改命后，任意列范围搜索，提升高效，赞   
+```
+postgres=# explain (analyze,verbose,timing,costs,buffers) select * from tab where c1 between 1 and 100000;
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------

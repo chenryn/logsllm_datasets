@@ -1,0 +1,157 @@
+Please:
+  * Check for duplicate requests.
+  * Describe your goal, and if possible provide a code snippet with a motivating example.
+This grew oddly specific, but really I just want to make a generalized
+function benchmark, we give it data and functions and a maximum timeout, it
+gives us the grid of results = function(data) and elapsed times, and stops the
+functions if they run longer than the maximum timeout. Could be cool if we
+could jit-compile that sort of "outer loop" since longer function runtimes
+would seem worse for users and the environment and faster benchmarks could
+also yield better feedback on performance tuning both Jax and stuff written
+with Jax.
+Inspired by #8477 with @jakevdp \- Here's how it might look. 1st benchmark is
+python. 2nd benchmark w/ jit doesn't work now but i wish i could figure out
+how to make it work)
+How could we make it easier to compile benchmarks like these and work with
+elapsed time / function timeouts inside jax.jit?
+    "goal: play with compiled benchmarks for compiled functions in jax"
+    from functools import partial
+    from itertools import product
+    from typing import Callable, List, Tuple
+    from time import perf_counter
+    from func_timeout import func_timeout
+    from pydantic import BaseSettings
+    import pandas as pd
+    import jax
+    jnp = jax.numpy
+    jit = jax.jit
+    # config
+    class Environment(BaseSettings):
+        n_x: List[int] = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        min_weight: float = -1.0
+        max_weight: float = 1.0
+        n_trials: int = 10
+        timeout_seconds: int = 30
+        seed: int = 42
+    env = Environment()
+    # types
+    PRNGKey = jax._src.random.PRNGKey
+    Array = jnp.ndarray
+    # functions - 'benchmark'
+    def benchmark_no_jit(
+        x: Array,
+        functions: List[Callable],
+        timeout_seconds: int = env.timeout_seconds,
+        min_weight: float = env.min_weight,
+        max_weight: float = env.max_weight,
+    ) -> Tuple[Array, Array]:
+        n_x = x.shape[0]
+        n_functions = len(functions)
+        outputs = jnp.empty((n_functions + 1, n_x)).at[-1, :].set(1.0)
+        timings = jnp.empty(n_functions)
+        for i, fun in enumerate(functions):
+            try:
+                # Without JIT, we can use func_timeout to set timeouts
+                # and measure runtime with time.perf_counter
+                start = perf_counter()
+                y = func_timeout(timeout_seconds, fun, args=(x,))
+                elapsed = perf_counter() - start
+                y = y if isinstance(y, Array) and y.shape[0] == n_x else 0
+            except Exception as e:
+                print(e)
+                y, elapsed = 0, timeout
+            outputs = outputs.at[i, :].set(y)
+            timings = timings.at[i].set(elapsed)
+        outputs = jnp.nan_to_num(
+            jnp.clip(outputs, a_min=min_weight, a_max=max_weight)
+        ).transpose()
+        return outputs, timings
+    # something like this...
+    @partial(jit, static_argnums=(0,1))
+    def _benchmark_with_jit(
+        n_x: int,
+        n_functions: int,
+        x: Array,
+        functions: List[Callable],
+        timeout_seconds: int = env.timeout_seconds,
+        min_weight: float = env.min_weight,
+        max_weight: float = env.max_weight,
+    ) -> Tuple[Array, Array]:
+        outputs = jnp.empty((n_functions + 1, n_x)).at[-1, :].set(1.0)
+        timings = jnp.empty(n_functions)
+        for i, fun in enumerate(functions):
+            try:
+                with jax.profiler.trace() as trace:
+                    # 1: set function timeouts / time limits (otherwise, search time is infinite)
+                    y = trace.timeout(timeout_seconds, fun, args=(x,))
+                    # 2: measure how long functions take to run (to find faster functions)
+                    elapsed = trace.elapsed()
+                    y = y if isinstance(y, Array) and y.shape[0] == n_x else 0
+            except Exception as _:
+                y, elapsed = 0, timeout
+            outputs = outputs.at[i, :].set(y)
+            timings = timings.at[i].set(elapsed)
+        outputs = jnp.nan_to_num(
+            jnp.clip(outputs, a_min=min_weight, a_max=max_weight)
+        ).transpose()
+        return outputs, timings
+    def f1(x: Array) -> Array:
+        return x ** 2 - 1
+    def f2(x: Array) -> Array:
+        return x / 2
+    def f3(x: Array) -> Array:
+        return x ** 3 * jnp.sin(x)
+    functions = [jit(f) for f in (f1, f2, f3)]
+    # because we can
+    def benchmark_benchmark(
+        benchmark: Callable = benchmark_no_jit,
+        words: str = "Python + func_timeout + time.perf_counter",
+        functions: List[Callable] = functions,
+        N_x: List[int] = env.n_x,
+        seed: int = env.seed,
+    ) -> float:
+        n_functions = len(functions)
+        begin = perf_counter()
+        rng = PRNGKey(seed)
+        df = []  # i admit to sucking at pandas
+        for i, n_x in product(range(env.n_trials), N_x):
+            rng, key = jax.random.split(rng)
+            x = jax.random.normal(key, (n_x,))
+            if isinstance(benchmark, dict):
+                print("n_x", n_x)
+                benchmark = benchmark[n_x]
+                print("benchmark", benchmark)
+                print("x", x)
+            outputs, timings = benchmark(x, functions)
+            # print(timings)
+            # print(outputs.shape)
+            # print(i, n_x, timings)
+            assert outputs.shape == (n_x, n_functions + 1)
+            assert timings.shape == (n_functions,)
+            assert (timings > 0).all()
+            assert (timings = outputs).all()
+            # print(f"All assertions passed.")
+            df.append(
+                {
+                    "n_x": n_x,
+                    "i": i,
+                    **{f"f{i+1} elapsed": t for i, t in enumerate(timings)},
+                }
+            )
+        df = pd.DataFrame(df).set_index(["n_x", "i"])
+        elapsed = perf_counter() - begin
+        print(df)
+        print(f"{words} took {elapsed:.2f} seconds")
+        return elapsed
+    def test_jax_benchmarks():
+        elapsed_no_jit = benchmark_benchmark()
+        elapsed_with_jit = benchmark_benchmark(
+            benchmark={
+                n: partial(_benchmark_with_jit, n_x=n, n_functions=len(functions))
+                for n in env.n_x
+            },
+            words="XLA (jax.jit) + jax.profiler.trace",
+        )
+        print("done!")
+    if __name__ == "__main__":
+        test_jax_benchmarks()

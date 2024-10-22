@@ -1,0 +1,293 @@
+        inet->uc_ttl    = -1;
+        inet->mc_loop    = 1;
+        inet->mc_ttl    = 1;
+        inet->mc_all    = 1;
+        inet->mc_index    = 0;
+        inet->mc_list    = NULL;
+        inet->rcv_tos    = 0;
+        ...
+    out:
+        return err;
+    out_rcu_unlock:
+        rcu_read_unlock();
+        goto out;
+    }
+###  1.1.2.1 sk_alloc
+    struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
+                  struct proto *prot, int kern)
+    {
+        struct sock *sk;
+        // 如果协议族存在slab则使用kmem_cache_alloc(slab, priority & ~__GFP_ZERO); 分配内存(不使用内核通用的slab, 可预防内存攻击)
+        // 如果协议族slab为空, 使用kmalloc分配内存
+        sk = sk_prot_alloc(prot, priority | __GFP_ZERO, family);
+        if (sk) {
+            // 指定sock协议族
+            sk->sk_family = family;
+            /*
+             * See comment in struct sock definition to understand
+             * why we need sk_prot_creator -acme
+             */
+            sk->sk_prot = sk->sk_prot_creator = prot;
+            sk->sk_kern_sock = kern;
+            sock_lock_init(sk);
+            sk->sk_net_refcnt = kern ? 0 : 1;
+            if (likely(sk->sk_net_refcnt)) {
+                get_net(net);
+                sock_inuse_add(net, 1);
+            }
+            // 将sock与net相互绑定
+            sock_net_set(sk, net);
+            refcount_set(&sk->sk_wmem_alloc, 1);
+            ...
+        }
+        return sk;
+    }
+###  1.2 sock_map_fd
+    static int sock_map_fd(struct socket *sock, int flags)
+    {
+        struct file *newfile;
+        // 获得空闲fd
+        int fd = get_unused_fd_flags(flags);
+        if (unlikely(fd file = file;
+        file->private_data = sock;
+        */
+        newfile = sock_alloc_file(sock, flags, NULL);
+        if (!IS_ERR(newfile)) {
+            // fd与file相互绑定
+            fd_install(fd, newfile);
+            return fd;
+        }
+        put_unused_fd(fd);
+        return PTR_ERR(newfile);
+    }
+## 2\. send(运输层)
+    int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
+             struct sockaddr __user *addr,  int addr_len)
+    {
+        struct socket *sock;
+        struct sockaddr_storage address;
+        int err;
+        struct msghdr msg;
+        struct iovec iov;
+        int fput_needed;
+        // 将待传输数据地址(判断该地址是否为用户态地址)和长度填充进入iov结构体, 
+        // 使用uaccess_kernel()判断当前系统调用可访问空间是否为全部空间(KERNEL_DS), 
+        // 由此决定使用 msg.msg_iter->kvec/msg.msg_iter->iov保存用户数据信息
+        // 详细见2.1
+        err = import_single_range(WRITE, buff, len, &iov, &msg.msg_iter);
+        if (unlikely(err))
+            return err;
+        // 通过fd获得struct fd, struct fd间接引用file, 然后通过file->private_data获得socket
+        // 详细见2.2
+        sock = sockfd_lookup_light(fd, &err, &fput_needed);
+        if (!sock)
+            goto out;
+        msg.msg_name = NULL;
+        msg.msg_control = NULL;
+        msg.msg_controllen = 0;
+        msg.msg_namelen = 0;
+        if (addr) {
+            // 使用copy_from_user将用户空间存储的目标地址复制到内核,
+            // 期间会判断目标地址长度是否大于 sizeof(struct sockaddr_storage)
+            err = move_addr_to_kernel(addr, addr_len, &address);
+            if (err file->f_flags & O_NONBLOCK)
+            flags |= MSG_DONTWAIT;
+        msg.msg_flags = flags;
+        err = sock_sendmsg(sock, &msg);
+    out_put:
+        fput_light(sock->file, fput_needed);
+    out:
+        return err;
+    }
+###  2.1 import_single_range
+    int import_single_range(int rw, void __user *buf, size_t len,
+             struct iovec *iov, struct iov_iter *i)
+    {
+        if (len > MAX_RW_COUNT)
+            len = MAX_RW_COUNT;
+        // 检查 buf:buf+len 是否指向用户区域
+        if (unlikely(!access_ok(buf, len)))
+            return -EFAULT;
+        // 记录用户数据地址与长度
+        iov->iov_base = buf;
+        iov->iov_len = len;
+        // i->count = count; 将数据长度记录进入msg.msg_iter->count
+        iov_iter_init(i, rw, iov, 1, len);
+        return 0;
+    }
+> iov_iter_init
+    void iov_iter_init(struct iov_iter *i, unsigned int direction,
+                const struct iovec *iov, unsigned long nr_segs,
+                size_t count)
+    {
+        // 不能存在读写之外的标志位
+        WARN_ON(direction & ~(READ | WRITE));
+        // 忽略传入标志位, 直接赋予READ | WRITE
+        direction &= READ | WRITE;
+        // uaccess_kernel()判断当前系统调用可访问空间是否为全部空间(KERNEL_DS),
+        // 由此决定使用ITER_KVEC / ITER_IOVEC
+        // msg.msg_iter->kvec/iov为union类型
+        if (uaccess_kernel()) {
+            i->type = ITER_KVEC | direction;
+            i->kvec = (struct kvec *)iov;
+        } else {
+            i->type = ITER_IOVEC | direction;
+            i->iov = iov;
+        }
+        i->nr_segs = nr_segs;
+        i->iov_offset = 0;
+        i->count = count;
+    }
+###  2.2 sockfd_lookup_light
+    static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
+    {
+        // 通过fd获得struct fd
+        struct fd f = fdget(fd);
+        struct socket *sock;
+        *err = -EBADF;
+        // 查看struct fd是否与file绑定
+        if (f.file) {
+            /*    判断file文件操作结构体成员是否与socket文件操作结构体相同, 
+                相同则说明struct fd内绑定的确实是socket文件, 
+                返回file->private_data即socket
+                if (file->f_op == &socket_file_ops)
+                    return file->private_data;
+            */
+            sock = sock_from_file(f.file, err);
+            if (likely(sock)) {
+                // 表示可解除对该文件描述符的引用
+                *fput_needed = f.flags & FDPUT_FPUT;
+                return sock;
+            }
+            fdput(f);
+        }
+        return NULL;
+    }
+###  2.3 sock_sendmsg
+> sock_sendmsg -> sock_sendmsg_nosec -> inet_sendmsg -> udp_sendmsg (层层封装)
+    int sock_sendmsg(struct socket *sock, struct msghdr *msg)
+    {
+        // LSM hook
+        int err = security_socket_sendmsg(sock, msg,
+                          msg_data_left(msg));
+        return err ?: sock_sendmsg_nosec(sock, msg);
+    }
+  * (假设family=AF_INET, protocol=UDP)调用sock->ops->sendmsg, 调用协议族自带的sendmsg功能函数(inet_sendmsg)
+    // msg_data_left(msg) 获得用户数据大小(msg.msg_iter->count)
+    static inline int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg)
+    {
+        int ret = INDIRECT_CALL_INET(sock->ops->sendmsg, inet6_sendmsg,
+                         inet_sendmsg, sock, msg,
+                         msg_data_left(msg));
+        BUG_ON(ret == -EIOCBQUEUED);
+        return ret;
+    }
+  * 根据socket获得sock, 由protocol决定调用功能函数(udp_sendmsg)
+    int inet_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+    {
+        struct sock *sk = sock->sk;
+        // 如果没有绑定端口, 这里自动绑定端口
+        if (unlikely(inet_send_prepare(sk)))
+            return -EAGAIN;
+        return INDIRECT_CALL_2(sk->sk_prot->sendmsg, tcp_sendmsg, udp_sendmsg,
+                       sk, msg, size);
+    }
+  * 栈回溯
+    gef➤  bt
+    #0  udp_sendmsg (sk=0xffff888005c7d680, msg=0xffffc900001b7e10, len=0x800) at net/ipv4/udp.c:969
+    #1  0xffffffff819f4135 in inet_sendmsg (sock=, msg=0xffffc900001b7e10, size=0x800) at net/ipv4/af_inet.c:807
+    #2  0xffffffff8190ba9e in sock_sendmsg_nosec (msg=, sock=) at ./include/linux/uio.h:235
+    #3  sock_sendmsg (sock=0xffff888006817a80, msg=0xffffc900001b7e10) at net/socket.c:657
+    #4  0xffffffff8190de13 in __sys_sendto (fd=, buff=, len=, flags=0x0, addr=0x7ffde0c0cf10, addr_len=0x10) at net/socket.c:1952
+###  2.4 udp_sendmsg
+  * 前置知识 
+    * 宏定义展开 
+      * DECLARE_SOCKADDR 
+                        // struct sockaddr_in * sin= ({__sockaddr_check_size(sizeof(*sin)); (struct sockaddr_in *) msg->msg_name;})
+            DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
+      * IS_UDPLITE: 传统的 UDP 通信对整个报文进行校验, UDP-LITE 通信则可以设置校验的长度, 适用于可以接受轻微的报文内容出错的应用场景 
+                        // int err, is_udplite = (sk) (sk->sk_protocol == IPPROTO_UDPLITE)
+            int err, is_udplite = IS_UDPLITE(sk);
+  * 根据socket获得inet_sock, udp_sock
+    struct inet_sock *inet = inet_sk(sk);
+    struct udp_sock *up = udp_sk(sk);
+  * udp_sock的corkflag标志或msg中的MSG_MORE标志存在则开启软木塞机制
+    int corkreq = up->corkflag || msg->msg_flags&MSG_MORE;
+  * udp 不能处理带外数据请求
+    if (msg->msg_flags & MSG_OOB) /* Mirror BSD error message compatibility */
+        return -EOPNOTSUPP;
+  * 尝试追加数据(由udp_sock->pending决定), 进入do_append_data, 阻塞追加
+    if (up->pending) {
+            /*
+             * There are pending frames.
+             * The socket lock must be held while it's corked.
+             */
+            lock_sock(sk);
+            if (likely(up->pending)) {
+                if (unlikely(up->pending != AF_INET)) {
+                    release_sock(sk);
+                    return -EINVAL;
+                }
+                goto do_append_data;
+            }
+            release_sock(sk);
+        }
+  * ulen 表示udp报文大小(带udphdr)
+    ulen += sizeof(struct udphdr);
+  * usin包含目标ip, 端口, 协议族信息. 在udp协议中, usin应使用AF_INET或AF_UNSPEC(支持同时返回IPv4&IPv6 信息). 同时如果当前状态为TCP_ESTABLISHED, 表示udp连接已经被建立(connected), usin可为空, 接下来需要继承上次通信对应的ip与端口信息.
+    if (usin) {
+        // 如果udp_send 存在目标位置, 则检查协议族, 
+        if (msg->msg_namelen sin_family != AF_INET) {
+            if (usin->sin_family != AF_UNSPEC)
+                return -EAFNOSUPPORT;
+        }
+        // 填充目标ip与端口信息(端口必须存在)
+        daddr = usin->sin_addr.s_addr;
+        dport = usin->sin_port;
+        if (dport == 0)
+            return -EINVAL;
+    } else {
+        // TCP_ESTABLISHED表示udp连接已经被建立, 所以可以不需要目标位置信息
+        if (sk->sk_state != TCP_ESTABLISHED)
+            return -EDESTADDRREQ;
+        daddr = inet->inet_daddr;
+        dport = inet->inet_dport;
+        /* Open fast path for connected socket.
+            Route will not be used, if at least one option is set.
+            */
+        connected = 1;
+    }
+  * 处理udp协议控制信息
+    // ipc用来记录控制信息
+    ipcm_init_sk(&ipc, inet);
+    // udp分片长度
+    ipc.gso_size = up->gso_size;
+    // 开始解析控制信息, 填充至ipc, 详细见2.4.1
+    if (msg->msg_controllen) {
+        err = udp_cmsg_send(sk, msg, &ipc.gso_size);
+        // cmsg->cmsg_level中存在SOL_UDP(need_ip = true), 进入ip_cmsg_send, 详细见4.1
+        if (err > 0)
+            err = ip_cmsg_send(sk, msg, &ipc,
+                        sk->sk_family == AF_INET6);
+        if (unlikely(err < 0)) {
+            kfree(ipc.opt);
+            return err;
+        }
+        if (ipc.opt)
+            free = 1;
+        connected = 0;
+    }
+  * 为ipc.opt 填充ip 选项信息(如果cmsg中存在ip选项信息, 则提前填充, 掠过此处). 即如果用户没有自定义ip 选项信息, 则使用inet默认的ip 选项信息
+    // ip 选项描述结构体
+    /** struct ip_options - IP Options
+     *
+     * @faddr - Saved first hop address
+     * @nexthop - Saved nexthop address in LSRR and SSRR
+     * @is_strictroute - Strict source route
+     * @srr_is_hit - Packet destination addr was our one
+     * @is_changed - IP checksum more not valid
+     * @rr_needaddr - Need to record addr of outgoing dev
+     * @ts_needtime - Need to record timestamp
+     * @ts_needaddr - Need to record addr of outgoing dev
+     */
+    struct ip_options {

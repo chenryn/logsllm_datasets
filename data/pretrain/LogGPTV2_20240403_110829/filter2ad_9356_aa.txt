@@ -1,0 +1,208 @@
+本文详细介绍了关于seccomp的相关概念，包括seccomp的发展历史、Seccomp
+BPF的实现原理已经与seccomp相关的一些工具等。此外，通过实例验证了如何使用seccomp bpf 来保护Docker的安全。
+# 简介
+seccomp（全称securecomputing mode）是linux
+kernel支持的一种安全机制。在Linux系统里，大量的系统调用（systemcall）直接暴露给用户态程序。但是，并不是所有的系统调用都被需要，而且不安全的代码滥用系统调用会对系统造成安全威胁。通过seccomp，我们限制程序使用某些系统调用，这样可以减少系统的暴露面，同时是程序进入一种“安全”的状态。
+## Seccomp 的发展历史
+2005年，Linux
+2.6.12中的引入了第一个版本的seccomp，通过向`/proc/PID/seccomp`接口中写入“1”来启用过滤器，最初只有一个模式：严格模式（strict
+mode），该模式下只允许被限制的进程使用4种系统调用： _read()_ , _write()_ , __exit()_ , 和
+_sigreturn()_
+，需要注意的是，`open()`系统调用也是被禁止的，这就意味着在进入严格模式之前必须先打开文件。一旦为程序施加了严格模式的seccomp，对于其他的所有系统调用的调用，都会触发`SIGKILL`并立即终止进程。
+2007年，Linux 2.6.23 内核使用`prctl（）`操作代替了`/proc/PID/seccomp`接口来施加seccomp，通过`Prctl
+(PR_SET_SECCOMP,arg)`修改调用者的seccomp模式；`prctl(PR_GET_SECCOMP)`用来获取seccomp的状态，返回值为0时代表进程没有被施加seccomp，但是如果进程配置了seccomp，则会由于不能调用`prctl(）`导致进程中止，那就没有其他返回值了？？
+2012年，Linux 3.5引入了”seccomp mode 2“，为seccomp带来了一种新的模式：过滤模式（ filter mode ），
+该模式使用 Berkeley 包过滤器 (BPF) 程序过滤任意系统调用及其参数,使用该模式，进程可以使用 `prctl (PR_SET_SECCOMP,
+SECCOMP_MODE_FILTER, ...)`来指定允许哪些系统调用。 现在已经有许多应用使用 seccomp 过滤器来对系统调用进行控制，包括
+Chrome/Chromium 浏览器、OpenSSH、vsftpd 和 Firefox OS 。
+2013年，Linux 3.8版本，在`/proc/PID/status`中添加了一个Seccomp字段， 可以通过读取该文件获取对应进程的 seccomp
+模式的状态（0 表示禁用，1 表示严格，2 表示过滤）。
+    /* Valid values for seccomp.mode and prctl(PR_SET_SECCOMP, ) */
+    #define SECCOMP_MODE_DISABLED   0 /* seccomp is not in use. */
+    #define SECCOMP_MODE_STRICT 1 /* uses hard-coded filter. */
+    #define SECCOMP_MODE_FILTER 2 /* uses user-supplied filter. */
+    null@ubuntu:~/seccomp$ cat /proc/1/status | grep Seccomp
+    Seccomp:        0
+2014年，Linux 3.17 引入了`seccomp()`系统调用，`seccomp()`在`prctl()`的基础上提供了现有功能的超集，
+增加了将进程中的所有线程同步到同一组过滤器的能力，这有助于确保即使在施加seccomp过滤器之前创建的线程仍然有效。
+## Seccomp + BPF
+seccomp 过滤模式允许开发人员编写 BPF
+程序来确定是否允许给定的系统调用，基于系统调用号和参数（寄存器）值进行过滤。当使用`seccomp()`或`prctl()`对进程施加seccomp
+时，需要提前将编写好的BPF程序安装到内核，之后每次系统调用都会经过该过滤器。而且此过程是不可逆的， 因为安装过滤器实际上是声明任何后续执行的代码都不可信。
+BPF在1992年的tcpdump程序中首次提出，tcpdump是一个网络数据包的监控工具，
+但是由于数据包的数量很大，而且将内核空间捕获到的数据包传输到用户空间会带来很多不必要的性能损耗，所以要对数据包进行过滤，只保留感兴趣的那一部分，而在内核中过滤感兴趣的数据包比在用户空间中进行过滤更有效。BPF
+就是提供了一种进行内核过滤的方法，因此用户空间只需要处理经过内核过滤的后感兴趣的数据包 。
+BPF定义了一个可以在内核内实现的虚拟机(VM)。该虚拟机有以下特性：
+>   * 简单指令集
+>     * 小型指令集
+>     * 所有的指令大小相同
+>     * 实现过程简单、快速
+>   * 只有分支向前指令
+>     * 程序是有向无环图(DAGs)，没有循环
+>   * 易于验证程序的有效性/安全性
+>     * 简单的指令集⇒可以验证操作码和参数
+>     * 可以检测死代码
+>     * 程序必须以 Return 结束
+>     * BPF过滤器程序仅限于4096条指令
+>
+BPF 程序在Linux内核中主要在`filter.h`和`bpf_common.h`中实现，主要的数据结构包括以下几个：
+Linux v5.18.4/include/uapi/linux/filte.h ->
+[sock_fprog](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/filter.h#L24)
+    struct sock_fprog { /* Required for SO_ATTACH_FILTER. */
+        unsigned short      len;    /* BPF指令的数量 */
+        struct sock_filter __user *filter;  /*指向BPF数组的指针 */
+    };
+这个结构体记录了过滤规则个数与规则数组起始位置 , 而 filter 域指向了具体的规则，每一条规则的形式如下：
+Linux v5.18.4/include/uapi/linux/filte.h ->
+[sock_filter](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/filter.h#L24)
+    struct sock_filter {    /* Filter block */
+        __u16   code;   /* Actual filter code */
+        __u8    jt; /* Jump true */
+        __u8    jf; /* Jump false */
+        __u32   k;      /* Generic multiuse field */
+    };
+该规则有四个参数，code：过滤指令；jt:条件真跳转；jf：条件假跳转；k：操作数
+BPF的指令集比较简单，主要有以下几个指令：
+>   * 加载指令
+>   * 存储指令
+>   * 跳转指令
+>   * 算术逻辑指令
+>     * 包括：ADD、SUB、 MUL、 DIV、 MOD、 NEG、OR、 AND、XOR、 LSH、 RSH
+>   * Return 指令
+>   * 条件跳转指令
+>     * 有两个跳转目标，jt为真，jf为假
+>     * jmp 目标是指令偏移量，最大 255
+>
+如何编写BPF程序呢？BPF指令可以手工编写，但是，开发人员定义了符号常量和两个方便的宏`BPF_STMT`和`BPF_JUMP`可以用来方便的编写BPF规则。
+Linux v5.18.4/include/uapi/linux/filte.h ->
+[BPF_STMT&BPF_JUMP](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/filter.h#L45)
+    /*
+     * Macros for filter block array initializers.
+     */
+    #ifndef BPF_STMT
+    #define BPF_STMT(code, k) { (unsigned short)(code), 0, 0, k }
+    #endif
+    #ifndef BPF_JUMP
+    #define BPF_JUMP(code, k, jt, jf) { (unsigned short)(code), jt, jf, k }
+    #endif
+  * **BPF_STMT**
+`BPF_STMT`有两个参数，操作码(code)和值(k)，举个例子：
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,(offsetof(struct seccomp_data, arch)))
+这里的操作码是由三个指令相或组成的，`BPF_LD`: 建一个 BPF 加载操作 ；`BPF_W`:操作数大小是一个字，`BPF_ABS`:
+使用绝对偏移，即使用指令中的值作为数据区的偏移量,该值是体系结构字段与数据区域的偏移量 。`offsetof()`生成数据区域中期望字段的偏移量。
+该指令的功能是将体系架构数加载到累加器中。
+  * **BPF_JUMP**
+`BPF_JUMP` 中有四个参数：操作码、值(k)、为真跳转(jt)和为假跳转(jf)，举个例子：
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K ,AUDIT_ARCH_X86_64 , 1, 0)
+`BPF_JMP | BPF
+JEQ`会创建一个相等跳转指令，它将指令中的值（即第二个参数AUDIT_ARCH_X86_64）与累加器中的值（BPF_K）进行比较。判断是否相等，也就是说，如果架构是
+x86-64，则跳过下一条指令（jt=1，代表测试为真跳过一条指令），否则将执行下一条指令（jf=0，代表如果测试为假，则跳过0条指令，也就是继续执行下一条指令）。
+上面这两条指令常用作系统架构的验证。
+再举个实际例子，该示例用作过滤execve系统调用的过滤规则：
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD+BPF_W+BPF_ABS,0),           //将帧的偏移0处，取4个字节数据，也就是系统调用号的值载入累加器
+        BPF_JUMP(BPF_JMP+BPF_JEQ,59,0,1),           //当A == 59时，顺序执行下一条规则，否则跳过下一条规则，这里的59就是x64的execve系统调用号
+        BPF_STMT(BPF_RET+BPF_K,SECCOMP_RET_KILL),   //返回KILL
+        BPF_STMT(BPF_RET+BPF_K,SECCOMP_RET_ALLOW),  //返回ALLOW
+    };
+在[bpf_common.h](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/bpf_common.h#L7)中给出了`BPF_STMT`和`BPF_JUMP`相关的操作码:
+    /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+    #ifndef _UAPI__LINUX_BPF_COMMON_H__
+    #define _UAPI__LINUX_BPF_COMMON_H__
+    /* Instruction classes */                     
+    #define BPF_CLASS(code) ((code) & 0x07)    //指定操作的类别
+    #define     BPF_LD      0x00               //将值复制到累加器中
+    #define     BPF_LDX     0x01               //将值加载到索引寄存器中
+    #define     BPF_ST      0x02               //将累加器中的值存到暂存器
+    #define     BPF_STX     0x03               //将索引寄存器的值存储在暂存器中
+    #define     BPF_ALU     0x04               //用索引寄存器或常数作为操作数在累加器上执行算数或逻辑运算
+    #define     BPF_JMP     0x05               //跳转
+    #define     BPF_RET     0x06               //返回
+    #define     BPF_MISC        0x07           // 其他类别
+    /* ld/ldx fields */
+    #define BPF_SIZE(code)  ((code) & 0x18)
+    #define     BPF_W       0x00 /* 32-bit */       //字
+    #define     BPF_H       0x08 /* 16-bit */       //半字
+    #define     BPF_B       0x10 /*  8-bit */       //字节
+    /* eBPF     BPF_DW      0x18    64-bit */       //双字
+    #define BPF_MODE(code)  ((code) & 0xe0)
+    #define     BPF_IMM     0x00                  //常数  
+    #define     BPF_ABS     0x20                  //固定偏移量的数据包数据(绝对偏移)
+    #define     BPF_IND     0x40                  //可变偏移量的数据包数据(相对偏移)
+    #define     BPF_MEM     0x60                  //暂存器中的一个字
+    #define     BPF_LEN     0x80                  //数据包长度
+    #define     BPF_MSH     0xa0
+    /* alu/jmp fields */
+    #define BPF_OP(code)    ((code) & 0xf0)       //当操作码类型为ALU时，指定具体运算符    
+    #define     BPF_ADD     0x00         
+    #define     BPF_SUB     0x10
+    #define     BPF_MUL     0x20
+    #define     BPF_DIV     0x30
+    #define     BPF_OR      0x40
+    #define     BPF_AND     0x50
+    #define     BPF_LSH     0x60
+    #define     BPF_RSH     0x70
+    #define     BPF_NEG     0x80
+    #define     BPF_MOD     0x90
+    #define     BPF_XOR     0xa0
+                                                   //当操作码是jmp时指定跳转类型
+    #define     BPF_JA      0x00
+    #define     BPF_JEQ     0x10
+    #define     BPF_JGT     0x20
+    #define     BPF_JGE     0x30
+    #define     BPF_JSET        0x40
+    #define BPF_SRC(code)   ((code) & 0x08)
+    #define     BPF_K       0x00                    //常数
+    #define     BPF_X       0x08                    //索引寄存器
+    #ifndef BPF_MAXINSNS
+    #define BPF_MAXINSNS 4096
+    #endif
+    #endif /* _UAPI__LINUX_BPF_COMMON_H__ */
+与seccomp相关的定义大多数在`seccomp.h`中定义。
+一旦为程序配置了seccomp-BPF，每个系统调用都会经过seccomp过滤器，这在一定程度上会影响系统的性能。此外，Seccomp过滤器会向内核返回一个值，指示是否允许该系统调用，该返回值是一个
+32 位的数值，其中最重要的 16 位（SECCOMP_RET_ACTION掩码）指定内核应该采取的操作，其他位（SECCOMP_RET_DATA
+掩码）用于返回与操作关联的数据 。
+    /*
+     * All BPF programs must return a 32-bit value.
+     * The bottom 16-bits are for optional return data.
+     * The upper 16-bits are ordered from least permissive values to most,
+     * as a signed value (so 0x8000000 is negative).
+     *
+     * The ordering ensures that a min_t() over composed return values always
+     * selects the least permissive choice.
+     */
+    #define SECCOMP_RET_KILL_PROCESS 0x80000000U /* kill the process */
+    #define SECCOMP_RET_KILL_THREAD  0x00000000U /* kill the thread */
+    #define SECCOMP_RET_KILL     SECCOMP_RET_KILL_THREAD
+    #define SECCOMP_RET_TRAP     0x00030000U /* disallow and force a SIGSYS */
+    #define SECCOMP_RET_ERRNO    0x00050000U /* returns an errno */
+    #define SECCOMP_RET_USER_NOTIF   0x7fc00000U /* notifies userspace */
+    #define SECCOMP_RET_TRACE    0x7ff00000U /* pass to a tracer or disallow */
+    #define SECCOMP_RET_LOG      0x7ffc0000U /* allow after logging */
+    #define SECCOMP_RET_ALLOW    0x7fff0000U /* allow */
+    /* Masks for the return value sections. */
+    #define SECCOMP_RET_ACTION_FULL 0xffff0000U
+    #define SECCOMP_RET_ACTION  0x7fff0000U
+    #define SECCOMP_RET_DATA    0x0000ffffU
+  * SECCOMP_RET_ALLOW：允许执行
+  * SECCOMP_RET_KILL：立即终止执行
+  * SECCOMP_RET_ERRNO：从系统调用中返回一个错误（系统调用不执行）
+  * SECCOMP_RET_TRACE：尝试通知ptrace()， 使之有机会获得控制权 
+  * SECCOMP_RET_TRAP：通知内核发送SIGSYS信号（系统调用不执行）
+每一个seccomp-BPF程序都使用[seccomp_data](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/seccomp.h#L63)结构作为输入参数：
+[/](https://elixir.bootlin.com/linux/latest/source)[include](https://elixir.bootlin.com/linux/latest/source/include)/[uapi](https://elixir.bootlin.com/linux/latest/source/include/uapi)/[linux](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux)/[seccomp.h](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/seccomp.h)
+:
+    struct seccomp_data {
+      int nr ;                    /* 系统调用号（依赖于体系架构） */
+      __u32 arch ;                /* 架构（如AUDIT_ARCH_X86_64） */
+      __u64 instruction_pointer ; /* CPU指令指针 */
+      __u64 args [6];             /* 系统调用参数，最多有6个参数 */
+    };
+# 实现
+## Prctl()
+[**prctl**](https://man7.org/linux/man-pages/man2/prctl.2.html)
+函数是为进程制定而设计的，该函数原型如下
+    #include 
+    int prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5);
+其中明确指定哪种种操作在于option选项， option有很多，与seccomp有关的option主要有两个：
+`PR_SET_NO_NEW_PRIVS()`和`PR_SET_SECCOMP()`。

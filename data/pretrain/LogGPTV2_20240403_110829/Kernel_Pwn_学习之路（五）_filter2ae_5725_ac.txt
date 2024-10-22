@@ -1,0 +1,258 @@
+    idtentry debug do_debug has_error_code=0 paranoid=1 shift_ist=IST_INDEX_DB ist_offset=DB_STACK_OFFSET
+    idtentry int3 do_int3 has_error_code=0 create_gap=1
+  * 编译器将生成带有`debug`和`int3`名称的两个例程，并且经过一些准备后，这两个异常处理程序将分别调用`do_debug`和`do_int3`辅助处理程序。第三个参数定义了错误代码是否存在，此处的两个异常都没有错误代码。如上面的堆栈结构所示，如果有异常，处理器会将错误代码压入堆栈。那么我们可以很直观的看出，对于提供错误代码的异常和未提供错误代码的异常，堆栈的外观会有所不同。这就是为什么`idtentry`宏的实现中，在异常未提供错误代码的情况下将会把”伪造”的错误代码放入堆栈： 
+        .if has_error_code == 0
+    pushq    $-1                /* ORIG_RAX: no syscall to restart */
+    .endif
+但这不仅仅是一个”伪造”的错误代码，`-1`还会代表无效的系统调用号，因此这不会触发系统调用的重新启动逻辑。
+  * 接下来的第一个可选参数 – `shift_ist`参数将表征异常处理程序是否使用了`IST`栈。系统中的每个内核线程都有自己的堆栈。除了这些堆栈外，还有一些专用堆栈与系统中的每个处理器相关联，异常栈就是这类专用堆栈之一。[x86_64](https://en.wikipedia.org/wiki/X86-64)架构提供了一个新机制，它被称为`Interrupt Stack Table`(`IST`机制)。此机制允许在发生指定事件时(例如`double fault`之类的原子异常等)切换到新堆栈。`shift_ist`参数就用来标识是否需要使用`IST`机制为异常处理程序创建一个新的堆栈。
+  * 第二个可选参数 – `paranoid`定义了一种方法，可以帮助我们知道服务程序的调用是来自用户空间还是来自异常处理程序。确定这一点的最简单方法是通过在`CS`段寄存器中的`CPL`(`Current Privilege Level`)。如果等于`3`，则来自用户空间，如果为零，则来自内核空间。 
+           .if paranoid == 1
+         testb    $3, CS-ORIG_RAX(%rsp)        /* If coming from userspace, switch stacks */
+         jnz    .Lfrom_usermode_switch_stack_@
+       .endif
+但是不幸的是，这种方法不能提供100％的保证。如内核文档中所述：
+> 如果我们处于 NMI/MCE/DEBUG 以及其他任何 super-atomic
+> 入口上下文中，那么在正常入口将CS写入堆栈之后，执行SWAPGS之前可能已经触发异常，那么检查GS的唯一安全方法是一种速度较慢的方法：RDMSR。
+换言之，例如`NMI`(不可屏蔽中断)发生在[swapgs](http://www.felixcloutier.com/x86/SWAPGS.html)指令的内部。这样的话，我们应该检查`MSR_GS_BASE`的值，该寄存器存储指向每个cpu区域开始的指针。因此，要检查我们是否来自用户空间，我们应该检查`MSR_GS_BASE`，如果它是负数，则我们来自内核空间，否则我们来自用户空间：
+          movl $MSR_GS_BASE,%ecx
+      rdmsr
+      testl %edx,%edx
+      js 1f
+在前两行代码中，我们将`MSR_GS_BASE`的值按`edx:eax`成对读取，我们不能为用户空间中的`gs`寄存器设置负值。但是从另一方面说，我们知道物理内存的直接映射是从`0xffff880000000000`虚拟地址开始的。这样，`MSR_GS_BASE`将包含从`0xffff880000000000`到的地址`0xffffc7ffffffffff`。而后`rdmsr`指令将被执行，`%edx`寄存器中可能的最小值将会是`0xffff8800`也就是`-30720`(`unsigned
+4 bytes`)。这就是`gs`指向`per-cpu`区域开始的内核空间包含负值的原因。
+  * 在为通用寄存器分配空间之后，我们进行一些检查以了解异常是否来自用户空间，如果是，则应移回中断的进程堆栈或保留在异常堆栈上：
+    .if paranoid
+        .if paranoid == 1
+            testb    $3, CS(%rsp)
+            jnz    1f
+        .endif
+        call    paranoid_entry
+    .else
+        call    error_entry
+    .endif
+让我们考虑一下所有这些情况。
+###  当用户空间中发生异常时
+可以看到，当用户空间中发生异常时，内核会执行如下处理逻辑：
+    .if paranoid == 1
+        testb    $3, CS-ORIG_RAX(%rsp)        /* If coming from userspace, switch stacks */
+        jnz    .Lfrom_usermode_switch_stack_@
+    .endif
+    .if paranoid == 1
+        /*
+         * Entry from userspace.  Switch stacks and treat it
+         * as a normal entry.  This means that paranoid handlers
+         * run in real process context if user_mode(regs).
+         */
+    .Lfrom_usermode_switch_stack_@:
+        idtentry_part do_sym, has_error_code, read_cr2, paranoid=0
+    .endif
+也就是核心是执行`idtentry_part do_sym, has_error_code, read_cr2, paranoid=0`
+那么关于`idtentry_part`在`/source/arch/x86/entry/entry_64.S#L868`处实现
+    /*
+     * Exception entry points.
+     */
+    #define CPU_TSS_IST(x) PER_CPU_VAR(cpu_tss_rw) + (TSS_ist + (x) * 8)
+    .macro idtentry_part do_sym, has_error_code:req, read_cr2:req, paranoid:req, shift_ist=-1, ist_offset=0
+        .if paranoid
+            call    paranoid_entry
+        /* returned flag: ebx=0: need swapgs on exit, ebx=1: don't need it */
+        .else
+            call    error_entry
+        .endif
+        UNWIND_HINT_REGS
+        .if read_cr2
+        /*
+         * Store CR2 early so subsequent faults cannot clobber it. Use R12 as
+         * intermediate storage as RDX can be clobbered in enter_from_user_mode().
+         * GET_CR2_INTO can clobber RAX.
+         */
+        GET_CR2_INTO(%r12);
+        .endif
+        .if shift_ist != -1
+        TRACE_IRQS_OFF_DEBUG            /* reload IDT in case of recursion */
+        .else
+        TRACE_IRQS_OFF
+        .endif
+        .if paranoid == 0
+        testb    $3, CS(%rsp)
+        jz    .Lfrom_kernel_no_context_tracking_@
+        CALL_enter_from_user_mode
+    .Lfrom_kernel_no_context_tracking_@:
+        .endif
+        movq    %rsp, %rdi            /* pt_regs pointer */
+        .if has_error_code
+        movq    ORIG_RAX(%rsp), %rsi        /* get error code */
+        movq    $-1, ORIG_RAX(%rsp)        /* no syscall to restart */
+        .else
+        xorl    %esi, %esi            /* no error code */
+        .endif
+        .if shift_ist != -1
+        subq    $ist_offset, CPU_TSS_IST(shift_ist)
+        .endif
+        .if read_cr2
+        movq    %r12, %rdx            /* Move CR2 into 3rd argument */
+        .endif
+        call    do_sym
+        .if shift_ist != -1
+        addq    $ist_offset, CPU_TSS_IST(shift_ist)
+        .endif
+        .if paranoid
+        /* this procedure expect "no swapgs" flag in ebx */
+        jmp    paranoid_exit
+        .else
+        jmp    error_exit
+        .endif
+    .endm
+####  error_entry处理分析
+假设我们此时进入了`error_entry`的处理逻辑，它在`/source/arch/x86/entry/entry_64.S#L1287`处实现：
+    /*
+     * Save all registers in pt_regs, and switch GS if needed.
+     */
+    SYM_CODE_START_LOCAL(error_entry)
+        UNWIND_HINT_FUNC
+        cld
+        PUSH_AND_CLEAR_REGS save_ret=1
+        ENCODE_FRAME_POINTER 8
+        testb    $3, CS+8(%rsp)
+        jz    .Lerror_kernelspace
+        /*
+         * We entered from user mode or we're pretending to have entered
+         * from user mode due to an IRET fault.
+         */
+        SWAPGS
+        FENCE_SWAPGS_USER_ENTRY
+        /* We have user CR3.  Change to kernel CR3. */
+        SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+    .Lerror_entry_from_usermode_after_swapgs:
+        /* Put us onto the real thread stack. */
+        popq    %r12                /* save return addr in %12 */
+        movq    %rsp, %rdi            /* arg0 = pt_regs pointer */
+        call    sync_regs
+        movq    %rax, %rsp            /* switch stack */
+        ENCODE_FRAME_POINTER
+        pushq    %r12
+        ret
+    .Lerror_entry_done_lfence:
+        FENCE_SWAPGS_KERNEL_ENTRY
+    .Lerror_entry_done:
+        ret
+        /*
+         * There are two places in the kernel that can potentially fault with
+         * usergs. Handle them here.  B stepping K8s sometimes report a
+         * truncated RIP for IRET exceptions returning to compat mode. Check
+         * for these here too.
+         */
+    .Lerror_kernelspace:
+        leaq    native_irq_return_iret(%rip), %rcx
+        cmpq    %rcx, RIP+8(%rsp)
+        je    .Lerror_bad_iret
+        movl    %ecx, %eax            /* zero extend */
+        cmpq    %rax, RIP+8(%rsp)
+        je    .Lbstep_iret
+        cmpq    $.Lgs_change, RIP+8(%rsp)
+        jne    .Lerror_entry_done_lfence
+        /*
+         * hack: .Lgs_change can fail with user gsbase.  If this happens, fix up
+         * gsbase and proceed.  We'll fix up the exception and land in
+         * .Lgs_change's error handler with kernel gsbase.
+         */
+        SWAPGS
+        FENCE_SWAPGS_USER_ENTRY
+        SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+        jmp .Lerror_entry_done
+    .Lbstep_iret:
+        /* Fix truncated RIP */
+        movq    %rcx, RIP+8(%rsp)
+        /* fall through */
+    .Lerror_bad_iret:
+        /*
+         * We came from an IRET to user mode, so we have user
+         * gsbase and CR3.  Switch to kernel gsbase and CR3:
+         */
+        SWAPGS
+        FENCE_SWAPGS_USER_ENTRY
+        SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+        /*
+         * Pretend that the exception came from user mode: set up pt_regs
+         * as if we faulted immediately after IRET.
+         */
+        mov    %rsp, %rdi
+        call    fixup_bad_iret
+        mov    %rax, %rsp
+        jmp    .Lerror_entry_from_usermode_after_swapgs
+    SYM_CODE_END(error_entry)
+#####  保存现场(储存所有通用寄存器)
+首先内核会把返回地址保存在`R12`寄存器中，随即会调用PUSH_AND_CLEAR_REGS将通用寄存器的值存储在中断栈上：
+首先内核会调用`PUSH_AND_CLEAR_REGS`将通用寄存器的值存储在中断栈上：
+    .macro PUSH_AND_CLEAR_REGS rdx=%rdx rax=%rax save_ret=0
+        /*
+         * Push registers and sanitize registers of values that a
+         * speculation attack might otherwise want to exploit. The
+         * lower registers are likely clobbered well before they
+         * could be put to use in a speculative execution gadget.
+         * Interleave XOR with PUSH for better uop scheduling:
+         */
+        .if save_ret
+        pushq    %rsi        /* pt_regs->si */
+        movq    8(%rsp), %rsi    /* temporarily store the return address in %rsi */
+        movq    %rdi, 8(%rsp)    /* pt_regs->di (overwriting original return address) */
+        .else
+        pushq   %rdi        /* pt_regs->di */
+        pushq   %rsi        /* pt_regs->si */
+        .endif
+        pushq    rdx        /* pt_regs->dx */
+        xorl    %edx, %edx    /* nospec   dx */
+        pushq   %rcx        /* pt_regs->cx */
+        xorl    %ecx, %ecx    /* nospec   cx */
+        pushq   rax        /* pt_regs->ax */
+        pushq   %r8        /* pt_regs->r8 */
+        xorl    %r8d, %r8d    /* nospec   r8 */
+        pushq   %r9        /* pt_regs->r9 */
+        xorl    %r9d, %r9d    /* nospec   r9 */
+        pushq   %r10        /* pt_regs->r10 */
+        xorl    %r10d, %r10d    /* nospec   r10 */
+        pushq   %r11        /* pt_regs->r11 */
+        xorl    %r11d, %r11d    /* nospec   r11*/
+        pushq    %rbx        /* pt_regs->rbx */
+        xorl    %ebx, %ebx    /* nospec   rbx*/
+        pushq    %rbp        /* pt_regs->rbp */
+        xorl    %ebp, %ebp    /* nospec   rbp*/
+        pushq    %r12        /* pt_regs->r12 */
+        xorl    %r12d, %r12d    /* nospec   r12*/
+        pushq    %r13        /* pt_regs->r13 */
+        xorl    %r13d, %r13d    /* nospec   r13*/
+        pushq    %r14        /* pt_regs->r14 */
+        xorl    %r14d, %r14d    /* nospec   r14*/
+        pushq    %r15        /* pt_regs->r15 */
+        xorl    %r15d, %r15d    /* nospec   r15*/
+        UNWIND_HINT_REGS
+        .if save_ret
+        pushq    %rsi        /* return address on top of stack */
+        .endif
+    .endm
+执行后，堆栈将如下所示：
+         +------------+
+    +160 | %SS        |
+    +152 | %RSP       |
+    +144 | %RFLAGS    |
+    +136 | %CS        |
+    +128 | %RIP       |
+    +120 | ERROR CODE |
+         |------------|
+    +112 | %RDI       |
+    +104 | %RSI       |
+     +96 | %RDX       |
+     +88 | %RCX       |
+     +80 | %RAX       |
+     +72 | %R8        |
+     +64 | %R9        |
+     +56 | %R10       |
+     +48 | %R11       |
+     +40 | %RBX       |
+     +32 | %RBP       |
+     +24 | %R12       |
+     +16 | %R13       |
+      +8 | %R14       |
+      +0 | %R15       | 初始化`GS`寄存器
+接下来将执行[SWAPGS](http://www.felixcloutier.com/x86/SWAPGS.html)指令，这将会交换`MSR_KERNEL_GS_BASE`和`MSR_GS_BASE`中的值。从这一刻起，`%gs`寄存器将指向内核结构的基址。

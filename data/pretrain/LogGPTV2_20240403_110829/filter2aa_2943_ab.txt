@@ -1,0 +1,113 @@
+第⼀个问题搞懂了就可以看看第⼆个问题了：整个请求流程是什么样的？
+还是如上例所演示的，当在浏览器中向 127.0.0.1:8080 地址发起根路径为 /new_route 的请求时，会被 Spring 
+Cloud Gateway 转发请求到 https://www.cnpanda.net/ 的根路径下
+⽐如，我们向 127.0.0.1:8080 地址发起为 /new_route/index.php 的请求，那么实际上会被 Spring Cloud 
+Gateway 转发请求到 https://www.cnpanda.net/index.php 的路径下，官⽅在其官⽅⽂档（Spring Cloud 
+GateWay⼯作流程）简单说明了流程：
+看起来⽐较简单，实际上要复杂的多，我做了⼀个更详细⼀点图帮助⼤家理解：
+我们⾸先向浏览器发送 http://127.0.0.1:8080/new_route/index.php  的请求，浏览器接收该请求后交给
+Spring Cloud Gateway，由Spring Cloud Gateway 进⾏内部处理，⾸先是在 Gateway Handler Mapping 模块中
+找到与 /new_route/index.php 请求相匹配的路由，然后将其发送到Gateway Web Handler模块，在这个模块中
+⾸先进⼊globalFilters中，由 globalFilters(NettyWriteResponseFilter、ForwardPathFilter、
+RouteToRequestUrlFilter、LoadBalancerClientFilter、AdaptCachedBodyGlobalFilter、
+WebsocketRoutingFilter、NettyRoutingFilter、ForwardRoutingFilter) 作为构造器参数创建 
+FilteringWebHandler。
+如下图，可以在 NettyRoutingFilter 中看到我们请求的中间态：
+然后，再由 FilteringWebHandler 运⾏特定的请求过滤器链，所有 Pre 过滤器(前过滤器)逻辑先执⾏，然后再向
+Proxied Service 执⾏代理请求，代理请求完成后，再由 Proxied Service 返回到 Gateway Web Handler模块去执
+⾏ post 过滤器(后过滤器)逻辑，最后由NettyWriteResponseFilter 返回响应内容到我们。响应过程可以参考⽹关 
+Spring-Cloud-Gateway 源码解析 —— 过滤器 (4.7) 之 NettyRoutingFilter：
+最终⼀次完整SSRF响应请求就形成了。
+实际上这种的 SSRF 属于Spring Cloud Gateway 本身的功能带来的”副产品“，类似于PHPMyadmin后台的SQL注⼊
+漏洞。
+0x03 CVE-2022-22947 分析
+如果你认真的看完了上⼀节的内容，那么你现在可能会对这个漏洞有了更多的认识。
+漏洞的触发点在于我们熟知的SpEL表达式
+实际上现在不具体分析源码，根据已有payload或者官⽅修复diff，你也应该能够得到⼀个结论：在动态添加路由的
+过程中，某个filter可以对传⼊进来的值进⾏SpEL表达式解析，从⽽造成了远程代码执⾏漏洞
+那么到底是不是如此呢？
+根据这种思路，通过source和sink，然后向上向下连线的⽅式来验证
+先来看看source，即创建路由时的payload：
+可以看到这⾥使⽤的filter是AddResponseHeader，由于我们已经猜测是SPEL表达，因此我们直接搜索SpEL的触
+发点StandardEvaluationContext：
+可以发现，在 ShortcutConfigurable 接⼝的getValue⽅法中，使⽤了StandardEvaluationContext，并且对
+传⼊的 SpEL 表达式进⾏了解析
+那么接着查找 ShortcutConfigurable 接⼝的实现类有哪些：
+{
+  "id": "hacktest",
+  "filters": [{
+    "name": "AddResponseHeader",
+    "args": {
+      "name": "Result",
+      "value": "#{new 
+String(T(org.springframework.util.StreamUtils).copyToByteArray(T(java.lang.Runtime).get
+Runtime().exec(new String[]{\"id\"}).getInputStream()))}"
+    }
+  }],
+  "uri": "http://example.com"
+}
+可以看到有很多，但是我们要找的是与AddResponseHeader过滤器相关的类，AddResponseHeader过滤器的⼯
+⼚类是org.springframework.cloud.gateway.filter.factory#AddResponseHeaderGatewayFilterFactory，因
+此根据模块名我们可以直接确定位置：
+逐⼀查看会发现：
+AddResponseHeaderGatewayFilterFactory  继承于 AbstractNameValueGatewayFilterFactory
+AbstractNameValueGatewayFilterFactory 继承于 AbstractGatewayFilterFactory
+AbstractGatewayFilterFactory 实现了 GatewayFilterFactory 接⼝
+GatewayFilterFactory 接⼝继承于 ShortcutConfigurable
+因此当从 AddResponseHeaderGatewayFilterFactory 传⼊的值进⾏计算（getValue()）的时候，会逐⼀向上调
+⽤对应的⽅法，直到进⼊带有 SpEL 表达式解析器的位置进⾏最后的解析，也从⽽触发了SpEL表达式注⼊漏洞。
+最后我们也可以直接进⼊ AddResponseHeaderGatewayFilterFactory 类回顾看看：
+可以看到，⾸先在apply⽅法中传⼊了NameValueConfig类型的config，点进去可以看到NameValueConfig类型
+有两个值，并且不能为空：
+public class AddResponseHeaderGatewayFilterFactory extends 
+AbstractNameValueGatewayFilterFactory {
+  @Override
+  public GatewayFilter apply(NameValueConfig config) {
+    return new GatewayFilter() {
+      @Override
+      public Mono filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String value = ServerWebExchangeUtils.expand(exchange, config.getValue());
+        exchange.getResponse().getHeaders().add(config.getName(), value);
+        return chain.filter(exchange);
+      }
+      @Override
+      public String toString() {
+        return filterToStringCreator(AddResponseHeaderGatewayFilterFactory.this)
+            .append(config.getName(), config.getValue()).toString();
+      }
+    };
+  }
+}
+可以看到，NameValueConfig 在AbstractNameValueGatewayFilterFactory中，
+AbstractNameValueGatewayFilterFactory是AddResponseHeaderGatewayFilterFactory的⽗类，在⽗类中进⾏
+了getValue()操作，并且可以看到 config 中通过 getValue() 返回的 value 值就是我们所执⾏的SpEL表达式返回的
+结果：
+0x04 漏洞修复
+由于是SpEL表达式注⼊漏洞，⽽引起这个漏洞的原因⼀般是使⽤了 StandardEvaluationContext ⽅法去解析表
+达式，解析表达式的⽅法有两个：
+SimpleEvaluationContext - 针对不需要SpEL语⾔语法的全部范围并且应该受到有意限制的表达式类别，公开
+SpEL语⾔特性和配置选项的⼦集。
+StandardEvaluationContext - 公开全套SpEL语⾔功能和配置选项。您可以使⽤它来指定默认的根对象并配置
+每个可⽤的评估相关策略。
+SimpleEvaluationContext旨在仅⽀持SpEL语⾔语法的⼀个⼦集，不包括 Java类型引⽤、构造函数和bean引⽤。
+⽽StandardEvaluationContext ⽀持全部SpEL语法。所以根据功能描述，将StandardEvaluationContext⽅法⽤ 
+SimpleEvaluationContext ⽅法替换即可。
+官⽅的修复⽅法是利⽤ BeanFactoryResolver 的⽅式去引⽤Bean，然后将其传⼊官⽅⾃⼰写的⼀个解析的⽅法
+GatewayEvaluationContext中：
+此外，官⽅还给了建议：
+如果不需要Gateway actuator的endpoint功能，就关了它吧，如果需要，那么就利⽤ Spring Security 对其进⾏保
+护，具体的保护⽅式可以参考：https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html
+#actuator.endpoints.security
+0x05 写在最后
+这个漏洞的原理还是⽐较清晰的，可惜没能通过陈师傅在星球发的那个SSRF漏洞更深的去分析，尝试挖掘新的漏
+洞，果然，成功是留给有⼼⼈的呀！
+在这⾥提醒⼀下，在实际环境中，如果由于某种原因删除不起作⽤，有可能会导致刷新请求失败，那么就会有可能
+会导致站点出现问题，所以在实际测试的过程中，建议别乱搞，不然就要重启站点了。
+最后，这个漏洞像不像是官⽅提供的⼀种内存⻢？（hhhhhhhh
+⽂笔有限，如果⽂章有错误，欢迎师傅们指正
+0x06 参考
+https://juejin.cn/post/6844903639840980999
+https://blog.csdn.net/qq_38233650/article/details/98038225
+https://github.com/vulhub/vulhub/blob/master/spring/CVE-2022-22947/README.zh-cn.md
+https://github.com/spring-cloud/spring-cloud-gateway/commit/337cef276bfd8c59fb421bfe7377a9e19c68fe
+1e

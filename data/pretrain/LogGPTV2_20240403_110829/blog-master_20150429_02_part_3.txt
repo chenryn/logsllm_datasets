@@ -1,0 +1,225 @@
+Owner       | postgres  
+Table       | tbl  
+Size        | 114 MB  
+Description |   
+```  
+如果产生新TUPLE版本的需求超过FSM的剩余空间，还会继续膨胀下去。  
+这个问题的改进非常简单，将批量更新的粒度降低，即单个事务时间缩短，可以降低事务排他锁持有时间，减少not yet removable的情况，同时事务变小后，单个事务对剩余空间的需求量也变小了，所以不需要扩展数据块。就不会膨胀。  
+例子：  
+```  
+postgres=# create sequence seq cache 10;  
+CREATE SEQUENCE  
+postgres=# vacuum full tbl;  
+VACUUM  
+postgres@db-172-16-3-150-> vi test.sql  
+update tbl set info=info,crt_time=clock_timestamp() where id=mod(nextval('seq'),2000001);  
+```  
+为了提高速度，我这里将nextval改为immutable, 让以上SQL可以走索引扫描（生产环境请勿模仿）。  
+```  
+postgres=# alter function nextval(regclass) immutable;  
+postgres@db-172-16-3-150-> pgbench -M prepared -n -r -f ./test.sql -c 20 -j 10 -T 500000  
+```  
+因为事务很短，所以只能看到少量的not yet removable，  
+同时因为一次更新带来的新版本需要的空间也比较小，所以不会超出FSM中的剩余空间，不需要EXTEND BLOCK。  
+```  
+tuples: 11116 removed, 977673 remain, 591 are dead but not yet removable  
+tuples: 12050 removed, 978437 remain, 979 are dead but not yet removable  
+tuples: 12687 removed, 981375 remain, 227 are dead but not yet removable  
+tuples: 12911 removed, 978912 remain, 831 are dead but not yet removable  
+tuples: 7 removed, 475 remain, 0 are dead but not yet removable  
+tuples: 13133 removed, 979761 remain, 522 are dead but not yet removable  
+tuples: 14419 removed, 977651 remain, 1077 are dead but not yet removable  
+tuples: 12111 removed, 978558 remain, 700 are dead but not yet removable  
+```  
+半小时后，并未出现膨胀  
+```  
+postgres=# \dt+ tbl  
+List of relations  
+-[ RECORD 1 ]---------  
+Schema      | public  
+Name        | tbl  
+Type        | table  
+Owner       | postgres  
+Size        | 75 MB  
+Description |   
+postgres=# \di+ tbl_pkey   
+List of relations  
+-[ RECORD 1 ]---------  
+Schema      | public  
+Name        | tbl_pkey  
+Type        | index  
+Owner       | postgres  
+Table       | tbl  
+Size        | 21 MB  
+Description |   
+```  
+2\. autovacuum launcher process 唤醒时间太长会影响垃圾回收。  
+调整autovacuum_naptime = 1000， 1000秒的睡觉时间，看看怎么完蛋的吧。  
+```  
+pg_ctl reload  
+postgres=# vacuum full tbl;  
+VACUUM  
+postgres=# \dt+ tbl  
+List of relations  
+-[ RECORD 1 ]---------  
+Schema      | public  
+Name        | tbl  
+Type        | table  
+Owner       | postgres  
+Size        | 145 MB  
+Description |   
+postgres=# \di+ tbl_pkey   
+List of relations  
+-[ RECORD 1 ]---------  
+Schema      | public  
+Name        | tbl_pkey  
+Type        | index  
+Owner       | postgres  
+Table       | tbl  
+Size        | 43 MB  
+Description |   
+```  
+```  
+postgres@db-172-16-3-150-> pgbench -M prepared -n -r -f ./test.sql -c 1 -j 1 -T 500000  
+```  
+现在不看日志，一段时间之后，你看看pg_stat_all_tables：  
+```  
+postgres@db-172-16-3-150-> psql  
+psql (9.4.1)  
+Type "help" for help.  
+postgres=# \x  
+Expanded display is on.  
+postgres=# select * from pg_stat_all_tables where relname='tbl';  
+-[ RECORD 1 ]-------+------------------------------  
+relid               | 60511  
+schemaname          | public  
+relname             | tbl  
+seq_scan            | 6  
+seq_tup_read        | 12082648  
+idx_scan            | 116  
+idx_tup_fetch       | 49232974  
+n_tup_ins           | 2000000  
+n_tup_upd           | 50732969  
+n_tup_del           | 0  
+n_tup_hot_upd       | 81869  
+n_live_tup          | 2328301  
+n_dead_tup          | 7895450  
+n_mod_since_analyze | 7825343  
+last_vacuum         |   
+last_autovacuum     | 2015-04-29 18:02:45.325102+08  
+last_analyze        |   
+last_autoanalyze    | 2015-04-29 18:02:45.596096+08  
+vacuum_count        | 0  
+autovacuum_count    | 247  
+analyze_count       | 0  
+autoanalyze_count   | 91  
+```  
+表已经膨胀了：  
+```  
+postgres=# \dt+ tbl  
+List of relations  
+-[ RECORD 1 ]---------  
+Schema      | public  
+Name        | tbl  
+Type        | table  
+Owner       | postgres  
+Size        | 393 MB  
+Description |   
+postgres=# \di+ tbl_pkey   
+List of relations  
+-[ RECORD 1 ]---------  
+Schema      | public  
+Name        | tbl_pkey  
+Type        | index  
+Owner       | postgres  
+Table       | tbl  
+Size        | 115 MB  
+Description |   
+```  
+## 小结  
+通过上面的分析，我们应该如何减少或避免PostgreSQL数据膨胀呢？  
+1\. 一定要开启autovacuum。  
+2\. 提高系统的IO能力，越高越好。  
+3\. 调整触发阈值，让触发阈值和记录数匹配。调小autovacuum_vacuum_scale_factor和autovacuum_analyze_scale_factor。比如我想在有1万条垃圾记录后就触发垃圾回收，那么对于一个1000万的表来说，我应该把autovacuum_vacuum_scale_factor调到千分之一即0.001，而autovacuum_analyze_scale_factor应该调到0.0005。（注意也不能太低，否则LONG SQL可能引起无用功，参考 [《PostgreSQL物理"备库"的哪些操作或配置，可能影响"主库"的性能、垃圾回收、IO波动》](../201704/20170410_03.md)  ）      
+4\. 增加autovacuum_max_workers，同时增加autovacuum_work_mem，同时增加系统内存。  
+例如对于有大量表需要频繁更新的数据库集群，可以将autovacuum_max_workers调整为与CPU核数一致，并将autovacuum_work_mem调整为2GB，同时需要确保系统预留的内存大于autovacuum_max_workers*autovacuum_work_mem。  
+5\. 应用程序设计时，尽量避免如下：  
+5\.1  LONG SQL（包括查，增，删，改，DDL所有的SQL），  
+5\.2  或者打开游标后不关闭，  
+5\.3  或者在不必要的场景使用repeatable read或serializable事务隔离级别，  
+5\.4  或者对大的数据库执行pg_dump进行逻辑备份（隐式repeatable read隔离级别的全库备份），  
+5\.5  或者长时间不关闭申请了事务号的事务（增，删，改，DDL的SQL）。  
+6\. 对于IO没有问题的系统，关闭autovacuum_vacuum_cost_delay。  
+7\. 调整autovacuum_naptime参数到最低(但是也要慎重，比如有长事务导致某些垃圾无法回收时，会不断的唤醒VACUUM WORKER去扫描垃圾页，然后发现无法回收，循环往复，浪费IO和CPU。比如本地有LONG SQL或者STANDBY开启了feedback并有LONG SQL时，都是问题。参考  [《PostgreSQL物理"备库"的哪些操作或配置，可能影响"主库"的性能、垃圾回收、IO波动》](../201704/20170410_03.md)  )，如果还是唤醒时间太长，可以调整代码中的限制，例如改为1毫秒：  
+```  
+#define MIN_AUTOVAC_SLEEPTIME 1.0               /* milliseconds */  
+```  
+8\. 应用程序设计时，避免使用大批量的更新，删除操作，可以切分为多个事务进行。  
+9\. 使用大的数据块，对于现代的硬件水平，32KB是比较好的选择，fillfactor实际上不需要太关注，100就可以了，调低它其实没有必要，因为数据库总是有垃圾，也就是说每个块在被更新后实际上都不可能是满的。  
+10\. 万一真的膨胀了，可以通过table rewrite来回收(如vacuum full, cluster)，但是需要迟排他锁。建议使用pg_reorg或者pg_repack来回收，实际上用到了交换 filenode可以缩短需要持有排他锁的时间。  
+## 参考  
+1\. src/backend/postmaster/autovacuum.c  
+2\. src/backend/storage/ipc/sinvaladt.c  
+```  
+/*  
+ * BackendIdGetTransactionIds  
+ *              Get the xid and xmin of the backend. The result may be out of date  
+ *              arbitrarily quickly, so the caller must be careful about how this  
+ *              information is used.  
+ */  
+void  
+BackendIdGetTransactionIds(int backendID, TransactionId *xid, TransactionId *xmin)  
+{  
+        SISeg      *segP = shmInvalBuffer;  
+        *xid = InvalidTransactionId;  
+        *xmin = InvalidTransactionId;  
+        /* Need to lock out additions/removals of backends */  
+        LWLockAcquire(SInvalWriteLock, LW_SHARED);  
+        if (backendID > 0 && backendID lastBackend)  
+        {  
+                ProcState  *stateP = &segP->procState[backendID - 1];  
+                PGPROC     *proc = stateP->proc;  
+                if (proc != NULL)  
+                {  
+                        PGXACT     *xact = &ProcGlobal->allPgXact[proc->pgprocno];  
+                        *xid = xact->xid;  
+                        *xmin = xact->xmin;  
+                }  
+        }  
+        LWLockRelease(SInvalWriteLock);  
+}  
+/* ----------  
+ * pgstat_read_current_status() -  
+ *  
+ *      Copy the current contents of the PgBackendStatus array to local memory,  
+ *      if not already done in this transaction.  
+ * ----------  
+ */  
+static void  
+pgstat_read_current_status(void)  
+{  
+......  
+                /* Only valid entries get included into the local array */  
+                if (localentry->backendStatus.st_procpid > 0)  
+                {  
+                        BackendIdGetTransactionIds(i,  
+                                                                           &localentry->backend_xid,  
+                                                                           &localentry->backend_xmin);  
+                        localentry++;  
+                        localappname += NAMEDATALEN;  
+                        localactivity += pgstat_track_activity_query_size;  
+                        localNumBackends++;  
+                }  
+......  
+```  
+## 注意事项
+[《PostgreSQL物理"备库"的哪些操作或配置，可能影响"主库"的性能、垃圾回收、IO波动》](../201704/20170410_03.md)   
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

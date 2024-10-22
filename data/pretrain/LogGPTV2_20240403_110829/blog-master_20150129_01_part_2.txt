@@ -1,0 +1,165 @@
+  57 | 5967428    
+  91 | 7405759    
+ 120 | 7764840    
+(5 rows)    
+```    
+压测    
+搬砖性能从4000提升到了将近9万。    
+![pic](20150129_01_pic_003.jpg)    
+```    
+vi test.sql    
+select * from exchange_t(1, 0.1);    
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 64 -j 64 -T 30    
+transaction type: ./test.sql    
+scaling factor: 1    
+query mode: prepared    
+number of clients: 64    
+number of threads: 64    
+duration: 30 s    
+number of transactions actually processed: 2677383    
+latency average = 0.714 ms    
+latency stddev = 2.607 ms    
+tps = 89200.726564 (including connections establishing)    
+tps = 89417.041119 (excluding connections establishing)    
+script statistics:    
+ - statement latencies in milliseconds:    
+         0.717  select * from exchange_t(1, 0.1);    
+```    
+## 场景2    
+除了这个搬砖场景，还有一些其他场景也能使用类似方法，感谢万能的PostgreSQL。    
+比如有一个场景初始化了一批账号ID，初始ID=0，每次有用户来注册时，将ID=0的记录修改为此次注册的用户ID，相当于消耗一条ID=0的记录。    
+使用采样的方法可以优化这个场景，不过别急着套用，因为数据采样是在过滤条件之前发生的，所以当所有数据范围都是我们的目标数据是没问题的，但是如果你把目标数据和非目标数据混到一起，这种采样的方法就可能导致冗余扫描，如果采样比例低，甚至找不到目标数据。因此前面的搬砖场景，我们每次都把数据搬走，剩余的所有数据依旧是目标数据，所以不存在问题。    
+那么了解了以上原理之后，第二个场景，我们也采样转移法，即申请ID的时候，将数据转移走，而不仅仅是UPDATE ID=NEWID的做法。    
+例子    
+```    
+初始表    
+create table tbl1(pk serial8 primary key, id int, info text, crt_time timestamp, mod_time timestamp);    
+转移表    
+create table tbl2(like tbl1);    
+初始数据1000万    
+insert into tbl1 (id, info, crt_time) select 0, 'test', now() from generate_series(1,10000000);    
+```    
+函数    
+```    
+create or replace function exchange_t(i_limit int8, sample_ratio real, i_id int, i_mod_time timestamp) returns setof tbl2 as $$    
+declare    
+  -- 总共搬几块砖    
+  res_cnt int8 := i_limit;    
+  -- 抢到的砖块ID    
+  pk_arr int8[];    
+  -- 这次搬了几块(极少情况, 可能有一些被别抢去了)    
+  tmp_cnt int8;    
+  -- 最多循环次数    
+  max_cnt int := 16;    
+begin    
+  loop    
+    -- 无耻的搬砖优化，通过PostgreSQL采样接口，随机取砖头    
+    select array_agg(pk) into pk_arr from (select pk from tbl1 TABLESAMPLE SYSTEM (sample_ratio) limit res_cnt) t ;    
+    -- 或者 select array_agg(pk) into pk_arr from (select pk from tbl1 TABLESAMPLE BERNOULLI (sample_ratio) limit res_cnt) t ;    
+    if found then    
+      -- 搬砖，并返回已搬走的砖头ID    
+      return query with tmp as (delete from tbl1 where pk = any (pk_arr) returning pk,info,crt_time) insert into tbl2(pk,id,info,crt_time,mod_time) select pk,i_id,info,crt_time,i_mod_time from tmp returning *;    
+      -- 这次搬了几块砖，还需要搬几块    
+      GET DIAGNOSTICS tmp_cnt = ROW_COUNT;    
+      -- raise notice 'tmp_cnt: %', tmp_cnt;    
+      res_cnt := res_cnt - tmp_cnt;    
+      -- raise notice 'res_cnt: %', res_cnt;    
+    end if;    
+    -- 如果搬完，返回    
+    if (res_cnt <= 0) then    
+      return;    
+    end if;    
+    -- 防止无限循环    
+    max_cnt := max_cnt - 1;    
+    if (max_cnt <=0 ) then    
+      return;    
+    end if;    
+  end loop;    
+end;    
+$$ language plpgsql strict;    
+```    
+测试    
+```    
+postgres=# select exchange_t(1,0.1,10,now());    
+                                exchange_t                                     
+---------------------------------------------------------------------------    
+ (360129,10,test,"2017-03-03 16:48:58.86919","2017-03-03 16:51:13.969138")    
+(1 row)    
+Time: 0.724 ms    
+postgres=# select count(*) from tbl1;    
+  count      
+---------    
+ 9999997    
+(1 row)    
+Time: 859.980 ms    
+postgres=# select count(*) from tbl2;    
+ count     
+-------    
+     3    
+(1 row)    
+Time: 0.420 ms    
+```    
+压测    
+```    
+vi test.sql    
+\set id random(1,10000000)    
+select * from exchange_t(1::int8, 0.1::real, :id, now()::timestamp);    
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 64 -j 64 -T 30    
+transaction type: ./test.sql    
+scaling factor: 1    
+query mode: prepared    
+number of clients: 64    
+number of threads: 64    
+duration: 30 s    
+number of transactions actually processed: 2970824    
+latency average = 0.644 ms    
+latency stddev = 0.348 ms    
+tps = 98599.587185 (including connections establishing)    
+tps = 98791.348808 (excluding connections establishing)    
+script statistics:    
+ - statement latencies in milliseconds:    
+         0.001  \set id random(1,10000000)    
+         0.644  select * from exchange_t(1::int8, 0.1::real, :id, now()::timestamp);    
+```    
+每秒转移9.8万记录，采样法消除冲突后性能惊人。    
+```    
+postgres=# select count(*) from tbl1;    
+  count      
+---------    
+ 7029173    
+(1 row)    
+postgres=# select count(*) from tbl2;    
+  count      
+---------    
+ 2970827    
+(1 row)    
+postgres=# select * from tbl2 limit 10;    
+   pk   |   id    | info |         crt_time          |          mod_time              
+--------+---------+------+---------------------------+----------------------------    
+ 329257 |      10 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:51:01.261172    
+ 107713 |      10 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:51:08.012152    
+ 360129 |      10 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:51:13.969138    
+  61065 | 7513722 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.669893    
+  95337 | 4101700 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.672948    
+ 124441 | 7159045 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.673335    
+  87041 | 1868904 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.671536    
+ 126617 | 4055074 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.673654    
+  10201 | 3790061 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.673959    
+ 191081 | 6663554 | test | 2017-03-03 16:48:58.86919 | 2017-03-03 16:52:44.674014    
+(10 rows)    
+```    
+## 小结     
+1\. 为了解决高并发的数据随机访问、更新、转移等热点与扫描相似悖论的问题，PostgreSQL 采样接口打开一种很"无耻"的优化之门，让小伙伴们可以开足并发，卯足玛丽开搞。  
+为什么一个蛋糕，大家都要从一处抢呢，围成一圈，每人在各自的方向挖一勺不是更好么？就好像小时候长辈较我们夹菜，要夹靠近自己这一边的一样。    
+## 参考  
+https://www.postgresql.org/docs/9.6/static/plpgsql-statements.html  
+https://wiki.postgresql.org/wiki/TABLESAMPLE_Implementation  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

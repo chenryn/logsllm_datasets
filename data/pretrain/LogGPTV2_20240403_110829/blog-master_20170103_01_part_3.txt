@@ -1,0 +1,89 @@
+注意每次被OOM后，重连，并将新的BACKEND PID写入CGROUP的tasks再测试下一轮.   
+1\. 以使用较大的列为例，将1亿个值，聚合为一个数组，由于数组属于变长类型，最长可以放1GB，1亿已经超过1GB了，所以触发了OOM。  
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select array_agg(id::text) from generate_series(1,10000000) t(id);  
+server closed the connection unexpectedly  
+        This probably means the server terminated abnormally  
+        before or while processing the request.  
+The connection to the server was lost. Attempting reset: Failed.  
+!>   
+```  
+2\. 对较大的表排序，并且设置较大的work_mem  
+```  
+postgres=# set work_mem ='101MB';  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select id from generate_series(1,10000000) t(id) order by id;  
+server closed the connection unexpectedly  
+        This probably means the server terminated abnormally  
+        before or while processing the request.  
+The connection to the server was lost. Attempting reset: Failed.  
+!>   
+```  
+使用较小的work_mem不会被OOM，因为使用了临时文件。  
+```  
+postgres=# set work_mem ='10MB';  
+SET  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select id from generate_series(1,10000000) t(id) order by id;  
+                                                                    QUERY PLAN                                                                      
+--------------------------------------------------------------------------------------------------------------------------------------------------  
+ Sort  (cost=59.83..62.33 rows=1000 width=4) (actual time=10291.920..11930.237 rows=10000000 loops=1)  
+   Output: id  
+   Sort Key: t.id  
+   Sort Method: external sort  Disk: 136856kB  
+   Buffers: shared hit=3, temp read=34198 written=34197  
+   ->  Function Scan on pg_catalog.generate_series t  (cost=0.00..10.00 rows=1000 width=4) (actual time=1573.165..3261.392 rows=10000000 loops=1)  
+         Output: id  
+         Function Call: generate_series(1, 10000000)  
+         Buffers: temp read=17091 written=17090  
+ Planning time: 0.232 ms  
+ Execution time: 12654.654 ms  
+(11 rows)  
+```  
+3\. autovacuum worker进程启动后，单个WORKER进程可能需要申请的内存大小为maintenance_work_mem或者vacuum_work_mem。  
+4\. 并行QUERY  
+5\. 带有多个hash join，多个排序操作的复杂QUERY，可能消耗多份WORK_MEM。  
+这种操作不需要很多内存：  
+比如查询了一张很大的表，返回了大批量（比如一亿）记录，即使不使用流式接收，也不需要很多内存。  
+## 审计  
+终于说到审计了，没错，当OOM发生后，我们怎么找到压死骆驼的最后一根稻草，或者是罪魁祸首呢？  
+由于OOM发的是KILL -9的信号，被KILL的进程根本无法通过捕获信号来记录当时正在执行的QUERY或者当时的状态。  
+那么审计就很有用了。  
+有这么几个参数  
+```
+postgres=# set log_statement='all';  // 在SQL请求时就写日志  
+SET  
+postgres=# set log_min_duration_statement ='0';  // 在SQL执行结束才写日志  
+SET  
+postgres=# set log_duration =on;  // 在SQL执行结束才写日志  
+SET  
+```
+显然，如果我们需要在OOM后，还能找到被OOM进程当时执行QUERY的蛛丝马迹，方法1:在请求时就记录下它在执行什么(开启log_statement='all')，方法2:记录detail字段，postmaster进程会收集这部分信息，不管什么方法，超过track_activity_query_size长度的QUERY都被截断。  
+例如开启log_statement='all';后，我们能在日志中看到这样的信息。   
+```
+开启了log_statement='all';后，在客户端发起QUERY请求时的日志。
+2017-01-03 16:22:44.612 CST,"postgres","postgres",85938,"127.0.0.1:27719",586b5f18.14fb2,12,"idle",2017-01-03 16:21:44 CST,2/11,0,LOG,00000,"statement: explain (analyze,verbose,timing,costs,buffers) select array_agg(id::text) from generate_series(1,10000000) t(id);",,,,,,,,"exec_simple_query, postgres.c:935","psql"
+被KILL后，postmaster进程收集到的收到KILL -9信号的backend process正在执行的SQL日志
+2017-01-03 16:22:49.041 CST,,,72682,,586b5a2d.11bea,11,,2017-01-03 16:00:45 CST,,0,LOG,00000,"server process (PID 85938) was terminated by signal 9: Killed","Failed process was running: explain (analyze,verbose,timing,costs,buffers) select array_agg(id::text) from generate_series(1,10000000) t(id);",,,,,,,"LogChildExit, postmaster.c:3502",""
+postmaster开始干掉所有进程，然后会进入恢复模式
+2017-01-03 16:22:49.041 CST,,,72682,,586b5a2d.11bea,12,,2017-01-03 16:00:45 CST,,0,LOG,00000,"terminating any other active server processes",,,,,,,,"HandleChildCrash, postmaster.c:3222",""
+autovacuum launcher进程的日志
+2017-01-03 16:22:49.041 CST,,,83546,,586b5e28.1465a,2,,2017-01-03 16:17:44 CST,1/0,0,WARNING,57P02,"terminating connection because of crash of another server process","The postmaster has commanded this server process to roll back the current transaction and exit, because another server process exited abnormally and possibly corrupted shared memory.","In a moment you should be able to reconnect to the database and repeat your command.",,,,,,"quickdie, postgres.c:2601",""
+尝试连接数据库的进程，提示还在恢复状态
+2017-01-03 16:22:49.044 CST,"postgres","postgres",86571,"127.0.0.1:27747",586b5f59.1522b,2,"",2017-01-03 16:22:49 CST,,0,FATAL,57P03,"the database system is in recovery mode",,,,,,,,"ProcessStartupPacket, postmaster.c:2187",""
+postmaster在干掉所有进程后，数据库重新初始化（构造共享内存区，启动服务端进程（autovacuum, log, writer, ...等）等动作）
+2017-01-03 16:22:49.147 CST,,,72682,,586b5a2d.11bea,13,,2017-01-03 16:00:45 CST,,0,LOG,00000,"all server processes terminated; reinitializing",,,,,,,,"PostmasterStateMachine, postmaster.c:3746",""
+```
+## 参考  
+[《精确度量Linux下进程占用多少内存的方法》](../201606/20160608_01.md)  
+[《一个笛卡尔积的update from语句引发的(内存泄露?)问题》](../201608/20160824_01.md)  
+[《PostgreSQL relcache在长连接应用中的内存霸占"坑"》](../201607/20160709_01.md)  
+[《Linux page allocation failure 的问题处理 - lowmem_reserve_ratio》](../201612/20161221_01.md)  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

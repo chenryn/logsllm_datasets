@@ -1,0 +1,82 @@
+WARN_ON_ONCE()将调试信息输出到dmesg，类似于BUG_ON()打印的内容。
+与BUG_ON()的区别在于WARN_ON_ONCE()仅在第一次触发时打印调试信息，并且继续执行：现在，当内核在VMA缓存查找快速路径中检测到空指针时 -换句话说，当它启发式地检测到use-after-free后 - ，它只是从快速路径中脱离出来，然后又回到了红黑树的路径中。 该过程正常运行。
+这符合内核的策略，即默认情况下尽可能地保持系统运行; 如果由于某种原因在这里触发了use-after-free漏洞，内核可能会启发式地减轻其影响并保持该过程正常工作。
+即使内核发现了内存损坏，也只打印警告的策略对于当内核注意到与安全相关的事件(如内核内存损坏)时应该引起内核恐慌的系统来说是有问题的。简单地使WARN()触发内核恐慌并不是真正的选项，因为WARN()也用于对内核安全性不重要的各种事件。出于这个原因，在与安全相关的地方用CHECK_DATA_CORRUPTION()来替代WARN_ON()的一些功能，它允许在内核配置时在BUG()和WARN()之间切换行为。然而，CHECK_DATA_CORRUPTION()只在链表操作代码和addr_limit_user_check()中使用;例如，VMA缓存中的检查仍然使用经典的WARN_ON_ONCE()。
+对这个函数做了第三个重要的[改变](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm/vmacache.c?id=ddbf369c0a33924f76d092985bd20d9310f43d7f);然而，这种变化是相对较新的，将首先出现在4.19内核中，该内核尚未发布，因此它与攻击当前部署的内核无关。
+    for (i = 0; i vmacache.vmas[i];
+    +               struct vm_area_struct *vma = current->vmacache.vmas[idx];
+    -               if (!vma)
+    -                       continue;
+    -               if (WARN_ON_ONCE(vma->vm_mm != mm))
+    -                       break;
+    -               if (vma->vm_start vm_end > addr) {
+    -                       count_vm_vmacache_event(VMACACHE_FIND_HITS);
+    -                       return vma;
+    +               if (vma) {
+    +#ifdef CONFIG_DEBUG_VM_VMACACHE
+    +                       if (WARN_ON_ONCE(vma->vm_mm != mm))
+    +                               break;
+    +#endif
+    +                       if (vma->vm_start vm_end > addr) {
+    +                               count_vm_vmacache_event(VMACACHE_FIND_HITS);
+    +                               return vma;
+    +                       }
+                   }
+    +               if (++idx == VMACACHE_SIZE)
+    +                       idx = 0;
+           }
+在这次修改之后，将跳过完整性检查，除非内核是用CONFIG_DEBUG_VM_VMACACHE选项构建的。
+# 漏洞利用：增加序列号
+该利用必须增加大约233次序列号。因此，用于增加序列号的原语的效率对整个利用程序的运行来说非常重要。
+可能会导致每个系统调用产生两个序列号增量，如下所示:创建一个跨越三个页面的匿名VMA。然后重复使用带有MAP_FIXED的mmap()，用等效的VMA替换中间页面。这导致mmap()首先将VMA分割为三个VMA，然后替换中间的VMA，然后再次合并三个VMA，从而导致在合并VMA时删除的两个VMA的VMA缓存失效。
+# 漏洞利用：替换VMA
+枚举所有能利用use-after-free，而不释放slab的后备页（根据/proc/slabinfo，Ubuntu内核每个vm_area_struct
+slab使用一个页）回到伙伴分配器/页分配器的方法：
+  1. 在同一个进程中重用vm_area_struct。然后进程就可以使用这个VMA，但是这不会产生任何有趣的结果，因为进程的VMA缓存无论如何都可以包含指向VMA的指针。
+  2. 释放vm_area_struct，使其位于slab分配器的空闲列表上，然后尝试访问它。不过，至少Ubuntu使用的SLUB分配器用一个内核地址替换了vm_area_struct的前8个字节(其中包含vm_start，用户空间开始地址)。这使得VMA缓存查找函数不可能返回它，因为条件VMA ->vm_start vm_end > addr无法实现，因此没有发生任何有趣的事情。
+  3. 释放vm_area_struct，使其位于slab分配器的空闲列表上，然后在另一个进程中分配它。这将导致命中WARN_ON_ONCE()(除了一个非常窄的竞争条件，不容易反复触发)，因此VMA缓存查找函数不会返回VMA。
+  4. 释放vm_area_struct，使其位于slab分配器的freelist上，然后从已与vm_area_struct slab合并的slab进行分配。这需要存在aliasing slab; 在Ubuntu 18.04 VM中，似乎不存在这样的slab。
+因此，要利用这个漏洞，有必要将备份页释放回页面分配器，然后以某种方式重新分配页面，以允许在其中放置受控数据。可以使用各种内核接口；例如：  
+管道页：
+  * 优点:在分配上不擦除
+  * 优点:如果splice()可用，则允许在页面内任意偏移位置进行写入
+  * 优点:页面对齐
+  * 缺点:如果不首先释放页面，然后重新分配它，就不能执行多次写操作
+BPF maps:
+  * 优点：可以从用户空间反复读写内容
+  * 优点：页面对齐
+  * 缺点：在分配上擦除
+我们的利用代码将使用BPF maps
+# 漏洞利用：从dmesg泄露指针
+我们的漏洞利用想要获取下面的信息：
+  * mm_struct的地址
+  * use-after-free的VMA地址
+  * 加载内核代码的地址
+至少在Ubuntu
+18.04内核中，前两个在WARN_ON_ONCE()触发的寄存器转储中直接可见，因此可以很容易地从dmesg中提取:mm_struct的地址在RDI中，VMA的地址在RAX中。然而，指令指针并不是直接可见的，因为RIP和堆栈是符号化的，并且没有一个通用寄存器包含指令指针。
+内核回溯可以包含多组寄存器集:当堆栈回溯逻辑遇到中断帧时，它会生成另一个寄存器转储。由于我们可以通过用户空间地址上的页错误触发WARN_ON_ONCE()，并且用户空间上的页错误可以发生在任何用户空间内存访问的系统调用上下文中（通过copy_from_user()/
+copy_to_user()/…），我们可以选择一个具有相关信息的调用点。事实证明，当R8仍然包含指向eventfd_fops结构的指针时，写入eventfd会触发一个usercopy。
+当利用代码运行时，它将VMA替换为零内存，然后对损坏的VMA缓存触发VMA查找，故意触发WARN_ON_ONCE()。这产生了一个警告，看起来如下:
+    [ 3482.271265] WARNING: CPU: 0 PID: 1871 at /build/linux-SlLHxe/linux-4.15.0/mm/vmacache.c:102 vmacache_find+0x9c/0xb0
+    [...]
+    [ 3482.271298] RIP: 0010:vmacache_find+0x9c/0xb0
+    [ 3482.271299] RSP: 0018:ffff9e0bc2263c60 EFLAGS: 00010203
+    [ 3482.271300] RAX: ffff8c7caf1d61a0 RBX: 00007fffffffd000 RCX: 0000000000000002
+    [ 3482.271301] RDX: 0000000000000002 RSI: 00007fffffffd000 RDI: ffff8c7c214c7380
+    [ 3482.271301] RBP: ffff9e0bc2263c60 R08: 0000000000000000 R09: 0000000000000000
+    [ 3482.271302] R10: 0000000000000000 R11: 0000000000000000 R12: ffff8c7c214c7380
+    [ 3482.271303] R13: ffff9e0bc2263d58 R14: ffff8c7c214c7380 R15: 0000000000000014
+    [ 3482.271304] FS: 00007f58c7bf6a80(0000) GS:ffff8c7cbfc00000(0000) knlGS:0000000000000000
+    [ 3482.271305] CS: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [ 3482.271305] CR2: 00007fffffffd000 CR3: 00000000a143c004 CR4: 00000000003606f0
+    [ 3482.271308] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    [ 3482.271309] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+    [ 3482.271309] Call Trace:
+    [ 3482.271314] find_vma+0x1b/0x70
+    [ 3482.271318] __do_page_fault+0x174/0x4d0
+    [ 3482.271320] do_page_fault+0x2e/0xe0
+    [ 3482.271323] do_async_page_fault+0x51/0x80
+    [ 3482.271326] async_page_fault+0x25/0x50
+    [ 3482.271329] RIP: 0010:copy_user_generic_unrolled+0x86/0xc0
+    [ 3482.271330] RSP: 0018:ffff9e0bc2263e08 EFLAGS: 00050202
+    [ 3482.271330] RAX: 00007fffffffd008 RBX: 0000000000000008 RCX: 0000000000000001

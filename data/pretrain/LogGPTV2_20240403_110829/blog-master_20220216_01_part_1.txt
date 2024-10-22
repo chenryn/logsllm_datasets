@@ -1,0 +1,110 @@
+## 一起学PolarDB - 第23期 - 为什么磁盘RT会严重影响vacuum垃圾回收效率?    
+### 作者            
+digoal            
+### 日期            
+2022-02-16          
+### 标签            
+PostgreSQL , PolarDB            
+----            
+## 背景            
+懂PostgreSQL, 学PolarDB不难, 就好像有九阳神功护体, 可以快速融会贯通.            
+对于DBA只要学会PolarDB精髓即可.            
+对于开发者来说不需要学习, 使用PolarDB和PostgreSQL一样.            
+#### 为什么磁盘RT会严重影响vacuum垃圾回收效率?    
+https://www.bilibili.com/video/BV15Z4y1d7ny/   
+声音在空气中的传播速率大约是340m/s, 两个房间里的人讲话感觉不到任何延迟, 你讲一句我马上就能听到并回话. 如果两个人隔了个山头, 你喊一句, 对方可能要隔几秒才能听到.   
+- a: 你吃了吗?  
+- b: 1s后: 吃了  
+- a: 1s后: 吃了啥呀?  
+- b: 1s后: 蛋炒饭  
+- a: 1s后: 蛋炒饭加蛋了吗?  
+- b: 1s后: 你说呢?  
+如果一次说很多内容再等对方一次回应, 马上就能节省很多时间.  
+- a: 你吃了吗? 吃了啥?   
+- b: 1s后: 吃了,蛋炒饭  
+- a: 1s后: 蛋炒饭加蛋了吗?  
+- b: 1s后: 你说呢?  
+对于没有上下文判断的交互, 批量操作带来的效果会更加明显. 例如本文接下来提到的vacuum .     
+磁盘RT其实是个比较大的问题, RT越大, 数据包传输的时延时就越大. 特别是网盘RT比本地盘大很多, 本地的机械盘也比本地SSD的RT大很多.   
+vacuum 过程:    
+- autovacuum launcher监测系统表(由计数器更新)发现表的垃圾条数或比例达到回收垃圾的阈值, 触发垃圾回收,   
+- 扫描数据页从磁盘将其读入shared buffer、或者已经在shared buffer中,   
+    - 除非这个表的每个page都在shared buffer中, 否则从磁盘读入是大概率事件.   
+        - 每次读1个page, 而且还是同步IO, 也就是说信号至少一个来回才读到1个page, 你说慢不慢?  RT越大这个问题越凸显.  特别是云盘  
+- 检查是否有可以被回收的垃圾tuple,   
+- 如有则回收之, 从磁盘读上来或者已经存在shared buffer的clean page可能变成dirty page.   
+- 也有可能之前这个page在shared buffer中就是dirty page.   
+- 最后由bgwriter 调度将dirty page持久化(当然这个部分也可能是checkpoint、backend process干的).   
+    - 把dirty page写入磁盘又与存储RT有关. 但是它不由vacuum进程去操作.    
+    - 同时我们也必须要清楚vacuum可能会读入大量数据到shared buffer, 因此shared buffer刷脏虽然是异步的, 但是刷脏慢就会导致shared buffer的clean page或空闲page不足, 还是要等待刷脏, 所以对vacuum也是有性能影响的.   
+经过以上分析, 磁盘rt大, 给vacuum带来的影响包括:  
+- 1、vacuum 从磁盘读取数据到shared buffer的过程慢, 从而影响vacuum速度.  
+- 2、或者等待刷脏, 影响vacuum速度(社区版本为异步IO, 影响不大. polardb为DIO,影响大).    
+社区版本:             
+目前PG社区版本的内核对RT高带来的vacuum性能问题优化手段较少(除了vm来减少不需要的page scan), 而且单表的vacuum也没有支持并行, 目前的vacuum内核加速包括:    
+- 同一个表如果有多个索引, 那么索引的vacuum可以并行.  这个优化针对的是索引多的表.    
+这也是为什么我建议把经常dml(update,delete,insert, 产生大量垃圾)的表用分区表代替(前提是垃圾回收赶不上产生垃圾的速度了), 因为不同分区做垃圾回收是能并行的.  
+还有什么优化方法呢?   
+操作系统有一项设置, 支持IO的prefetch, 就是说一次IO请求可以读取连续的N个扇区, 如果被多读上来的扇区是后续正好要读的扇区, 那么预度就能大大减少到块设备的IO次数(减少pagefault次数).    
+为了避免随机读也触发预读从而浪费磁盘带宽, linux 内核有个保护机制, 例如连续读n个扇区后才会触发预读.  例如3个扇区.   
+- https://blog.csdn.net/weixin_34138255/article/details/89910895  
+- https://www.hustyx.com/cpp/96  
+- http://tech.hexun.com/2011-03-28/128268656.html  
+- https://www.man7.org/linux/man-pages/man8/blockdev.8.html  
+- https://blog.csdn.net/kunyus/article/details/104620057  
+```
+blockdev --getmaxsect $device  // 块设备每次读请求最大扇区数
+blockdev --setra xx $device   // 设置块设备的预读扇区数, 0 表示关闭预读
+blockdev --getra xx $device  // 获得块设备的预读扇区数设置
+blockdev --getpbsz $device // 获得块设备的物理块(扇区)大小
+blockdev --getsize64 $device  // 获得块设备的空间大小(字节单位)
+blockdev --getsz $device  // 获得块设备的空间大小(扇区单位)
+```
+操作系统blockdev setra预读的弊端:    
+- 仅仅适合顺序IO, 离散IO预读无效果.    
+- 块设备全局的设置, 会影响所有的IO行为.     
+    - 虽然为了避免随机读也触发预读从而浪费磁盘带宽, linux 内核有个保护机制, 例如连续读n个扇区后才会触发预读.  例如3个扇区, 也就是12K, 当数据库block_size >= 16K时必然会触发预读, 导致浪费磁盘带宽(也包括网盘的网络带宽)从而瓶颈变成带宽瓶颈.    
+        - 对于这样的情况建议使用8K的block_size, 否则就如上面所说, 很浪费存储带宽.   
+除此以外, 还可以想想有没有这样的系统接口, 能够支持一次请求多个离散的IO, 同样也能减少RT, 并且避免全局的设置.    
+- writev readv    
+PolarDB:             
+内核层面支持预读功能, 新增函数：polar_bulk_read_buffer_common()   尝试读多个buffers。    
+- polar_bulk_read_size可以调，session级的参数.    
+同时支持结合VM判断不需要vacuum的page ID进行skip, 避免不必要的预读.   
+设置polar_bulk_read_size=512KB(最大预读大小)  优化结果，对于单个vacuum进程：  
+- CPU 使用率 从10%提升到 54%    
+- vacuum处理速度，从 60MB/s 提升到 380 MB/s（RDS_PG是 400 MB/s 左右(本地盘, RT低)） polardb是网盘, RT高于本地盘.    
+PolarDB 预读对什么场景有加速效果?  共同特点: 都是几乎全表顺序扫描的场景、几乎都是访问全表、几乎都是同步IO.    
+- heap scan、  
+- vacuum、  
+- create index    
+扩展知识1:   
+网盘(磁盘)RT高还会对哪些场景的性能影响较大, 问题如何解决?      
+- checkpoint, bgwriter都是后台进程刷脏, 相对用户是异步(不影响用户请求). 但是在写多的场景, 可能刷脏处理不及时, 导致backend申请不到shared buffer, 需要等待刷脏腾出buffer, 那么一样会影响写性能.       
+    - 这种情况建议调高bgwriter刷脏调度频率(一个周期内刷出更多脏页).  怎么判断呢? 从统计信息里判断,backend process是不是在大量主动刷脏, 是的话就要调高bgwriter刷脏速度了.  
+- backend process 申请buffer时遇到没有空闲page或clean page的情况, 需要等待dirty page刷脏.     
+- SQL有未命中buffer的IO请求, 需要等待从磁盘读取数据.     
+- 事务提交慢(需要持久化wal, 相当于同步IO). 需要等待写数据到磁盘.    
+- 数据库崩溃恢复, 需要从wal和datafile中读取对应page进行恢复, 都是同步IO. (polardb采用异步恢复解决这个问题)  
+    - [《一起学PolarDB - 第7期 - 为什么数据库越大崩溃恢复越慢?》](../202112/20211230_04.md)  
+参考:  
+[《一起学PolarDB - 第8期 - 为什么存储RT指标对实例性能影响很大?》](../202201/20220104_01.md)  
+扩展知识2:   
+与网盘RT高类似的, 网络RT高的影响场景和优化方式:    
+- [《PostgreSQL 15 preview - libpq协议新增H消息, 通知DB server flush output buffer in pipeline mode.》](../202106/20210630_03.md)    
+- [《PostgreSQL 14 preview - libpq驱动 支持pipeline 模式, SQL请求支持异步化通信, 大幅度提升性能, 降低RT》](../202103/20210316_03.md)    
+- 优化方式:   
+    - 网络RT高通常采用批量的方式(增加单趟传递的信息量, 避免等待回包的时间)、  
+    - 加大连接并发、  
+    - 或者异步消息(不需要等待回包)来提高处理吞吐量.     
+本期问题1:   
+网络RT高对哪些场景的性能有非常明显的影响?   
+- a. 高并发小事务    
+- b. 计算量或者IO量很大的复杂慢SQL      
+- c. 大量 简单insert 请求   
+- d. 大量 简单select 请求    
+答案:            
+- acd       
+解释:            
+- 参考本文内容       
+本期问题2:   

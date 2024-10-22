@@ -1,0 +1,247 @@
+# 0x00 简介
+原文：[Exploiting a Use-After-Free for code execution in every version of Python
+3](https://pwn.win/2022/05/11/python-buffered-reader.html)
+5月16日腾讯玄武实验室公众号推送了这篇文章，个人学习下来觉得要理解这个漏洞还需要一些知识基础，因此加了一些基础知识的说明，写了本篇保姆级漏洞说明。
+先说一下漏洞危害，虽然该漏洞可以导致命令执行，但需要一个前提，那就是能执行Python代码，所以本漏洞几乎毫无意义，作者也说了，不如直接利用`os.system`，可能在一些受限的沙箱环境才需要利用该漏洞；但是通过其他方式去执行`system('/bin/bash')`是一件很有趣的事，所以有兴趣的来看下吧。
+该漏洞针对的是CPython（C语言编写的Python.exe），需要了解Python对象在C语言中的表示形式，并了解一个特殊的对象`memoryview`，而作者编写Exp是针对Linux的Python3(64位)，所以还需要了解ELF文件结构。
+**导读**
+1~3：基础知识，会的可直接跳过。
+4：原文的内容的解释，漏洞说明以及EXP解释。
+5：另一个漏洞利用思路。
+# 0x01 Python对象
+## 1.1 PyObject
+Python中所有对象都是PyObject的子类，在C中没有类，因此都是结构体，结构体的头部都是PyObject，`_PyObject_HEAD_EXTRA`在release版本中是不存在的。
+另外对于变长的对象，另外定义了一个结构体PyVarObject，多了一个字段ob_size，用于表示该对象包含类型的个数，但是每个类型所占长度则需要看ob_type指向的类对象了。
+    //3.10.4
+    //Include\object.h
+    /* PyObject_HEAD defines the initial segment of every PyObject. */
+    #define PyObject_HEAD                   PyObject ob_base;
+    #define PyObject_VAR_HEAD      PyVarObject ob_base;
+    #define PyObject_HEAD_INIT(type)        \
+        { _PyObject_EXTRA_INIT              \
+        1, type },
+    #define PyVarObject_HEAD_INIT(type, size)       \
+        { PyObject_HEAD_INIT(type) size },
+    typedef struct _object {
+        _PyObject_HEAD_EXTRA//该值release没有
+        Py_ssize_t ob_refcnt;
+        PyTypeObject *ob_type;
+    } PyObject;
+    typedef struct {
+        PyObject ob_base;
+        Py_ssize_t ob_size; /* Number of items in variable part */
+    } PyVarObject;
+## 1.2 PyTypeObject
+Python中类也是一个对象，在C语言中就是以PyTypeObject表示，所以每个Python对象通过`type`获取的都是一个PyTypeObject结构体数据。
+`tp_basicsize`：表示的对象的基础数据的长度，可以理解位对象头信息长度。
+`tp_itemsize`：表示每个item的长度，而item的个数则在`PyVarObject`的`ob_size`，因为只有`PyVarObject`是变长的。
+PyTypeObject结构体中还包含了一些函数指针，比如获取和设置对象的属性，其实就是对应PyTypeObject结构体中的`tp_getattr`与`tp_setattr`指向的函数。
+    //3.10.4
+    //Include\object.h
+    typedef struct _typeobject PyTypeObject;
+    //Include\cpython\object.h
+    struct _typeobject {
+        PyObject_VAR_HEAD
+        const char *tp_name; /* For printing, in format "." */
+        Py_ssize_t tp_basicsize, tp_itemsize; /* For allocation */
+        /* Methods to implement standard operations */
+        destructor tp_dealloc;
+        Py_ssize_t tp_vectorcall_offset;
+        getattrfunc tp_getattr;
+        setattrfunc tp_setattr;
+        PyAsyncMethods *tp_as_async; /* formerly known as tp_compare (Python 2)
+                                        or tp_reserved (Python 3) */
+        reprfunc tp_repr;
+        /* Method suites for standard classes */
+        PyNumberMethods *tp_as_number;
+        PySequenceMethods *tp_as_sequence;
+        PyMappingMethods *tp_as_mapping;
+        /* More standard operations (here for binary compatibility) */
+        hashfunc tp_hash;
+        ternaryfunc tp_call;
+        reprfunc tp_str;
+        getattrofunc tp_getattro;
+        setattrofunc tp_setattro;
+        /* Functions to access object as input/output buffer */
+        PyBufferProcs *tp_as_buffer;
+        /* Flags to define presence of optional/expanded features */
+        unsigned long tp_flags;
+        const char *tp_doc; /* Documentation string */
+        /* Assigned meaning in release 2.0 */
+        /* call function for all accessible objects */
+        traverseproc tp_traverse;
+        /* delete references to contained objects */
+        inquiry tp_clear;
+        /* Assigned meaning in release 2.1 */
+        /* rich comparisons */
+        richcmpfunc tp_richcompare;
+        /* weak reference enabler */
+        Py_ssize_t tp_weaklistoffset;
+        /* Iterators */
+        getiterfunc tp_iter;
+        iternextfunc tp_iternext;
+        /* Attribute descriptor and subclassing stuff */
+        struct PyMethodDef *tp_methods;
+        struct PyMemberDef *tp_members;
+        struct PyGetSetDef *tp_getset;
+        // Strong reference on a heap type, borrowed reference on a static type
+        struct _typeobject *tp_base;
+        PyObject *tp_dict;
+        descrgetfunc tp_descr_get;
+        descrsetfunc tp_descr_set;
+        Py_ssize_t tp_dictoffset;
+        initproc tp_init;
+        allocfunc tp_alloc;
+        newfunc tp_new;
+        freefunc tp_free; /* Low-level free-memory routine */
+        inquiry tp_is_gc; /* For PyObject_IS_GC */
+        PyObject *tp_bases;
+        PyObject *tp_mro; /* method resolution order */
+        PyObject *tp_cache;
+        PyObject *tp_subclasses;
+        PyObject *tp_weaklist;
+        destructor tp_del;
+        /* Type attribute cache version tag. Added in version 2.6 */
+        unsigned int tp_version_tag;
+        destructor tp_finalize;
+        vectorcallfunc tp_vectorcall;
+    };
+## 1.3 bytearray
+bytearray虽然是变长，但是数据通过字符串指针指向堆内存，实际数据存储在了ob_bytes中。
+    //3.10.4
+    //Include\cpython\bytearrayobject.h
+    typedef struct {
+        PyObject_VAR_HEAD
+        Py_ssize_t ob_alloc;   /* How many bytes allocated in ob_bytes */
+        char *ob_bytes;        /* Physical backing buffer */
+        char *ob_start;        /* Logical start inside ob_bytes */
+        Py_ssize_t ob_exports; /* How many buffer exports */
+    } PyByteArrayObject;
+## 1.4 bytes
+bytes对象数据都是存储在PyBytesObject结构体中的，不像PyByteArrayObject结构体是通过指针指向的具体数据。
+根据1.1可知PyVarObject中存在ob_size表示包含类型个数，这里就是包含的字节数了，数据均是存储在ob_sval中，并最后多一个字节，数据为`\x00`。
+    //3.10.4
+    //Include\cpython\bytesobject.h
+    typedef struct {
+        PyObject_VAR_HEAD
+        Py_hash_t ob_shash;
+        char ob_sval[1];
+        /* Invariants:
+         *     ob_sval contains space for 'ob_size+1' elements.
+         *     ob_sval[ob_size] == 0.
+         *     ob_shash is the hash of the byte string or -1 if not computed yet.
+         */
+    } PyBytesObject;
+## 1.5 list
+ob_item是指针的指针，也就可以理解为指针数组，每一项都是一个PyObject *。
+    //3.10.4
+    //Include\cpython\listobject.h
+    typedef struct {
+        PyObject_VAR_HEAD
+        /* Vector of pointers to list elements.  list[0] is ob_item[0], etc. */
+        PyObject **ob_item;
+        /* ob_item contains space for 'allocated' elements.  The number
+         * currently in use is ob_size.
+         * Invariants:
+         *     0 ob_bytes；
+指向bytes，就相当于PyBytesObject->ob_sval；
+并且记录了具体长度，无法越界。
+    v=memoryview(b'abcd')
+    len(v) # 4
+    v[0] #61
+    v=memoryview(bytearray(b''))
+    len(v) # 4
+    v[0] #61
+## 2.2 id
+Python中的id函数返回的值其实是该对象在内存中的首地址。
+官方文档：
+    CPython implementation detail: This is the address of the object in memory.
+# 0x03 ELF文件
+这里推荐一本书《程序员的自我修养》，ELF文件解析主要的是参考该书以及elf.h文件。
+因为Exp是针对的64位，所以介绍的结构体都是64位的。
+## 3.1 文件头
+结构体
+    //include\linux\elf.h
+    typedef struct elf64_hdr {
+      unsigned char e_ident[16];        /* ELF "magic number" */
+      Elf64_Half e_type;
+      Elf64_Half e_machine;
+      Elf64_Word e_version;
+      Elf64_Addr e_entry;       /* Entry point virtual address */
+      Elf64_Off e_phoff;        /* Program header table file offset */
+      Elf64_Off e_shoff;        /* Section header table file offset */
+      Elf64_Word e_flags;
+      Elf64_Half e_ehsize;
+      Elf64_Half e_phentsize;
+      Elf64_Half e_phnum;
+      Elf64_Half e_shentsize;
+      Elf64_Half e_shnum;
+      Elf64_Half e_shstrndx;
+    } Elf64_Ehdr;
+e_ident中可以判断出是32位还是64位程序，数据存储是大端还是小端。
+  * Elf64_Ehdr[0:4] = "\x7fELF"
+  * Elf64_Ehdr[4]：1表示32位，2表示64位
+  * Elf64_Ehdr[5]：1表示小端，2表示大端
+e_type可以判断是否开启PIE。
+  * Elf64_Ehdr[0x10:0x12]：2表示可执行文件，未开启PIE；3表示开启了PIE
+获取Program Header Table的信息
+  * Elf64_Ehdr[0x20:0x28]：e_phoff，获取到偏移
+  * Elf64_Ehdr[0x36:0x38]：e_phentsize，Program Header每一项的大小
+  * Elf64_Ehdr[0x38:0x3A]：e_phnum，Program Header中包含的总数
+获取Section Header Table的信息
+  * Elf64_Ehdr[0x28:0x30]：e_shoff，获取到偏移
+  * Elf64_Ehdr[0x3A:0x3C]：e_shentsize，Section Header每一项的大小
+  * Elf64_Ehdr[0x3C:0x3E]：e_shnum，Section Header中包含的总数
+## 3.2 Program Header Table
+主要是用于说明ELF文件如何映射到内存中的，可以通过命令`readelf -l`查看；Program Header
+Table中的每一项称为Segment，Segment是多个Section的合集，相同属性的Section放于一个Segment，结构体如下：
+    //include\linux\elf.h
+    typedef struct elf64_phdr {
+      Elf64_Word p_type;
+      Elf64_Word p_flags;
+      Elf64_Off p_offset;       /* Segment file offset */
+      Elf64_Addr p_vaddr;       /* Segment virtual address */
+      Elf64_Addr p_paddr;       /* Segment physical address */
+      Elf64_Xword p_filesz;     /* Segment size in file */
+      Elf64_Xword p_memsz;      /* Segment size in memory */
+      Elf64_Xword p_align;      /* Segment alignment, file & memory */
+    } Elf64_Phdr;
+Elf64_Phdr[0:4]：p_type
+占4字节，不同类型的值参考于010editor的Templates，会加载到内存的仅`LOAD`类型，`PT_DYNAMIC`会指出.dynamic在内存中的地址。
+    PT_NULL     =0,
+    PT_LOAD     =1,
+    PT_DYNAMIC  =2,
+    PT_INERP    =3,
+    PT_NOTE     =4,
+    PT_SHLIB    =5,
+    PT_PHDR     =6,
+    PT_LOOS     =0x60000000,
+    PT_HIOS     =0x6fffffff,
+    PT_LOPROC   =0x70000000,
+    PT_HIPROC   =0x7fffffff
+Elf64_Phdr[0x10:0x18]：p_vaddr
+占8字节，该Segment的`virtual address`，虚拟地址，即内存地址，若开启PIE，则是相对基址的偏移。
+Elf64_Phdr[0x30:0x38]：p_align
+占8字节，Segment的对齐属性，用于表示在内存中的对齐单位，一般是0x1000。
+## 3.3 .dynamic
+保存了动态链接器所需要的基本信息。
+    typedef struct {
+      Elf64_Sxword d_tag;       /* entry tag value */
+      union {
+        Elf64_Xword d_val;
+        Elf64_Addr d_ptr;
+      } d_un;
+    } Elf64_Dyn;
+**d_tag** ：表明该项值的类型。
+    /* This is the info that is needed to parse the dynamic section of the file */
+    #define DT_NULL     0
+    #define DT_NEEDED   1
+    #define DT_PLTRELSZ 2
+    #define DT_PLTGOT   3
+    #define DT_HASH     4
+    #define DT_STRTAB   5
+    #define DT_SYMTAB   6
+    #define DT_RELA     7
+    #define DT_RELASZ   8
+    #define DT_RELAENT  9
+    #define DT_STRSZ    10

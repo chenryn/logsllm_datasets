@@ -1,0 +1,165 @@
+      "  popl %eax\n"
+      "\n"
+分析上述桩代码，其实主要作了以下几件事：  
+（1）通过环境变量获取共享内存标识符shm_id：getenv(AFL_SHM_ENV)  
+（2）通过shmat()函数，将共享内存地址存储到__afl_area_ptr：___afl_area_ptr = shmat(shm_id, 0, 0)
+## 0x03 forkserver
+forkserver主要是为了避免频繁调用execve()引起的开销。在完成了共享内存映射后，就会进入forkserver核心部分，执行`__afl_forkserver`。
+首先，看一下forkserver进程是如何创建的。AFL通过`init_forkserver()`进行forkserver相关的初始化工作：
+（1）创建状态管道和命令管道，用于AFL和forkserver进程之间的通信。AFL通过写命令管道向forkserver发送命令，forkserver通过读命令管道接收AFL的发送的命令；forkserver通过写状态管道向AFL发送信息，AFL通过读状态管道接收forkserver发送的信息。
+    int st_pipe[2], ctl_pipe[2]；
+（2）创建forkserver进程。
+在forkserver进程中，首先对状态管道和命令管道进行重定位；之后，forkserver进程调用execv()，会在target第一个基本块处执行插入的桩代码，调用__afl_maybe_log，然后跳到__afl_setup设置共享内存。共享内存设置完毕后，就进入了`__afl_forkserver`。
+    dup2(ctl_pipe[0], FORKSRV_FD) 和 dup2(st_pipe[1], FORKSRV_FD +1）
+    execv(target_path, argv);
+接下来看一下`__afl_forkserver`：
+      "__afl_forkserver:\n"
+      "\n"
+      "  /* Enter the fork server mode to avoid the overhead of execve() calls. */\n"
+      "\n"
+      "  pushl %eax\n"
+      "  pushl %ecx\n"
+      "  pushl %edx\n"
+      "\n"
+      "  /* Phone home and tell the parent that we're OK. (Note that signals with\n"
+      "     no SA_RESTART will mess it up). If this fails, assume that the fd is\n"
+      "     closed because we were execve()d from an instrumented binary, or because\n" 
+      "     the parent doesn't want to use the fork server. */\n"
+      "\n"
+      "  pushl $4          /* length    */\n"
+      "  pushl $__afl_temp /* data      */\n"
+      "  pushl $" STRINGIFY((FORKSRV_FD + 1)) "  /* file desc */\n"
+      "  call  write\n" ; write(STRINGIFY((FORKSRV_FD + 1)), __afl_temp, 4)
+      "  addl  $12, %esp\n"
+      "\n"
+      "  cmpl  $4, %eax\n"
+      "  jne   __afl_fork_resume\n"
+      "\n"
+forkserver首先会向状态管道写端（即 FORKSRV_FD +
+1）写入4字节的内容，告诉AFL“我准备好fork了”，而AFL进程也会通过读状态管道，判断forkserver进程是否创建成功：
+    rlen = read(fsrv_st_fd, &status, 4);
+forkserver创建成功后，就会进入`__afl_fork_wait_loop`
+，forkserver会阻塞，直到读取命令管道成功：read(STRINGIFY(FORKSRV_FD), __afl_tmp,
+4)，然后forkserver判断AFL是否发送了“fork一个子进程”的命令：
+      "__afl_fork_wait_loop:\n"
+      "\n"
+      "  /* Wait for parent by reading from the pipe. Abort if read fails. */\n"
+      "\n"
+      "  pushl $4          /* length    */\n"
+      "  pushl $__afl_temp /* data      */\n"
+      "  pushl $" STRINGIFY(FORKSRV_FD) "        /* file desc */\n"
+      "  call  read\n" ; read(STRINGIFY(FORKSRV_FD), __afl_tmp, 4)
+      "  addl  $12, %esp\n"
+      "\n"
+      "  cmpl  $4, %eax\n"
+      "  jne   __afl_die\n"
+      "\n"
+      "  /* Once woken up, create a clone of our process. This is an excellent use\n"
+      "     case for syscall(__NR_clone, 0, CLONE_PARENT), but glibc boneheadedly\n"
+      "     caches getpid() results and offers no way to update the value, breaking\n"
+      "     abort(), raise(), and a bunch of other things :-( */\n"
+      "\n"
+AFL在run_target()中通过命令管道向forkserver发送消息：
+    res = write(fsrv_ctl_fd, &prev_timed_out, 4)
+当forkserver收到AFL创建一个子进程的命令后，就会调用fork()创建target进程（Linux下的fork()提供了copy-on-write机制，fork()开销很低）：
+      "  call fork\n"
+      "\n"
+      "  cmpl $0, %eax\n"
+      "  jl   __afl_die\n"
+      "  je   __afl_fork_resume\n"
+在target进程里面，会跳到`__afl_fork_resume`执行，关闭文件描述符，恢复target的正常执行：
+      "__afl_fork_resume:\n"
+      "\n"
+      "  /* In child process: close fds, resume execution. */\n"
+      "\n"
+      "  pushl $" STRINGIFY(FORKSRV_FD) "\n"
+      "  call  close\n"
+      "\n"
+      "  pushl $" STRINGIFY((FORKSRV_FD + 1)) "\n"
+      "  call  close\n"
+      "\n"
+      "  addl  $8, %esp\n"
+      "\n"
+      "  popl %edx\n"
+      "  popl %ecx\n"
+      "  popl %eax\n"
+      "  jmp  __afl_store\n"
+      "\n"
+在forkserver进程里面，也就是在父进程里面，会将target进程的PID写入状态管道，然后等待target进程结束。target进程结束后，forkserver会再次向AFL说“我准备好fork了”，并继续执行`__afl_fork_wait_loop`，等待AFL发送“fork一个子进程”的命令。
+      "  /* In parent process: write PID to pipe, then wait for child. */\n"
+      "\n"
+      "  movl  %eax, __afl_fork_pid\n"
+      "\n"
+      "  pushl $4              /* length    */\n"
+      "  pushl $__afl_fork_pid /* data      */\n"
+      "  pushl $" STRINGIFY((FORKSRV_FD + 1)) "      /* file desc */\n"
+      "  call  write\n"
+      "  addl  $12, %esp\n"
+      "\n"
+      "  pushl $0             /* no flags  */\n"
+      "  pushl $__afl_temp    /* status    */\n"
+      "  pushl __afl_fork_pid /* PID       */\n"
+      "  call  waitpid\n"
+      "  addl  $12, %esp\n"
+      "\n"
+      "  cmpl  $0, %eax\n"
+      "  jle   __afl_die\n"
+      "\n"
+      "  /* Relay wait status to pipe, then loop back. */\n"
+      "\n"
+      "  pushl $4          /* length    */\n"
+      "  pushl $__afl_temp /* data      */\n"
+      "  pushl $" STRINGIFY((FORKSRV_FD + 1)) "  /* file desc */\n"
+      "  call  write\n"
+      "  addl  $12, %esp\n"
+      "\n"
+      "  jmp __afl_fork_wait_loop\n"
+forkserver创建完target进程后，需要将target进程的PID写道状态管道；而AFL进程则需要从状态管道中读出target进程的PID。
+    res = read(fsrv_st_fd, &child_pid, 4)
+## 0x04 边覆盖记录
+在__alf_maybe_log中，如果共享内存完成了映射，就会执行`__afl_store`，在共享内存中更新边覆盖情况。
+      "__afl_store:\n"
+      "\n"
+      "  /* Calculate and store hit for the code location specified in ecx. There\n"
+      "     is a double-XOR way of doing this without tainting another register,\n"
+      "     and we use it on 64-bit systems; but it's slower for 32-bit ones. */\n"
+      "\n"
+    #ifndef COVERAGE_ONLY
+      "  movl __afl_prev_loc, %edi\n" ;将__alf_prev_loc的值存储到寄存器edi
+      "  xorl %ecx, %edi\n"     ;将“__alf_prev_loc 异或 ecx”的值存储到edi寄存器中，相当于将边ID存储到了寄存器edi中
+      "  shrl $1, %ecx\n" ;将ecx的值右移1位，然后存储至ecx寄存器中
+      "  movl %ecx, __afl_prev_loc\n" ;将ecx寄存器的值存储到__afl_prev_loc中
+    #else
+      "  movl %ecx, %edi\n"
+    #endif /* ^!COVERAGE_ONLY */
+      "\n"
+    #ifdef SKIP_COUNTS
+      "  orb  $1, (%edx, %edi, 1)\n"
+    #else
+      "  incb (%edx, %edi, 1)\n"
+    #endif /* ^SKIP_COUNTS */
+      "\n"
+`__afl_store`的作用是计算前一个基本块（pre_location）到当前基本块（cur_location）这条边的ID，然后统计其出现次数。具体地，AFL使用（pre_location
+>> 1) xor (cur_locatino) 的方式记录一条边；使用共享内存（存储在寄存器edx中）统计边的出现次数。在上述汇编代码中：  
+（1）ecx存储的是`R(MAP_SIZE)`得到的值，也就是存储着为当前这个基本块分配的ID，即伪代码中的cur_location；  
+（2）`__afl_prev_loc`表示`上一个基本块的ID>>1`；  
+（3）edx存储的是共享内存的地址。  
+（4）`incb (%edx, %edi, 1)`这条指令就在共享内存（edx）中，将这条边（edi）的出现次数+1。
+__afl_store之后是`__afl_return:\n`。
+      "__afl_return:\n"
+      "\n"
+      "  addb $127, %al\n"
+      "  sahf\n"
+      "  ret\n"
+      "\n"
+关于插桩，可能会存在两个疑问：  
+（1）边覆盖不够精确，是否能够实现路径覆盖？边覆盖确实不够精确，但是目前来看，它还是简单实用的。论文[Be Sensitive and
+Collaborative: Analyzing Impact of Coverage Metrics in Greybox
+Fuzzing](https://www.usenix.org/conference/raid2019/presentation/wang)对不同代码覆盖率统计方式对于fuzzing的影响进行了研究。  
+（2）trace_bits使用边ID作为索引，是否存在hash碰撞？答案是存在的，hash碰撞由两部分引起。首先，trace_bits的大小为64KB，每个索引对应的数据大小为1
+byte，也就是说，最多能存放2^16条边，遇到边数大于2^16的目标程序，理论上会有概率存在碰撞；其次，边ID的计算方式没有过滤碰撞，因此这里也可能存在碰撞。为了解决hash碰撞，[CollAFL](http://chao.100871.net/papers/oakland18.pdf)提出了新的边ID计算方式，[CSI-Fuzz](https://ieeexplore.ieee.org/document/9139349/)也设计了新的插桩方式。
+## 0x05 总结
+AFL一共涉及三个进程，AFL进程，forkserver进程，以及targetg进程。AFL进程创建了forkserver进程，forkserver进程根据AFL的指令创建target进程。
+AFL和forkserver通过管道进行通信。
+AFL和target通过共享内存通信，获取目标程序代码覆盖信息。AFL通过trace_bits访问共享内存，target通过__afl_area_ptr访问共享内存。
+## 0x06 参考文献

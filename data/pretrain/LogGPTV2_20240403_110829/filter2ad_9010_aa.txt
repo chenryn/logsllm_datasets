@@ -1,0 +1,168 @@
+# AFL编译时插桩
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00 前言
+这篇文章主要从源码角度剖析AFL的编译时插桩（compile-time
+instrumentation）。AFL超级棒的一点在于其“灰盒”的特性：通过编译时插桩获动态获取目标程序的边覆盖信息。此外，AFL的forkserver机制使得AFL在运行过程中只需调用一次execv()函数，避免了多次调用execv()引起的开销（注：每执行一次execv()，都需要将目标程序加载到内存，进行链接等操作）。
+注意：本文只分析能获得目标程序源码、开启forkserver下的AFL的一些内部实现，主要以afl-gcc为例对插桩代码进行解读，涉及到的源文件主要有afl-fuzz.c，afl-as.c，afl-as.h 和 afl-gcc.c。
+## 0x01 插桩
+AFL的插桩在汇编阶段实现。在获取目标程序源码后，首先需要通过`afl-gcc/alf-g++`编译目标程序，对目标程序进行插桩，得到插桩后的二进制文件。而从源文件到可执行文件，需要依次经过：预处理、编译、汇编、链接。其中，编译器将预处理后源文件编译成汇编语言，汇编器将汇编语言翻译成机器语言，而AFL的插桩就是在汇编阶段实现。
+afl-gcc本质上是一个gcc的wrapper，afl-gcc通过设置gcc的`-B`选项设置编译器的搜索路径为
+“afl_path/as”。我们编译好AFL后，会在afl的根目录下生成`afl-gcc、as 和 afl-as`等文件，其中，as作为符号链接指向afl-as。接下来，本文将着重分析 afl-as.h 和 afl-as.c文件。
+    /* afl-gcc.c */
+    u8 *afl_path = getenv("AFL_PATH");
+    if (afl_path) {
+      tmp = alloc_printf("%s/as", afl_path); //tmp = afl_path/as
+      if (!access(tmp, X_OK)) { //判断对tmp是否有执行权限
+        as_path = afl_path;
+        ck_free(tmp);
+        return;
+      }
+      ck_free(tmp);
+    }
+    cc_params[cc_par_cnt++] = "-B";
+    cc_params[cc_par_cnt++] = as_path;
+    ...
+afl-as.c首先通过函数`add_instrumentation()`在汇编层面对目标程序进行插桩，然后再调用`gcc默认的汇编器as`或者用户设置的汇编器执行真正的汇编过程（注：用户可以通过设置环境变量AFL_AS自定义要使用的汇编器
+）。
+    /* afl-as.c */
+    int main(int argc, char** argv) {
+      ...
+      if (!just_version) add_instrumentation(); 
+      if (!(pid = fork())) {
+        execvp(as_params[0], (char**)as_params); //真正的汇编过程，as_params[0] = afl_as ? afl_as : (u8*)"as";
+        FATAL("Oops, failed to execute '%s' - check your PATH", as_params[0]);
+      }
+      ...
+    }
+add_instrumentation()插桩的大致思路：首先，只对.text段进行插桩，afl-as通过字符串匹配判断是不是.text段；其次，遍历目标程序对应的汇编文件的每一行代码，然后判断其是不是一个基本块的开始，如果是的话，就在这行代码之前进行插桩。
+    /* afl-as.c */
+    while (fgets(line, MAX_LINE, inf)) {
+          ....
+          if (!strncmp(line + 2, "text\n", 5) ||
+              !strncmp(line + 2, "section\t.text", 13) ||
+              !strncmp(line + 2, "section\t__TEXT,__text", 21) ||
+              !strncmp(line + 2, "section __TEXT,__text", 21)) {
+            instr_ok = 1;
+            continue; 
+          }
+          ....
+          if (line[0] == '\t') {
+           if (line[1] == 'j' && line[2] != 'm' && R(100) < inst_ratio) {
+             fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32,
+                     R(MAP_SIZE)); //插桩
+             ins_lines++;
+           }
+           continue;
+         }
+         ...
+    }
+先看一下fprintf函数的原型，其中第二个参数是格式化字符串，从第三个参数开始都将作为格式化字符串的参数，fprintf会将格式化字符串的最终输出打印到stream所指向的流中。
+    int fprintf(FILE *stream, const char *format, ...);
+现在来分析插桩的语句，afl-as调用fprintf()
+函数将桩代码插入目标程序的汇编文件：outf是一个指针，指向被插桩的汇编文件；`trampoline_fmt_*`是要插入的桩代码；`R(MAP_SIZE)`是0~MAP_SIZE之间的一个随机数，作为`trampoline_fmt_*`的参数，其实质是为当前基本块分配的ID。
+    fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32, R(MAP_SIZE))
+接下来，以32位为例，分析插入的桩代码（从这里开始，本文的代码分析基本都是按照afl-as.h中桩代码的顺序分析的）：
+    /* afl-as.h */
+    static const u8* trampoline_fmt_32 =
+      "\n"
+      "/* --- AFL TRAMPOLINE (32-BIT) --- */\n"
+      "\n"
+      ".align 4\n"
+      "\n"
+      "leal -16(%%esp), %%esp\n"
+      "movl %%edi, 0(%%esp)\n"
+      "movl %%edx, 4(%%esp)\n"
+      "movl %%ecx, 8(%%esp)\n"
+      "movl %%eax, 12(%%esp)\n"
+      "movl $0x%08x, %%ecx\n"
+      "call __afl_maybe_log\n"
+      "movl 12(%%esp), %%eax\n"
+      "movl 8(%%esp), %%ecx\n"
+      "movl 4(%%esp), %%edx\n"
+      "movl 0(%%esp), %%edi\n"
+      "leal 16(%%esp), %%esp\n"
+      "\n"
+      "/* --- END --- */\n"
+      "\n";
+这段的代码的主要作用是调用`__afl_maybe_log`：  
+（1）第8-12行代码将寄存器edi、edx、ecx、eax保存到栈上。在后续的桩代码中会使用这几个寄存器，因此需要先保存这些寄存器的值到栈上，以便后续恢复寄存器的值。  
+（2）将寄存器ecx的值设置为fprintf()中传入的R(MAP_SIZE)，第13行中`%08x`对应的值是R(MAP_SIZE)，R(MAP_SIZE)的作用是生成一个0～MAP_SIZE间的随机数，作为当前基本块的ID。  
+（3）调用`__afl_maybe_log`。  
+（4）恢复edi等寄存器，对应于15行到第19行代码。
+接下来看`__alf_maybe_log的实现：
+      "__afl_maybe_log:\n"
+      "\n"
+      "  lahf\n"
+      "  seto %al\n"
+      "\n"
+      "  /* Check if SHM region is already mapped. */\n"
+      "\n"
+      "  movl  __afl_area_ptr, %edx\n" ;__afl_area_ptr指向共享内存
+      "  testl %edx, %edx\n"
+      "  je    __afl_setup\n"
+      "\n"
+在__afl_maybe_log里面，会首先判断共享内存是否映射完成（`__afl_area_ptr`指向共享内存，在后面会解释），如果未完成映射，会执行`__afl_setup`；如果映射完成，那么会执行
+`__afl_store`。
+## 0x02 共享内存
+在AFL中，共享内存主要用于AFL进程和target进程通信。target进程可以通过写入共享内存更新一个测试用例对target的边覆盖信息；而AFL进程可以在target执行完毕后，通过访问共享内存获取target的边覆盖信息。具体地，在一个测试用例被执行前，共享内存会被重置；在执行该测试用例的过程中会被更新；当该测试用例执行完毕后，就会得到这个测试用例对应的共享内存。因此，共享内存能够表示目标程序执行某个测试用例后的边覆盖情况。
+那，什么是共享内存呢？
+共享内存是Linux下进程间的一种通信方式，两个进程将各自的一段虚拟地址空间映射到同一块物理地址上，然后这两个进程就可以通过操作这块物理地址进行通信。Linux下共享内存的具体实现方式：  
+（1）使用shmget()函数创建共享内存，并返回一个共享内存标识符shm_id 。shmget()原型为`int shmget(key_t key,
+size_t size, int shmflg);`。但是此时共享内存还不能被任何进程访问。  
+（2）shmat()函数的作用就是根据shm_id，将进程attach到共享内存上，即将进程虚拟地址空间中的一段内存映射到共享内存。shmat()的函数原型为`void
+*shmat(int shmid, const void *shmaddr, int shmflg);`。
+###  AFL进程中共享内存设置
+AFL通过共享内存获取一个测试用例对target的边覆盖信息。AFL开启后，会通过`setup_shm()`设置共享内存。
+（1）首先通过shmget()创建大小为MAP_SIZE的共享内存：
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+（2）将共享内存标识符存储到环境变量，forkserver进程和target进程就可以通过环境变量访问共享内存标识符：
+    shm_str = alloc_printf("%d", shm_id);  setenv(SHM_ENV_VAR, shm_str, 1);
+（3）AFL使用变量 `trace_bits`
+attach到共享内存，然后AFL就可以通过trace_bits访问共享内存。在每次执行target之前，AFL会将trace_bits清零。
+    trace_bits = shmat(shm_id, NULL, 0);
+###  target进程共享内存设置
+在 __alf_maybe_log中，如果共享内存未完成映射，就会执行`je
+__afl_setup`设置共享内存。`__afl_setup`的作用是获取AFL进程设置的共享内存标识符，并在target进程内attach到共享内存。
+      "__afl_setup:\n"
+      "\n"
+      "  /* Do not retry setup if we had previous failures. */\n"
+      "\n"
+      "  cmpb $0, __afl_setup_failure\n"
+      "  jne  __afl_return\n"
+      "\n"
+      "  /* Map SHM, jumping to __afl_setup_abort if something goes wrong.\n"
+      "     We do not save FPU/MMX/SSE registers here, but hopefully, nobody\n"
+      "     will notice this early in the game. */\n"
+      "\n"
+      "  pushl %eax\n" ;将eax寄存器压栈
+      "  pushl %ecx\n" ;将ecx寄存器压栈
+      "\n"
+      "  pushl $.AFL_SHM_ENV\n" ;压入getenv的参数
+      "  call  getenv\n" ;getenv(AFL_SHM_ENV)，返回值存储在eax寄存器
+      "  addl  $4, %esp\n"
+      "\n"
+      "  testl %eax, %eax\n" ;判断环境变量AFL_SHM_ENV是否存在
+      "  je    __afl_setup_abort\n" ;环境变量AFL_SHM_ENV不存在，共享内存映射失败
+      "\n"
+      "  pushl %eax\n" ; eax = getenv(AFL_SHM_ENV)
+      "  call  atoi\n" ; eax = atoi(getenv(AFL_SHM_ENV))
+      "  addl  $4, %esp\n"
+      "\n"
+      "  pushl $0          /* shmat flags    */\n"
+      "  pushl $0          /* requested addr */\n"
+      "  pushl %eax        /* SHM ID         */\n"
+      "  call  shmat\n" ; eax = shmat(shm_id, 0, 0)
+      "  addl  $12, %esp\n" 
+      "\n"
+      "  cmpl $-1, %eax\n"
+      "  je   __afl_setup_abort\n"
+      "\n"
+      "  /* Store the address of the SHM region. */\n"
+      "\n"
+      "  movl %eax, __afl_area_ptr\n"
+      "  movl %eax, %edx\n"
+      "\n"
+      "  popl %ecx\n"

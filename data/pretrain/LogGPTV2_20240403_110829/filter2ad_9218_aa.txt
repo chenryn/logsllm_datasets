@@ -1,0 +1,93 @@
+**作者：Lucifaer  
+原文链接：[https://lucifaer.com/2020/08/21/WebSphere...](https://lucifaer.com/2020/08/21/WebSphere%E8%BF%9C%E7%A8%8B%E4%BB%A3%E7%A0%81%E6%89%A7%E8%A1%8C%E6%BC%8F%E6%B4%9E%E5%88%86%E6%9E%90%EF%BC%88CVE-2020-4450%EF%BC%89/#3-3-%E6%9E%84%E9%80%A0RMI-Server%E7%BB%91%E5%AE%9A "https://lucifaer.com/2020/08/21/WebSphere...")**
+该漏洞本身其实并不是非常好用，但是对于分析来说，确实是今年以来比较有意思的一个漏洞了，值得所有做Java漏洞研究的人员进行跟进和学习。
+# 0x01 漏洞概述
+IBM WebSphere Application
+Server（后面简称WAS）在今年6月发布了一则漏洞通告，cve编号为：CVE-2020-4450。该漏洞允许攻击者通过`iiop`向WAS进行网络请求，最终在WAS上执行任意代码。
+在7月，ZDI公布了[漏洞细节](https://www.zerodayinitiative.com/blog/2020/7/20/abusing-java-remote-protocols-in-ibm-websphere)，同天iswin师傅也发布了他[对此漏洞的分析](https://www.secrss.com/articles/24353)，8月6日，360cert的小伙伴也公布了他自己的[分析](https://cert.360.cn/report/detail?id=3d016bdef66b8e29936f8cb364f265c8)，本文是参考以上三篇文章完成的，主要用于记录自己的调试过程，以及补充相关的分析细节。
+# 0x02 漏洞分析
+该漏洞主要分为三部分：
+  * `TXServerInterceptor`拦截器处理`iiop`请求
+  * 利用`WSIF`构造Gadget
+  * 伪造`wsdl`文件完成漏洞利用
+本文将从上而下将三部分进行串流分析，主要采用静态跟踪，最后会在漏洞利用部分分享如何创建相关数据流完成整条流程的串通。
+## 2.1 TXServerInterceptor拦截器处理iiop请求
+这一部分`tinit0`在19年的bh上其实已经做了[相关的分享](https://i.blackhat.com/eu-19/Wednesday/eu-19-An-Far-Sides-Of-Java-Remote-Protocols.pdf)，这里只是记录一下自己的跟进流程。
+`TXServerInterceptor`具体代码在`com.ibm.ws.Transaction.JTS.TxServerInterceptor#receive_request`，这里只截关键部分的代码：
+拦截器首先会根据`ServerRequestInfo`实例化`ServiceContext`对象，当`serviceContext.context_data`对象非空时可以进入`TxInterceptorHelper.demarshalContext`解析流程，而这里就是漏洞的起始点。
+跟进`TxInterceptorHelper.demarshalContext()`方法：
+对Corba处理稍微熟悉一点的可以很明显的看出这里为Corba
+rpc流程中的解包流程。根据传入的`bypte`数组初始化`CDRInputStream`对象用于后续进行反序列化操作。在完成`CDRInputStream`初始化后，调用`read_any()`方法初始化`Any`对象。
+由于IBM自己重新实现了具体的IIOP解析流程，所以不能先入为主的用JDK原生处理逻辑来思考后续漏洞调用流程。
+我们首先来跟进一下`CDRInputStream`的初始化逻辑，后续流程会用到其所定义的`CDRReader`：
+这里最终返回`EncoderInputStream`对象，并设置`reader`对象为`com.ibm.rmi.iiop.CDRInputStream`，`reader`会在后续流程中用到。
+现在跟进`inputStream.read_any()`：
+具体实现为`com.ibm.rmi.iiop.CDRInputStream#reade_any`。由于`CDRInputStream`中未实现`read_any()`方法则调用`com.ibm.rmi.iiop.CDRReader#read_any`：
+：
+其中最为关键的逻辑就是`Any.read_value()`。到这里为止，经历了以下流程：
+    CDRInputStream初始化 ->
+    CDRInputStream.read_any() ->
+    CDRInputStream.read_value()
+看过之前那篇简述`Corba`文章的，可能已经清楚了，JDK原生实现逻辑在后续会触发反序列化流程，而IBM的实现方式却不尽相同，后续会触发反射调用的流程。
+跟进`Any.read_value()`方法：
+首先会将传入的`TypeCode`转化为真正的`TypeCode`，之后调用`TCUtility.unmarshalIn()`对传入的`InputStream`进行解包操作，想要查看全部的`TypeCode`的话，可以查看`org.omg.CORBA.TCKind#from_int`。这里我们重点关注`tk_value`，也就是`TypeCode`为29的情况：
+接下来的调用逻辑为：
+    org.omg.CORBA_2_3.portable.InputStream#read_value ->
+    com.ibm.rmi.iiop.EncoderInputStream#read_value ->
+    com.ibm.rmi.iiop.CDRReader#read_value
+在`com.ibm.rmi.iiop.CDRReader#read_value()`中存在关键逻辑：
+在`this.fast_read_value_ludcl();`中对`this.valueClass`进行了初始化：
+最终通过`com.ibm.rmi.util.ClassCache#loadClass`调用JDK反射完成类的实例化。这里不做重点跟踪，感兴趣的可以自己跟一下。
+这里主要跟进一下`his.valueHandler.readValue()`方法的处理流程：
+调用了`this.inputStreamBridge.simpleReadObject()`最终返回一个`Serializable`对象，继续跟进：
+红框标注了两个重要的流程，`simpleReadObjectInternal`方法和`simpleReadObjectLoop`，这两个方法存在一定的区别。
+#### simpleReadObjectInternal
+`simpleReadObjectInternal`首先根据`valueClass`的类型进行流程分派，之后会向上轮询查找父类同时将`subClass`保存在`pendingReadStack`中。判断父类是否存在`readObject`方法，如果没有则将完成初步处理的对象传入`simpleReadObjectLoop`中对其子类进行反序列化。
+这里会会向上轮询查找父类同时将`subClass`保存在`pendingReadStack`中，跟进看一下`addSubclass()`方法：
+其将相关信息都进行了设置，这些设置在`simpleReadObjectLoop`中会用到。继续跟进：
+此处会判断父类中是否存在`readObject`方法，若不存在则完成后续处理逻辑并进入`simpleReadObjectLoop`逻辑之中。
+#### simpleReadObjectLoop
+`simpleReadObjectLoop`会遍历`pendingReadStack`中的子类，并调用`continueSimpleReadObject()`方法尝试反序列化。
+此处的`var2.obj`、`var2.classDesc`、`var2.fvd`在`simpleReadObjectInternal`中都已经进行了设置。跟进`inputObjectUsingClassDesc()`方法，和`simpleReadObjectInternal`是相同的逻辑，先判断是否存在`readObject`方法，如果存在则调用`readObject`方法进行反序列化操作：
+至此漏洞的触发点就梳理完毕了。
+## 2.2 利用WSIF构造Gadget
+### 2.2.1 WSIF更改执行流
+在具体梳理漏洞gadget前，先用一个例子来简单介绍一下`Apache WSIF`。
+`WSIF`全称Web服务调用框架，是一组用于调用Web服务的Java
+API。其和`wsdl`描述文件强关联，`wsdl`文件用于描述与Web服务的抽象结构进行交互，可以理解为Web服务API的描述文件。
+首先创建一个接口，该接口用于与对应的`wsdl`文件对应：
+然后本地实现`Gadget`接口，这里为了简单，直接将`exec()`方法实现为执行命令：
+具体的调用为：
+`WSIFServiceFactory.getService()`方法文档如下：
+可以看到这里主要需要以下几个参数：
+  * `javax.wsdl.Definition`：wsdl文件的位置
+  * `portTypeNs`：用于标识port的NameSpace，相当于配置的命名空间
+  * `portTypeName`：`port`的名字，在wsdl中`portType`为接口对象的xml表示
+这里的`WSIFService.getStub(Gadget.class)`方法最终返回的是一个`Gadget`类型的代理对象。
+wsdl文件定义如下：
+运行效果如下：
+现在我们在不改动`Main`代码的情况下（即不改变运行逻辑）让其执行el表达式解析（即实现不同的逻辑）。为了方便测试，只改变`Main`中`exec()`方法的参数（可以理解为这里是可控的值）：
+修改`wsdl`如下：
+执行结果如下：
+通过上面两个例子 **可以简单的将WSIF理解为接口的描述文件，而接口方法的具体实现是根据`wsdl`配置而进行绑定的**。
+**所以当在面对一个存在`WSIF`调用的逻辑时，可以考虑使用自定义的`wsdl`来将执行流引向符合条件的其他实现中**。
+### 2.2.2 Gadget执行流
+根据ZDI的文章，`tint0`找到了一个存在`readObject`方法的类，并且该类会触发`JNDI`逻辑，这个类就是`org.apache.wsif.providers.ejb.WSIFPort_EJB`：
+`HomeHandle.getEJBHome()`虽然也会触发JNDI流程，但是由于在具体实现时没有对返回回的代理类对象的相关方法进行引用，无法触发后续的gadget逻辑，所以此处需要构造一个`Handle`对象，而非一个`HomeHandle`对象。
+现在我们可以先继续跟着`Handle.getEJBObject()`的逻辑向下看，看到后面就可以理解为什么选择构造`Handle`对象了。
+跟进`com.ibm.ejs.container.EntityHandle#getEJBObject`，此处是整个Gadget的主要执行逻辑：
+总结一下分为三步:
+  * JNDI返回一个`EJBHome`类型的对象
+  * 检查返回对象的`EJBHome`对象是否存在`findByPrimaryKey`方法
+  * 反射调用`EJBHome`对象的`findByPrimaryKey`对象
+首先来看
+    home = (EJBHome)PortableRemoteObject.narrow(ctx.lookup(this.homeJNDIName), homeClass);
+由于最终返回类型为`EJBHome`，可以得知`homeClass`为`EJBHome`接口的具体实现类，且`ctx.lookup(this.homeJNDIName)`必须为`EJBHome`子类。
+接着跟进`com.ibm.ejs.container.EntityHandle#findFindByPrimaryKey`查看`homeClass`需要满足的条件：
+可以看到必须存在`findByPrimaryKey`方法。在`EJBHome`的继承树中寻找符合条件的类有：
+    com.ibm.ejs.security.registry.RegistryEntryHome
+    com.ibm.ws.batch.AbstractResourceHome
+    com.ibm.ws.batch.CounterHome
+    com.ibm.ws.batch.LocalJobStatusHome
+目前先不管构造哪个接口的具体实现类，先来看一下`ctx.lookup()`的具体实现，调用栈：
+    com.sun.jndi.rmi.registry.RegistryContext#lookup

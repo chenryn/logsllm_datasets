@@ -1,0 +1,118 @@
+作者：leveryd
+# 背景
+有大佬已经对 [apisix攻击面](https://ricterz.me/posts/2021-07-05-apache-apisix-attack-surface-research.txt) 做过总结。
+本文记录一下自己之前的评估过程。
+# 分析过程
+## 评估哪些模块？
+首先我需要知道要评估啥，就像搞渗透时，我得先知道攻击面在哪里。
+根据文档，可以知道apisix项目包括很多系统，包括：
+  * [网关](https://github.com/apache/apisix)
+  * [dashboard](https://github.com/apache/apisix-dashboard)
+  * [ingress控制器](https://github.com/apache/apisix-ingress-controller)
+  * 各种sdk
+sdk即使有漏洞，攻击场景也感觉有限，所以没有评估。
+"ingress控制器"需要结合k8s中的网络来做评估，因为时间有限，所以只是粗略看了一下。
+我主要看了网关和dashboard两个系统。
+从文档上很容易看出来，网关有三个重要的模块：
+  * 插件
+  * admin api
+  * control api
+对于api来说，首先要检查的是"身份认证"和"鉴权"这两个安全措施。
+apisix历史漏洞绝大部分都出现在插件中，所以插件属于"漏洞重灾区"。
+## 评估api安全性：身份认证和鉴权
+admin api实现如下：
+  * admin api 使用token做认证，token是硬编码的。这个问题已经被提交过漏洞，官方应该不打算修复。
+  * admin api 鉴权上，设计了viewer和非viewer两种角色。viewer角色只允许get方法。
+> 靶场见 [Apache APISIX
+> 默认密钥漏洞（CVE-2020-13945）](https://github.com/vulhub/vulhub/blob/master/apisix/CVE-2020-13945/README.zh-> cn.md)
+control api是没有身份认证的，但是有两个点限制了攻击：
+  * 默认它只在本地监听端口
+  * 插件无关的control api只有"读信息"的功能，没有发现啥风险点
+插件创建的control api是一个潜在的攻击面，不过我没找到啥漏洞。
+## 评估插件安全性
+因为插件默认都是不开启的，所以虽然它是重灾区，但是我并没有投入过多精力去审计。
+不过在这里确实发现了一个安全问题，报告给官方后，分配了[CVE-2022-25757](https://www.openwall.com/lists/oss-security/2022/03/28/2)。
+下面来说一下这个安全问题。
+# CVE-2022-25757
+## 这个安全问题是什么？
+request-validation插件可以检查HTTP请求头和BODY内容，当不符合用户配置的规则时，请求就不会转发到上游。
+比如用户按照如下规则配置时，body_schema限制请求中必须要有string_payload参数，并且是字符串类型，长度在1到32字节之间。
+    curl http://127.0.0.1:9080/apisix/admin/routes/10 -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+      {
+          "uri": "/10",
+          "plugins": {
+              "request-validation": {
+              "body_schema": {
+                    "type": "object",
+                    "required": ["string_payload"],
+                    "properties": {
+                        "string_payload": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 32
+                        }
+                    }
+                }
+              }
+          },
+          "upstream": {
+              "type": "roundrobin",
+              "nodes": {
+                  "192.168.2.189:8888": 1
+              }
+          }
+      }'
+但是恶意用户发送如下请求时，有可能绕过限制
+    POST http://127.0.0.1:9080/10
+     ...
+     {"string_payload":"","string_payload":"1111"}
+## 为什么会绕过限制？
+request-validation.lua中使用cjson.safe库解析字符串为json对象，对于带有"重复键值"的json，它会取最后面的值。比如`{"string_payload":"","string_payload":"1111"}`，request-validation插件会认为string_payload="1111"。
+    local _M = {
+        version = 0.1,
+        decode = require("cjson.safe").decode,
+    }
+但是有很多流行的库，对于带有"重复键值"的json，它会取最前面的值，因此`{"string_payload":"","string_payload":"1111"}`会被认为string_payload=""。
+因此request-validation插件和上游服务在解析json时可能存在差异性，所以会导致限制被绕过
+## 哪些库和request-validation插件在解析"重复键值json"时存在差异？
+根据 
+文章，可以知道最起码以下库和request-validation插件在解析"重复键值json"时存在差异。
+选取其中的gojay库做了验证，程序打印gojay而不是gojay2
+    package main
+    import "github.com/francoispqt/gojay"
+    type user struct {
+        id int
+        name string
+        email string
+    }
+    // implement gojay.UnmarshalerJSONObject
+    func (u *user) UnmarshalJSONObject(dec *gojay.Decoder, key string) error {
+        switch key {
+        case "id":
+            return dec.Int(&u.id)
+        case "name":
+            return dec.String(&u.name)
+        case "email":
+            return dec.String(&u.email)
+        }
+        return nil
+    }
+    func (u *user) NKeys() int {
+        return 3
+    }
+    func main() {
+        u := &user{}
+        d := []byte(`{"id":1,"name":"gojay","email":"PI:EMAIL"},"name":"gojay2"`)
+        err := gojay.UnmarshalJSONObject(d, u)
+        if err != nil {
+            //log.Fatal(err)
+        }
+        println(u.name);  // 取最前面的key的值，也就是gojay，而不是gojay2
+    }
+# 总结
+评估思路比较简单：
+  * 识别攻击面
+  * api关注身份认证和鉴权
+  * 插件关注业务逻辑
+openresty配置中的api也是攻击面，下一篇再写。
+> 说一个题外话：apisix的插件机制提供了很好的扩展能力，再加上openresty的高性能，或许拿来做waf架构很合适。

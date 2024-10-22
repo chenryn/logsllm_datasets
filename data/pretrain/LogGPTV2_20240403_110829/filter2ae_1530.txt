@@ -1,0 +1,104 @@
+# Intel CET缓解措施深度研究
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00 TL;DR
+上⼀篇⽂章中已经简单介绍过了CET的基本原理和实际应⽤的⼀些技术，站在防守⽅的视⻆下，CET确实是⼀个能
+⽐较有效防御ROP攻击技术的措施。那么在攻击者的视⻆来看，研究清楚CET的技术细节，进⽽判断CET是否是⼀
+个完美的防御⽅案，还是存在⼀定的局限性，则是攻击⽅的重中之重。
+本⽂由浅⼊深地讲述CET的实现细节，最后提出⼏个理论可⾏的绕过⽅案，供研究者参考。
+## 0x01 Shadow Stack Overview
+上⼀篇⽂章已经⼤概对CET做了个基本概念介绍，所以就不重复，直接说重点。
+### Shadow Stack PTE
+Shadow Stack本质上是块内存⻚，属于新增的⻚类型，因此需要增加⼀个新的⻚属性来标识Shadow
+Stack。PTE中的⼀些未有被CPU定义的，也有保留给操作系统使⽤的，例如第0位的Present就由CPU标识⻚是否分配。Linux
+操作系统没有将所有保留位都使⽤掉（⽤于别的⽤途），但是其他操作系统则没有剩余可⽤的保留位了，因此从 Linux中取⼀个未使⽤的位，不太可取。
+这⾥Linux采⽤了复⽤很少使⽤的⻚状态（写时复制的状态）：write=0, dirty=1。当Linux需要创建写时复制 write=0,
+dirty=1的⻚时，⽤软件定义的_PAGE_COW代替_PAGE_DIRTY，创建shadow stack时，则使⽤write=0,
+dirty=1。这就将两者区分开来了：
+### Shadow Stack Management Instructions
+为了保证shadow stack的独特性，CET专⻔设计了独有的汇编指令。普通的指令（MOV, XSAVE…）将不被允许操 作shadow stack。
+这⾥重点说SAVEPREVSSP、RSTORSSP。Linux环境下，会存在栈切换的情况（系统调⽤、信号处理…），为了保 证shadow
+stack的正常运作，数据栈切换后shadow stack也需要相应切换，因此就会⽤到这两个指令。
+下图为执⾏RSTORSSP指令前后的shadow stack状态变化。执⾏的操作为先将SSP指针指向new shadow stack的 ‘restore
+token’，即0x4000。然后⽤current（old） shadow stack的地址做‘new restore token’替换掉‘restore
+token’，⽤于后续的SAVEPREVSSP指令使⽤。
+下图为执⾏SAVEPREVSSP指令前后的变化。执⾏的操作为将前⾯设置的‘new restore token’压⼊previous shadow
+stack中，并将标志位置0。然后将SSP指针加1。
+⾄此，就完成了shadow stack切换的整个过程。
+## 0x02 Shadow Stack Implementation
+这⾥不提及Shadow Stack的普遍情况（⻅上⼀篇⽂章），只研究Shadow Stack在⼀些特殊场景下的实现，在这些 场景中光申请Shadow
+Stack⻚后做push/pop操作是不够的，往往需要更复杂的实现。
+### Signal
+⼀般⽤户需要对某个信号做⾃定义的特殊处理时，就会⽤到信号。对应的函数为signal()、sigaction()：
+当捕获信号到执⾏信号处理函数再到恢复正常执⾏的整个过程中，会经历进程挂起、Ring0和Ring3间的切换、上下⽂切换等操作，这都需要shadow
+stack作出相应的变化，否则就会出现不可知的异常。下图是信号处理期间进程的变化。
+以signal函数举例，在glibc中它的具体实现为下⾯所示，最终会调⽤rt_sigaction去注册信号。
+再看CET的实现，它在 **setup_rt_frame 函数中添加了shadow stack相关的操作函数，** setup_rt_frame 函
+数会在信号处理过程中被调⽤，即上⾯信号处理期间进程变化的图中②的期间：
+上⾯新增的 setup_signal_shadow_stack 函数，参数restorer即为前⾯ **libc_sigaction 函数中提到的**
+NR_rt_sigreturn 系统调⽤，且该参数后续会被push到shadow stack中去作为新的函数返回地址。
+相应地，再看 __NR_rt_sigreturn 系统调⽤的实现，该调⽤会在上⾯信号处理期间进程变化的图中④执⾏，CET 也在该处做了相应的改动：
+从上⾯ rt_sigreturn 新增代码结合 __setup_rt_frame 新增代码可知，两者是相互配合的：⼀个负责创建 restore
+token并在shadow stack设置返回地址，另⼀个则负责校验restore token并设置新的ssp，以此来兼容在
+信号处理过程中数据栈切换、上下⽂切换的场景。
+⾄于为什么要在创建restore token后设置shadow
+stack返回地址，是因为在信号处理过程中执⾏完sa_handler⽤户⾃定义函数后，紧接着就会执⾏sa_restorer所设置的函数，因此在CET场景下需要在shadow
+stack设置相应的返回地址。
+### Fork
+调⽤fork后，存在两种情况：
+  1. ⼦进程和⽗进程分别有⾃⼰的⼀块内存，不共享；
+  2. ⼦进程和⽗进程共享同⼀块内存，为vfork。
+因此，在shadow stack场景下，需要对fork系统调⽤做特殊处理。fork调⽤链如下：
+CET在copy_thread函数中添加了相关代码：
+从上⾯新增的代码可知，CET针对fork系统调⽤过程增加了创建新的shadow stack的部分，以兼容fork后⽗⼦进程
+不共享内存的情况。同时也对vfork后⽗⼦进程共享内存的情况做了处理，使得不创建新的shadow stack以兼容相应场景。
+Ucontext
+ucontext涉及到协程相关的技术，该技术和系统调⽤在R3、R0间的切换⽐较类似。但是该技术作⽤于⽤户态，⽬
+的是给⽤户态程序提供更快的切换效果，以及使得⽤户态的代码能够更加灵活。在⽤户态层⾯实现上下⽂切换。常⽤的函数为getcontext/setcontext：
+setjmp/longjmp的技术原理和实现和ucontext类似，就不提及了。getcontext/setcontext具体实现都在glibc中。ucontext协程技术涉及到上下⽂切换的场景，也会存在数据栈切换的情况，因此，shadow
+stack也需要做出相应 的动作。
+先看shadow stack在getcontext中的改动，先⽤ __NR_arch_prctl 系统调⽤获取当前shadow stack的基地址，其
+次将其保存在SSP_BASE_OFFSET寄存器中，随后保存shadow stack基地址、ssp值在ucontext结构体中，供后续
+setcontext使⽤：
+再来看setcontext中的改动，校验getcontext保存的ucontext中的shadow stack基地址和ssp，再恢复，达到切换
+回上⽂状态的⽬的：
+上⾯getcontext/setcontext的场景，是在同⼀块shadow
+stack中实现切换，因为进程并没有创建新的数据栈。此外，makecontext会创建⼀个新的数据栈，开辟⼀个新的上下⽂，和上⾯的场景⼜有些许不同，makecontext和
+setcontext也都做了相应的改动，由于篇幅原因不过多叙述，读者⾃⾏阅读源码即可，技术原理都是⼀样的。
+## 0x03 CET Bypass
+CET在多场景下的实现还是相对复杂的，需要软件层⾯做相应的配合，因此在复杂的设计实现层⾯，是否有可能存
+在绕过CET的可能性呢？本⼩节提出⼏个理论可⾏的⽅案供研究者参考。
+### Overwrite Function
+该⽅法⽐较简单粗暴，篡改结构体中的函数指针来控制执⾏流。假设现有如下代码：
+调⽤结构体函数（1）处的汇编代码如下：
+此时有间接call，IBT机制会起作⽤，call rax后⼀条指令必须为ENDBR64。
+如果此时拥有任意读写的能⼒，就可以篡改结构体str1的test函数指针为over_write（2）即可改变执⾏流。且此时
+over_write函数的⼊⼝点也是ENDBR64，即可绕过IBT的检查：
+IBT机制会给绝⼤部分函数体的⼊⼝点添加ENDBR指令，因此这种⽅法还是可⾏的，实际测试：
+扩展⼀下，还可以利⽤JOP去做。例如使⽤以下序列，也可以绕过CET：
+但是这种JOP序列实际上是⽐较稀少的，难找到。
+### Migrate Shadow Stack by RSTORSSP
+这种⽅案利⽤了CET新增的指令来做⽂章。前⾯已经介绍过了RSTORSSP，⽤于shadow stack的切换，那么如果切 换到的是攻击者伪造的shadow
+stack呢？
+整个过程⽐较简单，步骤如下：
+  1. 构造⼀块可控内存；
+  2. 在可控内存中事先构造好返回地址，后续作为shadow stack使⽤；
+  3. 将内存转变为shadow stack；
+  4. 构造ROP；
+  5. ROP利⽤rstorssp将原shadow stack迁移到伪造的shadow stack中；
+  6. ROP执⾏system。
+CET针对mmap和mprotect都做了相应的改动，在mmap中主要增加了⼀个VMA_FLAG为VM_SHADOW_STACK的
+属性，在mprotect中除了PROT_READ/PROT_WRITE外增加了PROT_SHADOW_STACK（有⼀点是PROT_WRITE和
+PROT_SHADOW_STACK不能同时使⽤，即只读），这两者是互相对应的关系。简单编写了这种⽅案的demo：
+调试效果如下，可⻅当前已经将shadow stack切换到事先伪造的内存⻚中，且返回地址也篡改得和数据栈返回地址 相同，为0x41414141：
+最终，RIP也能成功执⾏到控制的执⾏流：
+不过这种⽅法在实际场景中构造的要求⽐较⾼，局限性⽐较⼤。
+当然了，还有更粗暴的⽅法，CET新增指令还有⼀个WRSS的指令，该指令可以直接在shadow stack中写数据。但
+是该指令需要在CPU上做使能操作，⽬前笔者阅读的源码暂时还没有使能，就不赘述了。
+## 0x04 Summary
+CET与以往软件实现的CFI不同，它从硬件侧寻找解决⽅案，在底层就将ROP掐断，对于软件CFI来说从性能、缓解效果⻆度来说都有着极⼤的提升。有得必有失，底层的变动必然会撬动上层随之变化，想要将这⼀缓解措施真正实
+施落地，还有着很⻓的⼀段路要⾛。笔者略浅地研究了⼀番CET当前的实施进展，提出了部分攻防⽅向上的想法，
+供后续研究者参考。我相信在不远的将来，CET的落地会给攻防带来很⼤的变化，到时候⼜将摩擦出怎样的⽕花？让我们⼀起期待吧。
+## 0x05 Reference
+https://lore.kernel.org/lkml/PI:EMAIL/

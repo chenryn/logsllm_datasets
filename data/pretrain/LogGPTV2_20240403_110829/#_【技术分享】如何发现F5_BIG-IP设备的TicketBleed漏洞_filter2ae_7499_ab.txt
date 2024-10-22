@@ -1,0 +1,117 @@
+     261
+     262     msg, err := c.readHandshake()
+     263     if err != nil {
+     264         return err
+     265     }
+这是doFullHandshake函数。等等，这里的服务器显然正在进行会话复用（在Server Hello之后立即发送一个Change Cipher
+Spec），而客户端正在尝试进行完整握手？
+看起来情况是,客户端提供Session Ticket，服务器接受它，但是客户端并不知道并继续执行下去。
+**深入RFC**
+在这一点上，我查阅了TLS 1.2的相关信息,以了解服务器是如何表示接受Session Ticket？
+[RFC 5077](https://tools.ietf.org/html/rfc5077),过时的RFC 4507：
+当携带一个ticket时,客户端会在TLS ClientHello中生成并包含一个Session ID. 如果服务器接收了ticket并且Session
+ID不为空,它必须马上返回与ClientHello相同的Session ID.
+因此，客户端不应该猜测是否Session Ticket会被接受, 客户端应该发送一个Session ID并在服务器的回显中查找这个Session ID。
+crypto/tls中的代码很明显的说明了这一点。
+    func (hs *clientHandshakeState) serverResumedSession() bool {  
+        // If the server responded with the same sessionId then it means the
+        // sessionTicket is being used to resume a TLS session.
+        return hs.session != nil && hs.hello.sessionId != nil &&
+            bytes.Equal(hs.serverHello.sessionId, hs.hello.sessionId)
+    }
+**深入分析Session IDs**
+一定是这里出错了。让我们加入一些基于打印输出的调试。
+    diff --git a/src/crypto/tls/handshake_client.go b/src/crypto/tls/handshake_client.go  
+    index f789e6f888..2868802d82 100644  
+    --- a/src/crypto/tls/handshake_client.go
+    +++ b/src/crypto/tls/handshake_client.go
+    @@ -552,6 +552,8 @@ func (hs *clientHandshakeState) establishKeys() error {
+     func (hs *clientHandshakeState) serverResumedSession() bool {
+            // If the server responded with the same sessionId then it means the
+            // sessionTicket is being used to resume a TLS session.
+    +       println(hex.Dump(hs.hello.sessionId))
+    +       println(hex.Dump(hs.serverHello.sessionId))
+            return hs.session != nil && hs.hello.sessionId != nil &&
+                    bytes.Equal(hs.serverHello.sessionId, hs.hello.sessionId)
+     }
+    00000000  a8 73 2f c4 c9 80 e2 ef  b8 e0 b7 da cf 0d 71 e5  |.s/...........q.|
+    00000000  a8 73 2f c4 c9 80 e2 ef  b8 e0 b7 da cf 0d 71 e5  |.s/...........q.|  
+    00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+F5服务器将Session ID填充到它的最大长度32字节，而不是当客户端发送它时再返回它。crypto / tls在Go中使用16字节会话ID。
+从这里看错误就很明显了：服务器认为它告诉客户端使用Ticket而客户端认为服务器启动了新会话，于是意外就发生了。
+在TLS空间中，我们发现了一些不兼容性。为了[不与某些服务器实现发生冲突](https://bugs.chromium.org/p/chromium/issues/detail?id=315828),ClientHellos必须小于256字节或大于512字节。
+    00000000  79 bd e5 a8 77 55 8b 92  41 e9 89 45 e1 50 31 25  |y...wU..A..E.P1%|
+    00000000  79 bd e5 a8 77 55 8b 92  41 e9 89 45 e1 50 31 25  |y...wU..A..E.P1%|  
+    00000010  04 27 a8 4f 63 22 de 8b  ef f9 a3 13 dd 66 5c ee  |.'.Oc".......f.|
+噢哦。等等。这些不是零也不是填充。那是…内存？
+在这一点上，和Heartbleed的处理类似。服务器申请和客户端的会话ID一样大的缓冲区，然后总是返回32个字节的数据，在额外的字节里携带着未分配的内存数据。
+**深入浏览器**
+我最后一个疑问是：为什么之前没有发现这个漏洞？
+答案是:所有浏览器使用32字节的SESSION ID来协商SESSION TICKET。我和Nick
+Sullivan一起检查了NSS，OpenSSL和BoringSSL来确认这个问题。[以BoringSSL](https://github.com/google/boringssl/blob/33fe4a0d1406f423e7424ea7367e1d1a51c2edc1/ssl/handshake_client.c#L1901-L1908)为例。
+      /* Generate a session ID for this session based on the session ticket. We use
+       * the session ID mechanism for detecting ticket resumption. This also fits in
+       * with assumptions elsewhere in OpenSSL.*/
+      if (!EVP_Digest(CBS_data(&ticket), CBS_len(&ticket),
+                      session->session_id, &session->session_id_length,
+                      EVP_sha256(), NULL)) {
+        goto err;
+      }
+BoringSSL使用SHA256作为SESSION TICKET，正好是32个字节。
+(有趣的是，在TLS中，有人提到使用1字节的SESSION ID，但是没有人对它进行测试。)
+至于Go，可能是客户端没有启用SESSION TICKET。
+**深入披露**
+在意识到这个问题的影响之后，我们在公司内部进行了分享,我们的支持团队会建议客户禁用SESSION TICKET，并试图联系F5。
+我们与F5 SIRT联系，交换PGP密钥，并提供报告和PoC。
+报告已提交给开发团队，确定问题是未初始化的内存，但是仅限于Session Ticket功能。
+目前还不清楚哪些数据可以通过此漏洞泄露，但是HeartBleed和[Cloudflare Heartbleed
+Challenge](https://blog.cloudflare.com/the-results-of-the-cloudflare-challenge/)告诉我们未初始化的内存是不安全的
+在规划时间表时，F5团队面临着严格的发布计划。综合考虑多种因素，包括有效的缓解（禁用Session Ticket），我决定采用由[Google's
+Project
+Zero发布的业界标准的披露政策](https://googleprojectzero.blogspot.co.uk/2015/02/feedback-and-data-driven-updates-to.html)：在115天之后,如果漏洞没有被修复,就会被披露。
+巧合的是今天正好是计划发布修复补丁的截至日期。
+我要感谢F5 SIRT的专业性，透明度和协作性，这和我们在业内经常听到的对抗性形成鲜明对比。
+该漏洞已分配CVE-2016-9244。
+**  
+**
+**深入互联网**
+当我们向F5报告问题时，我已经针对单个主机测试了该漏洞，该主机在禁用Session
+Ticket后很快变得不可用。这意味着漏洞具有低信度，并且没有办法再现它。
+这是进行互联网扫描的绝佳场合。我选择了由密歇根大学授权Censys.io的工具包：zmap和zgrab。
+zmap是一种用于检测开放端口的IPv4空间扫描工具，而zgrab是一种Go工具，通过连接到这些端口并收集大量协议详细信息来进行跟踪。
+我在zgrab添加对Session
+Ticket复用的支持，然后让zgrab发送一个31字节的会话ID，并将其与服务器返回的ID进行比较。我写了一个简单的Ticketbleed检测器。
+    diff --git a/ztools/ztls/handshake_client.go b/ztools/ztls/handshake_client.go  
+    index e6c506b..af098d3 100644  
+    --- a/ztools/ztls/handshake_client.go
+    +++ b/ztools/ztls/handshake_client.go
+    @@ -161,7 +161,7 @@ func (c *Conn) clientHandshake() error {
+                    session, sessionCache = nil, nil
+                    hello.ticketSupported = true
+                    hello.sessionTicket = []byte(c.config.FixedSessionTicket)
+    -               hello.sessionId = make([]byte, 32)
+    +               hello.sessionId = make([]byte, 32-1)
+                    if _, err := io.ReadFull(c.config.rand(), hello.sessionId); err != nil {
+                            c.sendAlert(alertInternalError)
+                            return errors.New("tls: short read from Rand: " + err.Error())
+    @@ -658,8 +658,11 @@ func (hs *clientHandshakeState) processServerHello() (bool, error) {
+            if c.config.FixedSessionTicket != nil {
+                    c.resumption = &Resumption{
+    -                       Accepted:  hs.hello.sessionId != nil && bytes.Equal(hs.serverHello.sessionId, hs.hello.sessionId),
+    -                       SessionID: hs.serverHello.sessionId,
+    +                       Accepted: hs.hello.sessionId != nil && bytes.Equal(hs.serverHello.sessionId, hs.hello.sessionId),
+    +                       TicketBleed: len(hs.serverHello.sessionId) > len(hs.hello.sessionId) &&
+    +                               bytes.Equal(hs.serverHello.sessionId[:len(hs.hello.sessionId)], hs.hello.sessionId),
+    +                       ServerSessionID: hs.serverHello.sessionId,
+    +                       ClientSessionID: hs.hello.sessionId,
+                    }
+                    return false, FixedSessionTicketError
+            }
+选择31字节的原因是我可以确保不泄露敏感信息。
+然后，我从Censys网站下载最近的扫描结果，其中包括什么主机支持Session Ticket信息，并使用pv和jq完成了管道。
+在11月份的Alexa top 1m列表中的前1,000个主机中有2个存在漏洞，我中断了扫描，避免泄露漏洞，并推迟到了披露日期。
+在完成这篇指导时，我完成了扫描，0.1％和0.2％的主机容易受到攻击，0.4％的网站支持Session Ticket。
+**阅读更多**
+欲了解更多详情，请访问[F5
+K05121675文章](https://support.f5.com/csp/article/K05121675)或[ticketbleed.com](https://ticketbleed.com/)，在那里你会发现一个技术总结，受影响的版本，缓解指令，一个完整的时间表，扫描结果，扫描机器的IP地址，并可以进行在线测试。
+否则，你应该[关注我的Twitter](https://twitter.com/FiloSottile)。

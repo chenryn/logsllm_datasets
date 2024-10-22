@@ -1,0 +1,196 @@
+## PostgreSQL 排序去重limit查询优化 - 递归 vs group分组 (loop降到极限, block scan降到极限)     
+### 作者  
+digoal  
+### 日期  
+2020-05-15  
+### 标签  
+PostgreSQL , 递归 , 去重     
+----  
+## 背景  
+数据结构介绍, (不要想改数据结构(因为其他业务需要))    
+简化例子:   
+```  
+create extension hll;   
+create table tab1 (  
+  vid int8, -- 有重复值, 一个表里面每个VID 可能有100条  
+  score numeric, -- 同一个vid有多条记录, 同一个vid的多条记录score完全相同. 不同vid的score可能相同也可能不同  
+  other_col int -- 其他属性  
+);   
+```  
+写入1亿测试数据   
+```  
+insert into tab1 select generate_series(1,1000000),   
+generate_series(1,1000000)/10000000000000::numeric ,   
+random()*10000 from generate_series(1,100);  
+```  
+写入若干条重复score, 不同vid的数据.   
+```  
+insert into tab1 select generate_series(1000001,1000009),   
+(1000000-9)/10000000000000::numeric,   
+random()*10000 from generate_series(1,100);  
+```  
+创建表B, 使用hll存储一些unique value, 用于本文的测试查询过滤条件  
+```  
+create table tab2 (uid int8, vids hll);  
+```  
+查询时过滤这些hll包含的 ID  
+```  
+insert into tab2 values   
+(1,  
+hll_empty() || hll_hash_bigint(1000000) || hll_hash_bigint(1000000-1) || hll_hash_bigint(1000000-5) || hll_hash_bigint(1000000-8)  
+);     
+```  
+查询需求:   
+- 第一部分需求:  
+    - 按score倒排, 每个VID仅取一条,   
+- 第二部分需求:  
+    - 并且使用tab2.vids过滤tab1中的vid  
+创建索引:   
+```  
+create index idx_tab1_1 on tab1 (score desc,vid);  
+```  
+第一部分(按score倒排, 每个VID仅取一条)可以这么查询:    
+```  
+select distinct on (score,vid) vid,score from tab1 order by score desc,vid limit 20;  
+select vid,score from tab1 group by score,vid order by score desc,vid limit 20;  
+```  
+```  
+   vid   |           score              
+---------+----------------------------  
+ 1000000 | 0.000000100000000000000000  
+  999999 | 0.000000099999900000000000  
+  999998 | 0.000000099999800000000000  
+  999997 | 0.000000099999700000000000  
+  999996 | 0.000000099999600000000000  
+  999995 | 0.000000099999500000000000  
+  999994 | 0.000000099999400000000000  
+  999993 | 0.000000099999300000000000  
+  999992 | 0.000000099999200000000000  
+  999991 | 0.000000099999100000000000  
+ 1000001 | 0.000000099999100000000000  
+ 1000002 | 0.000000099999100000000000  
+ 1000003 | 0.000000099999100000000000  
+ 1000004 | 0.000000099999100000000000  
+ 1000005 | 0.000000099999100000000000  
+ 1000006 | 0.000000099999100000000000  
+ 1000007 | 0.000000099999100000000000  
+ 1000008 | 0.000000099999100000000000  
+ 1000009 | 0.000000099999100000000000  
+  999990 | 0.000000099999000000000000  
+(20 rows)  
+```  
+```  
+postgres=> explain (analyze,verbose,timing,costs,buffers)   
+select distinct on (score,vid) vid,score   
+from tab1 order by score desc,vid limit 20;  
+                                                                            QUERY PLAN       
+---------------------------------------------------------------------------------------------------------------------------------------------------------  
+ Limit  (cost=0.57..70.50 rows=20 width=16) (actual time=0.017..1.041 rows=20 loops=1)  
+   Output: vid, score  
+   Buffers: shared hit=1076  
+   ->  Result  (cost=0.57..34965244.98 rows=10000090 width=16) (actual time=0.016..1.035 rows=20 loops=1)  
+         Output: vid, score  
+         Buffers: shared hit=1076  
+         ->  Unique  (cost=0.57..34965244.98 rows=10000090 width=16) (actual time=0.015..1.030 rows=20 loops=1)  
+               Output: score, vid  
+               Buffers: shared hit=1076  
+               ->  Index Only Scan using idx_tab1_1 on public.tab1  (cost=0.57..34465240.50 rows=100000896 width=16) (actual time=0.013..0.683 rows=1901 loops=1)  
+                     Output: score, vid  
+                     Heap Fetches: 1901  
+                     Buffers: shared hit=1076  
+ Planning Time: 0.092 ms  
+ Execution Time: 1.062 ms  
+(15 rows)  
+postgres=> explain (analyze,verbose,timing,costs,buffers)   
+select vid,score from tab1   
+group by score,vid order by score desc,vid limit 20;  
+                                                                         QUERY PLAN     
+---------------------------------------------------------------------------------------------------------------------------------------------------------  
+ Limit  (cost=0.57..70.50 rows=20 width=16) (actual time=0.016..1.037 rows=20 loops=1)  
+   Output: vid, score  
+   Buffers: shared hit=1076  
+   ->  Group  (cost=0.57..34965244.98 rows=10000090 width=16) (actual time=0.016..1.032 rows=20 loops=1)  
+         Output: vid, score  
+         Group Key: tab1.score, tab1.vid  
+         Buffers: shared hit=1076  
+         ->  Index Only Scan using idx_tab1_1 on public.tab1  (cost=0.57..34465240.50 rows=100000896 width=16) (actual time=0.014..0.692 rows=1901 loops=1)  
+               Output: score, vid  
+               Heap Fetches: 1901  
+               Buffers: shared hit=1076  
+ Planning Time: 0.091 ms  
+ Execution Time: 1.055 ms  
+(13 rows)  
+```  
+结合第二部分需求, sql如下:  
+```  
+explain (analyze,verbose,timing,costs,buffers)   
+with tmp as (select vids from tab2 where uid=1)   
+select t1.vid,t1.score from tab1 t1,tmp   
+where (tmp.vids || hll_hash_bigint(t1.vid) <> tmp.vids)   
+group by t1.score,t1.vid    
+order by t1.score desc,t1.vid limit 20;   
+```  
+```  
+   vid   |           score              
+---------+----------------------------  
+  999998 | 0.000000099999800000000000  
+  999997 | 0.000000099999700000000000  
+  999996 | 0.000000099999600000000000  
+  999994 | 0.000000099999400000000000  
+  999993 | 0.000000099999300000000000  
+  999991 | 0.000000099999100000000000  
+ 1000001 | 0.000000099999100000000000  
+ 1000002 | 0.000000099999100000000000  
+ 1000003 | 0.000000099999100000000000  
+ 1000004 | 0.000000099999100000000000  
+ 1000005 | 0.000000099999100000000000  
+ 1000006 | 0.000000099999100000000000  
+ 1000007 | 0.000000099999100000000000  
+ 1000008 | 0.000000099999100000000000  
+ 1000009 | 0.000000099999100000000000  
+  999990 | 0.000000099999000000000000  
+  999989 | 0.000000099998900000000000  
+  999988 | 0.000000099998800000000000  
+  999987 | 0.000000099998700000000000  
+  999986 | 0.000000099998600000000000  
+(20 rows)  
+```  
+```  
+ Limit  (cost=25.57..133.47 rows=20 width=16) (actual time=0.626..3.477 rows=20 loops=1)  
+   Output: t1.vid, t1.score  
+   Buffers: shared hit=1475 read=4 dirtied=1  
+   I/O Timings: read=0.619  
+   CTE tmp  
+     ->  Seq Scan on public.tab2  (cost=0.00..25.00 rows=6 width=32) (actual time=0.309..0.310 rows=1 loops=1)  
+           Output: tab2.vids  
+           Filter: (tab2.uid = 1)  
+           Buffers: shared read=1 dirtied=1  
+           I/O Timings: read=0.299  
+   ->  Group  (cost=0.57..53950415.15 rows=10000090 width=16) (actual time=0.625..3.471 rows=20 loops=1)  
+         Output: t1.vid, t1.score  
+         Group Key: t1.score, t1.vid  
+         Buffers: shared hit=1475 read=4 dirtied=1  
+         I/O Timings: read=0.619  
+         ->  Nested Loop  (cost=0.57..50965388.40 rows=597005349 width=16) (actual time=0.624..3.098 rows=1901 loops=1)  
+               Output: t1.vid, t1.score  
+               Join Filter: ((tmp.vids || hll_hash_bigint(t1.vid, 0)) <> tmp.vids)  
+               Rows Removed by Join Filter: 400  
+               Buffers: shared hit=1475 read=4 dirtied=1  
+               I/O Timings: read=0.619  
+               ->  Index Only Scan using idx_tab1_1 on public.tab1 t1  (cost=0.57..34465240.50 rows=100000896 width=16) (actual time=0.012..1.190 rows=2301 loops=1)  
+                     Output: t1.score, t1.vid  
+                     Heap Fetches: 2301  
+                     Buffers: shared hit=1475 read=3  
+                     I/O Timings: read=0.320  
+               ->  CTE Scan on tmp  (cost=0.00..0.12 rows=6 width=32) (actual time=0.000..0.000 rows=1 loops=2301)  
+                     Output: tmp.vids  
+                     Buffers: shared read=1 dirtied=1  
+                     I/O Timings: read=0.299  
+ Planning Time: 0.164 ms  
+ Execution Time: 3.541 ms  
+(32 rows)  
+```  
+## 性能问题在哪?    
+1、循环次数多, 实际上是浪费, 因为每一个分组内的每条记录都在外部   
+```  
+loops=2301   

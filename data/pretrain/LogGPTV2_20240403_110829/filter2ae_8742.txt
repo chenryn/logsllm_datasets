@@ -1,0 +1,68 @@
+# CVE-2020-12388：Firefox沙箱逃逸
+|
+##### 译文声明
+本文是翻译文章，文章原作者 James Forshaw，文章来源：googleprojectzero.blogspot.com
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00 绪论
+在我[上一篇文章](https://googleprojectzero.blogspot.com/2020/04/you-wont-believe-what-this-one-line.html)中讨论了Windows内核对受限令牌的处理方式，利用其中的不当之处可以逃逸Chrome
+GPU沙箱。本来我打算用Firefox来做PoC，因为Firefox对其内容渲染进程采用的沙箱级别和Chrome
+GPU进程在效果上是相同的。这就表示如果Firefox里有内容进程RCE（远程代码执行漏洞），那就可以在沙箱中执行代码，滥用Windows内核的受限令牌存在的问题，这就要严重得多了。
+然而，在研究沙箱逃逸的过程中我发现，Firefox根本无需担心这个问题。就算是Windows的问题修复了，对多进程使用GPU级沙箱也引入了沙箱逃逸的攻击面。本文讨论Chromium沙箱的一些特定行为，以及为何Firefox受到漏洞影响。我还将详细说明我对Chromium沙箱做出的缓解问题的改动，这种缓解方式被Mozilla用来修复我报告的bug。
+为便于参考引用，Project Zero对其分配的issue编号是[2016](https://bugs.chromium.org/p/project-zero/issues/detail?id=2016)，Firefox对其分配的的issue编号是[1618911](https://bugzilla.mozilla.org/show_bug.cgi?id=1618911)。Firefox对沙箱有[自己的分级](https://wiki.mozilla.org/Security/Sandbox)，本文写作时，内容沙箱被定为5级，所以后文我就称其为5级沙箱，而不是GPU沙箱。
+## 0x01 漏洞成因
+问题的根本原因在于，使用5级沙箱，一个内容进程可以打开另一个内容进程进行完全访问。在基于Chromium的浏览器中，这通常不成问题，一次只能运行一个GPU进程，尽管可能同时有其他可访问的非Chromium进程在运行。Chromium中的内容渲染进程使用的沙箱受到更大的限制，并且它们不能打开任何其他进程。
+5级沙箱使用受限令牌作为基本的沙箱强制措施。之所以一个内容进程可以访问别的内容进程，是由于进程主令牌的默认DACL导致的。内容进程的默认DACL在[RestrictedToken::GetRestrictedToken](https://cs.chromium.org/chromium/src/sandbox/win/src/restricted_token.cc?l=65&rcl=f3935204227f849df0c15827e65d95348cf1c743)中设置，默认DACL授予以下用户完全访问：
+用户 | 访问权  
+---|---  
+当前用户 | 完全访问  
+`NT AUTHORITYSYSTEM` | 完全访问  
+`NT AUTHORITYRESTRICTED` | 完全访问  
+Logon SID | 读和执行  
+默认DACL用于设置初始的进程和线程安全描述符，5级沙箱使用的令牌等级是[USER_LIMITED](https://cs.chromium.org/chromium/src/sandbox/win/src/restricted_token_utils.cc?l=135&rcl=89183689bf398e20364fb78b0db4527e5b9ebb64)，禁用了大多数组，除了：
+  * 当前用户
+  * `BUILTINUsers`
+  * `Everyone`
+  * `NT AUTHORITYINTERACTIVE`
+  * Logon SID
+除此之外，还加入了下列受限SID：
+  * `BUILTINUsers`
+  * `Everyone`
+  * `NT AUTHORITYRESTRICTED`
+  * Logon SID.
+当前用户组和RESTRICTED受限SID组合在一起，将导致授予对沙箱进程的完全访问。
+要理解打开别的内容进程何以成为问题，先要理解Chromium沙箱是怎样初始化新进程的。主令牌在新进程启动时分配，一旦进程启动完毕，主令牌就不能更换了。你可以做删除特权或者降低完整性级别之类的事，但是不能移除组或者增加新的受限SID了。
+新启动的沙箱进程需要进行一些初始化操作，而它被授予的受限沙箱令牌的权限可能不足以进行这些操作，所以Chromium用了一个技巧：把一个特权更高的模拟令牌先分配给初始线程，以进行初始化操作。对5级沙箱而言，初始令牌的等级是[USER_RESTRICTED_SAME_ACCESS](https://cs.chromium.org/chromium/src/sandbox/win/src/restricted_token_utils.cc?l=85&rcl=89183689bf398e20364fb78b0db4527e5b9ebb64)，这个等级仅仅是创建了一个没有任何禁用组、所有常规组都被加入到受限SID的令牌，而这样的令牌几乎等同于一个普通令牌，只是被看作是一个受限令牌而已。如果主令牌是受限令牌的话，Windows会阻止设置令牌，但是模拟令牌则不会。
+一旦初始化完毕，沙箱就会调用[LowerToken](https://cs.chromium.org/chromium/src/sandbox/win/src/target_services.cc?l=131&rcl=89183689bf398e20364fb78b0db4527e5b9ebb64)函数丢弃模拟令牌，这就意味着从新沙箱进程启动到调用LowerToken之间有一段空窗期，在此期间进程相当于是没有沙箱化的（除了完整性级别是低）。如果在模拟令牌被丢弃前劫持执行流，就可以获得足够权限逃逸沙箱。
+与Chrome
+GPU进程不同的是，Firefox在正常使用过程中会定期创建一个新的内容进程。创建一个新标签页就会创建一个新进程。因此只要有一个被攻破的内容进程，它就可以等待新进程创建然后立刻劫持之。被攻破的渲染进程应该可以通过IPC调用强制新进程创建，但是我没深入研究过。
+借助这些知识，我开发了一个完整的POC，其中使用了许多前篇博文中使用的方法。USER_RESTRICTED_SAME_ACCESS令牌拥有的特权更高，这就使利用过程简化了。比如我们不再需要劫持COM服务器的线程，因为这个更高特权的令牌允许我们直接打开进程。此外，重要的是，我们根本无需逃逸受限沙箱，所以这个漏洞利用不依赖于前篇文章里微软已经修复的内核bug。可以在[issue](https://bugs.chromium.org/p/project-zero/issues/detail?id=2016)里找到完整POC，我在下图中总结了步骤。
+## 0x02 漏洞修补
+在我的报告中提出了一个修补方法：在沙箱策略中启用[SetLockdownDefaultDacl](https://cs.chromium.org/chromium/src/sandbox/win/src/sandbox_policy_base.cc?l=389&rcl=3cf5f883d04a46bc0a54c20f238843feea1792e0)选项。SetLockdownDefaultDacl将把RESTRICTED和Logon
+SIDs都从默认DACL中移除出去，阻止5级沙箱进程打开别的沙箱进程。我之前为了解决前篇博文所述的[GPU沙箱逃逸](https://bugs.chromium.org/p/chromium/issues/detail?id=595834)问题（lokihardt在Pwn2Own上利用了这个问题）而加入了这个沙箱策略功能。不过当时的目的是阻止GPU进程打开渲染进程，而不是阻止GPU进程互相打开。所以策略没有应用于GPU沙箱，只用在了渲染进程。
+其实我并非首个报告Firefox内容进程可以互相打开这一问题的人，[Niklas
+Baumstark](https://twitter.com/_niklasb)在我报告的一年前就报告了此问题。我所提出的修补方法已经被尝试用于修复Niklas报告的问题，但是结果搞坏了许多东西，包括DirectWrite缓存、音频播放，还导致了严重的性能恶化，这就使SetLockdownDefaultDacl不太可行。之所以DirectWrite缓存之类的东西被搞坏，是由于Windows
+RPC服务中常见的一种代码模式导致的：
+     int RpcCall(handle_t handle, LPCWSTR some_value) {
+      DWORD pid;
+      I_RpcBindingInqLocalClientPID(handle, &pid);
+      RpcImpersonateClient(handle);
+      HANDLE process = OpenProcess(PROCESS_ALL_ACCESS, nullptr, pid);
+      if (!process)
+        return ERROR_ACCESS_DENIED;
+      ...
+    }
+这份示例代码运行于某个特权服务中，被沙箱程序通过RPC调用。代码首先调用RPC运行时来查询调用者的进程ID，然后模拟调用者，试图打开调用进程得到句柄，如果打开进程失败，RPC调用返回拒绝访问错误。
+对于一般的程序而言，当然可以合理假设调用者能够访问自己的进程，但是，一旦我们对进程的安全权限进行锁定（lockdown），这个假设就不再成立了。我们在阻止沙箱进程访问同级别的进程的同时，也阻止了它打开自己的进程。通常情况下这不成问题，因为多数代码都会使用当前进程的伪句柄，伪句柄根本就不会经过访问权限检查。
+Niklas的[报告](https://bugzilla.mozilla.org/show_bug.cgi?id=1554110)没有包含完整的沙箱逃逸，再加上修复此问题的难度，导致了这个问题的修复陷入了停滞。但是，现在有了完整的沙箱逃逸，展示这个问题的严重性，Mozilla就必须在性能和安全间做出抉择，除非有其他的修补方式出现。因为我是Chromium的贡献者，还负责Windows沙箱，我觉得更应该由我去修复这个问题，而非Mozilla，因为他们依赖于我们的代码。
+修复问题必须做两件事：
+  * 授予进程访问自己的进程和线程的权限
+  * 拒绝访问同级别的其他进程
+因为没有管理员权限，所以诸如[内核进程回调](https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutine)的许多思路都行不通。修复必须完全基于用户模式和普通用户权限。
+修复问题的关键在于，受限SID的列表允许包含令牌的现有组中没有的SID。我们可以为每个沙箱进程生成一个随机SID，将其加入受限SID和默认DACL中，然后用SetLockdownDefaultDacl锁定默认DACL。
+打开进程时，访问检查首先进行常规检查，对当前用户SID进行匹配，然后进行受限SID检查，对随机SID进行匹配。这对RPC也同样有效。但是，每个内容进程都有不同的随机SID，所以虽然常规检查能通过，但是受限SID检查无法通过。这就达成了我们的目的。可以在[PolicyBase::MakeTokens](https://cs.chromium.org/chromium/src/sandbox/win/src/sandbox_policy_base.cc?l=418&rcl=11c92d48f99d8d5c1bf08a09655125f096e5900a)中查看实现代码。
+我将补丁加入到了Chromium仓库中，Firefox合并且测试了补丁。补丁成功阻止了攻击面，而且看起来没有导致性能问题。我说“看起来”是因为无法确知我们的修复是不是打破了哪个RPC服务或者其他什么代码依赖的某些特定行为。现在这部分代码已在Firefox
+76中发布，所以如果出什么问题的话肯定会暴露出来的。
+这个修复还有个问题，它是需要自愿启用的（opt-in），系统上所有进程都要启用缓解措施，包括所有Chromium浏览器和使用Chromium内核的程序，比如Electron。比如，如果Chrome没更新，那么Firefox内容进程可以杀死Chrome的GPU进程，这就会导致Chrome重启GPU进程，而Firefox进程可以劫持新GPU进程，借助Chrome实现逃逸。因此，虽然不能直接利用该漏洞，我还是在Chromium
+GPU进程上启用了缓解措施，这个修改在2020年4月底的M83（以及微软Edge 83）中发布。
+总之，本文展示了Firefox沙箱逃逸，导致需要在Chromium沙箱中加入一个新功能。与前篇博文不同的是，无需对Windows代码进行修改即可解决此问题。话虽如此，我们能够修复问题而又不破坏什么重要的东西，这点是我们走运。下次可能就没那么简单了。

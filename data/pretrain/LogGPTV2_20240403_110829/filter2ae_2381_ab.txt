@@ -1,0 +1,72 @@
+    ...
+    if(kull_m_process_getProcessIdForName(L"lsass.exe", &processId))
+      {
+        if(hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION, FALSE, processId))
+        {
+        if(kull_m_memory_open(KULL_M_MEMORY_TYPE_PROCESS, hProcess, &aLsass.hMemory))
+          {         if(kull_m_process_getVeryBasicModuleInformationsForName(aLsass.hMemory, L"msv1_0.dll", &iMSV))
+            {
+    …
+接下来，在内存中搜索，与我们在WDigest中看到的类似：
+    ...
+    sSearch.kull_m_memoryRange.kull_m_memoryAdress = iMSV.DllBase;
+    sSearch.kull_m_memoryRange.size = iMSV.SizeOfImage;
+    if(pGeneric = kull_m_patch_getGenericFromBuild(MSV1_0AcceptReferences, ARRAYSIZE(MSV1_0AcceptReferences), MIMIKATZ_NT_BUILD_NUMBER))
+    {
+      aLocal.address = pGeneric->Search.Pattern;
+      if(kull_m_memory_search(&aLocal, pGeneric->Search.Length, &sSearch, TRUE))
+      {
+    …
+如果暂停对代码的审查，使用`Ghidra`工具，就可以搜索正在使用的匹配模式，定位到这里：
+在这里，我们可以看到真实内幕：memssp被用于hook
+msv1_0.dll中的`SpAcceptCredentials`函数，以恢复凭证信息。让我们一头扎进调试器中看看添加后该hook是啥样子的。
+首先，我们确认`SpAcceptCredentials`包含一个hook：
+接下来逐步执行，进入到一个负责创建日志文件的存根，方法是在堆栈上构建文件名并将其传递给fopen：
+打开后，传递给`SpAcceptCredentials`的凭据将写入此文件：
+最后执行直接返回到`msv1_0.dll`：
+如果您想查看此hook的源代码，可以在kuhl_m_misc.c的[misc_msv1_0_SpAcceptCredentials](https://github.com/gentilkiwi/mimikatz/blob/72b83acb297f50758b0ce1de33f722e70f476250/mimikatz/modules/kuhl_m_misc.c#L462)函数中找到。
+那么，使用这种技术的风险是什么？我们可以看到上面的hook通过`kull_m_memory_copy`函数复制到了lsass中，实际上使用的是`WriteProcessMemory`。根据环境的不同，`WriteProcessMemory`被另一个进程调用时可能会被检测到，或者被标记为可疑，当这个进程是lsass时就更可疑了。
+现在，探索Mimikatz技术的好处之一是使我们能够改变与lsass交互的过程，使蓝队更难以检测它的活动痕迹。因此，让我们看看我们可以做些什么来实现这一过程。
+## 在没有`WriteProcessMemory`的情况下重新创建memssp
+回顾上述两种技术，可以说各有其优缺点。
+第一种方法（Mimilib）依赖于注册SSP，可通过`EnumerateSecurityPackages`返回一个已注册的SSP列表来定位。另外，如果未修改Mimilib库，则DLL会有许多附加功能。此外，加载`AddSecurityProvider`时，注册表值将被修改，目的是在重新启动系统后能够保留SSP。也就是说，这项技术的一大优势在于，它不需要存在潜在风险的`WriteProcessMemoryAPI`调用即可实现其目标。
+第二种方法（memssp）在很大程度上依赖于受监视的API调用，例如`WriteProcessMemory`，该API用于将hook加载到lsass中。但是，此技术的一大优势是它不会出现在已注册的SSP列表中，也不会存在于已加载的DLL中。
+那么，有没有更好的办法呢？一般这样子问那肯定是有的，那就是把这两种方法结合起来：使用`AddSecurityProvider`来加载代码，同时避免自身出现在已注册的SSP中，以及找到避免直接调用`AddSecurityProvider`API的方法。这种方法应该有助于解决那些令人恼火的AV或EDR（取决于hook该函数）。
+先来看一下`AddSecurityPackage`注册SSP的工作方式，其中涉及一些逆向操作。从公开此API的`Secur32.dll`DLL开始。
+在Ghidra中打开，可以看到，它实际上只是对`sspcli.dll`进行调用的一个封装：
+在sspcli.dll中反汇编上图中的`AddSecurityPackage`，特别是此函数使用的传出API调用，我们可以看到对`NdrClientCall3`的引用，这意味着此函数正在利用RPC。这一步意义非凡，因为此调用需要以某种方式向lsass发出信号，表明应该加载新的SSP：
+跟随对`NdrClientCall3`的调用时，发现它传递了以下参数：
+`nProcNum`参数值为3，如果详探sspirpc_ProxyInfo结构，将RPC接口UUID设为4f32adc8-6052-4a04-8701-293ccf2096f0：
+现在，我们已经掌握了足够多的信息，可以在RpcView来看看通过`sspisrv.dll`公开为`SspirCallRpc`的RPC调用:
+要使用此调用，需要知道传递的参数，可以从RpcView中找到：
+    long Proc3_SspirCallRpc(
+      [in][context_handle] void* arg_0,
+      [in]long arg_1,
+      [in][size_is(arg_1)]/*[range(0,0)]*/ char* arg_2,
+      [out]long* arg_3,
+      [out][ref][size_is(, *arg_3)]/*[range(0,0)]*/ char** arg_4,
+      [out]struct Struct_144_t* arg_5);
+但是，在执行此调用之前，需要知道要作为参数传递的arg_2值（arg_1标记为arg_2的大小，arg_3，arg_4和arg_5都被标记为“
+out”）。我发现执行此操作最简单的方法是：启动调试器并在`AddSecurityPackage`调用`NdrClientCall3`之前添加一个断点：
+暂停执行后，可以转储每个参数中传递的值。使用以下命令获取在arg_1参数传递的缓冲区大小：`dq rsp+0x20 L1`:
+在这种情况下，传递的缓冲区大小为0xEC字节。现在我们可以转储arg_2：
+经过一番探索发现，我能够关联大多数这些值。将输出请求重新格式化为`QWORD`并标记，以便清晰看到要处理的数据：
+现在我们已经映射了要传递的大多数数据，我们可以尝试发出RPC调用，而不必直接调用`AddSecurityPackage`API调用。我为此编写的代码参见[此处](https://gist.github.com/xpn/c7f6d15bf15750eae3ec349e7ec2380e)。
+现在已经无需直接调用`AddSecurityPackage`就可以加载程序，下一步再看看其他骚姿势。
+把`sspisrv.dll`加载进Ghidra，看看如何在服务器端处理RPC调用。我们在反汇编`SspirCallRpc`时遇到的直接问题是执行流程过程是通过`gLsapSspiExtension`传递的：
+这实际上是指向函数数组的指针，通过填充lsasrv.dll并指向`LsapSspiExtensionFunctions`：
+`SspiExCallRpc`与`RPCView`的内容非常相似，这引起了我的兴趣。此函数验证参数并将执行过程传递到`LpcHandler`：
+在最终将执行传递给`DispatchApi`之前，`LpcHandler`负责进一步检查提供的参数：
+同样，系统使用另一个函数指针数组来分派`LpcDispatchTable`指向的调用：
+这是一个很有意思的数组，因为我们很可能会根据名称查找`s_AddPackage`，并且索引也与在请求中找到的0xb“函数ID”索引匹配。
+继续往下走，到达`WLsaAddPackage`函数，该函数检查我们是否有足够的权限调用RPC方法，检查过程为：首先模拟了连接的客户端，然后尝试打开`HKLM\System\CurrentControlSet\Control\Lsa`的注册表项（具备读/写权限），如下图：
+如果成功（注意这可能是一个新的提权后门），则执行过程会转移至`SpmpLoadDll`，该函数被用于将提供的SSP加载到lsass中（通过`LoadLibraryExW`命令）：
+如果成功加载了SSP，则将DLL添加到注册表中以进行自动加载：
+我们可能会跳过最后一点，因为我们不会一直停留在这个过程（比如dump个密码就跑路了），另外最好避免接触注册表。防守方可能会利用像`ProcessExplorer`这样的工具列出lsass进程中我们的DLL，所以最好不要引起他们的怀疑。因此，我们可以使用RPC调用来传递DLL，并通过`DllMain`进程返回一个FALSE来强制我们的SSP加载失败，这将导致跳过修改注册表这一步骤，同时也意味着我们的DLL会从进程中卸载掉。
+使用Mimikatz的`memssp`作为模板，我制作了一个通过RPC调用加载的DLL，它将与Mimikatz一样，使用相同的hook来patch
+`SpAddCredentials`。源代码在[这里](https://gist.github.com/xpn/93f2b75bf086baf2c388b2ddd50fb5d0)
+大家也不受此限制从本地系统加载DLL，因为如果通过RPC调用传递了UNC路径，效果也很好（但应确保目标EDR不会将其标记为可疑）。
+当然，您也不仅限于使用`AddSecurityPackage`加载此DLL 。当我们精心制作了一个独立的DLL来patch
+`memssp`时，可以使用上一篇博文中的SAMR RPC脚本，通过`LoadLibrary`加载我们的DLL，并通过SMB共享写回登录尝试。
+当然，有很多方法可以提高这些示例的有效性，但是与第1部分一样，我希望本文能给大家打开思路，让大家可以diy自己的SSP。尽管本文仅介绍了几种将SSP加载到lsass中的方法，但是通过了解Mimikatz如何提供此功能，在尝试绕过AV或EDR时，大家还是很有希望能够根据环境调整自己的payload，或者用来测试蓝队在`Mimilib`和`memssp`之外的防护功能。
+[原文链接](https://blog.xpnsec.com/exploring-mimikatz-part-2/)

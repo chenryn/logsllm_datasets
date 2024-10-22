@@ -1,0 +1,115 @@
+**作者： Cyku**  
+**原文链接：**
+今日来聊聊在去年某次渗透测试过中发现的趣事，那是在一个风和日丽的下午，与往常一样进行著枯燥的测试环节，对每个参数尝试各种可能的注入，但迟迟没有任何进展和突破，直到在某个页面上注入
+`id=1; waitfor delay '00:00:05'--`，然后他就卡住了，过了恰好 5 秒钟后伺服器又有回应，这表示我们找到一个 SQL
+Server 上的 SQL Injection！
+一些陈旧、庞大的系统中，因为一些复杂的因素，往往仍使用著 sa 帐户来登入 SQL Server，而在有如此高权限的资料库帐户前提下，我们可以轻易利用
+xp_cmdshell
+来执行系统指令以取得资料库伺服器的作业系统控制权，但假如故事有如此顺利，就不会出现这篇文章，所以理所当然我们取得的资料库帐户并没有足够权限。但因为发现的
+SQL Injection 是 Stacked based，我们仍然可以对资料表做 CRUD，运气好控制到一些网站设定变数的话，甚至可以直接达成
+RCE，所以还是试著 dump schema 以了解架构，而在 dump 过程中发现了一个有趣的资料库：
+    Database: ASPState
+    [2 tables]
+    +---------------------------------------+
+    | dbo.ASPStateTempApplications          |
+    | dbo.ASPStateTempSessions              |
+    +---------------------------------------+
+阅读文件后了解到，这个资料库的存在用途是用来保存 ASP.NET 网站应用程式的 session。一般情况下预设 session 是储存在 ASP.NET
+网站应用程式的记忆体中，但某些分散式架构（例如 Load Balance 架构）的情况下，同时会有多个一模一样的 ASP.NET
+网站应用程式运行在不同伺服器主机上，而使用者每次请求时被分配到的伺服器主机也不会完全一致，就会需要有可以让多个主机共享 session 的机制，而储存在
+SQL Server 上就是一种解决方案之一，想启用这个机制可以在 web.config 中添加如下设定：
+            ;password="
+                timeout="20"
+            />
+             -->
+            -->
+而要在资料库中建立 ASPState 的资料库，可以利用内建的工具
+`C:\Windows\Microsoft.NET\Framework\v4.0.30319\aspnet_regsql.exe`
+完成这个任务，只需要使用下述指令即可：
+    # 建立 ASPState 资料库
+    aspnet_regsql.exe -S 127.0.0.1 -U sa -P password -ssadd -sstype p
+    # 移除 ASPState 资料库
+    aspnet_regsql.exe -S 127.0.0.1 -U sa -P password -ssremove -sstype p
+现在我们了解如何设定 session 的储存位置，且又可以控制 ASPState 资料库，可以做到些什么呢？这就是文章标题的重点，取得 Remote
+Code Execution！
+ASP.NET 允许我们在 session 中储存一些物件，例如储存一个 List 物件：`Session["secret"] = new
+List() { "secret string" }`;，对于如何将这些物件保存到 SQL Server
+上，理所当然地使用了序列化机制来处理，而我们又控制了资料库，所以也能执行任意反序列化，为此需要先了解 Session 物件序列化与反序列化的过程。
+简单阅读程式码后，很快就可以定位出处理相关过程的类别，为了缩减说明的篇幅，以下将直接切入重点说明从资料库取出资料后进行了什么样的反序列化操作。核心主要是透过呼叫
+`SqlSessionStateStore.GetItem` 函式还原出 Session
+物件，虽然已尽可能把无关紧要的程式码移除，但行数还是偏多，如果懒得阅读程式码的朋友可以直接下拉继续看文章说明 XD
+    namespace System.Web.SessionState {
+        internal class SqlSessionStateStore : SessionStateStoreProviderBase {
+            public override SessionStateStoreData  GetItem(HttpContext context,
+                                                            String id,
+                                                            out bool locked,
+                                                            out TimeSpan lockAge,
+                                                            out object lockId,
+                                                            out SessionStateActions actionFlags) {
+                SessionIDManager.CheckIdLength(id, true /* throwOnFail */);
+                return DoGet(context, id, false, out locked, out lockAge, out lockId, out actionFlags);
+            }
+            SessionStateStoreData DoGet(HttpContext context, String id, bool getExclusive,
+                                            out bool locked,
+                                            out TimeSpan lockAge,
+                                            out object lockId,
+                                            out SessionStateActions actionFlags) {
+                SqlDataReader       reader;
+                byte []             buf;
+                MemoryStream        stream = null;
+                SessionStateStoreData    item;
+                SqlStateConnection  conn = null;
+                SqlCommand          cmd = null;
+                bool                usePooling = true;
+                buf = null;
+                reader = null;
+                conn = GetConnection(id, ref usePooling);
+                try {
+                    if (getExclusive) {
+                        cmd = conn.TempGetExclusive;
+                    } else {
+                        cmd = conn.TempGet;
+                    }
+                    cmd.Parameters[0].Value = id + _partitionInfo.AppSuffix; // @id
+                    cmd.Parameters[1].Value = Convert.DBNull;   // @itemShort
+                    cmd.Parameters[2].Value = Convert.DBNull;   // @locked
+                    cmd.Parameters[3].Value = Convert.DBNull;   // @lockDate or @lockAge
+                    cmd.Parameters[4].Value = Convert.DBNull;   // @lockCookie
+                    cmd.Parameters[5].Value = Convert.DBNull;   // @actionFlags
+                    using(reader = SqlExecuteReaderWithRetry(cmd, CommandBehavior.Default)) {
+                        if (reader != null) {
+                            try {
+                                if (reader.Read()) {
+                                    buf = (byte[]) reader[0];
+                                }
+                            } catch(Exception e) {
+                                ThrowSqlConnectionException(cmd.Connection, e);
+                            }
+                        }
+                    }
+                    if (buf == null) {
+                        /* Get short item */
+                        buf = (byte[]) cmd.Parameters[1].Value;
+                    }
+                    using(stream = new MemoryStream(buf)) {
+                        item = SessionStateUtility.DeserializeStoreData(context, stream, s_configCompressionEnabled);
+                        _rqOrigStreamLen = (int) stream.Position;
+                    }
+                    return item;
+                } finally {
+                    DisposeOrReuseConnection(ref conn, usePooling);
+                }
+            }
+            class SqlStateConnection : IDisposable {
+                internal SqlCommand TempGet {
+                    get {
+                        if (_cmdTempGet == null) {
+                            _cmdTempGet = new SqlCommand("dbo.TempGetStateItem3", _sqlConnection);
+                            _cmdTempGet.CommandType = CommandType.StoredProcedure;
+                            _cmdTempGet.CommandTimeout = s_commandTimeout;
+                            // ignore process of setting parameters
+                        }
+                        return _cmdTempGet;
+                    }
+                }
+            }

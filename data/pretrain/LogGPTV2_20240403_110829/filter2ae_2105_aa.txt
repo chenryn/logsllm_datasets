@@ -1,0 +1,126 @@
+## 前言
+最近 `JDBC`爆了一个`XXE`漏洞，很久没有分析漏洞了，趁着周末没事分析下这个漏洞。
+## 分析
+> 10月21日,"阿里云应急响应"公众号发布Oracle Mysql  
+>
+> JDBC存在XXE漏洞,造成漏洞的原因主要是因为`getSource`方法未对传入的XML格式数据进行检验。导致攻击者可构造恶意的XML数据引入外部实体。造成XXE攻击。
+影响版本: ` T getSource(Class clazz) throws SQLException {
+          ...
+            if (clazz == null || clazz.equals(SAXSource.class)) {
+         ...
+                return (T) new SAXSource(inputSource);
+            } else if (clazz.equals(DOMSource.class)) {
+                try {
+                  ...
+                    return (T) new DOMSource(builder.parse(inputSource));
+                } 
+                ...
+            } else if (clazz.equals(StreamSource.class)) {
+              ...
+                return (T) new StreamSource(reader);
+            } else if (clazz.equals(StAXSource.class)) {
+              ...
+                    return (T) new StAXSource(this.inputFactory.createXMLStreamReader(reader));
+              ...
+我们再看看`DOMSource`部分的具体实现,并没有在`parse`前做防护处理，并且`inputSource`可以由`this.stringRep`参数控制。
+    try {
+                    DocumentBuilderFactory builderFactory = DocumentBuilderFactory.newInstance();
+                    builderFactory.setNamespaceAware(true);
+                    DocumentBuilder builder = builderFactory.newDocumentBuilder();
+                    InputSource inputSource = null;
+                    if (this.fromResultSet) {
+                        inputSource = new InputSource(this.owningResultSet.getCharacterStream(this.columnIndexOfXml));
+                    } else {
+                        inputSource = new InputSource(new StringReader(this.stringRep));
+                    }
+                    return (T) new DOMSource(builder.parse(inputSource));
+而在`setString`中为`stringRep`属性赋值，所以此处可以造成XXE漏洞。
+    public synchronized void setString(String str) throws SQLException {
+            checkClosed();
+            checkWorkingWithResult();
+            this.stringRep = str;
+            this.fromResultSet = false;
+        }
+但是分析到这里就结束了吗？我认为要真正了解这个漏洞，还需要解决下面的几个问题：
+  * `MysqlSQLXML`的功能是什么？为什么`getSource`中会解析XML?为什么只有`DomSource`会进行`parse`，其他的没有？
+  * 在什么样的场景下会调用`MysqlSQLXML#getSource`？
+  * 为什么只在`MYSQL`的`SQLXML`中出现了问题？其他数据库的`SQLXML`没有漏洞吗？
+## 思考
+要理清上面的问题，首先我们得了解`SQLXML`是什么东西，为什么要引入它。
+### SQLXML
+在开发的过程中，可能会需要在数据库中存储和检索`XML`文档，因此引入了SQLXML类型，SQLXML提供了 String、Reader、Writer 或  
+Stream 等多种形式访问XML值的方法。
+  * **getBinaryStream** 以流的形式获取此 SQLXML 实例指定的 XML 值。
+  * **getCharacterStream** 以 java.io.Reader 对象的形式获取此 SQLXML 实例指定的 XML 值。
+  * **getString** 返回此 SQLXML 实例指定的 XML 值的字符串表示形式。
+我们可以通过ResultSet、CallableStatement 、PreparedStatement  
+中的`getSQLXML`方法获取SQLXML对象。
+    SQLXML sqlxml = resultSet.getSQLXML(column);
+    InputStream binaryStream = sqlxml.getBinaryStream();
+再通过XML解析器解析XML
+    DocumentBuilder parser = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+    Document result = parser.parse(binaryStream);
+    SAXParser parser = SAXParserFactory.newInstance().newSAXParser();
+    parser.parse(binaryStream, myHandler);
+除了上述的处理方式外，也可以`getSource`和`setResult`直接进行XML处理，而不需要转换成流并调用解析器解析XML。
+比如直接对`DOM Document Node`进行操作。
+    //获取Document Node
+    DOMSource domSource = sqlxml.getSource(DOMSource.class);
+    Document document = (Document) domSource.getNode();
+    //设置Document Node
+    DOMResult domResult = sqlxml.setResult(DOMResult.class);
+    domResult.setNode(myNode);
+或者通过`sax`解析
+    SAXSource saxSource = sqlxml.getSource(SAXSource.class);
+    XMLReader xmlReader = saxSource.getXMLReader();
+    xmlReader.setContentHandler(myHandler);
+    xmlReader.parse(saxSource.getInputSource());
+### 为什么`DOMSource`会出现问题？
+首先我们看下当调用`getSource`时，不同类型的返回Source的代码。
+    return (T) new SAXSource(inputSource);
+    return (T) new DOMSource(builder.parse(inputSource));
+    return (T) new StreamSource(reader);
+    return (T) new StAXSource(this.inputFactory.createXMLStreamReader(reader));
+不同的`Source`为什么接收的数据类型不相同，这里需要了解不同的解析方式。
+> DOM:DOM是以层次结构组织的节点或信息片断的集合。这个层次结构允许开发人员在树中寻找特定信息。分析该结构通常
+> **需要加载整个文档和构造层次结构，然后才能做任何工作** 。
+>
+> SAX:SAX是一种 **基于流的推分析方式** 的XML解析技术，分析能够立即开始，而不是等待所有的数据被处理， **应用程序不必解析整个文档** ；
+>
+> StAX：StAX就是一种 **基于流的拉分析式**  
+>  的XML解析技术,只把感兴趣的部分拉出，不需要触发事件。StAX的API可以读取和写入XML文档。使用SAX API，XML可以是只读的。
+>
+> **推模型**
+> ：就是我们常说的SAX，它是一种靠事件驱动的模型。当它每发现一个节点就引发一个事件，而我们需要编写这些事件的处理程序。这样的做法很麻烦，且不灵活。
+>
+> **拉模型** ：在遍历文档时，会把感兴趣的部分从读取器中拉出，不需要引发事件，允许我们选择性地处理节点。这大大提e高了灵活性，以及整体效率。
+从`Dom`解析的特性来讲，必须一次性将`Dom`全部加载到内存中才能操作，而不是像其他类型，可以在使用时再去处理，因此在构建`DomSource`对象时需要先将`Dom`先整体解析后才能使用。
+### 如何触发漏洞？
+之前已经分析过一种方式，直接通过`setString`设置即可触发,下面是广为流传的`POC`
+    String poc = "\n" +
+                    "\n" +
+                    "\n" +
+                    "]>\n" +
+                    "&sp;";
+            Connection connection =
+                    DriverManager.getConnection("jdbc:mysql://127.0.0.1:3306/test", "root","xxxxx");
+            SQLXML sqlxml = connection.createSQLXML();
+            sqlxml.setString(poc);
+            sqlxml.getSource(DOMSource.class);
+虽然上面的方式确实可以触发漏洞，但是我觉得在真实环境中应该不会有人这么写， **所以我们应该思考下有没有其他的方式触发漏洞？**
+我们结合一下SQLXML的使用场景，是在操作数据库中的XML数据而产生的，所以正常情况下 **应该是操作数据库中的XML数据而导致的XXE漏洞**  
+。所以我认为下面的POC更符合真实场景，其中`DataXML`字段中保存着我们的`payload`。
+    Connection connection =DriverManager.getConnection("jdbc:mysql://192.168.3.16:3306/test666", "root",
+                            "xxxxxxx");
+            String sql = "SELECT DataXML from config";
+            Statement stmt = connection.createStatement();
+            ResultSet rs = stmt.executeQuery(sql);
+            rs.next();
+            SQLXML xml=rs.getSQLXML("DataXML");
+            DOMSource=xml.getSource(DOMSource.class);
+### 是否由其他方式会导致漏洞？
+我们还是看`getSource`方法，当内容为`SAXSource`直接将`InputSource`作为参数传给了`SaxSource`，所以从这来看没有明显的问题。
+    if (clazz == null || clazz.equals(SAXSource.class)) {
+                InputSource inputSource = null;
+                if (this.fromResultSet) {
+                    inputSource = new InputSource(this.owningResultSet.getCharacterStream(this.columnIndexOfXml));

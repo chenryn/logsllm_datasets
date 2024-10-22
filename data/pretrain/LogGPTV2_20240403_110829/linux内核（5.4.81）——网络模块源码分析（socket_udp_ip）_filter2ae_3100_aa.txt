@@ -1,0 +1,291 @@
+# linux内核（5.4.81）——网络模块源码分析（socket/udp/ip）
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+> author: povcfe
+  * 1\. socket
+    * 1.1 sock_create
+    * 1.1.1 sock_alloc
+    * 1.1.2 inet_create
+    * 1.1.2.1 sk_alloc
+    * 1.2 sock_map_fd
+  * 2\. send(运输层)
+    * 2.1 import_single_range
+    * 2.2 sockfd_lookup_light
+    * 2.3 sock_sendmsg
+    * 2.4 udp_sendmsg
+    * 2.4.1 udp_cmsg_send
+    * 2.4.2 TOS
+    * 2.4.3 多播/本地广播
+    * 2.4.4 检查sock中路由信息是否过期
+    * 2.4.5 udp_send_skb
+    * 2.4.6 udp_push_pending_frames
+  * 3\. recv(运输层)
+    * 2.1 udp_recvmsg
+    * 2.1.1 __skb_recv_udp
+    * 2.1.1.1 __skb_try_recv_from_queue
+  * 4\. IP(网络层)
+    * 4.1 ip_cmsg_send
+    * 4.2 ip_make_skb
+    * 4.2.1 ip_setup_cork
+    * 4.2.2 __ip_make_skb
+    * 4.3 ip_append_data
+    * 4.3.1 __ip_append_data
+    * 4.4 ip_send_skb
+    * 4.4.1 __ip_local_out
+## 1\. socket
+  * SOCK_CLOEXEC 和 SOCK_NONBLOCK是2.6.27版本后增加的sock类型: 
+    * SOCK_CLOEXEC 借助文件描述符FD_CLOEXEC 实现子进程运行exec后关闭sock_fd机制
+    * SOCK_NONBLOCK 借助文件描述符O_NONBLOCK 实现非阻塞IO通信
+    int __sys_socket(int family, int type, int protocol)
+    {
+        int retval;
+        struct socket *sock;
+        int flags;
+        /* Check the SOCK_* constants for consistency.  */
+        BUILD_BUG_ON(SOCK_CLOEXEC != O_CLOEXEC);
+        BUILD_BUG_ON((SOCK_MAX | SOCK_TYPE_MASK) != SOCK_TYPE_MASK);
+        BUILD_BUG_ON(SOCK_CLOEXEC & SOCK_TYPE_MASK);
+        BUILD_BUG_ON(SOCK_NONBLOCK & SOCK_TYPE_MASK);
+        // 如果flags除SOCK_CLOEXEC/SOCK_NONBLOCK掩码外不存在其他flag标志, 直接返回错误码
+        flags = type & ~SOCK_TYPE_MASK;
+        if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+            return -EINVAL;
+        type &= SOCK_TYPE_MASK;
+        // 因为SOCK_NONBLOCK实现的本质是借助O_NONBLOCK, 所以二者内容矛盾时, 使用O_NONBLOCK替换SOCK_NONBLOCK
+        if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
+            flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
+        // 创建socket, 详细见1.1
+        retval = sock_create(family, type, protocol, &sock);
+        if (retval  sock_create
+    int sock_create(int family, int type, int protocol, struct socket **res)
+    {
+        return __sock_create(current->nsproxy->net_ns, family, type, protocol, res, 0);
+    }
+> __sock_create
+    int __sock_create(struct net *net, int family, int type, int protocol,
+                 struct socket **res, int kern)
+    {
+        int err;
+        struct socket *sock;
+        const struct net_proto_family *pf;
+        /*
+         *      Check protocol is in range
+        */
+        // 检查协议族是否超出范围
+        if (family = NPROTO)
+            return -EAFNOSUPPORT;
+        // 检查socket类型是否超出范围
+        if (type = SOCK_MAX)
+            return -EINVAL;
+        /* Compatibility.
+           This uglymoron is moved from INET layer to here to avoid
+           deadlock in module load.
+        */
+        // SOCK_PACKET被从PF_INET族移入PF_PACKET
+        if (family == PF_INET && type == SOCK_PACKET) {
+            pr_info_once("%s uses obsolete (PF_INET,SOCK_PACKET)\n",
+                     current->comm);
+            family = PF_PACKET;
+        }
+        // 用来适配LSM(linux security module):LSM是一种安全框架，
+        // 将钩子安插在内核的关键函数上, 通过钩子上存储函数指针链表调用安全检查函数
+        // 用以在不修改内核代码的前提下, 为内核安装安全模块。
+        // 理论上讲不同的安全模块可以被同时安装到内核中, 钩子函数会依次执行对应的安全检查函数。
+        err = security_socket_create(family, type, protocol, kern);
+        if (err)
+            return err;
+        /*
+         *    Allocate the socket and allow the family to set things up. if
+         *    the protocol is 0, the family is instructed to select an appropriate
+         *    default.
+         */
+        // 创建socket, 详细见1.1.1
+        sock = sock_alloc();
+        if (!sock) {
+            net_warn_ratelimited("socket: no more sockets\n");
+            return -ENFILE;    /* Not exactly a match, but its the
+                       closest posix thing */
+        }
+        // 为socket->type填充socket类型信息
+        sock->type = type;
+    #ifdef CONFIG_MODULES
+        /* Attempt to load a protocol module if the find failed.
+         *
+         * 12/09/1996 Marcin: But! this makes REALLY only sense, if the user
+         * requested real, full-featured networking support upon configuration.
+         * Otherwise module support will break!
+         */
+        // 如果协议族内容不存在, 则试图加载驱动(内核执行用户指令modprobe加载驱动)
+        if (rcu_access_pointer(net_families[family]) == NULL)
+            request_module("net-pf-%d", family);
+    #endif
+        // 进入rcu_read区域, 有关rcu的扩展可以看这篇文章 [RCU简介](https://zhuanlan.zhihu.com/p/113999842)
+        rcu_read_lock();
+        // 获得协议族信息
+        pf = rcu_dereference(net_families[family]);
+        err = -EAFNOSUPPORT;
+        if (!pf)
+            goto out_release;
+        /*
+         * We will call the ->create function, that possibly is in a loadable
+         * module, so we have to bump that loadable module refcnt first.
+         */
+        // 检查协议族对应的模块是否被加载&增加模块的引用数
+        if (!try_module_get(pf->owner))
+            goto out_release;
+        /* Now protected by module ref count */
+        rcu_read_unlock();
+        // 在udp中调用inet_create创建sock, 详细见1.1.2
+        err = pf->create(net, sock, protocol, kern);
+        if (err ops, 所以他对应的模块必须在内存中加载
+        if (!try_module_get(sock->ops->owner))
+            goto out_module_busy;
+        /*
+         * Now that we're done with the ->create function, the [loadable]
+         * module can have its refcnt decremented
+         */
+        // pf->create函数调用完毕, 协议族对应的可加载模板引用数-1
+        module_put(pf->owner);
+        err = security_socket_post_create(sock, family, type, protocol, kern);
+        if (err)
+            goto out_sock_release;
+        *res = sock;
+        return 0;
+    out_module_busy:
+        err = -EAFNOSUPPORT;
+    out_module_put:
+        sock->ops = NULL;
+        module_put(pf->owner);
+    out_sock_release:
+        sock_release(sock);
+        return err;
+    out_release:
+        rcu_read_unlock();
+        goto out_sock_release;
+    }
+###  1.1.1 sock_alloc
+    struct socket *sock_alloc(void)
+    {
+        struct inode *inode;
+        struct socket *sock;
+        // 创建inode文件索引结点
+        // alloc inode时, 会分配sizeof(struct socket_alloc) 大小空间
+        inode = new_inode_pseudo(sock_mnt->mnt_sb);
+        if (!inode)
+            return NULL;
+        // 依据vfs_inode在struct socket_alloc中的偏移定位socket_alloc地址, 然后定位socket 成员位置
+        /*
+        struct socket_alloc {
+            struct socket socket;
+            struct inode vfs_inode;
+        };
+        static inline struct socket *SOCKET_I(struct inode *inode)
+        {
+            return &container_of(inode, struct socket_alloc, vfs_inode)->socket;
+        }
+        */
+        sock = SOCKET_I(inode);
+        // 填充inode属性, 
+        inode->i_ino = get_next_ino();
+        inode->i_mode = S_IFSOCK | S_IRWXUGO;
+        inode->i_uid = current_fsuid();
+        inode->i_gid = current_fsgid();
+        inode->i_op = &sockfs_inode_ops;
+        return sock;
+    }
+###  1.1.2 inet_create
+    static int inet_create(struct net *net, struct socket *sock, int protocol,
+                   int kern)
+    {
+        struct sock *sk;
+        struct inet_protosw *answer;
+        struct inet_sock *inet;
+        struct proto *answer_prot;
+        unsigned char answer_flags;
+        int try_loading_module = 0;
+        int err;
+        // 检查协议是否超出范围
+        if (protocol = IPPROTO_MAX)
+            return -EINVAL;
+        // 设置socket为无连接状态
+        sock->state = SS_UNCONNECTED;
+        /* Look for the requested type/protocol pair. */
+    lookup_protocol:
+        err = -ESOCKTNOSUPPORT;
+        rcu_read_lock();
+        // 此宏定义使用了RCU机制, 大致功能为遍历 &inetsw[sock->type] 链表, 
+        // 同时返回链表的next指针, 认为该指针是struct inet_protosw中的list成员, 
+        // 根据相对偏移, 定位此链表指针对应的结构体首地址, 赋值给answer
+        // 遍历对应sock->type的inetsw链表, 查找协议族中与socket类型相对应的网络层协议信息
+        // IPPROTO_IP表示用户不指定协议, 使用默认协议
+        list_for_each_entry_rcu(answer, &inetsw[sock->type], list) {
+            err = 0;
+            /* Check the non-wild match. */
+            // 如果遍历获得与用户指定协议相同的网络协议(IPPROTO_IP除外), 成功退出
+            if (protocol == answer->protocol) {
+                if (protocol != IPPROTO_IP)
+                    break;
+            } else {
+                /* Check for the two wild cases. */
+                // 用户指定IPPROTO_IP后, 使用默认协议
+                if (IPPROTO_IP == protocol) {
+                    protocol = answer->protocol;
+                    break;
+                }
+                // 遍历获得的协议必须非IPPROTO_IP(即必须指定确定协议)
+                if (IPPROTO_IP == answer->protocol)
+                    break;
+            }
+            err = -EPROTONOSUPPORT;
+        }
+        // 为了解决上诉错误, 此处决定尝试加载驱动(最多尝试两次)
+        if (unlikely(err)) {
+            if (try_loading_module type);
+                /*
+                 * Fall back to generic, e.g. net-pf-2-proto-132
+                 * (net-pf-PF_INET-proto-IPPROTO_SCTP)
+                 */
+                else
+                    request_module("net-pf-%d-proto-%d",
+                               PF_INET, protocol);
+                goto lookup_protocol;
+            } else
+                goto out_rcu_unlock;
+        }
+        err = -EPERM;
+        // 调用SOCK_RAW, 需要验证权限
+        if (sock->type == SOCK_RAW && !kern &&
+            !ns_capable(net->user_ns, CAP_NET_RAW))
+            goto out_rcu_unlock;
+        sock->ops = answer->ops;
+        answer_prot = answer->prot;
+        answer_flags = answer->flags;
+        rcu_read_unlock();
+        WARN_ON(!answer_prot->slab);
+        err = -ENOBUFS;
+        // sk_alloc 创建sock(真实大小: sizeof(struct xxx_sock). 比如udp对应udp_sock), 详细见1.1.2.1
+        sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot, kern);
+        if (!sk)
+            goto out;
+        err = 0;
+        if (INET_PROTOSW_REUSE & answer_flags)
+            sk->sk_reuse = SK_CAN_REUSE;
+        // 将sock转化为inet_sock(包含sock成员)
+        inet = inet_sk(sk);
+        inet->is_icsk = (INET_PROTOSW_ICSK & answer_flags) != 0;
+        inet->nodefrag = 0;
+        ...
+        // 检查配置确定是否开启动态mtu探测
+        if (net->ipv4.sysctl_ip_no_pmtu_disc)
+            inet->pmtudisc = IP_PMTUDISC_DONT;
+        else
+            inet->pmtudisc = IP_PMTUDISC_WANT;
+        inet->inet_id = 0;
+        // socket与sock相互绑定
+        sock_init_data(sock, sk);
+        // 初始化sock与inet属性
+        sk->sk_destruct       = inet_sock_destruct;
+        sk->sk_protocol       = protocol;
+        sk->sk_backlog_rcv = sk->sk_prot->backlog_rcv;

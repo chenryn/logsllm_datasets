@@ -1,0 +1,127 @@
+ERROR:  sparse multiset too small  
+LINE 1: select '\x13ff'::hll;  
+               ^  
+digoal=> select '\x14ff'::hll;  
+ERROR:  inconsistently sized compressed multiset  
+LINE 1: select '\x14ff'::hll;  
+               ^  
+-- 这个是合法的  
+digoal=> select '\x128c7f'::hll;  
+   hll      
+----------  
+ \x128c7f  
+(1 row)  
+-- DEBUG一个合法的hll如下 :   
+digoal=> select hll_print('\x128c7f'::hll);  
+                                 hll_print                                   
+---------------------------------------------------------------------------  
+ EXPLICIT, 0 elements, nregs=4096, nbits=5, expthresh=-1(320), sparseon=1:  
+(1 row)  
+-- DEBUG一个非法hll, 报错 :   
+digoal=> select hll_print('\xffff'::bytea::hll);  
+ERROR:  unknown schema version 15  
+```  
+## 三、hll的数据结构  
+总的来说包含五个部分的信息(data bytes不一定有, 如果是EMPTY或者无效定义则没有data bytes的数据).  
+```  
+1byte(version, data type), 1byte(parameter), 1byte(cutoff), data bytes;  
+```  
+3\.1 version和data type占用第一个字节 :   
+第一个字节分成了2部分信息, 如下 :   
+```  
+  version 指schema version , 目前为1 , 占用前4个比特位.  
+  data type 占用后4个比特位.  
+    // First byte is the version and type header.  
+    uint8_t vers = (i_bitp[0] >> 4) & 0xf;  
+    uint8_t type = i_bitp[0] & 0xf;  
+```  
+3\.2 parameter 占用第二个字节 :   
+第二个字节分成了2部分信息, 如下 :   
+```  
+  the highest 3 bits are used to encode the integer value "registerWidth - 1", and  
+  the remaining 5 bits encode the integer value "log2(numberOfRegisters)".  
+"registerWidth" may take values from 1 to 8, inclusive, and "log2(numberOfRegisters)" may take on 1 to 31, inclusive.  
+For example:  
+    P = xA6 = 1010 0110 = 101 00110  
+thus "registerWidth - 1" = 5, 因此 "registerWidth" = 6 and "log2(numberOfRegisters)" = 6, 因此 "numberOfRegisters" = 2^6 = 64.  
+```  
+3\.3 cutoff 占用第三个字节 :   
+第三个字节分成了3部分信息, 第二个比特位表示是否允许sparse结构. 接下来的6个比特位存储cutoff的(指数-1)信息. 如下 :   
+```  
+The 'cutoff' byte C encodes parameters defining the EXPLICIT to SPARSE, or EXPLICIT to FULL promotions.  
+-- 因为SPARSE到FULL不需要根据cutoff的值来判断, 当使用SPARSE存储会超过使用FULL存储时, 即转换为FULL.  
+1 bit (the top bit) of padding,  
+1 bit (second highest bit) indicating the boolean value sparseEnabled, and  
+6 bits (lowest six bits) as a big-endian integer explicitCutoff that can take on the values 0, 63, or 1 to 31 inclusive.  
+```  
+相关代码 :   
+```  
+// This routine is used to encode an expthresh value to be stored  
+// in the typmod metadata or a hll header.  
+//  
+static int32 encode_expthresh(int64 expthresh)  
+{  
+    // This routine presumes the uncompressed value is correct and  
+    // doesn't range check.  
+    //  
+    if (expthresh == -1)  
+        return 63;  
+    else if (expthresh == 0)  
+        return 0;  
+    else  
+        return integer_log2(expthresh) + 1;  
+}  
+// If expthresh == -1 (auto select expthresh) determine  
+// the expthresh to use from nbits and nregs.  
+//  
+// -1则自动计算cutoff的值  
+static size_t  
+expthresh_value(int64 expthresh, size_t nbits, size_t nregs)  
+{  
+    if (expthresh != -1)  
+    {  
+        return (size_t) expthresh;  
+    }  
+    else  
+    {  
+        // Auto is selected, choose the maximum number of explicit  
+        // registers that fits in the same space as the compressed  
+        // encoding.  
+        size_t cmpsz = ((nbits * nregs) + 7) / 8;  
+        return cmpsz / sizeof(uint64_t);  
+    }  
+}  
+解码代码 :   
+// The expthresh is represented in a encoded format in the  
+// type modifier to save metadata bits.  This routine is used  
+// when the expthresh comes from a typmod value or hll header.  
+//  
+static int64 decode_expthresh(int32 encoded_expthresh)  
+{  
+    // This routine presumes the encoded value is correct and  
+    // doesn't range check.  
+    //  
+    if (encoded_expthresh == 63)  
+        return -1LL;  
+    else if (encoded_expthresh == 0)  
+        return 0;  
+    else  
+        return 1LL << (encoded_expthresh - 1);  
+}  
+```  
+3\.4 不同的data type对应的data bytes也不一样.  
+所以data bytes存储的是动态的结构, data type可能包含如下结构类型. 数值对应的是存储在HLL中的第一个字节的后4个比特位.  
+```  
+0 - undefined, 无效或未定义的结构, 因此没有data bytes的部分.  
+1 - EMPTY, A constant value that denotes the empty set. 同样没有data bytes的部分  
+2 - EXPLICIT, 连续的字节流, 每个字节存储一个hll_hashval. 并且按照hll_hashval排序存储的结构.  
+3 - SPARSE, 后面再解释.  
+4 - FULL, 后面再解释.  
+```  
+根据第三部分的介绍, 举例来解析一下各个部分的信息 :   
+首先设置一下几部分的信息 :   
+```  
+log2m = 10  
+regwidth = 1  
+expthresh = 4  
+sparseon = 1  

@@ -1,0 +1,142 @@
+**作者： wzt  
+本文为作者投稿，Seebug Paper 期待你的分享，凡经采用即有礼品相送！ 投稿邮箱：PI:EMAIL**
+## 概述
+由于cpu的指令预取存在漏洞，可以从el0直接访问el1内容，主流os对其缓解措施就是限制el0能读取的el1代码范围，
+注意程序运行在el0时，并不能直接关闭el1的所有代码访问路径，一个原因是程序运行过程会产生错误，需要el1的异常处理逻辑来接管，另一个原因是程序需要主动使用svc请求el1的系统服务，同样还是会被异常处理逻辑来接管。为此linux和xnu使用了两种不同的方案来实现el1的页表隔离。
+## Linux kpti实现
+linux的做法是在el0
+level上提供一个简单的异常处理程序trampline以及新的`ttbr1_el1`页表，每次从el0进入el1时，切换`vbar_el1`的地址以及`ttbr1_el1`的地址为内核使用的异常处理地址和页表地址，每次从el1退回el0时，再次切换`vbar_el1`为trampline的地址以及切换新的`ttbr1_el1`地址。trampline的代码段很小，只会映射el1异常处理代码的范围，这样新的`ttbr_el1`的页表占用空间也会非常小。
+    ./arch/arm64/kernel/vmlinux.lds.S
+    \#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+    \#define TRAMP_TEXT                    \
+    ​  . = ALIGN(PAGE_SIZE);              \
+    ​    __entry_tramp_text_start = .;          \
+    ​    *(.entry.tramp.text)               \
+    ​    . = ALIGN(PAGE_SIZE);              \
+    ​    __entry_tramp_text_end = .;
+内核的链接脚本里预先划分出trampline的代码空间。
+    ​    idmap_pg_dir = .;
+    ​    . += IDMAP_DIR_SIZE;
+    \#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+    ​    tramp_pg_dir = .;
+    ​    . += PAGE_SIZE;
+    \#endif
+trampline的页表地址紧挨在`idmap_pg_dir`后面。
+    ./arch/arm64/kernel/entry.S
+    .pushsection ".entry.tramp.text", "ax"
+    .macro tramp_map_kernel, tmp
+    mrs   \tmp, ttbr1_el1
+      add   \tmp, \tmp, #(PAGE_SIZE + RESERVED_TTBR0_SIZE)
+      bic   \tmp, \tmp, #USER_ASID_FLAG
+      msr   ttbr1_el1, \tmp
+    .endm
+    .macro tramp_unmap_kernel, tmp
+      mrs   \tmp, ttbr1_el1
+      sub   \tmp, \tmp, #(PAGE_SIZE + RESERVED_TTBR0_SIZE)
+      orr   \tmp, \tmp, #USER_ASID_FLAG
+      msr   ttbr1_el1, \tmp
+    .endm
+宏`tramp_map_kernel`用来每次进入内核时，更新内核的`ttbr1_el1`地址。宏`tramp_unmap_kernel`用来每次退出内核时，切换`trampline的ttbr_el1`地址。
+    ​    .macro tramp_ventry, regsize = 64
+    ​    .align  7
+**1:**
+    ​    .if   \regsize == 64
+    ​    msr   tpidrro_el0, x30     // Restored in kernel_ventry
+    ​    .endif
+    ​    bl    2f
+    ​    b    .
+**2:**
+    tramp_map_kernel     x30
+    \#ifdef CONFIG_RANDOMIZE_BASE
+    ​    adr   x30, tramp_vectors + PAGE_SIZE
+    alternative_insn isb, nop, ARM64_WORKAROUND_QCOM_FALKOR_E1003
+    ​    ldr   x30, [x30]
+    \#else
+    ​    ldr   x30, =vectors
+    \#endif
+    ​    msr   vbar_el1, x30
+    ​    add   x30, x30, #(1b - tramp_vectors)
+    ​    isb
+    ​    ret
+    .endm
+宏`tramp_ventry`是el1异常处理的入口地址，首先调用了`tramp_map_kernel`切换内核的`ttbr1_el1`，紧接着切换`vbar_el1`为内核的异常处理地址=vectors，所以trampline的作用顾名思义只起到跳转的作用，真正对异常处理的流程还是要通过内核来接管。
+    ​    .macro tramp_exit, regsize = 64
+    ​    adr   x30, tramp_vectors
+    ​    msr   vbar_el1, x30
+    ​    tramp_unmap_kernel    x30
+    ​    .if   \regsize == 64
+    ​    mrs   x30, far_el1
+    ​    .endif
+    ​    eret
+    ​    Sb
+    ​    .endm
+每次退出异常处理时，首先调用`tramp_unmap_kernel`更新`trampline的ttbr1_el1`页表地址，然后更新`vbar_el1`为trampline使用的`tramp_vectors`异常处理入口。
+    ENTRY(tramp_vectors)
+    ​    .space  0x400
+    ​    tramp_ventry
+    ​    tramp_ventry
+    ​    tramp_ventry
+    ​    tramp_ventry
+    ​    tramp_ventry   32
+    ​    tramp_ventry   32
+    ​    tramp_ventry   32
+    ​    tramp_ventry   32
+    END(tramp_vectors)
+可以看到trampline的异常处理地址，只需填充了0x400偏移，也就是来自el0的同步类型的异常处理，因为trampline的存在仅是为了服务来自el0的异常处理请求。
+## XNU kpti实现
+我们看到linux为了在el0隔离el1的代码，使用了一个新的代码段叫trampline，一个新的页表`tramp_pg_dir`，每次进入内核与退出内核时都要切换`vbar_el1`以及`ttbr1_el1`。这样频繁的切换这两个寄存器，性能肯定会受到影响。而XNU利用了一个更聪明更巧妙的做法来使性能损失达到最小。
+XNU通过使tcr.T1SZ字段减去1，使从内核返回用户空间时，内核的虚拟地址空间减半，也就是缩减了内核空间的大小，这样即使el0程序利用cpu漏洞，也只能读取较低的内核地址空间，没有关键的内核数据。每次从用户空间进入内核时，在将tcr.T1SZ字段加1，恢复整个的内核地址空间。
+    ./osfmk/arm64/locore.s
+    .macro MAP_KERNEL
+    ​    mrs       x18, TTBR0_EL1
+    ​    orr       x18, x18, #(1 << TTBR_ASID_SHIFT)
+    ​    msr       TTBR0_EL1, x18
+    ​    MOV64      x18, TCR_EL1_BOOT
+    ​    msr       TCR_EL1, x18
+    ​    isb       sy
+    .endmacro
+每次进入内核时跟新`TCR_EL1`。
+    ​    /* Update TCR to unmap the kernel. */
+    ​    MOV64      x18, TCR_EL1_USER
+    ​    msr       TCR_EL1, x18
+每次从异常处理退出内核时，修改`TCR_EL1`缩减内核地址空间。
+    osfmk/arm64/proc_reg.h
+    \#define TCR_EL1_BOOT (TCR_EL1_BASE | (T1SZ_BOOT << TCR_T1SZ_SHIFT) | (TCR_TG0_GRANULE_SIZE))
+    \#define T1SZ_USER (T1SZ_BOOT + 1)
+    \#define TCR_EL1_USER (TCR_EL1_BASE | (T1SZ_USER << TCR_T1SZ_SHIFT) | (TCR_TG0_GRANULE_SIZE))
+同样对于在el0时触发的异常处理地址，XNU利用了一个tricky技巧，将内核态的异常处理地址的 **虚拟地址** 和在el0时触发的异常处理的
+**虚拟地址** ，都映射到了内核原有的异常处理地址的 **物理地址** ，并且el0时触发的异常处理的虚拟地址正好选在了内核地址空间的一半位置处。
+    ./osfmk/arm64/arm_vm_init.c
+    static void
+    arm_vm_prepare_kernel_el0_mappings(bool alloc_only)
+    {
+    ​    pt_entry_t pte = 0;
+    ​    vm_offset_t start = ((vm_offset_t)&ExceptionVectorsBase) & ~PAGE_MASK;
+    ​    vm_offset_t end = (((vm_offset_t)&ExceptionVectorsEnd) + PAGE_MASK) & ~PAGE_MASK;
+    ​    vm_offset_t cur = 0;
+    ​    vm_offset_t cur_fixed = 0;
+    ​    for (cur = start, cur_fixed = ARM_KERNEL_PROTECT_EXCEPTION_START; cur < end; cur += ARM_PGBYTES, cur_fixed += ARM_PGBYTES) {
+    ​        if (!alloc_only) {
+    ​            pte = arm_vm_kernel_pte(cur);
+    ​        }
+    ​        arm_vm_kernel_el1_map(cur_fixed, pte);
+    ​        arm_vm_kernel_el0_map(cur_fixed, pte);
+    ​    }
+    ​    __builtin_arm_dmb(DMB_ISH);
+    ​    __builtin_arm_isb(ISB_SY);
+    ​    if (!alloc_only) {
+    ​        set_vbar_el1(ARM_KERNEL_PROTECT_EXCEPTION_START);
+    ​        __builtin_arm_isb(ISB_SY);
+    ​    }
+    }
+    osfmk/arm/pmap.h
+    \#define ARM_KERNEL_PROTECT_EXCEPTION_START ((~((ARM_TT_ROOT_SIZE + ARM_TT_ROOT_INDEX_MASK) / 2ULL)) + 1ULL)
+    static void
+    arm_vm_kernel_el0_map(vm_offset_t vaddr, pt_entry_t pte)
+    {
+    ​    /* Calculate where vaddr will be in the EL1 kernel page tables. */
+    ​    vm_offset_t kernel_pmap_vaddr = vaddr - ((ARM_TT_ROOT_INDEX_MASK + ARM_TT_ROOT_SIZE) / 2ULL);
+    ​    arm_vm_map(cpu_tte, kernel_pmap_vaddr, pte);
+    }
+注意看`arm_vm_map`的第一个参数为`cpu_tte`，也就是内核的页表地址，XNU的KPTI使用了内核页表中的一个表项，没有像linux定义了一个全新的页表。所以不在需要切换`vbar_el1`和`ttbr1_el1`寄存器，性能相比linux会提升很多。
+* * *

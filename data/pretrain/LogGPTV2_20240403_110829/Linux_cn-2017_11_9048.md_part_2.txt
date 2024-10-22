@@ -1,0 +1,70 @@
+今天，我们提供 pgbouncer 作为 GitLab EE 高可用包的一部分。对于更多的信息，你可以参考 “[Omnibus GitLab PostgreSQL High Availability](https://docs.gitlab.com/ee/administration/high_availability/alpha_database.html)”。
+### GitLab 上的数据库负载均衡
+使用 pgpool 和它的负载均衡特性，我们需要一些其它的东西去分发负载到多个热备服务器上。
+对于（但不限于） Rails 应用程序，它有一个叫 [Makara](https://github.com/taskrabbit/makara) 的库，它实现了负载均衡的逻辑并包含了一个 ActiveRecord 的缺省实现。然而，Makara 也有一些我们认为是有些遗憾的问题。例如，它支持的粘连接是非常有限的：当你使用一个 cookie 和一个固定的 TTL 去执行一个写操作时，连接将粘到主服务器。这意味着，如果复制极大地滞后于 TTL，最终你可能会发现，你的查询运行在一个没有你需要的数据的主机上。
+Makara 也需要你做很多配置，如所有的数据库主机和它们的角色，没有服务发现机制（我们当前的解决方案也不支持它们，即使它是将来计划的）。 Makara 也 [似乎不是线程安全的](https://github.com/taskrabbit/makara/issues/151)，这是有问题的，因为 Sidekiq （我们使用的后台进程）是多线程的。 最终，我们希望尽可能地去控制负载均衡的逻辑。
+除了 Makara 之外 ，还有一个 [Octopus](https://github.com/thiagopradi/octopus) ，它也是内置的负载均衡机制。但是 Octopus 是面向分片数据库的，而不仅是均衡只读查询的。因此，最终我们不考虑使用 Octopus。
+最终，我们直接在 GitLab EE构建了自己的解决方案。 添加初始实现的 合并请求   merge request 可以在 [这里](https://gitlab.com/gitlab-org/gitlab-ee/merge_requests/1283)找到，尽管一些更改、提升和修复是以后增加的。
+我们的解决方案本质上是通过用一个处理查询的路由的代理对象替换 `ActiveRecord::Base.connection` 。这可以让我们均衡负载尽可能多的查询，甚至，包括不是直接来自我们的代码中的查询。这个代理对象基于调用方式去决定将查询转发到哪个主机， 消除了解析 SQL 查询的需要。
+#### 粘连接
+粘连接是通过在执行写入时，将当前 PostgreSQL WAL 位置存储到一个指针中实现支持的。在请求即将结束时，指针短期保存在 Redis 中。每个用户提供他自己的 key，因此，一个用户的动作不会导致其他的用户受到影响。下次请求时，我们取得指针，并且与所有的次级服务器进行比较。如果所有的次级服务器都有一个超过我们的指针的 WAL 指针，那么我们知道它们是同步的，我们可以为我们的只读查询安全地使用次级服务器。如果一个或多个次级服务器没有同步，我们将继续使用主服务器直到它们同步。如果 30 秒内没有写入操作，并且所有的次级服务器还没有同步，我们将恢复使用次级服务器，这是为了防止有些人的查询永远运行在主服务器上。
+检查一个次级服务器是否就绪十分简单，它在如下的 `Gitlab::Database::LoadBalancing::Host#caught_up?` 中实现：
+```
+def caught_up?(location)
+  string = connection.quote(location)
+  query = "SELECT NOT pg_is_in_recovery() OR " \
+    "pg_xlog_location_diff(pg_last_xlog_replay_location(), #{string}) >= 0 AS result"
+  row = connection.select_all(query).first
+  row && row['result'] == 't'
+ensure
+  release_connection
+end
+```
+这里的大部分代码是运行原生查询（raw queries）和获取结果的标准的 Rails 代码，查询的最有趣的部分如下：
+```
+SELECT NOT pg_is_in_recovery()
+OR pg_xlog_location_diff(pg_last_xlog_replay_location(), WAL-POINTER) >= 0 AS result"
+```
+这里 `WAL-POINTER` 是 WAL 指针，通过 PostgreSQL 函数 `pg_current_xlog_insert_location()` 返回的，它是在主服务器上执行的。在上面的代码片断中，该指针作为一个参数传递，然后它被引用或转义，并传递给查询。
+使用函数 `pg_last_xlog_replay_location()` 我们可以取得次级服务器的 WAL 指针，然后，我们可以通过函数 `pg_xlog_location_diff()` 与我们的主服务器上的指针进行比较。如果结果大于 0 ，我们就可以知道次级服务器是同步的。
+当一个次级服务器被提升为主服务器，并且我们的 GitLab 进程还不知道这一点的时候，添加检查 `NOT pg_is_in_recovery()` 以确保查询不会失败。在这个案例中，主服务器总是与它自己是同步的，所以它简单返回一个 `true`。
+#### 后台进程
+我们的后台进程代码 *总是* 使用主服务器，因为在后台执行的大部分工作都是写入。此外，我们不能可靠地使用一个热备机，因为我们无法知道作业是否在主服务器执行，也因为许多作业并没有直接绑定到用户上。
+#### 连接错误
+要处理连接错误，比如负载均衡器不会使用一个视作离线的次级服务器，会增加主机上（包括主服务器）的连接错误，将会导致负载均衡器多次重试。这是确保，在遇到偶发的小问题或数据库失败事件时，不会立即显示一个错误页面。当我们在负载均衡器级别上处理 [热备机冲突](https://www.postgresql.org/docs/current/static/hot-standby.html#HOT-STANDBY-CONFLICT) 的问题时，我们最终在次级服务器上启用了 `hot_standby_feedback` ，这样就解决了热备机冲突的所有问题，而不会对表膨胀造成任何负面影响。
+我们使用的过程很简单：对于次级服务器，我们在它们之间用无延迟试了几次。对于主服务器，我们通过使用越来越快的回退尝试几次。
+更多信息你可以查看 GitLab EE 上的源代码：
+* 
+* 
+数据库负载均衡首次引入是在 GitLab 9.0 中，并且 *仅* 支持 PostgreSQL。更多信息可以在 [9.0 release post](https://about.gitlab.com/2017/03/22/gitlab-9-0-released/) 和 [documentation](https://docs.gitlab.com/ee/administration/database_load_balancing.html) 中找到。
+### Crunchy Data
+我们与 [Crunchy Data](https://www.crunchydata.com/) 一起协同工作来部署连接池和负载均衡。不久之前我还是唯一的 [数据库专家](https://about.gitlab.com/handbook/infrastructure/database/)，它意味着我有很多工作要做。此外，我对 PostgreSQL 的内部细节的和它大量的设置所知有限 (或者至少现在是)，这意味着我能做的也有限。因为这些原因，我们雇用了 Crunchy 去帮我们找出问题、研究慢查询、建议模式优化、优化 PostgreSQL 设置等等。
+在合作期间，大部分工作都是在相互信任的基础上完成的，因此，我们共享私人数据，比如日志。在合作结束时，我们从一些资料和公开的内容中删除了敏感数据，主要的资料在 [gitlab-com/infrastructure#1448](https://gitlab.com/gitlab-com/infrastructure/issues/1448)，这又反过来导致产生和解决了许多分立的问题。
+这次合作的好处是巨大的，它帮助我们发现并解决了许多的问题，如果必须我们自己来做的话，我们可能需要花上几个月的时间来识别和解决它。
+幸运的是，最近我们成功地雇佣了我们的 [第二个数据库专家](https://gitlab.com/_stark) 并且我们希望以后我们的团队能够发展壮大。
+### 整合连接池和数据库负载均衡
+整合连接池和数据库负载均衡可以让我们去大幅减少运行数据库集群所需要的资源和在分发到热备机上的负载。例如，以前我们的主服务器 CPU 使用率一直徘徊在 70%，现在它一般在 10% 到 20% 之间，而我们的两台热备机服务器则大部分时间在 20% 左右：
+![CPU Percentage](/data/attachment/album/201711/11/141057u8e1omgqle3q5ge1.png)
+在这里， `db3.cluster.gitlab.com` 是我们的主服务器，而其它的两台是我们的次级服务器。
+其它的负载相关的因素，如平均负载、磁盘使用、内存使用也大为改善。例如，主服务器现在的平均负载几乎不会超过 10，而不像以前它一直徘徊在 20 左右：
+![CPU Percentage](/data/attachment/album/201711/11/141057oezcimd2d77k8wpu.png)
+在业务繁忙期间，我们的次级服务器每秒事务数在 12000 左右（大约为每分钟 740000），而主服务器每秒事务数在 6000 左右（大约每分钟 340000）：
+![Transactions Per Second](/data/attachment/album/201711/11/141058o7zm773axqfqxa8m.png)
+可惜的是，在部署 pgbouncer 和我们的数据库负载均衡器之前，我们没有关于事务速率的任何数据。
+我们的 PostgreSQL 的最新统计数据的摘要可以在我们的 [public Grafana dashboard](http://monitor.gitlab.net/dashboard/db/postgres-stats?refresh=5m&orgId=1) 上找到。
+我们的其中一些 pgbouncer 的设置如下：
+| 设置 | 值 |
+| --- | --- |
+| `default_pool_size` | 100 |
+| `reserve_pool_size` | 5 |
+| `reserve_pool_timeout` | 3 |
+| `max_client_conn` | 2048 |
+| `pool_mode` | transaction |
+| `server_idle_timeout` | 30 |
+除了前面所说的这些外，还有一些工作要作，比如： 部署服务发现（[#2042](https://gitlab.com/gitlab-org/gitlab-ee/issues/2042)）， 持续改善如何检查次级服务器是否可用（[#2866](https://gitlab.com/gitlab-org/gitlab-ee/issues/2866)），和忽略落后于主服务器太多的次级服务器 （[#2197](https://gitlab.com/gitlab-org/gitlab-ee/issues/2197)）。
+值得一提的是，到目前为止，我们还没有任何计划将我们的负载均衡解决方案，独立打包成一个你可以在 GitLab 之外使用的库，相反，我们的重点是为 GitLab EE 提供一个可靠的负载均衡解决方案。
+如果你对它感兴趣，并喜欢使用数据库、改善应用程序性能、给 GitLab上增加数据库相关的特性（比如： [服务发现](https://gitlab.com/gitlab-org/gitlab-ee/issues/2042)），你一定要去查看一下我们的 [招聘职位](https://about.gitlab.com/jobs/specialist/database/) 和 [数据库专家手册](https://about.gitlab.com/handbook/infrastructure/database/) 去获取更多信息。
+---
+via: 
+作者：[Yorick Peterse](https://about.gitlab.com/team/#yorickpeterse) 译者：[qhwdw](https://github.com/qhwdw) 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创编译，[Linux中国](https://linux.cn/) 荣誉推出

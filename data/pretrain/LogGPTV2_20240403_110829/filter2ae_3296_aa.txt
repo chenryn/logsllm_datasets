@@ -1,0 +1,135 @@
+**作者:[evilpan](https://evilpan.com/)  
+原文链接: **
+USB，全称是 [Universal Serial
+Bus](https://bk.tw.lvfukeji.com/wiki/Usb)，即通用串行总线，既是一个针对电缆和连接器的工业标准，也指代其中使用的连接协议。本文不会过多介绍标准中的细节，而是从软件工程师的角度出发，介绍一些重要的基本概念，以及实际的主机和从机应用。最后作为实际案例，从
+USB 协议实现的角度分析了`checkm8`漏洞的成因。
+# USB 101
+首先要明确的一点，USB 协议是以主机为中心的 (Host
+Centric)，也就是说只有主机端向设备端请求数据后，设备端才能向主机发送数据。从数据的角度来看，开发者最直接接触的就是端点
+(Endpoint)，端点可以看做是数据收发的管道。
+当主机给设备发送数据时，通常流程是:
+  * 调用用户层 API，如 `libusb_bulk_transfer`
+  * 对内核的 USB 驱动执行对应系统调用，添加发送队列，如 `ioctl(IOCTL_USBFS_SUBMITURB)`
+  * 内核驱动中通过 HCI 接口向 USB 设备发送请求+数据
+  * 数据发送到设备端的 Controller -> HCI -> Host
+设备给主机发送请求也是类似，只不过由于是主机中心，发送的数据会保存在缓存中，等待主机发送 IN TOKEN
+之后才真正发送到主机。在介绍数据发送流程之前，我们先来看下描述符。
+## 描述符
+所有的 USB 设备端设备，都使用一系列层级的描述符 (Descriptors) 来向主机描述自身信息。这些描述符包括:
+  * **Device Descriptors** : 设备描述
+  * **Configuration Descriptors** : 配置描述
+  * **Interface Descriptors** : 接口描述
+  * **Endpoint Descriptors** : 端点描述
+  * **String Descriptors** : 字符串描述
+它们之间的层级结构关系如下:
+每种描述符都有对应的数据结构，定义在标准中的第九章，俗称 ch9。下面以 Linux 内核的实现为例来简要介绍各个描述符，主要参考头文件
+**include/uapi/linux/usb/ch9.h** 。
+### 设备描述
+每个 USB 设备只能有一个设备描述(Device Descriptor)，该描述符中包括了设备的 USB 版本、厂商、产品 ID
+以及包含的配置描述符个数等信息，如下所示:
+    /* USB_DT_DEVICE: Device descriptor */
+    struct usb_device_descriptor {
+        __u8  bLength; // 18 字节
+        __u8  bDescriptorType; // 0x01
+        __le16 bcdUSB; // 设备所依从的 USB 版本号
+        __u8  bDeviceClass; // 设备类型
+        __u8  bDeviceSubClass; // 设备子类型
+        __u8  bDeviceProtocol; // 设备协议
+        __u8  bMaxPacketSize0; // ep0 的最大包长度，有效值为 8，6，32，64
+        __le16 idVendor; // 厂商号
+        __le16 idProduct; // 产品号
+        __le16 bcdDevice; // 设备版本号
+        __u8  iManufacturer; // 产商字名称
+        __u8  iProduct; // 产品名称
+        __u8  iSerialNumber; // 序列号
+        __u8  bNumConfigurations; // 配置描述符的个数
+    } __attribute__ ((packed));
+    #define USB_DT_DEVICE_SIZE      18
+每个字段的含义都写在注释中了，其中有几点值得一提。
+  * 设备类型、子类型和协议码，是由 USB 组织定义的；
+  * 产商号也是由 USB 组织定义的，但是产品号可以由厂商自行定义；
+  * 厂商、产品和序列号分别只有 1 字节，表示在字符串描述符中的索引；
+> BCD: binary- coded decimal
+### 配置描述
+每种不同的配置描述(Configuration Descriptor)中分别指定了 USB 设备所支持的配置，如功率等信息；一个 USB
+设备可以包含多个配置，但同一时间只能有一个配置是激活状态。实际上大部分的 USB 设备都只包含一个配置描述符。
+    /* USB_DT_CONFIG: Configuration descriptor information.
+     *
+     * USB_DT_OTHER_SPEED_CONFIG is the same descriptor, except that the
+     * descriptor type is different.  Highspeed-capable devices can look
+     * different depending on what speed they're currently running.  Only
+     * devices with a USB_DT_DEVICE_QUALIFIER have any OTHER_SPEED_CONFIG
+     * descriptors.
+     */
+    struct usb_config_descriptor {
+        __u8  bLength; // 9
+        __u8  bDescriptorType; // 0x02
+        __le16 wTotalLength; // 返回数据的总长度
+        __u8  bNumInterfaces; // 接口描述符的个数
+        __u8  bConfigurationValue; // 当前配置描述符的值 (用来选择该配置)
+        __u8  iConfiguration; // 该配置的字符串信息 (在字符串描述符中的索引)
+        __u8  bmAttributes; // 属性信息
+        __u8  bMaxPower; // 最大功耗，以 2mA 为单位
+    } __attribute__ ((packed));
+    #define USB_DT_CONFIG_SIZE      9
+当主设备读取配置描述的时候，从设备会返回该配置下所有的其他描述符，如接口、端点和字符串描述符，因此需要 **wTotalLength**
+来表示返回数据的总长度。
+**bmAttributes** 指定了该配置的电源参数信息，D6 表示是否为自电源驱动；D5 表示是否支持远程唤醒；D7 在 USB1.0
+中曾用于表示是否为总线供电的设备，但是在 USB2.0 中被 **bMaxPower** 字段取代了，该字段表示设备从总线上消耗的电压最大值，以 2mA
+为单位，因此最大电流大约是 `0xff * 2mA = 510mA`。
+### 接口描述
+一个配置下有多个接口，可以看成是一组相似功能的端点的集合，每个接口描述符的结构如下:
+    /* USB_DT_INTERFACE: Interface descriptor */
+    struct usb_interface_descriptor {
+        __u8  bLength;
+        __u8  bDescriptorType; // 0x04
+        __u8  bInterfaceNumber; // 接口序号
+        __u8  bAlternateSetting;
+        __u8  bNumEndpoints;
+        __u8  bInterfaceClass;
+        __u8  bInterfaceSubClass;
+        __u8  bInterfaceProtocol;
+        __u8  iInterface; // 接口的字符串描述，同上
+    } __attribute__ ((packed));
+    #define USB_DT_INTERFACE_SIZE       9
+其中接口类型、子类型和协议与前面遇到的类似，都是由 USB 组织定义的。在 Linux 内核中，每个接口封装成一个高层级的功能，即逻辑链接(Logical
+Connection)，例如对 USB 摄像头而言，接口可以分为视频流、音频流和键盘(摄像头上的控制按键)等。
+还有值得一提的是 **bAlternateSetting** ，每个 USB 接口都可以有不同的参数设置，例如对于音频接口可以有不同的带宽设置。实际上
+Alternate Settings 就是用来控制周期性的端点参数的，比如 isochronous endpoint。
+### 端点描述
+端点描述符用来描述除了零端点(ep0)之外的其他端点，零端点总是被假定为控制端点，并且在开始请求任意描述符之前就已经被配置好了。端点(Endpoint)，可以认为是一个单向数据信道的抽象，因此端点描述符中包括传输的速率和带宽等信息，如下所示:
+    /* USB_DT_ENDPOINT: Endpoint descriptor */
+    struct usb_endpoint_descriptor {
+        __u8  bLength;
+        __u8  bDescriptorType; // 0x05
+        __u8  bEndpointAddress; // 端点地址
+        __u8  bmAttributes; // 端点属性
+        __le16 wMaxPacketSize; // 该端点收发的最大包大小
+        __u8  bInterval; // 轮询间隔，只对 Isochronous 和 interrupt 传输类型的端点有效 (见下)
+        /* NOTE:  these two are _only_ in audio endpoints. */
+        /* use USB_DT_ENDPOINT*_SIZE in bLength, not sizeof. */
+        __u8  bRefresh;
+        __u8  bSynchAddress;
+    } __attribute__ ((packed));
+    #define USB_DT_ENDPOINT_SIZE        7
+    #define USB_DT_ENDPOINT_AUDIO_SIZE  9   /* Audio extension */
+**bEndpointAddress** 8位数据分别代表:
+  * Bit 0-3: 端点号
+  * Bit 4-6: 保留，值为0
+  * Bit 7: 数据方向，0 为 OUT，1 为 IN
+**bmAttributes** 8位数据分别代表:
+**Bit 0-1: 传输类型**  
+\- 00: Control  
+\- 01: Isochronous  
+\- 10: Bulk  
+\- 11: Interrupt  
+**Bit 2-7: 对非 Isochronous 端点来说是保留位，对 Isochronous 端点而言表示 Synchronisation Type 和
+Usage Type，不赘述；**
+每种端点类型对应一种传输类型，详见后文。
+### 字符串描述
+字符串描述符(String Descriptor)中包含了可选的可读字符串信息，如果没提供，则前文所述的字符串索引应该都设置为0，字符串表结构如下:
+    /* USB_DT_STRING: String descriptor */
+    struct usb_string_descriptor {
+        __u8  bLength;
+        __u8  bDescriptorType; // 0x03
+        __le16 wData[1];        /* UTF-16LE encoded */

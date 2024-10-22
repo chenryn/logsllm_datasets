@@ -1,0 +1,131 @@
+  * 服务端在什么时候进入了`TCPTransport#exportObject`，然后将这个`Target`放到了`objectTable`里呢？
+  * 在`replaceObject`中，调用`Target`上的`getStub`方法获取到的对象和我们在服务端自定义的`RemoteHelloWorldImpl`有什么关系呢？
+由于我们的对象`RemoteHelloWorldImpl`继承了`UnicastRemoteObject`类，第一时间想到的就是它的构造函数。我猜测也许是在新建`RemoteHelloWorldImpl`时，调用的父类无参构造函数做了些事情：
+跟进：
+发现它竟然调用了`exportObject`这个静态方法。它是我们创建一个远程对象的第二种方式。继续跟进：
+跟进ㄟ( ▔, ▔ )ㄏ：
+终于到头了。
+这里得到了两个信息：
+  * 首先，两种导出远程对象的形式最终都会去执行`UnicastServerRef#exportObject`。
+  * 其次，采用`UnicastRemoteObject.export(obj, port)`获取的远程对象，其实就是`UnicastServerRef#exportObject`的返回值。
+而这个方法，我在 **客户端—注册端**
+其实已经分析了。它的返回值就是一个`stub`，并且在它冗长的调用链中肯定会执行`TCPTransport#exportObject`方法。这里又再贴一下`UnicastServerRef#exportObject`方法：
+至此，之前的第一个问题解决了。第二个问题：
+**调用`Target`上的`getStub`方法获取到的`proxy`和我们自己的对象`RemoteHelloWorldImpl`有什么关系呢？**
+进入`Target`的构造函数可以看到：
+而`var3`就是我们刚刚创建的`Stub`对象。
+回到最最最开始， **我们奇怪两种创建远程对象的方式最终在客户端获取到的都是同一种类型的问题** 也解决了：
+  * 使用`extends UnicaseRemoteObject`的方式，在`writeObject`的时候，会去获取到相应的`Target`上的`stub`对象。
+  * 使用`UnicastRemoteObject.exportObject(obj,0);`的形式，由于它本身返回值就是这个`stub`，所以会直接被写入。
+* * *
+此时我仍然疑惑，这个`stub`对象究竟是哪一个类？
+跟进到`UnicastServerRef#exportObject`中的`Util.createProxy()`方法：
+之前获取的stub对象是在上面if代码块中的`createStub()`，
+而这里则是创建了一个`RemoteObjectInvocationHandler`的代理对象。
+### 客户端
+#### 远程方法调用
+经过了上面的分析，我们知道了客户端的调试需要从`RemoteObjectInvocationHandler#invoke`方法开始：
+前面几个if都直接跳过，直接进入到`invokeRemoteMethod`：
+进入到`UnicastRef#invoke`方法，这里只贴出较关键的部分：
+`new StreamRemoteCall()`之前已经跟过一次，就是写入一个版本字节，同时在BLOCK_DATA处写入数据：
+在for循环下的`marshalValue()`部分，是将客户端执行方法传入的参数一个个写入到流中：
+接下来跟进`var7.executeCall()`，即`StreamRemoteCall#executeCall`方法：
+到`this.releaseOutputStream();`为止，客户端的调用请求被发送出去。接下来的地方又是老样子，读取首字节，然后获取BLOCK_DATA信息，如果没有抛异常则正常返回（见之前的分析）。
+紧接着在`unmarshalValue()`方法中，将服务端执行命令后的返回对象进行了反序列化读取到`var50`中，并作为了`UnicastRef#invoke`的返回值。
+#### dgc分析
+等等，是不是什么东西漏了？明明还有DGC这些东西啊。它们的流量似乎在`RemoteObjectInvocationHandler#invoke`之前就发出了。
+调试后发现，有关`DGC`的那段流量，在客户端执行`registry.lookup`方法时就发出了：
+仔细调试后，定位到执行`RegistryImpl_Stub#lookup`finally块中的代码会发出这些流量：
+不断跟进，可以来到`StreamRemoteCall#releaseInputStream`处：
+`registerRefs`意味注册引用。看名字有点像是在告诉远端的JVM对对象增加引用的意思。
+跟进：
+这里获取到的`var5`类型是`List`。
+跟进`DGCClient#registerRefs`：
+这里也许有一些难懂，但是参考[jdk源码的注释](https://github.com/frohoff/jdk8u-jdk/blob/master/src/share/classes/sun/rmi/transport/DGCClient.java)则一目了然：
+    /**
+         * Register the LiveRef instances in the supplied list to participate
+         * in distributed garbage collection.
+         *
+         * All of the LiveRefs in the list must be for remote objects at the
+         * given endpoint.
+         */
+        static void registerRefs(Endpoint ep, List refs) {
+            /*
+             * Look up the given endpoint and register the refs with it.
+             * The retrieved entry may get removed from the global endpoint
+             * table before EndpointEntry.registerRefs() is able to acquire
+             * its lock; in this event, it returns false, and we loop and
+             * try again.
+             */
+            EndpointEntry epEntry;
+            do {
+                epEntry = EndpointEntry.lookup(ep);
+            } while (!epEntry.registerRefs(refs));
+        }
+也就是说，每一个`Endpoint`，它可能有不只一个`LiveRef`，我们要在这个循环中向`Endpoint`注册所有这些`LiveRef`。这里，`Endpoint`就理解为某个主机上监听在某个端口的进程就行了。
+接下来跟进`epEntry.registerRefs`，即`DGCClient#registerRefs(List)`：
+跟进`DGCClient#makeDirtyCall`：
+跟进`DGCImpl_Stub#dirty`：
+可以看到，在这里发送了`dgc`请求，并且收到服务端的回复是一个`java.rmi.dgc.Lease`对象。
+> 并且我们在这里再次看到了“_stub“字眼，再次说明skel和stub的概念不只用于客户端和服务端之间。
+这个`Lease`对象的作用可见官方注释：
+    /**
+     * A lease contains a unique VM identifier and a lease duration. A
+     * Lease object is used to request and grant leases to remote object
+     * references.
+     */
+发现它确实有一个成员变量来表示对象的存活时间：
+回过头来，再看一下`DGCClient`这个对象上官方的注释：
+    /**
+     * DGCClient implements the client-side of the RMI distributed garbage
+     * collection system.
+     *
+     * The external interface to DGCClient is the "registerRefs" method.
+     * When a LiveRef to a remote object enters the VM, it needs to be
+     * registered with the DGCClient to participate in distributed garbage
+     * collection.
+     *
+     * When the first LiveRef to a particular remote object is registered,
+     * a "dirty" call is made to the server-side distributed garbage
+     * collector for the remote object, which returns a lease guaranteeing
+     * that the server-side DGC will not collect the remote object for a
+     * certain period of time.  While LiveRef instances to remote objects
+     * on a particular server exist, the DGCClient periodically sends more
+     * "dirty" calls to renew its lease.
+     *
+     * The DGCClient tracks the local reachability of registered LiveRef
+     * instances (using phantom references).  When the LiveRef instance
+     * for a particular remote object becomes garbage collected locally,
+     * a "clean" call is made to the server-side distributed garbage
+     * collector, indicating that the server no longer needs to keep the
+     * remote object alive for this client.
+     *
+     * @see java.rmi.dgc.DGC, sun.rmi.transport.DGCImpl
+     *
+     * @author  Ann Wollrath
+     * @author  Peter Jones
+     */
+这里看到，自调用`StreamRemoteCall#releaseInputStream`中的`this.in.RegisterRefs`以来，客户端所作的事情，确实是向服务端注册每一个`LiveRef`，并且获取到服务端返回的Lease，来告诉服务端短时间内不要回收这些对象。至于像注释说的，租约lease到期后需要再次发送`dirty
+call`的操作，就不再跟进了。
+### 服务端
+我们在 **客户端—注册端**
+一节，调试`LocateRegistry#createRegistry`时曾跟进了`UnicastServerRef#exportObject`方法。它的调用栈会在某个地方执行`this.listen()`方法监听在某个端口接受客户端的请求；
+回到 **客户端—服务端** ，由于前面分析过，创建一个远程对象无论怎样都会调用`UnicastRemoteObject#exportObject`方法：
+在这里也调用了`UnicastServerRef#exportObject`方法。
+所以服务端和注册端一样都通过了`UnicastServerRef`对象来开放服务。这里就不进一步跟进了。
+需要强调的是`UnicastServerRef#dispatch`方法，我前面也提到过：
+在远程方法调用时，它是不会进入这个if分支的，而是会继续向下执行。
+它首先会从返回数据中读取一个数据类型为Long的变量：
+    var4 = var39.readLong();
+这个long变量其实是客户端想要调用方法的哈希，当在`this.hashToMethod_Map`获取不到时会报错：
+在学习使用反序列化攻击rmi服务端时，如果在客户端自己魔改了远程对象的接口方法（比如参数类型原本在服务端是`java.lang.String`，但在客户端修改为`java.lang.Object`），此时需要修改这个哈希值才能正常攻击。
+### 总结
+  * dgc流程：
+    1. 客户端通过`lookup`获取到一个对象后，会向服务端发起一次`dirty call`，以通知服务端短时间内不要回收该对象；
+    2. 服务端返回给客户端一个`lease`，该对象告诉了客户端接下来多久的时间内该对象是有效的。如果客户端在时间到期后还需要使用该对象，则需要继续调用`dirty call`；
+    3. `DGCClient`会跟踪每一个`liveRef`，当他们在客户端已经不再有效后，就会发起`clear call`告诉服务端可以回收有关对象了。
+  * 无论是rmi注册端还是服务端，它们都通过`UnicastServerRef#exportObject`开启指定端口上的服务，最终都会进入`TCPTransport#handleMessages`中的循环来监听输入流，并且最后又都会使用`UnicastServerRef#dispatch`来调用注册端或者服务端的功能。
+## 参考链接
+  1. [针对RMI服务的九重攻击](https://xz.aliyun.com/t/7930)
+  2. [Java安全-RMI-学习总结](https://payloads.info/2020/06/21/Java%E5%AE%89%E5%85%A8-RMI-%E5%AD%A6%E4%B9%A0%E6%80%BB%E7%BB%93/)
+  3. [DGCClient源码](https://github.com/frohoff/jdk8u-jdk/blob/master/src/share/classes/sun/rmi/transport/DGCClient.java)

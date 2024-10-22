@@ -1,0 +1,141 @@
+**本文翻译自：[CVE-2017-11176: A step-by-step Linux Kernel exploitation (part
+2/4)](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part2.html)**
+# Introduction
+在[前面的文章](https://blog.lexfo.fr/cve-2017-11176-linux-kernel-exploitation-part1.html)中对CVE-2017-11176漏洞进行了详细分析并提出了一个攻击场景。
+通过在内核空间强制触发漏洞来验证漏洞的可达性（在System Tap的帮助下），并构建了POC的第一个版本（只能到达漏洞代码路径，并不会崩溃）。
+它揭示了触发漏洞所需的三个条件（以及如何满足它们）：
+  * 使netlink_attachskb()返回1
+  * 避免阻塞exp进程
+  * 第二次fget()调用返回NULL
+在本文中，我们将尝试不使用System Tap脚本，并仅通过用户空间的代码满足这些条件。在本文结束时，我们将有一个完整的POC，可以可靠地触发漏洞。
+# 目录
+  * 核心概念 #2
+  * 主线程解除阻塞
+  * 使第二次循环中的fget()返回NULL
+  * “retry”路径
+  * 最终POC
+  * 结论
+在第二个“核心概念”部分中，将介绍调度子系统。第一个重点是任务状态以及任务如何在各个状态之间转换。请注意，这里将不讨论实际的调度算法（[Completely
+Fair Scheduler](https://www.linuxjournal.com/node/10267)）。
+主要说明 **等待队列** ，在本文中被用来解除阻塞的线程，并在exp利用期间获取任意调用原语（参见第3部分）。
+## 任务状态
+任务的运行状态由task_struct中的 **state** 字段表示。任务基本上处于下面其中一种状态（还有多种状态未列出）：
+  * **Running** ：进程正在运行或已经准备就绪只等待在cpu上运行。
+  * **Waiting** ：进程正在等待某种事件/资源。
+“正在运行”任务（ _TASK_RUNNING_ ）是属于 **运行队列的任务** 。它可以现在正在cpu上运行，也可以在不久的将来运行（由调度器选择）。
+“等待”任务未在任何CPU上运行。它可以由 **等待队列** 或信号唤醒。等待任务的最常见状态是 _TASK_INTERRUPTIBLE_
+（即“睡眠”可以被中断）。
+译者注：关于任务状态可以参考这里的[链接](http://www.mywiki.cn/Hovercool/index.php/linux%E8%BF%9B%E7%A8%8B%E7%8A%B6%E6%80%81)
+这里定义了各种任务状态：
+    // [include/linux/sched.h]
+    #define TASK_RUNNING        0
+    #define TASK_INTERRUPTIBLE  1
+    // ... cut (other states) ...
+可以直接修改state字段，也可以通过__set_current_state()来设置state字段。
+    // [include/linux/sched.h]
+    #define __set_current_state(state_value)            \
+        do { current->state = (state_value); } while (0)
+## 运行队列
+**struct rq** (run
+queue)是调度器最重要的数据结构之一。运行队列中的每个任务都将由CPU执行。每个CPU都有自己的运行队列（允许真正的多任务处理）。运行队列(run
+queue)具有一个任务(由调度器选择在指定的CPU上运行)列表。还具有统计信息，使调度器做出“公平”选择并最终重新平衡每个cpu之间的负载（即cpu迁移）。
+    // [kernel/sched.c]
+    struct rq {
+      unsigned long nr_running;   // curr;    // state && !(preempt_count() & PREEMPT_ACTIVE)) {   // state, prev)))
+                prev->state = TASK_RUNNING;
+              else
+                deactivate_task(rq, prev, DEQUEUE_SLEEP);     // nvcsw;
+            }
+            // ... cut (choose the next task) ...
+          }
+最后，可以通过如下代码阻塞任务：
+    void make_it_block(void)
+    {
+      __set_current_state(TASK_INTERRUPTIBLE);
+      schedule();
+    }
+任务将被阻塞，直到其他 _东西_ 唤醒它。
+## 等待队列
+任务等待资源或特殊事件非常普遍。例如，如果运行服务器(客户端-服务器（Client/Server）架构里的Server)，主线程可能正在等待即将到来的连接。除非它被标记为“非阻塞”，否则accept()系统调用将阻塞主线程。也就是说，主线程将阻塞在内核中，直到其他
+_东西_ 唤醒它。
+**等待队列** 基本上是由当前阻塞(等待)的任务组成的双链表。与之相对的是运行队列。队列本身用 **wait_queue_head_t** 表示：
+    // [include/linux/wait.h]
+    typedef struct __wait_queue_head wait_queue_head_t;
+    struct __wait_queue_head {
+        spinlock_t lock;
+        struct list_head task_list;
+    };
+**NOTE** ：struct list_head是Linux实现双链表的方式。
+等待队列的每个元素都具有 **wait_queue_t** ：
+    // [include/linux.wait.h]
+    typedef struct __wait_queue wait_queue_t;
+    typedef int (*wait_queue_func_t)(wait_queue_t *wait, unsigned mode, int flags, void *key);
+    struct __wait_queue {
+        unsigned int flags;
+        void *private;                
+        wait_queue_func_t func;     // flags &= ~WQ_FLAG_EXCLUSIVE;
+        spin_lock_irqsave(&q->lock, flags);
+        __add_wait_queue(q, wait);              // lock, flags);
+    }
+    static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
+    {
+        list_add(&new->task_list, &head->task_list);
+    }
+## 唤醒任务
+到目前为止，我们知道有两种队列：运行队列和等待队列。阻塞任务就是将其从运行队列中删除（通过deactivate_task()）。但它如何从阻塞（睡眠）状态转换回运行状态？
+**NOTE** ：阻塞的任务可以通过信号（和其他方式）唤醒，但在本文中不会讨论这些。
+由于被阻塞的任务不再运行，因此 **无法自行唤醒** 。需要由 **别的任务** 唤醒它。
+特定资源具有特定的等待队列。当任务想要访问此资源但此时不可用时，该任务可以使自己处于睡眠状态，直到资源所有者将其唤醒为止。
+为了在资源可用时被唤醒，它必须将自己注册到该资源的等待队列。正如我们之前看到的，这个“注册”是通过add_wait_queue()调用完成的。
+当资源可用时，所有者唤醒一个或多个任务，以便他们可以继续执行。这是通过__wake_up()函数完成的：
+    // [kernel/sched.c]
+    /**
+     * __wake_up - wake up threads blocked on a waitqueue.
+     * @q: the waitqueue
+     * @mode: which threads
+     * @nr_exclusive: how many wake-one or wake-many threads to wake up
+     * @key: is directly passed to the wakeup function
+     *
+     * It may be assumed that this function implies a write memory barrier before
+     * changing the task state if and only if any tasks are woken up.
+     */
+    void __wake_up(wait_queue_head_t *q, unsigned int mode,
+                int nr_exclusive, void *key)
+    {
+        unsigned long flags;
+        spin_lock_irqsave(&q->lock, flags);
+        __wake_up_common(q, mode, nr_exclusive, 0, key);    // lock, flags);
+    }
+    // [kernel/sched.c]
+        static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+              int nr_exclusive, int wake_flags, void *key)
+        {
+          wait_queue_t *curr, *next;
+    [0]   list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+            unsigned flags = curr->flags;
+    [1]     if (curr->func(curr, mode, wake_flags, key) &&
+                (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+              break;
+          }
+        }
+此函数迭代等待队列中的每个元素[0]（ **list_for_each_entry_safe()是与双链表一起使用的宏** ）。对每个元素都调用
+**func()** 回调函数[1]。
+还记得DECLARE_WAITQUEUE()宏吗？它将func设置为 **default_wake_function()** ：
+    // [include/linux/wait.h]
+    #define __WAITQUEUE_INITIALIZER(name, tsk) {                \
+        .private    = tsk,                      \
+        .func       = default_wake_function,            \                 // private, mode, wake_flags);
+    }
+最后，try_to_wake_up()有点像schedule()的“对立面”。schedule()将当前任务“调度出去”，try_to_wake_up()使其再次可调度。也就是说，它将任务加入运行队列中并更改其状态为"TASK_RUNNING"！
+    static int try_to_wake_up(struct task_struct *p, unsigned int state,
+                  int wake_flags)
+    {
+        struct rq *rq;
+        // ... cut (find the appropriate run queue) ...
+    out_activate:
+        schedstat_inc(p, se.nr_wakeups);              // state = TASK_RUNNING;                      // <----- the state has changed!
+        // ... cut ...
+    }
+这里调用了 **activate_task()**
+。因为任务现在回到运行队列中并且其状态为TASK_RUNNING，所以它有可能会被调度，回到之前调用schedule()中断的地方继续执行。
+实际上很少直接调用__wake_up()。通常会调用这些辅助宏：

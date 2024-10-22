@@ -1,0 +1,76 @@
+## Recheck Cond filter IO\CPU放大 原理与优化CASE - 含 超级大表 不包含(反选) SQL优化  
+### 作者                        
+digoal                       
+### 日期                         
+2017-12-07                    
+### 标签                  
+PostgreSQL , 全文检索 , 数组 , 不包含 , not in , bitmap scan filter , toast 切片存储 , except , IO , cpu , 放大         
+----                  
+## 背景       
+在阅读本文之前，先提几个问题：  
+1、用了索引是不是就不需要访问表了？  
+2、用了索引是不是就不需要进行二次判断了？  
+第一个问题，只有一种情况用了索引是不需要访问表的，Index Only Scan，并且对应堆表行号对应的HEAP块中没有不可见TUPLE（访问表的VM文件得到）。否则都需要回表，访问堆表的tuple head(infomask掩码)，并判断行版本获得可见性。注意回表并不需要访问COLUMN的VALUE，只需要访问堆表中TUPLE的HEAD，取其掩码来判断可见性。  
+第二个问题，实际上是索引精确性的问题，对于精准索引的INDEX SCAN，是不需要RECHECK的，例如B-TREE索引。但是这里指的是index scan和index only scan，并不是bitmap scan。bitmap scan实际上只是定位到了BLOCK，并没有定位到item，也就是说，需要recheck。因此什么时候recheck，取决于索引的精确性 以及是否使用了bitmapcan。对于不lossy index，必然是要recheck的，对于bitmap scan也必然是需要recheck的。  
+recheck有哪些开销？  
+recheck需要取得HEAP TABLE的对应被过滤列的VALUE，进行recheck。  
+好的，接下来谈一下recheck引入的隐含问题：  
+recheck过多，就会导致CPU使用偏高，同时响应变慢，毋庸置疑。  
+## recheck 引入的开销举例  
+### 例子1 - bitmap scan带来的recheck  
+bitmap scan将数据收敛到了被命中的BLOCK，并执行顺序的HEAP扫描。这样减少了数据块的随机性，但是引入了一个问题，RECHECK的问题。  
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select count(*) from a where id>10 and id  Bitmap Heap Scan on public.a  (cost=132.77..10815.80 rows=9750 width=0) (actual time=1.082..3.056 rows=9989 loops=1)  
+         Output: id, info, crt_time  
+	 -- 这条就是heap scan的时候的recheck  
+         Recheck Cond: ((a.id > 10) AND (a.id   Bitmap Index Scan on a_pkey  (cost=0.00..130.34 rows=9750 width=0) (actual time=1.060..1.060 rows=9989 loops=1)  
+               Index Cond: ((a.id > 10) AND (a.id 10 and id  Index Scan using a_pkey on public.a  (cost=0.43..320.04 rows=9750 width=0) (actual time=0.020..2.280 rows=9989 loops=1)  
+         Output: id, info, crt_time  
+         Index Cond: ((a.id > 10) AND (a.id   Bitmap Index Scan on idx_t_big  (cost=0.00..234754.90 rows=99500 width=0) (actual time=6445.690..6445.690 rows=100000 loops=1)  
+         Index Cond: (t_big.info @@ to_tsquery('! -1'::text))  
+         Buffers: shared hit=165083  
+ Planning time: 0.166 ms  
+ Execution time: 6468.692 ms  
+(10 rows)  
+```  
+后面谈优化方法。  
+### 例子3 - lossy index 引入的recheck  
+brin索引, bloom索引都属于lossy索引，索引本身决定了在输入条件后，只能将数据缩小到一个范围，然后再通过recheck来决定tuple是否符合条件。  
+```  
+create table t_brin (id int, info text);  
+insert into t_brin select generate_series(1,10000000), 'test';  
+create index idx_t_brin on t_brin using brin(id);  
+explain (analyze,verbose,timing,costs,buffers) select count(*) from t_brin where id between 1 and 100;  
+```  
+```  
+postgres=# explain (analyze,verbose,timing,costs,buffers) select count(*) from t_brin where id between 1 and 100;  
+                                                           QUERY PLAN                                                             
+--------------------------------------------------------------------------------------------------------------------------------  
+ Aggregate  (cost=21314.01..21314.02 rows=1 width=8) (actual time=2.685..2.685 rows=1 loops=1)  
+   Output: count(*)  
+   Buffers: shared hit=137  
+   ->  Bitmap Heap Scan on public.t_brin  (cost=4.83..21314.01 rows=1 width=0) (actual time=0.165..2.669 rows=100 loops=1)  
+         Output: id, info  
+         -- 这里出现了recheck  
+	 Recheck Cond: ((t_brin.id >= 1) AND (t_brin.id   Bitmap Index Scan on idx_t_brin  (cost=0.00..4.83 rows=23641 width=0) (actual time=0.148..0.148 rows=1280 loops=1)  
+               Index Cond: ((t_brin.id >= 1) AND (t_brin.id <= 100))  
+               Buffers: shared hit=9  
+ Planning time: 0.211 ms  
+ Execution time: 2.739 ms  
+(14 rows)  
+```  
+## 切片存储-TOAST  
+这里为什么要提到切片存储，因为我接下来的优化方法，如果没有切片存储，那么就不成立。  
+切片存储指对超过BLOCK 1/4大小的变长记录，存储到切片中，而在TUPLE中仅仅使用TOAST 指针来引用，从而减少TUPLE本身的大小。  
+那么扫描全表的行号时，实际上，如果记录数本身不多，只是列比较大时，实际上全表扫描取行号很快。  
+## 如何优化大字段 recheck带来的问题  
+前面举的例子，当字段很大时，recheck很耗费资源。  
+假设满足条件的数据太多，导致recheck很久。应该如何优化呢？  
+```  
+select * from tbl where id not in (....);  
+select * from tbl where ts @@ to_tsquery('! china');  
+```  
+既然这些条件的结果很多，那么说明相反的结果就很少，这些条件相反的条件来查询（走index scan，避免recheck），另外再使用全量数据(全表扫，不recheck，所以不需要扫描大字段)，except来排他。  
+### except方法优化  
+1、找出所有符合条件的数据的ID或行号  
+2、找出（满足条件）相反的ID或行号  

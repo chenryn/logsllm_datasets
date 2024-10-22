@@ -1,0 +1,125 @@
+# 一种 SonicWall nsv 虚拟机的解包方法
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+最近 SonicWall 官方发布了影响 SonicOS 的数个缓冲区溢出漏洞，编号 CVE-2021-20048、CVE-2021-20046
+等。在研究复现过程中发现针对此设备的解包思路比较有趣，所以在这里分享给大家。
+## 固件获取
+该设备固件前段时间可以从 mysonicwall 网站上获取，但目前 sonicwall 下架了 nsv200(SonicOS GEN6)
+相关固件，所以这里提供旧版固件的[网盘链接](https://pan.baidu.com/s/1O6iyLwHUgyQKSymsaVO7Iw)(提取码：1a30)，感兴趣的朋友可以自行下载。
+## 安装和配置
+用 VMWare 打开 ova 文件，一路确定并等待开机完成。虚拟机会从 DHCP 自动获取到 IP 地址，访问可以看到登录界面：
+默认用户名和密码：admin:password
+## 解包
+###  启动分析
+sonicwall nsv 的默认终端是一个自定义 CLI 程序，不提供 Linux root shell，所以想要得到关键文件，必须解包固件。
+查看虚拟机的启动过程，输出很少的信息之后就会出现 sonicwall logo
+厂商使用这种方式遮蔽了系统启动时输出的信息，只能直接从固件下手。
+找到虚拟机的 vmdk 磁盘文件，使用 7-zip 打开，可以看到内部有数个分区文件
+这里也可尝试直接将磁盘挂载到已有的 Linux 虚拟机上，虚拟机设置 -> 添加 -> 硬盘 -> SCSI -> 使用现有虚拟磁盘 -> 选择
+sonicwall vmdk 文件 -> 保持现有格式
+挂载之后分区状态如下
+系统识别到 4 个分区，但是全部加密，猜测文件系统就位于其中一个分区内。
+ls 查看 /dev/ 目录下信息，发现还有 sdb1、2 等没有在文件管理器显示出来，尝试手动挂载
+    sudo mount /dev/sdb1 ./test
+第一个分区存放了 BOOT 相关文件，并有一个 coreos 目录，可能是基于开源项目制作的。在 boot 分区中我们发现虚拟机使用了 GRUB
+引导系统启动，GRUB 是一个常见的启动引导程序，它具有命令行功能。根据官方文档，当系统引导失败时会自动进入 GRUB
+救援模式，可以执行一些和文件系统相关的操作。
+###  加密方式
+明确了后续思路，我们还需要知道分区的加密方式是什么。
+用 7-zip 解压出其中一个较小的加密分区 OEM.img，然后加载到 16 进制编辑器看到文件开头是 LUKS
+LUKS 是一种磁盘加密标准，nsv 设备使用 LUKS 实现了全盘加密。
+网络上存在一些 LUKS 全盘加密的[解密方法](https://www.ajfriesen.com/decrypt-and-mount-luks-volume-in-grub-rescue-mode/)，可以进入 GRUB 的救援模式命令行并使用 cryptomount
+命令&密码解密。但目前还不知道加密密码是什么，需要研究一下 LUKS 的加密逻辑。
+既然系统可以正常启动，说明在引导阶段就通过某种方式解密了各个分区。参考分区的加密方式，密码应该被保存在 luks 相关的模块中。
+关于 LUKS 解密的具体逻辑可参考它的项目源码，解密关键函数是 grub_crypto_pbkdf2，原型如下
+    grub_crypto_pbkdf2 (const struct gcry_md_spec *md,
+                const grub_uint8_t *P, grub_size_t Plen,
+                const grub_uint8_t *S, grub_size_t Slen,
+                unsigned int c,
+                grub_uint8_t *DK, grub_size_t dkLen)
+其中第二个参数是用于解密分区的密钥。
+在 BOOT 分区搜索正好可以找到 luks.mod 模块，将它解压，然后用 IDA 分析，通过交叉引用找到解密相关代码
+    grub_real_dprintf("disk/luks.c", 246LL, "luks", "Trying keyslot %d\n", k);
+    v32 = grub_crypto_pbkdf2(*(a2 + 88), a4, v43, v31, 32LL, _byteswap_ulong(*(v31 - 1)), v51, v38);
+我们看到解密时会输出 log 信息 “Trying keyslot xx”，而变量 a4 应该就是 key。
+###  提取密钥
+为了解密分区，需要通过某种手段获取模块中的密钥，而密钥又保存在 luks 模块中，所以具体思路是进入 GRUB
+命令行，然后加载和解密相关的各个模块，接着利用调试器附加到 luks.mod 上，尝试中断在 grub_crypto_pbkdf2 函数，并提取其参数。
+为了能完成上述操作，首先我们需要一种能够在启动虚拟机后从外部修改文件的方式。这一点可利用 qemu-nbd 实现。
+其次还要支持调试器，用于调试 luks 相关模块。可以利用 Linux 下虚拟化平台 QEMU/KVM 虚拟机实现。
+**工具配置**
+安装 qemu-utils 和 KVM & VMM
+    sudo apt install qemu-utils
+    sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst virt-manager
+**转换镜像**
+vmware 使用的是 vmdk 虚拟磁盘镜像，为了使用 qemu-nbd 修改镜像，首先要把 vmdk 转换成 qcow2 格式。
+    qemu-img convert -f vmdk ./image.vmdk -O qcow2 sonicwall.qcow2
+**配置虚拟机**
+注：虚拟机需要开启 Intel-VTx 或 AMD-V 支持。
+将转换之后的镜像使用 qemu-nbd 挂载到本地
+    sudo modprobe nbd max_part=8    # 加载 nbd 模块
+    sudo qemu-nbd --connect=/dev/nbd0 ./sonicwall.qcow2    # 挂载镜像
+    sudo fdisk /dev/nbd0 -l    # 查看分区信息
+此时已经成功挂载。
+然后导入挂载的镜像到 KVM 虚拟机，在 VMM 中添加一个虚拟机，导入现有磁盘映像 -> 存储路径：/dev/nbd0
+**配置调试接口**
+和 vmware 一样，KVM 也支持对虚拟机添加调试接口，在终端输入命令
+    virsh edit 
+进入命令行模式，随意选择一个编辑器修改配置文件。
+修改 \ 为
+这样当虚拟机启动之后就可以用 gdb 附加到 localhost:12345 对其进行调试了。
+**进入救援模式**
+我们重命名 boot 分区中的一些文件，当 GRUB 引导时就会由于找不到关键文件而进入救援模式。
+首先挂载 nbd 中的 BOOT 分区到本地目录。
+    sudo mount /dev/nbd0p1 ./test
+然后进入 /coreos/grub 目录，并重命名其中的三个目录
+    mv i386-pc i386-pc-bak
+    mv x86_64-efi x86_64-efi-bak
+    mv x86_64-xen x86_64-xen-bak
+    sync
+    sync
+启动虚拟机，此时系统会自动进入救援模式。
+这里可用 TAB 键看看有哪些可用的命令。
+ls 命令显示分区列表
+**使用解密功能**
+解密分区命令为 cryptomount，不过在使用之前需要恢复 BOOT 分区中的目录名。
+    mv ./i386-pc-bak i386-pc     
+    mv x86_64-efi-bak x86_64-efi     
+    mv x86_64-xen-bak x86_64-xen
+    sync
+    sync
+使用 cryptomount 尝试解密 (hd0,gpt3) 报错
+这是因为相关模块没加载，需要手动将部分模块加载一遍，经过测试，至少要加载 gcry_rijndael、luks、gcry_sha256 三个模块
+    insmod luks
+    insmod gcry_rijndael
+    insmod gcry_sha256
+然后再对 gpt3 分区进行解密
+    cryptomount (hd0,gpt3)
+这样解密成功，还可以加载 ext2 模块并用 ls 命令查看文件系统结构
+**调试 luks 模块**
+在救援模式下已经成功解密分区，但无法将文件提取出来，所以需要调试 LUKS 模块取得相关密钥，再挂载镜像到普通的 Linux 系统解密。
+重新启动虚拟机，然后另开一个终端，启动 gdb，并附加到当前虚拟机
+    target remote 0:12345
+    continue
+加载 gcry_rijndael 等模块，之后通过搜索 LUKS.mod 中特殊字符串来定位关键代码
+    find 0,0x8000000,"Trying keyslot %d\n"
+这里找到两个结果，依次从每个地址附近查找关键代码，例如进行以下搜索
+    x /30i 0x7f56fb7 - 0xbf0
+继续向下找到关键函数开头
+根据指令偏移量找到关键位置
+这些指令序列和 IDA 对应位置相同
+在 call 指令下断点，然后让系统继续运行，接着在命令行中解密 gpt3 分区，gdb 将会断下
+此时 rcx 寄存器值表示密钥的长度，而在 rdx 寄存器指向的地址中就能找到解密分区使用的密钥
+###  解密文件
+我们已经获取解密 gpt3 分区的密钥，接下来可以在本地 Linux 系统中尝试解密分区。
+将 vmdk 重新挂载到本地 Linux 系统，并把调试得到的密钥保存到一个文件中，然后执行以下命令尝试解密。
+    cat key_p3 | sudo cryptsetup luksOpen /dev/sdb3 p3    # 解密分区
+    dd if=/dev/mapper/p3 of=./part3    # 某些情况下挂载分区会报错，我们将分区拷贝到  Windows 下解压
+将生成的 part3 分区文件解压即可得到解密后的文件系统
+同理，对于剩下的几个加密分区也能通过同样的方式实现解密。
+## 参考文章
+[qemu-nbd技术分析](https://cloud.tencent.com/developer/article/1087439)
+[Decrypt and mount LUKS volume in GRUB rescue
+mode](https://www.ajfriesen.com/decrypt-and-mount-luks-volume-in-grub-rescue-mode/)
+[Linux的磁盘加密技术LUKS](http://pavelhan.tech/post/2020-07-07-00-Linux%E7%9A%84%E7%A3%81%E7%9B%98%E5%8A%A0%E5%AF%86%E6%8A%80%E6%9C%AFLUKS/)

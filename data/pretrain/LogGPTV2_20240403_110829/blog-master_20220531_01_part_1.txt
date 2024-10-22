@@ -1,0 +1,139 @@
+## PostgreSQL 事务号耗尽错误 或 即将耗尽警告 原理、救火、预防 : database %s must be vacuumed within %u transactions 或 database is not accepting commands to avoid wraparound data loss in database         
+### 作者                                                      
+digoal                                                                          
+### 日期                                                                          
+2022-05-31                                                                         
+### 标签                                                                       
+PostgreSQL , 事务号                                           
+----                                                                        
+## 背景   
+也许是最后一次讲这个问题, 因为PostgreSQL社区正在将xid从32位改成64位, 未来的PG版本不会因为某些原因未及时freeze导致事务号耗尽需要停库维护.   
+当然了, 事务号改成64位并不代表未来都不需要freeze了, commit log的推进依然可能需要freeze的动作.  (否则需要保留所有commit log来判断事务状态, 所有事务状态都从commit log查询会导致物理IO增加可能导致性能变差).    
+事务号耗尽前会发生什么? 数据库会发出告警, 就好像我们身体出现问题时会发出告警一样, 例如胃不舒服会胀气、胃痛.    
+- 1、剩余4000万可分配事务号时, 开始警告, 必须执行库级别vacuum freeze.  
+- 2、剩余300万可分配事务号时, 报错, 必须停库, 重启进入单用户模式, 执行集群级别vacuum freeze.  
+相关代码:  
+src/backend/access/transam/varsup.c  
+```  
+/*  
+ * Allocate the next FullTransactionId for a new transaction or  
+ * subtransaction.  
+ *  
+ * The new XID is also stored into MyProc->xid/ProcGlobal->xids[] before  
+ * returning.  
+ *  
+ * Note: when this is called, we are actually already inside a valid  
+ * transaction, since XIDs are now not allocated until the transaction  
+ * does something.  So it is safe to do a database lookup if we want to  
+ * issue a warning about XID wrap.  
+ */  
+FullTransactionId  
+GetNewTransactionId(bool isSubXact)  
+{  
+......  
+        /*----------  
+         * Check to see if it's safe to assign another XID.  This protects against  
+         * catastrophic data loss due to XID wraparound.  The basic rules are:  
+         *  
+         * If we're past xidVacLimit, start trying to force autovacuum cycles.  
+         * If we're past xidWarnLimit, start issuing warnings.  
+         * If we're past xidStopLimit, refuse to execute transactions, unless  
+         * we are running in single-user mode (which gives an escape hatch  
+         * to the DBA who somehow got past the earlier defenses).  
+         *  
+         * Note that this coding also appears in GetNewMultiXactId.  
+         *----------  
+         */  
+......  
+                TransactionId xidWarnLimit = ShmemVariableCache->xidWarnLimit;  
+                TransactionId xidStopLimit = ShmemVariableCache->xidStopLimit;  
+                TransactionId xidWrapLimit = ShmemVariableCache->xidWrapLimit;  
+                Oid                     oldest_datoid = ShmemVariableCache->oldestXidDB;  
+......    
+                if (IsUnderPostmaster &&  
+                        TransactionIdFollowsOrEquals(xid, xidStopLimit))  
+                {  
+                        char       *oldest_datname = get_database_name(oldest_datoid);  
+                        /* complain even if that DB has disappeared */  
+                        if (oldest_datname)  
+                                ereport(ERROR,  
+                                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),  
+                                                 errmsg("database is not accepting commands to avoid wraparound data loss in database \"%s\"",  
+                                                                oldest_datname),  
+                                                 errhint("Stop the postmaster and vacuum that database in single-user mode.\n"  
+                                                                 "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));  
+                        else  
+                                ereport(ERROR,  
+                                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),  
+                                                 errmsg("database is not accepting commands to avoid wraparound data loss in database with OID %u",  
+                                                                oldest_datoid),  
+                                                 errhint("Stop the postmaster and vacuum that database in single-user mode.\n"  
+                                                                 "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));  
+                }  
+                else if (TransactionIdFollowsOrEquals(xid, xidWarnLimit))  
+                {  
+                        char       *oldest_datname = get_database_name(oldest_datoid);  
+                        /* complain even if that DB has disappeared */  
+                        if (oldest_datname)  
+                                ereport(WARNING,  
+                                                (errmsg("database \"%s\" must be vacuumed within %u transactions",  
+                                                                oldest_datname,  
+                                                                xidWrapLimit - xid),  
+                                                 errhint("To avoid a database shutdown, execute a database-wide VACUUM in that database.\n"  
+                                                                 "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));  
+                        else  
+                                ereport(WARNING,  
+                                                (errmsg("database with OID %u must be vacuumed within %u transactions",  
+                                                                oldest_datoid,  
+                                                                xidWrapLimit - xid),  
+                                                 errhint("To avoid a database shutdown, execute a database-wide VACUUM in that database.\n"  
+                                                                 "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));  
+                }  
+```  
+```  
+/*  
+ * VariableCache is a data structure in shared memory that is used to track  
+ * OID and XID assignment state.  For largely historical reasons, there is  
+ * just one struct with different fields that are protected by different  
+ * LWLocks.  
+ *  
+ * Note: xidWrapLimit and oldestXidDB are not "active" values, but are  
+ * used just to generate useful messages when xidWarnLimit or xidStopLimit  
+ * are exceeded.  
+ */  
+typedef struct VariableCacheData  
+{  
+...  
+        /*  
+         * These fields are protected by XidGenLock.  
+         */  
+        FullTransactionId nextXid;      /* next XID to assign */  
+        TransactionId oldestXid;        /* cluster-wide minimum datfrozenxid */  
+        TransactionId xidVacLimit;      /* start forcing autovacuums here */  
+        TransactionId xidWarnLimit; /* start complaining here */  
+        TransactionId xidStopLimit; /* refuse to advance nextXid beyond here */  
+        TransactionId xidWrapLimit; /* where the world ends */  
+        Oid                     oldestXidDB;    /* database with minimum datfrozenxid */  
+...  
+        /*  
+         * The place where we actually get into deep trouble is halfway around  
+         * from the oldest potentially-existing XID.  (This calculation is  
+         * probably off by one or two counts, because the special XIDs reduce the  
+         * size of the loop a little bit.  But we throw in plenty of slop below,  
+         * so it doesn't matter.)  
+         */  
+        xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId >> 1);  
+        if (xidWrapLimit < FirstNormalTransactionId)  
+                xidWrapLimit += FirstNormalTransactionId;  
+        /*  
+         * We'll refuse to continue assigning XIDs in interactive mode once we get  
+         * within 3M transactions of data loss.  This leaves lots of room for the  
+         * DBA to fool around fixing things in a standalone backend, while not  
+         * being significant compared to total XID space. (VACUUM requires an XID  
+         * if it truncates at wal_level!=minimal.  "VACUUM (ANALYZE)", which a DBA  
+         * might do by reflex, assigns an XID.  Hence, we had better be sure  
+         * there's lots of XIDs left...)  Also, at default BLCKSZ, this leaves two  
+         * completely-idle segments.  In the event of edge-case bugs involving  
+         * page or segment arithmetic, idle segments render the bugs unreachable  
+         * outside of single-user mode.  
+         */  

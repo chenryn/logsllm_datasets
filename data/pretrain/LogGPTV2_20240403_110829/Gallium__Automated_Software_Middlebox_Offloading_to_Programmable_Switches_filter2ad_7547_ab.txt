@@ -1,0 +1,297 @@
+execution. Any time two statements access the same state, with
+at least one of them being a write, or if a statement determines
+whether or not some other statement will be executed, we will tag a
+dependency between the two statements. In the generated program,
+we ensure that, for any statement S, all statements that S depends
+on have been executed before S.
+The second step is to partition the input program’s source code
+into the desired three partitions (i.e., a pre-processing partition,
+a non-offloaded partition, and a post-processing partition) while
+maintaining the dependencies. (See §4.2.) At the same time, Gallium
+must ensure that the generated P4 program, which contains the
+pre- and post-processing partitions, conforms to the expressiveness
+and the hardware resource constraints.
+We develop a label-removing algorithm that partitions the source
+program and preserves dependencies while meeting the switch con-
+straints. Our algorithm first finds a partitioning that maximizes the
+number of statements offloaded to the programmable switch by
+only considering the restrictions imposed by the program depen-
+dencies and P4’s expressiveness constraints. Our algorithm then
+refines the partitioning result by gradually moving statements from
+the pre- and post-processing partition to the non-offloaded partition
+until it satisfies all the resource constraints.
+The final step is to generate code that provides the desired concur-
+rency semantics. (See §4.3.) The partitioning process assumes that
+the middlebox state is synchronously replicated across the switch
+and the server and that the packets are processed one at a time. The
+code generation step, along with the runtime system, ensures that
+SIGCOMM ’20, August 10–14, 2020, Virtual Event, NY, USA
+Kaiyuan Zhang, Danyang Zhuo, and Arvind Krishnamurthy
+the generated program provides a per-packet run-to-completion
+semantics even as the switch and the server concurrently consume
+packets. Crucially, Gallium identifies what program state has to be
+replicated and includes distinct mechanisms for handling replicated
+and non-replicated state in order to provide run-to-completion
+semantics.
+For state replicated across the programmable switch and the
+middlebox server, the concurrent processing of packets should
+exhibit behaviors that would have been obtained if the packets
+had been processed sequentially. As a concrete example, consider
+a NAT that maintains a bidirectional address mapping using two
+connection tables: one which maps an internal address and port to
+an externally visible port, and the other which maps the externally
+visible port to an internal address and port. When the NAT receives
+a SYN packet from a new TCP connection, it updates both of these
+connection tables to handle subsequent packets from both sides
+properly. If this computation is performed on the server, then the
+updates would have to be consistently and atomically replicated
+on the switch. Therefore, Gallium provides efficient mechanisms
+for state synchronization.
+Gallium also provides mechanisms to communicate non-replicated
+state between the server and the switch. Because the non-offloaded
+partition may require additional information from the pre-processing
+partition (e.g., a temporary variable computed by the pre-processing
+partition), Gallium has to synthesize a packet format where the
+additional information can be delivered using the packet header.
+A similar mechanism also has to exist for delivering information
+from the non-offloaded partition to the post-processing partition.
+Gallium uses static analysis to identify the set of variables that
+need to be transferred and allocates packet header fields to store
+these variables. Finally, Gallium maps all the data structures and
+instructions to their P4 counterparts, e.g., from a HashMap lookup
+to a P4 table lookup. Gallium requires a middlebox developer to
+annotate the maximum size for each data structure stored in the
+programmable switch.
+At the end of the compilation, Gallium outputs: (1) a deploy-
+able P4 program that contains both the pre- and post-processing
+partitions; and (2) a C++ server program that corresponds to the
+non-offloaded partition.
+4 Design
+This section describes the details of dependency extraction, parti-
+tioning, code generation, and runtime execution. We use a simple
+load balancer, MiniLB, as a running example. MiniLB uses consistent
+hashing over the source and destination IP addresses to assign in-
+coming TCP connections to a list of server backends. MiniLB steers
+packets by rewriting the destination IP address of the packet. To en-
+sure that packets in a given connection are sent to the same backend
+server even when the list of backends changes, MiniLB stores the
+mapping from existing connections to backends and steers packets
+using this mapping. For simplicity, MiniLB does not garbage collect
+completed connections. MiniLB contains a single Click element, and
+its C++ source code is shown below.
+class MiniLB {
+HashMap map;
+Vector backends;
+void process(Packet *pkt) {
+iphdr *ip = pkt->network_header();
+uint32_t hash32 = ip->saddr ^ ip->daddr;
+uint16_t key = (uint16_t)(hash32 & 0xFFFF);
+uint32_t *bk_addr = map.find(&key);
+if (bk_addr != NULL) {
+ip_hdr->daddr = *bk_addr;
+pkt->send();
+} else {
+uint32_t idx = hash32 % backends.size();
+uint32_t bk_addr = backends[idx];
+ip_hdr->daddr = bk_addr;
+map.insert(&key, &bk_addr);
+pkt->send();
+}}};
+4.1 Dependency Extraction
+The first step is to extract the statement-level dependencies in the
+source program. When we create the partitions (pre-processing,
+non-offloaded code, post-processing), we want to move as many
+statements as possible to the pre-processing and post-processing
+partitions to maximize offloading. The statement-level dependen-
+cies determine whether it is possible to move a particular statement
+to other locations in the source program that are conducive to
+offloading.
+We define the dependency relation “S2 depends on S1” to repre-
+sent the constraint that “S2” must run after “S1”. This dependency
+could exist due to one of many reasons, e.g., both statements write
+to the same memory location. To formally define the dependency
+condition, we first define a “can happen after” relation. “S2 can
+happen after S1” means that, for all possible program executions
+of the input program, there is at least one execution trace where
+S2 is performed after S1. This “can happen after” relation denotes
+a possible dependency of S2 on S1. On the contrary, if S2 cannot
+happen after S1, it is impossible for S2 to depend on S1.
+Extracting “can happen after” relations is straightforward. Gal-
+lium builds a control-flow graph of the source program. Whether
+S2 can happen after S1 is simply whether S2 is reachable from S1 in
+the control-flow graph.
+After we have extracted all the “can happen after” relations, we
+need to pick the real dependencies inside this set. There are three
+types of dependencies that we consider, as in a program dependence
+graph [10].
+• Data Dependency: S1 modifies the state that S2 reads from or
+writes to (i.e., read after write and write after write).
+• Reverse Data Dependency: S1 reads some variable or state modi-
+• Control Dependency: S1 modifies a condition variable used to
+fied by S2 (i.e., write after read).
+determine whether S2 should be executed.
+Note that, for programs with loops, S “can happen after” itself and,
+thus, can also “depend” on itself.
+When performing the dependency analysis, Gallium needs to
+understand what variables and data structures a program statement
+might access. Specifically, Gallium has to identify a read set, includ-
+ing all the locations a statement may read, and a write set, including
+all the locations a statement may modify. For simple operations,
+the source code itself contains the information. For operations in-
+voked through abstract data structure APIs, we need to know the
+state accessed for each API invocation. This knowledge comes from
+annotations on the APIs.
+286
+Gallium: Automated Software Middlebox Offloading to Prog. Switches
+SIGCOMM ’20, August 10–14, 2020, Virtual Event, NY, USA
+iphdr *ip_hdr = pkt->network_header();
+uint32_t hash32 = ip_hdr->saddr ^ip_hdr->daddr;
+uint16_t key = (uint16_t)(hash32 & 0xFFFF);
+uint32_t *bk_addr = map.find(&key);
+if (bk_addr == NULL)
+ip_hdr->daddr = *bk_addr;
+pkt->send();
+uint32_t idx = hash32 % backends.size();
+uint32_t bk_addr = backends[idx];
+ip_hdr->daddr = bk_addr;
+map.insert(&key, &bk_addr);
+pkt->send();
+Pre-processing
+Non-offloaded
+Post-Processing
+Figure 3: The dependency graph of MiniLB with partitions.
+In Gallium, we require annotations for both data structure APIs
+(such asHashMap andVector) and APIs used to access packet headers.
+In particular, we need two types of annotations for the Click APIs:
+(a) the data read and modified when calling into the API and (b) if
+the API returns a pointer, the data referred to by the pointer.
+In MiniLB, we have the following annotations:
+• The methods network_header() and transport_header() return
+pointers to the IP and TCP headers of the packet, respectively.
+Further, a read/write using the returned pointers is also a read-
+/write of the corresponding headers.
+• The method HashMap::find() performs reads on both the input
+parameter (e.g., key pointer) and the HashMap data structure (e.g.,
+map).
+• The [] operator of Vector class reads the parameter (e.g., idx)
+and the Vector (e.g., backends).
+• The method HashMap::insert() reads the two input parameters
+(e.g., key and bk_addr) and modifies the HashMap (e.g., map).
+With these annotations, Gallium constructs the read and write
+sets for each statement. For statements without method calls, Gal-
+lium directly constructs the read and write sets because the vari-
+ables are explicit. For a Click API invocation, Gallium uses the
+corresponding annotation to build the read and write set. When
+the source program uses a pointer dereference, Gallium performs
+pointer analysis to determine the variable referred to by the pointer.
+For example, in MiniLB, when dereferencing the pointer ip_hdr,
+Gallium traces the origin of the pointer and uses the annotation
+of network_header() API to determine that this is an access to the
+packet’s IP header. Gallium inlines all other function calls before
+constructing the read and write sets.
+Finally, Gallium builds a directed dependency graph from the
+per-instruction read and write sets. Vertices in the graph are state-
+ments in the program, and edges denote the dependencies between
+statements. For each pair S1 and S2, Gallium creates an edge from
+S1 to S2 if S2 depends on S1 by checking whether one of the three
+dependency conditions hold. Figure 3 is the extracted dependency
+graph for MiniLB.
+In our examples, we represent the dependency graph using state-
+ments in C++. Our implementation, however, creates the depen-
+dency graph on LLVM Intermediate Representation (IR) of the
+287
+source code because LLVM’s syntax is simpler than C++. We also
+ensure that a statement in the LLVM IR can be mapped to a cor-
+responding switch pipeline statement if the programmable switch
+supports the execution of the operations performed in the state-
+ment. This step is relatively straightforward, given that our switch
+target supports only a limited number of operations, all of which
+are available as primitives in the LLVM IR. As we expand Gallium to
+target other, more expressive execution platforms, we might need
+more flexible intermediate representations.
+4.2 Partitioning
+Given the dependency information, Gallium then partitions the
+middlebox program into three pieces, pre-processing, non-offloaded,
+and post-processing segments, each corresponding to a packet
+processing step.
+There are two problems to solve in partitioning the source pro-
+gram: (1) we need to consider the expressiveness of P4, and (2) we
+need to consider resource constraints. The latter includes issues
+such as how much memory is consumed by the pre- and post-
+processing partitions, how much packet header space we need to
+transfer information between programmable switches and servers,
+and can pre- and post-processing partitions fit onto the limited
+number of processing pipeline stages in the programmable switch.
+We choose to deal with these two problems separately. The first
+step is to determine how to partition the program if we have an
+unbounded amount of resources (e.g., switch memory, switch pro-
+cessing pipelines, and packet header space). In this step, we only
+consider P4’s expressiveness and the source program’s dependen-
+cies. The result of the first step is three partitions where we put
+as many statements as possible in the pre- and post-processing
+partitions, while maintaining functional equivalence to the source
+program. For the next step, we refine the partition by carefully
+moving statements from the pre- and post-processing partitions
+to the non-offloaded partition so that the final partitions meet the
+resource constraints.
+4.2.1 Assigning Execution Labels to Statements We use a
+label-removing algorithm to solve the first problem. The basic idea
+is to assign a set of labels (pre, non_off , post) to each statement
+to denote whether a statement can belong to a specific partition.
+We begin with each statement having all possible labels and then
+gradually remove labels based on a set of label-removing rules that
+use the computed dependencies.
+We define L(S) to be the set of labels for S. We initialize labels in
+the following way:
+(cid:40){pre, post, non_off }
+{non_off }
+L(S) =
+if S is supported by P4
+otherwise
+This initialization means that any statement not supported by P4
+should be in the non-offloaded partition. A statement S is supported
+by P4 if and only if these conditions hold:
+(1) S involves only those operations that P4 supports, e.g., inte-
+ger addition, subtraction, and comparison.
+(2) S’s access of the packet, if any, is only to the packet header
+fields and not packet payloads.
+SIGCOMM ’20, August 10–14, 2020, Virtual Event, NY, USA
+Kaiyuan Zhang, Danyang Zhuo, and Arvind Krishnamurthy
+iphdr *ip_hdr = pkt->network_header();
+uint32_t hash32 = ip_hdr->saddr ^ip_hdr->daddr;
+uint16_t key = (uint16_t)(hash32 & 0xFFFF);
+uint32_t *bk_addr = map.find(&key);
+if (bk_addr == NULL)
+ip_hdr->daddr = *bk_addr;
+pkt->send();
+if (bk_addr == NULL)
+uint32_t idx = hash32 % backends.size();
+uint32_t bk_addr = backends[idx];
+map.insert(&key, &bk_addr);
+if (bk_addr == NULL)
+ip_hdr->daddr = bk_addr;
+pkt->send();
+(a) pre-proccessing
+(b) non-offloaded
+(c) post-processing
+Figure 4: Control-flow graphs for pre-processing, non-offloaded, and post-processing partitions of MiniLB.
+(3) S is a Click API invocation with a P4 implementation, e.g.,
+a hash table lookup that can be replaced with a P4 table
+lookup.
+Gallium applies a set of label-removing rules over all the state-
+ments repetitively. The updating rules are given as constraints
+between the labels of statement S and all its neighboring state-
+ments in the statement dependency graph. Here, we use S1 ⇝ S2
+to denote the fact that “S2 depends on S1”, and ⇝∗ to denote the
+transitive closure of ⇝.
+Gallium uses the following label-removing rules during the la-
+beling process:
+(1) ∀S, S
+(2) ∀S, S
+(3) ∀S, S
+′
+′
+′
+,(S
+,(S
+,(S

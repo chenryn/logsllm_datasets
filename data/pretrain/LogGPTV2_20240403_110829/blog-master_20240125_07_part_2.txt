@@ -1,0 +1,126 @@
+- `polar_ss_dedicated_dbuser_names`：记录指定数据库/用户使用时进入 Native 模式，默认为空，格式为 `d1/_,_/u1,d2/u2`，表示对使用数据库 `d1` 的任意连接、使用用户 `u1` 的任意连接、使用数据库 `d2` 且用户 `u2` 的任意连接，都会回退到 Native 模式  
+### 3、闪回表和闪回日志  
+闪回表功能依赖闪回日志和快速恢复区功能，需要设置 `polar_enable_flashback_log=on` 和 `polar_enable_fast_recovery_area=on` 参数并重启。其他的参数也需要按照需求来修改，建议一次性修改完成并在业务低峰期重启。打开闪回表功能将会增大内存、磁盘的占用量，并带来一定的性能损失，请谨慎评估后再使用。  
+目前闪回表功能会恢复目标表的数据到一个新表中，表名为 polar_flashback_目标表 OID。在执行 FLASHBACK TABLE 语法后会有如下 NOTICE 提示：  
+```  
+polardb=# flashback table test to timestamp now() - interval '1h';  
+NOTICE:  Flashback the relation test to new relation polar_flashback_54986, please check the data  
+FLASHBACK TABLE  
+```  
+其中的 `polar_flashback_54986` 就是闪回恢复出的临时表，只恢复表数据到目标时刻。目前只支持 普通表 的闪回，不支持以下数据库对象：  
+- 索引  
+- Toast 表  
+- 物化视图  
+- 分区表 / 分区子表  
+- 系统表  
+- 外表  
+- 含有 toast 子表的表  
+使用方法  
+```  
+FLASHBACK TABLE  
+    [ schema. ]table  
+    TO TIMESTAMP expr;  
+```  
+准备测试数据。创建表 test，并插入数据：  
+```  
+CREATE TABLE test(id int);  
+INSERT INTO test select * FROM generate_series(1, 10000);  
+```  
+查看已插入的数据：  
+```  
+polardb=# SELECT count(1) FROM test;  
+ count  
+-------  
+ 10000  
+(1 row)  
+polardb=# SELECT sum(id) FROM test;  
+   sum  
+----------  
+ 50005000  
+(1 row)  
+```  
+等待 10 秒并删除表数据：  
+```  
+SELECT pg_sleep(10);  
+DELETE FROM test;  
+```  
+表中已无数据：  
+```  
+polardb=# SELECT * FROM test;  
+ id  
+----  
+(0 rows)  
+```  
+闪回表到 10 秒之前的数据：  
+```  
+polardb=# FLASHBACK TABLE test TO TIMESTAMP now() - interval'10s';  
+NOTICE:  Flashback the relation test to new relation polar_flashback_65566, please check the data  
+FLASHBACK TABLE  
+```  
+检查闪回表数据：  
+```  
+polardb=# SELECT count(1) FROM polar_flashback_65566;  
+ count  
+-------  
+ 10000  
+(1 row)  
+polardb=# SELECT sum(id) FROM polar_flashback_65566;  
+   sum  
+----------  
+ 50005000  
+(1 row)  
+```  
+更多用法和注意事项请参考[PolarDB 开源官方手册](https://apsaradb.github.io/PolarDB-for-PostgreSQL/zh/features/v11/availability/flashback-table.html)  
+### 4、弹性跨机并行查询（ePQ）  
+PostgreSQL 提供了 `EXPLAIN` 命令用于 SQL 语句的性能分析。它能够输出 SQL 对应的查询计划，以及在执行过程中的具体耗时、资源消耗等信息，可用于排查 SQL 的性能瓶颈。  
+`EXPLAIN` 命令原先只适用于单机执行的 SQL 性能分析。PolarDB-PG 的 ePQ 弹性跨机并行查询扩展了 EXPLAIN 的功能，使其可以打印 ePQ 的跨机并行执行计划，还能够统计 ePQ 执行计划在各个算子上的执行时间、数据扫描量、内存使用量等信息，并以统一的视角返回给客户端。  
+ePQ执行计划查看  
+ePQ 的执行计划是分片的。每个计划分片（Slice）由计算节点上的虚拟执行单元（Segment）启动的一组进程（Gang）负责执行，完成 SQL 的一部分计算。ePQ 在执行计划中引入了 Motion 算子，用于在执行不同计划分片的进程组之间进行数据传递。因此，Motion 算子就是计划分片的边界。  
+ePQ 中总共引入了三种 Motion 算子：  
+- `PX Coordinator`：源端数据发送到同一个目标端（汇聚）  
+- `PX Broadcast`：源端数据发送到每一个目标端（广播）  
+- `PX Hash`：源端数据经过哈希计算后发送到某一个目标端（重分布）  
+以一个简单查询作为例子：  
+```  
+=> CREATE TABLE t (id INT);  
+=> SET polar_enable_px TO ON;  
+=> EXPLAIN (COSTS OFF) SELECT * FROM t LIMIT 1;  
+                   QUERY PLAN  
+-------------------------------------------------  
+ Limit  
+   ->  PX Coordinator 6:1  (slice1; segments: 6)  
+         ->  Partial Seq Scan on t  
+ Optimizer: PolarDB PX Optimizer  
+(4 rows)  
+```  
+以上执行计划以 `Motion` 算子为界，被分为了两个分片：一个是接收最终结果的分片 `slice0`，一个是扫描数据的分片`slice1`。对于 `slice1` 这个计划分片，ePQ 将使用六个执行单元（`segments: 6`）分别启动一个进程来执行，这六个进程各自负责扫描表的一部分数据（`Partial Seq Scan`），通过 `Motion` 算子将六个进程的数据汇聚到一个目标端（`PX Coordinator 6:1`），传递给 `Limit` 算子。  
+如果查询逐渐复杂，则执行计划中的计划分片和 `Motion` 算子会越来越多：  
+```  
+=> CREATE TABLE t1 (a INT, b INT, c INT);  
+=> SET polar_enable_px TO ON;  
+=> EXPLAIN (COSTS OFF) SELECT SUM(b) FROM t1 GROUP BY a LIMIT 1;  
+                         QUERY PLAN  
+------------------------------------------------------------  
+ Limit  
+   ->  PX Coordinator 6:1  (slice1; segments: 6)  
+         ->  GroupAggregate  
+               Group Key: a  
+               ->  Sort  
+                     Sort Key: a  
+                     ->  PX Hash 6:6  (slice2; segments: 6)  
+                           Hash Key: a  
+                           ->  Partial Seq Scan on t1  
+ Optimizer: PolarDB PX Optimizer  
+(10 rows)  
+```  
+以上执行计划中总共有三个计划分片。将会有六个进程（`segments: 6`）负责执行 `slice2` 分片，分别扫描表的一部分数据，然后通过 `Motion` 算子（`PX Hash 6:6`）将数据重分布到另外六个（`segments: 6`）负责执行 `slice1` 分片的进程上，各自完成排序（`Sort`）和聚合（`GroupAggregate`），最终通过 `Motion` 算子（`PX Coordinator 6:1`）将数据汇聚到结果分片 `slice0`。  
+更多弹性跨机并行查询（ePQ）用法和注意事项请参考[PolarDB 开源官方手册](https://apsaradb.github.io/PolarDB-for-PostgreSQL/zh/features/v11/epq/)  
+更多特性参考[PolarDB 开源官方手册](https://apsaradb.github.io/PolarDB-for-PostgreSQL/zh/)  
+#### [期望 PostgreSQL|开源PolarDB 增加什么功能?](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+#### [PolarDB 开源数据库](https://openpolardb.com/home "57258f76c37864c6e6d23383d05714ea")
+#### [PolarDB 学习图谱](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [PostgreSQL 解决方案集合](../201706/20170601_02.md "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's Github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")

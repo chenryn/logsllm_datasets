@@ -1,0 +1,157 @@
+# Linux slub 分配器上的安全加固学习
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+linux 内核默认使用slub分配器来做内存管理，在这篇文章里，我们首先简要交代了slub分配器内存分配的基本流程，然后对其上面的两种安全加固做了分析。
+## slub 分配器简述
+slub
+的实现具体可以参考[这篇文章](https://my.oschina.net/fileoptions/blog/1630346),这里我们简要说明一下。
+slub 是针对内核的小内存分配，和用户态堆一开始会brk分一大块内存，然后再慢慢切割一样
+伙伴系统给内存，然后slub分配器把内存切割成特定大小的块，后续的分配就可以用了。
+具体来说，内核会预先定义一些`kmem_cache` 结构体，它保存着要如何分割使用内存页的信息，可以通过`cat /proc/slabinfo`
+查看系统当前可用的`kmem_cache`。
+内核很多的结构体会频繁的申请和释放内存，用`kmem_cache`
+来管理特定的结构体所需要申请的内存效率上就会比较高，也比较节省内存。默认会创建`kmalloc-8k,kmalloc-4k,...
+,kmalloc-16,kmalloc-8` 这样的cache，这样内核调用kmalloc函数时就可以根据申请的内存大小找到对应的`kmalloc-xx`，然后在里面找可可用的内存块。  
+内核全局有一个 `slab_caches` 变量，它是一个链表，系统所有的 `kmem_cache` 都接在这个链表上。
+slab 以页为基本单位切割，然后用单向链表(fd指针)串起来，类似用户态堆的 fastbin，每一个小块我们叫它`object`
+`kmem_cache` 内部比较重要的结构如下:
+    kmem_cache
+        - kmem_cache_cpu 
+            - freelist
+            - partial
+        - kmem_cache_node
+            - partial
+因为现在的计算机大多是多个cpu的，`kmem_cache_cpu`相当于一个缓存，kmalloc的时候会现在这里找free的slab,
+找不到再到`kmem_cache_node` 找。`partial` 保存着之前申请过的没用完的slab
+###  内存分配与释放
+slab 其实就类似一个fastbin, 所有的分配都会在`kmem_cache_cpu` 结构体的 `freelist` 上找。
+刚开始什么都没有，伙伴系统会根据`kmem_cache`的配置信息给出一块内存，分配好后类似`freelist ==>
+[x]->[x]->[x]->...->0` 这样，后面每次分配就到`freelist`链表上找 ，它指向第一个可用的free object。
+然后可能申请太多，free object 用完了，那就会再向伙伴系统要。
+已经用满的slab不用去管它，等它里面有object被free之后，它就会被挂到`kmem_cache_cpu` 的`partial`链表上。
+等下一次 `freelist`上的slab又用完了，就可以看看`partial`还有没有可用的，直接拿过来换上，就不用去麻烦伙伴系统了。
+`kmem_cache_cpu` 上的`partial` 可能挂了很多未满的slab,
+超过一个阈值的时候，就会把整个链表拿到`kmem_cache_node`的`partial` 链表上，然后再有就又可以放了。
+那可能又用多了，`kmem_cache_cpu` 上的 freelist 和 partial 的slab都用满了，这时就可以到
+`kmem_cache_node`的partial 上拿。
+object 的free 是 FIFO的，也就是都会接在freelist 链表头，free 的object 超过一个设定好的阈值时会触发内存回收。
+okay， slub 分配器大概就是这样，我们接下来分析一下slub上的两个安全加固是什么样的。
+## 环境配置
+[linux-5.4
+版本](https://mirrors.edge.kernel.org/pub/linux/kernel/v5.x/linux-5.4.tar.xz)
+## 模块编写
+为了方便调试，我们写个模块来帮助我们操作内核的 kmalloc 以及kfree, 可以随便kmalloc和kfree任意地址
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include
+    #include 
+    #include 
+    //msleep
+    MODULE_LICENSE("Dual BSD/GPL");
+    #define ADD_ANY   0xbeef
+    #define DEL_ANY   0x2333
+    struct in_args{
+        uint64_t addr;
+        uint64_t size;
+        char __user *buf;
+    };
+    uint64_t g_val = 0;
+    static long add_any(struct in_args *args){
+        long ret = 0;
+        char *buffer = kmalloc(args->size,GFP_KERNEL);
+        if(buffer == NULL){
+            return -ENOMEM;
+        }
+        if(copy_to_user(args->buf,(void *)&buffer,0x8)){
+            return -EINVAL;
+        }
+        return ret;
+    }
+    static long del_any(struct in_args *args){
+        long ret = 0;
+        kfree((void *)args->addr);
+        return ret;
+    }
+    static long kpwn_ioctl(struct file *file, unsigned int cmd, unsigned long arg){
+        long ret = -EINVAL;
+        struct in_args in;
+        if(copy_from_user(&in,(void *)arg,sizeof(in))){
+            return ret;
+        }
+        switch(cmd){
+            case DEL_ANY:
+                ret = del_any(&in);
+                break;
+            case ADD_ANY:
+                ret = add_any(&in);
+                break;
+            default:
+                ret = -1;
+        }
+        return ret;
+    }
+    static struct file_operations fops = {
+        .owner = THIS_MODULE,
+        .open =      NULL,
+        .release =   NULL,
+        .read =      NULL,
+        .write =     NULL,
+        .unlocked_ioctl = kpwn_ioctl
+    };
+    static struct miscdevice misc = {
+        .minor = MISC_DYNAMIC_MINOR,
+        .name  = "kpwn",
+        .fops = &fops
+    };
+    int kpwn_init(void)
+    {
+        misc_register(&misc);
+        return 0;
+    }
+    void kpwn_exit(void)
+    {
+        printk(KERN_INFO "Goodbye hackern");
+        misc_deregister(&misc);
+    }
+    module_init(kpwn_init);
+    module_exit(kpwn_exit);
+然后写个交互脚本
+    #define _GNU_SOURCE
+    #include "exp.h"
+    #define ADD_ANY 0xbeef
+    #define DEL_ANY 0x2333
+    struct in_args{
+        u64 addr;
+        u64 size;
+        char *buf;
+    };
+    void init(){
+        save_status();
+        setbuf(stdin,0);
+        setbuf(stdout,0);
+        signal(SIGSEGV, sh);
+    }
+    int main(int argc,char **argv){
+        init();
+        char *buf=malloc(0x1000);
+        u64 *buf64 =(u64 *)buf;
+        struct in_args *p = malloc(sizeof(struct in_args));
+        int op=0;
+        u32 addsize=1024;
+        int fd = open("/dev/kpwn",O_RDWR);
+        logx("fd",fd);
+        u64 freeaddr=0;
+        while(1){
+            printf("1.mallocn");
+            printf("2.freen");
+            printf("3.exitn");
+            printf(">> ");
+            scanf("%d",&op);
+            switch(op){
+                case 1:

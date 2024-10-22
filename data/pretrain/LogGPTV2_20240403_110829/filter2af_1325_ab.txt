@@ -1,0 +1,199 @@
+    2117         err = -EADDRINUSE;
+    2118         ifindex = imr->imr_ifindex;
+    2119         for_each_pmc_rtnl(inet, i) {
+    2120                 if (i->multi.imr_multiaddr.s_addr == addr &&
+    2121                     i->multi.imr_ifindex == ifindex)
+    2122                         goto done;
+    2123                 count++;
+    2124         }
+    2125         err = -ENOBUFS;
+    2126         if (count >= net->ipv4.sysctl_igmp_max_memberships)
+    2127                 goto done;
+    2128         iml = sock_kmalloc(sk, sizeof(*iml), GFP_KERNEL);
+    2129         if (!iml)
+    2130                 goto done;
+    2131
+    2132         memcpy(&iml->multi, imr, sizeof(*imr));
+    2133         iml->next_rcu = inet->mc_list;
+    2134         iml->sflist = NULL;
+    2135         iml->sfmode = MCAST_EXCLUDE;
+    2136         rcu_assign_pointer(inet->mc_list, iml);
+    2137         ip_mc_inc_group(in_dev, addr);
+    2138         err = 0;
+    2139 done:
+    2140         return err;
+    2141 }
+代码2128行 `sock_kmalloc()` 进行了内存分配。
+  * The first free
+在内核里无时无刻都在产生软中断，而此次漏洞涉及的软中断是由 `accept()` 系统调用引起的，由于该函数本身作用于进程上下文，并不会产生软中断。但是调用
+`accept()` 时，会在内核中诱发某种软中断产生，该软中断会调用 `rcu_process_callbacks()` 函数：
+**kernel/rcu/tree.c**
+    3118 static __latent_entropy void rcu_process_callbacks(struct softirq_action *unused)
+    3119 {
+    3120         struct rcu_state *rsp;
+    3121
+    3122         if (cpu_is_offline(smp_processor_id()))
+    3123                 return;
+    3124         trace_rcu_utilization(TPS("Start RCU core"));
+    3125         for_each_rcu_flavor(rsp)
+    3126                 __rcu_process_callbacks(rsp);
+    3127         trace_rcu_utilization(TPS("End RCU core"));
+    3128 }
+`__rcu_process_callbacks` 调用 `rcu_do_batch()` 函数，如下：
+**kernel/rcu/tree.c**
+    2840 static void rcu_do_batch(struct rcu_state *rsp, struct rcu_data *rdp)
+    2841 {
+    2842         unsigned long flags;
+    2843         struct rcu_head *next, *list, **tail;
+    2844         long bl, count, count_lazy;
+    2845         int i;
+    2846
+    2847         /* If no callbacks are ready, just return. */
+    2848         if (!cpu_has_callbacks_ready_to_invoke(rdp)) {
+    2849                 trace_rcu_batch_start(rsp->name, rdp->qlen_lazy, rdp->qlen, 0);
+    2850                 trace_rcu_batch_end(rsp->name, 0, !!READ_ONCE(rdp->nxtlist),
+    2851                                     need_resched(), is_idle_task(current),
+    2852                                     rcu_is_callbacks_kthread());
+    2853                 return;
+    2854         }
+    [...]
+    2874         count = count_lazy = 0;
+    2875         while (list) {
+    2876                 next = list->next;
+    2877                 prefetch(next);
+    2878                 debug_rcu_head_unqueue(list);
+    2879                 if (__rcu_reclaim(rsp->name, list))
+    2880                         count_lazy++;
+    2881                 list = next;
+    2882                 /* Stop only if limit reached and CPU has something to do. */
+    2883                 if (++count >= bl &&
+    2884                     (need_resched() ||
+    2885                      (!is_idle_task(current) && !rcu_is_callbacks_kthread())))
+    2886                         break;
+    2887         }
+    [...]
+注意代码中第2879行，函数 `__rcu_reclaim()` 实现如下：
+**kernel/rcu/rcu.h**
+    106 static inline bool __rcu_reclaim(const char *rn, struct rcu_head *head)
+    107 {
+    108         unsigned long offset = (unsigned long)head->func;
+    109
+    110         rcu_lock_acquire(&rcu_callback_map);
+    111         if (__is_kfree_rcu_offset(offset)) {
+    112                 RCU_TRACE(trace_rcu_invoke_kfree_callback(rn, head, offset));
+    113                 kfree((void *)head - offset);
+    114                 rcu_lock_release(&rcu_callback_map);
+    115                 return true;
+    116         } else {
+    117                 RCU_TRACE(trace_rcu_invoke_callback(rn, head));
+    118                 head->func(head);
+    119                 rcu_lock_release(&rcu_callback_map);
+    120                 return false;
+    121         }
+    122 }
+在113行调用 `kfree()` 进行了第一次释放。
+  * The second free
+当断开 TCP 连接时，内核通过 `sock\_close()` 函数直接调用 `sock\_release()` 来实现断开功能，该函数会清空
+ops，更新全局 socket 数目，更新 inode 引用计数。随后进入到 `inet\_release()` 函数调用 `tcp\_close()`
+函数来最终关闭 sock。
+**net/ipv4/af_inet.c**
+    403 int inet_release(struct socket *sock)
+    404 {
+    405         struct sock *sk = sock->sk;
+    406
+    407         if (sk) {
+    408                 long timeout;
+    409
+    410                 /* Applications forget to leave groups before exiting */
+    411                 ip_mc_drop_socket(sk);
+    412
+    413                 /* If linger is set, we don't return until the close
+    414                  * is complete.  Otherwise we return immediately. The
+    415                  * actually closing is done the same either way.
+    416                  *
+    417                  * If the close is due to the process exiting, we never
+    418                  * linger..
+    419                  */
+    420                 timeout = 0;
+    421                 if (sock_flag(sk, SOCK_LINGER) &&
+    422                     !(current->flags & PF_EXITING))
+    423                         timeout = sk->sk_lingertime;
+    424                 sock->sk = NULL;
+    425                 sk->sk_prot->close(sk, timeout);
+    426         }
+    427         return 0;
+    428 }
+用户程序断开 TCP 连接时，内核里使用 `ip\_mc\_drop\_socket()` 函数进行回收。
+**net/ipv4/igmp.c**
+    2592 void ip_mc_drop_socket(struct sock *sk)
+    2593 {
+    2594         struct inet_sock *inet = inet_sk(sk);
+    2595         struct ip_mc_socklist *iml;
+    2596         struct net *net = sock_net(sk);
+    2597
+    2598         if (!inet->mc_list)
+    2599                 return;
+    2600
+    2601         rtnl_lock();
+    2602         while ((iml = rtnl_dereference(inet->mc_list)) != NULL) {
+    2603                 struct in_device *in_dev;
+    2604
+    2605                 inet->mc_list = iml->next_rcu;
+    2606                 in_dev = inetdev_by_index(net, iml->multi.imr_ifindex);
+    2607                 (void) ip_mc_leave_src(sk, iml, in_dev);
+    2608                 if (in_dev)
+    2609                         ip_mc_dec_group(in_dev, iml->multi.imr_multiaddr.s_addr);
+    2610                 /* decrease mem now to avoid the memleak warning */
+    2611                 atomic_sub(sizeof(*iml), &sk->sk_omem_alloc);
+    2612                 kfree_rcu(iml, rcu);
+    2613         }
+    2614         rtnl_unlock();
+    2615 }
+代码2612行调用 `kfree_rcu()` 进行第二次释放。
+#### 3.Affected
+  * 受影响的内核版本
+经研究，理论上 Linux kernel 2.5.69 ~ Linux kernel 4.11 的所有版本都受 “Phoenix Talon”
+影响，且经开源社区验证 “Phoenix Talon” 漏洞影响的 Linux 内核版本部分列表如下：
+经启明星辰ADLab测试 Linux kernel 4.11 亦受影响。
+  * 受影响的发行版本
+经开源社区验证部分受影响发行版本（不完整列表）如下：
+Red Hat Enterprise MRG 2 Red Hat Enterprise Linux 7 Red Hat Enterprise Linux 6
+Red Hat Enterprise Linux 5 SUSE Linux Enterprise Desktop 12 SP1 SUSE Linux
+Enterprise Desktop 12 SP2 SUSE Linux Enterprise Server 11 SP3 LTSS SUSE Linux
+Enterprise Server 11 SP4 SUSE Linux Enterprise Server 12 GA SUSE Linux
+Enterprise Server 12 SP1 SUSE Linux Enterprise Server 12 SP2 SUSE Linux
+Enterprise Server for SAP 11 SP3 SUSE Linux Enterprise Server for SAP 11 SP4
+SUSE Linux Enterprise Server for SAP 12 GA SUSE Linux Enterprise Server for
+SAP 12 SP1 SUSE Linux Enterprise Server for SAP 12 SP2
+另外，启明星辰ADLab对下列的部分发行版本做了测试，确认均受 “Phoenix Talon” 漏洞影响：
+Ubuntu 14.04 LTS (Trusty Tahr) Ubuntu 16.04 LTS (Xenial Xerus) Ubuntu 16.10
+(Yakkety Yak) Ubuntu 17.04 (Zesty Zapus) Ubuntu 17.10 (Artful Aardvark)
+#### 4\. Solution
+  1. 官方已经发布了修复该问题的补丁，可通过升级Linux内核修复“Phoenix Talon”相关漏洞。
+  2. 使用 Grsecurity/PaX 对内核加固。
+#### 5\. Timeline
+May 09 - Report sent to Linux Kernel Community May 09 - Linux Kernel Community
+confirmed May 09 - Linux Kernel Community patched in linux upstream May 10 -Assgined CVE number
+“Phoenix Talon”在 Linux 内核中潜伏长达11年之久，影响范围非常广泛（以上只是官方以及我们测试的部分结果，即使这些也足够看出
+“Phoenix Talon” 波及之深之广），启明星辰ADLab提醒广大用户尽快采取相应的修复措施，避免引发漏洞相关的网络安全事件。
+**Reference:**  
+[1] https://people.canonical.com/~ubuntu-security/cve/2017/CVE-2017-8890.html  
+[2] https://security-tracker.debian.org/tracker/CVE-2017-8890  
+[3] https://www.suse.com/security/cve/CVE-2017-8890/  
+[4] https://bugzilla.redhat.com/show_bug.cgi?id=1450973  
+[5] https://bugzilla.suse.com/show_bug.cgi?id=1038544  
+[6] https://www.mail-archive.com/PI:EMAIL/msg167626.html  
+[7] https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-8890  
+[8] https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-9075  
+[9] https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-9076  
+[10] https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-9077  
+[11]
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=657831ffc38e30092a2d5f03d385d710eb88b09a  
+[12] http://www.securityfocus.com/bid/98562/info  
+[13] http://www.openwall.com/lists/oss-security/2017/05/30/24  
+[14] https://www.kernel.org  
+[15] Linux Kernel Documentation
+* * *
+**启明星辰积极防御实验室（ADLab）**
+ADLab成立于1999年，是中国安全行业最早成立的攻防技术研究实验室之一，微软MAPP计划核心成员。截止目前，ADLab通过CVE发布Windows、Linux、Unix等操作系统安全或软件漏洞近300个，持续保持亚洲领先并确立了其在国际网络安全领域的核心地位。实验室研究方向涵盖操作系统与应用系统安全研究、移动智能终端安全研究、物联网智能设备安全研究、Web安全研究、工控系统安全研究、云安全研究。研究成果应用于产品核心技术研究、国家重点科技项目攻关、专业安全服务等。
+* * *

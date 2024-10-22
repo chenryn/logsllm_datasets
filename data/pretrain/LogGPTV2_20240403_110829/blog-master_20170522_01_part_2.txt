@@ -1,0 +1,194 @@
+unalias vi  
+```  
+2\. 初始化SQL   
+```  
+vi init.sql  
+-- 清除环境  
+drop table bptest cascade;  
+-- 初始父表  
+create table bptest  
+(  
+  ts timestamptz,   -- 行为发生时间  
+  content text    -- 行为内容  
+);   
+-- 建立索引  
+-- create index idx_bptest_ts on bptest using brin(ts) with(pages_per_range=1);  -- TS字段块级索引，如果不需要按ts排序输出结果，建议使用brin索引  
+create index idx_bptest_ts on bptest using btree(ts) ;  -- 如果需要按ts sort输出结果，建议使用btree  
+-- schemaless相关，自动建表函数  
+create or replace function create_schemaless(target name) returns void as $$    
+declare    
+begin    
+  execute format('create table if not exists %I (like bptest including all) inherits(bptest)', target);    
+  -- 这里可以设置列的statistic  
+exception when others then    
+  return;    
+end;    
+$$ language plpgsql strict;    
+-- 数据写入函数  
+create or replace function ins_schemaless(uid int, ts timestamptz, content text) returns void as $$    
+declare   
+  target name := 'bptest_'||uid||'_'||to_char(ts,'yyyymmdd');  
+begin    
+  execute format('insert into %I values (%L, %L)', target, ts, content);    
+  exception     
+    WHEN SQLSTATE '42P01' THEN     
+    perform create_schemaless(target);    
+    execute format('insert into %I values (%L, %L)', target, ts, content);     
+end;    
+$$ language plpgsql strict;    
+-- 产生随机字符串的函数, 本例的CPU消耗大量来自这个函数  
+CREATE OR REPLACE FUNCTION public.gen_rand_str(integer)  
+ RETURNS text  
+ LANGUAGE sql  
+ STRICT  
+AS $function$  
+  select string_agg(a[(random()*6)::int+1],'') from generate_series(1,$1), (select array['a','b','c','d','e','f',' ']) t(a);  
+$function$;  
+-- 分页评估函数, 用于评估返回多少条记录，尽量避免使用count(*)估算精确值  
+CREATE FUNCTION count_estimate(query text) RETURNS INTEGER AS    
+$func$    
+DECLARE    
+    rec   record;    
+    ROWS  INTEGER;    
+BEGIN    
+    FOR rec IN EXECUTE 'EXPLAIN ' || query LOOP    
+        ROWS := SUBSTRING(rec."QUERY PLAN" FROM ' rows=([[:digit:]]+)');    
+        EXIT WHEN ROWS IS NOT NULL;    
+    END LOOP;    
+    RETURN ROWS;    
+END    
+$func$ LANGUAGE plpgsql;    
+-- 随机查询性能评估函数
+CREATE or replace FUNCTION rand_query(
+v_uid int, -- 客户ID
+v_epoch int, -- 搜索开始时间
+v_randts int,  -- 搜索interval seconds
+v_randlog text,  -- 搜索query条件
+v_cnt int  -- 返回若干行
+) RETURNS void AS    
+$func$    
+DECLARE  
+  tbl name := 'bptest_'||v_uid||'_'||to_char(('1970-01-01'::date+(v_epoch||' sec')::interval),'yyyymmdd');  
+  sql text;
+  cnt int;
+BEGIN  
+  -- 分页评估
+  sql := format('select * from %I where ts between %L and %L and content ~ %L order by ts', tbl, '1970-01-01'::date+(v_epoch||' sec')::interval, '1970-01-01'::date+((v_epoch+v_randts)||' sec')::interval, v_randlog);
+  select count_estimate(sql) into cnt;
+  raise notice 'cnt: %', cnt;
+  -- 如果页数较少时，使用count(*)返回精确页数
+  -- 返回若干记录
+  sql := format('select * from %I where ts between %L and %L and content ~ %L order by ts limit %L', tbl, '1970-01-01'::date+(v_epoch||' sec')::interval, '1970-01-01'::date+((v_epoch+v_randts)||' sec')::interval, v_randlog, v_cnt);
+  execute sql;
+  -- 用户可以将函数内代码转移到程序端，使用游标获取数据，确保每一页的感受一致
+  -- 当用户需要返回最后一页时，使用逆序，重新拼接SQL (order by origin_time desc)。
+  exception when others then
+    return;
+END    
+$func$ LANGUAGE plpgsql;
+```  
+初始化每个数据库实例  
+```  
+psql -f ./init.sql -p 1921  
+...  
+psql -f ./init.sql -p 1932  
+```  
+### 写入压测 1 
+12个库，100个UID。  
+每个UID每个库写入1000万记录，每个UID总共写入1.2亿，所有UID总共写入120亿记录。  
+使用gen_rand_str生成指定长度的随机字符串（gen_rand_str存在大量的CPU开销，压测2使用其他随机值产生的方法）。  
+```  
+vi test.sql  
+\set uid random(1,100)  
+select ins_schemaless(:uid, now(), gen_rand_str(512));  
+```  
+测试脚本  
+```  
+vi test.sh  
+for ((i=1;i/tmp/bptest_${i}.log 2>&1 &  
+done  
+```  
+#### 测试结果  
+写入性能:   
+1\. 使用brin索引时 9.47万/s  
+2\. 使用btree索引时 7.9万/s  
+3\. 服务器资源开销：  
+```  
+CPU：  
+Cpu(s): 90.7%us,  7.1%sy,  0.1%ni,  0.4%id,  0.1%wa,  0.0%hi,  1.6%si,  0.0%st  
+IOUITL：  
+SSD: 50 %    
+```  
+#### 瓶颈分析  
+1\. 大部分CPU开销在产生随机串的函数中，所以实际场景，CPU的消耗会小很多。  
+如下  
+```  
+perf top -ag  
+            60953.00  6.0% ExecInterpExpr                          /home/digoal/pgsql10_8k/bin/postgres  
+            33647.00  3.3% AllocSetAlloc                           /home/digoal/pgsql10_8k/bin/postgres  
+            27560.00  2.7% advance_aggregates                      /home/digoal/pgsql10_8k/bin/postgres  
+            22894.00  2.3% base_yyparse                            /home/digoal/pgsql10_8k/bin/postgres  
+            21976.00  2.2% SearchCatCache                          /home/digoal/pgsql10_8k/bin/postgres  
+            21768.00  2.2% array_seek                              /home/digoal/pgsql10_8k/bin/postgres  
+            20957.00  2.1% appendBinaryStringInfo                  /home/digoal/pgsql10_8k/bin/postgres  
+            19912.00  2.0% memcpy                                  /lib64/libc-2.12.so                     
+            17058.00  1.7% array_get_element                       /home/digoal/pgsql10_8k/bin/postgres  
+            14916.00  1.5% heap_form_minimal_tuple                 /home/digoal/pgsql10_8k/bin/postgres  
+            13617.00  1.3% heap_fill_tuple                         /home/digoal/pgsql10_8k/bin/postgres  
+            12201.00  1.2% __rint                                  /lib64/libm-2.12.so                     
+            10938.00  1.1% palloc0                                 /home/digoal/pgsql10_8k/bin/postgres  
+            10683.00  1.1% MemoryContextAllocZeroAligned           /home/digoal/pgsql10_8k/bin/postgres  
+            10591.00  1.0% ExecStoreMinimalTuple                   /home/digoal/pgsql10_8k/bin/postgres  
+            10292.00  1.0% string_agg_transfn                      /home/digoal/pgsql10_8k/bin/postgres  
+            10202.00  1.0% advance_transition_function             /home/digoal/pgsql10_8k/bin/postgres  
+             9973.00  1.0% core_yylex                              /home/digoal/pgsql10_8k/bin/postgres  
+```  
+2\. bcache问题  
+bcache垃圾回收时，对IO的影响非常严重。  
+```  
+  PID USER      PR  NI  VIRT  RES  SHR S %CPU %MEM    TIME+  COMMAND    
+40207 root      20   0     0    0    0 R 100.0  0.0  34:47.86 [bch_gc-0b34a79a]  
+```  
+await已经到秒级  
+```  
+Device:         rrqm/s   wrqm/s     r/s     w/s   rsec/s   wsec/s avgrq-sz avgqu-sz   await  svctm  %util  
+bcache11          0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00   0.00   0.00  
+bcache10          0.00  6054.00    1.00  105.00     8.00 48640.00   458.94    17.19  157.73   9.43 100.00  
+bcache9           0.00  2431.00    0.00  100.00     0.00 29408.00   294.08     4.22  102.87   9.86  98.60  
+bcache8           0.00  4013.00    0.00   85.00     0.00 37352.00   439.44    10.04  174.19  11.76 100.00  
+bcache7           0.00  1661.00    0.00   58.00     0.00 12952.00   223.31     2.34   53.47  17.02  98.70  
+bcache6           0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00   0.00   0.00  
+bcache5           0.00    48.00    0.00   71.00     0.00 44896.00   632.34   183.24 2124.06  14.08 100.00  
+bcache4           0.00  6506.00    0.00  211.00     0.00 56312.00   266.88    74.89  488.20   4.74 100.00  
+bcache3           0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00   0.00   0.00  
+bcache2           0.00  5502.00    0.00  103.00     0.00 44168.00   428.82   144.85  709.10   9.71 100.00  
+bcache1           0.00 12302.00    0.00   34.00     0.00 13464.00   396.00    84.11  877.03  29.41 100.00  
+bcache0           0.00 15148.00    0.00  260.00     0.00 42504.00   163.48    47.39  155.56   3.85 100.00  
+```  
+3\. 配置了smooth checkpoint后，checkpoint已经没有问题, sync时间非常短暂。  
+```  
+2017-05-23 10:49:55.749 CST,,,25095,,59239d76.6207,9,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint starting: time",,,,,,,,"LogCheckpointStart, xlog.c:8369",""  
+2017-05-23 10:50:25.434 CST,,,25095,,59239d76.6207,10,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint complete: wrote 233036 buffers (5.6%); 0 WAL file(s) added, 0 removed, 131 recycled; write=29.250 s, sync=0.018 s, total=29.685 s; sync files=300, longest=0.004 s, average=0.000 s; distance=2145650 kB, estimate=2145650 kB",,,,,,,,"LogCheckpointEnd, xlog.c:8451",""  
+2017-05-23 10:54:55.529 CST,,,25095,,59239d76.6207,11,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint starting: time",,,,,,,,"LogCheckpointStart, xlog.c:8369",""  
+2017-05-23 10:57:59.222 CST,,,25095,,59239d76.6207,12,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint complete: wrote 191434 buffers (4.6%); 0 WAL file(s) added, 0 removed, 131 recycled; write=118.012 s, sync=59.816 s, total=183.693 s; sync files=300, longest=16.126 s, average=0.199 s; distance=1752021 kB, estimate=2106288 kB",,,,,,,,"LogCheckpointEnd, xlog.c:8451",""  
+2017-05-23 10:59:55.328 CST,,,25095,,59239d76.6207,13,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint starting: time",,,,,,,,"LogCheckpointStart, xlog.c:8369",""  
+2017-05-23 11:00:25.350 CST,,,25095,,59239d76.6207,14,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint complete: wrote 176278 buffers (4.2%); 0 WAL file(s) added, 0 removed, 107 recycled; write=29.688 s, sync=0.009 s, total=30.021 s; sync files=300, longest=0.003 s, average=0.000 s; distance=1630757 kB, estimate=2058734 kB",,,,,,,,"LogCheckpointEnd, xlog.c:8451",""  
+2017-05-23 11:04:55.467 CST,,,25095,,59239d76.6207,15,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint starting: time",,,,,,,,"LogCheckpointStart, xlog.c:8369",""  
+2017-05-23 11:05:25.381 CST,,,25095,,59239d76.6207,16,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint complete: wrote 232981 buffers (5.6%); 0 WAL file(s) added, 0 removed, 99 recycled; write=29.555 s, sync=0.013 s, total=29.914 s; sync files=300, longest=0.006 s, average=0.000 s; distance=2142180 kB, estimate=2142180 kB",,,,,,,,"LogCheckpointEnd, xlog.c:8451",""  
+2017-05-23 11:06:44.503 CST,,,36368,"127.0.0.1:44645",5923a744.8e10,1,"",2017-05-23 11:06:44 CST,,0,LOG,00000,"connection received: host=127.0.0.1 port=44645",,,,,,,,"BackendInitialize, postmaster.c:4178",""  
+2017-05-23 11:06:44.504 CST,"postgres","postgres",36368,"127.0.0.1:44645",5923a744.8e10,2,"authentication",2017-05-23 11:06:44 CST,13/223,0,LOG,00000,"connection authorized: user=postgres database=postgres",,,,,,,,"PerformAuthentication, postinit.c:272",""  
+2017-05-23 11:09:55.512 CST,,,25095,,59239d76.6207,17,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint starting: time",,,,,,,,"LogCheckpointStart, xlog.c:8369",""  
+2017-05-23 11:09:56.221 CST,"postgres","postgres",36368,"127.0.0.1:44645",5923a744.8e10,3,"idle",2017-05-23 11:06:44 CST,,0,LOG,00000,"disconnection: session time: 0:03:11.717 user=postgres database=postgres host=127.0.0.1 port=44645",,,,,,,,"log_disconnections, postgres.c:4500","psql"  
+2017-05-23 11:10:25.512 CST,,,25095,,59239d76.6207,18,,2017-05-23 10:24:54 CST,,0,LOG,00000,"checkpoint complete: wrote 232090 buffers (5.5%); 0 WAL file(s) added, 0 removed, 131 recycled; write=29.489 s, sync=0.141 s, total=29.999 s; sync files=300, longest=0.033 s, average=0.000 s; distance=2136269 kB, estimate=2141589 kB",,,,,,,,"LogCheckpointEnd, xlog.c:8451",""  
+```  
+### 写入压测 2
+使用另一种方法生成随机字符串  
+```
+postgres=# select length(concat_ws('',random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random(),random()));
+ length 
+--------
+    512
+(1 row)
+```
+```  
+vi test.sql  

@@ -1,0 +1,152 @@
+    +0 x020 InterlockedLong : Int4B
+    +0 x024 FreeHint : Uint2B
+    +0 x026 Location : UChar
+    +0 x027 WitheldBlockCount : UChar
+    +0 x028 BlockOffsets : _HEAP_LFH_SUBSEGMENT_ENCODED_OFFSETS
+    +0 x02c CommitUnitShift : UChar
+    +0 x02d CommitUnitCount : UChar
+    +0 x02e CommitStateOffset : Uint2B
+    +0 x030 BlockBitmap : [1] Uint8B
+然后将每个子段分割成相应的bucket大小的不同的LFH块。
+为了知道哪个bucket被使用，在每个子段的header中维护了一个bitmap。
+图7. 低碎片化堆后端内部结构
+当请求一个分配的时候，LFH分配器将首先在_HEAP_LFH_SUBSEGMENT结构中寻找Freelist子段，目的是为了找到子段中最后释放的块的偏移。接着将扫描BlockBitmap，在32个块里找一个空闲块。由于RtlpLowFragHeapRandomData表，导致这个扫描是随机的。
+根据给定的bucket的竞争状况，可以启用一种机制使得每个CPU有一个专属子段用于实现简易分配，这种机制称为Affinity Slot（亲和槽）。
+图7展示了LFH后端的主要架构。
+#### 动态快表（Dynamic Lookaside）
+大小为0x200到0xF80字节的释放块可以被临时存储在快表中以提供快速分配。当这些块处于快表中时，这些块不会走后端释放机制。
+快表由_RTL_DYNAMIC_LOOKASIDE结构体来表示，并存储在_SEGMENT_HEAP结构体的UserContext域中。
+    0: kd > dt nt! _RTL_DYNAMIC_LOOKASIDE
+    +0 x000 EnabledBucketBitmap : Uint8B
+    +0 x008 BucketCount : Uint4B
+    +0 x00c ActiveBucketCount : Uint4B
+    +0 x040 Buckets : [64] _RTL_LOOKASIDE
+每个释放的块都存储在与其大小相对应的_RTL_LOOKASIDE中，大小对应着LFH中Bucket一样的模式
+    0: kd > dt nt!_RTL_LOOKASIDE
+    +0 x000 ListHead : _SLIST_HEADER
+    +0 x010 Depth : Uint2B
+    +0 x012 MaximumDepth : Uint2B
+    +0 x014 TotalAllocates : Uint4B
+    +0 x018 AllocateMisses : Uint4B
+    +0 x01c TotalFrees : Uint4B
+    +0 x020 FreeMisses : Uint4B
+    +0 x024 LastTotalAllocates : Uint4B
+    +0 x028 LastAllocateMisses : Uint4B
+    +0 x02c LastTotalFrees : Uint4B
+图8
+在同一时间，仅可启用一个可用buckets子集。每次请求分配时，相应的快表指标都会更新。
+每扫描三次Balance Set
+Mangager，动态快表就会重新平衡。启动了自上次重新平衡以来使用最多的。每个快表的大小取决于它的用途，但最大不能超过MaximumDepth，最小不能小于4。当新分配的数量小于25时，深度将减小10。另外，当未命中率小于0.5时，深度将减小到1，否则将按照下列公式来增长。
+### 2.2 POOL_HEADER
+如1.1节所述，Windows 10
+19H1之前的内核层堆分配器分配的所有块都以POOL_HEADER为头部。在当时，POOL_HEADER中所有的字段都被使用了。随着内核层堆分配器的更新，POOL
+HEADER的大部分字段都变的无用了，但仍然有少量分配的内存以POOL_HEADER为首。
+    //POOL_HEADER定义
+    struct POOL_HEADER
+    {
+    char PreviousSize;
+    char PoolIndex;
+    char BlockSize;
+    char PoolType;
+    int PoolTag;
+    Ptr64 ProcessBilled ;
+    };
+分配器设置的唯一字段如下
+    PoolHeader ->PoolTag = PoolTag;
+    PoolHeader ->BlockSize = BucketBlockSize >> 4;
+    PoolHeader ->PreviousSize = 0;
+    PoolHeader ->PoolType = changedPoolType & 0x6D | 2;
+下面是总结的自windows 19H1以来POOL_HEADER结构体的每个字段用途
+    PreviousSize：未使用的，并保持为0
+    PoolIndex：未使用的
+    BlockSize：块的大小，仅用于最终将块存储在动态快表中
+    PoolType：用法没有改变，依旧是请求的池的类型
+    PoolTag：用法没有改变，依旧是池标签
+    ProcessBilled：用法没有改变，保持对请求分配内存的进程进行追踪，如果池类型为PoolQuota,那么ProcessBilled的计算方法如下
+    ProcessBilled = chunk_addr ^ ExpPoolQuotaCookie ^ KPROCESS
+#### 缓存对齐
+当调用ExAllocatPoolWithTag时，如果PoolType有CacheAligned位被设置，函数执行后返回的内存是与Cache对齐的。Cache线的大小取决于CPU，但通常来说都是0x40。
+首先分配器会增加ExpCacheLineSize的大小
+    if ( PoolType & 4 )
+    {
+    request_alloc_size += ExpCacheLineSize ;
+    if ( request_alloc_size > 0xFE0 )
+    {
+    request_alloc_size -= ExpCacheLineSize ;
+    PoolType = PoolType & 0xFB;
+    }
+    }
+如果新的分配大小不能容纳在单个页面中，那么CacheAligned位将会被忽略。
+并且，分配的块必须遵守下面的三个条件：
+  * 最终分配的地址必须与ExpCacheLineSize对齐
+  * 在块的最开始处，必须有一个POOL_HEADER头
+  * 块在分配的地址减去POOL_HEADER的大小的地址处必须有一个POOL_HEADER。
+因此，如果分配的地址没有正确的对齐，那么块可能会有两个headers。
+图9. 缓存对齐的内存布局
+像往常一样，第一个POOL_HEADER将在块的起始处，第二个将在ExpCacheLineSize-Sizeof(POOL_HEADER)上对齐，使最终的分配地址与ExpCacheLineSize对齐。CacheAligned将从第一个POOL_HEADER中移除，且第二个POOL_HEADER将使用以下值来填充：
+  * PreviousSize：用来保存两个headers之间的偏移
+  * PoolIndex：未使用
+  * BlockSize：在第一个POOL_HEADER中申请的bucket的大小。
+  * PoolType：和之前一样，但是CacheAligned位必须设置
+  * PoolTag：像往常一样，两个POOL_HEADER是相同的
+  * ProcessBilled：未使用
+此外，如果对齐填充中有足够的空间，则我们命名为AlignedPoolHeader的指针可能会存储在第一个POOL_HEADER之后。它指向第二个POOL_HEADER，并与ExpPoolQuotaCookie异或。
+图9总结了缓存对齐情况下两个POOL_HEADER的布局。
+### 2.3 总结
+自Windows
+19H1和引入段堆以来，一些存储在每个块的POOL_HEADER中的信息不要需要了。但是，其他的一些，例如PoolType，PoolTag，或是使用CacheAligned和PoolQuota机制的能力依旧需要。
+这就是为什么分配的小于0xFE0块至少都还有一个POOL_HEADER头。自Windwos
+19H1以来，POOL_HEADER结构体的字段的用法在2.2节中介绍过了。图10表示了使用LFH后端分配的一个块，因此前面只有一个POOL_HEADER头。
+图10. 返回的LHF块
+正如2.1节中解释的那样，不同的后端，申请的内存块可能以不同的header开头。例如，一个使用VS后端分配的大小0x280的块，因此将以大小为0x10的_HEAP_VS_CHUNK_HEADER开头。图11代表了一个使用VS段分配的块，因此是以VS
+HEADER和POOL_HEADER开头。
+图11. 返回的VS块
+最后，如果请求的分配要以Cache
+Line对齐，那么块可能包含两个POOL_HEADER头。第二个POOL_HEADER的CacheAligned位将会被设置，并用于检索第一个块和实际分配的地址。图12代表了一个使用LFH申请并需要与Cacha
+Size对齐的块，因此开头的是两个POOL_HEADER。
+图12. 返回的以缓存大小对齐的LFH块
+图13总结了分配时的决策树
+图13. 段堆分配器的决策流
+从漏洞利用的角度，可以得出两个结论。第一，POOL_HEADER的新用法使利用变得容易：由于大多数字段没有使用，因此覆盖的时候不用非常小心。第二，就是利用POOL_HEADER的新用法来寻找新的利用技术。
+## 3 攻击POOL_HEADER
+如果堆溢出漏洞允许很好的控制写入的数据和大小，那么最简单的解决方法可能是重写POOL_HEADER并且直接攻击下一个块的数据。唯一要做的事情就是控制PoolType中的PoolQuota位没有被设置，以避免在释放破坏的区块时对ProcessBilled字段进行完整性检查。
+但是，本节将提供一些针对POOL_HEADER的攻击，且这些攻击仅仅只需堆溢出几个字节。
+### 3.1 BlockSize作为目标
+从堆溢出到更大的堆溢出
+正如2.1节中解释的，在释放机制中，BlockSize字段被用于存储一些块到动态快表中。
+攻击者可以通过堆溢出来改变BlockSize字段的值使其变的更大，大于0x200。如果破坏的块已经被释放，被控制的BlockSize将被用于存储一些错误大小的块在快表中。再次申请这个大小的块时可能会使用一个非常小的分配的内存来存储所需的数据，从而触发另一个堆溢出。
+通过使用堆喷技术和一些指定的对象，攻击者可能将一个3个字节的堆溢出实现变成高达0xFD0字节字节的堆溢出，这取决于漏洞块的大小。同样，攻击者还可以选择用来溢出的对象，并且可能对溢出条件有更多的控制。
+### 3.2 PoolType作为目标
+大多数时候，存储在PoolType中的信息只是用来提供信息；它在分配的时候提供信息，并存储在PoolType中，但不会用于释放机制中。
+例如，改变存储在PoolType中的内存类型实际上不会改变分配的内存的类型。不会因为仅仅只改变了PoolType中的一个bit位就会将NonPagedPoolNx类型改为NonPagedPool。
+但是对于PoolQuota和CacheAligned位来说不是这样的。设置PoolQuota位将触发POOL_HEADER中ProcessBilled指针的使用，以便在释放时解除对配额的引用。如1.2节中所述，对ProcessBilled指针的攻击已经得到了缓解。
+所以唯一剩下的位就是CacheAligned位。
+**块排列混淆**
+如2.2节中所示，如果一个请求分配的PoolType中的CacheAligned位被设置，那么块的布局是不同的。
+当分配器正在释放这种块时，它将尝试寻找原始的块地址，用来在正确的地址释放块。它将在对齐的POOL_HEADER中使用PreviousSize字段。分配器使用一个简单的减法来计算原始块的地址。
+    if ( AlignedHeader ->PoolType & 4 )
+    {
+    OriginalHeader = (QWORD)AlignedHeader - AlignedHeader ->
+    PreviousSize * 0x10;
+    OriginalHeader ->PoolType |= 4;
+    }
+在内核中引入段堆之前，在这个操作之后有几个检查。
+  1. 分配器检查原始块在PoolType中是否设置了MustSucceed位。
+  2. 使用ExpCacheLineSize重新计算两个头之间的偏移量，并且验证两个头之间的偏移量一样。
+  3. 分配器检查对齐的头的BlockSize是否等于原始头的BlockSize加对齐头的PreviousSize。
+  4. 分配器检查OriginalHeader中保存的指针加上POOL_HEADER的大小是否等于对齐头的地址与ExpPoolQuotaCookie异或的值。
+自Windows 19H1开始，池分配器使用Segment
+Heap，所有的检查都不存在了。异或的指针依然存在于原始头之后，但在释放机制中不在进行检查。作者认为有一些检查被错误的删除了。在未来的版本中可能会重新打开这些检查，但是在Windows
+10 20H1的预览版中没有这样的补丁。
+目前，由于缺乏检查，攻击者可以使用PoolType作为攻击向量。攻击者可以使用堆溢出来设置下一个块的PoolType字段的CacheAligned位，并完全控制PreviousSize字段。当块被释放时，释放机制使用受控的PreviousSize字段寻找原始块，并释放它。因为PreviousSize字段存储在一个字节中，所以攻击者可以在原始块地址之前释放任意对齐在0x10上的地址，最多可达0xFF*0x10=0xFF0。
+这篇文章的最后一部分将使用本文介绍的技术演示一个通用漏洞利用。它提供了在池溢出或UAF的情况下需要控制的通用对象，以及使用受控数据重用已释放的分配的多个对象和技术。
+## 4 通用的漏洞利用技术
+### 4.1 所需条件
+这一节的目的是为了介绍利用一个漏洞来实现Windows System权限提升的技术。假设攻击者在低完整性级别。
+最终的目的是为了开发最通用的漏洞利用程序，可用于不同类型的内存，PagedPool和NonPagedPoolNx，具有不同大小的块和能够提供以下所需条件的任意堆溢出漏洞。
+当目标为BlockSize时，漏洞需要提供用一个可控的值重写下一个块的POOL_HEADER的第三个字节的能力。
+当目标为PoolType时，漏洞需要提供用一个可控的值重写下一个块的POOL_HEADER的第一个和第四个字节的能力。
+在所有的情况下，都需要控制漏洞对象的分配和释放，以最大限度的提升堆喷射的成功率。
+### 4.2利用策略
+所选择的利用策略使用攻击下一个块的POOL_HEADER的PoolType和PreviousSize字段的能力。易受堆溢出漏洞影响的块被称为“漏洞块”，放置在其后的块被称为“被覆盖的块“；
+正如在3.2节中描述的，通过控制下一个块的POOL_HEADER的PoolType字段和PreviousSize字段，攻击者可以更改被覆盖的块实际释放的位置。可以通过多种方式利用这种原语。

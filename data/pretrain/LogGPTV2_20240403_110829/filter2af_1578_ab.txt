@@ -1,0 +1,189 @@
+            pc,
+            bufferSize
+        );
+    }
+分析procmon.exe的winmain函数和IDA对比的效果如图
+根据IDA的识别计算一下函数大小 **0x0045E6B4-0x0045D840=3700** ，和自己程序的识别结果一致
+* * *
+# 函数粉碎
+有了上面得到的信息就能进行粉碎了，用前面讲的方法将函数进行混淆得到新的代码块，  
+再 **找到reloc段的前面一个段** ， **向下合并reloc段** ， **创建一个新的text段** ，把混淆代码放进去，  
+最后 **在新text段后面创建reloc段** ，修复重定位信息。  
+**混淆之前必须先扫描记录当前函数的所有重定位信息** ，混淆过程中将原始重定位信息和新的重定位信息联系在一起，以便后面进行重定位修复。
+**部分代码实现：**
+    char* x86PEObfuscate::BrokenFunction(FunctionNode function,DWORD *obfucodeSize, vector &relocFixBox,DWORD64 VirtulAddress)
+    {
+        //解析指令流
+        vector instrbox = this->m_Analysis.InstrExtract(function.memoryFileAddress, function.size, function.loadImageAddress);
+        if (instrbox.empty())
+        {
+            return nullptr;
+        }
+        //获取PE重定位表
+        map> relocTable;
+        vectorrelocInstrBox;
+        bool hasReloc = this->m_pefile.getRelocTable(relocTable);
+        if (hasReloc)
+        {
+            //得到指令集合中的重定位信息
+            checkReloc(instrbox, relocTable, relocInstrBox);
+        }
+        class ObfuscateInstr
+        {
+        public:
+            ObfuscateInstr() {};
+            ObfuscateInstr(const ObfuscateInstr&o)
+            {
+                this->memoryAddress = o.memoryAddress;
+                this->virtulAddress = o.virtulAddress;
+                this->prexCodeSize = o.prexCodeSize;
+                this->size = o.size;
+                this->code = new char[this->size];
+                memcpy(this->code, o.code, this->size);
+            }
+            ~ObfuscateInstr() 
+            {
+                if (code != nullptr)
+                {
+                    delete[] code;
+                }
+            }
+            //该混淆指令块被随机分配到内存中的地址，以便后面指令修复寻找地址
+            //随机方式将chunkbox集合中的指令块分配到内存
+            //修复的时候顺序遍历chunkbox集合，根据相邻元素的memoryAddress链接相邻的指令块
+            //遍历chunkbox的时候根据下标找到instrbox中的原始指令元素，判断当前是否是jcc指令
+            //是则根据以原始指令内存地址为key，在orign_chunk_map中找到目标指令块地址，计算修复当前指令
+            DWORD64 memoryAddress = 0;// 该混淆块被写入新空间的地址
+            DWORD64 virtulAddress = 0;// 该混淆块的 VA
+            DWORD prexCodeSize = 0;  //混淆块中原始功能指令前面的指令长度=原始功能指令在该指令块的偏移
+            char *code = nullptr;//混淆块
+            DWORD size = 0;
+        };
+        //对每条指令预进行预处理混淆
+        vector chunkbox;
+        x86::Gp registers[] = { x86::eax,x86::ebx,x86::ecx,x86::edx,x86::esi,x86::edi };
+        bool first = true;  //true 代表处理指令流的第一条指令 pop reg
+        int index;
+        for (auto instr : instrbox)
+        {
+            CodeHolder code;
+            code.init(CodeInfo(ArchInfo::kIdX86));
+            x86::Assembler assember(&code);
+            //原始功能指令前面
+            if (!first)
+            {
+                assember.pop(registers[index]);
+                assember.popfd();//保护标志位
+            }
+            else
+            {
+                first = false;
+            }
+            DWORD prexCodeSize = code.sectionById(0)->buffer().size();  //前缀指令的长度
+            //处理原始功能指令
+            int insn_len;
+            if ((instr.isJcc||instr.isCall)&&(instr.operatorType == UD_OP_JIMM))
+            {
+                char *new_jcc = new char[6];
+                DWORD jcc_padding = 0xAAAAAAAA;//jcc跳转偏移填充
+                WORD jcc_opcode = this->jcc_long_opcode[instr.type];
+                if ((instr.type == UD_Icall) || (instr.type == UD_Ijmp))
+                {
+                    //如果原始指令是call或者jmp 这两种指令opcode和jx类指令的长度不一致 单独处理   0xE8  0xE9
+                    memcpy(new_jcc, (char*)&jcc_opcode, 1);     
+                    memcpy(new_jcc + 1, &jcc_padding, 4);//0xAAAAAAAA占位，必须修复
+                    insn_len = 5;
+                }
+                else
+                {
+                    memcpy(new_jcc, (char*)&jcc_opcode, 2);   //0F 80  ....
+                    memcpy(new_jcc + 2, &jcc_padding, 4);//0xAAAAAAAA占位，必须修复
+                    insn_len = 6;
+                }
+                assember.embed(new_jcc, insn_len);
+                delete[] new_jcc;
+            }
+            else
+            {
+                insn_len = instr.insnLen;
+                assember.embed((char*)instr.memoryFileAddress, instr.insnLen);//  目标指令 非jcc指令 直接写入内存
+            }
+            //原始功能指令后面
+            assember.pushfd();//保护标志位
+            index = this->GetRandomKey() % sizeof(registers) / sizeof(x86::Gp);  //随机选择寄存器
+            assember.mov(x86::dword_ptr(x86::esp, -4), registers[index]);
+            assember.add(x86::esp, -4);
+            Label label = assember.newLabel();
+            assember.call(label);
+            assember.bind(label);
+            assember.pop(registers[index]);
+            int num = -(13 + prexCodeSize + insn_len);//12+1
+            assember.add(registers[index], num);  //得到本混淆指令块开始地址
+            assember.add(registers[index], 0xdeadbeaf);   //0xdeadbeaf占位，必须修复
+            assember.push(registers[index]);
+            assember.ret();
+            CodeBuffer& buffer = code.sectionById(0)->buffer();
+            ObfuscateInstr instrchunk;
+            instrchunk.code = new char[buffer.size()];
+            ::memcpy(instrchunk.code, buffer.data(), buffer.size());
+            instrchunk.size = buffer.size();
+            instrchunk.prexCodeSize = prexCodeSize;
+            chunkbox.push_back(instrchunk);
+        }
+        //将指令块随机乱序分配到新空间
+        DWORD buffer_index = 0;
+        DWORD buffer_size = function.size * 100;
+        char * buffer = new char[buffer_size];  //申请100倍原始函数空间的大小
+        map orign_chunk_map;   //修复跳转指令 key是原始指令内存地址，value是被混淆过后的指令被随机分配后的地址
+        vector  indexTable;   //chunkbox的索引表
+        for (int i = 0; i GetRandomKey() % indexTable.size();
+            int index = indexTable[key];
+            memcpy(buffer + buffer_index, chunkbox[index].code, chunkbox[index].size);
+            DWORD64 addr = (DWORD64)buffer + buffer_index;
+            DWORD64 va = VirtulAddress + (addr - (DWORD64)buffer);
+            chunkbox[index].memoryAddress = addr;   //随机放置的地址
+            chunkbox[index].virtulAddress = va;  //该指令块的va
+            orign_chunk_map.insert(pair(instrbox[index].memoryFileAddress, addr));
+            buffer_index += chunkbox[index].size;
+            //随机产生5-20字节垃圾数据
+            int junk_size = this->GetRandomKey() % 16 + 6;
+            this->GetRandomBytes(buffer + buffer_index, junk_size);
+            buffer_index += junk_size;
+            //从tmpchunk中删除当前指令元素
+            auto iter = indexTable.begin();
+            iter += key;
+            indexTable.erase(iter);
+        }
+        //修复指令间执行顺序和jcc跳转目的地址  注意最后一条指令的处理
+        DWORD offset_flag = 0xdeadbeaf;
+        DWORD jcc_flag = 0xAAAAAAAA;
+        for (int i = 0; i GetRandomKey() % (chunkbox.size() - 1);
+                offset = chunkbox[k].memoryAddress - chunkbox[i].memoryAddress;
+            }
+            //修复相邻指令执行顺序
+            char* ptr = this->SearchBytes(begin, end, (char*)&offset_flag, sizeof(DWORD));
+            memcpy(ptr, &offset, 4);
+            if ((instrbox[i].isJcc|| instrbox[i].isCall) && (instrbox[i].operatorType == UD_OP_JIMM))
+            {
+                //修复jcc指令跳转偏移
+                char* ptr = this->SearchBytes(begin, end, (char*)&jcc_flag, sizeof(DWORD));
+                DWORD64 addr = 0;
+                if ((instrbox[i].type == UD_Icall)||(orign_chunk_map.count(instrbox[i].jmpMemoryFileAddress)m_pefile.getOptionHeader()->ImageBase;
+            DWORD orignRva = instrbox[index].loadImageAddress + relocInstr.off - this->m_pefile.getOptionHeader()->ImageBase;
+            WORD typeOffset = rva % 0x1000;  //新的typeOffset
+            DWORD newPage = rva - typeOffset;
+            typeOffset |= ((WORD)(relocInstr.type GetRandomBytes(begin, function.size - 6);
+        char *obfucode = new char[buffer_index];
+        memcpy(obfucode, buffer, buffer_index);
+        *obfucodeSize = buffer_index;
+        delete[] buffer;
+        return obfucode;
+    }
+对procmon.exe的winmain函数进行粉碎生成procmon2.exe
+procmon2.exe正常运行
+**混淆前:**
+**混淆后:**
+原理很简单，只实现了乱序粉碎的功能，而且是很简单的 **函数粉碎** ，只作为 **学习的一个玩具demo** 参考  
+**代码变形，常量隐藏，导入表加密等等功能都没有加入** 。 **没什么技术含量** ，代码很垃圾， **大佬轻喷**  
+发个demo bin玩玩，把Obfuscater.exe和procmon.exe放在同一目录，运行即可生procmon.obf.exe  
+Obfuscater.exe处理的exe和函数我都写死了，想用的大佬可以 **自行逆向patch** 一下

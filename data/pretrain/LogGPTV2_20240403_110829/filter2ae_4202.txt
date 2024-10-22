@@ -1,0 +1,132 @@
+# 以太坊UDP流量放大反射DDOS漏洞
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 漏洞影响
+该漏洞表面上是一个放大5倍udp反射DDOS漏洞，但其对ETH的P2P网络的影响是非常大的，但是这个漏洞有很大的两个副作用，一个是ETH的发现节点池会不断的被堆满，导致正常节点无法加入，二是可屏蔽被攻击节点无法探索到任意子网的节点。
+## 漏洞分析
+先让我们来看看ETH
+P2P发现协议的文档，在`https://github.com/ethereum/devp2p/blob/master/discv4.md`这篇ETH
+P2P发现协议文档里是有对udp反射DDOS做防御的。
+> Pong Packet (0x02)  
+>  packet-data = [to, ping-hash, expiration]  
+>  **Pong is the reply to ping.ping-hash should be equal to hash of the
+> corresponding ping packet.** Implementations should ignore unsolicited pong
+> packets that do not contain the hash of the most recent ping packet.
+其方法就是通过签名PIng包并且让对方主机回复的Pong包要带上之前Ping包的hash才可以通过校验。这个从设计上来说是没什么问题的，然而go-ethereum在实现该协议的时候出了问题。
+让我们来看看go-ethereum是怎么实现该协议的，在`https://github.com/ethereum/go-ethereum/blob/master/p2p/discover/udp.go#L618`
+    func (req *ping) handle(t *udp, from *net.UDPAddr, fromKey encPubkey, mac []byte) error {
+        if expired(req.Expiration) {
+            return errExpired
+        }
+        key, err := decodePubkey(fromKey)
+        if err != nil {
+            return fmt.Errorf("invalid public key: %v", err)
+        }
+        //收到ping包后马上回复pong包
+        t.send(from, pongPacket, &pong{
+            To:         makeEndpoint(from, req.From.TCP),
+            ReplyTok:   mac,
+            Expiration: uint64(time.Now().Add(expiration).Unix()),
+        })
+        n := wrapNode(enode.NewV4(key, from.IP, int(req.From.TCP), from.Port))
+        t.handleReply(n.ID(), pingPacket, req)
+        //如果没通过pong校验则发送一个ping包进行pong校验，如果通过pong校验则加入发现节点池
+        if time.Since(t.db.LastPongReceived(n.ID())) > bondExpiration {
+            t.sendPing(n.ID(), from, func() { t.tab.addThroughPing(n) })
+        } else {
+            t.tab.addThroughPing(n)
+        }
+        t.localNode.UDPEndpointStatement(from, &net.UDPAddr{IP: req.To.IP, Port: int(req.To.UDP)})
+        t.db.UpdateLastPingReceived(n.ID(), time.Now())
+        return nil
+    }
+由于我们是第一次连接，所以要进行pong校验，我们来看看go-ethereum是怎么实现协议中的pong校验的，在`https://github.com/ethereum/go-ethereum/blob/master/p2p/discover/udp.go#L645`
+    func (req *pong) handle(t *udp, from *net.UDPAddr, fromKey encPubkey, mac []byte) error {
+        if expired(req.Expiration) {
+            return errExpired
+        }
+        fromID := fromKey.id()
+        //开始处理pong，如果没有请求过pong，就返回错误
+        if !t.handleReply(fromID, pongPacket, req) {
+            return errUnsolicitedReply
+        }
+        t.localNode.UDPEndpointStatement(from, &net.UDPAddr{IP: req.To.IP, Port: int(req.To.UDP)})
+        //刷新pong时间，通过pong校验
+        t.db.UpdateLastPongReceived(fromID, time.Now())
+        return nil
+    }
+可见只要通过t.handleReply的校验我们就可以刷新pong时间通过校验了，让我们来看看t.handleReply
+是怎么处理的`https://github.com/ethereum/go-ethereum/blob/master/p2p/discover/udp.go#L369`
+    func (t *udp) handleReply(from enode.ID, ptype byte, req packet) bool {
+        matched := make(chan bool, 1)
+        select {
+        //放入gotreply等待返回matched
+        case t.gotreply <- reply{from, ptype, req, matched}:
+            // loop will handle it
+            return <-matched
+        case <-t.closing:
+            return false
+        }
+    }
+我们继续往下追
+    case r := <-t.gotreply:
+                var matched bool
+                for el := plist.Front(); el != nil; el = el.Next() {
+                    p := el.Value.(*pending)
+                    if p.from == r.from && p.ptype == r.ptype {
+                        //是否有拉取过请求，有则matched为true
+                        matched = true
+                        // Remove the matcher if its callback indicates
+                        // that all replies have been received. This is
+                        // required for packet types that expect multiple
+                        // reply packets.
+                        //对应的callback校验，然而就算p.callback返回为false，matched也为true
+                        if p.callback(r.data) {
+                            p.errc <- nil
+                            plist.Remove(el)
+                        }
+                        // Reset the continuous timeout counter (time drift detection)
+                        contTimeouts = 0
+                    }
+                }
+                r.matched <- matched
+这里基本能看出问题了，p.callback返回了false，只要不抛出错误，matched还是true，校验就算通过了，我们再来看看pong校验的callback是怎么处理的`https://github.com/ethereum/go-ethereum/blob/master/p2p/discover/udp.go#L294`
+    func (t *udp) sendPing(toid enode.ID, toaddr *net.UDPAddr, callback func()) <-chan error {
+        req := &ping{
+            Version:    4,
+            From:       t.ourEndpoint(),
+            To:         makeEndpoint(toaddr, 0), // TODO: maybe use known TCP port from DB
+            Expiration: uint64(time.Now().Add(expiration).Unix()),
+        }
+        packet, hash, err := encodePacket(t.priv, pingPacket, req)
+        if err != nil {
+            errc := make(chan error, 1)
+            errc <- err
+            return errc
+        }
+        //这里就是pong校验的callback，可见就算没通过校验也只是返回了false
+        errc := t.pending(toid, pongPacket, func(p interface{}) bool {
+            ok := bytes.Equal(p.(*pong).ReplyTok, hash)
+            if ok && callback != nil {
+                callback()
+            }
+            return ok
+        })
+        t.localNode.UDPContact(toaddr)
+        t.write(toaddr, req.name(), packet)
+        return errc
+    }
+所有，实际上go-ethereum并没有很好的实现pong校验，导致协议设计的防御机制彻底失效。
+## 漏洞利用
+  1. 伪造udp源地址
+  2. 构造ping包发送到geth的p2p发现协议UDP端口，拉取pong请求
+  3. 构造pong包发送到geth的p2p发现协议UDP端口，hash留空即可
+  4. 然后再发送findnode包即可发射5倍以上udp流量
+由于官方还未修补该漏洞，所以暂时不公布POC
+## 漏洞演示
+下面用go-ETH最新版1.8.21来演示
+成功将UDP流量放大5倍反射到1.1.6.7
+单个虚拟机测试，CPU占用率轻松达到50%
+屏蔽受害节点无法发现指定网段节点：

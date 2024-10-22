@@ -1,0 +1,135 @@
+      }
+默认情况下，`DataFlow`库仅保留每个节点的值，例如函数调用参数，赋值表达式等。 但是我们还需要数据从请求数据指针流向它所投射到的结构的字段。
+我们使用如下操作：
+    override predicate isAdditionalFlowStep(DataFlow::Node node1, DataFlow::Node node2)
+      {
+        // any terminal field access on request packet
+        //   e.g. in expression a->b.c the data flows from a to c
+        exists(Expr e, FieldAccess fa |  
+          node1.asExpr() = e and node2.asExpr() = fa |  
+          fa.getQualifier*() = e and not (fa.getParent() instanceof FieldAccess)
+        )
+      }
+要使用边界检查排除数据，我们需要在控制流图中较早的在某些条件语句中使用变量或字段，并放置一些屏障。
+    override predicate isBarrier(DataFlow::Node node) { 
+        exists(ConditionalStmt condstmt |  
+          // dataflow node variable is used in expression of conditional statement
+          //   this includes fields (because FieldAccess extends VariableAccess)
+          node.asExpr().(VariableAccess).getTarget().getAnAccess()
+                                              = condstmt.getControllingExpr().getAChild*()
+          // and that statement precedes the dataflow node in the control flow graph
+          and condstmt.getASuccessor+() = node.asExpr()
+          // and the dataflow node itself not part of the conditional statement expression
+          and not (node.asExpr() = cs.getControllingExpr().getAChild*())
+        ) 
+      }
+将此应用于上述两个示例，每个节点的数据流将是：
+在我们的代码库中，此查询在15个消息处理程序函数中共定位了18个漏洞，这是一组攻击者所控制的越界读写操作。
+我们应用了类似的分析来查找函数调用的参数，并不验证消息请求数据。
+首先，我们定义了一个QL类来定义函数调的用和参数，包括调用`memcpy`的大小参数和类似的函数`_fmemcpy`，以及`CalculateChecksum`的长度参数。
+`CalculateChecksum`是一个特定的代码库函数，它将返回缓冲区的`CRC32`部分，并且可能被用作信息泄露。其中消息处理函数将此值复制到其响应缓冲区中。
+    class ArgumentMustBeCheckedFunctionCall extends FunctionCall {
+      int argToCheck;
+      ArgumentMustBeCheckedFunctionCall() {
+        ( this.getTarget().hasName("memcpy")            and argToCheck = 2 ) or
+        ( this.getTarget().hasName("_fmemcpy")          and argToCheck = 2 ) or
+        ( this.getTarget().hasName("CalculateChecksum") and argToCheck = 1 )
+      }
+      Expr getArgumentToCheck() { result = this.getArgument(argToCheck) }
+    }
+接下来，我们修改了上一个查询的接收器以匹配`ArgumentMustBeCheckedFunctionCall`而不是数组索引：
+    override predicate isSink(DataFlow::Node sink) {
+        // sink node is an argument to a function call that must be checked first
+        exists (ArgumentMustBeCheckedFunctionCall fc | 
+                  fc.getArgumentToCheck() = sink.asExpr())
+      }
+这个查询暴露出另外17个漏洞，其中大多数是攻击者控制的超出边界读取（我们后来证实在响应消息中已经披露了这些漏洞），其中一个超出边界写入。
+### 污点跟踪
+在上面的查询中，我们覆盖了`DataFlow`库的`isAdditionalFlowStep`谓词以确保数据流向指向结构的指针，该结构的字段将作为数据流图中的节点被添加。
+在默认情况下，数据流分析仅包括数据值保持不变的路径，但我们希望跟踪可能受影响的表达式集合。 也就是说，我们定义了一组被不受信任的数据污染表达式。
+`QL`包含一个内置库，可以应用更通用的方法来进行污点跟踪。
+在`DataFlow`库之上开发，它会覆盖`isAdditionalFlowStep`，并为值修改表达式提供更丰富的规则集。
+这就是`TaintTracking`库，它以类似于`DataFlow`的方式被导入：
+    import semmle.code.cpp.dataflow.TaintTracking
+它的使用方式与数据库几乎相同，只是要扩展的QL类是`TaintTracking::Configuration`，这些配置谓词：
+我们重新运行了先前的查询，删除了`isAdditionalFlowStep`并且将`isBarrier`重命名为`isSanitizer`。
+正如预期的那样，它返回了上面提到的所有结果，但也在数组索引中发现了一些额外的整数下溢缺陷。 例如：
+    int ExampleMessageHandler(UINT8 *pRequest(1:source), int RequestLength, UINT8 *pResponse)
+    {
+        ExampleMessageRequest* pMsgReq(3) = (ExampleMessageRequest *) pRequest(2);
+        int index1(6) = pMsgReq(4)->index1(5);
+        pTable1[(index1(7) - 2)(8:sink)].field1 = pMsgReq->value1;
+    }
+对于每个漏洞类型的内部报告，我们将这些与早期查询结果分开进行分类。 这包括使用`SubExpr QL`类对接收器进行简单修改：
+    override predicate isSink(DataFlow::Node sink) {
+        // this sink is the left operand of a subtraction expression,
+        //   which is part of an array offset expression, e.g. x in a[x - 1]
+        exists(ArrayExpr ae, SubExpr s | sink.asExpr() instanceof FieldAccess
+          and ae.getArrayOffset().getAChild*() = s
+          and s.getLeftOperand().getAChild*() = sink.asExpr())
+      }
+这也暴露了其中2个消息处理函数中的另外3个漏洞。
+### 查找路径遍历漏洞
+为了找到潜在的路径来遍历漏洞，我们使用QL尝试识别文件所打开函数中的消息处理函数。
+我们这次使用了不同的方法进行污点跟踪。此处我们定义了一些额外的污点步骤，这些步骤将流经各种字符串处理C库函数：
+    predicate isTaintedString(Expr expSrc, Expr expDest) {
+      exists(FunctionCall fc, Function f |
+        expSrc = fc.getArgument(1) and 
+        expDest = fc.getArgument(0) and
+        f = fc.getTarget() and (
+          f.hasName("memcpy") or 
+          f.hasName("_fmemcpy") or 
+          f.hasName("memmove") or 
+          f.hasName("strcpy") or 
+          f.hasName("strncpy") or
+          f.hasName("strcat") or
+          f.hasName("strncat")
+          )
+      )
+      or exists(FunctionCall fc, Function f, int n |
+        expSrc = fc.getArgument(n) and 
+        expDest = fc.getArgument(0) and
+        f = fc.getTarget() and (
+          (f.hasName("sprintf") and n >= 1) or 
+          (f.hasName("snprintf") and n >= 2)
+        )
+      )
+    }
+    …
+      override predicate isAdditionalTaintStep(DataFlow::Node node1, DataFlow::Node node2) {
+        isTaintedString(node1.asExpr(), node2.asExpr())
+      }
+此处我们将接收器定义为文件打开功能的路径参数：
+    class FileOpenFunction extends Function {
+      FileOpenFunction() {
+        this.hasName("fopen") or this.hasName("open")
+      }
+      int getPathParameter() { result = 0 } // filename parameter index
+    }
+    …
+      override predicate isSink(DataFlow::Node sink) {
+        exists(FunctionCall fc, FileOpenFunction fof |
+          fc.getTarget() = fof and fc.getArgument(fof.getPathParameter()) = sink.asExpr())
+      }
+在我们解决下一个排除数据验证流程的问题之前，我们对目标设备的工作模式进行了初步审查，我们发现其结果正如我们之前的查询的那样，查询根本没有返回任何内容。
+由于没有检查的数据流路径，我们无法打开查询函数调用以搜索消息处理函数和调用文件打开函数之间的任何路径，不包括path参数为常量的调用：
+    // this recursive predicate defines a function call graph
+    predicate mayCallFunction(Function caller, FunctionCall fc) {
+      fc.getEnclosingFunction() = caller or mayCallFunction(fc.getTarget(), fc)
+    }
+    from MessageHandlerFunction mhf, FunctionCall fc, FileOpenFunction fof
+    where mayCallFunction(mhf, fc)
+      and fc.getTarget() = fof
+      and not fc.getArgument(fof.getPathParameter()).isConstant()
+    select 
+      mhf, "$@ may have a path to $@",
+      mhf, mhf.toString(),
+      fc, fc.toString()
+这个查询提供了5个结果，从中我们发现了2个路径遍历漏洞，一个写入文件，另一个读取文件，两者都有攻击者提供的路径。
+事实证明，污点跟踪没有标记这些，因为它需要发送两个单独的消息类型：第一个设置文件名，第二个读取或写入具有该名称的文件的数据。
+然而QL足够灵活，可以提供另一种探索途径。
+### 结论
+在Microsoft，我们采取深度防御方法来保护云并保护客户的数据安全。 其中一个重要部分是对Azure内部攻击面进行全面的安全性审查。
+在这个嵌入式设备的源代码审查中，我们应用`Semmle QL`的静态分析技术来查找基于消息的管理协议中的漏洞。
+这在各种bug类中发现了总共33个易受攻击的消息处理程序。 使用QL使我们能够自动执行完全手动代码审查的重复部分，同时可以采用新型手段进行探测。
+    本文为翻译文章并来自：[https://blogs.technet.microsoft.com/srd/2019/03/19/vulnerability-hunting-with-semmle-ql-part-2/](https://blogs.technet.microsoft.com/srd/2019/03/19/vulnerability-hunting-with-semmle-ql-part-2/)

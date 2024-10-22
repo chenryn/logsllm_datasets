@@ -1,0 +1,150 @@
+    ......
+    case *ast.SwitchStmt:
+            if nn.Tag == nil || nn.Body == nil {
+                return s // recurse
+            }
+            // Replace:
+            //  switch a := foo(); bar(a) {
+            //  case x: ...
+            //  case y: ...
+            //  }
+            // with:
+            //  switch {
+            //  default:
+            //      a := foo()
+            //      __tmp := bar(a)
+            //      switch {
+            //      case __tmp == x: ...
+            //      case __tmp == y: ...
+            //      }
+            //  }
+            // The == comparisons will be instrumented later when we recurse.
+            sw := new(ast.SwitchStmt)
+            *sw = *nn
+            var stmts []ast.Stmt
+            if sw.Init != nil {
+                stmts = append(stmts, sw.Init)
+                sw.Init = nil
+            }
+            const tmpvar = "__go_fuzz_tmp"
+            tmp := ast.NewIdent(tmpvar)
+            typ := s.info.Types[sw.Tag]
+            s.info.Types[tmp] = typ
+            stmts = append(stmts, &ast.AssignStmt{Lhs: []ast.Expr{tmp}, Tok: token.DEFINE, Rhs: []ast.Expr{sw.Tag}})
+            stmts = append(stmts, &ast.AssignStmt{Lhs: []ast.Expr{ast.NewIdent("_")}, Tok: token.ASSIGN, Rhs: []ast.Expr{tmp}})
+            sw.Tag = nil
+            stmts = append(stmts, sw)
+            for _, cas1 := range sw.Body.List {
+                cas := cas1.(*ast.CaseClause)
+                for i, expr := range cas.List {
+                    tmp := &ast.Ident{Name: tmpvar, NamePos: expr.Pos()}
+                    s.info.Types[tmp] = typ
+                    cas.List[i] = &ast.BinaryExpr{X: tmp, Op: token.EQL, Y: expr}
+                }
+            }
+            nn.Tag = nil
+            nn.Init = nil
+            nn.Body = &ast.BlockStmt{List: []ast.Stmt{&ast.CaseClause{Body: stmts}}}
+            return s // recurse
+    ......
+    }
+第一步先根据节点类型找到Switch和For这种结构进行语法树级别的变化，整体的替换逻辑已经在注释里面体现出来了，其实就是类似把switch的条件都提出来放在body内部，然后再body里面建立一个新的switch结构，主要作用可能就是方便识别和统计，对于ast.BinaryExpr结构则是通过自定义的flag进行标注。
+整体来看其实就是对包内代码各种语法树节点进行类型检查和过滤，因为一些代码是肯定顺序执行的，然后再需要的地方都插入一些标志，同时在结构体里面记录标志的总量，方便在fuzz执行的时候确定自己的代码位置从而更方便进行统计，具体的可以细看相关代码。
+#### 插桩总结
+其实无论是File还是Sonar，个人认为都算是一种插桩，方便对代码覆盖率进行统计，在结束之后都通过createFuzzMain函数进行了封装，这个地方其实也是go-fuzz不支持fuzz的代码包含main函数的具体原因：
+    func (c *Context) createFuzzMain() string {
+        mainPkg := filepath.Join(c.fuzzpkg.PkgPath, "go.fuzz.main")
+        path := filepath.Join(c.workdir, "gopath", "src", mainPkg)
+        c.mkdirAll(path)
+        c.writeFile(filepath.Join(path, "main.go"), c.funcMain())
+        return mainPkg
+    }
+其实就是将已经写好的main函数模板写入：
+    var ainSrc = template.Must(template.New("main").Parse(`
+    package main
+    import (
+        target "{{.Pkg}}"
+        dep "go-fuzz-dep"
+    )
+    func main() {
+        fns := []func([]byte)int {
+            {{range .AllFuncs}}
+                target.{{.}},
+            {{end}}
+        }
+        dep.Main(fns)
+    }
+    `))
+主要作用还是调用包内的Fuzz代码。
+### go-fuzz
+  1. 首先通过丢弃触发相同代码路径的的样本来最小化语料库。
+  2. 开始改变输入并将数据传递给Fuzz函数，不失败（return 1），然后扩展代码覆盖率的突变会被保留和迭代形成新的样本。
+  3. 当程序出现Crash的时候，会保存报告并重新启动程序。
+Fuzz这块的具体原理其实都是参考的AFL，就不多说了，详细也可以参考AFL的Fuzz方式和源码。
+## 测试用例
+首先简单介绍一下go的Fuzz函数的基本信息：
+    func Fuzz(data []byte) int {
+    }
+该函数以int作为返回值，因此当其返回值为0的时候说明Fuzz对于数据不敢影响，可能的原因是测试目标发生了无意义的错误，比如输入内容不合法等，返回值为1说明该数据已经被成功解析，简单来说就是Fuzz输入的data被目标所接受。
+### DNS解析器Fuzz
+首先第一步是创建初始语料库，其实就是通过拆解pcap数据包来创造数据：
+    package main
+    import (
+        "crypto/rand"
+        "encoding/hex"
+        "log"
+        "os"
+        "strconv"
+        "github.com/miekg/pcap"
+    )
+    func fatalIfErr(err error) {
+        if err != nil {
+            log.Fatal(err)
+        }
+    }
+    func main() {
+        handle, err := pcap.OpenOffline(os.Args[1])
+        fatalIfErr(err)
+        b := make([]byte, 4)
+        _, err = rand.Read(b)
+        fatalIfErr(err)
+        prefix := hex.EncodeToString(b)
+        i := 0
+        for pkt := handle.Next(); pkt != nil; pkt = handle.Next() {
+            pkt.Decode()
+            f, err := os.Create("p_" + prefix + "_" + strconv.Itoa(i))
+            fatalIfErr(err)
+            _, err = f.Write(pkt.Payload)
+            fatalIfErr(err)
+            fatalIfErr(f.Close())
+            i++
+        }
+    }
+编写初步的Fuzz函数：
+    func Fuzz(rawMsg []byte) int {
+        msg := &dns.Msg{}
+        if unpackErr := msg.Unpack(rawMsg); unpackErr != nil {
+            return 0
+        }
+        if _, packErr = msg.Pack(); packErr != nil {
+            println("failed to pack back a message")
+            spew.Dump(msg)
+            panic(packErr)
+        }
+        return 1
+    }
+作者在发现了越界：
+    func unpackTxt(msg []byte, offset, rdend int) ([]string, int, error) {
+        var err error
+        var ss []string
+        var s string
+        for offset  https://adalogics.com/blog/structure-aware-go-fuzzing-complex-types
+## 云原生下的Fuzz思考
+云原生的很多新技术其实都是在老技术的交叉上形成的，其实可以类似go项目结构里面的不同的包，对于很多Fuzz目标来言，像以前那样直接从最根本处下手已经不太现实可行，比如容器Fuzz其实很难通过生成大量镜像或者docker
+client的命令来解决，恰恰相反深入程序内部针对不同函数来编写Fuzz或许更有价值。
+但是缺点也很明显，首先必须和代码审计相结合，其次就是由于代码是否用户可达或者crash是否真的引发漏洞效果都有待评估，正如go-fuzz创始人所说：“go-fuzz其实更适合开发者来寻求自己项目中存在的bug”，但是漏洞挖掘技术也是在不断的进步之中，或许可以思考如何把找到的bug发展成漏洞，毕竟对于内存安全的高级语言来说直接谋求可利用漏洞相对困难。
+其实在内存漏洞越来越少的现在，这种bug最终演变成漏洞的例子还是有的，就比如linux
+pkexec提权漏洞，过去几年大家都认为这是一个bug，但是等利用方式被真正发掘，就能变化成为严重的安全问题。
+## 参考资料
+> https://github.com/dvyukov/go-fuzz
+* * *

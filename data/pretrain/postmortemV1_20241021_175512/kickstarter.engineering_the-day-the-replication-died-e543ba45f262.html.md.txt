@@ -1,0 +1,152 @@
+# The Day the Replication Died 
+
+On Thursday, March 7th, we scrambled. Most of Kickstarter's traffic is
+served from replicated copies of the MySQL database, and those replicas
+had quit updating. The problem wasn't on one replica that we could
+easily replace; it was on *all* the replicas. And MySQL was telling us
+something new:
+
+``` 
+mysql> SHOW SLAVE STATUS\G
+*************************** 1. row ***************************
+Last_Error: Could not execute Update_rows event on table
+kickstarter.backings; Duplicate entry '123456-789' for key
+'index_backings_on_project_id_and_sequence', Error_code: 1062;
+handler error HA_ERR_FOUND_DUPP_KEY; the event's master log
+mysql-bin-changelog.169933, end_log_pos 12969124
+```
+
+We immediately set to work. Over the next few hours we kept the site
+stable, minimized the effects of stale replicas, communicated the issue
+to users, recovered, sounded the all clear, and then watched as the
+whole cycle repeated itself.
+
+But that's a different story. This is about discovering a MySQL bug.
+Let's talk shop.
+
+### Background: Replication 
+
+To understand the problem we first had to dig into MySQL's replication
+modes. We rely on Amazon RDS for managed MySQL, and their [default
+replication
+mode](https://web.archive.org/web/20170728131458/http://aws.amazon.com/rds/faqs/#100) is `MIXED`. According to [MySQL's
+docs](https://web.archive.org/web/20170728131458/http://dev.mysql.com/doc/refman/5.5/en/binary-log-formats.html) this is a best-of-both-worlds hybrid
+between statement- and row-based replication.
+
+To summarize:
+
+#### Statement-Based Replication 
+
+This is the most *efficient* replication. In this mode, MySQL replicates
+the query itself, with additional context such as the current time or
+the next insert id. It minimizes how much the master must write to its
+binlog, and efficiently replays the same query on each replica.
+
+The downside is that some queries may not be deterministic: they may not
+replay the same on each replica.
+
+#### Row-Based Replication 
+
+This is the most *accurate* replication. Instead of replicating the
+query, it replicates the new version of each row in its entirety. The
+replicas simply replace their version with the new version.
+
+#### Mixed-Mode Replication 
+
+In this mode, MySQL favors efficient statement-based replication until
+it recognizes an
+[unsafe](https://web.archive.org/web/20170728131458/http://dev.mysql.com/doc/refman/5.5/en/replication-rbr-safe-unsafe.html) query. Then it temporarily switches to
+row-based replication.
+
+### Breaking Down the Problem 
+
+Once the replication error told us where to look, we were able to easily
+spot our inconsistent data: a range of rows where the replicas were out
+of sync with the master. But this particular data had been inconsistent
+for days, and when we expanded our search, we found some inconsistent
+data over a month old. Why had it waited to break?
+
+``` 
+master> select from tbl;    replica> select from tbl;
++----+------+----------+    +----+------+----------+
+| id | foo  | uniq_col |    | id | foo  | uniq_col |
++----+------+----------+    +----+------+----------+
+| .. | ...  | ...      |    | .. | ...  | ...      |
+| 12 | bar  | 10       |    | 12 | bar  | 4        |
+| 13 | baz  | 4        |    | 13 | baz  | 10       |
+| .. | ...  | ...      |    | .. | ...  | ...      |
++----+------+----------+    +----+------+----------+
+```
+
+Inconsistent data is bad enough on its own, but it was only half of our
+issue. It wasn't until a later unsafe query triggered *row-based
+replication* that replication broke.
+
+``` 
+-- An example unsafe query
+master> UPDATE tbl SET foo = 'qux' ORDER BY rand() LIMIT 1;
+
+-- Would replicate like (decoded as SQL):
+replica> UPDATE tbl SET id = 13, foo = 'qux', uniq_col = 4 WHERE id = 13;
+ERROR 1062: Duplicate entry '4' for key 'index_foo_on_uniq_col'
+```
+
+### The Affected Feature 
+
+The inconsistent data was a handful of backer sequences. We aim to
+assign each backer a unique and incremental number for that project when
+they complete the pledge process. This is pretty helpful for reports
+that we give to creators.
+
+In an effort to avoid race conditions and unnecessary rollbacks/retries
+from duplicate keys, we opted for a background job that updates recent
+sequences for a given project using a [user-defined counter
+variable](https://web.archive.org/web/20170728131458/http://dev.mysql.com/doc/refman/5.5/en/user-variables.html). The order is maintained through an
+appropriate timestamp column.
+
+``` 
+SELECT COALESCE(MAX(sequence), 0)
+FROM backings
+WHERE project_id = ?
+INTO @sequence;
+
+UPDATE backings
+SET sequence = @sequence := @sequence + 1
+WHERE project_id = ?
+  AND sequence IS NULL
+  AND pledged_at IS NOT NULL
+ORDER BY pledged_at ASC, id ASC;
+```
+
+Somehow that query had given backings a *different sequence* on the
+replicas. But it has a well-specified `ORDER BY`; why didn't it work?
+
+### Back In Time 
+
+We found evidence that in the timeframe when the data became
+inconsistent, a set of transactions hung while waiting for locks after
+writing to the backings table. InnoDB's transaction engine is [optimized
+for](https://web.archive.org/web/20170728131458/http://mysqldump.azundris.com/archives/77-Transactions-An-InnoDB-Tutorial.html) `COMMIT`,
+which means it writes each query to disk such that
+`COMMIT` has nothing to do but mark the
+transaction as complete and release locks.
+
+Then, the transactions finished, but out of order. Since MySQL flushes a
+transaction's queries to the binlog on `COMMIT`, this means that the order in which records were
+written to disk on the master was different than the order in which the
+replicas wrote to disk when replaying the binlog.
+
+But this only matters if there's no explicit `ORDER BY` clause, and we had one. It just didn't match up.
+Puzzling on this led us to discover the final piece of the puzzle: a bug
+where [MySQL will sometimes ignore
+the](https://web.archive.org/web/20170728131458/http://bugs.mysql.com/bug.php?id=68656) `ORDER BY`
+[clause](https://web.archive.org/web/20170728131458/http://bugs.mysql.com/bug.php?id=68656). Without that clause, the master and the
+replicas relied on their own versions of the implicit order, ran the
+sequencing, and fell out of sync.
+
+### Lessons Learned 
+
+Databases are intricate. In the Rails community we sometimes treat them
+as simple data stores, hidden behind ActiveRecord and ActiveRelation.
+But it's important to find opportunities to better understand how they
+do what we ask them to do. The answers are illuminating!

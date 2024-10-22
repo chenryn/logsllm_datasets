@@ -1,0 +1,116 @@
+    //POC of the ArrayObject GC vulnerability
+    $serialized_string = 'a:1:{i:1;C:11:"ArrayObject":37:{x:i:0;a:2:{i:1;R:4;i:2;r:1;};m:a:0:{}}}';
+在使用gdb时，我们可以使用标准的PHP 5.6 .gdbinit（  ）和一个额外的自定义例程来转储垃圾回收缓冲区的内容。
+    //.gdbinit dumpgc
+    define dumpgc
+        set $current = gc_globals.roots.next
+        printf "GC buffer content:n"
+        while $current != &gc_globals.roots
+            printzv $current.u.pz
+            set $current = $current.next
+        end
+    end
+此外，我们现在可以在gc_mark_roots和gc_scan_roots上设置断点来查看所有相关引用计数器的状态。  
+此次分析的目标，是为了解答为什么外部数组会完全被释放。我们将PHP进程加载到gdb中，并按照上文所述设置断点，执行示例脚本。
+    (gdb) r poc1.php
+    [...]
+    Breakpoint 1, gc_mark_roots () at [...]
+    (gdb) dumpgc
+    GC roots buffer content:
+    [0x109f4b0] (refcount=2) array(1): { // outer_array
+        1 => [0x109d5c0] (refcount=1) object(ArrayObject) #1
+      }
+    [0x109ea20] (refcount=2,is_ref) array(2): { // inner_array
+        1 => [0x109ea20] (refcount=2,is_ref) array(2): // reference to inner_array
+        2 => [0x109f4b0] (refcount=2) array(1): // reference to outer_array
+      }
+在这里，我们看到，一旦反序列化完成，两个数组（inner_array和outer_array）都会被添加到垃圾回收缓冲区中。如果我们在gc_scan_roots处中断，那么将会得到如下的引用计数器：
+    (gdb) c
+    [...]
+    Breakpoint 2, gc_scan_roots () at [...]
+    (gdb) dumpgc
+    GC roots buffer content:
+    [0x109f4b0] (refcount=0) array(1): { // outer_array
+        1 => [0x109d5c0] (refcount=0) object(ArrayObject) #1
+      }
+在这里，我们确实看到了gc_mark_roots将所有引用计数器减为0，所以这些节点接下来会变为白色，随后被释放。但是，我们有一个问题，为什么引用计数器会首先变为0呢？
+###  3.1 对意外行为的调试
+接下来，让我们逐步通过gc_mark_roots和zval_mark_grey探究其原因。  
+1、zval_mark_grey将会在outer_array上调用（此时，outer_array已经添加到垃圾回收缓冲区中）；  
+2、将outer_array标记为灰色，并检索所有子项，在这里，outer_array只有一个子项，即“object(ArrayObject)
+#1”（引用计数器 = 1）；  
+3、将子项或ArrayObject的引用计数分别进行递减，结果为“object(ArrayObject) #1”（引用计数器 = 0）；  
+4、zval_mark_grey将会在此ArrayObject上被调用；  
+5、这一对象会被标记为灰色，其所有子项（对inner_array的引用和对outer_array的引用）都将被检索；  
+6、两个子项的引用计数器，即两个引用的zval将被递减，目前“outer_array”（引用计数器 = 1），“inner_array”（引用计数器 =
+1）；  
+7、由于outer_array已经标记为灰色（步骤2），所以现在要在outer_array上调用zval_mark_grey；  
+8、在inner_array上调用zval_mark_grey，它将被标记为灰色，并且其所有子项都将被检索，同步骤5一样；  
+9、两个子项的引用计数器再次被递减，导致“outer_array”（引用计数器 = 0），“inner_array”（引用计数器 = 0）；  
+10、最后，由于不再需要访问zval，所以zval_mark_grey将终止。  
+在此过程中，我们没有想到的是，inner_array和ArrayObject中包含的引用分别递减了两次，而实际上它们每个引用应该只递减一次。另外，其中的步骤8不应被执行，因为这些元素在步骤6中已经被标记算法访问过。  
+经过探究我们发现，标记算法假设每个元素只能有一个父元素，而在上述过程中显然不满足这一预设条件。那么，为什么在我们的示例中，一个元素可以作为两个不同父元素的子元素被返回呢？
+###  3.2 造成子项有两个父节点的原因
+要找到答案，我们必须先看看是如何从父对象中检索到子zval的：
+    "Zend/zend_gc.c"
+    [...]
+    static void zval_mark_grey(zval *pz TSRMLS_DC)
+    {
+    [...]
+            if (Z_TYPE_P(pz) == IS_OBJECT && EG(objects_store).object_buckets) {
+                if (EXPECTED(EG(objects_store).object_buckets[Z_OBJ_HANDLE_P(pz)].valid &&
+                         (get_gc = Z_OBJ_HANDLER_P(pz, get_gc)) != NULL)) {
+    [...]
+                        HashTable *props = get_gc(pz, &table, &n TSRMLS_CC);
+    [...]
+    }
+可以看出，如果传递的zval是一个对象，那么该函数就会调用特定于对象的get_gc处理程序。这个处理程序应该返回一个哈希表，其中包含所有的子zval。经过进一步调试后，我们发现该过程将会调用spl_array_get_properties：
+    "ext/spl/spl_array.c"
+    [...]
+    static HashTable *spl_array_get_properties(zval *object TSRMLS_DC) /* {{{ */
+    {
+    [...]
+        result = spl_array_get_hash_table(intern, 1 TSRMLS_CC);
+    [...]
+        return result;
+    }
+总之，将会返回内部ArrayObject数组的哈希表。然而，问题发生的根源是这个哈希表在两个不同的上下文环境中使用，分别是：  
+1、当算法试图访问ArrayObject zval的子元素时；  
+2、当算法试图访问inner_array的子项时。  
+大家可能现在能猜到，在步骤1中缺少了一些东西。由于返回inner_array哈希表的行为与访问inner_array的行为非常相似，因此前者在步骤1中也应该标记为灰色，从而保证在步骤2中不能再次对其进行访问。  
+那么，接下来我们会问，为什么inner_array在步骤1中没有被标记为灰色？我们可以再次仔细阅读一下zval_mark_grey是如何检索子项的：
+    HashTable *props = get_gc(pz, &table, &n TSRMLS_CC);
+该方法推测是负责调用对象的垃圾回收函数，其垃圾回收函数类似于如下例子：
+    "ext/spl/php_date.c"
+    [...]
+    static HashTable *date_object_get_gc(zval *object, zval ***table, int *n TSRMLS_DC)
+    {
+       *table = NULL;
+       *n = 0;
+       return zend_std_get_properties(object TSRMLS_CC);
+    }
+然而，返回的哈希表应该只包含对象自身的属性。实际上，还有zval的参数，会通过引用进行传递，并作为第二个“返回参数”。该zval应该包含该对象在其他上下文中所引用的所有zval。这一点，可以以存储在SplObjectStorage中的所有对象/zval为例。  
+对于我们特定的ArrayObject场景，我们希望zval表能够包含对inner_array的引用。然而，这一过程为什么要调用spl_array_get_properties而不是spl_array_get_gc呢？
+###  3.3 缺少的垃圾回收函数及其导致的后果
+问题的答案很简单，spl_array_get_gc根本就不存在！  
+PHP的开发人员并没有为ArrayObjects实现相应的垃圾回收函数。尽管如此，其实还是不能解释为什么spl_array_get_properties被调用。为了进一步追溯其原因，我们首先看看对象是如何初始化的：
+    "Zend/zend_object_handlers.c"
+    [...]
+    ZEND_API HashTable *zend_std_get_gc(zval *object, zval ***table, int *n TSRMLS_DC) /* {{{ */
+    {
+        if (Z_OBJ_HANDLER_P(object, get_properties) != zend_std_get_properties) {
+            *table = NULL;
+            *n = 0;
+            return Z_OBJ_HANDLER_P(object, get_properties)(object TSRMLS_CC);
+    [...]
+    }
+处理遗漏的垃圾回收函数，依靠于对象自身的get_properties方法（前提是该方法已定义）。  
+现在，我们终于找到了第一个问题的答案。造成该漏洞的主要原因，是ArrayObject缺少垃圾回收函数。  
+奇怪的是，这个函数是在PHP 7.1.0 alpha2版本中又被引入（  ）。因此，只有PHP
+5.3及以上版本和7以下的版本缺少此函数，受到漏洞影响。然而，由于在不经过对反序列化进行调整的前提下，我们无法触发这一漏洞，因此还不能仅凭借此漏洞来实现远程代码执行。截至目前，我们将该漏洞称为“双递减漏洞”，漏洞报告如下（CVE-2016-5771）：
+ 。
+## 小结
+现在，我们仍然需要回答开头提出的问题。其中之一是，是否有必要手动调用gc_collect_cycles？  
+此外，在发现了这一漏洞后，是否可以有效将其利用在对网站的远程代码执行漏洞利用上？  
+我们将在下篇文章中具体分析，敬请关注。
+审核人：yiwang 编辑：少爷

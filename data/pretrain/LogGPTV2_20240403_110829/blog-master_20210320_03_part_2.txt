@@ -1,0 +1,98 @@
+## Why pg_query 2.0 adds support for Protocol Buffers  
+Whilst JSON is convenient for passing around the parse tree, it has a few problems:  
+- JSON is slower to parse than a binary format  
+- Memory usage can become an issue with complex parse trees  
+- Building logic around a tree of JSON data is error-prone, as one needs to add a lot of checks to identify each node and its supported fields  
+- It's hard to instantiate new parse tree nodes, for example to use for deparsing back into a SQL statement  
+In pg_query 1.0, accessing the value of a "SELECT 1" would have looked like this with the Ruby binding:  
+```  
+result = PgQuery.parse("SELECT 1")  
+result.tree[0]['RawStmt']['stmt']['SelectStmt']['targetList'][0]['ResTarget']['val']  
+# => {"A_Const"=>{"val"=>{"Integer"=>{"ival"=>1}}, "location"=>7}}  
+```  
+Here is how Protobuf improves the parse tree handling in Ruby:  
+```  
+result = PgQuery.parse("SELECT 1")  
+result.tree.stmts[0].stmt.select_stmt.target_list[0].res_target.val.a_const  
+# => >, location: 7>  
+```  
+Note how we have a full class definition for each parse tree node type, making interaction with the tree nodes significantly easier.  
+Now, let's say I want to change a parse tree and turn it back into a SQL statement. For this, I need a deparser.  
+## Turning parse trees back into SQL using a deparser  
+![pic](20210320_03_pic_002.png)  
+Illustration of deparsing Postgres parse tree back into SELECT statement  
+Postgres itself has deparser logic in many places. For example postgres_fdw has a deparser to generate the query to send to the remote server. But, the deparser code in Postgres requires a post-parse analysis parse tree (that directly references relation OIDs, etc). That means we can't make use of it in pg_query, which works with raw parse trees.  
+For many years now, the Ruby pg_query library has had a deparser. Over the years we've had many community contributions to make it complete. The third-party libraries for Python and Node.js also have their own deparser. These efforts were all done in parallel, without sharing code. And the Go library is missing a deparser altogether.  
+How can we reduce the duplicated effort in the community? By creating a new portable deparser for raw parse trees. This avoids having duplicate efforts for every pg_query-based library.  
+### The pg_query deparser with coverage for all Postgres regression tests  
+pg_query 2.0 features a new deparser, written in C. This was by far the biggest undertaking of this new release. The new deparser is able to generate all SQL queries used in the Postgres regression tests (which the pg_query parser can of course parse), and more.  
+It works like this, here by example of the Go library, which before did not have a deparser:  
+```  
+package main  
+import (  
+  "fmt"  
+  pg_query "github.com/pganalyze/pg_query_go/v2"  
+)  
+func main() {  
+  // Parse a query  
+  result, err := pg_query.Parse("SELECT 42")  
+  if err != nil {  
+    panic(err)  
+  }  
+  // Modify the parse tree  
+  result.Stmts[0].Stmt.GetSelectStmt().GetTargetList()[0].GetResTarget().Val =  
+    pg_query.MakeAConstStrNode("Hello World", -1)  
+  // Deparse back into a query  
+  stmt, err := pg_query.Deparse(result)  
+  if err != nil {  
+    panic(err)  
+  }  
+  fmt.Printf("%s\n", stmt)  
+}  
+```  
+This will output the following:  
+```  
+SELECT 'Hello World'  
+```  
+First, the deparsing step encodes the Go structs into the new Protobuf format. Then, the C library decodes this into Postgres parse tree C structs. Last but not least, the C library's new deparser turns the C structs into the SQL query text.  
+Stepping away from deparsing, let's take a look at the new fingerprinting mechanism:  
+## Fingerprints in pg_query: A better way to check if two queries are identical  
+Let's start with the motivation for query fingerprints. pganalyze needs to link together Postgres statistics across different data sources. For example queries from pg_stat_statements with the Postgres auto_explain logs. You can see the fingerprint in pganalyze on the query details page:  
+![pic](20210320_03_pic_003.png)  
+pganalyze Query Details page showing a query and its associated fingerprint value  
+This query can be represented differently depending on which part of Postgres you look at:  
+- pg_stat_statements: ```SELECT "abalance" FROM "pgbench_accounts" WHERE "aid" = ?```  
+- auto_explain: ```SELECT abalance FROM pgbench_accounts WHERE aid = 4674588```  
+A simple text comparison would not be sufficient to determine that these queries are identical.  
+### Why did we create our own query fingerprint concept?  
+Postgres already has the concept of a "queryid", calculated based on the post-parse analysis tree. It's used in places such as pg_stat_statements to distinguish the different query entries.  
+But, this queryid is not available everywhere today, e.g. you can't get it with auto_explain plans. It's also not portable between databases, as it's dependent on specific relation OIDs. Even if you have the exact same queries on your staging and production system, they will have different queryid values. And the queryid can't be generated outside the context of a Postgres server. Thus, pganalyze has its own mechanism, called a query fingerprint.   
+Fingerprints identify a Postgres query based on its raw parse tree alone. We've open-sourced this mechanism in pg_query:  
+```  
+PgQuery.fingerprint('SELECT a, b FROM c')  
+# => "fb1f305bea85c2f6"  
+PgQuery.fingerprint('SELECT b, a FROM c')  
+# => "fb1f305bea85c2f6"  
+```  
+This mechanism does not need a running server, so all you need as input is a valid Postgres query.  
+With pg_query 2.0, we've done a few enhancements to the fingerprint functionality:  
+- Use the faster XXH3 hash function, instead of SHA-1. pg_query 1.0 used the outdated cryptographic hash function SHA-1. Cryptographic guarantees are not needed for this use case, and XXH3 is much faster.  
+- Contain the fingerprint in a 64-bit value, instead of 136 bits. We've determined that 64-bit precision is good enough for query fingerprints. Postgres itself thinks so too, since it uses 64-bit for the Postgres queryid. We often use data from pg_stat_statements, so there is little benefit to more bits. Using a smaller data type also means better performance for pganalyze.  
+- Fix edge cases where two almost identical queries had different fingerprints. Fingerprints should ignore query differences, when they result in the same query intent. We've addressed a few cases where this was not working as expected. You can look at the corresponding wiki page to understand these changes in more detail.  
+## Additional changes for pg_query 2.0  
+A few other things about the new release:  
+- The pg_query library now resides in the pganalyze organization on GitHub. This makes it clear who maintains and funds the core development. We will continue to make pg_query available under the BSD 3-clause license.  
+- pg_query has a new method for splitting queries. This can be useful when you want to split a multi-statement string into its component statements, for example SELECT ';'; SELECT 'foo' into SELECT ';' and SELECT 'foo'  
+- There is a new function available to access the Postgres scanner. This includes the location of comments in a query text. One could envision building a syntax highlighter based on this. Or extract comments from queries whilst ignoring comment-like tokens in a constant value.  
+## Conclusion  
+The new pg_query 2.0 is available today, with bindings for Go and Ruby available to start. We are also working on a new pganalyze-maintained Rust binding that we'll have news about soon.  
+Help us get the word out by sharing this post on Twitter.  
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

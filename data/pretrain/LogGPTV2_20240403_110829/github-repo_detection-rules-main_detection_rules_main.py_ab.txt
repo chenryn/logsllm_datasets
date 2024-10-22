@@ -1,0 +1,194 @@
+    outfile.write_text('\n'.join(output_lines) + '\n')
+    if verbose:
+        click.echo(f'Exported {len(rules) - len(unsupported)} rules into {outfile}')
+        if skip_unsupported and unsupported:
+            unsupported_str = '\n- '.join(unsupported)
+            click.echo(f'Skipped {len(unsupported)} unsupported rules: \n- {unsupported_str}')
+@root.command('export-rules')
+@multi_collection
+@click.option('--outfile', '-o', default=Path(get_path('exports', f'{time.strftime("%Y%m%dT%H%M%SL")}.ndjson')),
+              type=Path, help='Name of file for exported rules')
+@click.option('--replace-id', '-r', is_flag=True, help='Replace rule IDs with new IDs before export')
+@click.option('--stack-version', type=click.Choice(all_versions()),
+              help='Downgrade a rule version to be compatible with older instances of Kibana')
+@click.option('--skip-unsupported', '-s', is_flag=True,
+              help='If `--stack-version` is passed, skip rule types which are unsupported '
+                   '(an error will be raised otherwise)')
+def export_rules(rules, outfile: Path, replace_id, stack_version, skip_unsupported) -> RuleCollection:
+    """Export rule(s) into an importable ndjson file."""
+    assert len(rules) > 0, "No rules found"
+    if replace_id:
+        # if we need to replace the id, take each rule object and create a copy
+        # of it, with only the rule_id field changed
+        old_rules = rules
+        rules = RuleCollection()
+        for rule in old_rules:
+            new_data = dataclasses.replace(rule.contents.data, rule_id=str(uuid4()))
+            new_contents = dataclasses.replace(rule.contents, data=new_data)
+            rules.add_rule(TOMLRule(contents=new_contents))
+    outfile.parent.mkdir(exist_ok=True)
+    _export_rules(rules=rules, outfile=outfile, downgrade_version=stack_version,
+                  skip_unsupported=skip_unsupported)
+    return rules
+@root.command('validate-rule')
+@click.argument('path')
+@click.pass_context
+def validate_rule(ctx, path):
+    """Check if a rule staged in rules dir validates against a schema."""
+    rule = RuleCollection().load_file(Path(path))
+    click.echo('Rule validation successful')
+    return rule
+@root.command('validate-all')
+def validate_all():
+    """Check if all rules validates against a schema."""
+    RuleCollection.default()
+    click.echo('Rule validation successful')
+@root.command('rule-search')
+@click.argument('query', required=False)
+@click.option('--columns', '-c', multiple=True, help='Specify columns to add the table')
+@click.option('--language', type=click.Choice(["eql", "kql"]), default="kql")
+@click.option('--count', is_flag=True, help='Return a count rather than table')
+def search_rules(query, columns, language, count, verbose=True, rules: Dict[str, TOMLRule] = None, pager=False):
+    """Use KQL or EQL to find matching rules."""
+    from kql import get_evaluator
+    from eql.table import Table
+    from eql.build import get_engine
+    from eql import parse_query
+    from eql.pipes import CountPipe
+    from .rule import get_unique_query_fields
+    flattened_rules = []
+    rules = rules or {str(rule.path): rule for rule in RuleCollection.default()}
+    for file_name, rule in rules.items():
+        flat: dict = {"file": os.path.relpath(file_name)}
+        flat.update(rule.contents.to_dict())
+        flat.update(flat["metadata"])
+        flat.update(flat["rule"])
+        tactic_names = []
+        technique_ids = []
+        subtechnique_ids = []
+        for entry in flat['rule'].get('threat', []):
+            if entry["framework"] != "MITRE ATT&CK":
+                continue
+            techniques = entry.get('technique', [])
+            tactic_names.append(entry['tactic']['name'])
+            technique_ids.extend([t['id'] for t in techniques])
+            subtechnique_ids.extend([st['id'] for t in techniques for st in t.get('subtechnique', [])])
+        flat.update(techniques=technique_ids, tactics=tactic_names, subtechniques=subtechnique_ids,
+                    unique_fields=get_unique_query_fields(rule))
+        flattened_rules.append(flat)
+    flattened_rules.sort(key=lambda dct: dct["name"])
+    filtered = []
+    if language == "kql":
+        evaluator = get_evaluator(query) if query else lambda x: True
+        filtered = list(filter(evaluator, flattened_rules))
+    elif language == "eql":
+        parsed = parse_query(query, implied_any=True, implied_base=True)
+        evaluator = get_engine(parsed)
+        filtered = [result.events[0].data for result in evaluator(flattened_rules)]
+        if not columns and any(isinstance(pipe, CountPipe) for pipe in parsed.pipes):
+            columns = ["key", "count", "percent"]
+    if count:
+        click.echo(f'{len(filtered)} rules')
+        return filtered
+    if columns:
+        columns = ",".join(columns).split(",")
+    else:
+        columns = ["rule_id", "file", "name"]
+    table = Table.from_list(columns, filtered)
+    if verbose:
+        click.echo_via_pager(table) if pager else click.echo(table)
+    return filtered
+@root.command("test")
+@click.pass_context
+def test_rules(ctx):
+    """Run unit tests over all of the rules."""
+    import pytest
+    clear_caches()
+    ctx.exit(pytest.main(["-v"]))
+@root.group('typosquat')
+def typosquat_group():
+    """Commands for generating typosquat detections."""
+@typosquat_group.command('create-dnstwist-index')
+@click.argument('input-file', type=click.Path(exists=True, dir_okay=False), required=True)
+@click.pass_context
+@add_client('elasticsearch', add_func_arg=False)
+def create_dnstwist_index(ctx: click.Context, input_file: click.Path):
+    """Create a dnstwist index in Elasticsearch to work with a threat match rule."""
+    from elasticsearch import Elasticsearch
+    es_client: Elasticsearch = ctx.obj['es']
+    click.echo(f'Attempting to load dnstwist data from {input_file}')
+    dnstwist_data: dict = load_dump(input_file)
+    click.echo(f'{len(dnstwist_data)} records loaded')
+    original_domain = next(r['domain-name'] for r in dnstwist_data if r.get('fuzzer', '') == 'original*')
+    click.echo(f'Original domain name identified: {original_domain}')
+    domain = original_domain.split('.')[0]
+    domain_index = f'dnstwist-{domain}'
+    # If index already exists, prompt user to confirm if they want to overwrite
+    if es_client.indices.exists(index=domain_index):
+        if click.confirm(
+                f"dnstwist index: {domain_index} already exists for {original_domain}. Do you want to overwrite?",
+                abort=True):
+            es_client.indices.delete(index=domain_index)
+    fields = [
+        "dns-a",
+        "dns-aaaa",
+        "dns-mx",
+        "dns-ns",
+        "banner-http",
+        "fuzzer",
+        "original-domain",
+        "dns.question.registered_domain"
+    ]
+    timestamp_field = "@timestamp"
+    mappings = {"mappings": {"properties": {f: {"type": "keyword"} for f in fields}}}
+    mappings["mappings"]["properties"][timestamp_field] = {"type": "date"}
+    es_client.indices.create(index=domain_index, body=mappings)
+    # handle dns.question.registered_domain separately
+    fields.pop()
+    es_updates = []
+    now = datetime.utcnow()
+    for item in dnstwist_data:
+        if item['fuzzer'] == 'original*':
+            continue
+        record = item.copy()
+        record.setdefault('dns', {}).setdefault('question', {}).setdefault('registered_domain', item.get('domain-name'))
+        for field in fields:
+            record.setdefault(field, None)
+        record['@timestamp'] = now
+        es_updates.extend([{'create': {'_index': domain_index}}, record])
+    click.echo(f'Indexing data for domain {original_domain}')
+    results = es_client.bulk(body=es_updates)
+    if results['errors']:
+        error = {r['create']['result'] for r in results['items'] if r['create']['status'] != 201}
+        client_error(f'Errors occurred during indexing:\n{error}')
+    click.echo(f'{len(results["items"])} watchlist domains added to index')
+    click.echo('Run `prep-rule` and import to Kibana to create alerts on this index')
+@typosquat_group.command('prep-rule')
+@click.argument('author')
+def prep_rule(author: str):
+    """Prep the detection threat match rule for dnstwist data with a rule_id and author."""
+    rule_template_file = Path(get_etc_path('rule_template_typosquatting_domain.json'))
+    template_rule = json.loads(rule_template_file.read_text())
+    template_rule.update(author=[author], rule_id=str(uuid4()))
+    updated_rule = Path(get_path('rule_typosquatting_domain.ndjson'))
+    updated_rule.write_text(json.dumps(template_rule, sort_keys=True))
+    click.echo(f'Rule saved to: {updated_rule}. Import this to Kibana to create alerts on all dnstwist-* indexes')
+    click.echo('Note: you only need to import and enable this rule one time for all dnstwist-* indexes')
+@root.group('rta')
+def rta_group():
+    """Commands related to Red Team Automation (RTA) scripts."""
+# create command to show rule-rta coverage
+@rta_group.command('coverage')
+@click.option("-o", "--os-filter", default="all",
+              help="Filter rule coverage summary by OS. (E.g. windows) Default: all")
+def rta_coverage(os_filter: str):
+    """Show coverage of RTA / rules by os type."""
+    # get all rules
+    all_rules = RuleCollection.default()
+    # get rules triggered by RTA
+    triggered_rules = get_triggered_rules()
+    # build coverage map
+    coverage_map = build_coverage_map(triggered_rules, all_rules)
+    # # print summary
+    all_rule_count = len(all_rules.rules)
+    print_converage_summary(coverage_map, all_rule_count, os_filter)

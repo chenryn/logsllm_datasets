@@ -1,0 +1,294 @@
+                    ptrace(PTRACE_GETREGS, tracee, 0, &regs);
+                    ptrace(PTRACE_CONT, tracee, 0, 0);
+                    continue;
+                }
+                //hook & modify
+                mod_handle(tracee, (void*)argv[0], (void*)argv[1]);
+                //修改回原值
+                plt.val = bak;
+                ptrace(PTRACE_POKEDATA, tracee, plt_addr, plt.val);
+                //返回0xcc前
+                regs.rip -= 1;
+                ptrace(PTRACE_SETREGS, tracee, 0, &regs);
+                ptrace(PTRACE_SINGLESTEP, tracee, 0, 0);
+                wait(0);
+                ptrace(PTRACE_GETREGS, tracee, 0, &regs);
+                plt.chars[0] = 0xcc;
+                ptrace(PTRACE_POKEDATA, tracee, plt_addr, plt.val);
+                ptrace(PTRACE_CONT, tracee, 0, 0);
+            }
+            return 0;
+        }
+  * #### Ring0级别的Hook
+    * ##### 前置知识
+      * linux内核的编译
+        * 最好选择一个和自己虚拟机内核版本一致的源码，网上也很多教程。
+        * 再编译一个busybox的文件系统，为了方便添加文件。
+      * 模块编译
+        * makefile的基本格式（用于本机加载的模块）
+                                obj-m += inter.o
+                CURRENT_PATH := $(shell pwd)
+                LINUX_KERNEL := $(shell uname -r)
+                LINUX_KERNEL_PATH := /usr/src/linux-headers-$(LINUX_KERNEL)
+                all:
+                    make -C $(LINUX_KERNEL_PATH) M=$(CURRENT_PATH) modules
+                clean:
+                    make -C $(LINUX_KERNEL_PATH) M=$(CURRENT_PATH) clean
+        * 交叉编译（本机和编译的内核不同）
+                                obj-m += mod1.o
+                CURRENT_PATH := $(shell pwd)
+                LINUX_KERNEL := $(shell uname -r)
+                LINUX_KERNEL_PATH := /home/tree/kernel/linux-5.0.3
+                all:
+                    make -C $(LINUX_KERNEL_PATH) M=$(CURRENT_PATH) modules
+                clean:
+                    make -C $(LINUX_KERNEL_PATH) M=$(CURRENT_PATH) clean
+    * **sys_call_table**
+      * 都知道linux通过int 0x80或者syscall都可以进入kernel完成系统调用，而我们需要把对应的系统调用号传给rax。两者最终还是用了system_call。
+      * int 0x80工作原理
+                        1、系统维护一个叫做“向量中断表的”，每个int xx都会去对应的向量表的xx处
+            2、0x80对应系统调用的服务例程，记录了syscall的地址。
+            3、而eax的值，对应具体的系统调用号。
+      * syscall的具体实现，可以看到这里有sys_call_table符号。
+                        .globl system_call, buserr, trap, resume
+            .globl sys_call_table
+            ................
+            ................
+            ENTRY(system_call)
+              SAVE_ALL_SYS                            //保存
+              GET_CURRENT(%d1)
+              movel   %d1,%a1
+              | save top of frame
+              movel   %sp,%curptr@(TASK_THREAD+THREAD_ESP0)
+              | syscall trace?                        //有没有被ptrace跟踪
+              tstb    %a1@(TINFO_FLAGS+2)
+              jmi do_trace_entry
+              cmpl    #NR_syscalls,%d0
+              jcc badsys
+            syscall:                                  //真实的执行系统调用
+              jbsr    @(sys_call_table,%d0:l:4)@(0)
+              movel   %d0,%sp@(PT_OFF_D0) | save the return value
+            ret_from_syscall:
+              |oriw   #0x0700,%sr
+              movel   %curptr@(TASK_STACK),%a1
+              movew   %a1@(TINFO_FLAGS+2),%d0
+              jne syscall_exit_work
+            1:    RESTORE_ALL
+    * **获得sys_call_table地址的方式**
+      * 由于syscall实现处有sys_call_table的符号，我们可以从这里拿到地址。
+                        1. 获取中断描述符表(IDT)的地址(使用C ASM汇编)
+            2. 从中查找0x80中断(系统调用中断)的服务例程(8*0x80偏移)
+            3. 搜索该例程的内存空间
+            4. 从其中获取sys_call_table(保存所有系统调用例程的入口地址)的地址
+      * 使用kallsyms_lookup_name读取。该函数本身也是一个符号，如果没有导出就不能使用。
+                        sys_call_table_addr = kallsyms_lookup_name("sys_call_table")
+      * 读取/proc/kallsyms文件。我的理解就是和/proc/pid/maps差不多特殊的一个文件，由内核动态生成，需要root权限，普通用户读到的全是0（但是加载模块也是需要root权限的，所以不是问题）
+                        sudo cat /proc/kallsyms | grep sys_call_table
+      * 修改内核，添加EXPORT_SYMBOL(sys_call_table)或EXPORT_SYMBOL_GPL(sys_call_table)。  
+这种方法适用于可以修改内核的情形。在可以修改内核的情况下，这是最简单的方式。
+    * 实战——hook系统调用 mkdir，我这里使用 **kallsyms_lookup_name**
+                //This kernel module locates the sys_call_table by kallsyms_lookup_name
+        #include
+        #include
+        #include
+        #include
+        #include
+        #include
+        #include
+        #include
+        #include
+        #include
+        #include 
+        #include
+        #include
+        #include 
+        //module macros
+        MODULE_LICENSE("GPL");
+        MODULE_DESCRIPTION("hook sys_mkdir");
+        //module constructor/destructor
+        typedef unsigned long (*sys_call_ptr_t)(void);
+        sys_call_ptr_t *_sys_call_table = NULL;
+        typedef asmlinkage long (*old_mkdir_t)(const char __user *pathname, umode_t mode);
+        old_mkdir_t old_mkdir = NULL;
+        // hooked mkdir function
+        asmlinkage long hooked_mkdir(const char __user *pathname, umode_t mode) {
+                printk("hooked sys_mkdir(), mkdir name: ");
+                printk(pathname);
+                old_mkdir(pathname, mode);
+        }
+        // memory protection shinanigans
+        unsigned int level;
+        pte_t *pte;
+        //obtain sys_call_table
+        static int get_sys_call_table(void){
+            unsigned long tmp_sys_call_table = 0;
+            int ans = 0;
+            tmp_sys_call_table = kallsyms_lookup_name("sys_call_table");
+            if(tmp_sys_call_table != 0)
+            {
+                ans = 1;
+                _sys_call_table = tmp_sys_call_table;
+                printk("[+] find sys_call_table: 0x%lx\n", tmp_sys_call_table);
+            }
+            return ans;
+        }
+        // initialize the module
+        static int hooked_init(void) {
+            printk("+ Loading hook_mkdir module\n");
+            if(!get_sys_call_table()){
+                return 0;
+            }
+            // now we can hook syscalls ...such as uname
+            // first, save the old gate (fptr)
+            old_mkdir = (old_mkdir_t) _sys_call_table[__NR_mkdir];
+            // unprotect sys_call_table memory page
+            pte = lookup_address((unsigned long) _sys_call_table, &level);
+            // change PTE to allow writing
+            set_pte_atomic(pte, pte_mkwrite(*pte));
+            printk("+ unprotected kernel memory page containing sys_call_table\n");
+            // now overwrite the __NR_uname entry with address to our uname
+            _sys_call_table[__NR_mkdir] = (sys_call_ptr_t) hooked_mkdir;
+            printk("+ sys_mkdir hooked!\n");
+            return 0;
+        }
+        static void hooked_exit(void) {
+            if(old_mkdir != NULL) {
+                // restore sys_call_table to original state
+                _sys_call_table[__NR_mkdir] = (sys_call_ptr_t) old_mkdir;
+                // reprotect page
+                set_pte_atomic(pte, pte_clear_flags(*pte, _PAGE_RW));
+            }
+            printk("+ Unloading hook_mkdir module\n");
+        }
+        /*entry/exit macros*/
+        module_init(hooked_init);
+        module_exit(hooked_exit);
+      * 效果（不知道为啥pathname参数不能输出）  
+    * **system_call函数内存内搜索sys_call_table** ，实现execve的hook
+      * 这里注意这种方式在x86和x64上的区别。
+                        1、x86或者x64的兼容模式：使用int 0x80,MSR寄存器地址为0xc0000083,宏MSR_CSTAR来代表. 使用sidt获取system_call地址
+            2、x64的long模式：使用syscall,MSR寄存器地址为0xc0000082，宏MSR_LSTAR来代表. 使用rdmsrl指令获取system_call地址
+            3、x86 sys_call_table的特征码  \xff\x14\x85
+            4、x86_64下 sys_call_table的特征码  \xff\x14\xc5
+      * 网上有一大堆x86的获取sys_call_table的方法，我本来打算用下面的思路实现一个x64的。
+                        1、在x64下，通过rdmsrl(MSR_LSTAR, xxxx)可以拿到entry_SYSCALL_64的地址。entry_SYSCALL_64的实现里会有sys_call_table的机器码。
+            2、所以有两种hook的思路
+              a、修改entry_SYSCALL_64起始的几个字节（内联hook）
+              b、找到sys_call_table，修改对应的系统调用。
+      * 但是在linux内核5.x里，entry_SYSCALL_64的实现改了，不再试图用过call sys_call_table[index]的方式进行系统调用，而是引入了一个do_syscall_64的符号。具体的看下面截取的源码
+                        ENTRY(entry_SYSCALL_64)
+              UNWIND_HINT_EMPTY
+              .......
+              .......
+              /* IRQs are off. */
+              movq    %rax, %rdi
+              movq    %rsp, %rsi
+              call    do_syscall_64       /* returns with IRQs disabled */
+      * 于是我找到了do_syscall_64的实现，幸运的是在这里找到了对sys_call_table的直接引用。
+                        #ifdef CONFIG_X86_64
+            __visible void do_syscall_64(unsigned long nr, struct pt_regs *regs)
+            {
+              struct thread_info *ti;
+              enter_from_user_mode();
+              local_irq_enable();
+              ti = current_thread_info();
+              if (READ_ONCE(ti->flags) & _TIF_WORK_SYSCALL_ENTRY)
+                  nr = syscall_trace_enter(regs);
+              /*
+               * NB: Native and x32 syscalls are dispatched from the same
+               * table.  The only functional difference is the x32 bit in
+               * regs->orig_ax, which changes the behavior of some syscalls.
+               */
+              nr &= __SYSCALL_MASK;
+              if (likely(nr ax = sys_call_table[nr](regs);    //这里sys_call_table的直接引用
+              }
+              syscall_return_slowpath(regs);
+            }
+            #endif
+      * 所以，显然我们就需要多一次的搜索，特征码可以在gdb里查或者看它的汇编指令。
+                        1、在entry_SYSCALL_64里搜索do_syscall_64； 特征码'\x48\x89\xe6\xe8' <= mov rsi, rsp; call ....
+            2、在do_syscall_64里搜索sys_call_table；  特征码 '\x48\x8b\x04\xfd' <= mov rax []
+      * 通过entry_SYSCALL_64的call do_syscall_64找到call do_syscall_64地址
+      * 通过do_syscall_64对sys_call_table的引用找到sys_call_table
+      * 代码实现
+                        static void*
+            get_lstar_dosys_addr(void){
+              unsigned long lstar;
+                // temp variables for scan
+                unsigned int i;
+                unsigned char *off;
+                rdmsrl(MSR_LSTAR, lstar);
+                // print out int 0x80 handler
+                printk("[+] entry_SYSCALL_64 is at 0x%lx\n", lstar);
+                // scan for known pattern(0xff14c5xx)
+                // pattern is just before sys_call_table address
+                for(i = 0; i <= PAGE_SIZE; i++) {
+                    off = (char*)lstar + i;
+                    if(*(off) == 0x48 && *(off+1) == 0x89 && *(off+2) == 0xe6) {
+                        return (off + 3);                     //call do_syscall_64
+                    }
+                }
+              return NULL;
+            }
+            static void*
+            get_lstar_dosys(void)
+            {
+              unsigned long* lstar_dosys_addr = get_lstar_dosys_addr();
+              if(lstar_dosys_addr != NULL) {
+                  printk("[+] call_do_syscall_64 at: 0x%lx\n", lstar_dosys_addr);
+                  unsigned int offset = *(unsigned int*)((char*)lstar_dosys_addr + 1);
+                  printk("[+] offset is: 0x%08x\n", offset);
+                  unsigned long base = 0xffffffff00000000;
+                  return (void*)(base | ((unsigned long)lstar_dosys_addr + 5 + offset));
+              }
+              return NULL;
+            }
+            static void*
+            get_sys_sct_addr(unsigned long* do_syscall_64_addr)
+            {
+              unsigned char* off;
+              int i;
+              for(i = 0; i <= PAGE_SIZE; i++) {
+                  off = (char*)do_syscall_64_addr + i;
+                  if(*(off) == 0x48 && *(off+1) == 0x8b && *(off+2) == 0x04 && *(off+3) == 0xfd) {
+                      return (off+4);
+                  }
+              }
+              return NULL;
+            }
+            static void*
+            get_sys_sct(unsigned long* do_syscall_64_addr) 
+            {
+              unsigned long* sct_addr = get_sys_sct_addr(do_syscall_64_addr);
+              if(!sct_addr){
+                  return NULL;
+              }
+              unsigned int offset = *(unsigned int*)(sct_addr);
+              unsigned long base = 0xffffffff00000000;
+              return (void*)(base | offset);
+            }
+            //hooked execve
+            static int hook_execve_init(void){
+              printk("[+] Finding sys_call_table\n");
+              unsigned long* do_syscall_64_addr = 0;
+              do_syscall_64_addr = get_lstar_dosys();
+              if(!do_syscall_64_addr){
+                  printk("[x] Failed to find do_syscall_64_addr\n");
+                  return 0;
+              }
+              printk("[+] Found do_syscall_64_addr at: 0x%lx\n", do_syscall_64_addr);
+              _sys_call_table = get_sys_sct(do_syscall_64_addr);
+              if(!_sys_call_table) {
+                  printk("[x] Failed to find sys_call_table\n");
+                  return 0;
+              }
+              printk("[+] Found sys_call_table at: 0x%lx\n", _sys_call_table);
+              return 0;
+            }
+      * 注意处理一些细节问题（比如unsigned long 还是 unsinged int），最终可以达到想要的效果。  
+  * 参考链接
+    * [LINUX的LD_PRELOAD相关知识学习](https://ixyzero.com/blog/archives/3137.html)
+    * [Intercepting and Emulating Linux System Calls with Ptrace](https://nullprogram.com/blog/2018/06/23/)
+    * [ptrace注入进程](http://nicephil.blinkenshell.org/my_book/ch10.html)
+    * [Linux内核模块编译](https://www.cnblogs.com/klb561/p/9048662.html)
+    * [获取Linux内核未导出符号的几种方式](https://www.cnblogs.com/bittorrent/p/3804141.html)

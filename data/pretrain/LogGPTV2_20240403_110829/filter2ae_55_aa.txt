@@ -1,0 +1,161 @@
+**作者： 天融信阿尔法实验室**  
+**原文链接：**
+最近笔者分析了一个chrome
+v8引擎的漏洞chromium821137，虽然这是一个老的漏洞，但是从漏洞分析利用中我们还是可以学习到v8漏洞利用的一些基础知识，对于入门学习浏览器漏洞利用具有较高的研究价值。
+### 环境搭建
+#### 拉取代码
+因为众所周知的原因，拉取v8代码需要使用非常规的方法，具体的搭建过程可以参考文末的链接。环境搭建和拉取旧的commit过程中我遇到的主要的坑是代理的问题，需要使用sock5全局代理，并且在使用谷歌的gclient
+sync命令的时候需要在根目录写一个.boto的配置文件才能使之运行时使用配置的代理；另外一个很重要的点是linux要使用ubuntu的镜像（笔者使用的是ubuntu
+18.04），使用其他发行版可能会遇到奇奇怪怪意想不到的问题。大家在配置的过程如果遇到问题可以查找是不是上述步骤出现问题。
+#### 调试环境搭建
+v8调试环境可以使用v8安装目录下的/tools/gdbinit并将它加入根目录下.gdbinit配置里，修改.gdbinit配置
+    sudo gedit ~/.gdbinit
+添加配置（可以配合其他gdb插件如pwndbg使用），
+    source path/to/gdbinit
+使用gdb调试时可以先加载要调试的d8文件，然后设置启动参数
+    set args --allow-natives-syntax xxx.js
+其中xxx.js可以在要调试的地方设置输出点和断点
+    %DebugPrint(obj)    // 输出对象地址
+    %SystemBreak()      // 触发调试中断
+在gdb中使用job addr命令可以很清晰的看到addr处的数据结构。
+#### 漏洞环境搭建
+我们从漏洞的issue链接找到修复的commit链接，可以看到漏洞信息、存在漏洞的上一个版本（parent）、diff修复信息和漏洞poc（[test/mjsunit/regress/regress-821137.js](https://chromium.googlesource.com/v8/v8.git/+/b5da57a06de8791693c248b7aafc734861a3785d/test/mjsunit/regress/regress-821137.js)）
+回退到漏洞存在的commit，分别编译debug和release版。（其中ninja构建系统是非google系的，需要自行安装，可以参考v8环境搭建的链接）
+    git reset --hard 1dab065bb4025bdd663ba12e2e976c34c3fa6599
+    gclient sync
+    tools/dev/v8gen.py x64.debug 
+    ninja -C out.gn/x64.debug d8
+    tools/dev/v8gen.py x64.relase
+    ninja -C out.gn/x64.relase d8
+### 漏洞分析
+我们从poc出发来分析漏洞的原理，poc如下
+    let oobArray = [];
+    let maxSize = 1028 * 8;
+    Array.from.call(function() { return oobArray }, {[Symbol.iterator] : _ => (
+      {
+        counter : 0,
+        next() {
+          let result = this.counter++;
+          if (this.counter > maxSize) {
+            oobArray.length = 0;
+            return {done: true};
+          } else {
+            return {value: result, done: false};
+          }
+        }
+      }
+    ) });
+    oobArray[oobArray.length - 1] = 0x41414141;
+poc主要是定义了一个数组和一个smi（small
+int）值，然后调用了一个方法Array.from.call，最后给定义的数组偏移[长度-1]的位置赋值时v8崩溃了。
+poc中Array.from.call这个方法需要关注下，Array是一个js数据类型，from是Array类型的一个方法，Array.from整体相当于一个function，这个function又调用了call方法，这是js的一种调用方式Function.prototype.call()，语法是function.call(thisArg,
+arg1, arg2,
+...)。通过搜索MDN了解到Function.prototype.call()可以使用一个指定的this值和单独给出的一个或多个参数来调用一个函数即Function，而且参数可以是一个参数列表。
+凭经验我们可以猜到应该是Array.from方法出现了问题，我们在/v8/src/目录下查找问题代码。（PS:v8的js函数实现方法一般在src目录下，搜索命令中r表示递归查找，R表示查找包含子目录的所有文件，n表示显示出现的行数）
+    r00t@5n1p3r0010:~$ grep -rRn "array\.from" -r /home/r00t/v8/src/
+    /home/r00t/v8/src/builtins/builtins-definitions.h:245:  /* ES6 #sec-array.from */                                                    \
+    /home/r00t/v8/src/builtins/builtins-array-gen.cc:1996:// ES #sec-array.from
+找到Array.from方法实现的位置和行数/home/r00t/v8/src/builtins/builtins-array-gen.cc:1996://
+ES #sec-array.from并跟进。
+v8中js原生函数的实现是用`c++`写的，为了在各种cpu架构下做到性能优化的极致，google把这些重载过的`c++`代码实现的js原型函数用汇编器CodeStubAssembler生成了汇编代码。重载过的`c++`代码根据函数名字能大致猜到函数的功能（分析这个漏洞我们可以暂时不把主要精力放在分析这些重载的方法上，当然你要是像lokihardt那样“看一眼函数名字就知道哪有漏洞”当我没说;），其中一些常用的重载方法如下
+    label   定义和bind绑定的标签
+    bind    绑定声明的label和代码块，bind绑定的代码块并不以{}作为分割，绑定的是两个bind或者bind到当前函数结束之间的代码
+    goto    跳转到代码块执行
+    branch  相当于if的三目运算，即if(flag)? a;b，根据条件flag是否成立跳转到指定的label代码块a或b
+我们来分析一下v8的array.from实现，
+    TF_BUILTIN(ArrayFrom, ArrayPopulatorAssembler) {
+      TNode context = CAST(Parameter(BuiltinDescriptor::kContext));
+      TNode argc =
+          UncheckedCast(Parameter(BuiltinDescriptor::kArgumentsCount));
+      CodeStubArguments args(this, ChangeInt32ToIntPtr(argc));
+      TNode map_function = args.GetOptionalArgumentValue(1);
+      // If map_function is not undefined, then ensure it's callable else throw.
+      //判断arg[1]即mapFn类型是否为undefined、smi、callable，否则报错
+      {
+        Label no_error(this), error(this);
+        GotoIf(IsUndefined(map_function), &no_error);
+        GotoIf(TaggedIsSmi(map_function), &error);
+        Branch(IsCallable(map_function), &no_error, &error);
+        BIND(&error);
+        ThrowTypeError(context, MessageTemplate::kCalledNonCallable, map_function);
+        BIND(&no_error);
+      }
+首先判断了arg[1]的类型，我们通过查找MDN得知array.from的函数原型是Array.from(arrayLike[, mapFn[,
+thisArg]])，所以这里的arg[1]对应mapFn，同理GetOptionalArgumentValue()得到的其他参数对应方式类似。
+      //判断[symbol.iterator]方法是否定义
+      IteratorBuiltinsAssembler iterator_assembler(state());
+      Node* iterator_method =
+          iterator_assembler.GetIteratorMethod(context, array_like);
+      Branch(IsNullOrUndefined(iterator_method), &not_iterable, &iterable);
+      //使用自定义的[symbol.iterator]方法
+      BIND(&iterable);
+      {
+        TVARIABLE(Number, index, SmiConstant(0));//定义Number类型变量index，值为0
+        TVARIABLE(Object, var_exception);
+        Label loop(this, &index), loop_done(this),
+            on_exception(this, Label::kDeferred),
+            index_overflow(this, Label::kDeferred);
+        // Check that the method is callable.
+        //判断自定义的[symbol.iterator]方法是否是callable类型
+        {
+          Label get_method_not_callable(this, Label::kDeferred), next(this);
+          GotoIf(TaggedIsSmi(iterator_method), &get_method_not_callable);
+          GotoIfNot(IsCallable(iterator_method), &get_method_not_callable);
+          Goto(&next);
+          BIND(&get_method_not_callable);
+          ThrowTypeError(context, MessageTemplate::kCalledNonCallable,
+                         iterator_method);
+          BIND(&next);
+        }
+        // Construct the output array with empty length.
+        //创建length为empty的数组
+        array = ConstructArrayLike(context, args.GetReceiver());
+        // Actually get the iterator and throw if the iterator method does not yield
+        // one.
+        IteratorRecord iterator_record =
+            iterator_assembler.GetIterator(context, items, iterator_method);
+        TNode native_context = LoadNativeContext(context);
+        TNode fast_iterator_result_map =
+            LoadContextElement(native_context, Context::ITERATOR_RESULT_MAP_INDEX);
+        Goto(&loop);
+然后判断array.from的第一个参数是否定义了迭代器方法iterator，若iterator方法非undefined、null使用自定义的迭代器方法，poc中的数组oobArray定义了iterator，会执行BIND(&iterable)中的代码。这里需要关注的一点是在执行自定义的iterator时使用了变量index去记录迭代的次数。在判断完iterator方法是否是callable类型后poc中的代码会执行BIND(&next)处的代码，在next中首先创建了一个长度为0的数组，然后跳转到loop处继续执行。
+BIND(&loop)主要是调用CallJS执行了自定义的Array.from(arrayLike[, mapFn[,
+thisArg]])中的mapFn方法，返回值存储在thisArg中，并用index记录迭代的次数。
+        ......
+        BIND(&loop_done);
+        {
+          length = index;
+          Goto(&finished);
+        }
+        ......
+          BIND(&finished);
+      // Finally set the length on the output and return it.
+      GenerateSetLength(context, array.value(), length.value());
+      args.PopAndReturn(array.value());
+    }
+iterator执行完成之后会跳转到loop_done处，index的value赋值给length，继续跳转到finished处。在finished处调用了GenerateSetLength设置生成的array的长度，注意这里的第三个参数length.value()实际上是自定义的iterator执行的次数。
+继续跟进GenerateSetLength
+        BranchIfFastJSArray(array, context, &fast, &runtime);
+        BIND(&fast);
+        {
+          TNode fast_array = CAST(array);
+          TNode length_smi = CAST(length);
+          TNode old_length = LoadFastJSArrayLength(fast_array);
+          CSA_ASSERT(this, TaggedIsPositiveSmi(old_length));
+          // 2) Ensure that the length is writable.
+          // TODO(delphick): This check may be redundant due to the
+          // BranchIfFastJSArray above.
+          EnsureArrayLengthWritable(LoadMap(fast_array), &runtime);
+          // 3) If the created array already has a length greater than required,
+          //    then use the runtime to set the property as that will insert holes
+          //    into the excess elements and/or shrink the backing store.
+          GotoIf(SmiLessThan(length_smi, old_length), &runtime);
+          StoreObjectFieldNoWriteBarrier(fast_array, JSArray::kLengthOffset,
+                                         length_smi);
+          Goto(&done);
+        }
+在GenerateSetLength中首先判断了array是否包含fast
+elements(具体快元素和字典元素的区别可以查阅参考链接)。poc中oobarray不包含configurable为false的元素是快元素，执行BIND(&fast)的代码。在fast中把GenerateSetLength的第三个参数length转化赋值给length_smi，array的length转化赋值给old_length，然后比较length_smi和old_length的大小，若length_smi小于old_length则进行内存缩减跳转到runtime设置array的length为length_smi。
+代码的逻辑看起来似乎没问题，就是对Array.from(arrayLike[, mapFn[,
+thisArg]])方法中的arrayLike对象执行自定义的迭代方法index次，创建一个空的array并在执行自定义迭代方法时设置它的长度为index.value，并最后检查根据index.value是否小于array的实际长度来决定设置array的长度为index.value或实际长度。但开发者似乎忽略了一个问题就是迭代方法是我们自己定义的，我们可以在迭代方法中设置Array.from(arrayLike[,
+mapFn[,

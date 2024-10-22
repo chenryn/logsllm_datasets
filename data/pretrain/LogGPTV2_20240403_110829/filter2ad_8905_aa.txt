@@ -1,0 +1,52 @@
+# 原文链接
+# 提高AFL qemu模式性能
+作为我最喜欢的fuzzer工具，[AFL](http://lcamtuf.coredump.cx/afl/)健全有效，由覆盖率引导，还支持使用qemu模式来fuzz闭源二进制程序，然而qemu模式所带来的就是明显的性能花费。所以，是否可以改进一下呢？
+**2018-9-22更新：**
+感谢[@domenuk](https://twitter.com/domenuk)[建议](https://twitter.com/domenuk/status/1043168787518898177)在parent里缓存chains，博客相应更新了，我们现在可以做到3-4倍的提速效果了。
+## QEMU的块翻译
+在开始之前，我们首先需要来看看QEMU的一些基础。QEMU的目标是能够在`host`（宿主机）上模拟`target`（目标机），而这两个机器的架构可能完全不同。最简单的实现方式就是针对目标机的指令集写一个解释器，然后在宿主机上编译，但是显然这样的方式会非常缓慢。一个更聪明一点的方式则是使用jit编译：把目标机器的代码翻译为宿主机器的指令，然后使用原生的速度去执行，这也是QEMU所采用的方法。
+直接从宿主机翻译到目标机的方法扩展起来效果并不好，因为这样意味着对于所有的(目标机，宿主机)元组都要实现一个翻译器，所以，与计算机科学的任何问题一样，我们可以通过引入一个间接层来解决问题，也就是：`Tiny
+Code Generator`（小代码生成器），简称TCG。一个TCG _前端_ 将目标机原生指令lift（提升）到架构无关的中间表示（IR），而一个TCG
+_后端_
+则将IR降级到原生宿主机指令。想要加一个新的目标架构？只需要写一个前端就可以了。新的宿主机架构？加一个后端，非常简单。翻译是在基本块等级模拟的时候同时进行的，而因为翻译的过程代价较大，翻译块(TB)会被存储在TCG
+_缓存_ 里，这样如果再次执行到，就可以执行使用。
+当你在进行这种翻译的时候，你需要考虑到翻译后的代码可能并不一定和原来的代码内存布局相同，这样的话，你就需要修理好对内存地址的引用，比如我们来考虑一下终结一个块的控制流指令：如果是一个直接跳转，那么其跳转地址是已知的，所以我们可以马上修正好，把跳转翻译成跳转到后继的原生跳转，这样就完全没有运行时的额外代价。QEMU将这种情况称为
+_块chain_ (block
+chaining)。而如果是间接跳转，我们就无法在翻译的时候确定跳转目标（即使我们尝试去做分析，这也不是一个可以保证出结果的情况），所以我们跳转到QEMU核心的一个回调，这个回调函数就会去翻译还没有翻译的目标块，然后转移控制，之后继续模拟，显然这种情况就会有性能消耗。
+## AFL的QEMU插桩
+AFL，作为一个由覆盖率引导的fuzzer，需要执行轨迹插桩来获取程序控制流的信息，我在这里不会去解释太原始的一些细节，可以从[AFL技术白皮书](http://lcamtuf.coredump.cx/afl/technical_details.txt)里去看，如果你想知道具体里面都是怎么工作的话。如果你有程序源码，你可以用AFL的插桩编译器重新编译一下，这个编译器会在每一个基本块之前加入一小段代码。如果你只有二进制文件，你就可以用AFL的QEMU模式：二进制会在一个被打过补丁的QEMU里执行，然后收集覆盖信息，并传递给AFL。
+AFL的QEMU补丁工作如下：在`qemu_mode/patches/afl-qemu-cpu-inl.h`文件里包含了实际的实现，包含了两个主要部分，一个是forkserver，另外一个是执行轨迹的插桩。forkserver是AFL用来优化初始化额外消耗的一种方法，因为在每次程序开始执行前forkserver会先启动，所以子进程都只有空的TCG缓存，这样的话，AFL采用了一种机制，子进程在有新的翻译块的时候通知父进程，这样父进程就可以在他自己的缓存里边翻译这个块，然后为未来的子进程做准备。
+插桩在QEMU核心的`accel/tcg/cpu-exec.c`进行了hook，这个patch主要是在`cpu_tb_exec`里插入了一段，`cpu_tb_exec`在每次TB被模拟器执行的时候都会被调用。patch调用了`afl_maybe_log`，该函数会检查块是否在trace边界以内，如果在，就会将控制流记录下来，然后传递到AFL的边图(edge
+map)里。
+然而这样有个问题：跳转到chain的块不会调用到模拟器里，因为这样的情况不会经过整个`cpu_tb_exec`，AFL的解决办法是，直接 _取消chain_
+。
+    /* Workaround for a QEMU stability glitch. */
+    setenv("QEMU_LOG", "nochain", 1);
+的确，通过`cpu_tb_exec`的插桩，如果你不取消chain就会导致比较低的稳定性，但是那是由于你完全没有追踪直接跳转造成的，所以其实我不会把它称作一种“瑕疵“，不管怎么说，取消chain都是一个非常大的性能影响，所以我们能够想个办法解决这个问题么？
+## TCG插桩
+我的想法是通过把插桩直接移入到编译后的代码中，通过在每一个TB前都注入一段TCG
+IR来实现。这样的话，插桩就直接变成了模拟的程序的一部分，所以我们不需要让模拟器每次都跳回去，而且也可以重新打开chain。
+这里是原来的`qemu_mode/patches/afl-qemu-cpu-inl.h`里的`afl_maybe_log`：
+    /* The equivalent of the tuple logging routine from afl-as.h. */
+    static inline void afl_maybe_log(abi_ulong cur_loc) {
+      static __thread abi_ulong prev_loc;
+      /* Optimize for cur_loc > afl_end_code, which is the most likely case on
+         Linux systems. */
+      if (cur_loc > afl_end_code || cur_loc > 4) ^ (cur_loc = afl_inst_rms) return;
+      afl_area_ptr[cur_loc ^ prev_loc]++;
+      prev_loc = cur_loc >> 1;
+    }
+所有依赖`cur_loc`的都可以在翻译时完成，因为`cur_loc`是当前块的地址，所以简单来说我们只需要对最后两行去生成TCG
+IR，所以我写了这么一段：
+    tatic void afl_gen_trace(target_ulong cur_loc)
+    {
+      static __thread target_ulong prev_loc;
+      TCGv index, count, new_prev_loc;
+      TCGv_ptr prev_loc_ptr, count_ptr;
+      /* 针对cur_loc > afl_end_code 进行优化，这种情况也是linux系统上的大多数情况 */
+      /* Optimize for cur_loc > afl_end_code, which is the most likely case on
+         Linux systems. */
+      if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
+        return;
+      /* 好像QEMU总是会映射到固定位置，所以ASAN不太需要去注意，还好。但是指令地址必须要对齐，那我们把值混一下来得到点拟均匀的东西。 */
+      /* Looks like QEMU always maps to fixed locations, so ASAN is not a

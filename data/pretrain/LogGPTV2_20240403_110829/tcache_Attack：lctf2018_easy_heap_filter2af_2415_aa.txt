@@ -1,0 +1,99 @@
+# tcache Attack：lctf2018 easy_heap
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 本文摘要：
+  * tcache机制与特性、攻击手段
+  * off-by-one漏洞
+  * 两种典型内存泄露手段：深入分析几处源码
+## 引言：
+前段时间的lctf2018中，第一道pwn题打击很大，深感知识储备捉襟见肘，虽然逆向分析五分钟之内就迅速确定了off-by-one漏洞的存在，但是由于对堆块重用机制和libc2.26之后新增的tcache机制一无所知，导致此题最终留憾；而在赛后了解到这两个机制后进行的复现过程中，最深的感受就是，这年头不好好审libc源码是不行了，否则真的是阻碍重重！
+## 前置知识：堆块重用机制与size字段对齐计算方式
+参考文章：
+近期继续匍匐在堆漏洞的学习路途上，接触了unsorted bin attack、fastbin attack、off by
+one三个漏洞，不过最终还是在off by one的学习上晚了一步，导致lctf
+easy_heap没能攻克下来：主要原因就是因为对堆块重用机制和size字段对齐处理一无所知。这篇文章将进行简单介绍。
+### 一、堆块重用机制
+之前在chunk结构的学习中我们已经了解到，presize字段仅在前一个堆块是空闲时才有意义，也就是说，当前一个堆块是inuse态时，presize是可有可无的。考虑到这一点，libc采用了一种机制：当一个堆块是inuse态时，它会把下一个堆块的presize字段也作为自己的用户区，这样就可以节省内存空间，这种把presize字段在pre_chunk非空闲时用作pre_chunk的数据区的处理机制就是堆块重用。
+然而，并不是所有情况下都会使用堆块重用！这也是今天要讲的要点：
+我们知道，堆块分配时，它的大小要进行内存对齐，32位操作系统中，会以8字节进行对齐（即堆块的大小必须是8字节的整数倍），而64位操作系统中，会以16字节进行对齐（即堆块的大小必须是16字节的整数倍）。
+而堆块重用只出现在如下情况：申请的内存大小在按照上述规则进行向大取整后，得到的应有大小比原大小大出的值大于等于对齐字节量的一半！
+比如64位操作系统中，malloc(0x88)，向大取整后是0x90，比原来大出了8个字节，而64位下的对齐字节量是16字节，8字节大于等于16的一半，因此会进行堆块重用：0x88中的最后8字节会存在下一个chunk的presize字段位置。而如果是malloc(0x79)，向大取整后是0x80，比原来大出7个字节，小于16的一半，就不会发生堆块重用。
+为什么呢？堆块重用的初衷就是节约内存，当符合上述重用条件时，用户申请的大小mod对齐字节量后多出的那块大小是小于等于presize字段长度（如64位下是8字节）的，因此多出的这块小尾巴就正好可以顺便放进presize字段存储，相比来说，如果不重用presize来存，而是继续按16字节对齐，将会产生较大的内存浪费；而当不符合重用条件时，多出来的小尾巴是大于presize长度的，presize就存不下了，而size字段人家自己还有用你又不能拿来占，因此就没法进行堆块重用了。
+> 总结一下堆块重用条件：申请的内存大小在按照上述规则进行向大取整后，得到的应有大小比原大小大出的值>=对齐字节量的一半（presize字段长度）.
+> =>也即：申请的内存大小mod对齐字节量 tcache：Thread Local Caching，线程本地缓存
+>
+> 故名思意，是个缓存，与其线程对应；说到缓存，应该想到“优先存取”的特点，事实上也确实如此
+>
+> 它也是个堆表，而且是单链表，其特点和fastbin基本相同，只是更弱，弱爆了，没有首块double free检查也没有size校验，爽歪歪
+>
+> tcache特殊的一点是，它的fd指针是指向用户区的，而不是块首，这是和其他bin的一个重要区别
+>
+>
+> 此外这个东西有一个奇葩的地方，人家别的堆表都待在arena里，但是tcache却存储在堆区；tcache的位置位于堆区的起始处，一共有64个链表，这64个链表的索引结点（也就是链首结点用于存放链表中第一个堆块地址的结点）依次存放在堆区起始处；每个链表最多维护7个堆块
+#### 0x01:我们来看一下tcache的相关源码：
+1.在 tcache 中新增了两个结构体，分别是 tcache_entry 和 tcache_pertheread_struct
+    /* We overlay this structure on the user-data portion of a chunk when the chunk is stored in the per-thread cache.  */
+    typedef struct tcache_entry
+    {
+      struct tcache_entry *next;
+    } tcache_entry;
+    /* There is one of these for each thread, which contains the per-thread cache (hence "tcache_perthread_struct").  Keeping overall size low is mildly important.  Note that COUNTS and ENTRIES are redundant (we could have just counted the linked list each time), this is for performance reasons.  */
+    typedef struct tcache_perthread_struct
+    {
+      char counts[TCACHE_MAX_BINS];
+      tcache_entry *entries[TCACHE_MAX_BINS];
+    } tcache_perthread_struct;
+    static __thread tcache_perthread_struct *tcache = NULL;
+可以看到，链表结点结构体很简单，就是一个next指针指向链表中下一个堆块（的用户数据区）；然后定义了一个线程的完整tcache结构体，由两部分组成，第一部分是计数表，记录了64个tcache链表中每个链表内已有的堆块个数（0-7），第二部分是入口表，用来记录64个tcache链表中每条链表的入口地址（即链表中第一个堆块的用户区地址）；最后一行则是初始化了一个线程的tcache，存储在堆空间起始处的tcache在这一步后就完成了分配，由于tcache本身也在堆区故也是一个大chunk，因此其大小是size_chunkhead
++ size_counts + size_entries = 16 + 64 + 64*8 = 592 = 0x250
+因此在libc2.26及以后的版本中，堆空间起始部分都会有一块先于用户申请分配的堆空间，大小为0x250，这就是tcache（0x000-0x24F），也就是说用户申请第一块堆内存的起始地址的最低位字节是0x50
+2.其中有两个重要的函数， tcache_get() 和 tcache_put():
+    static void
+    tcache_put (mchunkptr chunk, size_t tc_idx)
+    {
+      tcache_entry *e = (tcache_entry *) chunk2mem (chunk);
+      assert (tc_idx next = tcache->entries[tc_idx];
+      tcache->entries[tc_idx] = e;
+      ++(tcache->counts[tc_idx]);
+    }
+    static void *
+    tcache_get (size_t tc_idx)
+    {
+      tcache_entry *e = tcache->entries[tc_idx];
+      assert (tc_idx entries[tc_idx] > 0);
+      tcache->entries[tc_idx] = e->next;
+      --(tcache->counts[tc_idx]);
+      return (void *) e;
+    }
+这两个函数的会在函数
+[_int_free](https://sourceware.org/git/gitweb.cgi?p=glibc.git;a=blob;f=malloc/malloc.c;h=2527e2504761744df2bdb1abdc02d936ff907ad2;hb=d5c3fafc4307c9b7a4c7d5cb381fcdbfad340bcc#l4173)
+和
+[__libc_malloc](https://sourceware.org/git/gitweb.cgi?p=glibc.git;a=blob;f=malloc/malloc.c;h=2527e2504761744df2bdb1abdc02d936ff907ad2;hb=d5c3fafc4307c9b7a4c7d5cb381fcdbfad340bcc#l3051)
+的开头被调用，其中 tcache_put 当所请求的分配大小不大于0x408并且当给定大小的 tcache bin 未满时调用。一个 tcache bin
+中的最大块数mp_.tcache_count是7。free进去和分配出来就是用的put和get，可以看到并没有什么安全检查
+小结：单链表LIFO头插、tcache存储在堆区、64个bins、每个bins最多放7个chunk、tcache的next指针指向chunk的用户数据区而不是chunk_head
+@tcache特性
+#### 0x02:逆向分析寻找漏洞：
+丢IDA看F5（笔者已对大部分函数重命名）：
+只有set_log、delet_log、print_log三个功能，显然新建记录和对记录的编辑应该是捏在一起了，因为没有单独的编辑功能，所以应该是新建即确定内容，我们先来看看set_log：
+可以看到，程序最多允许用户维护十条记录，索引表的每个表项只存一个记录指针和记录的大小，指针为空就是没记录，不为空就是有内容，还是非常的简洁的；分配用的函数是malloc，大小固定为0xF8，然后让用户输入要输入内容的长度，不得长于0xF8，然后就到了输入内容的部分了，输入内容单独用一个函数read_content来实现，传入的参数是写入目标地址和用户输入的size，我们跟进这个函数看看：
+a2就是用户输入的内容长度，是0的话就直接向目标内存写一个0x00
+a2不为零时，循环一个字节一个字节读，如果没有触发0x00或n触发截断的话，循环条件就是判断a2-1<v3，按理说v3作为下标应该是从0读到a2-1，但是read函数是在if之前执行的，也就是说，当v3递增至v3
+= a2 –
+1后，经过一次++v3后v3就等于a2了，已经溢出了，但是下一轮循环在if之前已然read给了a1[v3]即a1[a2]，溢出了一个字节，也就是说只要用户输入长度为0xf8，最终对应的堆块就一定会被溢出一个字节踩到下一个堆块的开头
+注意往下两行a1[v3] = 0和a1[a2] =
+0，v3代表的是读入的最终停止位置，a2代表的是用户输入的长度，但是显然这里的处理是错误的，应该是a1[a2-1]=0，也就是说，如果用户输入的长度是0xf8，即使用户提前用0x00或n停止了输入，依然会溢出一个字节0x00踩到下个堆块
+综上，用户可以通过输入长度0xf8，来溢出一个字节踩到下个堆块，但是存在限制，通过溢出写入字节只能是0x00；这就是典型的由于缓冲区边界检查逻辑考虑不周导致的OFF
+BY ONE漏洞。
+再来看一下delet_log：
+该置零的都置零了，没有漏洞，给个赞
+最后看看print_log，这是我们泄露内存的唯一依据：
+做了存在性检查，又由于delet_log是安全的，故这里没有利用点；此外打印用的是puts，遇到0x00和n会截断，泄露内存时注意一下即可
+小结：存在off by one漏洞，通过在输入长度时输入0xf8触发
+### 二、漏洞利用分析
+现在已经能够确定：存在off by one，但是溢出只能写入0x00
+那么到底踩到了下一个堆块的哪一部分呢？chunk的头部依次是pre_size和size字段，故踩到的是pre_size的最低字节…..
+还没反应过来的读者请学习笔者之前的文章《堆块重用机制与size字段对齐计算方式》
+malloc申请的大小是0xf8，满足堆块重用条件，故发生了堆块重用，因此溢出的那个字节踩到的是下一个chunk的size字段的最低字节，被篡改成了00.
+size字段原本应该是0x101（不知道怎么算出来的仍旧参考堆块重用那篇文章），所以我们实际上是将0x01改写成了0x00，在没有破坏到原有大小值的情况下将pre_inuse位覆盖成了0，成功伪造了pre_chunk为free态的假象，进一步可以触发合并

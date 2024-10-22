@@ -1,0 +1,79 @@
+本文原文来自[From zero to tfp0 - Part 2: A Walkthrough of the voucher_swap
+exploit](http://highaltitudehacks.com/2020/06/01/from-zero-to-tfp0-part-2-a-walkthrough-of-the-voucher-swap-exploit/)  
+在本文中将深入研究voucher_swap漏洞以及获取内核任务端口的所有步骤。  
+该漏洞的发现和POC都归功于[@_bazad](https://twitter.com/_bazad)。  
+([@S0rryMybad](https://twitter.com/S0rryMybad)也发现了这个漏洞并用在天府杯上：)
+## 引用计数
+本文中的漏洞是由于MIG生成的代码的引用计数问题造成的。什么是引用计数？引用计数是一种简单而有效的内存管理方式。创建或复制对象会将其引用计数加1，而销毁或覆盖对象会将其引用计数减1。如果对象的引用计数达到零，则将释放该对象。在内存有限的系统中，引用计数比垃圾回收(它是循环发生的，可能会耗费时间)更有效，因为可以在对象的引用计数为零时立即释放对象，从而提高了系统的整体响应能力。  
+对象结构体中的成员可以表示该对象的引用计数。例如，Mach端口(ipc_port_t)中io_references成员表示其引用计数，ip_references和ip_release用于增加和减少端口上的引用计数。简单搜索ip_reference将找到此函数用于操纵端口的引用计数的许多示例。  
+voucher也是一样的，其中iv_refs成员表示引用计数。  
+iv_refs的类型为os_refcnt_t，它是32位整数，因此其范围为0-0xffffffff(8个f)吗？其实并不是。在libkern/os/refcnt.c中，最大值定义为0x0fffffff(7个f)。这是一种新的防止整数溢出的缓解措施。  
+如下所示，访问超出此范围的任何值都会触发内核panic。  
+voucher的ipc_voucher_reference和ipc_voucher_release函数仅检查voucher是否不为NULL，然后调用iv_reference和iv_release，他们分别调用os_ref_retain和os_ref_release。  
+BUILD/obj/EXPORT_HDRS/libkern/os/refcnt.h中可以找到更多细节。  
+因此，可能会出现两种漏洞：一种是以某种方式增加引用计数，从而导致溢出。如前所述，由于存在上限，这实际上是无法利用的。但是仍然可以将引用计数增加到0x0fffffff(7个f)，稍后我们将使用此技术。另一种是将对象的引用计数设置为0，但是仍然有一个指向它的指针。由于引用计数变为0，对象将被释放，因此指向该对象的指针变成了悬空指针。
+## 漏洞
+让我们看一下该漏洞。查看xnu-4903.221.2/osfmk/kern/task.c中的task_swap_mach_voucher函数。这是一个简单的函数，它应该将新的voucher和旧的voucher交换。但是它只是用new_voucher替换了old_voucher。  
+根据注释，task_swap_mach_voucher函数是一个占位符。可在xnu-4903.221.2/osfmk/mach/task.defs中找到它。  
+这证明它实际上是Mach API，因为MIG
+def文件正在为Mach接口生成代码。/BUILD/obj/RELEASE_X86_64/osfmk/mach/task.h中可以找到此函数的Mach消息格式。  
+/BUILD/obj/RELEASE_X86_64/osfmk/RELEASE/mach/task_server.c中可以看到对请求执行的检查。  
+下面是实际的实现。  
+简化一下。  
+convert_port_to_voucher函数通过调用ipc_voucher_reference函数将引用计数增加1。  
+convert_voucher_to_port函数通过调用ipc_voucher_release函数将引用计数减少1。  
+在task_swap_mach_voucher例程中，通过调用ipc_voucher_release函数(第4844行)将新voucher的引用计数减1。  
+此例程中引用计数的变化如下。  
+第4839行: new_voucher的引用计数+1  
+第4841行: old_voucher的引用计数+1  
+第4843行: task_swap_mach_voucher调用，old_voucher = new_voucher  
+第4844行: new_voucher的引用计数-1  
+第4857行: new_voucher的引用计数-1(因为old_voucher现在是new_voucher)  
+你可能已经看出问题了。可以将new_voucher的引用计数减少为0，从而释放该对象。并且old_voucher的引用计数可以增加很多。如果存储指向new_voucher的指针，然后使用漏洞将new_voucher的引用计数减少为0，这样就有可能获得指向new_voucher的悬空指针。  
+## 关于voucher
+在继续之前，最好先查看ipc_voucher结构体并了解其中的成员。  
+第一件事是确定要在哪个对象中存储被释放的voucher的指针。最好的方法是在内核源代码中搜索ipc_voucher_t，并寻找易于获取和设置该指针的API。明显的地方之一是osfmk/kern/thread.h中的thread对象，该对象存储名为ith_voucher的voucher的引用。  
+可以使用thread_get_mach_voucher和thread_set_mach_voucher函数从用户态读取和写入voucher引用。查看MIG为该函数生成的代码。  
+一旦获得了指向已释放voucher对象的悬空指针，便可以使用其他对象占用已释放的voucher对象。但是这并不简单。voucher通常位于自己的ipc
+voucher zone中，如osfmk/ipc/ipc_voucher.c所示，其中zinit为voucher分配了一个新zone。  
+因此，被释放的voucher的内存将被放置在zone的freelist中，并在创建新voucher时分配给新voucher。为了用其他对象占用，唯一可行的方法是触发zone垃圾收集，它会将被释放的voucher的内存(最小大小为1页)移到zone
+map中，然后这些内存就可以重新分配给其他对象。可以通过分配大量voucher并释放它们来做到这一点。  
+让我们再次仔细查看MIG为thread_get_mach_voucher生成的代码。假设我们确实用其他对象占用了已释放的voucher对象，则调用thread_get_mach_voucher应该成功而内核不会panic。在第2688行的thread_get_mach_voucher函数调用ipc_voucher_reference(voucher)，这意味着该voucher应该具有有效的iv_refs成员。  
+在第2695行的convert_voucher_to_port函数如下所示。  
+在第503行首先检查voucher是否具有正确的引用计数。然后在第507行检查voucher端口的有效性。如果无效，则会分配一个新的voucher端口。这很棒，因为在分配伪造的voucher占用已释放的voucher时，如果以某种方式将iv_port指针设置为NULL，那么实际上还可以将新分配的voucher端口(IKOT_VOUCHER)返回到用户态(ith_voucher->iv_port)。这将使我们能够进一步操纵voucher。
+## 通过OOL端口描述符进行堆风水
+正如在第1部分中简要讨论的那样，复杂的Mach消息具有一个描述符成员，该成员有四种类型。
+  * MACH_MSG_PORT_DESCRIPTOR：在消息中发送一个端口
+  * MACH_MSG_OOL_DESCRIPTOR：在消息中发送OOL数据
+  * MACH_MSG_OOL_PORTS_DESCRIPTOR：在消息中发送OOL端口数组
+  * MACH_MSG_OOL_VOLATILE_DESCRIPTOR：在消息中发送易失性数据
+当通过mach_msg发送Mach消息时依次调用mach_msg_send->ipc_kmsg_copyin->ipc_kmsg_copyin_body，在ipc_kmsg_copyin_body函数中对于MACH_MSG_OOL_PORTS_DESCRIPTOR的情况会调用ipc_kmsg_copyin_ool_ports_descriptor函数。  
+第2879行调用kalloc在kalloc
+zone中分配内存。第2902行将得到的内存转换为objects对象，该对象是端口指针的数组。因此使用OOL端口描述符发送大量Mach消息，可以使用有效指针或0xFFFFFFFFFFFFFFFFFF(MACH_PORT_DEAD)或0x0000000000000000(MACH_PORT_NULL)填充kalloc
+zone。
+## 管道缓冲区
+管道是xnu中另一个用于IPC的系统调用。它创建一个分配一对文件描述符并允许单向数据流的管道。数据流经的缓冲区称为管道缓冲区。可以从缓冲区的读取端读取写入缓冲区的写入端的数据，但是并不能反过来。基本上你可以在同一地址空间中进行读写。另一个重要的事情是它占用内核虚拟地址空间，因此是在堆中分配内存的有用原语。默认情况管道缓冲区的大小设置为最大16384字节，所有管道缓冲区的大小设置为最大16MB。  
+如果数据已被写入管道缓冲区并且管道缓冲区已满，则认为该管道缓冲区已阻塞。要释放该管道缓冲区必须从中读取数据。可以通过分配许多管道缓冲区并将数据写入其中来利用管道缓冲区进行喷射。可以创建的管道总数是16MB除以16384字节，即1024。  
+管道缓冲区的优势在于，如果能够获得指向其中一个管道缓冲区的指针并读取其值，则基本上可以识别出是这1024个管道缓冲区中的哪个，然后就可以在这个特定的管道缓冲区中重新分配数据。  
+有了足够的背景知识，让我们详细介绍一下EXP吧。
+## EXP
+如果还没有下载voucher_swap EXP代码的话可以在[这里](https://bugs.chromium.org/p/project-zero/issues/detail?id=1731#c10)下载以便阅读接下来的内容。
+#### Step 1:为voucher创建一个单独的线程
+创建一个单独的线程，我们将在其中存储指向voucher的指针。该线程有一个ith_voucher成员，可以在其中保留对voucher的引用。  
+#### Step 2:创建喷射管道缓冲区用的管道
+创建喷射管道缓冲区用的管道。前面提过，可创建的管道总数为1024。之后我们会看到其中一个管道对应的管道缓冲区将与fake port重叠。  
+#### Step 3:喷射端口
+我们需要喷射许多端口。它们将占用现有的空洞，并迫使内核从zone
+map中分配新块。在此之后喷射管道缓冲区时，我们将假定它们位于端口的后面。根据反复试验，将filler_port_count设为8000。base
+port是使用create_ports创建的最后一个端口。记住这一点，因为将在第8步中用到。对于前2000个端口还增加了队列限制，该限制是可以立即发送到端口的最大消息数。这样做的原因是我们将使用OOL端口描述符向这些端口发送消息占用已释放的voucher，因此能够向这些端口发送更多的消息将有助于喷射。  
+#### Step 4:喷射管道缓冲区
+接下来喷射管道缓冲区，希望它们刚好在端口后面。  
+将ipc_port写入管道缓冲区，将其12位的IKOT_TYPE设置为管道索引。具体步骤如下。  
+回调函数update调用iterate_ipc_ports。  
+iterate_ipc_ports给回调函数callback传递端口的偏移量。  
+在回调函数callback中使用端口的偏移量找到端口设置相应的成员(可以在Step 4第一张图中看到)。
+#### Step 5:使用voucher喷射堆
+接下来用voucher喷射堆并选择一个最终将被释放的voucher(uaf_voucher_port)。如前一篇文章所述，内存是从zone
+map中以块为单位获取的。对于特定的版本，一个块的大小是固定的(iPhone11,8
+16C50的ipc_voucher是0x4000)。由于voucher的大小也是固定的(0x50)，因此块中的voucher的数量也是固定的(0x4000/0x50=80)。我们将分配额外的块，在这些块中存储uaf_voucher_port。前300个voucher基本上可以填补内存中的空洞。然后将voucher喷射入约16个块，把uaf_voucher_port放到第7块-第10块，前后各有6个过渡的块。之后我们会看到这些块被OOL端口指针覆盖。  
+#### Step 6:继续喷射

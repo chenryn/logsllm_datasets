@@ -1,0 +1,156 @@
+        // the idea of a connection wouldn't make sense).
+        err = -EINVAL;
+        if (sock->state != SS_UNCONNECTED || sock->type != SOCK_STREAM)
+            goto out;
+        if (_some_tcp_fast_open_stuff_) {
+            // ... do some TCP fast open stuff ...
+            // Initialize the necessary data structures
+            // for turning this socket into a listening socket
+            // that is going to be able to receive connections.
+            err = inet_csk_listen_start(sk, backlog);
+            if (err)
+                goto out;
+        }
+        // Annotate the protocol-specific socket structure
+        // with the backlog configured by `sys_listen` (the
+        // value from userspace after being capped by the
+        // kernel).
+        sk->sk_max_ack_backlog = backlog;
+        err                    = 0;
+        return err;
+    }
+完成某些检查后，[inet_csk_listen_start](https://elixir.bootlin.com/linux/v4.15/source/net/ipv4/inet_connection_sock.c#L863
+"inet_csk_listen_start")开始侦听套接字的变化情况，并对连接队列进行赋值：
+    int inet_csk_listen_start(struct sock *sk, int backlog)
+    {
+        struct inet_connection_sock *icsk = inet_csk(sk);
+        struct inet_sock *inet = inet_sk(sk);
+        int err = -EADDRINUSE;
+            // Initializes the internet connection accept
+            // queue.
+        reqsk_queue_alloc(&icsk->icsk_accept_queue);
+            // Sets the maximum ACK backlog to the one that
+            // was capped by the kernel.
+        sk->sk_max_ack_backlog = backlog;
+            // Sets the current size of the backlog to 0 (given
+            // that it's not started yet.
+        sk->sk_ack_backlog = 0;
+        inet_csk_delack_init(sk);
+            // Marks the socket as in the TCP_LISTEN state.
+        sk_state_store(sk, TCP_LISTEN);
+            // Tries to either reserve the port already
+            // bound to the socket or pick a "random" one.
+        if (!sk->sk_prot->get_port(sk, inet->inet_num)) {
+            inet->inet_sport = htons(inet->inet_num);
+            sk_dst_reset(sk);
+            err = sk->sk_prot->hash(sk);
+            if (likely(!err))
+                return 0;
+        }
+            // If things went south, then return the error
+            // but first set the state of the socket to
+            // TCP_CLOSE.
+        sk->sk_state = TCP_CLOSE;
+        return err;
+    }
+现在，我们已经为套接字设置了一个地址、正确的状态集和一个为传入的连接进行排序的队列，接下来，我们就可以接收连接了。
+不过，在此之前，先让我们来了解一下可能会遇到的一些情况。
+**如果侦听之前没有执行绑定操作的话，会出现什么情况**
+* * *
+如果“根本”没有执行绑定操作的话，listen(2)最终会为你选择一个随机的端口。
+为什么会这样呢？如果我们仔细考察[inet_csk_listen_start](https://elixir.bootlin.com/linux/v4.15/source/net/ipv4/inet_connection_sock.c#L863
+"inet_csk_listen_start")用来准备端口的方法（[get_port](https://elixir.bootlin.com/linux/v4.15/source/net/ipv4/inet_connection_sock.c#L283
+"get_port")），我们就会发现，如果底层套接字没有选择端口的话，它会随机选一个临时端口。
+    /* Obtain a reference to a local port for the given sock,
+     * if snum is zero it means select any available local port.
+     * We try to allocate an odd port (and leave even ports for connect())
+     */
+    int inet_csk_get_port(struct sock *sk, unsigned short snum)
+    {
+        bool reuse = sk->sk_reuse && sk->sk_state != TCP_LISTEN;
+        struct inet_hashinfo *hinfo = sk->sk_prot->h.hashinfo;
+        int ret = 1, port = snum;
+        struct inet_bind_hashbucket *head;
+        struct inet_bind_bucket *tb = NULL;
+            // If we didn't specify a port (port == 0)
+        if (!port) {
+            head = inet_csk_find_open_port(sk, &tb, &port);
+            if (!head)
+                return ret;
+            if (!tb)
+                goto tb_not_found;
+            goto success;
+        }
+            // ...
+    }
+所以，如果您不想在侦听的时候选择端口的话，那就随您便吧！
+**当接收连接的速度不够快时，哪些指标会达到峰值**
+* * *
+假设套接字进入被动状态时，我们总是有两个队列（一个队列用于那些尚未完成三次握手的连接，另一个用于那些已经完成但尚未被接收的队列），我们可以想象
+，一旦接收连接的速度跟不上的话，第二个队列将逐渐被塞满。
+我们可以看到的第一个指标是我们之前已经介绍过的指标，即sock_diag为特定套接字报告的idiag_rqueue和idiag_wqueue的值。
+    idiag_rqueue
+           对于侦听套接字：挂起连接的数量。
+           对于其他套接字：传入队列中的数据量。
+    idiag_wqueue
+           对于侦听套接字：积压长度。
+           对于其他套接字：可用于发送操作的内存量。
+虽然这些对于每个套接字的分析来说非常有用，但我们可以查看更高级别的信息，以便从整体上了解该机器的接收队列是否将出现溢出情况。
+鉴于每当内核尝试将传入请求从syn队列转移到接收队列并失败时，它会在ListenOverflows上记录一个错误，所以，我们可以跟踪错误的数量（您可以从/proc/net/netstat中获取该数据）：
+    # Retrieve the number of listen overflows
+    # (accept queue full, making transitioning a
+    # connection from `syn queue` to `accept queue`
+    # not possible at the moment).
+    cat /proc/net/netstat
+    cat /proc/net/netstat
+    TcpExt: SyncookiesSent SyncookiesRecv ...  ListenOverflows
+    TcpExt: 0 0 ... 105 ...
+当然，我们可以看到，/proc/net/netstat提供的数据的格式不够人性化。这时，netstat(工具)就有了用武之地了:
+    netstat --statistics | \
+            grep 'times the listen queue of a socket overflowed'
+    105 times the listen queue of a socket overflowed
+想知道内核代码中发生了什么吗?
+C详见[tcp_v4_syn_recv_sock](https://elixir.bootlin.com/linux/v4.15/source/net/ipv4/tcp_ipv4.c#L1332
+"tcp_v4_syn_recv_sock")。
+    /*
+     * The three way handshake has completed - we got a valid synack -     * now create the new socket.
+     */
+    struct sock *tcp_v4_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
+                      struct request_sock *req,
+                      struct dst_entry *dst,
+                      struct request_sock *req_unhash,
+                      bool *own_req)
+    {
+            // ...
+        if (sk_acceptq_is_full(sk))
+            goto exit_overflow;
+            // ...
+    exit_overflow:
+        NET_INC_STATS(
+                    sock_net(sk), 
+                    LINUX_MIB_LISTENOVERFLOWS); // (ListenOverflows)
+    }
+现在，如果syn队列接近满载，但是仍然没有出现三方握手已经完成的连接，所以不能将连接转移到接收队列，假设该队列眼看就要溢出了，那该怎么办呢？
+这时，另一个指标就派上用场了，即TCPReqQFullDrop或TCPReqQFullDoCookies（取决于是否启用了SYN
+cookie），详情请参见[tcp_conn_request](https://elixir.bootlin.com/linux/v4.15/source/net/ipv4/tcp_input.c#L6204
+"tcp_conn_request")。
+如果想知道某时刻第一个队列（syn队列）中的连接数是多少，我们可以列出仍处于syn-recv状态的所有套接字：
+    # List all sockets that are in
+    # the `SYN-RECV` state  towards
+    # the port 1337.
+    ss \
+      --numeric \
+      state syn-recv sport = :1337
+关于该主题，在CloudFlare上有一篇很棒的文章：[SYN packet handling in the
+wild](https://blog.cloudflare.com/syn-packet-handling-in-the-wild/ "SYN packet
+handling in the wild")。
+大家不妨去看看吧！
+**小结**
+* * *
+如果能够理解为接收新连接而设置服务器TCP套接字所涉及的一些边缘情况的话，自然是极好的。所以，我计划对这个过程中涉及的其他一些内容做进一步的解释，以便帮助读者理解现代的TCP的一些怪癖行为，但那是另一篇文章的任务。最后，祝大家阅读愉快！
+**参考资料**
+* * *
+  * [Systems Performance: Enterprise and the Cloud](https://amzn.to/2DAORD5 "Systems Performance: Enterprise and the Cloud")
+  * [Computer Networking: A top-down approach](https://amzn.to/2DEiNOG "Computer Networking: A top-down approach")
+  * [The Linux Programming Interface](https://amzn.to/2QWyXp9 "The Linux Programming Interface")
+  * [Understanding the Linux Kernel, 3rd Ed](https://amzn.to/2QD0kU4 "Understanding the Linux Kernel, 3rd Ed")

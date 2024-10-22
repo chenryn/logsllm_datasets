@@ -1,0 +1,236 @@
+# exit()分析与利用
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 概述
+main()函数return时, 有一些析构工作需要完成
+  * 用户层面: 
+    * 需要释放libc中的流缓冲区, 退出前清空下stdout的缓冲区, 释放TLS, …
+  * 内核层面: 
+    * 释放掉这个进程打开的文件描述符, 释放掉task结构体, …
+    * 再所有资源都被释放完毕后, 内核会从调度队列从取出这个任务
+    * 然后向父进程发送一个信号, 表示有一个子进程终止
+    * 此时这个进程才算是真正结束
+因此我们可以认为:
+  * 进程终止 => 释放其所占有的资源 + 不再分配CPU时间给这个进程
+内核层面的终止是通过exit系统调用来进行的,其实现就是一个syscall , libc中声明为
+    #include  
+    void _exit(int status);
+但是如果直接调用_exit(), 会出现一些问题, 比如stdout的缓冲区中的数据会直接被内核释放掉, 无法刷新, 导致信息丢失
+因此在调用_exit()之前, 还需要在用户层面进行一些析构工作
+libc将负责这个工作的函数定义为exit(), 其声明如下
+    #include  
+    extern void exit (int __status);
+因为我们可以认为:
+  * exit() => 进行用户层面的资源析构 + 调用_exit()进行系统级别的析构
+在pwn中, _exit()是无法利用的, 但是exit()是有很多攻击点的, 因此本文会着重分析libc中exit()函数实现, 相关机制, 及其利用手法
+## exit()源码分析
+  * exit()为libc中定义的函数, 是对__run_exit_handlers()的包装
+    void exit(int status)
+    {
+      //退出时调用__exit_funcs链表中的函数，__exit_funcs位于libc的.data段
+      __run_exit_handlers(status, &__exit_funcs, true); 
+    }
+  * 其中有一个重要的数据结构:__exit_funcs, 是一个指针, 指向 / 保存析构函数的数组链表/, 其定义如下 
+        static struct exit_function_list initial;           //initial定义在libc的可写入段中
+    struct exit_function_list *__exit_funcs = &initial; //exit函数链表
+  * exit_function_list结构体定义, 里面保存了多个析构的函数的描述:
+    struct exit_function_list
+    {
+      struct exit_function_list *next; //单链表, 指向下一个exit_function_list结构体
+      size_t idx;                      //记录有多少个函数
+      struct exit_function fns[32];    //析构函数数组
+    };
+  * struct exit_function是对单个析构函数的描述, 可以描述多种析构函数类型 
+        //描述单个析构函数的结构体
+    struct exit_function
+    {
+    long int flavor; 
+    /*
+       函数类型, 可以是{ef_free, ef_us, ef_on, ef_at, ef_cxa}
+            - ef_free表示此位置空闲
+           - ef_us表示此位置被使用中, 但是函数类型不知道
+           - ef_on, ef_at, ef_cxa 分别对应三种不同的析构函数类型, 主要是参数上的差异
+    */
+    union            //多个种函数类型中只会有一个有用, 所以是联合体
+    {
+    void (*at)(void); //ef_at类型 没有参数
+    struct
+    {
+     void (*fn)(int status, void *arg);
+     void *arg;
+    } on; //ef_on类型
+    struct
+    {
+     void (*fn)(void *arg, int status);
+     void *arg;
+     void *dso_handle;
+    } cxa; //ef_cxa类型
+    } func;
+    };
+  * 用图片表示如下:
+弄清楚libc是如何组织析构函数之后, 分析__run_exit_handlers()是如何处理这些析构函数的
+  * **run_exit_handlers()的主要工作就是调用** exit_funcs中保存的各种函数指针 
+        //调用atexit与on_exit注册的函数，顺序为注册的逆序
+    void attribute_hidden __run_exit_handlers(int status, struct exit_function_list **listp, bool run_list_atexit)
+    {
+    //首先释放线程局部储存, 即TLS
+    #ifndef SHARED
+    if (&__call_tls_dtors != NULL)
+    #endif
+    __call_tls_dtors();
+    //遍历exit_fundtion_list链表，链表种每个节点里又有一个函数指针数组，根据里面的函数类型进行调用
+    while (*listp != NULL)
+    {
+    struct exit_function_list *cur = *listp; //cur指向当前exit_function_list节点
+    //cur->idx表示cur->fns中有多少个函数，从后往前遍历
+    while (cur->idx > 0) //遍历exit_function_list节点中 析构函数数组fns[32]中的函数指针
+    {
+      const struct exit_function *const f = &cur->fns[--cur->idx]; //f指向对应析构函数的描述符
+      switch (f->flavor) //选择析构函数类型
+      {
+        //三种函数指针
+        void (*atfct)(void);
+        void (*onfct)(int status, void *arg);
+        void (*cxafct)(void *arg, int status);
+      //这两种类型不调用
+      case ef_free:
+      case ef_us:
+        break;
+      //on类型的参数为注册时设定的参数
+      case ef_on:
+        onfct = f->func.on.fn; //设置函数指针
+    #ifdef PTR_DEMANGLE
+        PTR_DEMANGLE(onfct);
+    #endif
+        onfct(status, f->func.on.arg); //调用这个函数指针
+        break;
+        //at没有参数
+      case ef_at:
+        atfct = f->func.at;
+    #ifdef PTR_DEMANGLE
+        PTR_DEMANGLE(atfct);
+    #endif
+        atfct();
+        break;
+      //cxa类型则先为设定时的参数，再为状态码
+      case ef_cxa:
+        cxafct = f->func.cxa.fn;
+    #ifdef PTR_DEMANGLE
+        PTR_DEMANGLE(cxafct);
+    #endif
+        cxafct(f->func.cxa.arg, status); 
+        break;
+      }
+    }
+    *listp = cur->next; //listp指向下一个exit_function_list节点
+    //最后一个链表节点为libc .data段中的initial，不需要释放
+    //除此以外的节点都是malloc申请得到的, 所以需要释放
+    if (*listp != NULL)
+      free(cur);
+    }
+    if (run_list_atexit) //调用_atexit
+    RUN_HOOK(__libc_atexit, ());
+    _exit(status); //真正的exit系统调用
+    }
+## 劫持__exit_funcs链表?
+那么有没有可能通过劫持__exit_funcs去当exit()调用我们想要的函数呢?
+我们动态调试来分析一个例子
+  * 在exit调用 **run_exit_handlers()时下断点, 找到** exit_funcs指针
+  * 查看里面保存的数据, 发现最重要的函数指针fns[0].on.fn是类似于乱码一样的东西, 这是因为libc为了安全, 对其进行的加密
+  * 我们看一下__run_exit_handles()是怎么解密并调用的
+  * 其中关键的key是fs:0x30, 那么这又是什么? 
+    * fs是一个段寄存器, 里面存放着GDT表的索引
+    * CPU开启分段机制后, 段寄存器可以结合gdtr寄存器找到对应段描述符, 根据段描述符得到段的基址, 大小, 属性等等
+    * x86架构没有对fs怎么使用做出明确规定, linux中让fs指向当前线程的控制块, 也就是tcbhead_t结构体, 也就是说 fs:0x30 寻址结果和 *(tcbhead_t+0x30) 一样
+    * tcbhead_t定义如下, 栈溢出时常见的 fs:0x28得到的就是tcb中的stack_canary值
+    typedef struct
+    {
+        void *tcb;                /* Pointer to the TCB.  Not necessarily the
+                                   thread descriptor used by libpthread.  */
+        dtv_t *dtv;
+        void *self;                /* Pointer to the thread descriptor.  */
+        int multiple_threads;
+        int gscope_flag;
+        uintptr_t sysinfo;
+        uintptr_t stack_guard;        //栈canary, fs:0x28
+        uintptr_t pointer_guard;    //指针加密, fs:0x30
+        unsigned long int vgetcpu_cache[2];
+        /* Bit 0: X86_FEATURE_1_IBT.
+             Bit 1: X86_FEATURE_1_SHSTK.
+           */
+        unsigned int feature_1;
+        int __glibc_unused1;
+        /* Reservation of some values for the TM ABI.  */
+        void *__private_tm[4];
+        /* GCC split stack support.  */
+        void *__private_ss;
+        /* The lowest address of shadow stack,  */
+        unsigned long long int ssp_base;
+        /* Must be kept even if it is no longer used by glibc since programs,
+             like AddressSanitizer, depend on the size of tcbhead_t.  */
+        __128bits __glibc_unused2[8][4] __attribute__ ((aligned (32)));
+    void *__padding[8];
+    } tcbhead_t;
+综上, 想要劫持__exit_funcs链表, 不仅要能写入, 还需要控制或者泄露tcb中的pointer_guard, 难度太高, 放弃
+## __exit_funcs如何添加析构函数()
+既然难以攻击 **exit_funcs, 那么尝试从** exit_funcs中的函数入手
+我们首先要弄明白, __exit_funcs中的函数是怎么添加的
+  * libc提供了一个接口: atexit()用来注册exit()时调用的析构函数
+    /* DSO由GCC定义，用来识别模块的*/
+    extern void *__dso_handle __attribute__((__weak__));
+    /* 注册一个exit时调用的析构函数*/
+    int atexit(void (*func)(void))
+    {
+        return __cxa_atexit((void (*)(void *))func, NULL, &__dso_handle == NULL ? NULL : __dso_handle);
+    }
+  * **cxa_atexit()是对** internal_atexit()的封装 
+    * 注意: __exit_funcs就是exit()时是用的那个指针
+    //注册一个exit/共享库被卸载时调用的函数，只会被C++编译器生产的代码调用，C会通过atexit调用
+    int __cxa_atexit(void (*func)(void *), void *arg, void *d)
+    {
+      return __internal_atexit(func, arg, d, &__exit_funcs);
+    }
+    libc_hidden_def(__cxa_atexit)
+  * **internel_atexit()通过** new_exitfn()找到一个在__exit_funcs链表上注册析构函数的位置, 然后进行写入
+    /*
+      参数:
+        - func  析构函数指针
+        - arg   参数指针
+        - d     DSO
+        - listp 析构函数数组链表指针
+    */
+    int attribute_hidden __internal_atexit(void (*func)(void *), void *arg, void *d, struct exit_function_list **listp)
+    {
+      struct exit_function *new = __new_exitfn(listp); //先在__exit_funcs链表上添加一个描述析构函数的结构体
+      if (new == NULL)
+        return -1;
+    #ifdef PTR_MANGLE
+      PTR_MANGLE(func);
+    #endif
+      //然后设置分配到的这个结构体
+      new->func.cxa.fn = (void (*)(void *, int))func; //函数指针
+      new->func.cxa.arg = arg;                        //参数
+      new->func.cxa.dso_handle = d;
+      atomic_write_barrier();
+      new->flavor = ef_cxa;                         //类型
+      return 0;
+    }
+__new_exitfn()的逻辑大致为
+  * 先尝试在__exit_funcs中找到一个exit_function类型的ef_free的位置, ef_free代表着此位置空闲
+  * 如果没找到, 就新建一个exit_function节点, 使用头插法插入__exit_funcs链表, 使用新节点的第一个位置作为分配到的exit_function结构体
+  * 设置找到的exit_function的类型为ef_us, 表示正在使用中, 并返回
+    //从listp上返回一个新的exit_function结构体
+    struct exit_function *__new_exitfn(struct exit_function_list **listp)
+    {
+      struct exit_function_list *p = NULL;
+      struct exit_function_list *l;
+      struct exit_function *r = NULL;
+      size_t i = 0;
+      __libc_lock_lock(lock); //上锁
+      //寻找一个析构函数类型为ef_free的位置
+      for (l = *listp; l != NULL; p = l, l = l->next) //遍历链表，l指向当前节点, p指向l的前一个节点
+      {
+        for (i = l->idx; i > 0; --i)           //搜索l中的函数指针数组fns[32]
+          if (l->fns[i - 1].flavor != ef_free) //有一个不是ef_free的就停止

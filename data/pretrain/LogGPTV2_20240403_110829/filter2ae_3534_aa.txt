@@ -1,0 +1,138 @@
+# 简介
+smep的全称是`Supervisor Mode Execution
+Protection`,它是内核的一种保护机制,作用是当CPU处于ring0模式的时候，如果执行了用户空间的代码就会触发页错误,很明现这个保护机制就是为了防止ret2usr攻击的....  
+这里为了演示如何绕过这个保护机制,我仍然使用的是CISCN2017 babydriver,这道题基本分析和利用UAF的方法原理我已经在[kernel pwn
+--UAF](https://bbs.pediy.com/thread-252826.htm)这篇文章中做了解释,在这里就不再阐述了,环境也是放在[github](https://github.com/cc-sir/ctf-challenge/tree/master/2017CISCN%20babydriver)上面的,需要的可以自行下载学习....
+# 前置知识
+## ptmx && tty_struct && tty_operations
+`ptmx`设备是`tty`设备的一种,`open`函数被`tty`核心调用,
+当一个用户对这个`tty`驱动被分配的设备节点调用`open`时`tty`核心使用一个指向分配给这个设备的`tty_struct`结构的指针调用它,也就是说我们在调用了`open`函数了之后会创建一个`tty_struct`结构体,然而最关键的是这个`tty_struct`也是通过`kmalloc`申请出来的一个堆空间,下面是关于`tty_struct`结构体申请的一部分源码:
+    struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
+    {
+        struct tty_struct *tty;
+        tty = kzalloc(sizeof(*tty), GFP_KERNEL);
+        if (!tty)
+            return NULL;
+        kref_init(&tty->kref);
+        tty->magic = TTY_MAGIC;
+        tty_ldisc_init(tty);
+        tty->session = NULL;
+        tty->pgrp = NULL;
+        mutex_init(&tty->legacy_mutex);
+        mutex_init(&tty->throttle_mutex);
+        init_rwsem(&tty->termios_rwsem);
+        mutex_init(&tty->winsize_mutex);
+        init_ldsem(&tty->ldisc_sem);
+        init_waitqueue_head(&tty->write_wait);
+        init_waitqueue_head(&tty->read_wait);
+        INIT_WORK(&tty->hangup_work, do_tty_hangup);
+        mutex_init(&tty->atomic_write_lock);
+        spin_lock_init(&tty->ctrl_lock);
+        spin_lock_init(&tty->flow_lock);
+        INIT_LIST_HEAD(&tty->tty_files);
+        INIT_WORK(&tty->SAK_work, do_SAK_work);
+        tty->driver = driver;
+        tty->ops = driver->ops;
+        tty->index = idx;
+        tty_line_name(driver, idx, tty->name);
+        tty->dev = tty_get_device(tty);
+        return tty;
+    }
+其中`kzalloc`:
+    static inline void *kzalloc(size_t size, gfp_t flags)
+    {
+        return kmalloc(size, flags | __GFP_ZERO);
+    }
+而正是这个`kmalloc`的原因,根据前面介绍的slub分配机制,我们这里仍然可以利用UAF漏洞去修改这个结构体....  
+这个`tty_struct`结构体的大小是0x2e0,源码如下:
+    struct tty_struct {
+        int magic;
+        struct kref kref;
+        struct device *dev;
+        struct tty_driver *driver;
+        const struct tty_operations *ops;     // tty_operations结构体
+        int index;
+        /* Protects ldisc changes: Lock tty not pty */
+        struct ld_semaphore ldisc_sem;
+        struct tty_ldisc *ldisc;
+        struct mutex atomic_write_lock;
+        struct mutex legacy_mutex;
+        struct mutex throttle_mutex;
+        struct rw_semaphore termios_rwsem;
+        struct mutex winsize_mutex;
+        spinlock_t ctrl_lock;
+        spinlock_t flow_lock;
+        /* Termios values are protected by the termios rwsem */
+        struct ktermios termios, termios_locked;
+        struct termiox *termiox;    /* May be NULL for unsupported */
+        char name[64];
+        struct pid *pgrp;       /* Protected by ctrl lock */
+        struct pid *session;
+        unsigned long flags;
+        int count;
+        struct winsize winsize;     /* winsize_mutex */
+        unsigned long stopped:1,    /* flow_lock */
+                  flow_stopped:1,
+                  unused:BITS_PER_LONG - 2;
+        int hw_stopped;
+        unsigned long ctrl_status:8,    /* ctrl_lock */
+                  packet:1,
+                  unused_ctrl:BITS_PER_LONG - 9;
+        unsigned int receive_room;  /* Bytes free for queue */
+        int flow_change;
+        struct tty_struct *link;
+        struct fasync_struct *fasync;
+        wait_queue_head_t write_wait;
+        wait_queue_head_t read_wait;
+        struct work_struct hangup_work;
+        void *disc_data;
+        void *driver_data;
+        spinlock_t files_lock;      /* protects tty_files list */
+        struct list_head tty_files;
+    #define N_TTY_BUF_SIZE 4096
+        int closing;
+        unsigned char *write_buf;
+        int write_cnt;
+        /* If the tty has a pending do_SAK, queue it here - akpm */
+        struct work_struct SAK_work;
+        struct tty_port *port;
+    } __randomize_layout;
+而在`tty_struct`结构体中有一个非常棒的结构体`tty_operations`,其源码如下:
+    struct tty_operations {
+        struct tty_struct * (*lookup)(struct tty_driver *driver,
+                struct file *filp, int idx);
+        int  (*install)(struct tty_driver *driver, struct tty_struct *tty);
+        void (*remove)(struct tty_driver *driver, struct tty_struct *tty);
+        int  (*open)(struct tty_struct * tty, struct file * filp);
+        void (*close)(struct tty_struct * tty, struct file * filp);
+        void (*shutdown)(struct tty_struct *tty);
+        void (*cleanup)(struct tty_struct *tty);
+        int  (*write)(struct tty_struct * tty,
+                  const unsigned char *buf, int count);
+        int  (*put_char)(struct tty_struct *tty, unsigned char ch);
+        void (*flush_chars)(struct tty_struct *tty);
+        int  (*write_room)(struct tty_struct *tty);
+        int  (*chars_in_buffer)(struct tty_struct *tty);
+        int  (*ioctl)(struct tty_struct *tty,
+                unsigned int cmd, unsigned long arg);
+        long (*compat_ioctl)(struct tty_struct *tty,
+                     unsigned int cmd, unsigned long arg);
+        void (*set_termios)(struct tty_struct *tty, struct ktermios * old);
+        void (*throttle)(struct tty_struct * tty);
+        void (*unthrottle)(struct tty_struct * tty);
+        void (*stop)(struct tty_struct *tty);
+        void (*start)(struct tty_struct *tty);
+        void (*hangup)(struct tty_struct *tty);
+        int (*break_ctl)(struct tty_struct *tty, int state);
+        void (*flush_buffer)(struct tty_struct *tty);
+        void (*set_ldisc)(struct tty_struct *tty);
+        void (*wait_until_sent)(struct tty_struct *tty, int timeout);
+        void (*send_xchar)(struct tty_struct *tty, char ch);
+        int (*tiocmget)(struct tty_struct *tty);
+        int (*tiocmset)(struct tty_struct *tty,
+                unsigned int set, unsigned int clear);
+        int (*resize)(struct tty_struct *tty, struct winsize *ws);
+        int (*set_termiox)(struct tty_struct *tty, struct termiox *tnew);
+        int (*get_icount)(struct tty_struct *tty,
+                    struct serial_icounter_struct *icount);
+        void (*show_fdinfo)(struct tty_struct *tty, struct seq_file *m);

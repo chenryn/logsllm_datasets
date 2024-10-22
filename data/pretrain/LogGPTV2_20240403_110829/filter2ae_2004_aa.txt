@@ -1,0 +1,75 @@
+**作者：启明星辰ADLab  
+公众号：**
+### 1 研究背景
+4月1日，以色列安全研究员Gil Dabah在博客上发布了一篇关于win32k漏洞研究文章，描述了如何通过内核对象的Destroy函数和win32k
+user-mode callback缓解措施的特性来寻找UAF漏洞的新思路。
+为此，启明星辰ADLab对win32k相关内核机制进行研究分析，并对这类漏洞的挖掘思路进行详细解读分析。
+### 2 win32k漏洞缓解与对抗
+#### 2.1 win32k user-mode callback漏洞
+由于设计原因，win32k驱动需要处理很多用户层的回调，这些回调给win32k模块的安全带来了非常大的隐患，并在过去10年时间贡献了大量的漏洞。
+为了便于漏洞描述，以如下伪代码进行举例分析。
+    NtUserSysCall()
+    ｛
+        PWND p = CreateWindowEx(…);
+        somecallback();
+        xxxSetWindowStyle(p);
+    ｝
+上述代码执行效果如下图所示，用户层执行的某函数通过syscall传入内核层，当内核层代码执行到somecallback这一句时，用户层可以在用户定义的callback函数中获得代码执行的机会，如果用户在callback函数调用了DestroyWindow函数销毁窗口p，内核层的相应销毁代码将会被执行，p的相应内存被释放，回调执行完毕，NtUserSysCall函数继续执行，当执行到xxxSetWindowStyle(p)一句时，由于p的内存已经被释放从而导致UAF漏洞的产生。
+![
+](https://images.seebug.org/content/images/2020/05/111a0766-2239-49bd-b985-270ae656bf9d.png-w331s)
+#### 2.2 user-mode callback漏洞缓解机制
+为了防止上述问题的产生，微软在对象中引入了一个引用计数（对象+0x8处），对象分配时引用计数为1，当执行对象的Destroy函数时引用计数减1，当引用计数为0时对象会被真正释放。微软通过锁的概念为对象添加和减少引用计数，在win32k中为对象管理引用计数的锁有两种分别是临时锁（相应函数为ThreadLock/
+ThreadUnlock）和永久锁（相应函数为HMAssignmentLock/ HMAssignmentUnlock）。经过加固之后代码表现为如下形式：
+    NtUserSysCall()
+    ｛
+        PWND p = CreateWindowEx(…);
+        ThreadLock(p);
+        Somecallback();
+        xxxSetWindowStyle(p);
+        ThreadUnlock();
+    ｝
+通过上述代码，可以保证即使callback被执行，p在xxxSetWindowStyle函数执行的时候也不会被释放。
+#### 2.3 缓解机制的对抗技术
+上一节提到了对象的引用计数，如果对象的引用计数为正，即使执行对象的destroy函数，对象没有真正被释放，仍旧存留在内存中，这种对象被微软开发者称为僵尸（Zombie）对象。一旦僵尸对象的引用计数减少到0它将会消失，但是在此之前它仍旧存在内存中，只是用户层无法访问该对象。
+同时为了防止僵尸对象继续存留在内存中，锁的释放函数（ThreadUnlock/ HMAssignmentUnlock）一般会包含对象的释放环节。
+对象的Destroy函数还有一个特性就是在释放对象的同时，Destroy函数也会释放对象的子资源，其过程可以简要描述如下。
+    void xxxDestroyWindow(PWND pwnd)
+    ｛
+        xxxFW_DestroyAllChildren(); // Destroy child windows, if exist!
+        if (NULL != pwnd->spmenu)  // If there’s a menu, remove and destroy it.
+        ｛
+            PMENU tmp = pwnd->spmenu;
+            if (HMAssignmentUnlock(&pwnd->spmenu)) // If it’s still locked
+            ｛
+                DestroyMenu(tmp); // Try destroying it (it can remain a zombie).
+    ｝
+    ｝
+    DereferenceClass(pwnd);
+    if (HMMarkObjectDestroy(pwnd)) // Check for zero refs!
+        HmFreeObject(pwnd); // Only now free the object and handle pair.
+    ｝
+DestroyWindow在第一次调用时释放子资源，一旦窗口不再被引用，句柄管理器就会再次完全销毁它，一般情况下，第二次销毁Destroy函数不会在去处理子资源，因为第一次已经释放了所有的子资源。
+但是事情往往不是这么简单，事实上即使是一个已经调用过相应Destroy函数释放的僵尸对象，仍然有机会对其本身进行一些更改（回调之后内核代码仍会对对象进行一些操作），我们把这种情况叫做Zombie
+Reload，当该僵尸对象由于引用计数为0而被真正释放时，之前的更改操作将会给内核带来一些隐患。
+对于如下代码片段：
+    ThreadLock(pwnd);
+    xxxSomeCallback(); // Here we can destroy pwnd from user-mode.
+    InternalSetTimer(pwnd, ...);  // reuse pwnd without check wether it is destroyed
+    ThreadUnlock();
+    SomefunctionUseTimer();   //UAF of Timer
+我们在用户层回调中对pwnd执行了Destroy函数，然后通过InternalSetTimer为之设置了一个计时器，当ThreadUnlock将pwnd真正释放的时候，计时器也将被释放，那么接下来对计时器的操作将会导致UAF漏洞的产生。
+### 3 案例分析
+上一节我们讨论了对象的引用计数和锁给对象带来的新的安全隐患，但是真正的挑战在于我们如何确定一段代码中存在漏洞，关键点是确保在unlock函数中释放的对象在运行到有问题的代码时其引用计数应该为1，只有这样我们才能在用户层回调调用其Destroy函数，并通过unlock函数将这个对象真正释放掉（上锁的时候会做+1处理），这也是我们接下来需要讨论的。下面我们通过一个案例来分析漏洞挖掘思路。
+#### 3.1 漏洞成因
+下图是xxxMnOpenHierarchy函数的代码片段。
+![
+](https://images.seebug.org/content/images/2020/05/31e6d62d-b88f-48e0-b607-38e42c5bf039.png-w331s)
+图中通过xxxCreateWindowEx可以获得一个返回用户层执行callback函数的机会，xxxCreateWindowEx创建的窗口将作为父窗口`*(struct
+tagWND **)(**v3 +
+8)`（上图红框）的子窗口，如果我们可以通过ThreadUnlock释放父窗口，那幺子窗口v32也会被释放，所以当后续的`safe_cast_fnid_to_PMENUWND`函数将v32作为参数执行时就会产生问题，值得注意的是通过回调释放v32是行不通的，如果这样xxxCreateWindowEx将会返回0，无法通过if判断。
+这里的问题就在于如何保证父窗口在ThreadUnlock函数执行的时候引用计数为1，因为要执行xxxMnOpenHierarchy函数需要将父窗口关联到一个menu窗口上，此时父窗口和menu窗口将会被一个永久锁锁住，下面我们介绍如何绕过永久锁。
+#### 3.2 漏洞挖掘思路
+首先我们创建了g_hMenuOwner和g_hNewOwner两个窗口，其中g_hMenuOwner的菜单句柄为hMenu，它也是g_hNewOwner的所有者。
+![
+](https://images.seebug.org/content/images/2020/05/5c6a3bb2-0dee-434d-905a-50f17509ea6d.png-w331s)
+在上述创建过程中内核通过LockPopuMenu函数分别为hMenu和g_hMenuOwner添加 了永久锁，为了达成释放目的，这个永久锁需要被绕过。

@@ -1,0 +1,306 @@
+### do_slab_free
+    static __always_inline void do_slab_free(struct kmem_cache *s,
+                    struct page *page, void *head, void *tail,
+                    int cnt, unsigned long addr)
+    {
+        void *tail_obj = tail ? : head;
+        struct kmem_cache_cpu *c;
+        unsigned long tid;
+    redo:
+        // 使用tid保持cpu同步
+        do {
+            tid = this_cpu_read(s->cpu_slab->tid);
+            c = raw_cpu_ptr(s->cpu_slab);
+        } while (IS_ENABLED(CONFIG_PREEMPT) &&
+             unlikely(tid != READ_ONCE(c->tid)));
+        // 和slab_alloc_node()中的barrier作用相同
+        barrier();
+        // 如果待释放obj所属的page并不是cpu_slab对应的page则进入__slab_free慢释放
+        if (likely(page == c->page)) {
+            void **freelist = READ_ONCE(c->freelist);
+            // tail_obj是待插入的obj, set_freepointer: *(tail_obj->offset)=freelist(原freelist)
+            set_freepointer(s, tail_obj, freelist);
+            // 验证cpu没有被抢占后, 使得s->cpu_slab->freelist=head(tail_obj), tid=next_tid(tid), tail_obj成功插入
+            if (unlikely(!this_cpu_cmpxchg_double(
+                    s->cpu_slab->freelist, s->cpu_slab->tid,
+                    freelist, tid,
+                    head, next_tid(tid)))) {
+                note_cmpxchg_failure("slab_free", s, tid);
+                goto redo;
+            }
+            stat(s, FREE_FASTPATH);
+        } else
+            __slab_free(s, page, head, tail_obj, cnt, addr);
+    }
+#### __slab_free
+    static void __slab_free(struct kmem_cache *s, struct page *page,
+                void *head, void *tail, int cnt,
+                unsigned long addr)
+    {
+        void *prior;
+        int was_frozen;
+        struct page new;
+        unsigned long counters;
+        struct kmem_cache_node *n = NULL;
+        // uninitialized_var消除没有初始化的警告
+        unsigned long uninitialized_var(flags);
+        stat(s, FREE_SLOWPATH);
+        if (kmem_cache_debug(s) &&
+            !free_debug_processing(s, page, head, tail, cnt, addr))
+            return;
+        do {
+            // n置空, 释放free_debug_processing()设置的自旋锁
+            if (unlikely(n)) {
+                spin_unlock_irqrestore(&n->list_lock, flags);
+                n = NULL;
+            }
+            prior = page->freelist;
+            counters = page->counters;
+            // tail是待插入的obj, set_freepointer: *(tail_obj->offset)=freelist(原freelist)
+            set_freepointer(s, tail, prior);
+            new.counters = counters;
+            was_frozen = new.frozen;
+            // inuse_obj = inuse_obj - cnt, 当前page释放了cnt(1)个obj
+            new.inuse -= cnt;
+            // 如果该page(不存在正被使用的obj或者无可被使用的obj)且没有被冻结(不属于cpu_slab), 说明正在被释放的obj是该page的最后一个被使用的obj, 该page可被放入buddy
+            if ((!new.inuse || !prior) && !was_frozen) {
+                // 如果kmem_cache存在cpu_slab->partial且该page无可用obj则冻结page, 后续会被放入cpu_slab->partial
+                if (kmem_cache_has_cpu_partial(s) && !prior) {
+                    new.frozen = 1;
+                } else {
+                    // 获得node, 加锁node资源区
+                    n = get_node(s, page_to_nid(page));
+                    spin_lock_irqsave(&n->list_lock, flags);
+                }
+            }
+        // 释放head(正在被释放的obj)进入page(page->freelist=head, page->counters=new.counters)
+        } while (!cmpxchg_double_slab(s, page,
+            prior, counters,
+            head, new.counters,
+            "__slab_free"));
+        if (likely(!n)) {
+            // 如果page没有被冻结, 则将page挂载进入cpu_slab->partial
+            if (new.frozen && !was_frozen) {
+                put_cpu_partial(s, page, 1);
+                stat(s, CPU_PARTIAL_FREE);
+            }
+            // page被冻结后只更新"FREE_FROZEN"信息
+            if (was_frozen)
+                stat(s, FREE_FROZEN);
+            return;
+        }
+        // 如果page无obj被使用, 且kmem_cache的半满page超过临界点(n->nr_partial >= s->min_partial), 则进行page释放
+        if (unlikely(!new.inuse && n->nr_partial >= s->min_partial))
+            goto slab_empty;
+        // 释放obj后slab从full变为partial
+        if (!kmem_cache_has_cpu_partial(s) && unlikely(!prior)) {
+            // 将slab从full链表删除, 插入n->partial链表尾部
+            remove_full(s, n, page);
+            add_partial(n, page, DEACTIVATE_TO_TAIL);
+            stat(s, FREE_ADD_PARTIAL);
+        }
+        // 解锁node资源区
+        spin_unlock_irqrestore(&n->list_lock, flags);
+        return;
+    slab_empty:
+        if (prior) {
+            // 如果该page存在可用obj, 则该page会在partial链表, 所以在partial链表中将page删除
+            remove_partial(n, page);
+            stat(s, FREE_REMOVE_PARTIAL);
+        } else {
+            // 将page从full链表中删除
+            remove_full(s, n, page);
+        }
+        spin_unlock_irqrestore(&n->list_lock, flags);
+        stat(s, FREE_SLAB);
+        discard_slab(s, page);
+    }
+##### discard_slab
+  1. discard_slab->dec_slabs_node(更新node信息)
+  2. discard_slab->free_slab->__free_slab
+    static void __free_slab(struct kmem_cache *s, struct page *page)
+    {
+        // 获得page_order
+        int order = compound_order(page);
+        int pages = 1 flags & SLAB_CONSISTENCY_CHECKS) {
+            void *p;
+            // 对page做安全检查 
+            slab_pad_check(s, page);
+            // 对page中的每个obj进行安全检测
+            for_each_object(p, s, page_address(page),
+                            page->objects)
+                check_object(s, page, p, SLUB_RED_INACTIVE);
+        }
+        // 清除page标志位
+        __ClearPageSlabPfmemalloc(page);
+        __ClearPageSlab(page);
+        // page不再被引用
+        page->mapping = NULL;
+        // 更新内存回收状态
+        if (current->reclaim_state)
+            current->reclaim_state->reclaimed_slab += pages;
+        // 更新系统状态
+        uncharge_slab_page(page, order, s);
+        // 伙伴算法释放内存
+        __free_pages(page, order);
+    }
+###### slab_pad_check
+    // 当slab_debug开启后, kmem_cache建立时, 内存空间全部被覆写成0x5a, 一个slab被切割成obj时有可能不能被完全利用, 可能会剩余一些空间(padding), 又因为padding区域在内存分配期间不会被修改, 所以应该一直是0x5a, 本函数通过对0x5a进行检测, 试图发现溢出覆写错误
+    static int slab_pad_check(struct kmem_cache *s, struct page *page)
+    {
+        u8 *start;
+        u8 *fault;
+        u8 *end;
+        u8 *pad;
+        int length;
+        int remainder;
+        // 如果kmem_cache没有配置SLAB_POISON则直接返回
+        if (!(s->flags & SLAB_POISON))
+            return 1;
+        start = page_address(page);
+        length = page_size(page);
+        end = start + length;
+        // 获得切割obj后slab的剩余空间
+        remainder = length % s->size;
+        if (!remainder)
+            return 1;
+        pad = end - remainder;
+        metadata_access_enable();
+        // 访问元数据查看POISON_INUSE magic是否被修改, 定位错误的起始位置
+        fault = memchr_inv(pad, POISON_INUSE, remainder);
+        metadata_access_disable();
+        if (!fault)
+            return 1;
+        // 定位数据覆盖的结尾
+        while (end > fault && end[-1] == POISON_INUSE)
+            end--;
+        // 抛出错误, 打印错误覆盖区间
+        slab_err(s, page, "Padding overwritten. 0x%p-0x%p", fault, end - 1);
+        print_section(KERN_ERR, "Padding ", pad, remainder);
+        restore_bytes(s, "slab padding", POISON_INUSE, fault, end);
+        return 0;
+    }
+###### check_object
+    // 讲解slub算法的开头, 列出了有关slab_debug所用到的magic_num以及obj内存布局, 本函数对magic_num和freelist进行安全检测
+    static int check_object(struct kmem_cache *s, struct page *page,
+                        void *object, u8 val)
+    {
+        u8 *p = object;
+        u8 *endobject = object + s->object_size;
+        // 如果kmem_cache区域配置了SLAB_RED_ZONE, 则对相应的magic_num进行检测
+        if (s->flags & SLAB_RED_ZONE) {
+            // 检测red_left_pad
+            if (!check_bytes_and_report(s, page, object, "Redzone",
+                object - s->red_left_pad, val, s->red_left_pad))
+                return 0;
+            // 检测Redzone
+            if (!check_bytes_and_report(s, page, object, "Redzone",
+                endobject, val, s->inuse - s->object_size))
+                return 0;
+        } else {
+            if ((s->flags & SLAB_POISON) && s->object_size inuse) {
+                // 检测padding区域
+                check_bytes_and_report(s, page, p, "Alignment padding",
+                    endobject, POISON_INUSE,
+                    s->inuse - s->object_size);
+            }
+        }
+        if (s->flags & SLAB_POISON) {
+            if (val != SLUB_RED_ACTIVE && (s->flags & __OBJECT_POISON) &&
+                // 检测obj是否早已被free检测obj[-1]是否为POISON_END(0xa5)
+                (!check_bytes_and_report(s, page, p, "Poison", p,
+                        POISON_FREE, s->object_size - 1) ||
+                 !check_bytes_and_report(s, page, p, "Poison",
+                    p + s->object_size - 1, POISON_END, 1)))
+                return 0;
+            check_pad_bytes(s, page, p);
+        }
+        if (!freeptr_outside_object(s) && val == SLUB_RED_ACTIVE)
+            /*
+             * Object and freepointer overlap. Cannot check
+             * freepointer while object is allocated.
+             */
+            return 1;
+        // 检查freelist是否有效
+        if (!check_valid_pointer(s, page, get_freepointer(s, p))) {
+            object_err(s, page, p, "Freepointer corrupt");
+            // 如果无效则丢弃该freelist链后续object
+            set_freepointer(s, p, NULL);
+            return 0;
+        }
+        return 1;
+    }
+## 进程vma
+  * 进程由许多的segment组成, 例如text segment,data segment, bss segment等, segment中被填充各种功能的数据, 每个segment具有不同的权限(r, w, x)
+  * 对于进程来说segment由什么结构来标识? 这就是接下来要将的进程vma
+### vm_area_struct 结构体
+  * 在进程中每个segment都被描述为vm_area_struct
+  * task_struct -> mm_struct -> vm_area_struct
+    struct vm_area_struct {
+        // 第一个cache line
+        unsigned long vm_start;     
+        unsigned long vm_end;                       // vm_area_struct所对应的vma在进程地址空间中的起始和结束地址
+        struct vm_area_struct *vm_next, *vm_prev;   // 按照vma在进程地址空间中的顺序, 将vma链入双链表,
+        struct rb_node vm_rb;                       // 红黑树结点
+        unsigned long rb_subtree_gap;               // 记录该vma与上一个vma(可以选择双链表中或者红黑树中)之间的空闲空间大小, 
+        // 第二个cache line
+        struct mm_struct *vm_mm;                    // 指向该vma对应的进程的mm_struct结构体
+        pgprot_t vm_page_prot;                      // 该vma访问权限
+        unsigned long vm_flags;                     // 描述该vma标志位
+        const struct vm_operations_struct *vm_ops;  // 指向function集合, 虚表
+        unsigned long vm_pgoff;                     // 以page为单位的文件映射偏移量
+        struct file * vm_file;                      // 指向被映射的文件
+        ...
+    }
+### find_vma(vma查找)
+    struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+    {
+        struct rb_node *rb_node;
+        struct vm_area_struct *vma;
+        // 在cache中寻找vma
+        vma = vmacache_find(mm, addr);
+        if (likely(vma))
+            return vma;
+        // 定位红黑树根节点
+        rb_node = mm->mm_rb.rb_node;
+        // 在红黑树中查找vma
+        while (rb_node) {
+            struct vm_area_struct *tmp;
+            // 获得当前结点的vm_area_struct
+            tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+            if (tmp->vm_end > addr) {
+                vma = tmp;
+                if (tmp->vm_start rb_left;
+            } else
+                rb_node = rb_node->rb_right;
+        }
+        // 如果查找到的vma有效, 则更新cache
+        if (vma)
+            vmacache_update(addr, vma);
+        return vma;
+    }
+#### vmacache_find
+    struct vm_area_struct *vmacache_find(struct mm_struct *mm, unsigned long addr)
+    {
+        // 通过左移addr, 定位addr对应的index(这个位置可能会存在对应的vma)
+        int idx = VMACACHE_HASH(addr);
+        int i;
+        // 记录事件
+        count_vm_vmacache_event(VMACACHE_FIND_CALLS);
+        // 检测mm是否是当前进程的mm_struct, 如果是第一次触发cache, 将进行初始化
+        if (!vmacache_valid(mm))
+            return NULL;
+        // 遍历current->vmacache.vmas[](从idx开始, 因为inx对应的位置cache hit可能性最大)
+        for (i = 0; i vmacache.vmas[idx];
+            if (vma) {
+    #ifdef CONFIG_DEBUG_VM_VMACACHE
+                if (WARN_ON_ONCE(vma->vm_mm != mm))
+                    break;
+    #endif
+                // 判断vma是否匹配
+                if (vma->vm_start vm_end > addr) {
+                    count_vm_vmacache_event(VMACACHE_FIND_HITS);
+                    return vma;
+                }
+            }
+            // inx遍历到VMACACHE_SIZE后, 归0继续遍历(idx是从中间开始遍历的)

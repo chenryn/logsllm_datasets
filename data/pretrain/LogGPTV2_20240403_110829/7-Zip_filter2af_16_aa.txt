@@ -1,0 +1,93 @@
+# 7-Zip：从未初始化内存到远程代码执行
+##### 译文声明
+本文是翻译文章，文章来源：https://landave.io/
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 一、前言
+之前我发表过一篇[文章](https://landave.io/2018/01/7-zip-multiple-memory-corruptions-via-rar-and-zip/)介绍了7-Zip的CVE-2017-17969以及CVE-2018-5996漏洞，后面我又继续花了点时间分析了反病毒软件。碰巧的是，我又发现了一个新的bug，该漏洞（与之前两个bug一样）最终会影响到7-Zip。由于反病毒软件厂商还没有发布安全补丁，因此我会在本文更新时添加受影响的产品名称。
+## 二、简介
+7-Zip的RAR代码主要基于最近版本的UnRAR代码，但代码的高层部分已经被大量修改过。我曾经在之前的一些文章中提到过，UnRAR的代码非常脆弱，因此，对这份代码的改动很有可能会引入新的问题，这一点非常正常。
+从抽象层面来讲，这个问题可以简单描述如下：在解码RAR数据前，应用程序需要对RAR解码器类的一些成员数据结构进行初始化操作，而这些初始化操作需要依赖RAR处理函数来正确配置解码器。不幸的是，RAR处理函数无法正确过滤其输入数据，会将错误的配置传入解码器，导致程序使用未初始化内存。
+现在你可能会认为这个问题无关痛痒。不可否认的是，我第一次发现这个问题时也存在相同的看法，然而事实证明并非如此。
+接下来我会详细介绍这个漏洞，然后简单看一下7-Zip的修复措施，最后我们来看一下如何利用这个漏洞实现远程代码执行。
+## 三、漏洞分析（CVE-2018-10115）
+存在问题的代码位于solid compression处理流程中。solid
+compression的原理很简单：给定一组文件（比如来自于某个文件夹的一组文件），我们可以将这些文件当成一个整体，即单独的一个数据块，然后对整个数据块进行压缩（而不是单独压缩每一个文件）。这样可以达到较高的压缩率，特别是文件数非常多或类似情况时压缩率会更高。
+在（版本5之前的）RAR格式中，solid
+compression的用法非常灵活：压缩文档中每个文件（item）都可以打上`solid`标记，与其他item无关。如果某个item设置了solid位，那么解码器在解码这个item时并不会重新初始化其状态，而会从前一个item的状态继续处理。
+显而易见的是，程序需要确保解码器对象在一开始时（从解码第一个item开始）就初始化其状态。我们来看一下7-Zip中的具体实现。RAR处理器中包含[NArchive::NRar::CHandler::Extract](https://landave.io/2018/05/7-zip-from-uninitialized-memory-to-remote-code-execution/#fn:1)这样一个方法，该方法在循环中通过一个变量索引遍历所有item。在这个循环中，我们可以找到如下代码：
+    Byte isSolid = (Byte)((IsSolid(index) || item.IsSplitBefore()) ? 1: 0);
+    if (solidStart) {
+      isSolid = 0;
+      solidStart = false;
+    }
+    RINOK(compressSetDecoderProperties->SetDecoderProperties2(&isSolid, 1));
+这段代码的主要原理是使用`solidStart`这个布尔（boolean）标志，该标志初始化为`true`（在循环开始前），确保在解码第一个item时，使用`isSolid==false`来配置解码器。此外，只要使用`isSolid==false`来调用解码器，那么解码器在开始解码前总会（重新）初始化其状态。
+这个逻辑看上去没有问题，对吧？好吧，其实问题在于RAR支持3种不同的编码方法（版本5除外），每个item都可以使用不同的方法进行编码。更具体一点，这3种编码方法中每一种都存在不同的解码器对象。有趣的是，3种解码器对象的构造函数中并没有对一大部分成员进行初始化处理。这是因为对于非solid的item，其状态总是需要重新进行初始化，并且有一个隐含的前提，那就是解码器的调用者会确保首次调用解码器时使用`isSolid==false`。然而我们可以[构造](https://landave.io/2018/05/7-zip-from-uninitialized-memory-to-remote-code-execution/#fn:2)如下这样一个RAR压缩包，打破这个假设条件：
+1、第一个item使用的是v1编码方法；
+2、第二个item使用的是v2（或者v3）编码方法，并且设置了`solid`位。
+第一个item会导致`solidStart`标志设置为`false`。对于第二个item，应用会创建一个新的Rar2解码对象，然后（由于已经设置了`solid`标志位）在解码器中大部分成员未经初始化的状态下，开始解码过程。
+乍看之下，这可能不是个大问题。然而，许多数据没经过初始化处理可能会被恶意利用，导致出现内存损坏：
+1、保存堆上缓存大小的成员变量。这些变量现在保存的大小值可能比真实的缓冲区还要大，就会出现堆缓冲区溢出现象。
+2、带有索引的数组，这些数组用来索引其他数组的读写操作。
+3、在我之前那篇[文章](https://landave.io/2018/01/7-zip-multiple-memory-corruptions-via-rar-and-zip/)中讨论过的PPMd状态。这些代码很大程度上依赖于模型状态的正确性，然而现在这个正确性很容易就会被破坏。
+很显然，以上并没有覆盖所有的利用场景。
+## 四、修复措施
+实际上这个漏洞的本质是程序无法确保在第一次使用解码器类之前正确初始化解码器类的状态。相反，在解码第一个item前，程序需要依赖调用者使用`isSolid==false`来配置解码器。前面我们也看到过，这么做效果并不是特别好。
+解决这个漏洞可以采用两种不同的方法：
+1、在解码器类的构造函数中正确初始化所有的状态。
+2、在每个解码器类中添加一个额外的boolean成员变量：`solidAllowed`（初始化为`false`）。如果`solidAllowed==false`，即便`isSolid==true`，解码器也会遇到错误终止处理作业（或者设置`isSolid=false`）。
+UnRAR貌似使用的是第一种方法，而Igor Pavlov选择使用第二种方法来修复7-Zip。
+如果你想自己修复7-Zip的某个分支，或者你对修复过程比较感兴趣，那么你可以参考[这个文件](https://landave.io/files/patch_7zip_CVE-2018-10115.txt)，文件总结了具体的版本改动。
+## 五、缓解漏洞利用
+在介绍CVE-2017-17969以及CVE-2018-5996漏洞的上一篇[文章](https://landave.io/2018/01/7-zip-multiple-memory-corruptions-via-rar-and-zip/)中，我提到7-Zip在18.00（beta）版本之前缺少DEP以及ASLR机制。在那篇文章公布后不久，Igor Pavlov 就发布了7-Zip
+18.01，该版本带有`/NXCOMPAT`标志，在全平台上启用了DEP。此外，所有动态库（`7z.dll`、`7-zip.dll`以及`7-zip32.dll`）都带有`/DYNAMICBASE`标志以及重定位表。因此，大部分运行代码都受到ASLR的约束。
+然而，所有的主执行文件（`7zFM.exe`、`7zG.exe`以及`7z.exe`）并没有使用`/DYNAMICBASE`标志，同时剥离了重定位表。这意味着不仅这些程序不受ASLR约束，并且我们也无法使用诸如EMET或者Windows
+Defender Exploit Guard之类的工具强制启用ASLR功能。
+显然，只有当所有的模块都正确随机化后，ASLR才能发挥作用。我之前和Igor讨论过这个问题，已经说服他在新版的7-Zip
+18.05中，让主执行程序使用`/DYNAMICBASE`标志以及重定位表。目前64位版本的7-Zip仍在使用标准的非高熵版ASLR（大概是因为基础镜像小于4GB），但这是一个小问题，可以在未来版本中解决。
+另外我想指出一点，7-Zip并不会分配或者映射其他可执行内存空间，因此可以作为Windows ACG（Arbitrary Code
+Guard）机制的保护目标。如果你使用的是Windows 10，我们可以在Windows Defender Security
+Center中添加7-Zip的主执行文件（`7z.exe`、`7zFM.exe`以及`7zG.exe`），为其启用保护功能（操作路径为：App &
+browser control -> Exploit Protection -> Program
+settings）。这样将会应用W^X策略，使代码执行的漏洞利用过程变得更加困难。
+## 六、编写代码执行利用载荷
+通常情况下，我并不会花太多事件来思考如何开发武器化的利用技术。然而，如果我们想知道在给定条件下，编写漏洞利用代码需要花费多少精力，那么此时我们可以考虑实际动手试一下。
+我们的目标平台为打上完整更新补丁的Windows 10 Redstone 4（RS4，Build
+17134.1），64位操作系统，上面运行着64位版本的7-Zip 18.01。
+###  挑选合适的利用场景
+使用7-Zip来解压归档文件时，我们主要可以采用3种方法：
+1、通过GUI界面打开压缩文档，分别提取其中的文件（比如使用拖放操作）或者使用`Extract`按钮解压整个压缩文档。
+2、右键压缩文件，在弹出的菜单种选择“7-Zip->Extract Here”或者“7-Zip->Extract to subfolder”。
+3、使用命令行版本的7-Zip进行解压。
+这三种方法都要调用不同的可执行文件（`7zFM.exe`、`7zG.exe`以及
+`7z.exe`）。这些模块中缺乏ASLR，由于我们想利用这一点，因此我们需要关注文件提取方法。
+第二种方法（通过上下文菜单解压文件）看起来吸引力最大，原因在于这可能是人们最常使用的方法，并且通过这种方法我们可以较为精确地预测用户的行为（不像第一种方法那样，人们会打开压缩文档，但选择提取“错误”的文件）。因此，我们选择第二种方法作为目标。
+###  利用策略
+利用前面介绍的那个问题，我们可以创建一个Rar解码器，针对（大部分）未初始化的状态执行处理过程。我们来看一下哪个Rar解码器可以让我们以攻击者期望看到的效果来破坏内存。
+一种可能的方法是选择使用Rar1解码器，其[NCompress::NRar1::CDecoder::HuffDecode](https://landave.io/2018/05/7-zip-from-uninitialized-memory-to-remote-code-execution/#fn:3)方法包含如下代码：
+    int bytePlace = DecodeNum(...);
+    // some code omitted
+    bytePlace &= 0xff;
+    // more code omitted
+    for (;;)
+    {
+      curByte = ChSet[bytePlace];
+      newBytePlace = NToPl[curByte++ & 0xff]++;
+      if ((curByte & 0xff) > 0xa1)
+        CorrHuff(ChSet, NToPl);
+      else
+        break;
+    }
+    ChSet[bytePlace] = ChSet[newBytePlace];
+    ChSet[newBytePlace] = curByte;
+    return S_OK;
+这一点非常有用，因为Rar1解码器的未初始化状态中包含`uint32_t`类型的数组`ChSet`以及`NtoPl`。因此，`newBytePlace`是攻击者可控的一个`uint32_t`，`curByte`也是如此（有个限制条件就是最低有效字节不能大于`0xa1`）。此外，`bytePlace`需要根据输入流来决定，因此这个值也是攻击者可控的一个值（但不能大于`0xff`）。
+这样就让我们具有很好的读写利用条件。但是请注意，我们正处于64位地址空间中，所以我们不可能通过`ChSet`的32位偏移量来访问Rar1解码器对象的vtable指针（即便乘以`sizeof(uint32_t)`这个值）。因此，我们的目标是堆上位于Rar1解码器之后的那个对象的vtable指针。
+为此我们可以使用一个Rar3解码器对象，与此同时我们也会使用该对象来保存我们的载荷。更具体一点，我们利用前面得到的读写条件将`_windows`指针（Rar3解码器的一个成员变量）与同一个Rar3解码器对象的vtable指针进行交换。`_window`指向的是一个4MB大小的缓冲区，该缓冲区保存着利用解码器提取出的数据（也就是说这也是攻击者可控的一段数据）。
+我们将使用stack pivot技术（`xchg rax,
+rsp`）将某个地址填充到`_window`缓冲区中，然后跟着一个ROP链以获得可执行的内存并执行shellcode（我们也会将这段shellcode放入`_windows`缓冲区中）。
+###  在堆上放置一个替代对象
+为了成功实现既定策略，我们需要完全控制解码器的未经初始化的内存空间。大致做法就是分配大小为Rar1解码器对象大小的一段内存空间，将所需数据写入其中，然后在程序真正分配Rar1解码器空间之前先行释放掉这块内存。
+显然，我们需要确保Rar1解码器所分配的空间的确重用了我们先前释放的同一块内存区域。想实现这个目标的一种直接方法就是激活相同大小的低碎片堆（Low
+Fragmentation Heap，LFH），然后使用多个替代对象来喷射LFH。这种方法的确行之有效，然而由于从Windows

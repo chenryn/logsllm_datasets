@@ -1,0 +1,239 @@
+             *
+             * Since this is without lock semantics the protection is only
+             * against code executing on this cpu *not* from access by
+             * other cpus.
+             */
+            // 通过一个原子操作取出对象
+            if (unlikely(!this_cpu_cmpxchg_double(
+                    s->cpu_slab->freelist, s->cpu_slab->tid,
+                    object, tid,
+                    next_object, next_tid(tid)))) {
+                // 获取失败，回到redo，尝试重新分配
+                note_cmpxchg_failure("slab_alloc", s, tid);
+                goto redo;
+            }
+            // 若获取成功，则使用此函数更新数据
+            prefetch_freepointer(s, next_object);
+            // 设置 kmem_cache_cpu 的状态位,表示通过当前cpu的cpu slub分配对象(快路径分配)
+            stat(s, ALLOC_FASTPATH);
+        }
+        // 初始化我们刚刚获取的对象
+        if (unlikely(gfpflags & __GFP_ZERO) && object)
+            memset(object, 0, s->object_size);
+        // 进行分配后处理
+        slab_post_alloc_hook(s, gfpflags, 1, &object);
+        return object;
+    }
+###  `__slab_alloc()`源码分析
+`__slab_alloc()`用于分配一个新的slab并从中取出一个对象：(`__slab_alloc()`在`/source/mm/slub.c#L2612`处实现）
+    /*
+     * Another one that disabled interrupt and compensates for possible
+     * cpu changes by refetching the per cpu area pointer.
+     */
+    static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+                  unsigned long addr, struct kmem_cache_cpu *c)
+    {
+        void *p;
+        unsigned long flags;
+        // 禁用系统中断
+        local_irq_save(flags);
+    #ifdef CONFIG_PREEMPT
+        /*
+         * We may have been preempted and rescheduled on a different
+         * cpu before disabling interrupts. Need to reload cpu area
+         * pointer.
+         * 由于在关中断之前，可能被抢占或者重新调度（迁移到其余cpu），因此需要重新获取每cpu变量
+         */
+        c = this_cpu_ptr(s->cpu_slab);
+    #endif
+        // 核心函数
+        p = ___slab_alloc(s, gfpflags, node, addr, c);
+        // 恢复使用系统中断
+        local_irq_restore(flags);
+        return p;
+    }
+###  `___slab_alloc()`源码分析
+`___slab_alloc()`是`__slab_alloc()`的核心方法：(`___slab_alloc()`在`/source/mm/slub.c#L2519`处实现）
+    /*
+     * Slow path. The lockless freelist is empty or we need to perform
+     * debugging duties.
+     *
+     * Processing is still very fast if new objects have been freed to the
+     * regular freelist. In that case we simply take over the regular freelist
+     * as the lockless freelist and zap the regular freelist.
+     *
+     * If that is not working then we fall back to the partial lists. We take the
+     * first element of the freelist as the object to allocate now and move the
+     * rest of the freelist to the lockless freelist.
+     *
+     * And if we were unable to get a new slab from the partial slab lists then
+     * we need to allocate a new slab. This is the slowest path since it involves
+     * a call to the page allocator and the setup of a new slab.
+     *
+     * Version of __slab_alloc to use when we know that interrupts are
+     * already disabled (which is the case for bulk allocation).
+     */
+    static void *___slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+                  unsigned long addr, struct kmem_cache_cpu *c)
+    {
+        void *freelist;
+        struct page *page;
+        page = c->page;
+        // 如果没有本地活动 slab，转到 new_slab 步骤获取 slab
+        if (!page)
+            goto new_slab;
+    redo:
+        if (unlikely(!node_match(page, node))) {
+            // 如果本处理器所在节点与指定节点不一致
+            int searchnode = node;
+            if (node != NUMA_NO_NODE && !node_present_pages(node))
+                // 获取指定节点的node
+                searchnode = node_to_mem_node(node);
+            if (unlikely(!node_match(page, searchnode))) {
+                // 如果node还是不匹配，则移除cpu slab，进入new_slab流程
+                stat(s, ALLOC_NODE_MISMATCH);
+                // 移除cpu slab(释放每cpu变量的所有freelist对象指针)
+                deactivate_slab(s, page, c->freelist, c);
+                goto new_slab;
+            }
+        }
+        /*
+         * By rights, we should be searching for a slab page that was
+         * PFMEMALLOC but right now, we are losing the pfmemalloc
+         * information when the page leaves the per-cpu allocator
+         */
+        // 判断当前页面属性是否为pfmemalloc，如果不是则同样移除cpu slab。
+        if (unlikely(!pfmemalloc_match(page, gfpflags))) {
+            deactivate_slab(s, page, c->freelist, c);
+            goto new_slab;
+        }
+        /* must check again c->freelist in case of cpu migration or IRQ */
+        // 再次检查空闲对象指针freelist是否为空
+        // 避免在禁止本地处理器中断前因发生了CPU迁移或者中断，导致本地的空闲对象指针不为空；
+        freelist = c->freelist;
+        if (freelist)
+            // 如果不为空的情况下，将会跳转至load_freelist
+            goto load_freelist;
+        // 如果为空，将会更新慢路径申请对象的统计信息
+        // 并通过 get_freelist() 从非冻结页面（未在cpu缓存中）中获取空闲队列
+        freelist = get_freelist(s, page);
+        // 若获取空闲队列失败则需要创建新的 slab
+        if (!freelist) {
+            c->page = NULL;
+            stat(s, DEACTIVATE_BYPASS);
+            goto new_slab;
+        }
+        // 否则更新统计信息进入 load_freelist 分支取得对象并返回
+        stat(s, ALLOC_REFILL);
+    load_freelist:
+        /*
+         * freelist is pointing to the list of objects to be used.
+         * page is pointing to the page from which the objects are obtained.
+         * That page must be frozen for per cpu allocations to work.
+         * freelist 指向将要被使用的空闲列表
+         * page 指向包含对象的页
+         * page 应处于冻结状态，即在cpu缓存中
+         */
+        VM_BUG_ON(!c->page->frozen);
+        // 获取空闲对象并返回空闲对象
+        c->freelist = get_freepointer(s, freelist);
+        c->tid = next_tid(c->tid);
+        return freelist;
+    new_slab:
+        // 首先会判断 partial 是否为空，不为空则从 partial 中取出 page ，然后跳转回 redo 重试分配
+        if (slub_percpu_partial(c)) {
+            page = c->page = slub_percpu_partial(c);
+            slub_set_percpu_partial(c, page);
+            stat(s, CPU_PARTIAL_ALLOC);
+            goto redo;
+        }
+        //如果partial为空，意味着当前所有的slab都已经满负荷使用，那么则需使用new_slab_objects()创建新的slab
+        freelist = new_slab_objects(s, gfpflags, node, &c);
+        if (unlikely(!freelist)) {
+            // 如果创建失败，调用slab_out_of_memory()记录日志后返回NULL表示申请失败
+            slab_out_of_memory(s, gfpflags, node);
+            return NULL;
+        }
+        page = c->page;
+        if (likely(!kmem_cache_debug(s) && pfmemalloc_match(page, gfpflags)))
+            goto load_freelist;
+        /* Only entered in the debug case */
+        if (kmem_cache_debug(s) &&
+                !alloc_debug_processing(s, page, freelist, addr))
+            goto new_slab;    /* Slab failed checks. Next slab needed */
+        deactivate_slab(s, page, get_freepointer(s, freelist), c);
+        return freelist;
+    }
+## 0x05 整体分配流程总结
+那么，我们可以总结出整个`slub`分配器的初始化以及创建流程：
+  1. 首先，内核调用`kmem_cache_init`，创建两个结构体`boot_kmem_cache`和`boot_kmem_cache_node`，这两个结构体将作为`kmem_cache`和`kmem_cache_node`的管理结构体。 
+    1. 然后，内核调用`create_boot_cache()`初始化`boot_kmem_cache_node`结构体的部分成员变量，被初始化的成员变量如下：`name`、`size`、`object_size`、`align`、`memcg`。 
+      1. 紧接着，内核继续调用`__kmem_cache_create`继续初始化`boot_kmem_cache_node`结构体，而进入`__kmem_cache_create`后又会直接进入`kmem_cache_open`，最终的初始化工作将会在`kmem_cache_open`中完成。 
+        1. 在`kmem_cache_open`中，内核首先初始化结构体的`flag`成员，注意，内核将在这一步来判断是否开启了内核调试模式，若开启，`flag`则为空值。
+        2. 接下来如果内核开启了`CONFIG_SLAB_FREELIST_HARDENED`保护，内核将获取一个随机数存放在结构体的`random`成员变量中。
+        3. 若开启了`SLAB_TYPESAFE_BY_RCU`选项(`RCU`是自`Kernel 2.5.43`其`Linux`官方加入的锁机制)，则设置结构体的`random`成员变量`reserved`为`rcu_head`结构体的大小。
+        4. 接下来调用`calculate_sizes()`计算并设置结构体内其他成员变量的值，首先会从结构体的`object_size`和`flag`中取值。 
+          1. 在`calculate_sizes()`中，内核首先将取到的`size`与`sizeof(void *)`指针大小对齐，这是为了能够将空闲指针存放至对象的边界中。
+          2. 接下来，若内核的调试模式(`CONFIG_SLUB_DEBUG`)被启用且`flag`中申明了用户会在对象释放后或者申请前访问对象，则需要调整`size`，以期能够在对象的前方和后方插入一些数据用来在调试时检测是否存在越界写。
+          3. 接下来设置结构体的`inuse`成员以表示元数据的偏移量，这也同时表示对象实际使用的大小，也意味着对象与空闲对象指针之间的可能偏移量。
+          4. 接下来判断是否允许用户越界写，若允许越界写，则对象末尾和空闲对象之间可能会存在其余数据，若不允许，则直接重定位空闲对象指针到对象末尾，并且设置`offset`成员的值。
+          5. 接下来，若内核的调试模式(`CONFIG_SLUB_DEBUG`)被启用且`flag`中申明了用户需要内核追踪该对象的使用轨迹信息，则需要调整`size`，在对象末尾加上两个`track`的空间大小，用于记录该对象的使用轨迹信息（分别是申请和释放的信息。
+          6. 接下来，内核将创建一个`kasan`缓存(`kasan`是`Kernel Address Sanitizer`的缩写，它是一个动态检测内存错误的工具，主要功能是检查内存越界访问和使用已释放的内存等问题。它在`Kernel 4.0`被正式引入内核中。
+          7. 接下来，若内核的调试模式(`CONFIG_SLUB_DEBUG`)被启用且`flag`中申明了用户可能会有越界写操作时，则需要调整`size`，以期能够在对象的后方插入空白边界用来捕获越界写的详细信息。
+          8. 由于出现了多次`size`调整的情况，那么很有可能现在的`size`已经被破坏了对齐关系，因此需要再做一次对齐操作，并将最终的`size`更新到结构体的`size`中。
+          9. 接下来通过`calculate_order()`计算单`slab`的页框阶数。
+          10. 最后调用到`oo_make`计算`kmem_cache`结构的`oo`、`min`、`max`等相关信息后，内核回到`kmem_cache_open`继续执行。
+        5. 内核在回到`kmem_cache_open`后，调用`set_min_partial()`来设置`partial`链表的最小值，避免过度使用页面分配器造成冲击。
+        6. 紧接着会调用`set_cpu_partial()`据对象的大小以及配置的情况，对`cpu_partial`进行设置。
+        7. 接下来由于slab分配器尚未完全就绪，内核将尝试使用`init_kmem_cache_nodes`分配并初始化整个结构体。 
+          1. 接下来内核会建立管理节点列表，并遍历每一个管理节点，遍历时，首先建立一个`struct kmem_cache_node`，然后内核会尝试使用`slab`分配器建立整个`slab_cache`( **当且仅当slab分配器部分或完全初始化时才可以使用这个分配器进行分配** )，那么显然，我们此时的`slab`分配器状态为`DOWN`。
+          2. 接下来程序将调用`early_kmem_cache_node_alloc()`尝试建立第一个节点对象。 
+            1. 在`early_kmem_cache_node_alloc()`中，内核会首先通过`new_slab()`创建`kmem_cache_node`结构空间对象的`slab`，它将会检查传入的`flag`是否合法，若合法，将会进入主分配函数`allocate_slab()`。 
+              1. 在主分配函数`allocate_slab()`中，内核会首先建立一个`page`结构体，此时若传入的`flag`带有`GFP`标志，程序将会启用内部中断。
+              2. 尝试使用`alloc_slab_page()`进行内存页面申请，若申请失败，则会将`oo`调至`s->min`进行降阶再次尝试申请， **再次失败则返回错误** ！
+              3. 若申请成功，则开始初始化`page`结构体，设置`page`的`object`成员为从`oo`获取到的`object`，设置`page`的`slab_cache`成员为它所属的`slab_cache`，并将`page`链入节点中。
+              4. 接下来内核会对申请下来的页面的值利用 memset 进行初始化。
+              5. 接下来就是经过`kasan`的内存检查和调用`shuffle_freelist` 函数，`shuffle_freelist` 函数会根据`random_seq` 来把 `freelist` 链表的顺序打乱，这样内存申请的`object`后，下一个可以申请的`object`的地址也就变的不可预测。
+            2. 接下来内核会返回到`early_kmem_cache_node_alloc()`继续运行，内核首先会检查申请下来的`page`和`node`是否对应，若对应则进行下一步操作，否则将会打印错误信息并返回。
+            3. 接下来初始化`page`的相关成员，然后将取出`page`的第一个对象，初始化后将其加入`partial`链表。
+          3. 返回到`init_kmem_cache_nodes()`继续执行，继续申请下一个节点对象。(这个过程由于始终没有更新slab分配器的状态，因此还需要继续使用`early_kmem_cache_node_alloc()`)
+        8. 接下来内核会返回到`kmem_cache_open`继续运行，内核将尝试使用`alloc_kmem_cache_cpus`继续执行初始化操作，初始化失败则触发`panic`。
+      2. 接下来内核会返回到`__kmem_cache_create`继续运行，如果此时`slub`分配器仍未初始化完毕，则直接返回。
+    2. 接下来内核会返回到`create_boot_cache()`继续运行，接下来，若没有返回错误，则继续返回到父函数。
+  2. 接下来内核会返回到`kmem_cache_init()`继续运行，接下来内核将注册内核通知链回调， **设定`slub`分配器的状态为部分初始化已完成**，调用`create_boot_cache`创建`kmem_cache`对象缓冲区。
+  3. 接下来的调用步骤大多数与之前初始化`boot_kmem_cache_node`结构体相同，但是，此时的`slub`分配器的状态为部分初始化已完成。于是此时我们在进入`init_kmem_cache_nodes`后，在`if (slab_state == DOWN)`分支处将会使得内核不再使用`early_kmem_cache_node_alloc()`分配节点，取而代之的使用`kmem_cache_alloc_node`来进行分配。 
+    1. 进入`kmem_cache_alloc_node`后又会直接进入`slab_alloc_node`，最终的初始化工作将会在`slab_alloc_node`中完成。 
+      1. 进入`slab_alloc_node`后，调用`slab_pre_alloc_hook`进行预处理，返回一个用于分配`slub`对象的 `kmem_cache`。
+      2. 接下来如果`flag`标志位中启用了抢占功能，重新获取当前 CPU 的`kmem_cache_cpu`结构以及结构中的`tid`值。
+      3. 接下来加入一个`barrier`栅栏，然后获得当前cpu的空闲对象列表以及其使用的页面。
+      4. 当前`CPU`的`slub`空闲列表为空或者当前`slub`使用内存页面与管理节点不匹配时，需要重新分配`slub`对象，我们此时的空闲列表必定为空，因为我们之前仅仅在`early_kmem_cache_node_alloc()`将一个`slub`对象放在了`partial`链表中。那么，内核将会调用`__slab_alloc()`进行`slub`对象的分配。 
+        1. 在`__slab_alloc()`中，内核会首先禁用系统中断，并在那之后检查`flag`中是否允许抢占，若允许，则需要再次获取`CPU`。
+        2. 在那之后，调用`__slab_alloc()`的核心函数`___slab_alloc()`进行对象的分配。 
+          1. 在`___slab_alloc()`中，内核会首先检查有无活动的`slub`，此时必定没有，于是跳转到`new slab`处获取一个新的`slab`。
+          2. 然后内核会检查`partial`是否为空，不为空则从`partial`中取出`page`，然后跳转回`redo`重试分配。此处我们的`partial`显然不为空，那么取出`page`继续执行`redo`流程。
+          3. 首先检查本处理器所在节点是否指定节点一致，若不一致，则重新获取指定节点。
+          4. 如果节点还是不匹配，则移除`cpu slab`(释放每cpu变量的所有freelist对象指针)，进入`new_slab`流程。
+          5. 若一致，判断当前页面属性是否为`pfmemalloc`，如果不是则同样移除`cpu slab`，进入`new_slab`流程。
+          6. 再次检查空闲对象指针`freelist`是否为空，这是为了避免在禁止本地处理器中断前因发生了`CPU`迁移或者中断，导致本地的空闲对象指针不为空。
+          7. 如果不为空的情况下，将会跳转至`load_freelist`。
+          8. 如果为空，将会更新慢路径申请对象的统计信息，通过`get_freelist()`从非冻结页面（未在`cpu`缓存中）中获取空闲队列。
+          9. 若获取空闲队列失败则需要创建新的`slab`。
+          10. 此处我们之前是有初始化空闲队列操作的，因此直接跳转到`load_freelist`执行。
+          11. 从此列表中取出一个空闲对象，返回。
+        3. 接下来内核会返回到`__slab_alloc()`继续运行，内核启用系统中断，继续将获取到的对象返回。
+      5. 接下来内核会返回到`slab_alloc_node`继续运行，内核接下来进行初始化对象操作，并进行分配后处理。
+    2. 接下来内核会返回到`kmem_cache_alloc_node`继续运行，内核接收对象后进行CPU层面的相关设置，继续返回
+  4. 接下来内核会返回到`kmem_cache_init()`继续运行，内核接下来将临时`kmem_cache`向最终`kmem_cache`迁移，并修正相关指针，使其指向最终的`kmem_cache`。 **这里是因为之前我们用`early_kmem_cache_node_alloc()`事实上是静态分配的，那么我们需要对其进行迁移。**
+  5. 接下来对`kmem_cache_node`进行迁移及修正。
+  6. **至此，内核中的两大管理结构头已经分配完毕。** 接下来将使用`kmem_cache`来初始化整个`kmalloc`结构。⚠️：在`create_kmalloc_caches`中，初始化整个`kmalloc`结构结束后将设置`slub_state`为`UP`。
+  7. **接下来对整个`kmalloc`结构的`freelist`进行随机排布，以增加内核攻击者的攻击成本(安全措施)。**
+  8. 至此，整个slub分配器初始化完毕。
+## 0x06 参考链接
+[linux内核内存管理学习之一(基本概念，分页及初始化) –
+goodluckwhh](https://blog.csdn.net/goodluckwhh/article/details/9970845)
+[【Linux内存源码分析】SLUB分配算法（4）-JeanLeo](https://www.jeanleo.com/2018/09/07/%5Blinux%E5%86%85%E5%AD%98%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90%5Dslub%E5%88%86%E9%85%8D%E7%AE%97%E6%B3%95%EF%BC%884%EF%BC%89/)
+[kmem_cache_alloc核心函数slab_alloc_node的实现详解 –
+菜鸟别浪](https://blog.csdn.net/hzj_001/article/details/99706159)
+[slub分配器 – itrocker](http://www.wowotech.net/memory_management/247.html)
+[Linux伙伴系统(一)—伙伴系统的概述 –
+橙色逆流](https://blog.csdn.net/vanbreaker/article/details/7605367)

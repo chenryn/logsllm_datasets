@@ -1,0 +1,57 @@
+         concern. Phew. But instruction addresses may be aligned. Let's mangle
+         the value to get something quasi-uniform. */
+      cur_loc  = (cur_loc >> 4) ^ (cur_loc = afl_inst_rms) return;
+      /* index = prev_loc ^ cur_loc */
+      prev_loc_ptr = tcg_const_ptr(&prev_loc);
+      index = tcg_temp_new();
+      tcg_gen_ld_tl(index, prev_loc_ptr, 0);
+      tcg_gen_xori_tl(index, index, cur_loc);
+      /* afl_area_ptr[index]++ */
+      count_ptr = tcg_const_ptr(afl_area_ptr);
+      tcg_gen_add_ptr(count_ptr, count_ptr, TCGV_NAT_TO_PTR(index));
+      count = tcg_temp_new();
+      tcg_gen_ld8u_tl(count, count_ptr, 0);
+      tcg_gen_addi_tl(count, count, 1);
+      tcg_gen_st8_tl(count, count_ptr, 0);
+      /* prev_loc = cur_loc >> 1 */
+      new_prev_loc = tcg_const_tl(cur_loc >> 1);
+      tcg_gen_st_tl(new_prev_loc, prev_loc_ptr, 0);
+    }
+在每次翻译一个块之前都需要调用这一段，TB IR的生成在`tb_gen_code`(`accel/tcg/translate-all.c`)里进行的，在里边调用了目标机前端的`gen_intermediate_code`函数：
+    tcg_ctx.cpu = ENV_GET_CPU(env);
+    gen_intermediate_code(cpu, tb);
+    tcg_ctx.cpu = NULL;
+所以我们hook一下，来在每一个块之前插入我们的IR：
+    tcg_ctx.cpu = ENV_GET_CPU(env);
+    afl_gen_trace(pc);
+    gen_intermediate_code(cpu, tb);
+    tcg_ctx.cpu = NULL;
+现在我们就可以从AFL(`afl-analyze.c`, `afl-fuzz.c`, `afl-showmap.c`, `afl-tmin.c`)里去掉`setenv("QEMU_LOG", "nochain", 1)`之后测试了。
+## chain缓存
+如同我之前提到的，AFL使用了一个forkserver策略来减少初始化的额外消耗，基本上说，forkserver在初始化之后启动，然后根据AFL的请求来fork出子进程。每一个子进程都执行一个test
+case，这样的方法是可以消除QEMU初始化的消耗的，但是会导致严重的TCG
+缓存颠簸(thrashing)，因为父进程在初始化之后的缓存是空的，所以会导致子进程都以空缓存状态开始启动。为了避免这个情况，AFL的patch在父进程和子进程之间建立了一个管道，子进程使用这个管道来在每一次新的基本块翻译的时候提醒父进程，父进程之后就在自己的缓存里翻译这个块，这样未来的子进程就可以使用这个缓存了（这样的话，每个块会翻译两次，我也不觉得为了避免翻译两次而采用非常复杂的序列化有什么价值）
+为了做到这个，AFL patch了`accel/tcg/cpu-exec.c`里的`tb_find`，在`tb_gen_code`后面插入了一个`afl_request_tsl`的调用，来翻译这个块。`afl_request_tsl`函数会把需要用来标识TB的信息（地址，CS基地址，flags）发给父进程，父进程此时正在`afl_wait_tsl`里等待，最终`afl_wait_tsl`会调用`tb_gen_code`来在父进程的缓存中翻译一个块。
+`tb_find`函数接受几个参数，`last_tb`和`tb_exit`，这两个参数可以分别标识前一个TB和前一个TB的最后一条指令使我们到达现在位置的的
+_jump slot_ 。在翻译之后，如果请求的块不是已经被处理过，`tb_find`就通过patch前一个块的jump slot来进行chain：
+    /* 看下我们是否可以patch正在调用的TB */
+    /* See if we can patch the calling TB. */
+    if (last_tb && !qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
+        if (!have_tb_lock) {
+            tb_lock();
+            have_tb_lock = true;
+        }
+        if (!tb->invalid) {
+            tb_add_jump(last_tb, tb_exit, tb);
+        }
+    }
+然而`afl_wait_tsl`没有这么做，也就是说在TB间的chain不会被缓存。我实现了patch后的jump
+slot的缓存，基本上是通过在我们到达`tb_add_jump`块的时候通知父进程来实现的。为了实现这个做了一点重构，细节这里就不再说了，可以看看后面的补丁。
+## 结果
+我没时间来进行非常详尽的测试，但是我在32和64位x86目标机上做了一下测试（在64
+x86宿主机上），第一版没有chain缓存的，大概是原来速度的1.5到3倍，加上chain缓存，可以达到3到4倍的速度。路径计数和`afl-showmap`看起来可以确认trace是正确的，所以我还是很自信它应该是按照想象的情况工作的。
+## 试一下！
+TCG插桩已经在[我的AFL
+fork](https://github.com/abiondo/afl)，build和运行qemu模式都和平常一样，我的fork还包含一个导致GNU
+libc >=
+2.27时编译错误的`memfd_create`的patch，所以在linux上build应该很容易。如果你测试了，并且有更好的性能比较，issue，任何问题，都可以留个评论！

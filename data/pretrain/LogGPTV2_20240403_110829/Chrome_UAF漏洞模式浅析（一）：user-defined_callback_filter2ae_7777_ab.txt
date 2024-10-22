@@ -1,0 +1,109 @@
+          blink.mojom.FileWriter? writer);
+     // ...
+    };
+    void FileSystemManagerImpl::CreateWriter(const GURL& file_path,
+                                            CreateWriterCallback callback) {
+     DCHECK_CURRENTLY_ON(BrowserThread::IO);
+    ...
+     blink::mojom::FileWriterPtr writer;
+     mojo::MakeStrongBinding(std::make_unique(
+                                 url, context_->CreateFileSystemOperationRunner(),
+                                 blob_storage_context_->context()->AsWeakPtr()),
+                             MakeRequest(&writer));
+     std::move(callback).Run(base::File::FILE_OK, std::move(writer));
+    }
+从mojo接口可以看出`FileWriterImpl::Write`的第二个参数是一个BlobPtr。
+**注意我们是可以在js层构造一个BlobPtr传入的**
+这里的`base::BindOnce(&FileWriterImpl::DoWrite, base::Unretained(this),
+std::move(callback),
+position));`其实就是创建一个callback对象，在callback执行的时候，它将调用`FileWriterImpl::DoWrite`函数，并依次传入`base::Unretained(this),std::move(callback),
+position)`作为参数，对应于`this,WriteCallback callback,uint64_t position`
+Write将调用GetBlobDataFromBlobPtr函数，并将一个 **用户可控的blob** 和`FileWriterImpl::DoWrite`
+callback传入，这里记做callback1。
+    void FileWriterImpl::Write(uint64_t position,
+                              blink::mojom::BlobPtr blob,
+                              WriteCallback callback) {
+     blob_context_->GetBlobDataFromBlobPtr(
+         std::move(blob),
+         base::BindOnce(&FileWriterImpl::DoWrite, base::Unretained(this),
+                        std::move(callback), position));
+    }
+    ...
+    void FileWriterImpl::DoWrite(WriteCallback callback,
+                                 uint64_t position,
+                                 std::unique_ptr blob) {
+      ...
+    }
+最后我们来看一下GetBlobDataFromBlobPtr函数，其调用 **raw_blob->GetInternalUUID**函数，因为blob是我们传入的，所以GetInternalUUID也是对应我们自己定义好的js函数，它只需要满足mojo
+idl接口即可，将一个`string uuid`作为response返回。
+**此时我们就可以回调到js里，并在js函数GetInternalUUID里将之前建立好的message
+pipe给断开，从而析构掉之前创建出的FileWriterImpl对象**
+    // This interface provides access to a blob in the blob system.
+    interface Blob {
+     // Creates a copy of this Blob reference.
+     Clone(Blob& blob);
+    // This method is an implementation detail of the blob system. You should not
+     // ever need to call it directly.
+     // This returns the internal UUID of the blob, used by the blob system to
+     // identify the blob.
+     GetInternalUUID() => (string uuid);
+    }
+    ...
+    ...
+      function BlobImpl() {
+        this.binding = new mojo.Binding(blink.mojom.Blob, this);
+      }
+      BlobImpl.prototype = {
+        clone: async (arg0) => {
+          console.log('clone');
+        },
+        asDataPipeGetter: async (arg0, arg1) => {
+          console.log("asDataPipeGetter");
+        },
+        readAll: async (arg0, arg1) => {
+          console.log("readAll");
+        },
+        readRange: async (arg0, arg1, arg2, arg3) => {
+          console.log("readRange");
+        },
+        readSideData: async (arg0) => {
+          console.log("readSideData");
+        },
+        getInternalUUID: async (arg0) => {
+          console.log("getInternalUUID");
+          create_writer_result.writer.ptr.reset();
+          return {'uuid': 'blob_0'};
+        }
+      };
+回到`raw_blob->GetInternalUUID`，其参数是一个callback，这里记做callback2，callback2最终就是调用callback1，并将从uuid得到的BlobData，作为callback1，即DoWrite的最后一个参数`std::unique_ptr
+blob`。
+    ...
+    void BlobStorageContext::GetBlobDataFromBlobPtr(
+        blink::mojom::BlobPtr blob,
+        base::OnceCallback)> callback) {
+      DCHECK(blob);
+      blink::mojom::Blob* raw_blob = blob.get();
+      raw_blob->GetInternalUUID(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+          base::BindOnce(
+              [](blink::mojom::BlobPtr, base::WeakPtr context,
+                 base::OnceCallback)> callback,
+                 const std::string& uuid) {
+                ...
+                std::move(callback).Run(context->GetBlobDataFromUUID(uuid));
+              },//---> 类似于函数指针
+              std::move(blob), AsWeakPtr(), std::move(callback)),
+          ""));
+    }
+现在我们将调用callback1回调`FileWriterImpl::DoWrite`，而此时，因为FileWriterImpl实例已经在回调到js里时析构掉了，所以就触发了UAF。
+这个漏洞的一个关键就是callback1的参数`base::Unretained(this)`，被Unretained修饰的this指针，只由回调的调用者来保证回调执行时，this指针仍然可用。
+这里如果换成WeakPtr，那么在this被析构后，回调就不会被执行。
+###  poc
+###  patch
+       blob_context_->GetBlobDataFromBlobPtr(
+           std::move(blob),
+    -      base::BindOnce(&FileWriterImpl::DoWrite, base::Unretained(this),
+    +      base::BindOnce(&FileWriterImpl::DoWrite, weak_ptr_factory_.GetWeakPtr(),
+                          std::move(callback), position));
+补丁就是把`base::Unretained(this)`换成了`weak_ptr_factory_.GetWeakPtr()`，这样如果当前FileWriterImpl实例被析构掉了，则`&FileWriterImpl::DoWrite`回调不会被调用。
+## 后记
+本篇主要是笔者以前分析漏洞时候的笔记摘录修改，如有不明确之处，欢迎斧正。

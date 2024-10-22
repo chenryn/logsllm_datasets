@@ -1,0 +1,114 @@
+# 如何在iOS 12上绕过SSL Pinning
+|
+##### 译文声明
+本文是翻译文章，文章原作者 nabla-c0d3，文章来源：nabla-c0d3.github.io
+原文地址：
+译文仅供参考，具体内容表达以及含义原文为准。
+## 0x00 前言
+两星期之前，我发布了新版的[SSL Kill Switch](https://github.com/nabla-c0d3/ssl-kill-switch2)，这是我在iOS应用上禁用SSL pinning的一款黑盒工具，新版中我添加了对iOS 12的支持。
+iOS
+11和12的网络协议栈发生了较为明显的[改变](https://developer.apple.com/videos/play/wwdc2018/715/)，因此针对iOS
+11的SSL Kill Switch自然无法适用于（已越狱的）iOS 12设备。在本文中，我将与大家分享这款工具中针对iOS 12的适配改动。
+## 0x01 SSL Pinning禁用策略
+为了在移动应用上实现SSL
+pinning，在通过SSL连接服务端时，应用需要自定义服务端证书链的验证逻辑。自定义SSL验证逻辑大多会通过某种回调机制来实现，其中应用代码会在初始TLS握手中接收服务端的证书链，然后决定下一步操作（判断证书链是否“有效”）。比如，在iOS上：
+  * 打开HTTPS连接的最高级API为`NSURLSession`，该函数通过[`[NSURLSessionDelegate URLSession:didReceiveChallenge:completionHandler:]`](https://developer.apple.com/documentation/foundation/url_loading_system/handling_an_authentication_challenge/performing_manual_server_trust_authentication)委派方法来实现证书验证回调。
+  * 当使用低级的`Network.framework`（iOS 12新增功能），可以使用[`sec_protocol_options_set_verify_block()`](https://developer.apple.com/documentation/security/2976289-sec_protocol_options_set_verify_)来设置验证回调函数。
+  * Apple开发者[文档](https://developer.apple.com/library/archive/technotes/tn2232/_index.html#//apple_ref/doc/uid/DTS40012884-CH1-SECCUSTOMIZEAPIS)中描述了如何在其他iOS网络API上自定义验证逻辑。
+因此，在应用中禁用SSL pinning的较高级策略是阻止系统触发SSL验证回调，这样负责实现pinning的应用代码永远不会执行。
+在iOS上，阻止`NSURLSessionDelegate`验证方法被调用相对而言较为简单（这也是[之前版本](https://github.com/nabla-c0d3/ios-ssl-kill-switch/blob/release-0.3/Tweak.xm)SSL Kill
+Switch的工作原理），但当iOS应用使用低级API时（如`Network.framework`）该怎么办？由于iOS上的每个网络API都基于其他API构建，在最底层禁用验证回调可能会禁用所有高级网络API的验证逻辑，这样我们的工具就可以适用于许多应用。
+iOS网络协议栈从iOS 8以来经过了多次改动，在iOS
+12上，SSL/TLS栈基于[BoringSSL](https://www.imperialviolet.org/2014/06/20/boringssl.html)的自定义fork实现（我个人这么认为）。当某个应用[创建连接](https://github.com/datatheorem/TrustKit/tree/master/TrustKitDemo/TrustKitDemo-ObjC)时，我们可以在随机选择的某个BoringSSL符号上设置断点来验证这一点：
+大家应该还记得前面提到的禁用策略，如果我们定位并patch BoringSSL（iOS上最底层的SSL/TLS
+API），那么iOS上所有较高级的API（包括`NSURLSession`）都会禁用pinning验证。
+来测试一下。
+## 0x02 BoringSSL验证回调
+使用BoringSSL时，自定义SSL验证的一种方法就是通过[`SSL_CTX_set_custom_verify()`](https://github.com/google/boringssl/blob/7540cc2ec0a5c29306ed852483f833c61eddf133/include/openssl/ssl.h#L2294)函数来配置验证回调函数。
+简单的使用示例如下所示：
+    // Define a cert validation callback to be triggered during the SSL/TLS handshake
+    ssl_verify_result_t verify_cert_chain_callback(SSL* ssl, uint8_t* out_alert) {
+        // Retrieve the certificate chain sent by the server during the handshake
+        STACK_OF(X509) *certificateChain = SSL_get_peer_cert_chain(ssl);
+        // Do custom validation (pinning or something else)
+        if do_custom_validation(certificateChain) == 0 {
+            // If validation succeeded, return OK
+            return ssl_verify_ok;
+        }
+        else {
+            // Otherwise close the connection
+            return ssl_verify_invalid;
+        }
+    }
+    // Enable my callback for all future SSL/TLS connections implemented using the ssl_ctx
+    SSL_CTX_set_custom_verify(ssl_ctx, SSL_VERIFY_PEER, verify_cert_chain_callback);
+我选择的测试[应用](https://github.com/datatheorem/TrustKit/tree/master/TrustKitDemo/TrustKitDemo-ObjC)在`NSURLSession`中启用了SSL
+pinning，经过测试后我确认`SSL_CTX_set_custom_verify()`的确会在打开连接时被调用：
+我们还可以看到Apple/默认的iOS验证回调函数会以第3个参数形式传入（`x2`寄存器）：`boringssl_context_certificate_verify_callback()`。很有可能这个回调中包含一些代码逻辑，用来设置所需的环境，使系统最终会调用测试应用的`NSURLSession`回调/委派方法来处理服务端证书。
+与我们预期的一样，测试应用中负责pinning验证的委派方法的确会被调用：
+我也专门设计了测试应用代码，使其自定义/pinning验证逻辑始终会返回失败：
+因此，如果我们能绕过pinning，那么这个连接应当会成功建立。
+现在我们已经有测试方案，也搭建了适当的实验环境（启用pinning的应用、已越狱的设备、Xcode等），我们可以开始研究了。
+## 0x03 修改BoringSSL
+首先我想试着处理iOS网络协议栈默认设置的BoringSSL回调（`boringssl_context_certificate_verify_callback()`），将其替换为空的回调函数，永远不去检查服务端的证书链：
+    // My "evil" callback that does not check anything
+    ssl_verify_result_t verify_callback_that_does_not_validate(void *ssl, uint8_t *out_alert)
+    {
+        return ssl_verify_ok;
+    }
+    // My "evil" replacement function for SSL_CTX_set_custom_verify()
+    static void replaced_SSL_CTX_set_custom_verify(void *ctx, int mode, ssl_verify_result_t (*callback)(void *ssl, uint8_t *out_alert))
+    {
+        // Always ignore the callback that was passed and instead set my "evil" callback
+        original_SSL_CTX_set_custom_verify(ctx, SSL_VERIFY_NONE verify_callback_that_does_not_validate);
+        return;
+    }
+    // Lastly, use MobileSubstrate to replace SSL_CTX_set_custom_verify() with my "evil" replaced_SSL_CTX_set_custom_verify()
+    void* boringssl_handle = dlopen("/usr/lib/libboringssl.dylib", RTLD_NOW);
+    void *SSL_CTX_set_custom_verify = dlsym(boringssl_handle, "SSL_CTX_set_custom_verify");
+    if (SSL_CTX_set_custom_verify)
+    {
+        MSHookFunction((void *) SSL_CTX_set_custom_verify, (void *) replaced_SSL_CTX_set_custom_verify,  NULL);
+    }
+将如上代码实现成`MobileSubstrate`
+tweak并插入测试应用后，发生了一些有趣的事情：测试应用的`NSURLSession`委派方法不再被调用（这意味着该方法已被“绕过”），但应用发起的第一个连接会出现错误，提示“Peer
+was not authenticated”（“对端未经身份认证”），这是新的/未知的错误，如下所示：
+    TrustKitDemo-ObjC[3320:160146] === SSL Kill Switch 2: replaced_SSL_CTX_set_custom_verify
+    TrustKitDemo-ObjC[3320:160146] Failed to clone trust Error Domain=NSOSStatusErrorDomain Code=-50 "null trust input" UserInfo={NSDescription=null trust input} [-50]
+    TrustKitDemo-ObjC[3320:160146] [BoringSSL] boringssl_session_finish_handshake(306) [C1.1:2][0x10bd489a0] Peer was not authenticated. Disconnecting.
+    TrustKitDemo-ObjC[3320:160146] NSURLSession/NSURLConnection HTTP load failed (kCFStreamErrorDomainSSL, -9810)
+    TrustKitDemo-ObjC[3320:160146] Task . finished with error - code: -1200
+在应用中，第一个连接在出错的同时，会弹出与之前不同的一个错误信息：
+然而，发往该服务器的后续连接会成功建立，不会触发pinning验证回调：
+因此，对于所有连接（除了第一个连接外）我都已经绕过了pinning，额好吧，其实还并不完美……
+## 0x04 修复第一个连接
+我需要更多上下文信息才能理解“Peer was not authenticated”错误的真正含义，所以我从iOS
+12设备上提取了共享缓存（其中有Apple的所有库和框架，包括BoringSSL），提取步骤参考此处[链接](https://kov4l3nko.github.io/blog/2016-05-13-disassembling-ios-system-frameworks-and-libs/)。
+将`libboringssl.dylib`载入Hopper后，我找到了“Peer was not
+authenticated”错误（如下图红框1处），该错误位于`boringssl_session_finish_handshake()`函数中：
+我试着去理解这个函数的功能，想更深入理解这个错误，然而我对arm64汇编代码理解并不透彻，因此无法完成这个任务。我试了其他方法（比如patch
+`boringssl_context_certificate_verify_callback()`），但是没有找到有价值的信息。
+我决定使用更为极端的方法。如果我们再次观察反编译的`boringssl_session_finish_handshake()`函数，可以看到其中有两条“主”代码路径，由`if/else`语句分条件触发。其中，“Peer
+was not authenticated”错误位于`if`代码路径中，并不位于`else`路径中。
+很自然的一个想法就是阻止执行带有该错误消息的代码路径，也就是`if`路径。如上图所示，触发`if`分支的一个条件就是`(_SSL_get_psk_identity()
+== 0x0)`（上图红框2处）。如果我们patch这个函数，使其不返回`0`，让系统执行`else`这条代码路径会出现什么情况（这样就不会触发“Peer
+was not authenticated”错误）？
+对应的`MobileSubtrate` patch如下所示：
+    // Use MobileSubstrate to replace SSL_get_psk_identity() with this function, which never returns 0:
+    char *replaced_SSL_get_psk_identity(void *ssl)
+    {
+        return "notarealPSKidentity";
+    }
+    MSHookFunction((void *) SSL_get_psk_identity, (void *) replaced_SSL_get_psk_identity, (void **) NULL);
+将这个运行时patch注入测试应用后，我们的确成功了！此时第一个连接已经成功，并且测试应用的验证回调也永远不会被触发。我们通过patch
+BoringSSL，成功绕过了该应用的SSL pinning验证代码。
+## 0x05 总结
+这显然并不是非常完美的运行时patch，虽然patch后一切似乎都正常工作（这一点比较让我惊讶），但每当应用打开一个连接时，我们还是可以在日志中看到一些错误，如下所示：
+    TrustKitDemo-ObjC[3417:166749] Failed to clone trust Error Domain=NSOSStatusErrorDomain Code=-50 "null trust input" UserInfo={NSDescription=null trust input} [-50]
+这个patch还有其他一些问题：
+  * 可能会破坏与TLS-PSK加密套件（cipher suites）有关的代码，而当使用`SSL_get_psk_identity()`函数时就涉及到这些代码。然而这些加密套件使用场景本身就比较少（特别是在移动应用中）。
+  * patch后系统永远不会调用iOS网络协议栈中默认的BoringSSL回调（`boringssl_context_certificate_verify_callback()`）。这意味着iOS网络协议栈中的某些状态可能不会得到正确的设置，应该会出现一些bug。
+最后，因为时间有限，我还没有处理其他一些事情：
+  * 再次确认这个BoringSSL运行时patch的确会禁用较底层iOS网络API的pinning功能，比如`Network.framework`或者`CFNetwork`。
+  * 添加针对macOS的支持。我有信心这个patch在macOS上应该能正常工作，但我没有找到macOS上hook BoringSSL（或者共享缓存中任何C函数）的方法。我之前使用的一款工具（Facebook的[fishhook](https://github.com/facebook/fishhook)）似乎无法正常工作。
+大家可以访问[Github](https://github.com/nabla-c0d3/ssl-kill-switch2)查看源码，下载这个tweak。

@@ -1,0 +1,128 @@
+[实际会看到这样](https://man7.org/linux/man-pages/man8/ss.8.html)的：
+```
+tcp ESTAB 45 0 10.0.186.140:3306 10.0.186.70:26494 skmem:(r768,rb65536,t0,tb131072,f3328,w0,o0,bl0,d0)
+tcp ESTAB 0 0 10.0.186.140:3306 10.0.186.70:26546 skmem:(r0,rb65536,t0,tb131072,f4096,w0,o0,bl0,d0)
+```
+为什么kernel要double 接收和发送buffer可以[参考man7中的socket帮助信息](https://man7.org/linux/man-pages/man7/socket.7.html)
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/4e2b2e12c754f01a-4e2b2e12c754f01a2f99f9f47dd5fd8e.png)
+## tcp包发送流程
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/d385a7dad76ec403-d385a7dad76ec4031dfb6c096bca434b.png)
+（图片[来自](https://www.atatech.org/articles/9032)）
+## 用tc构造延时和带宽限制的模拟重现环境
+```
+sudo tc qdisc del dev eth0 root netem delay 20ms
+sudo tc qdisc add dev eth0 root tbf rate 500kbit latency 50ms burst 15kb
+```
+## 内核观测tcp_mem是否不足
+因 tcp_mem 达到限制而无法发包或者产生抖动的问题，我们也是可以观测到的。为了方便地观测这类问题，Linux 内核里面预置了静态观测点：sock_exceed_buf_limit（需要 4.16+ 的内核版本）。
+> $ echo 1 > /sys/kernel/debug/tracing/events/sock/sock_exceed_buf_limit/enable
+然后去看是否有该事件发生：
+> $ cat /sys/kernel/debug/tracing/trace_pipe
+如果有日志输出（即发生了该事件），就意味着你需要调大 tcp_mem 了，或者是需要断开一些 TCP 连接了。
+## 或者通过systemtap来观察
+如下是tcp_sendmsg流程，sk_stream_wait_memory就是tcp_wmem不够的时候触发等待：
+![image.png](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/ff025f076a4a2bc2-ff025f076a4a2bc2b1b13d11f32a97d3.png)
+如果sendbuffer不够就会卡在上图中的第一步 sk_stream_wait_memory, 通过systemtap脚本可以验证：
+```
+ #!/usr/bin/stap
+    # Simple probe to detect when a process is waiting for more socket send
+    # buffer memory. Usually means the process is doing writes larger than the
+    # socket send buffer size or there is a slow receiver at the other side.
+    # Increasing the socket's send buffer size might help decrease application
+    # latencies, but it might also make it worse, so buyer beware.
+probe kernel.function("sk_stream_wait_memory")
+{
+    printf("%u: %s(%d) blocked on full send buffern",
+        gettimeofday_us(), execname(), pid())
+}
+probe kernel.function("sk_stream_wait_memory").return
+{
+    printf("%u: %s(%d) recovered from full send buffern",
+        gettimeofday_us(), execname(), pid())
+}
+# Typical output: timestamp in microseconds: procname(pid) event
+#
+# 1218230114875167: python(17631) blocked on full send buffer
+# 1218230114876196: python(17631) recovered from full send buffer
+# 1218230114876271: python(17631) blocked on full send buffer
+# 1218230114876479: python(17631) recovered from full send buffer
+```
+# 其它案例分析
+从如下案例可以看到在时延5ms和1ms的时候，分别执行相同的SQL，SQL查询结果13M，耗时分别为4.6和0.8秒
+```
+$time mysql  -h127.1  -e "select * from test;" >/tmp/result.txt
+real    0m3.078s
+user    0m0.273s
+sys     0m0.028s
+$ping -c 1 127.0.0.1
+PING 127.0.0.1 (127.0.0.1) 56(84) bytes of data.
+64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=5.01 ms
+--- 127.0.0.1 ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 5.018/5.018/5.018/0.000 ms
+$ls -lh /tmp/result.txt
+-rw-rw-r-- 1 admin admin 13M Mar 12 12:51 /tmp/result.txt
+//减小时延后继续测试
+$ping 127.0.0.1
+PING 127.0.0.1 (127.0.0.1) 56(84) bytes of data.
+64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=1.01 ms
+64 bytes from 127.0.0.1: icmp_seq=2 ttl=64 time=1.02 ms
+^C
+--- 127.0.0.1 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1001ms
+rtt min/avg/max/mdev = 1.016/1.019/1.022/0.003 ms
+$time mysql  -h127.1  -e "select * from test;" >/tmp/result.txt
+real    0m0.838s
+user    0m0.271s
+sys     0m0.030s
+//通过ss可以看到这个连接的buffer 大小相关信息，3306端口socket的send buffer为32K；
+//7226为客户端，发送buffer为128K，OS默认参数 
+tcp ESTAB 0 0 127.0.0.1:7226 127.0.0.1:3306 skmem:(r0,rb131072,t2,tb2626560,f24576,w0,o0,bl0,d0)
+tcp ESTAB 0 20480 127.0.0.1:3306 127.0.0.1:7226 skmem:(r0,rb16384,t0,tb32768,f1792,w26880,o0,bl0,d0)
+```
+在这个案例中 send buffer为32K（代码中设置的16K，内核会再翻倍，所以是32K），如果时延5毫秒时，一秒钟最多执行200次来回，也就是一秒钟能传输：200*32K=6.4M，总大小为13M，也就是最快需要2秒钟才能传输行完，另外MySQL innodb执行耗时0.5ms，也就是极限速度也就是2.5秒+了。
+这个场景下想要快得减少rt或者增加send buffer， 增加接收端的buffer没有意义，比如如下代码增加client的 --net-buffer-length=163840000  没有任何帮助
+> time mysql --net-buffer-length=163840000  -h127.1  -e "select * from test;" >/tmp/result.txt
+## 在2 MiB buffer下rt和 throughput的关系
+![img](https://cdn.jsdelivr.net/gh/shareImage/image@_md2zhihu_programmer_case_81efef37/就是要你懂TCP--性能和发送接收Buffer的关系/028c3cfe690f4f2e-image10-5.png)
+# 总结
+-   一般来说绝对不要在程序中手工设置SO_SNDBUF和SO_RCVBUF，内核自动调整比你做的要好；
+-   SO_SNDBUF一般会比发送滑动窗口要大，因为发送出去并且ack了的才能从SO_SNDBUF中释放；
+-   代码中设置的SO_SNDBUF和SO_RCVBUF在内核中会翻倍分配；
+-   TCP接收窗口跟SO_RCVBUF关系很复杂；
+-   SO_RCVBUF太小并且rtt很大的时候会严重影响性能；
+-   接收窗口比发送窗口复杂多了；
+-   发送窗口/SO_SNDBUF--发送仓库，带宽/拥塞窗口--马路通畅程度，接收窗口/SO_RCVBUF--接收仓库；
+-   发送仓库、马路宽度、长度（rt）、接收仓库一起决定了传输速度--类比一下快递过程。
+**总之记住一句话：不要设置socket的SO_SNDBUF和SO_RCVBUF**
+关于传输速度的总结：窗口要足够大，包括发送、接收、拥塞窗口等，自然就能将BDP跑满
+# 相关和参考文章
+[用stap从内核角度来分析buffer、rt和速度](https://blog.csdn.net/dog250/article/details/113020804)
+[经典的 nagle 和 dalay ack对性能的影响 就是要你懂 TCP-- 最经典的TCP性能问题](https://www.atatech.org/articles/80292)
+[关于TCP 半连接队列和全连接队列](https://www.atatech.org/articles/78858)
+[MSS和MTU导致的悲剧](https://www.atatech.org/articles/60633)
+[双11通过网络优化提升10倍性能](https://www.atatech.org/articles/73174)
+[就是要你懂TCP的握手和挥手](https://www.atatech.org/articles/79660)
+[高性能网络编程7--tcp连接的内存使用](https://www.atatech.org/articles/13203)
+[The story of one latency spike][https://blog.cloudflare.com/the-story-of-one-latency-spike/] : 应用偶发性出现了rt 很高的时延，通过两个差量 ping 来定位具体节点
+> Using a large chunk of receive buffer space for the metadata is not really what the programmer wants. To counter that, when the socket is under memory pressure complex logic is run with the intention of freeing some space. One of the operations is `tcp_collapse` and it will merge adjacent TCP packets into one larger `sk_buff`. This behavior is pretty much a garbage collection (GC)—and as everyone knows, when the garbage collection kicks in, the latency must spike.
+原因：将 tcp_rmem 最大值设置得太大，在内存压力场景下触发了GC（tcp_collapse），将 tcp_rmem 调小后（32M->2M）不再有偶发性 rt 很高的延时
+从 net_rx_action 追到 tcp_collapse 的逻辑没太理解（可能是对内核足够了解）
+[What is rcv_space in the 'ss --info' output, and why it's value is larger than net.core.rmem_max](https://access.redhat.com/discussions/782343)
+Reference:
+- 23 : [https://www.atatech.org/articles/80292](https://www.atatech.org/articles/80292)
+- 24 : [https://www.atatech.org/articles/78858](https://www.atatech.org/articles/78858)
+- 25 : [https://www.atatech.org/articles/60633](https://www.atatech.org/articles/60633)
+- 26 : [https://www.atatech.org/articles/73174](https://www.atatech.org/articles/73174)
+- 27 : [https://www.atatech.org/articles/13203](https://www.atatech.org/articles/13203)
+- 28 : [https://access.redhat.com/discussions/782343](https://access.redhat.com/discussions/782343)
+- 5 : [https://www.atatech.org/articles/9032](https://www.atatech.org/articles/9032)
+- 7 : [https://www.atatech.org/articles/79660](https://www.atatech.org/articles/79660)
+[23]:  https://www.atatech.org/articles/80292
+[24]:  https://www.atatech.org/articles/78858
+[25]:  https://www.atatech.org/articles/60633
+[26]:  https://www.atatech.org/articles/73174
+[27]:  https://www.atatech.org/articles/13203
+[28]:  https://access.redhat.com/discussions/782343
+[5]:  https://www.atatech.org/articles/9032
+[7]:  https://www.atatech.org/articles/79660

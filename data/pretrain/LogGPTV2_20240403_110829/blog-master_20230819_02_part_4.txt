@@ -1,0 +1,209 @@
+(1 row)  
+```  
+以下这个就不太准了, 100万个vid, 居然有413826个被认为在uid=5000的hll已读列表值里面, 所以可能出现的结果是大量未读视频会被误以为是已读.  
+解决办法大家可以思考一下, 调整hll的参数即可.    
+```  
+postgres=# select count(*) from tbl_hll , (select generate_series(1,1000000) as vid) as t where uid=5000 and ( vids || hll_hash_bigint(vid) ) = vids;  
+ count    
+--------  
+ 413826  
+(1 row)  
+```  
+test case1:   
+从4900-5100号段热门vid随机生成100个推荐视频, 从4900-5100号段随机获取活跃uid, 从用户已读列表中过滤该UID已读的vid, 返回未读的UID.   
+编写压测脚本:  
+```  
+vi ~/test1.sql  
+\set uid random(4900, 5100)    
+select t1.vid from   
+(  
+  select 4900+(random()*200)::int as vid from generate_series(1,100)  
+) t1   
+join   
+tbl_hll t2   
+on ( t2.uid=:uid and t2.vids || hll_hash_bigint(t1.vid) <> t2.vids);   
+```  
+压测结果:  
+```  
+pgbench -M prepared -n -r -P 1 -f ~/test1.sql -c 10 -j 10 -T 120  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 10  
+number of threads: 10  
+duration: 120 s  
+number of transactions actually processed: 583366  
+latency average = 2.057 ms  
+latency stddev = 0.631 ms  
+initial connection time = 21.736 ms  
+tps = 4862.153296 (without initial connection time)  
+```  
+tps: 4862.153296  
+是不是有点失望? 原因主要是hll的计算比较耗时, 可以考虑优化hll代码, 或者把vid和hll都推出到application端进行判断(也就是把压力给到应用程序, 毕竟应用程序是无状态的非常容易扩展).     
+#### rb数据库设计和试验    
+下面使用rb类型来代替hll存储用户聚合后的已读视频id, rb是稀疏bitmap存储, 精确值.   
+创建roaringbitmap插件  
+```  
+postgres=# create extension roaringbitmap ;  
+CREATE EXTENSION  
+postgres=# \dT  
+          List of data types  
+ Schema |     Name      | Description   
+--------+---------------+-------------  
+ public | roaringbitmap |   
+(1 row)  
+postgres=# \do+  
+                                          List of operators  
+ Schema | Name | Left arg type | Right arg type |  Result type  |       Function        | Description   
+--------+------+---------------+----------------+---------------+-----------------------+-------------  
+ public | #    | roaringbitmap | roaringbitmap  | roaringbitmap | rb_xor                |   
+ public | &    | roaringbitmap | roaringbitmap  | roaringbitmap | rb_and                |   
+ public | &&   | roaringbitmap | roaringbitmap  | boolean       | rb_intersect          |   
+ public | -    | roaringbitmap | integer        | roaringbitmap | rb_remove             |   
+ public | -    | roaringbitmap | roaringbitmap  | roaringbitmap | rb_andnot             |   
+ public |    | roaringbitmap | roaringbitmap  | boolean       | rb_not_equals         |   
+ public | >   | roaringbitmap | bigint         | roaringbitmap | rb_shiftright         |   
+ public | @>   | roaringbitmap | integer        | boolean       | public.rb_contains    |   
+ public | @>   | roaringbitmap | roaringbitmap  | boolean       | public.rb_contains    |   
+ public | |    | integer       | roaringbitmap  | roaringbitmap | public.rb_add         |   
+ public | |    | roaringbitmap | integer        | roaringbitmap | public.rb_add         |   
+ public | |    | roaringbitmap | roaringbitmap  | roaringbitmap | rb_or                 |   
+(16 rows)  
+```  
+创建聚合表    
+```  
+drop table if exists tbl_rb;   
+create table tbl_rb (  
+  uid int8 unique,   
+  vids roaringbitmap   
+);  
+```  
+写入聚合数据  
+```  
+insert into tbl_rb select uid, rb_build_agg(vid::int4) from tbl group by 1;    
+INSERT 0 10000  
+```  
+查看聚合表, 只占用了20MB左右.    
+```    
+postgres=# \dt+  
+                                    List of relations  
+ Schema |  Name  | Type  |  Owner   | Persistence | Access method |  Size  | Description   
+--------+--------+-------+----------+-------------+---------------+--------+-------------  
+ public | tbl    | table | postgres | unlogged    | heap          | 575 MB |   
+ public | tbl_rb | table | postgres | permanent   | heap          | 20 MB  |   
+(2 rows)  
+postgres=# \di+  
+                                             List of relations  
+ Schema |      Name       | Type  |  Owner   | Table  | Persistence | Access method |  Size  | Description   
+--------+-----------------+-------+----------+--------+-------------+---------------+--------+-------------  
+ public | tbl_pkey        | index | postgres | tbl    | unlogged    | btree         | 344 MB |   
+ public | tbl_rb_uid_key  | index | postgres | tbl_rb | permanent   | btree         | 240 kB |   
+ public | tbl_uid_vid_idx | index | postgres | tbl    | unlogged    | btree         | 301 MB |   
+(3 rows)  
+```    
+rb是精确类型, 与原始数据对照如下:     
+```  
+postgres=# select count(distinct vid) from tbl where uid=5000;  
+ count   
+-------  
+  1807  
+(1 row)  
+postgres=# select count(*) from (select unnest(rb_to_array(vids)) from tbl_rb where uid=5000) t;  
+ count   
+-------  
+  1807  
+(1 row)  
+```  
+test case1:   
+从4900-5100号段热门vid随机生成100个推荐视频, 从4900-5100号段随机获取活跃uid, 从用户已读列表中过滤该UID已读的vid, 返回未读的UID.   
+编写测试脚本:  
+```  
+vi ~/test2.sql  
+\set uid random(4900, 5100)    
+select t1.vid from   
+(  
+  select 4900+(random()*200)::int as vid from generate_series(1,100)  
+) t1   
+join   
+tbl_rb t2   
+on ( t2.uid=:uid and not (t1.vid <@ t2.vids) );   
+```  
+压测结果:  
+```  
+pgbench -M prepared -n -r -P 1 -f ~/test2.sql -c 10 -j 10 -T 120  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 10  
+number of threads: 10  
+duration: 120 s  
+number of transactions actually processed: 3098707  
+latency average = 0.387 ms  
+latency stddev = 0.147 ms  
+initial connection time = 21.281 ms  
+tps = 25826.645185 (without initial connection time)  
+```  
+tps: 25826.645185   
+#### 性能对比结果  
+对比项 | 传统测试 | hll聚合 | rb稀疏聚合  
+---|---|---|---  
+存储空间占用 | 1220 MB | 11 MB | 20 MB  
+tps | 20578 | 4862 | 25826  
+## 知识点  
+1、hll.  
+往hll中增加一个值时, 可以理解为将这个值经过hashfunction后, 将其映射到一个bitmap value的n个position上, 即这n个bit position位上的值都设置为1.    
+当需要判断某个值是否存在时, 判断这个值在bitmap value中的n个bit position位上的值是否都为1.   
+hll类型 lossy问题: 不存在一定为真, 存在可能是假的(因为bit position conflict问题.). 所以有失真问题.   
+和bloom有点异曲同工, bloom算法参考: [《PostgreSQL 9.6 黑科技 bloom 算法索引，一个索引支撑任意列组合查询》](../201605/20160523_01.md)  
+hll 可以实现比普通计数器更多更复杂的需求:    
+- 唯一值个数 (计数器只能统计一次, 换个窗口就必须重新全量统计. 但是2个hll值可以叠加, 所以不需要重新全量统计.)   
+- 是否已存在 (计数器做不到.)   
+- PV UV (计数器也能做到.)   
+- 滑动窗口分析 (计数器做不到, 因为两个计数器值无法叠加, 所以使用计数器时每个维度都要重新统计. 但是2个hll值可以叠加, 因此不需要重新统计, 只需要计算hll即可.)   
+2、窗口查询语法.  
+- [《PostgreSQL SELECT 的高级用法(CTE, LATERAL, ORDINALITY, WINDOW, SKIP LOCKED, DISTINCT, GROUPING SETS, ...) - 珍藏级》](../201802/20180226_05.md)  
+3、如何根据业务模型快速构建测试数据?  
+[《PostgreSQL+MySQL 联合解决方案 - 第3课视频 - 如何压测PG数据库、如何瞬间构造海量测试数据》](../202001/20200103_01.md)  
+[《PostgreSQL 如何快速构建 海量 逼真 测试数据》](../201711/20171121_01.md)  
+[《生成泊松、高斯、指数、随机分布数据 - PostgreSQL 9.5 new feature - pgbench improve, gaussian (standard normal) & exponential distribution》](../201506/20150618_01.md)  
+man pgbench  
+4、roaringbitmap: 
+- [《PolarDB 开源版通过roaringbitmap支持高效用户画像等标签操作》](../202212/20221208_02.md)  
+- [《PostgreSQL roaringbitmap UID溢出（超出int4(32字节)）时的处理方法 - offset》](../202001/20200110_03.md)  
+- [《画像系统标准化设计 - PostgreSQL roaringbitmap, varbitx , 正向关系, 反向关系, 圈选, 相似扩选(向量相似扩选)》](../201911/20191128_02.md)  
+- [《PostgreSQL pg_roaringbitmap - 用户画像、标签、高效检索》](../201911/20191118_01.md)  
+## 思考  
+1、还有没有其他场景会用到hll?  
+2、还有比hll更好的技术实现?  
+- roaringbitmap 类型?  
+- array 类型?   
+3、通过这个实验, 你学到了什么?   
+4、为什么hll性能这么好?   
+5、hll提升性能的同时牺牲了什么?   
+6、为什么hll是近似的?   
+7、hll类型的什么变量可以控制一个hll value能存储多少唯一值?   
+8、hll value近似度的精确度和什么变量有关？  
+9、为什么多个hll的值可以union?   
+## 参考  
+- https://www.crunchydata.com/blog/high-compression-metrics-storage-with-postgres-hyperloglog  
+- [《PostgreSQL sharding : citus 系列6 - count(distinct xx) 加速 (use 估值插件 hll|hyperloglog)》](../201809/20180913_04.md)    
+- [《PostgreSQL hll (HyperLogLog) extension for "State of The Art Cardinality Estimation Algorithm" - 3》](../201302/20130228_01.md)    
+- [《PostgreSQL hll (HyperLogLog) extension for "State of The Art Cardinality Estimation Algorithm" - 2》](../201302/20130227_01.md)    
+- [《PostgreSQL hll (HyperLogLog) extension for "State of The Art Cardinality Estimation Algorithm" - 1》](../201302/20130226_01.md)    
+- [《PolarDB 开源版通过 postgresql_hll 实现高效率 UV滑动分析、实时推荐已读列表过滤》](../202212/20221213_01.md)    
+- [《PostgreSQL HLL 近似计算算法要点》](../202010/20201011_02.md)    
+- [《PostgreSQL 13 & 14 hashagg 性能增强(分组选择性精准度) - 使用hll评估hash字段的选择性, 而非使用记录数》](../202008/20200803_05.md)    
+- [《PostgreSQL hll 在留存、UV统计中的通用用法》](../202006/20200610_01.md)    
+- [《Greenplum 最佳实践 - 估值插件hll的使用(以及hll分式聚合函数优化)》](../201608/20160825_02.md)    
+- [《重新发现PostgreSQL之美 - 24 滑动窗口分析 2000x》](../202106/20210614_01.md)    
+- [《PostgreSQL、Greenplum 滑动窗口 分析SQL 实践》](../201711/20171129_01.md)    
+- [《PostgreSQL 海量时序数据(任意滑动窗口实时统计分析) - 传感器、人群、物体等对象跟踪》](../201707/20170705_01.md)    
+- [《PostgreSQL 应用开发解决方案最佳实践系列课程 - 2. 短视频业务实时推荐》](../202105/20210503_01.md)    
+- [《重新发现PostgreSQL之美 - 26 这个推荐算法价值1亿》](../202106/20210615_09.md)    
+- [《PostgreSQL SELECT 的高级用法(CTE, LATERAL, ORDINALITY, WINDOW, SKIP LOCKED, DISTINCT, GROUPING SETS, ...) - 珍藏级》](../201802/20180226_05.md)  
+#### [期望 PostgreSQL|开源PolarDB 增加什么功能?](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+#### [PolarDB 云原生分布式开源数据库](https://github.com/ApsaraDB "57258f76c37864c6e6d23383d05714ea")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、内核开发公开课、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [PostgreSQL 解决方案集合](../201706/20170601_02.md "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

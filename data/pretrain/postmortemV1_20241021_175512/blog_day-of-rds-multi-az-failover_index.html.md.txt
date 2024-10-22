@@ -1,0 +1,226 @@
+# The Day of the RDS Multi-AZ Failover 
+
+[June 8, 2020](https://razorpay.com/blog/day-of-rds-multi-az-failover/)
+
+On a fateful Friday evening on December 2019, when a few of us were
+looking forward to packing their bags and going home, we got an alert
+from the internal monitoring tool that the system has started throwing
+unusually high numbers of 5xx errors.
+
+The SRE team quickly realized that one of our main applications (called
+"API") was not able to connect to its RDS (MySQL) database. By the time
+we could make any sense of the issue, the application came back up
+automatically and the alerts stopped.
+
+Looking at the RDS logs, we realized that the master instance has gone
+through a *Multi-AZ
+failover*.
+
+According to the SLA's provided by AWS, whenever an instance marked as
+multi-AZ goes through a failure (whether it is a network failure, disk
+failure, etc); AWS automatically shifts the traffic to its standby
+running on a separate AZ on the same AWS region. The failover can take
+up anytime between 60 and 120 seconds, and this was the reason our
+master instance automatically came back up after around 110 seconds and
+the application started working without any manual intervention.
+
+##  Replication failure
+
+The API master instance has a set of 5 replica instances which are used
+to query different sets of workloads in various
+applications.
+
+![](http://blog.razorpay.in/wp-content/uploads/2020/06/one.png)
+
+While the application stopped throwing errors and started working, we
+received another set of alerts stating that the replication on all the
+replicas had failed.
+
+All the replicas displayed a *duplicate-key*
+error message. We immediately shifted all the traffic going to these
+replica instances to the master instance so that the application does
+not receive any stale data and display incorrect data to the users.
+
+The drawback of moving all the traffic to the master was that all the
+heavier selects were also moved to the master, and the CPU load on the
+master instance increased by 50%. Hence, our immediate move was to
+recreate all the 5 replicas so that we can move the replica load back as
+soon as possible.
+
+The new replica creation process internally creates a snapshot from the
+master instance of the current data and then starts a DB instance from
+that snapshot. The very first snapshot from a particular machine takes
+the snapshot of the entire data until now, but the subsequent snapshots
+are incremental in nature. In the past, we had noticed that these
+incremental snapshots take around 15-20 minutes for the API database.
+
+While taking the snapshot, we experienced another reality-check. The
+process was taking more than the usual time that day. After an hour or
+so, when the snapshot creation was still in progress, we were forced to
+contact AWS tech support to check why the whole process was taking much
+longer that day.
+
+The AWS tech-support informed us that since the master instance has
+gone through a multi-AZ failover, they had replaced the old master with
+a new machine, which is a routine. Since the snapshot was being taken
+from the new machine then and was the very first snapshot from the new
+machine, RDS would take a full snapshot of the data.
+
+So, we had no other option but wait for the snapshots to finish and
+keep monitoring the master instance in the meantime. We waited six hours
+for the snapshot to complete and only then were we able to create the
+replicas and redirect the traffic back to them.
+
+Once the replicas were in place, we assumed that the worst was over,
+and finally called it a night.
+
+##  Data loss
+
+Next day, on our follow-up calls with RDS tech support, we were told
+that it was not a usual occurrence that the replication crashes in
+scenarios of multi-AZ master failover, and there must be more to the
+incident than what meets the eye.
+
+This is when we started looking at various reasons on why the
+replication crashed. After matching the database and the application
+trace logs for the time around the incident, we found that a few records
+were present in the trace logs, but not in the database. This is when we
+realised that we had lost some data at the time of
+failover.
+
+Being a fintech company, losing transactional data actually meant
+losing money and the trust of our customers. We began digging the binary
+logs for that time frame and matching them with the data in the store.
+We finally figured out that the RDS database had been missing 5 seconds
+of data. Right after these 5 seconds, we had started receiving 5xx
+errors on our application logs.
+
+Luckily, we could dig the exact queries from the binary logs, go
+through the sequence of events from the application trace logs and after
+an 8-hour marathon meeting, were able to correct the data stored in the
+RDS.
+
+##  How Multi-AZ replication works
+
+It was time for us to investigate why we even fell into this situation
+in the first place. To solve the puzzle, we had to find the answer to
+the following questions:
+
+-   How does the RDS Multi-AZ replication
+    work?
+-   What steps does RDS take at the time of a multi-AZ
+    failover?
+-   Why was the data missing in the
+    database?
+-   Why did the replication crash?
+
+We got on tens of calls with a number of RDS solution architects over
+the next week, and were finally able to connect all the dots.
+
+![](http://blog.razorpay.in/wp-content/uploads/2020/06/two.png)
+
+In a Multi-AZ setup, the RDS endpoint points to a primary instance.
+Another machine in a separate AZ is reserved for the standby, in case
+the master instance goes down. 
+
+The MySQL installed on the standby instance is in shutdown mode; and
+the replication happens between the two EBS. i.e., as soon as the data
+is written to the primary EBS, it is duplicated to the standby EBS in a
+synchronized fashion. This way, RDS ensures that any data written to the
+master EBS is always present on the standby EBS; and hence, there will
+be no data loss in the case of a failover.
+
+At the time of a failover, the RDS goes through a number of steps to
+ensure that the traffic is moved over to the standby machine in a sane
+manner. These steps are listed below:
+
+1.  Primary MySQL instance goes through a cut-over (networking
+    stopped). Client application goes down.
+2.  MySQL on the standby machine is
+    started.
+3.  RDS endpoint switches to the standby machine (new
+    primary).
+4.  Application starts connecting to the standby machine. Client
+    application is up now.
+5.  Old primary machine goes through a host-change
+    (hard-reboot).
+6.  EBS sync starts from the new primary instance to the new standby
+    instance.
+
+Looking at the process of failover, it seems pretty foolproof; and the
+replicas should've never gone through any duplicate errors and we
+should've never had any data loss. 
+
+*So, what went wrong?*
+
+##  Incorrect configuration variable
+
+We found a MySQL configuration parameter
+innodb_flush_log_at_trx_commit, which is very critical for the seamless
+process of a failover.
+
+InnoDB data changes are always committed to a transactional log which
+resides in the memory. This data is flushed to the EBS disk based on the
+setting of innodb_flush_log_at_trx_commit. 
+
+-   If the variable is set to 0, logs are written and flushed to the
+    disk once every second. Transactions for which logs have not been
+    flushed to the disk can be lost in case of a
+    crash.
+-   If the variable is set to 1, logs are written and flushed to the
+    disk after every transaction commit. This is the default RDS setting
+    and is required for full ACID
+    compliance.
+-   If the variable is set to 2, logs are written after each
+    transaction commit, but flushed to disk after every one second.
+    Transactions for which logs have not been flushed to the disk can be
+    lost in case of a crash.
+
+For full ACID compliance, we must set the variable to 1. However, in
+our case, we had set it to 2. This means even though the logs were
+written after every commit, they were not getting flushed to the disk
+immediately.
+
+After learning about this variable, everything suddenly became crystal
+clear to us. Since, we had set it to 2, the data was committed to the
+master instance but was not flushed to the primary EBS. Hence, the
+standby (new primary) never received this data; which is why we could
+not find it in the master instance after the failover.
+
+*But, why did the replicas fail? And, why was the data found in the
+binary logs?*
+
+Apparently, there is another variable called sync_binlog which when set
+to 1, flushes the data to binary logs immediately. As we had set it to 1
+(which is correct), the data got written to the binary logs and replicas
+were able to read that data. Once the data was read, replicas ran those
+DML queries onto them and became in sync with the old master.
+
+![](http://blog.razorpay.in/wp-content/uploads/2020/06/three.png)
+
+Let's say, the auto-increment value of one of the tables was X.
+Application inserted a new row which got auto-increment-id as X+1. This
+value X+1 reached the replica, but not the standby machine. So, when the
+application failed over to the standby machine, it again entered a new
+row with auto-increment-id as X+1. This insert, on reaching the replica,
+threw the duplicate-key error and crashed the replication.
+
+We went back to our old snapshots (incidentally, we had kept the
+snapshots of the old replicas before deleting them); and were able to
+prove that the lost data was present in the replicas.
+
+Once our theory was proved, we immediately went to the master instance
+and changed the value of innodb_flush_log_at_trx_commit from 2 to 1; and
+closed the final loop.
+
+##  Final thoughts
+
+In retrospect, we're glad that we dug deeper into the incident and how
+we were able to reach the root of the problem. The incident showed us
+that we were always vulnerable to data loss because of an incorrect
+setting of a configuration variable. 
+
+The only silver lining is, however, that we learnt a lot about how RDS
+manages the Multi-AZ setup and its failovers. And, of course, we gained
+an interesting tale to tell you all!
+

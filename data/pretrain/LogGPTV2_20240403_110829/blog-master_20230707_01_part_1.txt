@@ -1,0 +1,179 @@
+## PostgreSQL的安全场景介绍, 以及security label(安全标签功能)和两个label provider: anon, sepgsql的介绍(隐藏|加密敏感信息)  
+### 作者    
+digoal    
+### 日期    
+2023-07-07    
+### 标签    
+PostgreSQL , PolarDB , 安全 , 敏感信息 , 加密 , security label , row security policy , anon , sepgsql    
+----    
+## 背景    
+## 安全场景需求介绍  
+1、根据来源用户、IP限制可以访问的数据库.   
+- 通过pg_hba.conf可以实现.  
+2、根据用户限制可以访问的表、视图、函数等数据库实体对象.   
+- 通过grant对象权限控制可以实现.   
+3、根据用户限制可以访问的数据表的列范围.   
+- 通过grant表相关column权限可以实现.   
+4、不同的用户读到的数据行范围不一样.   
+- 通过行级别安全策略可以实现.   
+- [《PostgreSQL 行安全策略 - PostgreSQL 9.5 new feature - can define row security policy for table》](../201504/20150409_01.md)      
+5、不同的用户读到的数据记录内容不一样. 例如a看到的是原始值, b看到的是加密后的值.  
+- 通过安全标签可以实现.  https://www.postgresql.org/docs/16/sql-security-label.html  
+- [《PostgreSQL 敏感信息遮掩插件 anon (Anonymizer) - security label provider - anon》](../201911/20191115_03.md)    
+- [《Anonymization & Data Masking for PostgreSQL - 自动脱敏控制 - oracle data vault - postgresql-anonymizer》](../201908/20190817_03.md)    
+## 安全标签 sql-security-label 原理  
+这篇文章进行了详细的介绍: https://zhuanlan.zhihu.com/p/597950184  
+我这里摘取一下内容:  
+最近一段时间我都在给我们自己的系统适配PostgreSQL Anonymizer 这个插件，它基于SECURITY LABEL机制提供了数据脱敏的功能。在接下来的内容中，我将详细介绍SECURITY LABEL的实现原理以及这个插件是如何利用这个功能的。  
+我在这篇文章中混用了role和user这两个概念，但其实role和user是不同的两个概念，role包含了user和group。具体可以阅读PG文档。  
+### Security Label实现原理  
+SECURITY LABEL是PostgreSQL（下文以PG代称）在PG11中引入的功能，它能够为一个数据库对象（object）指定Security Label。基本语法是：`SECURITY LABEL FOR provider ON object IS 'label'`。provider是可以动态加载的模块，比如说插件。label是一个字符串，由provider提供的hook来检测是否有效。label的含义完全由provider来决定，PG只是负责存储他们。  
+PG在planner阶段会生成`SecLabelStmt`。可以看到这个结构体还是非常简单的，基本上和SQL语句中的各个部分一一对应。  
+```  
+typedef struct SecLabelStmt  
+{  
+    NodeTag     type;  
+    ObjectType  objtype;        /* Object's type */  
+    Node       *object;         /* Qualified name of the object */  
+    char       *provider;       /* Label provider (or NULL) */  
+    char       *label;          /* New security label to be assigned */  
+} SecLabelStmt;  
+```  
+执行器部分的代码基本都在`src/backend/commands/seclabel.c`这个文件里。`ExecSecLabelStmt` 的执行思路为：先对当前用户的ownership以及其他需满足的条件做一些检查；接着调用provider提供的hook来检查label是否有效；最后调用`SetSecurityLabel`来设置security label。 下面简单讲讲`SetSecurityLabel`的执行过程：  
+```  
+void  
+SetSecurityLabel(const ObjectAddress *object,  
+                 const char *provider, const char *label)  
+{  
+    ...  
+    // 打开存储Security Label的表  
+    // 从pg_class中查询得知这个表的名称为pg_seclabel  
+    pg_seclabel = table_open(SecLabelRelationId, RowExclusiveLock);   
+    // 根据ScanKey来扫描系统表得到对应的tuple  
+    scan = systable_beginscan(pg_seclabel, SecLabelObjectIndexId, true,  
+                              NULL, 4, keys);  
+    oldtup = systable_getnext(scan);  
+    // 根据tuple是否为NULL以及label是否为NULL来决定采取什么操作  
+    if (HeapTupleIsValid(oldtup))  
+    {  
+        if (label == NULL)  
+            CatalogTupleDelete(pg_seclabel, &oldtup->t_self);  
+        else  
+        {  
+            replaces[Anum_pg_seclabel_label - 1] = true;  
+            newtup = heap_modify_tuple(oldtup, RelationGetDescr(pg_seclabel),  
+                                       values, nulls, replaces);  
+            CatalogTupleUpdate(pg_seclabel, &oldtup->t_self, newtup);  
+        }  
+    }  
+    systable_endscan(scan);  
+    if (newtup == NULL && label != NULL)  
+    {  
+        newtup = heap_form_tuple(RelationGetDescr(pg_seclabel),  
+                                 values, nulls);  
+        CatalogTupleInsert(pg_seclabel, newtup);  
+    }  
+    ...  
+}  
+```  
+我们可以看到对于SECURITY LABEL语句，PG做的其实不多，只是提供了一个表来存储label。而label要怎么用则要看provider的功能，因此接下来我将借助PostgreSQL Anonymizer这个插件来讲解具体的使用。  
+### PostgreSQL Anonymizer实现原理  
+PostgreSQL Anonymizer是一个提供数据脱敏功能的PG插件。数据脱敏是指对某些敏感信息通过脱敏规则进行数据的变形，实现敏感隐私数据的可靠保护。这里的关键词是脱敏规则，事实上这个插件就是使用Security Label来为数据库对象指定脱敏规则，从而达到数据脱敏的效果。  
+PostgreSQL Anonymizer提供了Anonymous Dumps, Static Masking, Dynamic Masking和Generalization四种功能。这里我仅使用Dynamic Masking来介绍Security Label的使用。所谓的Dynamic Masking说的就是将一个用户指定为"MASKED"后，这个用户读取出来的数据就是经过了数据脱敏的，而其他未被指定为"MASKED"的用户读取出来的还是原始数据。  
+以下是测试使用的SQL语句：  
+```  
+-- 指定连接开始时要加载的共享库  
+-- 注意：设置完这个参数后需要新开一个连接才会生效  
+ALTER DATABASE :DBNAME SET session_preload_libraries = 'anon';  
+-- 创建扩展并初始化  
+CREATE EXTENSION IF NOT EXISTS anon CASCADE;  
+SELECT anon.init();  
+-- 创建测试使用的表  
+CREATE TABLE people ( id TEXT, firstname TEXT, lastname TEXT, phone TEXT); INSERT INTO people VALUES ('T1','Sarah', 'Conor','0609110911'); SELECT * FROM people;  
+-- 为people的列指定脱敏规则  
+SECURITY LABEL FOR anon ON COLUMN people.lastname IS 'MASKED WITH FUNCTION anon.fake_last_name()';  
+SECURITY LABEL FOR anon ON COLUMN people.phone IS 'MASKED WITH FUNCTION anon.partial(phone,2,$$******$$,2)';  
+-- 创建新的用户，并将其指定为"MASKED"  
+CREATE ROLE skynet LOGIN;  
+SECURITY LABEL FOR anon ON ROLE skynet IS 'MASKED';  
+-- 开始Dynamic Masking  
+SELECT anon.start_dynamic_masking();  
+-- 切换到新用户后，查看脱敏后的数据  
+\c - skynet  
+SELECT * FROM people;  
+以下是测试结果，可以看到lastname和phone这两列已经完成了数据脱敏。  
+dynamic_masking=> SELECT * FROM people;  
+ id | firstname | lastname |   phone  
+----+-----------+----------+------------  
+ T1 | Sarah     | Watsica  | 06******11  
+(1 row)  
+```  
+要探寻Dynamic Masking的实现原理，我们可以从测试使用的SQL语句开始。通过观察，我们发现了几个特殊的函数：`anon.init`，`anon.start_dynamic_masking`，`anon.fake_last_name`，`anon.partial`。后两者是在label里面指定的，显然它们就是所谓的脱敏规则了。由于不管使用什么脱敏规则都不会影响Dynamic Masking的基本实现原理，所以我们先关注前面两个函数。  
+在`anon.sql`这个文件中可以找到所有和这个插件有关的函数实现。通过阅读`anon.init`的实现不难发现这个函数主要就是加载了几个后续可能会用到的表，因此这不是我们想探寻的Dynamic Masking的实现原理。  
+我们接着来看`anon.start_dynamic_masking`的实现。在这个函数的函数体中，我们发现了下面两个语句，它们可能就和我们想探究的原理有关。  
+```  
+EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I',  
+                  pg_catalog.current_setting('anon.maskschema')::NAME  
+  );  
+PERFORM anon.mask_update();  
+```  
+先来看前者，它创建了一个schema。那这个schema叫什么名字呢？我们直接在psql里执行`SELECT pg_catalog.current_setting('anon.maskschema')::NAME`就知道了。  
+```  
+dynamic_masking=> select pg_catalog.current_setting('anon.maskschema')::NAME;  
+ current_setting  
+-----------------  
+ mask  
+(1 row)  
+```  
+这个叫mask的schema有什么用呢？我们暂时还不知道，不过相信我们会在后面的探索过程中发现它的真正作用。  
+再来看看`anon.mask_update`的具体实现。我们同样在它的函数体中发现了两段有意思的语句。  
+```  
+  -- Walk through all tables in the source schema  
+  -- and build a dynamic masking view  
+  PERFORM anon.mask_create_view(oid)  
+  FROM pg_catalog.pg_class  
+  WHERE relnamespace = quote_ident(pg_catalog.current_setting('anon.sourceschema'))::REGNAMESPACE  
+  AND relkind IN ('r','p','f') -- relations or partitions or foreign tables;  
+  -- Walk through all masked roles and apply the restrictions  
+  PERFORM anon.mask_role(oid::REGROLE)  
+  FROM pg_catalog.pg_roles  
+  WHERE anon.hasmask(oid::REGROLE);  
+```  
+看到这里我们大概就能明白了，前者就是在为原来的表创建view，后者则是在为被指定为"MASKED"的用户设置一些东西，从而让我们能从中读取到脱敏后的数据。不过为了能够完全弄清楚它的实现原理，我们继续来看`anon.mask_create_view`和`anon.mask_role`这两个函数的实现。  
+`anon.mask_create_view`在mask这个schema下为指定的表创建view，它调用了`anon.mask_select`函数。这个函数为被创建的view构造了一个SELECT查询语句，查询语句中的表达式为`anon.mask_filters`的返回值。`anon.mask_filters`接着又调用`anon.mask_columns`来为表的各个列返回对应的脱敏函数，如果某列没有对应的脱敏函数，则返回NULL。`anon.mask_columns`会使用`anon.pg_masking_rules`来列出所有被mask了的列。从`anon.pg_masking_rules`的实现中我们不难发现它会去从`pg_seclabel`这个系统表中读取对应的`label`，这也就对应上了之前说的`SECURITY LABEL`会将`label`存在`pg_seclabel`中。  
+我们还剩一个问题没有解决：这个插件是如何对某些特定的用户起作用的呢？这个答案就在`anon.mask_role`中。它禁止了被mask的用户读取原来的schema，而允许它读取插件创建的两个schema。并且它还设置了`search_path`这个参数，使得在mask这个schema下创建的view可以被优先读到。  
+```  
+  -- The masked role cannot read the authentic data in the source schema  
+  EXECUTE format('REVOKE ALL ON SCHEMA %s FROM %s', sourceschema, maskedrole);  
+  -- The masked role can use the anon schema  
+  EXECUTE format('GRANT USAGE ON SCHEMA anon TO %s', maskedrole);  
+  EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA anon TO %s', maskedrole);  
+  EXECUTE format('GRANT SELECT ON ALL SEQUENCES IN SCHEMA anon TO %s', maskedrole);  
+  -- The masked role can use the masking schema  
+  EXECUTE format('GRANT USAGE ON SCHEMA %s TO %s', maskschema, maskedrole);  
+  EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %s TO %s', maskschema, maskedrole);  
+  -- This is how we "trick" the masked role  
+  EXECUTE format('ALTER ROLE %s SET search_path TO %s, %s;', maskedrole, maskschema,sourceschema);  
+```  
+通过简单的测试就可以验证我们的想法：  
+```  
+dynamic_masking=# \c - skynet  
+You are now connected to database "dynamic_masking" as user "skynet".  
+dynamic_masking=> show search_path;  
+ search_path  
+--------------  
+ mask, public  
+(1 row)  
+dynamic_masking=> \d people;  
+                View "mask.people"  
+  Column   | Type | Collation | Nullable | Default  
+-----------+------+-----------+----------+---------  
+ id        | text |           |          |  
+ firstname | text |           |          |  
+ lastname  | text |           |          |  
+ phone     | text |           |          |  
+```  
+在切换到skynet这个用户后，我们读取到不再是原来的那个table，而变成view了。  
+总结一下，这个插件利用PG的`SECURITY LABEL`来存储脱敏规则，并且会在mask这个schema下为那些表创建对应的view。当切换到被指定为“MASKED”的用户时，会从mask而不是原来的public schema下读取对应的view，从而达成替换原来SQL语句的效果。  
+## security label provider: anon  
+anon 用法参考:   

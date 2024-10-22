@@ -1,0 +1,283 @@
+  r.relation is not distinct from w.relation and  
+  r.page is not distinct from w.page and  
+  r.tuple is not distinct from w.tuple and  
+  r.classid is not distinct from w.classid and  
+  r.objid is not distinct from w.objid and  
+  r.objsubid is not distinct from w.objsubid and  
+  r.transactionid is not distinct from w.transactionid and  
+  r.pid <> w.pid  
+  order by f_lock_level(w.mode)+f_lock_level(r.mode) desc,r.xact_start;  
+```  
+现在可以排在前面的就是锁级别高的等待，优先干掉这个。  
+```  
+-[ RECORD 1 ]-+---------------------------------------------------------------------  
+locktype      | relation  -- 冲突类型  
+r_mode        | ShareUpdateExclusiveLock  -- 持锁模式  
+r_user        | postgres  -- 持锁用户  
+r_db          | postgres  -- 持锁数据库  
+relation      | tbl  -- 持锁对象  
+r_pid         | 25656  -- 持锁进程  
+r_xact_start  | 2015-05-10 14:11:16.08318+08  -- 持锁事务开始时间  
+r_query_start | 2015-05-10 14:11:16.08318+08  -- 持锁SQL开始时间  
+r_locktime    | 00:01:49.460779  -- 持锁时长  
+r_query       | vacuum freeze tbl;  --  持锁SQL,注意不一定是这个SQL带来的锁,也有可能是这个事务在之前执行的SQL加的锁  
+w_mode        | AccessExclusiveLock  -- 等待锁模式  
+w_pid         | 26731  -- 等待锁进程  
+w_xact_start  | 2015-05-10 14:11:17.987362+08  --  等待锁事务开始时间  
+w_query_start | 2015-05-10 14:11:17.987362+08  --  等待锁SQL开始时间  
+w_locktime    | 00:01:47.556597  --  等待锁时长  
+w_query       | truncate tbl;  -- 等待锁SQL  
+-[ RECORD 2 ]-+---------------------------------------------------------------------  
+locktype      | relation  
+r_mode        | ShareUpdateExclusiveLock  
+r_user        | postgres  
+r_db          | postgres  
+relation      | tbl  
+r_pid         | 25656  
+r_xact_start  | 2015-05-10 14:11:16.08318+08  
+r_query_start | 2015-05-10 14:11:16.08318+08  
+r_locktime    | 00:01:49.460779  
+r_query       | vacuum freeze tbl;  
+w_mode        | RowExclusiveLock  
+w_pid         | 25582  
+w_xact_start  | 2015-05-10 14:11:22.845+08  
+w_query_start | 2015-05-10 14:11:22.845+08  
+w_locktime    | 00:01:42.698959  
+w_query       | insert into tbl(crt_time) select now() from generate_series(1,1000);  -- 这个SQL其实等待的是truncate tbl的锁;  
+......  
+```  
+锁冲突判断函数：  
+LockCheckConflicts()@src/backend/storage/lmgr/lock.c  
+我们可以创建一个函数用来杀掉对同一个对象某些锁等待时间和等待进程超出阈值的进程。  
+例如扩展数据块的锁超出一定数量，我们想办法杀掉，避免大量等待。  
+```  
+CREATE OR REPLACE FUNCTION public.f_kill_extend(i_interval interval, i_waiting bigint)  
+ RETURNS void  
+ LANGUAGE plpgsql  
+ STRICT  
+AS $function$  
+declare  
+  v_database oid;  
+  v_relation oid;  
+  v_pid int;  
+  v_record record;  
+begin  
+if (pg_is_in_recovery()) then  
+  return;  
+end if;  
+for v_record in with t_wait as                       
+(select a.mode,a.locktype,a.database,a.relation,a.page,a.tuple,a.classid,a.objid,a.objsubid,  
+a.pid,a.virtualtransaction,a.virtualxid,a,transactionid,b.query,b.xact_start,b.query_start,  
+b.usename,b.datname from pg_locks a,pg_stat_activity b where a.pid=b.pid and not a.granted),  
+t_run as   
+(select a.mode,a.locktype,a.database,a.relation,a.page,a.tuple,a.classid,a.objid,a.objsubid,  
+a.pid,a.virtualtransaction,a.virtualxid,a,transactionid,b.query,b.xact_start,b.query_start,  
+b.usename,b.datname from pg_locks a,pg_stat_activity b where a.pid=b.pid and a.granted)   
+select r.locktype,r.mode r_mode,r.usename r_user,r.datname r_db,r.relation::regclass,r.pid r_pid,  
+r.page r_page,r.tuple r_tuple,r.xact_start r_xact_start,r.query_start r_query_start,  
+now()-r.query_start r_locktime,r.query r_query,w.mode w_mode,w.pid w_pid,w.page w_page,  
+w.tuple w_tuple,w.xact_start w_xact_start,w.query_start w_query_start,  
+now()-w.query_start w_locktime,w.query w_query    
+from t_wait w,t_run r where  
+  r.locktype is not distinct from w.locktype and  
+  r.database is not distinct from w.database and  
+  r.relation is not distinct from w.relation and  
+  r.page is not distinct from w.page and  
+  r.tuple is not distinct from w.tuple and  
+  r.classid is not distinct from w.classid and  
+  r.objid is not distinct from w.objid and  
+  r.objsubid is not distinct from w.objsubid and  
+  r.transactionid is not distinct from w.transactionid and  
+  r.pid <> w.pid  
+  order by f_lock_level(w.mode)+f_lock_level(r.mode) desc,r.xact_start   
+LOOP  
+  raise notice '%', v_record;  
+END LOOP;  
+for v_database,v_relation in select database,relation from pg_locks where   
+  locktype='extend' and mode='ExclusiveLock' and not granted and  
+  pid in (select pid from pg_stat_activity where now()-xact_start > i_interval)   
+  group by 1,2 having count(*) > i_waiting  
+loop  
+  perform pg_terminate_backend(pid) from pg_locks   
+    where database=v_database and relation=v_relation;  
+end loop;  
+return;  
+end;  
+$function$;  
+```  
+例如：  
+```  
+psql -c "select f_kill_extend(interval '1 sec', 10);"  
+```  
+## 参考  
+1\. http://blog.163.com/digoal@126/blog/static/163877040201352010122653/  
+2\. src/backend/storage/lmgr/proc.c  
+```  
+/*  
+ * ProcSleep -- put a process to sleep on the specified lock  
+ *  
+ * Caller must have set MyProc->heldLocks to reflect locks already held  
+ * on the lockable object by this process (under all XIDs).  
+ *  
+ * The lock table's partition lock must be held at entry, and will be held  
+ * at exit.  
+ *  
+ * Result: STATUS_OK if we acquired the lock, STATUS_ERROR if not (deadlock).  
+ *  
+ * ASSUME: that no one will fiddle with the queue until after  
+ *              we release the partition lock.  
+ *  
+ * NOTES: The process queue is now a priority queue for locking.  
+ *  
+ * P() on the semaphore should put us to sleep.  The process  
+ * semaphore is normally zero, so when we try to acquire it, we sleep.  
+ */  
+int  
+ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)  
+{  
+        LOCKMODE        lockmode = locallock->tag.mode;  
+        LOCK       *lock = locallock->lock;  
+        PROCLOCK   *proclock = locallock->proclock;  
+        uint32          hashcode = locallock->hashcode;  
+        LWLockId        partitionLock = LockHashPartitionLock(hashcode);  
+        PROC_QUEUE *waitQueue = &(lock->waitProcs);  
+        LOCKMASK        myHeldLocks = MyProc->heldLocks;  
+        bool            early_deadlock = false;  
+        bool            allow_autovacuum_cancel = true;  
+        int                     myWaitStatus;  
+        PGPROC     *proc;  
+        int                     i;  
+        /*  
+         * Determine where to add myself in the wait queue.  
+         *  
+         * Normally I should go at the end of the queue.  However, if I already  
+         * hold locks that conflict with the request of any previous waiter, put  
+         * myself in the queue just in front of the first such waiter. This is not  
+         * a necessary step, since deadlock detection would move me to before that  
+         * waiter anyway; but it's relatively cheap to detect such a conflict  
+         * immediately, and avoid delaying till deadlock timeout.  
+         *  
+         * Special case: if I find I should go in front of some waiter, check to  
+         * see if I conflict with already-held locks or the requests before that  
+         * waiter.  If not, then just grant myself the requested lock immediately.  
+         * This is the same as the test for immediate grant in LockAcquire, except  
+         * we are only considering the part of the wait queue before my insertion  
+         * point.  
+         */  
+        if (myHeldLocks != 0)  
+        {  
+                LOCKMASK        aheadRequests = 0;  
+                proc = (PGPROC *) waitQueue->links.next;  
+                for (i = 0; i size; i++)  
+                {  
+                        /* Must he wait for me? */  
+                        if (lockMethodTable->conflictTab[proc->waitLockMode] & myHeldLocks)  
+                        {  
+                                /* Must I wait for him ? */  
+                                if (lockMethodTable->conflictTab[lockmode] & proc->heldLocks)  
+                                {  
+                                        /*  
+                                         * Yes, so we have a deadlock.  Easiest way to clean up  
+                                         * correctly is to call RemoveFromWaitQueue(), but we  
+                                         * can't do that until we are *on* the wait queue. So, set  
+                                         * a flag to check below, and break out of loop.  Also,  
+                                         * record deadlock info for later message.  
+                                         */  
+                                        RememberSimpleDeadLock(MyProc, lockmode, lock, proc);  
+                                        early_deadlock = true;  
+                                        break;  
+                                }  
+                                /* I must go before this waiter.  Check special case. */  
+                                if ((lockMethodTable->conflictTab[lockmode] & aheadRequests) == 0 &&  
+                                        LockCheckConflicts(lockMethodTable,  
+                                                                           lockmode,  
+                                                                           lock,  
+                                                                           proclock,  
+                                                                           MyProc) == STATUS_OK)  
+                                {  
+                                        /* Skip the wait and just grant myself the lock. */  
+                                        GrantLock(lock, proclock, lockmode);  
+                                        GrantAwaitedLock();  
+                                        return STATUS_OK;  
+                                }  
+                                /* Break out of loop to put myself before him */  
+                                break;  
+                        }  
+                        /* Nope, so advance to next waiter */  
+                        aheadRequests |= LOCKBIT_ON(proc->waitLockMode);  
+                        proc = (PGPROC *) proc->links.next;  
+                }  
+                /*  
+                 * If we fall out of loop normally, proc points to waitQueue head, so  
+                 * we will insert at tail of queue as desired.  
+                 */  
+        }  
+        else  
+        {  
+                /* I hold no locks, so I can't push in front of anyone. */  
+                proc = (PGPROC *) &(waitQueue->links);  
+        }  
+        /*  
+         * Insert self into queue, ahead of the given proc (or at tail of queue).  
+         */  
+        SHMQueueInsertBefore(&(proc->links), &(MyProc->links));  
+        waitQueue->size++;  
+        lock->waitMask |= LOCKBIT_ON(lockmode);  
+        /* Set up wait information in PGPROC object, too */  
+        MyProc->waitLock = lock;  
+        MyProc->waitProcLock = proclock;  
+        MyProc->waitLockMode = lockmode;  
+        MyProc->waitStatus = STATUS_WAITING;  
+        /*  
+         * If we detected deadlock, give up without waiting.  This must agree with  
+         * CheckDeadLock's recovery code, except that we shouldn't release the  
+         * semaphore since we haven't tried to lock it yet.  
+         */  
+        if (early_deadlock)  
+        {  
+                RemoveFromWaitQueue(MyProc, hashcode);  
+                return STATUS_ERROR;  
+        }  
+        /* mark that we are waiting for a lock */  
+        lockAwaited = locallock;  
+        /*  
+         * Release the lock table's partition lock.  
+         *  
+         * NOTE: this may also cause us to exit critical-section state, possibly  
+         * allowing a cancel/die interrupt to be accepted. This is OK because we  
+         * have recorded the fact that we are waiting for a lock, and so  
+         * LockErrorCleanup will clean up if cancel/die happens.  
+         */  
+        LWLockRelease(partitionLock);  
+        /*  
+         * Also, now that we will successfully clean up after an ereport, it's  
+         * safe to check to see if there's a buffer pin deadlock against the  
+         * Startup process.  Of course, that's only necessary if we're doing Hot  
+         * Standby and are not the Startup process ourselves.  
+         */  
+        if (RecoveryInProgress() && !InRecovery)  
+                CheckRecoveryConflictDeadlock();  
+        /* Reset deadlock_state before enabling the timeout handler */  
+        deadlock_state = DS_NOT_YET_CHECKED;  
+        /*  
+         * Set timer so we can wake up after awhile and check for a deadlock. If a  
+         * deadlock is detected, the handler releases the process's semaphore and  
+         * sets MyProc->waitStatus = STATUS_ERROR, allowing us to know that we  
+         * must report failure rather than success.  
+         *  
+         * By delaying the check until we've waited for a bit, we can avoid  
+         * running the rather expensive deadlock-check code in most cases.  
+         *  
+         * If LockTimeout is set, also enable the timeout for that.  We can save a  
+         * few cycles by enabling both timeout sources in one call.  
+         */  
+        if (LockTimeout > 0)  
+        {  
+                EnableTimeoutParams timeouts[2];  
+                timeouts[0].id = DEADLOCK_TIMEOUT;  
+                timeouts[0].type = TMPARAM_AFTER;  
+                timeouts[0].delay_ms = DeadlockTimeout;  
+                timeouts[1].id = LOCK_TIMEOUT;  
+                timeouts[1].type = TMPARAM_AFTER;  
+                timeouts[1].delay_ms = LockTimeout;  
+                enable_timeouts(timeouts, 2);  

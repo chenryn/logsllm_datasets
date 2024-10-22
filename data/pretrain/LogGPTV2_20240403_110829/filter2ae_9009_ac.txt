@@ -1,0 +1,125 @@
+由官网文档可知，AFL是根据二元tuple(跳转的源地址和目标地址)来记录分支信息，从而获取target的执行流程和代码覆盖情况，其伪代码如下：
+    cur_location = ;
+    shared_mem[cur_location ^ prev_location]++; 
+    prev_location = cur_location >> 1;
+我们再回到方法`__afl_maybe_log()`中。上面提到，在target完成准备工作后，共享内存的地址被保存在寄存器`edx`中。随后执行以下代码：
+      "__afl_store:\n"
+      "\n"
+      " /* Calculate and store hit for the code location specified in ecx. There\n"
+      " is a double-XOR way of doing this without tainting another register,\n"
+      " and we use it on 64-bit systems; but it's slower for 32-bit ones. */\n"
+      "\n"
+    #ifndef COVERAGE_ONLY
+      " movl __afl_prev_loc, %edi\n"
+      " xorl %ecx, %edi\n"
+      " shrl $1, %ecx\n"
+      " movl %ecx, __afl_prev_loc\n"
+    #else
+      " movl %ecx, %edi\n"
+    #endif /* ^!COVERAGE_ONLY */
+      "\n"
+    #ifdef SKIP_COUNTS
+      " orb $1, (%edx, %edi, 1)\n"
+    #else
+      " incb (%edx, %edi, 1)\n"
+这里对应的便正是文档中的伪代码。具体地，变量`__afl_prev_loc`保存的是前一次跳转的”位置”，其值与`ecx`做异或后，保存在`edi`中，并以`edx`（共享内存）为基址，对`edi`下标处进行加一操作。而`ecx`的值右移1位后，保存在了变量`__afl_prev_loc`中。
+那么，这里的`ecx`，保存的应该就是伪代码中的`cur_location`了。回忆之前介绍代码插桩的部分：
+    static const u8* trampoline_fmt_32 = 
+    ...
+      "movl $0x%08x, %%ecx\n"
+      "call __afl_maybe_log\n"
+在每个插桩处，afl-as会添加相应指令，将`ecx`的值设为0到MAP_SIZE之间的某个随机数，从而实现了伪代码中的`cur_location =
+;`。
+因此，AFL为每个代码块生成一个随机数，作为其“位置”的记录；随后，对分支处的”源位置“和”目标位置“进行异或，并将异或的结果作为该分支的key，保存每个分支的执行次数。用于保存执行次数的实际上是一个哈希表，大小为`MAP_SIZE=64K`，当然会存在碰撞的问题；但根据AFL文档中的介绍，对于不是很复杂的目标，碰撞概率还是可以接受的：
+       Branch cnt | Colliding tuples | Example targets
+      ------------+------------------+-----------------            1,000 | 0.75%            | giflib, lzo
+            2,000 | 1.5%             | zlib, tar, xz
+            5,000 | 3.5%             | libpng, libwebp
+           10,000 | 7%               | libxml
+           20,000 | 14%              | sqlite
+           50,000 | 30%              | -
+如果一个目标过于复杂，那么AFL状态面板中的map_density信息就会有相应的提示：
+    ┬─ map coverage ─┴───────────────────────┤
+    │    map density : 3.61% / 14.13%        │
+    │ count coverage : 6.35 bits/tuple       │
+    ┼─ findings in depth ────────────────────┤
+这里的map
+density，就是这张哈希表的密度。可以看到，上面示例中，该次执行的哈希表密度仅为3.61%，即整个哈希表差不多有95%的地方还是空的，所以碰撞的概率很小。不过，如果目标很复杂，map
+density很大，那么就需要考虑到碰撞的影响了。此种情况下的具体处理方式可见官方文档。
+另外，比较有意思的是，AFL需要将`cur_location`右移1位后，再保存到`prev_location`中。官方文档中解释了这样做的原因。假设target中存在`A->A`和`B->B`这样两个跳转，如果不右移，那么这两个分支对应的异或后的key都是0，从而无法区分；另一个例子是`A->B`和`B->A`，如果不右移，这两个分支对应的异或后的key也是相同的。
+由上述分析可知，之前提到的共享内存，被用于保存一张哈希表，target在这张表中记录每个分支的执行数量。随后，当target执行结束后，fuzzer便开始对这张表进行分析，从而判断代码的执行情况。
+#### 分支信息的分析
+首先，fuzzer对`trace_bits`（共享内存）进行预处理：
+    classify_counts((u32*)trace_bits);
+具体地，target是将每个分支的执行次数用1个byte来储存，而fuzzer则进一步把这个执行次数归入以下的buckets中：
+    static const u8 count_class_lookup8[256] = {
+      [0]           = 0, 
+      [1]           = 1, 
+      [2]           = 2, 
+      [3]           = 4, 
+      [4 ... 7]     = 8, 
+      [8 ... 15]    = 16,
+      [16 ... 31]   = 32,
+      [32 ... 127]  = 64,
+      [128 ... 255] = 128
+    };
+举个例子，如果某分支执行了1次，那么落入第2个bucket，其计数byte仍为1；如果某分支执行了4次，那么落入第5个bucket，其计数byte将变为8，等等。
+这样处理之后，对分支执行次数就会有一个简单的归类。例如，如果对某个测试用例处理时，分支A执行了32次；对另外一个测试用例，分支A执行了33次，那么AFL就会认为这两次的代码覆盖是相同的。当然，这样的简单分类肯定不能区分所有的情况，不过在某种程度上，处理了一些因为循环次数的微小区别，而误判为不同执行结果的情况。
+随后，对于某些mutated
+input来说，如果这次执行没有出现崩溃等异常输出，fuzzer还会检查其是否新增了执行路径。具体来说，是对`trace_bits`计算hash并来实现：
+    u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+通过比较hash值，就可以判断trace_bits是否发生了变化，从而判断此次mutated
+input是否带来了新路径，为之后的fuzzing提供参考信息。
+#### 总结
+以上便是对AFL内部细节的一些分析整理，其实还有很多地方值得进一步深入去研究，例如AFL是如何判断一条路径是否是favorite的、如何对seed文件进行变化，等等。如果只是使用AFL进行简单的fuzzing，那么这些细节其实不需要掌握太多；但是如果需要在AFL的基础上进一步针对特定目标进行优化，那么了解AFL的内部工作原理就是必须的了。
+## Part 2：AFL文件变异一览
+[上一部分](https://rk700.github.io/2017/12/28/afl-internals/)主要对AFL的一些实现细节进行了分析，但正如最后所说，还有很多细节讲到。所以我又另外写了这篇，专门介绍AFL是如何对输入文件进行变异的。
+总的来讲，AFL维护了一个队列(queue)，每次从这个队列中取出一个文件，对其进行大量变异，并检查运行后是否会引起目标崩溃、发现新路径等结果。变异的主要类型如下：
+  * bitflip，按位翻转，1变为0，0变为1
+  * arithmetic，整数加/减算术运算
+  * interest，把一些特殊内容替换到原文件中
+  * dictionary，把自动生成或用户提供的token替换/插入到原文件中
+  * havoc，中文意思是“大破坏”，此阶段会对原文件进行大量变异，具体见下文
+  * splice，中文意思是“绞接”，此阶段会将两个文件拼接起来得到一个新的文件
+其中，前四项bitflip, arithmetic, interest, dictionary是非dumb
+mode（`-d`）和主fuzzer（`-M`）会进行的操作，由于其变异方式没有随机性，所以也称为deterministic
+fuzzing；havoc和splice则存在随机性，是所有状况的fuzzer（是否dumb mode、主从fuzzer）都会执行的变异。
+以下将对这些变异类型进行具体介绍。
+#### bitflip
+拿到一个原始文件，打头阵的就是bitflip，而且还会根据翻转量/步长进行多种不同的翻转，按照顺序依次为：
+  * bitflip 1/1，每次翻转 **1** 个bit，按照每 **1** 个bit的步长从头开始
+  * bitflip 2/1，每次翻转相邻的 **2** 个bit，按照每 **1** 个bit的步长从头开始
+  * bitflip 4/1，每次翻转相邻的 **4** 个bit，按照每 **1** 个bit的步长从头开始
+  * bitflip 8/8，每次翻转相邻的 **8** 个bit，按照每 **8** 个bit的步长从头开始，即依次对每个byte做翻转
+  * bitflip 16/8，每次翻转相邻的 **16** 个bit，按照每 **8** 个bit的步长从头开始，即依次对每个word做翻转
+  * bitflip 32/8，每次翻转相邻的 **32** 个bit，按照每 **8** 个bit的步长从头开始，即依次对每个dword做翻转
+作为精妙构思的fuzzer，AFL不会放过每一个获取文件信息的机会。这一点在bitflip过程中就体现的淋漓尽致。具体地，在上述过程中，AFL巧妙地嵌入了一些对文件格式的启发式判断。
+###### 自动检测token
+在进行bitflip 1/1变异时，对于每个byte的最低位(least significant
+bit)翻转还进行了额外的处理：如果连续多个bytes的最低位被翻转后，程序的执行路径都未变化，而且与原始执行路径不一致(检测程序执行路径的方式可见上篇文章中[“分支信息的分析”](https://rk700.github.io/2017/12/28/afl-internals/#%E5%88%86%E6%94%AF%E4%BF%A1%E6%81%AF%E7%9A%84%E5%88%86%E6%9E%90)一节)，那么就把这一段连续的bytes判断是一条token。
+例如，PNG文件中用`IHDR`作为起始块的标识，那么就会存在类似于以下的内容：
+    ........IHDR........
+当翻转到字符`I`的最高位时，因为`IHDR`被破坏，此时程序的执行路径肯定与处理正常文件的路径是不同的；随后，在翻转接下来3个字符的最高位时，`IHDR`标识同样被破坏，程序应该会采取同样的执行路径。由此，AFL就判断得到一个可能的token：`IHDR`，并将其记录下来为后面的变异提供备选。
+AFL采取的这种方式是非常巧妙的：就本质而言，这实际上是对每个byte进行修改并检查执行路径；但集成到bitflip后，就不需要再浪费额外的执行资源了。此外，为了控制这样自动生成的token的大小和数量，AFL还在`config.h`中通过宏定义了限制：
+    /* Length limits for auto-detected dictionary tokens: */
+    #define MIN_AUTO_EXTRA      3
+    #define MAX_AUTO_EXTRA      32
+    /* Maximum number of auto-extracted dictionary tokens to actually use in fuzzing
+       (first value), and to keep in memory as candidates. The latter should be much
+       higher than the former. */
+    #define USE_AUTO_EXTRAS     10
+    #define MAX_AUTO_EXTRAS     (USE_AUTO_EXTRAS * 10)
+对于一些文件来说，我们已知其格式中出现的token长度不会超过4，那么我们就可以修改`MAX_AUTO_EXTRA`为4并重新编译AFL，以排除一些明显不会是token的情况。遗憾的是，这些设置是通过宏定义来实现，所以不能做到运行时指定，每次修改后必须重新编译AFL。
+###### 生成effector map
+在进行bitflip 8/8变异时，AFL还生成了一个非常重要的信息：effector map。这个effector
+map几乎贯穿了整个deterministic fuzzing的始终。
+具体地，在对每个byte进行翻转时，如果其造成执行路径与原始路径不一致，就将该byte在effector
+map中标记为1，即“有效”的，否则标记为0，即“无效”的。
+这样做的逻辑是：如果一个byte完全翻转，都无法带来执行路径的变化，那么这个byte很有可能是属于"data"，而非"metadata"（例如size,
+flag等），对整个fuzzing的意义不大。所以，在随后的一些变异中，会参考effector map，跳过那些“无效”的byte，从而节省了执行资源。
+由此，通过极小的开销（没有增加额外的执行次数），AFL又一次对文件格式进行了启发式的判断。看到这里，不得不叹服于AFL实现上的精妙。
+不过，在某些情况下并不会检测有效字符。第一种情况就是dumb mode或者从fuzzer，此时文件所有的字符都有可能被变异。第二、第三种情况与文件本身有关：
+    /* Minimum input file length at which the effector logic kicks in: */
+    #define EFF_MIN_LEN         128
+    /* Maximum effector density past which everything is just fuzzed
+       unconditionally (%): */

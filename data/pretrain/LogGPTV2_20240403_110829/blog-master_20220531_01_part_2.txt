@@ -1,0 +1,111 @@
+        xidStopLimit = xidWrapLimit - 3000000;  
+        if (xidStopLimit < FirstNormalTransactionId)  
+                xidStopLimit -= FirstNormalTransactionId;  
+        /*  
+         * We'll start complaining loudly when we get within 40M transactions of  
+         * data loss.  This is kind of arbitrary, but if you let your gas gauge  
+         * get down to 2% of full, would you be looking for the next gas station?  
+         * We need to be fairly liberal about this number because there are lots  
+         * of scenarios where most transactions are done by automatic clients that  
+         * won't pay attention to warnings.  (No, we're not gonna make this  
+         * configurable.  If you know enough to configure it, you know enough to  
+         * not get in this kind of trouble in the first place.)  
+         */  
+        xidWarnLimit = xidWrapLimit - 40000000;  
+        if (xidWarnLimit < FirstNormalTransactionId)  
+                xidWarnLimit -= FirstNormalTransactionId;  
+......   
+```  
+## 原理、问题分析  
+1、事务号存在哪?  
+- tuple head   
+2、事务号有什么用?   
+- 结合commit log和事务快照, 判断tuple对其他活跃会话的可见性    
+- 事务分配的先后顺序   
+3、为什么要擦除(freeze)事务号?    
+- 事务号只有32位(值的上限约40亿), 需要循环使用, 可以理解为需要降低已使用xid的水位.  (解释: 把40亿xid分布在一个圆圈上, 以frozen xid为分界点劈成两半(一半即20亿), 以frozen xid为起点顺时针的一半圆内是可分配或已消耗事务号. 随着事务号的分配, 半圆被逐渐消耗, freeze的动作是针对已分配事务的, freeze的目的是擦除xid(使这些事务对应tuple对所有人可见), 从而在圆上移动frozen xid, 保持半圆内一直都有可分配事务号. )   
+- 被擦除(freeze)事务号的tuple, 对所有事务可见.   因此tuple的xid信息能不能擦出取决于它还有没有可能被用到(判断可见性)?     
+4、事务号耗尽原因:   
+4\.1、 没有及时擦除(freeze)事务号  
+- 高并发小事务, 消耗事务号快. 在非常极端的情况下(例如硬件性能差, 但是写入事务开启了异步模式. 使得写入可以非常快, 但是擦除(freeze)慢.), 擦除速度可能跟不上.   
+    - 建议选择低延迟高带宽的存储  
+- 表太大, 设计不合理. 因为单表(如果是分区表, 指的是最小粒度的分区大小)太大, freeze暂时还不支持单表并行, 所以速度可能比较慢.   
+    - 建议采用分区表   
+- 参数设置不当, 垃圾回收进程睡眠过多, 垃圾回收进程数太少等, 导致freeze慢  
+    - autovacuum_max_workers 太小  
+    - autovacuum_vacuum_cost_delay 太大  
+- 未开启自动回收(请注意这个参数可以全局设置, 也可以表级别设置.)  
+    - autovacuum=off   
+    - 此时freeze只会发生在表的年龄超过autovacuum_freeze_max_age时, 强制freeze, 但是这个时候可能年龄已经较大, 剩余可分配xid已经不多, 那么有更大的可能性导致在耗尽xid之前都无法完成freeze.   
+- 硬件性能差(IO延迟高、吞吐低), 回收慢   
+    - 建议选择低延迟高带宽的存储  
+- 内存配置不合理, 大表索引多次扫描. 单表的垃圾比较多的情况下, 垃圾记录的行号过多打爆 autovacuum_work_mem, 使得索引需要多次扫描, 影响速度.    
+    - [《PostgreSQL 14 preview - 支持 vacuum 强制加速参数 vacuum_failsafe_age , vacuum_multixact_failsafe_age. (跳过vacuum index, 不受delay限制等) 防止 xid wraparound》](../202104/20210408_03.md)    
+    - [《PostgreSQL 垃圾回收参数优化之 - maintenance_work_mem , autovacuum_work_mem》](../201902/20190226_01.md)    
+    - 调大autovacuum_work_mem或者用分区表解决.    
+4\.2、 存在无法擦除(freeze)的事务号  
+主库 或 开启了hot_standby_feedback的只读从库 存在如下情况时, 可能影响freeze操作擦除某些事务号 :   
+- 存在长事务 , 检查 pg_stat_activity : backend_xid , backend_xmin , xact_start , query_start    
+- 存在未结束的2pc , 检查 pg_prepared_xacts : prepared , database   
+- 存在长sql , 检查 pg_stat_activity : backend_xid , backend_xmin , xact_start , query_start    
+主库存在如下情况时, 可能影响freeze操作擦除某些事务号:   
+- 未正常消费的 replication slot, 检查 pg_replication_slots. 由于逻辑订阅需要从wal中解析数据逻辑变更, 需要用到当时对应的catalog元数据(例如结构定义数据), 所以不消费或者消费慢的话, catalog的表需要保留比较旧的版本. 妨碍catalog的freeze.      
+- 设置了延迟回收参数, vacuum_defer_cleanup_age.   强制延迟保留多少个垃圾版本.     
+## 如何救火  
+假设你的数据库已经不允许执行事务, 报错了.   
+```  
+"database is not accepting commands to avoid wraparound data loss in database \"%s\"",  
+        oldest_datname),  
+("Stop the postmaster and vacuum that database in single-user mode.\n"  
+         "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));  
+```  
+你必须进入单用户模式进行修复.    
+如果你想最快的速度恢复数据库的使用, 可以不要freeze整个集群.   
+进入单用户, 找出年龄最大的对象(表、物化视图, 包括系统表), 依次 freeze. 集群的年龄下降后即可开启, 然后在正常模式执行freeze.   
+排序方法:    
+```  
+先找最大年龄的库  
+age(pg_database.datfrozenxid), age(pg_database.datminmxid)  
+进入对应库, 找最大年龄的表或者物化视图  
+age(pg_class.relfrozenxid), age(pg_class.relminmxid)  
+然后 vacuum freeze 对应TABLE;  
+差不多了就可以检查数据库的剩余可分配事务是否大于300万;  
+```  
+单用户进入方法:  
+- [《PostgreSQL single-user mode 单用户模式修复 database is not accepting commands to avoid wraparound data loss in database "...." 问题 - usage,like Repair Database》](../201012/20101210_01.md)    
+- [《PostgreSQL 单用户模式修复 系统索引损坏 - single user mode, reindex system》](../202101/20210104_01.md)    
+如果尝试了以上方法, 数据库年龄还是降不下来, 需要分析是不是因为集群中存在未结束的prepare事务或者僵尸slot导致的, 是的话要先要把prepare事务结束, 或把slot干掉(或者推进slot位移). 然后重复以上操作.    
+```  
+slot处理:   
+pg_drop_replication_slot(name) 删除slot  
+pg_replication_slot_advance(slot_name name, upto_lsn pg_lsn) 推进slot位移  
+2pc事务处理:   
+ROLLBACK PREPARED transaction_id;  
+COMMIT PREPARED transaction_id;  
+```  
+## 如何预防  
+### 1、硬  
+提升硬件性能:   
+- 更大内存;   
+- 低RT, 高带宽的存储硬件;   
+- 多CPU核数;  
+### 2、软  
+1、打开snapshot too old参数. old_snapshot_threshold, 根源上杜绝存在无法擦除(freeze)的事务号的问题, 但是有性能副作用, 有对长事务或者2pc事务的伤害.  对slot原因无效.   
+2、使用分区表. 缩短大表freeze时间.   
+3、分区, 并设置每个分区的autovacuum_freeze_max_age, 错开freeze风暴.   
+- [《PostgreSQL的"天气预报" - 如何预测Freeze IO风暴》](../201606/20160612_01.md)    
+- [《PostgreSQL freeze 风暴导致的IOPS飙升 - 事后追溯》](../201801/20180117_03.md)    
+- [《PostgreSQL Freeze 风暴预测续 - 珍藏级SQL》](../201804/20180411_01.md)    
+4、调大autovacuum_work_mem内存配置, 避免大表垃圾多时需要多次扫描索引.   
+5、调大autovacuum_max_workers. 但是也不能太多, 可能对正常业务有影响.   
+6、调高vacuum的工作频率, 减少休息, 涉及autovacuum_vacuum_cost_delay, autovacuum_vacuum_cost_limit等参数.   
+7、监控主库和从库的: 年龄、长SQL、长事务、2PC、僵尸SLOT, 尽早发现处理隐患.    
+8、采用批量提交, 减少事务号的消耗.   
+#### [期望 PostgreSQL 增加什么功能?](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+#### [PolarDB for PostgreSQL云原生分布式开源数据库](https://github.com/ApsaraDB/PolarDB-for-PostgreSQL "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

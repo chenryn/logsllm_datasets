@@ -1,0 +1,141 @@
+# tcache poisoning在glibc2.29中的利用小结
+## 前言
+最近在练习渗透，万万没想到做渗透还是遇上了pwn，提权过程发现一个有suid的二进制程序，程序的漏洞比较明显，唯一难点是程序使用的libc版本较高，为glibc2.29，这么高版本的libc还没了解过，借此机会学一下2.29libc新增的保护机制，以及如何绕过新增的保护，使用tcache进行攻击。
+## Glibc-2.29 tcache新增防护机制
+tcache是glibc-2.26引入的一种新技术，目的是提升堆管理的性能，早期的libc对tcache基本没任何防护，简直到了为所欲为的地步，一不检查double
+free，二不检查size大小，使用起来比fastbins还要简单。
+查看glibc-2.29 malloc.c的源码，tcache_entry结构体增加了一个新指针`key`放在bk的位置，用于检测double free。
+    typedef struct tcache_entry
+    {
+      struct tcache_entry *next;
+      /* This field exists to detect double frees.  */
+      struct tcache_perthread_struct *key; /* 新增指针 */
+    } tcache_entry;
+在之前的版本，要填满tcache非常简单粗暴，如果程序不清空指针，可以由头到尾free同一个chunk，直接把tcache填满，在2.29下这个方法不再适用。下面继续看一下`tcache_put`和`tcache_get`部分的源码，看看这个新指针起到如何的作用。
+    /* Caller must ensure that we know tc_idx is valid and there's room
+       for more chunks.  */
+    static __always_inline void
+    tcache_put (mchunkptr chunk, size_t tc_idx)
+    {
+      tcache_entry *e = (tcache_entry *) chunk2mem (chunk);
+      assert (tc_idx key = tcache;   // 写入tcache_perthread_struct地址
+      e->next = tcache->entries[tc_idx];
+      tcache->entries[tc_idx] = e;
+      ++(tcache->counts[tc_idx]);
+    }
+    /* Caller must ensure that we know tc_idx is valid and there's
+       available chunks to remove.  */
+    static __always_inline void *
+    tcache_get (size_t tc_idx)
+    {
+      tcache_entry *e = tcache->entries[tc_idx];
+      assert (tc_idx counts[tc_idx] > 0);
+      tcache->entries[tc_idx] = e->next;
+      --(tcache->counts[tc_idx]);
+      e->key = NULL;  // 清空
+      return (void *) e;
+    }
+当一个属于tcache大小的chunk被free掉时，会调用`tcache_put`，`e->key`被写入`tcache_perthread_struct`的地址，也就是heap开头的位置。而当程序从tcache取出chunk时，会将`e->key`重新清空。简单的调试看看实际的运行结果，下图为一个0x60大小的chunk，bk位置写入了一个`tcache_perthread_struct`的地址。
+然后再看一下`_int_free`中`tcache`部分如何进行double free检测。
+    static void
+    _int_free (mstate av, mchunkptr p, int have_lock)
+    {
+      INTERNAL_SIZE_T size;        /* its size */
+      mfastbinptr *fb;             /* associated fastbin */
+      mchunkptr nextchunk;         /* next contiguous chunk */
+      INTERNAL_SIZE_T nextsize;    /* its size */
+      int nextinuse;               /* true if nextchunk is used */
+      INTERNAL_SIZE_T prevsize;    /* size of previous contiguous chunk */
+      mchunkptr bck;               /* misc temp for linking */
+      mchunkptr fwd;               /* misc temp for linking */
+      ...
+    #if USE_TCACHE
+      {
+        size_t tc_idx = csize2tidx (size);
+        if (tcache != NULL && tc_idx  chance), so verify it's not an unlikely
+           coincidence before aborting.  */
+        if (__glibc_unlikely (e->key == tcache)) // 检查是否为tcache_perthread_struct地址
+          {
+            tcache_entry *tmp;
+            LIBC_PROBE (memory_tcache_double_free, 2, e, tc_idx);
+            for (tmp = tcache->entries[tc_idx];
+             tmp;
+             tmp = tmp->next)
+              if (tmp == e)                      // 检查tcache中是否有一样的chunk
+            malloc_printerr ("free(): double free detected in tcache 2");
+            /* If we get here, it was a coincidence.  We've wasted a
+               few cycles, but don't abort.  */
+          }
+      ...
+首先`_int_free`会检查chunk的key是否为tcache_perthread_struct地址，然后会遍历tcache，检查此chunk是否已经在tcache中，如有则触发`malloc_printerr`报错`free():
+double free detected in tcache 2`。
+简单总结一下，2.29下tcache触发double free报错的条件为：
+    e-key == &tcache_perthread_struct && chunk in tcachebin[chunk_idx]
+新增保护主要还是用到`e->key`这个属性，因此绕过想绕过检测进行double free，这里也是入手点。绕过思路有以下两个：
+  1. 如果有UAF漏洞或堆溢出，可以修改`e->key`为空，或者其他非`tcache_perthread_struct`的地址。这样可以直接绕过`_int_free`里面第一个if判断。不过如果UAF或堆溢出能直接修改chunk的fd的话，根本就不需要用到double free了。
+  2. 利用堆溢出，修改chunk的size，最差的情况至少要做到off by null。留意到`_int_free`里面判断当前chunk是否已存在tcache的地方，它是根据chunk的大小去查指定的tcache链，由于我们修改了chunk的size，查找tcache链时并不会找到该chunk，满足free的条件。虽然double free的chunk不在同一个tcache链中，不过不影响我们使用tcache poisoning进行攻击。
+## picoctf2019 zero_to_hero
+由于渗透环境的题目，官方暂时不允许公开wp，我这里找到了picoctf2019一题pwn进行演示攻击流程。首先看一下题目的保护情况:
+    [*] '/ctf/work/zero_to_hero'
+        Arch:     amd64-64-little
+        RELRO:    Full RELRO
+        Stack:    Canary found
+        NX:       NX enabled
+        PIE:      No PIE (0x400000)
+        RUNPATH:  './'
+题目提供了ld-2.29.so和libc.so.6(版本为2.29)，如果使用Ubuntu19.10以下版本进行调试，需要用patchelf进行patch。
+    void __fastcall __noreturn main(__int64 a1, char **a2, char **a3)
+    {
+      int v3; // [rsp+Ch] [rbp-24h]
+      char buf[24]; // [rsp+10h] [rbp-20h]
+      unsigned __int64 v5; // [rsp+28h] [rbp-8h]
+      v5 = __readfsqword(0x28u);
+      setvbuf(stdin, 0LL, 2, 0LL);
+      setvbuf(stdout, 0LL, 2, 0LL);
+      setvbuf(stderr, 0LL, 2, 0LL);
+      puts("From Zero to Hero");
+      puts("So, you want to be a hero?");
+      buf[read(0, buf, 0x14uLL)] = 0;
+      if ( buf[0] != 'y' )
+      {
+        puts("No? Then why are you even here?");
+        exit(0);
+      }
+      puts("Really? Being a hero is hard.");
+      puts("Fine. I see I can't convince you otherwise.");
+      printf("It's dangerous to go alone. Take this: %p\n", &system);
+      while ( 1 )
+      {
+        while ( 1 )
+        {
+          menu();
+          printf("> ");
+          v3 = 0;
+          __isoc99_scanf("%d", &v3);
+          getchar();
+          if ( v3 != 2 )
+            break;
+          delete();
+        }
+        if ( v3 == 3 )
+          break;
+        if ( v3 != 1 )
+          goto LABEL_11;
+        add("%d", &v3);
+      }
+      puts("Giving up?");
+    LABEL_11:
+      exit(0);
+    }
+题目逻辑很简单，只有add和delete两个功能，同时程序直接给出了system的运行地址，不需要进行libc地址泄露，难度大大降低。
+漏洞一：free之后没有情况指针
+    unsigned __int64 sub_400BB3()
+    {
+      unsigned int v1; // [rsp+4h] [rbp-Ch]
+      unsigned __int64 v2; // [rsp+8h] [rbp-8h]
+      v2 = __readfsqword(0x28u);
+      v1 = 0;
+      puts("Which power would you like to remove?");
+      printf("> ");
+      __isoc99_scanf("%u", &v1);
+      getchar();

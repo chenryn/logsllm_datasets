@@ -1,0 +1,290 @@
+#### 无密码验证开始部分的处理程序
+```
+type PasswordlessStartRequest struct {
+    Email       string `json:"email"`
+    RedirectURI string `json:"redirectUri"`
+}
+```
+这个结构体含有 `passwordlessStart` 的请求体：希望去登入的用户 email、来自客户端的重定向 URI（这个应用中将使用我们的 API）如：`https://frontend.app/callback`。
+```
+var magicLinkTmpl = template.Must(template.ParseFiles("templates/magic-link.html"))
+```
+我们将使用 golang 模板引擎去构建邮件，因此需要你在 `templates` 目录中，用如下的内容创建一个 `magic-link.html` 文件：
+```
+    Magic Link
+    Click here to login.
+    This link expires in 15 minutes and can only be used once.
+```
+这个模板是给用户发送魔法链接邮件用的。你可以根据你的需要去随意调整它。
+现在， 进入 `passwordlessStart` 函数内部：
+```
+var input PasswordlessStartRequest
+if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+    respondJSON(w, err.Error(), http.StatusBadRequest)
+    return
+}
+defer r.Body.Close()
+```
+首先，我们像前面一样解码请求体。
+```
+errs := make(map[string]string)
+if input.Email == "" {
+    errs["email"] = "Email required"
+} else if !rxEmail.MatchString(input.Email) {
+    errs["email"] = "Invalid email"
+}
+if input.RedirectURI == "" {
+    errs["redirectUri"] = "Redirect URI required"
+} else if u, err := url.Parse(input.RedirectURI); err != nil || !u.IsAbs() {
+    errs["redirectUri"] = "Invalid redirect URI"
+}
+if len(errs) != 0 {
+    respondJSON(w, errs, http.StatusUnprocessableEntity)
+    return
+}
+```
+我们使用 golang 的 URL 解析器去验证重定向 URI，检查那个 URI 是否为绝对地址。
+```
+var verificationCode string
+err := db.QueryRowContext(r.Context(), `
+    INSERT INTO verification_codes (user_id) VALUES
+        ((SELECT id FROM users WHERE email = $1))
+    RETURNING id
+`, input.Email).Scan(&verificationCode)
+if errPq, ok := err.(*pq.Error); ok && errPq.Code.Name() == "not_null_violation" {
+    respondJSON(w, "No user found with that email", http.StatusNotFound)
+    return
+} else if err != nil {
+    respondInternalError(w, fmt.Errorf("could not insert verification code: %v", err))
+    return
+}
+```
+这个 SQL 查询将插入一个验证代码，这个代码通过给定的 email 关联到用户，并且返回一个自动生成的 id。因为有可能会出现用户不存在的情况，那样的话子查询可能解析为 `NULL`，这将导致在 `user_id` 字段上因违反 `NOT NULL` 约束而导致失败，因此需要对这种情况进行检查，如果用户不存在，则返回 `404 Not Found` 或者一个内部错误。
+```
+q := make(url.Values)
+q.Set("verification_code", verificationCode)
+q.Set("redirect_uri", input.RedirectURI)
+magicLink := *config.appURL
+magicLink.Path = "/api/passwordless/verify_redirect"
+magicLink.RawQuery = q.Encode()
+```
+现在，构建魔法链接并设置查询字符串中的 `verification_code` 和 `redirect_uri` 的值。如：`http://localhost/api/passwordless/verify_redirect?verification_code=some_code&redirect_uri=https://frontend.app/callback`。
+```
+var body bytes.Buffer
+data := map[string]string{"MagicLink": magicLink.String()}
+if err := magicLinkTmpl.Execute(&body, data); err != nil {
+    respondInternalError(w, fmt.Errorf("could not execute magic link template: %v", err))
+    return
+}
+```
+我们将得到的魔法链接模板的内容保存到缓冲区中。如果发生错误则返回一个内部错误。
+```
+to := mail.Address{Address: input.Email}
+if err := sendMail(to, "Magic Link", body.String()); err != nil {
+    respondInternalError(w, fmt.Errorf("could not mail magic link: %v", err))
+    return
+}
+```
+现在来写给用户发邮件的 `sendMail` 函数。如果发生错误则返回一个内部错误。
+```
+w.WriteHeader(http.StatusNoContent)
+```
+最后，设置响应状态码为 `204 No Content`。对于成功的状态码，客户端不需要很多数据。
+#### 发送邮件函数
+```
+func sendMail(to mail.Address, subject, body string) error {
+    from := mail.Address{
+        Name:    "Passwordless Demo",
+        Address: "noreply@" + config.appURL.Host,
+    }
+    headers := map[string]string{
+        "From":         from.String(),
+        "To":           to.String(),
+        "Subject":      subject,
+        "Content-Type": `text/html; charset="utf-8"`,
+    }
+    msg := ""
+    for k, v := range headers {
+        msg += fmt.Sprintf("%s: %s\r\n", k, v)
+    }
+    msg += "\r\n"
+    msg += body
+    return smtp.SendMail(
+        config.smtpAddr,
+        config.smtpAuth,
+        from.Address,
+        []string{to.Address},
+        []byte(msg))
+}
+```
+这个函数创建一个基本的 HTML 邮件结构体并使用 SMTP 服务器去发送它。邮件的内容你可以随意定制，我喜欢使用比较简单的内容。
+#### 无密码验证重定向的处理程序
+```
+var rxUUID = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+```
+首先，这个正则表达式去验证一个 UUID（即验证代码）。
+现在进入 `passwordlessVerifyRedirect` 函数内部：
+```
+q := r.URL.Query()
+verificationCode := q.Get("verification_code")
+redirectURI := q.Get("redirect_uri")
+```
+`/api/passwordless/verify_redirect` 是一个 `GET` 端点，以便于我们从查询字符串中读取数据。
+```
+errs := make(map[string]string)
+if verificationCode == "" {
+    errs["verification_code"] = "Verification code required"
+} else if !rxUUID.MatchString(verificationCode) {
+    errs["verification_code"] = "Invalid verification code"
+}
+var callback *url.URL
+var err error
+if redirectURI == "" {
+    errs["redirect_uri"] = "Redirect URI required"
+} else if callback, err = url.Parse(redirectURI); err != nil || !callback.IsAbs() {
+    errs["redirect_uri"] = "Invalid redirect URI"
+}
+if len(errs) != 0 {
+    respondJSON(w, errs, http.StatusUnprocessableEntity)
+    return
+}
+```
+类似的验证，我们保存解析后的重定向 URI 到一个 `callback` 变量中。
+```
+var userID string
+if err := db.QueryRowContext(r.Context(), `
+    DELETE FROM verification_codes
+    WHERE id = $1
+        AND created_at >= now() - INTERVAL '15m'
+    RETURNING user_id
+`, verificationCode).Scan(&userID); err == sql.ErrNoRows {
+    respondJSON(w, "Link expired or already used", http.StatusBadRequest)
+    return
+} else if err != nil {
+    respondInternalError(w, fmt.Errorf("could not delete verification code: %v", err))
+    return
+}
+```
+这个 SQL 查询通过给定的 id 去删除相应的验证代码，并且确保它创建之后时间不超过 15 分钟，它也返回关联的 `user_id`。如果没有检索到内容，意味着代码不存在或者已过期，我们返回一个响应信息，否则就返回一个内部错误。
+```
+expiresAt := time.Now().Add(time.Hour * 24 * 60)
+tokenString, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
+    Subject:   userID,
+    ExpiresAt: expiresAt.Unix(),
+}).SignedString(config.jwtKey)
+if err != nil {
+    respondInternalError(w, fmt.Errorf("could not create JWT: %v", err))
+    return
+}
+```
+这些是如何去创建 JWT。我们为 JWT 设置一个 60 天的过期值，你也可以设置更短的时间（大约 2 周），并添加一个新端点去刷新令牌，但是不要搞的过于复杂。
+```
+expiresAtB, err := expiresAt.MarshalText()
+if err != nil {
+    respondInternalError(w, fmt.Errorf("could not marshal expiration date: %v", err))
+    return
+}
+f := make(url.Values)
+f.Set("jwt", tokenString)
+f.Set("expires_at", string(expiresAtB))
+callback.Fragment = f.Encode()
+```
+我们去规划重定向；你可使用查询字符串去添加 JWT，但是更常见的是使用一个哈希片段。如：`https://frontend.app/callback#jwt=token_here&expires_at=some_date`.
+过期日期可以从 JWT 中提取出来，但是这样做的话，就需要在客户端上实现一个 JWT 库来解码它，因此为了简化，我将它加到这里。
+```
+http.Redirect(w, r, callback.String(), http.StatusFound)
+```
+最后我们使用一个 `302 Found` 重定向。
+---
+无密码的流程已经完成。现在需要去写 `getAuthUser` 端点的代码了，它用于获取当前验证用户的信息。你应该还记得，这个端点使用了 `guard` 中间件。
+#### 使用 Auth 中间件
+在编写 `guard` 中间件之前，我将编写一个不需要验证的分支。目的是，如果没有传递 JWT，它将不去验证用户。
+```
+type ContextKey struct {
+    Name string
+}
+var keyAuthUserID = ContextKey{"auth_user_id"}
+func withAuth(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        a := r.Header.Get("Authorization")
+        hasToken := strings.HasPrefix(a, "Bearer ")
+        if !hasToken {
+            next(w, r)
+            return
+        }
+        tokenString := a[7:]
+        p := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Name}}
+        token, err := p.ParseWithClaims(
+            tokenString,
+            &jwt.StandardClaims{},
+            func (*jwt.Token) (interface{}, error) { return config.jwtKey, nil },
+        )
+        if err != nil {
+            respondJSON(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+            return
+        }
+        claims, ok := token.Claims.(*jwt.StandardClaims)
+        if !ok || !token.Valid {
+            respondJSON(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+            return
+        }
+        ctx := r.Context()
+        ctx = context.WithValue(ctx, keyAuthUserID, claims.Subject)
+        next(w, r.WithContext(ctx))
+    }
+}
+```
+JWT 将在每次请求时以 `Bearer ` 格式包含在 `Authorization` 头中。因此，如果没有提供令牌，我们将直接通过，进入接下来的中间件。
+我们创建一个解析器来解析令牌。如果解析失败则返回 `401 Unauthorized`。
+然后我们从 JWT 中提取出要求的内容，并添加 `Subject`（就是用户 ID）到需要的地方。
+#### Guard 中间件
+```
+func guard(next http.HandlerFunc) http.HandlerFunc {
+    return withAuth(func(w http.ResponseWriter, r *http.Request) {
+        _, ok := r.Context().Value(keyAuthUserID).(string)
+        if !ok {
+            respondJSON(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+            return
+        }
+        next(w, r)
+    })
+}
+```
+现在，`guard` 将使用 `withAuth` 并从请求内容中提取出验证用户的 ID。如果提取失败，它将返回 `401 Unauthorized`，提取成功则继续下一步。
+#### 获取 Auth 用户
+在 `getAuthUser` 处理程序内部：
+```
+ctx := r.Context()
+authUserID := ctx.Value(keyAuthUserID).(string)
+user, err := fetchUser(ctx, authUserID)
+if err == sql.ErrNoRows {
+    respondJSON(w, http.StatusText(http.StatusTeapot), http.StatusTeapot)
+    return
+} else if err != nil {
+    respondInternalError(w, fmt.Errorf("could not query auth user: %v", err))
+    return
+}
+respondJSON(w, user, http.StatusOK)
+```
+首先，我们从请求内容中提取验证用户的 ID，我们使用这个 ID 去获取用户。如果没有获取到内容，则发送一个 `418 I'm a teapot`，或者一个内部错误。最后，我们将用这个用户去响应。
+#### 获取 User 函数
+下面你看到的是 `fetchUser` 函数。
+```
+func fetchUser(ctx context.Context, id string) (User, error) {
+    user := User{ID: id}
+    err := db.QueryRowContext(ctx, `
+        SELECT email, username FROM users WHERE id = $1
+    `, id).Scan(&user.Email, &user.Username)
+    return user, err
+}
+```
+我将它解耦是因为通过 ID 来获取用户是个常做的事。
+---
+以上就是全部的代码。你可以自己去构建它和测试它。[这里](https://go-passwordless-demo.herokuapp.com/) 还有一个 demo 你可以试用一下。
+如果你在 mailtrap 上点击之后出现有关 `脚本运行被拦截，因为文档的框架是沙箱化的，并且没有设置 'allow-scripts' 权限` 的问题，你可以尝试右键点击 “在新标签中打开链接“。这样做是安全的，因为邮件内容是 [沙箱化的](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/iframe#attr-sandbox)。我在 `localhost` 上有时也会出现这个问题，但是我认为你一旦以 `https://` 方式部署到服务器上应该不会出现这个问题了。
+如果有任何问题，请在我的 [GitHub repo](https://github.com/nicolasparada/go-passwordless-demo) 留言或者提交 PRs
+以后，我为这个 API 写了一个客户端作为这篇文章的[第二部分](https://nicolasparada.netlify.com/posts/passwordless-auth-client/)。
+---
+via: 
+作者：[Nicolás Parada](https://nicolasparada.netlify.com/) 译者：[qhwdw](https://github.com/qhwdw) 校对：[wxy](https://github.com/wxy)
+本文由 [LCTT](https://github.com/LCTT/TranslateProject) 原创编译，[Linux中国](https://linux.cn/) 荣誉推出

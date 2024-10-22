@@ -1,0 +1,215 @@
+## 阿里云ApsaraDB RDS for PostgreSQL 最佳实践 - 3 水平分库(plproxy) vs 单机 性能
+##### [TAG 24](../class/24.md)
+### 作者                                                                           
+digoal                         
+### 日期                           
+2015-12-20                           
+### 标签                         
+PostgreSQL , 阿里云RDS        
+----                        
+## 背景               
+本文是针对单个RDS实例（同样的配置）承载6400万数据的测试。对比前面的水平分库。  
+创建测试表，生成测试数据。  
+```  
+create table userinfo(userid int,info text);  
+create table session (userid int,last_login timestamp);  
+create table login_log (userid int,db_user name,client_addr inet,  
+                       client_port int,server_addr inet,server_port int,login_time timestamp);  
+create table tbl_small (userid int primary key,info text);  
+set synchronous_commit=off;  
+insert into userinfo select generate_series(1,32000000);  
+insert into session select generate_series(1,32000000);  
+insert into tbl_small select generate_series(1,500000);  
+set maintenance_work_mem='10GB';  
+alter table userinfo add constraint pk_userinfo primary key (userid);  
+alter table session add constraint pk_session primary key (userid);  
+postgres=> \dt+  
+                         List of relations  
+ Schema |      Name       | Type  | Owner  |  Size   | Description   
+--------+-----------------+-------+--------+---------+-------------  
+ public | ha_health_check | table | aurora | 40 kB   |   
+ public | session         | table | digoal | 1106 MB |   
+ public | userinfo        | table | digoal | 1106 MB |   
+(3 rows)  
+postgres=> \di+  
+                                    List of relations  
+ Schema |         Name         | Type  | Owner  |      Table      |  Size  | Description   
+--------+----------------------+-------+--------+-----------------+--------+-------------  
+ public | ha_health_check_pkey | index | aurora | ha_health_check | 16 kB  |   
+ public | pk_session           | index | digoal | session         | 686 MB |   
+ public | pk_userinfo          | index | digoal | userinfo        | 686 MB |   
+(3 rows)  
+```  
+测试中发现一个小小的惊喜，RDS限制了数据库进程的内存使用（包括shared buffers,work_mem,maintenance_work_mem, wal_buffers等限制），但是并不会限制OS层缓存的使用，也就是说我们的数据表对应的数据文件如果是热数据的话，可能被缓存好OS层缓存中，假如RDS能提供pgfincore插件就更完美了，不过在云环境中使用会造成内存争抢的情况。  
+下面我们看一个测试，实例只有256MB的shared buffer, 下面的查询却飞快。  
+```  
+postgres=> explain (analyze,verbose,timing,buffers,costs) select count(userid) from session;  
+                                                             QUERY PLAN                                                               
+------------------------------------------------------------------------------------------------------------------------------------  
+ Aggregate  (cost=541593.00..541593.01 rows=1 width=4) (actual time=6574.761..6574.761 rows=1 loops=1)  
+   Output: count(userid)  
+   Buffers: shared hit=20229 read=121364  
+   I/O Timings: read=227.803  
+   ->  Seq Scan on public.session  (cost=0.00..461593.00 rows=32000000 width=4) (actual time=0.029..3295.744 rows=32000001 loops=1)  
+         Output: userid, last_login  
+         Buffers: shared hit=20229 read=121364  
+         I/O Timings: read=227.803  
+ Planning time: 0.044 ms  
+ Execution time: 6574.794 ms  
+(10 rows)  
+postgres=> explain (analyze,verbose,timing,buffers,costs) select count(userid) from userinfo;  
+                                                             QUERY PLAN                                                               
+------------------------------------------------------------------------------------------------------------------------------------  
+ Aggregate  (cost=541593.00..541593.01 rows=1 width=4) (actual time=6653.383..6653.383 rows=1 loops=1)  
+   Output: count(userid)  
+   Buffers: shared hit=64 read=141529  
+   I/O Timings: read=265.700  
+   ->  Seq Scan on public.userinfo  (cost=0.00..461593.00 rows=32000000 width=4) (actual time=0.029..3358.069 rows=32000001 loops=1)  
+         Output: userid, info  
+         Buffers: shared hit=64 read=141529  
+         I/O Timings: read=265.700  
+ Planning time: 0.046 ms  
+ Execution time: 6653.417 ms  
+(10 rows)  
+```  
+分析这里的I/O Timings，单位毫秒，每次IO请求只需要0.0019毫秒。  
+这已经是内存级别的速度了。  
+```  
+postgres=> select 265.700/141529;  
+        ?column?          
+------------------------  
+ 0.00187735375788707615  
+(1 row)  
+postgres=> select 227.803/121364;  
+        ?column?          
+------------------------  
+ 0.00187702284038100260  
+(1 row)  
+```  
+离散扫描测试：  
+```  
+postgres=> set enable_seqscan=off;  
+SET  
+postgres=> explain (analyze,verbose,timing,buffers,costs) select count(userid) from userinfo;  
+                                                                          QUERY PLAN                                                  
+------------------------------------------------------------------------------------------------------------------------------------  
+--------------------------  
+ Aggregate  (cost=1052572.56..1052572.57 rows=1 width=4) (actual time=10343.801..10343.801 rows=1 loops=1)  
+   Output: count(userid)  
+   Buffers: shared read=229028  
+   I/O Timings: read=674.634  
+   ->  Index Only Scan using pk_userinfo on public.userinfo  (cost=0.56..972572.56 rows=32000000 width=4) (actual time=0.082..7277.8  
+18 rows=32000001 loops=1)  
+         Output: userid  
+         Heap Fetches: 32000001  
+         Buffers: shared read=229028  
+         I/O Timings: read=674.634  
+ Planning time: 0.035 ms  
+ Execution time: 10343.851 ms  
+(11 rows)  
+postgres=> explain (analyze,verbose,timing,buffers,costs) select count(userid) from session;  
+                                                                         QUERY PLAN                                                   
+------------------------------------------------------------------------------------------------------------------------------------  
+------------------------  
+ Aggregate  (cost=1052572.56..1052572.57 rows=1 width=4) (actual time=10321.901..10321.901 rows=1 loops=1)  
+   Output: count(userid)  
+   Buffers: shared read=229028  
+   I/O Timings: read=633.969  
+   ->  Index Only Scan using pk_session on public.session  (cost=0.56..972572.56 rows=32000000 width=4) (actual time=0.080..7268.908  
+ rows=32000001 loops=1)  
+         Output: userid  
+         Heap Fetches: 32000001  
+         Buffers: shared read=229028  
+         I/O Timings: read=633.969  
+ Planning time: 0.056 ms  
+ Execution time: 10321.935 ms  
+(11 rows)  
+```  
+分析这里的I/O Timings，单位毫秒，每次IO请求只需要0.0028毫秒。  
+```  
+postgres=> select 633.969/229028;  
+        ?column?          
+------------------------  
+ 0.00276808512496288663  
+(1 row)  
+postgres=> select 674.634/229028;  
+        ?column?          
+------------------------  
+ 0.00294563983443072463  
+(1 row)  
+```  
+如果这些数据不是在内存中，那么有这样IOPS能力的块设备，那也是怪兽级别的了(8K的数据块，离散读IOPS达到36万，未考虑read ahead，考虑的话一般默认预读是256个扇区，真实IOPS能力会略低)。  
+我个人的判断还是倾向阿里的RDS未限制OS层CACHE，也就是随你用。  
+创建测试函数：  
+```  
+CREATE OR REPLACE FUNCTION query_pk(IN i_userid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        select t.userid,t.info into userid,info from userinfo t where t.userid=i_userid;  
+        return;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION insert_log(IN i_userid int)  
+     RETURNS void  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        set synchronous_commit=off;  
+        insert into login_log (userid,db_user,client_addr,client_port,server_addr,server_port,login_time)  
+   values (i_userid,current_user,inet_client_addr(),inet_client_port(),inet_server_addr(),inet_server_port(),now());  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION query_insert(IN i_userid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        set synchronous_commit=off;  
+        select t.userid,t.info into userid,info from userinfo t where t.userid=i_userid;  
+        insert into login_log (userid,db_user,client_addr,client_port,server_addr,server_port,login_time)  
+   values (i_userid,current_user,inet_client_addr(),inet_client_port(),inet_server_addr(),inet_server_port(),now());  
+        return;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION update_pk(IN i_userid int)  
+     RETURNS void  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        set synchronous_commit=off;  
+        update session t set last_login=now() where t.userid=i_userid;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION query_update_insert(IN i_userid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        set synchronous_commit=off;  
+        select t.userid,t.info into userid,info from userinfo t where t.userid=i_userid;  
+        insert into login_log (userid,db_user,client_addr,client_port,server_addr,server_port,login_time)  
+   values (i_userid,current_user,inet_client_addr(),inet_client_port(),inet_server_addr(),inet_server_port(),now());  
+        update session t set last_login=now() where t.userid=i_userid;  
+        return;  
+      end;  
+    $function$;  
+CREATE OR REPLACE FUNCTION query_smalltbl(IN i_userid int, OUT userid int, OUT info text)  
+     RETURNS record  
+     LANGUAGE plpgsql  
+     STRICT  
+    AS $function$  
+      declare  
+      begin  
+        select t.userid,t.info into userid,info from tbl_small t where t.userid=i_userid;  

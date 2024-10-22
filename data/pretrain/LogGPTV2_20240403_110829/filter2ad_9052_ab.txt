@@ -1,0 +1,228 @@
+      }
+      // Check for known builtin functions.
+      int builtin_id =
+          shared.HasBuiltinId() ? shared.builtin_id() : Builtins::kNoBuiltinId;
+      switch (builtin_id) {
+        case Builtins::kArrayConstructor:
+          return ReduceArrayConstructor(node);
+        ...
+        case Builtins::kReflectConstruct:
+          return ReduceReflectConstruct(node);
+        ...
+        case Builtins::kArrayPrototypePop:
+          return ReduceArrayPrototypePop(node);
+`poc`中`a.pop`函数所对应的`builtin_id`为`kArrayPrototypePop`。
+这个阶段的`inlining`的一个很重要的思想是：确定调用该内置函数的对象的类型；有了相应的类型后，可以根据对象的类型快速的实现相应的功能，从而去掉冗余的多种类型兼容的操作。
+如`kArrayPrototypePop`函数功能则是根据对象的类型，将它最后一个元素直接弹出。当`a.pop`如果知道`a`的类型为`PACKED_SMI_ELEMENTS`，则可以根据`PACKED_SMI_ELEMENTS`类型，直接通过偏移找到该类型最后一个元素的位置（而不用通过复杂运行时来确定），将它置为`hole`，更新数组长度，并返回该元素的值。
+这个过程有一个很重要的前置条件则是确定调用`builtin`函数的对象进行类型。只有知道了对象的类型，才能够知道相应字段的偏移和位置等，从而快速实现该功能。
+如何确定输入对象的类型，以及它的类型是否可靠，`v8`代码通过`MapInference`类来实现。
+该类的相关代码如下所示，它的作用正如它的注释所示，主要包括两点：
+  1. 推断传入的对象的类型（`MAP`）并返回；
+  2. 根据传入的`effect`，决定推测的返回对象类型（`MAP`）结果是否可靠，`reliable`表示返回的对象的类型是可靠的，在后面使用该对象时无需进行类型检查，即可根据该类型进行使用；如果是`reliable`则表示该类型不一定准确，在后面使用时需要加入检查（加入`MAP Check`），才能使用。
+    // compiler/map-inference.h:25
+    // The MapInference class provides access to the "inferred" maps of an
+    // {object}. This information can be either "reliable", meaning that the object
+    // is guaranteed to have one of these maps at runtime, or "unreliable", meaning
+    // that the object is guaranteed to have HAD one of these maps.
+    //
+    // The MapInference class does not expose whether or not the information is
+    // reliable. A client is expected to eventually make the information reliable by
+    // calling one of several methods that will either insert map checks, or record
+    // stability dependencies (or do nothing if the information was already
+    // reliable).
+    // compiler/map-inference.cc:18
+    MapInference::MapInference(JSHeapBroker* broker, Node* object, Node* effect)
+        : broker_(broker), object_(object) {
+      ZoneHandleSet maps;
+      auto result =
+          NodeProperties::InferReceiverMapsUnsafe(broker_, object_, effect, &maps);
+      maps_.insert(maps_.end(), maps.begin(), maps.end());
+      maps_state_ = (result == NodeProperties::kUnreliableReceiverMaps)
+                        ? kUnreliableDontNeedGuard
+                        : kReliableOrGuarded;
+      DCHECK_EQ(maps_.empty(), result == NodeProperties::kNoReceiverMaps);
+    }
+`MapInference`构造函数调用`InferReceiverMapsUnsafe`函数来判断推断的`Map`是否可靠，如下所示。它会遍历将该`object`作为`value
+input`的结点的`effect`链，追溯看是否存在改变`object`类型的代码。如果没有会改变对象类型的代码，则返回`kReliableReceiverMaps`；如果存在结点有属性`kNoWrite`以及改变对象类型的操作，则表示代码运行过程中可能会改变对象的类型，返回`kUnreliableReceiverMaps`，表示返回的`MAP`类型不可靠。
+    // compiler/node-properties.cc:337
+    // static
+    NodeProperties::InferReceiverMapsResult NodeProperties::InferReceiverMapsUnsafe(
+        JSHeapBroker* broker, Node* receiver, Node* effect,
+        ZoneHandleSet* maps_return) {
+      HeapObjectMatcher m(receiver);
+      if (m.HasValue()) {
+        HeapObjectRef receiver = m.Ref(broker);
+        // We don't use ICs for the Array.prototype and the Object.prototype
+        // because the runtime has to be able to intercept them properly, so
+        // we better make sure that TurboFan doesn't outsmart the system here
+        // by storing to elements of either prototype directly.
+        //
+        // TODO(bmeurer): This can be removed once the Array.prototype and
+        // Object.prototype have NO_ELEMENTS elements kind.
+        if (!receiver.IsJSObject() ||
+            !broker->IsArrayOrObjectPrototype(receiver.AsJSObject())) {
+          if (receiver.map().is_stable()) {
+            // The {receiver_map} is only reliable when we install a stability
+            // code dependency.
+            *maps_return = ZoneHandleSet(receiver.map().object());
+            return kUnreliableReceiverMaps;
+          }
+        }
+      }
+      InferReceiverMapsResult result = kReliableReceiverMaps;
+      while (true) {
+        switch (effect->opcode()) {
+          case IrOpcode::kMapGuard: {
+            Node* const object = GetValueInput(effect, 0);
+            if (IsSame(receiver, object)) {
+              *maps_return = MapGuardMapsOf(effect->op());
+              return result;
+            }
+            break;
+          }
+          case IrOpcode::kCheckMaps: {
+            Node* const object = GetValueInput(effect, 0);
+            if (IsSame(receiver, object)) {
+              *maps_return = CheckMapsParametersOf(effect->op()).maps();
+              return result;
+            }
+            break;
+          }
+          case IrOpcode::kJSCreate: {
+            if (IsSame(receiver, effect)) {
+              base::Optional initial_map = GetJSCreateMap(broker, receiver);
+              if (initial_map.has_value()) {
+                *maps_return = ZoneHandleSet(initial_map->object());
+                return result;
+              }
+              // We reached the allocation of the {receiver}.
+              return kNoReceiverMaps;
+            }
+            break;
+          }
+          default: {
+            DCHECK_EQ(1, effect->op()->EffectOutputCount());
+            if (effect->op()->EffectInputCount() != 1) {
+              // Didn't find any appropriate CheckMaps node.
+              return kNoReceiverMaps;
+            }
+            if (!effect->op()->HasProperty(Operator::kNoWrite)) {
+              // Without alias/escape analysis we cannot tell whether this
+              // {effect} affects {receiver} or not.
+              result = kUnreliableReceiverMaps;
+            }
+            break;
+    ...
+        // Stop walking the effect chain once we hit the definition of
+        // the {receiver} along the {effect}s.
+        if (IsSame(receiver, effect)) return kNoReceiverMaps;
+        // Continue with the next {effect}.
+        DCHECK_EQ(1, effect->op()->EffectInputCount());
+        effect = NodeProperties::GetEffectInput(effect);
+      }
+    }
+最后来看数组对象的`Array.prototype.pop`函数所对应的`ReduceArrayPrototypePop`函数是如何实现`builtin
+inlining`的，相关代码如下所示，主要功能为：
+  1. 获取`pop`函数所对应的`JSCall`结点的`value`、`effect`以及`control`输入；其中`value`输入即为调用该函数的对象，即`a.pop`中的`a`。
+  2. 调用`MapInference`来推断调用`pop`函数对象类型的`MAP`，如果没有获取到对象的类型，则不进行优化；
+  3. 调用`RelyOnMapsPreferStability`，来查看获取的类型是否可靠。如果可靠，则无需加入类型检查；如果不可靠，则需要加入类型检查。
+  4. 因为前面三步确认了调用`pop`函数的对象类型，后面就是具体的功能实现，可以直接看注释。根据获取的对象的类型，得到`length`、计算新的`length`、获取数组的最后一个值用于返回、将数组的最后一个字段赋值为`hole`。
+    // compiler/js-call-reducer.cc:4910
+    // ES6 section 22.1.3.17 Array.prototype.pop ( )
+    Reduction JSCallReducer::ReduceArrayPrototypePop(Node* node) {
+      DisallowHeapAccessIf disallow_heap_access(should_disallow_heap_access());
+      ...
+      Node* receiver = NodeProperties::GetValueInput(node, 1);  // 获取value输入
+      Node* effect = NodeProperties::GetEffectInput(node);      // 获取effect输入
+      Node* control = NodeProperties::GetControlInput(node);    // 获取control输入
+      MapInference inference(broker(), receiver, effect);       // 获取调用`pop`函数的对象的类型
+      if (!inference.HaveMaps()) return NoChange();     // 如果没有获取到该对象的类型，不进行优化
+      MapHandles const& receiver_maps = inference.GetMaps();
+      std::vector kinds;
+      if (!CanInlineArrayResizingBuiltin(broker(), receiver_maps, &kinds)) {
+        return inference.NoChange();
+      }
+      if (!dependencies()->DependOnNoElementsProtector()) UNREACHABLE();
+      inference.RelyOnMapsPreferStability(dependencies(), jsgraph(), &effect,
+                                          control, p.feedback());   // 根据类型是否可靠，确定是否要加入类型检查
+      std::vector controls_to_merge;
+      std::vector effects_to_merge;
+      std::vector values_to_merge;
+      Node* value = jsgraph()->UndefinedConstant();
+      Node* receiver_elements_kind =
+          LoadReceiverElementsKind(receiver, &effect, &control);
+        // Load the "length" property of the {receiver}.
+        Node* length = effect = graph()->NewNode(
+            simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)),
+            receiver, effect, control);
+        ...
+          // Compute the new {length}.
+          length = graph()->NewNode(simplified()->NumberSubtract(), length,
+                                    jsgraph()->OneConstant());
+            ...
+          // Store the new {length} to the {receiver}.
+          efalse = graph()->NewNode(
+              simplified()->StoreField(AccessBuilder::ForJSArrayLength(kind)),
+              receiver, length, efalse, if_false);
+            ...
+          // Load the last entry from the {elements}.
+          vfalse = efalse = graph()->NewNode(
+              simplified()->LoadElement(AccessBuilder::ForFixedArrayElement(kind)),
+              elements, length, efalse, if_false);
+            ...
+          // Store a hole to the element we just removed from the {receiver}.
+          efalse = graph()->NewNode(
+              simplified()->StoreElement(
+                  AccessBuilder::ForFixedArrayElement(GetHoleyElementsKind(kind))),
+              elements, length, jsgraph()->TheHoleConstant(), efalse, if_false);
+      ReplaceWithValue(node, value, effect, control);
+      return Replace(value);
+    }
+最后来看下`RelyOnMapsPreferStability`函数是怎么实现加入检查或不加的。当`maps_state_`不是`kUnreliableNeedGuard`的时候，即返回的类型推断是可信的时候，则什么都不干直接返回；当类型是不可信的时候，最终会调用`InsertMapChecks`在图中插入`CheckMaps`结点。
+    // compiler/js-call-reducer.cc:120
+    bool MapInference::RelyOnMapsPreferStability(
+        CompilationDependencies* dependencies, JSGraph* jsgraph, Node** effect,
+        Node* control, const FeedbackSource& feedback) {
+      CHECK(HaveMaps());
+      if (Safe()) return false;
+      if (RelyOnMapsViaStability(dependencies)) return true;
+      CHECK(RelyOnMapsHelper(nullptr, jsgraph, effect, control, feedback));
+      return false;
+    }
+    // compiler/map-inference.cc:120
+    bool MapInference::Safe() const { return maps_state_ != kUnreliableNeedGuard; }
+    // compiler/map-inference.cc:114
+    bool MapInference::RelyOnMapsViaStability(
+        CompilationDependencies* dependencies) {
+      CHECK(HaveMaps());
+      return RelyOnMapsHelper(dependencies, nullptr, nullptr, nullptr, {});
+    }
+    // compiler/map-inference.cc:130
+    bool MapInference::RelyOnMapsHelper(CompilationDependencies* dependencies,
+                                        JSGraph* jsgraph, Node** effect,
+                                        Node* control,
+                                        const FeedbackSource& feedback) {
+      if (Safe()) return true;
+      auto is_stable = [this](Handle map) {
+        MapRef map_ref(broker_, map);
+        return map_ref.is_stable();
+      };
+      if (dependencies != nullptr &&
+          std::all_of(maps_.cbegin(), maps_.cend(), is_stable)) {
+        for (Handle map : maps_) {
+          dependencies->DependOnStableMap(MapRef(broker_, map));
+        }
+        SetGuarded();
+        return true;
+      } else if (feedback.IsValid()) {
+        InsertMapChecks(jsgraph, effect, control, feedback);
+        return true;
+      } else {
+        return false;
+      }
+    }
+    // compiler/map-inference.cc:101
+    void MapInference::InsertMapChecks(JSGraph* jsgraph, Node** effect,
+                                       Node* control,
+                                       const FeedbackSource& feedback) {
+      CHECK(HaveMaps());

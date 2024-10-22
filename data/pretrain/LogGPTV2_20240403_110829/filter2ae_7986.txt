@@ -1,0 +1,92 @@
+# CVE-2020-26945漏洞分析
+|
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+## 引言
+昨天晚上出了一个和mybatis相关的反序列化高危漏洞，花了小半天时间跟进了一下，做一下分析、复现、利用场景的思考。
+## 功能介绍
+由于MyBatis从缓存中读取数据的依据与ＳＱＬ的ID相关，而非查询出的对象。  
+所以，使用二级缓存的目的，不是在多查询间共享查询结果（所有查询中只要存在该对象，就直接从缓存中读取，这是对查询结果的共享，Hibernate中的缓存就是  
+为了再多个查询中共享查询结果，但是MyBatista不是），而是为了防止同一查询（相同的SQL ID，相同的SQL语句）的反复执行。
+二次缓存默认关闭，需要在配置文件中增加setting，
+同时需要在mapper配置文件中增加cache标签，
+配置完成后一条sql反复执行，数据库只会调一次sql。
+## 漏洞分析
+首先看了一下官方补丁的防护方式，增加了一个反序列化过滤函数，那过滤一定发送在漏洞触发的正前方，
+源码全局搜索一下，找到漏洞触发位置，SerializedCache.deserialize
+    private Serializable deserialize(byte[] value) {
+        SerialFilterChecker.check();
+        Serializable result;
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(value);
+            ObjectInputStream ois = new CustomObjectInputStream(bis)) {
+          result = (Serializable) ois.readObject();
+        } catch (Exception e) {
+          throw new CacheException("Error deserializing object.  Cause: " + e, e);
+        }
+        return result;
+      }
+这是一个私有方法，找到内部调用为SerializedCache.getObject
+      @Override
+      public Object getObject(Object key) {
+        Object object = delegate.getObject(key);
+        return object == null ? null : deserialize((byte[]) object);
+      }
+在该函数上打上断点，启用mybatis的内置二次缓存功能，看一下堆栈，
+其实就是如果mybtis开启了二次缓存，那么那个cache会保存在PerpetualCache.cache中，如果下次查询发现调用的sqlid和parameter不变，然后就可以直接去cache里面拿结果，并进行反序列化得出结果返回给前端而不需要再去调用sql了。
+着重看一下SerializedCache.getObject，得出下面信息，
+  1. object对象会被带入deserialize函数进行反序列化。
+  2. 反序列化的object由`this.delegate.getObject(key);`产生。
+跟进getObject函数，发现有一些限制，
+     public Object getObject(Object key) {
+            return this.clearWhenStale() ? null : this.delegate.getObject(key);
+        }
+        private boolean clearWhenStale() {
+            if (System.currentTimeMillis() - this.lastClear > this.clearInterval) {
+                this.clear();
+                return true;
+            } else {
+                return false;
+            }
+        }
+第一个限制和时间有关，使用不会成功阻碍漏洞触发的关键，相当于与一个刷新时间，时间到了总会返回flase的，使用我这里是把mapper里cache的flushInterval属性设置的大了很多就可以了，而this.delegate为PerpetualCache类型，所以需要去看一下PerpetualCache.getObject函数，
+    public class PerpetualCache implements Cache {
+        private final String id;
+        private final Map cache = new HashMap();
+        public PerpetualCache(String id) {
+            this.id = id;
+        }
+        public String getId() {
+            return this.id;
+        }
+        public int getSize() {
+            return this.cache.size();
+        }
+        public void putObject(Object key, Object value) {
+            this.cache.put(key, value);
+        }
+        public Object getObject(Object key) {
+            return this.cache.get(key);
+        }
+可以看到object的值 其实就是PerpetualCache.cache对应的value，这也应正了官方通告里的一条利用的关键要求： ** _the
+attacker found a way to modify entries of the private Map field i.e.
+org.apache.ibatis.cache.impl.PerpetualCache.cache and a valid cache key_**
+而且还有一个更重要的点，就算可以设置cache，攻击者还需要去将恶意的value对用到系统设置的key中，这个key虽然逻辑不算难，但是信息源自配置文件，因此获取key的值是一个黑盒下很难达到的条件，
+由于目前没有找到可以以攻击者身份达成这种条件的方法，所以这里为了达到漏洞复现的目的，我这里暂时使用的是反射来对cache的值做了修改，  
+首先把断点打在SerializedCache.getObject处,然后在断点处执行下面的代码修改cache的值，
+    HashMap expMap = new HashMap();
+    FileInputStream fis = new FileInputStream("/Users/glassy/Documents/spring-jndi-master/CommonCollectionClient/payload.ser"); //payload.ser中储存恶意字节码
+    byte[] byt = new byte[fis.available()];
+    fis.read(byt);
+    expMap.put(key,byt); //这个key为传进来的key，直接用省去构造了
+    Class PerpetualCacheClass = Class.forName("org.apache.ibatis.cache.impl.PerpetualCache");
+    Field modifiersField = Field.class.getDeclaredField("modifiers");
+    Field cache = PerpetualCacheClass.getDeclaredField("cache");
+    modifiersField.setAccessible(true);
+    modifiersField.setInt(cache, cache.getModifiers() & ~Modifier.FINAL);
+    cache.setAccessible(true);
+    cache.set(((FifoCache) ((ScheduledCache) this.delegate).delegate).delegate, expMap);
+成功触发了反序列化的RCE，
+## 总结
+在总结这里面说一下这个漏洞的利用场景，其实最重要的还是在于如何把恶意字节码传入PerpetualCache.cache，在代码层设置这个值得唯一途径是PerpetualCache.putObject，因此需要去做一下代码审计找一找有没有可以通过http请求调用该方法并且参数可控的途径。
+还有一种可能就是，cache因为正常功能下会是一次sql查询的值，那么如果在mapper中设置的resultType为一个反序列化可利用的gadget，与此同时它的值又可以由攻击者插入（这样连key都不用去思考怎么构造了），那么就可以顺理成章的在反序列化时造成RCE。不过这个场景也是非常少有的。

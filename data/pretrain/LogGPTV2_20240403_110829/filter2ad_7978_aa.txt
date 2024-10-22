@@ -1,0 +1,242 @@
+## 基础
+### RASP 设计思路
+RASP（Runtime Application self-protection）是一种在运行时检测攻击并且进行自我保护的一种技术。PHP
+RASP的设计思路很直接，安全圈有一句名言叫一切输入都是有害的，我们就跟踪这些有害变量，看它们是否对系统造成了危害。我们跟踪了HTTP请求中的所有参数、HTTP
+Header等一切client端可控的变量，随着这些变量被使用、被复制，信息随之流动，我们也跟踪了这些信息的流动。我们还选取了一些敏感函数，这些函数都是引发漏洞的函数，例如require函数能引发文件包含漏洞，mysqli->query方法能引发SQL注入漏洞。简单来说，这些函数都是大家在代码审计时关注的函数。我们利用某些方法为这些函数添加安全检查代码。当跟踪的信息流流入敏感函数时，触发安全检查代码，如果通过安全检查，开始执行敏感函数，如果没通过安全检查，阻断执行，通过SAPI向HTTP
+Server发送403 Forbidden信息。当然，这一切都在PHP代码运行过程中完成。  
+这里主要有两个技术问题，一个是如何跟踪信息流，另一个是如何安全检查到底是怎样实现的。  
+有两个技术思路来解决两个问题，第一个是动态污点跟踪，另一个是基于词法分析的漏洞检测。本文用主要分析的是污点标记的方法。
+> 参考[一类PHP RASP实现](https://paper.seebug.org/449/#_1)所述
+### 技术栈
+  * taint污点分析模式
+    * 命令执行
+    * XSS
+    * SQL
+  * payload模式：重命名+phpwaf
+    * 特征捕获检测
+简而言之taint检测未知，payload上线前Fuzz检测  
+taint：污点标记，对参数传递过程进行判断清除或保留标记  
+payload模式：忽略参数传递过程，只分析最后作用于敏感函数的参数是否恶意
+### PHP生命周期
+简而言之，无论以哪种方式启动php程序，经过下边四个步骤：模块初始化（MINIT）、请求初始化(RINIT)、请求处理、请求结束(RSHUTDOWN)、模块结束(MSHUTDOWN)  
+这四个阶段对应扩展开发中`PHP_MINIT_FUNCTION`、`PHP_MSHUTDOWN_FUNCTION`、`PHP_RINIT_FUNCTION`、`PHP_RSHUTDOWN_FUNCTION`四个函数来处理对应的功能。
+### php opcode
+opcode是计算机指令中的一部分，用于指定要执行的操作，指令的格式和规范由处理器的指令规范指定。
+记录一下php解析的过程：
+  * 旧版本：php代码—>词法、语法分析->直接生成opcode指令
+  * php7：php代码—>词法、语法分析生成抽象语法树AST->opcode指令
+简单概括一下，所有php代码最终以opcode指令的形式在zend虚拟机中执行。
+### 函数实现
+PHP中函数的存储结构：/Zend/zend_compile.h#404
+    union _zend_function {
+        zend_uchar type;    /* MUST be the first element of this struct! */
+        struct {
+            zend_uchar type;  /* never used */
+            zend_uchar arg_flags[3]; /* bitset of arg_info.pass_by_reference */
+            uint32_t fn_flags;
+            zend_string *function_name;
+            zend_class_entry *scope;
+            union _zend_function *prototype;
+            uint32_t num_args;
+            uint32_t required_num_args;
+            zend_arg_info *arg_info;
+        } common;
+        zend_op_array op_array;
+        zend_internal_function internal_function;
+    };
+这个联合体里边定义了四个结构体，内部函数通过扩展或者内核提供的C函数，比如time、array等，编译后用的`internal_function`结构；用户自定函数编译后为普通的opcode数组，用的`op_array`结构。剩下的`common`和`type`可以看做是`internal_function`和`op_array`的header。
+实际上还有其他几类函数，暂时还没太明白：  
+#### 内部函数
+内部函数是指由内核、扩展提供的C语言编写的function，这类函数不用经过opcode的编译过程，效率高于php用户自定义函数，调用时与普通的C程序没有差异。
+Zend引擎中定义了很多内部函数供用户在PHP中使用，比如：`define、defined、strlen、method_exists、class_exists、function_exist`等等，除了Zend引擎中定义的内部函数，PHP扩展中也提供了大量内部函数，我们也可以灵活的通过扩展自行定制。
+前文介绍`zend_function`为`union`，其中`internal_function`就是内部函数用到的具体结构：/Zend/zend_compile.h#384
+    typedef struct _zend_internal_function {
+        /* Common elements */
+        zend_uchar type;
+        zend_uchar arg_flags[3]; /* bitset of arg_info.pass_by_reference */
+        uint32_t fn_flags;
+        zend_string* function_name;
+        zend_class_entry *scope;
+        zend_function *prototype;
+        uint32_t num_args;
+        uint32_t required_num_args;
+        zend_internal_arg_info *arg_info;
+        /* END of common elements */
+        void (*handler)(INTERNAL_FUNCTION_PARAMETERS);
+        struct _zend_module_entry *module;
+        void *reserved[ZEND_MAX_RESERVED_RESOURCES];
+    } zend_internal_function;
+`zend_internal_function`头部是一个与`zend_op_array`完全相同的common结构。
+## 环境搭建
+### 开发流程
+php版本7.0.33，为了方便开发扩展，先下载源码：
+    wget https://github.com/php/php-src/archive/php-7.0.33.zip
+解压后，在php源码里有一个代码生成器`ext_skel`，位于`php-src-php-7.0.33/ext`，先构建扩展基本文件：
+    ./ext_skel --extname=passer6y
+将`config.m4`文件中这几行前的dnl去掉：  
+在头文件`php_passer6y.h`文件中声明扩展函数：
+    PHP_FUNCTION(passer6y_helloworld);
+接着编辑`passer6y.c`，添加一行：`PHP_FE(passer6y_helloworld, NULL)`  
+最后在文件末尾加入`passer6y_helloworld`函数代码
+    PHP_FUNCTION(passer6y_helloworld)
+    {
+        char *arg = NULL;
+      int arg_len, len;
+      char *strg;
+      if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &arg, &arg_len) == FAILURE) {
+        return;
+      }
+      php_printf("my first ext,Hello World!\n");
+      RETRUN_TRUE;
+    }
+编译扩展：
+    apt-get install php7.0-dev
+    phpize
+    ./configure --with-php-config=/usr/bin/php-config7.0
+    make && make install
+测试插件：
+    php -d "extension=passer6y.so" -r "passer6y_helloworld('123');"
+### GDB调试
+参考文章：  
+下载php7.0.23：  
+重新编译php，开启`--enable-debug`
+    ./configure \
+    --prefix=/opt/php_debug/ \
+    --enable-debug \
+    --enable-cli \
+    --without-pear \
+    --enable-embed  \
+    --enable-inline-optimization \
+    --enable-shared \
+    --enable-opcache \
+    --enable-fpm \
+    --with-gettext \
+    --enable-mbstring \
+    --with-iconv=/usr/local/libiconv \
+    make && make install
+    mkdir /opt/php_debug/conf/  
+    cp php.ini-development /opt/php_debug/conf/php.ini
+再加个软连接方便执行：
+    ln -s /opt/php_debug/bin/php /usr/bin/php_debug
+    ln -s /opt/php_debug/bin/phpize /usr/bin/phpize_debug
+创建插件的步骤和之前一样，在config.m4最后加上：
+    if test -z "$PHP_DEBUG"; then
+            AC_ARG_ENABLE(debug,
+                    [--enable-debug  compile with debugging system],
+                    [PHP_DEBUG=$enableval], [PHP_DEBUG=no]
+            )
+    fi
+然后再编译即可用gdb调试了
+>
+> 在make的时候可能会遇到libiconv的报错问题，参考这个文章安装一下就OK了，
+### vld查看代码opcode
+参考文章：  
+安装vld：
+    wget http://pecl.php.net/get/vld-0.14.0.tgz
+    tar zxvf vld-0.14.0.tgz 
+    cd vld-0.14.0/
+找到php-config路径: `locate php-config`  
+编译：
+    ./configure --with-php-config=/usr/bin/php-config7.0 --enable-vld
+    make && make install
+检查是否编译成功：  
+修改php.ini `/etc/php/7.0/cli/php.ini`，在最后加上：
+    extension=vld.so
+检测是否安装成功：`php -r "phpinfo();" | grep "vld"`  
+功能测试：  
+写一个phpinfo，然后执行下边命令，`-dvld.active`参数为1时使用vld扩展，`-dvld.execute`为1时执行改文件，这里不需要执行文件，就看一下php代码转换对应的opcode指令：
+    php -dvld.active=1 -dvld.execute=0 1.php
+### apache配置
+还是之前的源码，重新编译php
+    ./buildconf --force && ./configure --disable-all --enable-debug --prefix=/opt/php --with-apxs2=/usr/bin/apxs && make && make install
+爆了一个线程安全的问题，执行下面两个命令凑合用着(每个子进程只有一个线程)：
+    //  apache2 -t 查看错误日志
+    a2dismod mpm_event
+    a2enmod mpm_prefork
+也可以用康师傅写的dockerfile，一键拉取环境：[Dockerfile](media/15822119434822/Dockerfile.)
+命令备忘：
+    php --ini        // 查看php.ini默认配置路径
+## 函数Hook
+两种方式：
+  * 重命名函数，并在`function_table`删除原函数定义，接着在php中重新定义一个该函数(像waf一样在入口include)，并对参数进行威胁判断(prvd的payload模式)
+  * 直接在底层Hook opcode，并检测函数函数(taint模式)
+### 重命名函数
+这里的重命名内部函数是在`MINIT`阶段进行实现的，在`RINIT`阶段是无法对已有的内部函数进行修改名称，只能对用户函数修改(即php中自定义的函数)。
+参考fate0师傅的[xmark](https://github.com/fate0/xmark)项目实现的`PHP_FUNCTION(xrename_function)`函数，核心在这段：
+    // ...
+    Bucket *p = rename_hash_key(EG(function_table), orig_fname, new_fname, XMARK_IS_FUNCTION);
+跟进`rename_hash_key`函数：
+    static zend_always_inline Bucket *rename_hash_key(HashTable *ht, zend_string *orig_name, zend_string *new_name, int type)
+    {
+        zend_ulong h;
+        uint32_t nIndex;
+        uint32_t idx;
+        Bucket *p = NULL, *arData, *prev = NULL;
+        zend_bool found = 0;
+        orig_name = zend_string_tolower(orig_name);
+        new_name = zend_string_tolower(new_name);
+        if (zend_hash_exists(ht, new_name)) {
+            zend_string_release(orig_name);
+            zend_string_release(new_name);
+            zend_error(E_ERROR, "function/class '%s' already exists", ZSTR_VAL(new_name));
+            return NULL;
+        }
+        h = zend_string_hash_val(orig_name);
+        arData = ht->arData;
+        nIndex = h | ht->nTableMask;
+        idx = HT_HASH_EX(arData, nIndex);
+        while (EXPECTED(idx != HT_INVALID_IDX)) {
+            prev = p;
+            p = HT_HASH_TO_BUCKET_EX(arData, idx);
+            if (EXPECTED(p->key == orig_name)) { /* check for the same interned string */
+                found = 1;
+                break;
+            } else if (EXPECTED(p->h == h) &&
+                       EXPECTED(p->key) &&
+                       EXPECTED(ZSTR_LEN(p->key) == ZSTR_LEN(orig_name)) &&
+                       EXPECTED(memcmp(ZSTR_VAL(p->key), ZSTR_VAL(orig_name), ZSTR_LEN(orig_name)) == 0)) {
+                found = 1;
+                break;
+            }
+            idx = Z_NEXT(p->val);
+        }
+        if (!found) {
+            zend_string_release(orig_name);
+            zend_string_release(new_name);
+            zend_error(E_ERROR, "function/class '%s' does not exists", ZSTR_VAL(orig_name));
+            return NULL;
+        }
+        // rehash
+        if (!prev && Z_NEXT(p->val) == HT_INVALID_IDX) {  // only p
+            HT_HASH(ht, nIndex) = HT_INVALID_IDX;
+        } else if (prev && Z_NEXT(p->val) != HT_INVALID_IDX) {  // p in middle
+            Z_NEXT(prev->val) = Z_NEXT(p->val);
+        } else if (prev && Z_NEXT(p->val) == HT_INVALID_IDX) {  // p in tail
+            Z_NEXT(prev->val) = HT_INVALID_IDX;
+        } else if (!prev && Z_NEXT(p->val) != HT_INVALID_IDX) {  // p in head
+            HT_HASH(ht, nIndex) = Z_NEXT(p->val);
+        }
+        zend_string_release(p->key);
+        p->key = zend_string_init_interned(ZSTR_VAL(new_name), ZSTR_LEN(new_name), 1);
+        p->h = h = zend_string_hash_val(p->key);
+        nIndex = h | ht->nTableMask;
+        // 重命名函数名
+        if (type == XMARK_IS_FUNCTION) {
+            zend_string_release(p->val.value.func->common.function_name);
+            zend_string_addref(p->key);
+            p->val.value.func->common.function_name = p->key;
+        }
+        if (HT_HASH(ht, nIndex) != HT_INVALID_IDX)
+            Z_NEXT(p->val) = HT_HASH(ht, nIndex);
+        HT_HASH(ht, nIndex) = idx;
+        zend_string_release(orig_name);
+        zend_string_release(new_name);
+        return p;
+    }
+### Hook opcode
+为什么要hook
+opcode呢？在后来的测试中发现像`echo`、`eval`这些，它是一个语言特性，而不是一个函数，在`EG(function_table)`这个记录所有PHP函数的哈希表中找不到，但是他们最终都要解析成opcode，所以可以通过这种方式来劫持函数。  
+再举一个遇到的例子，比如在污点标记的时候，用户可控`$a`，但在后文经过字符串拼接`$b =
+"xx".$a`，将恶意代码传递给`$b`变量，这个时候我们是没有办法在函数层面控制的标记的，这个时候通过处理`CONCAT`指令即可解决：  
+#### Demo: Hook ZEND_ECHO
+基础，php执行流程、全局变量等

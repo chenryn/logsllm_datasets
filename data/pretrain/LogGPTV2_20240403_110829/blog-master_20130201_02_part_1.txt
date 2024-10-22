@@ -1,0 +1,253 @@
+## PostgreSQL How to deal TUPLE LOCK : 2 - "one|more transactions waiting one|more transactions release tuple lock"  
+### 作者                                                                               
+digoal                                                                       
+### 日期                                                                                                                                           
+2013-02-01                                                                     
+### 标签                                                                        
+PostgreSQL , 行锁机制          
+----                                                                                                                                        
+## 背景           
+接上一篇 :   
+《PostgreSQL How to deal TUPLE LOCK : 1 - "One transaction lock single or multiple tuples | rows"》  
+http://blog.163.com/digoal@126/blog/static/16387704020130312271679/  
+本文基于以下版本进行讲解(已经修复了multixact的问题).  
+http://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=b78647a0e6f7b110273e98601f26d3d1db0ad931  
+在这个补丁前, 关于MultiXact情形下key share锁升级为share锁的问题, 我们看看会发生什么?  
+SESSION A :   
+```  
+digoal=# create table test (id int);  
+CREATE TABLE  
+digoal=# insert into test values (1),(2);  
+INSERT 0 2  
+digoal=# begin;  
+BEGIN  
+digoal=# select * from test for no key update;  
+ id   
+----  
+  1  
+  2  
+(2 rows)  
+```  
+SESSION B :   
+```  
+digoal=# begin;  
+BEGIN  
+digoal=# select * from test for key share;  
+ id   
+----  
+  1  
+  2  
+(2 rows)  
+```  
+接下来BUG发生了, 居然能够上升到share锁, "no key update和share是冲突的, 不应该上升".  
+问题出在哪里呢? 因为此时tuple lock的信息不是存储在infomask里面的, 而是存储在pg_multixact里面, 所以问题一定是出在multixact的锁的处理上.  
+```  
+digoal=# select * from test for share;  
+ id   
+----  
+  1  
+  2  
+(2 rows)  
+```  
+补丁请参见 :   
+http://git.postgresql.org/gitweb/?p=postgresql.git;a=commitdiff;h=b78647a0e6f7b110273e98601f26d3d1db0ad931;hp=77a3082fc546774808b76f58173caec3852ebf62  
+打补丁后, 看看情况如何?  
+SESSION B 执行 digoal=# select * from test for share;时等待锁. 没有发生锁升级的情况.  
+说明这个补丁已经修复了前面提到的BUG.  
+进入主题  
+## 二  
+上一篇BLOG讲的是单事务锁单行或多行的情形, 不存在并发.  
+这一篇要讲多个事务锁单行或多行的情形, 主要解释一下几个问题。  
+1\. 多个事务锁锁单行, 这些锁信息依靠tuple head的t_infomask以及t_infomask2来存储是不够用的.  
+那么这些锁信息存储在哪里呢?  
+2\. 当多个事务请求锁同一条tuple时, 是如何处理的? 锁请求顺序如何?  
+## 1. 单条记录同时被多个事务共享锁, 这些锁信息依靠tuple head的t_infomask以及t_infomask2来存储是不够用的.  
+那么这些锁信息存储在哪里呢?  
+当多个事务共享锁单条记录时, 该记录的tuple head中的t_infomask HEAP_XMAX_IS_MULTI 比特位将会被设置.  
+同时HeapTupleFields.t_xmax 将改为MultiXactId, 而非TransactionId.  
+这些锁信息存储在以下数据结构 :   
+每个MultiXactId中包含多个member(member数组).  
+```  
+00068 typedef struct xl_multixact_create  
+00069 {  
+00070     MultiXactId mid;            /* new MultiXact's ID */  
+00071     MultiXactOffset moff;       /* its starting offset in members file */  
+00072     int32       nmembers;       /* number of member XIDs */  
+00073     MultiXactMember members[FLEXIBLE_ARRAY_MEMBER];  
+00074 } xl_multixact_create;  
+```  
+member的数据结构如下, 包含事务ID以及状态信息 :   
+```  
+00052 typedef struct MultiXactMember  
+00053 {  
+00054     TransactionId   xid;  
+00055     MultiXactStatus status;  
+00056 } MultiXactMember;  
+```  
+状态信息是个枚举类型, 如下, 用来存储锁信息 :   
+```  
+00032 /*  
+00033  * Possible multixact lock modes ("status").  The first four modes are for  
+00034  * tuple locks (FOR KEY SHARE, FOR SHARE, FOR NO KEY UPDATE, FOR UPDATE); the  
+00035  * next two are used for update and delete modes.  
+00036  */  
+00037 typedef enum  
+00038 {  
+00039     MultiXactStatusForKeyShare = 0x00,  
+00040     MultiXactStatusForShare = 0x01,  
+00041     MultiXactStatusForNoKeyUpdate = 0x02,  
+00042     MultiXactStatusForUpdate = 0x03,  
+00043     /* an update that doesn't touch "key" columns */  
+00044     MultiXactStatusNoKeyUpdate = 0x04,  
+00045     /* other updates, and delete */  
+00046     MultiXactStatusUpdate = 0x05  
+00047 } MultiXactStatus;  
+```  
+看起来好像有2个是重复的, 如下 :   
+```  
+MultiXactStatusForNoKeyUpdate = 0x02 以及 MultiXactStatusNoKeyUpdate = 0x04 ;   
+MultiXactStatusForUpdate = 0x03 以及 MultiXactStatusUpdate = 0x05 ;   
+```  
+其实没有重复, 因为一种是显锁(select for ...), 一种是隐锁(update).  
+来看个例子区分一下 :   
+先使用A和B会话, 设置TUPLE的头信息中的t_infomask.HEAP_XMAX_IS_MULTI .  
+SESSION A :   
+```  
+digoal=# begin;  
+BEGIN  
+digoal=# select * from test for key share;  
+ id   
+----  
+  1  
+  2  
+(2 rows)  
+```  
+SESSION B :   
+```  
+digoal=# begin;  
+BEGIN  
+digoal=# select * from test for key share;  
+ id   
+----  
+  1  
+  2  
+(2 rows)  
+```  
+SESSION C :   
+```  
+digoal=# begin;  
+BEGIN  
+digoal=# select * from test for no key update;  
+ id   
+----  
+  1  
+  2  
+(2 rows)  
+```  
+SESSION D :   
+```  
+digoal=# select * from pgrowlocks('test');  
+ locked_row | locker | multi |       xids       |                     modes                     |        pids           
+------------+--------+-------+------------------+-----------------------------------------------+---------------------  
+ (0,1)      |     25 | t     | {1774,1775,1776} | {"Key Share","Key Share","For No Key Update"} | {10099,10102,12822}  
+ (0,2)      |     25 | t     | {1774,1775,1776} | {"Key Share","Key Share","For No Key Update"} | {10099,10102,12822}  
+(2 rows)  
+```  
+注意这里SESSION C获得的是显锁, For No Key Update.  
+再来看看隐锁 :   
+先使用A和B会话, 设置TUPLE的头信息中的t_infomask.HEAP_XMAX_IS_MULTI .  
+SESSION A :   
+```  
+digoal=# begin;  
+BEGIN  
+digoal=# select * from test for key share;  
+ id | info   
+----+------  
+  1 |   
+  2 |   
+(2 rows)  
+```  
+SESSION B :   
+```  
+digoal=# select * from test for key share;  
+ id | info   
+----+------  
+  1 |   
+  2 |   
+(2 rows)  
+```  
+SESSION C :   
+```  
+digoal=# select pg_backend_pid();  
+ pg_backend_pid   
+----------------  
+          12822  
+(1 row)  
+```  
+SESSION C GDB :   
+```  
+gdb  
+(gdb) attach 12822  
+(gdb) b MultiXactIdWait  
+Breakpoint 1 at 0x48b1f0: file heapam.c, line 5403.  
+```  
+SESSION C :   
+```  
+digoal=# begin;  
+BEGIN  
+digoal=# update test set info='test' where id=1;  
+```  
+SESSION C GDB :   
+```  
+Breakpoint 1, MultiXactIdWait (multi=26, status=MultiXactStatusNoKeyUpdate, remaining=0x7ffff88ddb94, infomask=4496)  
+    at heapam.c:5403  
+5403            Do_MultiXactIdWait(multi, status, remaining, infomask, false);  
+(gdb) p status  
+$1 = MultiXactStatusNoKeyUpdate  
+(gdb) c  
+Continuing.  
+```  
+在gdb中打印status, 显然等待的是MultiXactStatusNoKeyUpdate锁, 而不是MultiXactStatusForNoKeyUpdate . 这就是显锁和隐锁的区别.  
+SESSION D :   
+```  
+digoal=# select * from pgrowlocks('test');  
+ locked_row | locker | multi |       xids       |                   modes                   |        pids           
+------------+--------+-------+------------------+-------------------------------------------+---------------------  
+ (0,1)      |     27 | t     | {1781,1782,1783} | {"Key Share","Key Share","No Key Update"} | {10099,10102,12822}  
+ (0,2)      |     26 | t     | {1781,1782}      | {"Key Share","Key Share"}                 | {10099,10102}  
+(2 rows)  
+```  
+注意这里SESSION C获得的是隐锁, No Key Update. 与之前的例子用select ... for no key update的到的不一样.  
+## 2. 当多个事务请求锁同一条tuple时, 是如何处理的? 锁请求顺序如何?  
+为什么要关心多个事务对同一条TUPLE请求锁呢, 来看一个场景.  
+假设按顺序在不同的会话中执行以下SQL.  
+SESSION A :   
+```  
+select * from test for share;  
+```  
+SESSION B :   
+```  
+select * from test for share;  
+```  
+SESSION C :   
+```  
+select * from test for update;  
+-- 这里等待是毋庸置疑的.  
+```  
+SESSION D :   
+```  
+select * from test for share;  
+-- 这里需要等待吗?  
+-- 如果SESSION D不需要等待锁, 那么持续不断的涌现出类似SESSION D这样的SQL, SESSION C就杯具了, 一直需要等待下去.  
+-- 当然这种事情不会发生. 因为C会先获得锁, D继续等待. 原因看后面的介绍.  
+```  
+下面使用gdb来跟踪一下以上场景, 看看SESSION D要不要等待.  :   
+SESSION A :   
+```  
+digoal=# select pg_backend_pid();  
+ pg_backend_pid   
+----------------  
+          10099  
+(1 row)  
+digoal=# begin;  
+BEGIN  

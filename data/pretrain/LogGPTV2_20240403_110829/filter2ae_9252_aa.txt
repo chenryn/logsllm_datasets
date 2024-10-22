@@ -1,0 +1,102 @@
+本文是[Windows Exploitation Tricks: Exploiting Arbitrary File Writes for Local
+Elevation of
+Privilege](https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html)的翻译文章
+# 前言
+[之前](https://xz.aliyun.com/t/2662)我提出了一种技术，可以在Windows上利用任意目录创建漏洞，从而对系统上的任意文件进行读取访问。
+在即将发布的Spring Creators Update（RS4）中，我在前一篇文章中利用的挂载点链接到文件的bug已得到修复。
+这就是一个如何利用漏洞获得长期安全的一个示例，让开发人员更有动力去找减少利用的方式。
+我将在这篇文章中保持这种精神，介绍一种新技术，利用Windows
+10上的任意文件写入。也许微软可能再一次强化操作系统，使其更难以利用这些类型的漏洞。我将通过详细描述Project
+Zero向Microsoft报告的最近修复的问题（问题[1428](https://bugs.chromium.org/p/project-zero/issues/detail?id=1428)）来证明此利用。
+任意文件写入漏洞是用户可以在他们通常无法访问的位置创建或修改文件。
+这是由于权限服务错误地清理了用户传递的信息，或者由于符号链接劫持攻击，用户可以将链接写入之后由权限服务使用的位置。
+理想的漏洞是攻击者不仅控制正在写入的文件的位置，还控制整个内容。
+利用任意文件写入的常用方法是执行[DLL劫持](https://cwe.mitre.org/data/definitions/427.html)。当Windows可执行文件开始执行NTDLL中的初始加载程序时，将尝试查找所有导入的DLL。
+加载程序检查导入的DLL的位置比您预期的更复杂，但就我们的目的而言可以总结如下：
+  1. 检查[已知DLL](https://blogs.msdn.microsoft.com/larryosterman/2004/07/19/what-are-known-dlls-anyway/)，它是操作系统已知的预缓存DLL列表。 如果找到，则DLL将从预加载的节对象映射到内存中。
+  2. 检查程序的目录，例如，如果导入TEST.DLL并且程序在C:\APP中，则它将检查C:\APP\TEST.DLL。
+  3. 检查系统位置，例如C:\WINDOWS\SYSTEM32和C:\WINDOWS。
+  4. 如果所有其他方法都失败，请搜索当前环境变量。
+DLL劫持的目的是找到一个以高权限运行的可执行文件，它将通过漏洞允许我们在写入的位置加载DLL。 如果在先前检查的位置中尚未找到DLL，则仅劫持成功。
+有两个问题导致DLL劫持很麻烦：
+  1. 您通常需要创建特权进程的新实例，因为在首次执行进程时会解析大多数DLL导入。
+  2. 将作为特权用户运行的大多数系统二进制文件，可执行文件和DLL将安装到SYSTEM32中。
+第二个问题意味着在步骤2和3中，加载器将始终在SYSTEM32中查找DLL。假设覆盖DLL不太可能是一个选项（至少如果DLL已经加载，你不能写入文件），这使得找到合适的DLL来劫持更加困难。解决这些问题的一种典型方法是选择一个不在SYSTEM32中且可以轻松激活的可执行文件，例如通过加载COM服务器或运行计划任务。
+即使你发现一个合适的目标可执行文件DLL劫持，实现也可能非常难看。有时你需要为原始DLL实现存根导出，否则DLL的加载将失败。在其他情况下，运行代码的最佳位置是在DllMain期间，这会引入其他问题，例如在[加载程序锁](https://msdn.microsoft.com/en-us/library/windows/desktop/dn633971%28v=vs.85%29.aspx)内运行代码。
+什么是好的是一个权限服务，它将为我们加载一个任意的DLL，没有劫持，不需要产生“正确的”特权进程。 问题是，这样的服务是否存在？
+事实证明是的，并且服务本身之前至少被利用了两次，一次是Lokihardt用于沙箱逃逸，一次是由我user到[EoP系统](https://bugs.chromium.org/p/project-zero/issues/detail?id=887)。 此服务名为“Microsoft（R）诊断中心标准收集器服务”，但我们将其简称为DiagHub。
+DiagHub服务是在Windows 10中引入的，尽管有一项服务在Windows 7和8.1中执行类似的IE ETW Collector任务。
+该服务的目的是代表沙盒应用程序（特别是Edge和Internet
+Explorer）使用Windows事件跟踪（ETW）收集诊断信息。它的一个有趣特性是它可以配置为从SYSTEM32目录加载任意DLL，这是Lokihardt和我获取提权的确切特性。该服务的所有功能都通过已注册的DCOM对象公开，因此为了加载我们的DLL，我们需要弄清楚如何在该DCOM对象上调用方法。
+此时你可以跳到最后，但如果你想了解我将如何实现DCOM对象，下一部分可能会引起关注。
+# 逆向DCOM对象
+让我们来看看我将尝试找到未知DCOM对象支持的接口并找到实现的步骤，以便我们可以对它们进行逆向。我通常会采用两种方法，直接在IDA
+Pro中使用RE或类似方法，或者首先进行一些系统检查以缩小我们需要调查的范围。在这里，我们将采用第二种方法，因为它能提供更多信息。我不能说Lokihardt是如何找到他的问题的;
+我选择魔法。
+使用这种方法，我们需要一些工具，特别是来自github的[OleViewDotNet](https://github.com/tyranid/oleviewdotnet/releases)
+v1.4 +（OVDN）工具以及[SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-10-sdk)中的WinDBG安装。第一步是找到DCOM对象的注册信息，并发现可访问的接口。我们知道DCOM对象托管在一个服务中，所以一旦你加载了OVDN，就进入菜单`Registry⇒LocalServices`，该工具将加载一个公开COM对象的已注册系统服务列表。
+如果你找到了“Microsoft（R）诊断中心标准收集器服务”服务（此处应用过滤器很有帮助），你应该能在列表中找到该条目。如果打开服务树节点，会看到一个子节点“诊断中心标准收集器服务”，它是托管的DCOM对象。打开该树节点，该工具将创建此对象，然后查询所有可远程访问的COM接口，以提供该对象支持的接口列表。
+下面的截图中展示了这点：  
+虽然我们在这里检查访问DCOM对象所需的安全性是有用的。 如果右键单击treenode类，则可以选择“View Access
+Permissions（查看访问权限）”或“View Launch Permissions（查看启动权限）”，然后您将看到一个显示权限的窗口。
+在这种情况下，它显示可以从IE保护模式以及Edge的AppContainer沙箱（包括LPAC）访问此DCOM对象。  
+在显示的接口列表中，我们只关心标准接口。 有时会有一些有趣的界面，但在这种情况下却没有。
+在这些标准接口中，有两个我们关心的，`IStandardCollectorAuthorizationService`和`IStandardCollectorService`。
+我已经知道它是我们感兴趣的`IStandardCollectorService`服务，但是由于以下过程对于每个接口都是相同的，所以首先选择哪一个并不重要。
+如果右键单击界面treenode并选择“Properties”，则可以看到有关已注册界面的一些信息。  
+除了我们可以看到此界面上有8种方法之外，没有更多的信息可以帮助我们。 与许多COM注册信息一样，此值可能会丢失或错误，但在这种情况下，我们假设它是正确的。
+要了解这些方法，我们需要在COM服务器中跟踪`IStandardCollectorService`的实现。
+这些知识使我们能够将RE工作的目标定位于正确的二进制值和正确的方法。
+为进程内COM对象执行此操作相对简单，因为我们可以通过取消引用几个指针直接查询对象的VTable指针。 但是，进程外的情况要更复杂。
+这是因为你调用的进程内对象实际上是远程对象的代理，如下图所示：  
+然而，什么都没有丢失; 我们仍然可以通过提取存储在服务器进程中的对象的信息来找到OOP对象的VTable。首先右键单击“Diagnostics Hub
+Standard Collector Service”对象树节点，然后选择 `Create Instance`。 创建COM对象的新实例，如下所示：  
+该实例为你提供基本信息，例如我们稍后需要的对象的CLSID（在本例中为{42CBFAA7-A4A7-47BB-B422-BD10E9D02700}）以及支持的接口列表。
+现在我们需要确保连接到我们感兴趣的接口。为此，选择下方列表中的`IStandardCollectorService`接口，然后在底部的`Operations`菜单中选择`Marshal⇒ViewProperties`。
+如果成功，你将看到以下界面：  
+此图中有很多信息，但我们最感兴趣的两个部分是托管服务的进程ID和接口指针标识符（IPID）。在这种情况下，当服务在其自己的进程中运行时，进程ID应该是显而易见的，但情况并非总是如此
+- 有时当你创建COM对象时，并不知道哪个进程实际托管COM服务器，因此这些信息非常宝贵。  
+IPID是DCOM对象的服务器端的托管过程中的唯一标识符;
+我们可以结合使用进程ID和IPID来查找此服务器，并从中找出实现COM方法的实际VTable的位置。 值得注意的是，IPID的最大进程ID大小为16位;
+但是，现代版本的Windows可以拥有更大的PID，因此你可能需要手动查找过程或多次重启服务，直到获得合适的PID。
+现在我们将使用OVDN的一个功能，它允许我们进入服务器进程的内存并找到IPID信息。 你可以通过`main menu Object ⇒
+Processes`访问有关所有进程的信息，但我们知道我们感兴趣的进程只需单击编组视图中进程ID旁边的`View`按钮。你需要以管理员身份运行OVDN，否则将无法打开服务流程。如果你还没有这样做，该工具将要求你配置标志支持，因为OVDN需要公共标志来查找要解析的COM
+DLL中的正确位置。你将需要使用WinDBG附带的DBGHELP.DLL版本，因为它支持远程符号服务器。 配置类似于以下的标志：  
+如果一切都配置正确并且您是管理员，您现在应该看到有关IPID的更多详细信息，如下所示：  
+这里最有用的两条信息是接口指针，它是堆分配对象的位置（如果要检查其状态），以及接口的VTable指针。VTable地址为我们提供了COM服务器实现所在位置的信息。
+正如我们在这里看到的那样，VTable位于主可执行文件（`DiagnosticsHub.StandardCollector.Server`）的不同模块（`DiagnosticsHub.StandardCollector.Runtime`）中。
+我们可以通过使用WinDBG附加到服务进程并将符号转储到VTable地址来验证VTable地址是否正确。
+我们之前也知道我们期待8种方法，因此我们可以使用以下命令将其考虑在内：
+    dqs DiagnosticsHub_StandardCollector_Runtime+0x36C78 L8
+请注意，WinDBG将模块名称中的句点转换为下划线。 如果成功，你将看到类似于以下的内容：  
+提取出这些信息，得到方法的名称（如下所示）以及二进制文件中的地址。 我们可以设置断点并查看在正常操作期间调用的内容，或者获取此信息并启动RE过程。
+    ATL::CComObject::QueryInterface
+    ATL::CComObjectCached::AddRef
+    ATL::CComObjectCached::Release
+    StandardCollectorService::CreateSession
+    StandardCollectorService::GetSession
+    StandardCollectorService::DestroySession
+    StandardCollectorService::DestroySessionAsync
+    StandardCollectorService::AddLifetimeMonitorProcessIdForSession
+方法列表看起来是正确的：它们从COM对象的3种标准方法开始，在这种情况下由ATL库实现。
+以下这些方法由`StandardCollectorService`类实现。 作为公共标志，这并不告诉我们期望传递给COM服务器的参数。
+由于包含某些类型信息的C++名称，IDA Pro也许能为你提取该信息，但并不一定会告诉你可能传递给该函数的任何结构的格式。
+幸运的是，由于如何使用网络数据表示（NDR）解释器实现COM代理来执行编组，因此可以将NDR字节码反转回我们可以理解的格式。
+在这种情况下，请返回原始服务信息，右键单击`IStandardCollectorService treenode`并选择`View Proxy
+Definition`。 这会使OVDN解析NDR代理信息并显示新视图，如下所示。  
+查看代理定义还将解析该代理库实现的任何其他接口。 也许对进一步的逆向工作有用。
+反编译的代理定义以类似C#的伪代码显示，但是根据需要应该很容易转换为能工作的C#或C++。 请注意，代理定义不包含方法的名称，但我们已经提取出来了。
+因此，应用一些cleanup和方法名称，我们得到一个如下所示的定义：
+    [uuid("0d8af6b7-efd5-4f6d-a834-314740ab8caa")]
+    struct IStandardCollectorService : IUnknown {
+       HRESULT CreateSession(_In_ struct Struct_24* p0, 
+                             _In_ IStandardCollectorClientDelegate* p1,
+                             _Out_ ICollectionSession** p2);
+       HRESULT GetSession(_In_ GUID* p0, _Out_ ICollectionSession** p1);
+       HRESULT DestroySession(_In_ GUID* p0);
+       HRESULT DestroySessionAsync(_In_ GUID* p0);
+       HRESULT AddLifetimeMonitorProcessIdForSession(_In_ GUID* p0, [In] int p1);
+    }
+最后一项丢失了; 我们不知道Struct_24结构的定义。 可以从RE过程中提取它，但幸运的是在这种情况下我们不必这样做。
+NDR字节码必须知道如何编组这种结构，因此OVDN只是自动为我们提取结构定义：选择`Structures`选项卡并找到Struct_24。  
+当你实践RE过程时，可以根据需要重复此过程，直到你了解一切如何运作。 现在让我们开始实际利用DiagHub服务，并展示它在真实环境中的应用。

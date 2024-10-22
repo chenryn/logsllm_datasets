@@ -1,0 +1,355 @@
+# Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+# or more contributor license agreements. Licensed under the Elastic License
+# 2.0; you may not use this file except in compliance with the Elastic License
+# 2.0.
+"""Rule object."""
+import copy
+import dataclasses
+import json
+import os
+import typing
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from functools import cached_property
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from uuid import uuid4
+import eql
+from semver import Version
+from marko.block import Document as MarkoDocument
+from marko.ext.gfm import gfm
+from marshmallow import ValidationError, validates_schema
+import kql
+from kql.ast import FieldComparison
+from . import beats, ecs, endgame, utils
+from .integrations import (find_least_compatible_version,
+                           load_integrations_manifests)
+from .misc import load_current_package_version
+from .mixins import MarshmallowDataclassMixin, StackCompatMixin
+from .rule_formatter import nested_normalize, toml_write
+from .schemas import (SCHEMA_DIR, definitions, downgrade,
+                      get_min_supported_stack_version, get_stack_schemas)
+from .schemas.stack_compat import get_restricted_fields
+from .utils import cached, convert_time_span, PatchedTemplate
+_META_SCHEMA_REQ_DEFAULTS = {}
+MIN_FLEET_PACKAGE_VERSION = '7.13.0'
+BUILD_FIELD_VERSIONS = {
+    "related_integrations": (Version.parse('8.3.0'), None),
+    "required_fields": (Version.parse('8.3.0'), None),
+    "setup": (Version.parse('8.3.0'), None)
+}
+@dataclass(frozen=True)
+class RuleMeta(MarshmallowDataclassMixin):
+    """Data stored in a rule's [metadata] section of TOML."""
+    creation_date: definitions.Date
+    updated_date: definitions.Date
+    deprecation_date: Optional[definitions.Date]
+    # Optional fields
+    bypass_bbr_timing: Optional[bool]
+    comments: Optional[str]
+    integration: Optional[Union[str, List[str]]]
+    maturity: Optional[definitions.Maturity]
+    min_stack_version: Optional[definitions.SemVer]
+    min_stack_comments: Optional[str]
+    os_type_list: Optional[List[definitions.OSType]]
+    query_schema_validation: Optional[bool]
+    related_endpoint_rules: Optional[List[str]]
+    promotion: Optional[bool]
+    # Extended information as an arbitrary dictionary
+    extended: Optional[Dict[str, Any]]
+    def get_validation_stack_versions(self) -> Dict[str, dict]:
+        """Get a dict of beats and ecs versions per stack release."""
+        stack_versions = get_stack_schemas(self.min_stack_version)
+        return stack_versions
+@dataclass(frozen=True)
+class RuleTransform(MarshmallowDataclassMixin):
+    """Data stored in a rule's [transform] section of TOML."""
+    # note (investigation guides) Markdown plugins
+    # /elastic/kibana/tree/main/x-pack/plugins/security_solution/public/common/components/markdown_editor/plugins
+    ##############################################
+    # timelines out of scope at the moment
+    @dataclass(frozen=True)
+    class OsQuery:
+        label: str
+        query: str
+        ecs_mapping: Optional[Dict[str, Dict[Literal['field', 'value'], str]]]
+    @dataclass(frozen=True)
+    class Insight:
+        @dataclass(frozen=True)
+        class Provider:
+            field: str
+            value: str
+            type: str
+        label: str
+        providers: List[List[Provider]]
+    # these must be lists in order to have more than one. Their index in the list is how they will be referenced in the
+    # note string templates
+    osquery: Optional[List[OsQuery]]
+    insight: Optional[List[Insight]]
+    @validates_schema
+    def validate_transforms(self, value: dict, **kwargs):
+        """Validate transform fields."""
+        # temporarily invalidate insights until schema stabilizes
+        insight = value.get('insight')
+        if insight is not None:
+            raise NotImplementedError('Insights are not stable yet.')
+        return
+    def render_insight_osquery_to_string(self) -> Dict[Literal['osquery', 'insight'], List[str]]:
+        obj = self.to_dict()
+        rendered: Dict[Literal['osquery', 'insight'], List[str]] = {'osquery': [], 'insight': []}
+        for plugin, entries in obj.items():
+            for entry in entries:
+                rendered[plugin].append(f'!{{{plugin}{json.dumps(entry, sort_keys=True, separators=(",", ":"))}}}')
+        return rendered
+    ##############################################
+@dataclass(frozen=True)
+class BaseThreatEntry:
+    id: str
+    name: str
+    reference: str
+@dataclass(frozen=True)
+class SubTechnique(BaseThreatEntry):
+    """Mapping to threat subtechnique."""
+    reference: definitions.SubTechniqueURL
+@dataclass(frozen=True)
+class Technique(BaseThreatEntry):
+    """Mapping to threat subtechnique."""
+    # subtechniques are stored at threat[].technique.subtechnique[]
+    reference: definitions.TechniqueURL
+    subtechnique: Optional[List[SubTechnique]]
+@dataclass(frozen=True)
+class Tactic(BaseThreatEntry):
+    """Mapping to a threat tactic."""
+    reference: definitions.TacticURL
+@dataclass(frozen=True)
+class ThreatMapping(MarshmallowDataclassMixin):
+    """Mapping to a threat framework."""
+    framework: Literal["MITRE ATT&CK"]
+    tactic: Tactic
+    technique: Optional[List[Technique]]
+    @staticmethod
+    def flatten(threat_mappings: Optional[List]) -> 'FlatThreatMapping':
+        """Get flat lists of tactic and technique info."""
+        tactic_names = []
+        tactic_ids = []
+        technique_ids = set()
+        technique_names = set()
+        sub_technique_ids = set()
+        sub_technique_names = set()
+        for entry in (threat_mappings or []):
+            tactic_names.append(entry.tactic.name)
+            tactic_ids.append(entry.tactic.id)
+            for technique in (entry.technique or []):
+                technique_names.add(technique.name)
+                technique_ids.add(technique.id)
+                for subtechnique in (technique.subtechnique or []):
+                    sub_technique_ids.add(subtechnique.id)
+                    sub_technique_names.add(subtechnique.name)
+        return FlatThreatMapping(
+            tactic_names=sorted(tactic_names),
+            tactic_ids=sorted(tactic_ids),
+            technique_names=sorted(technique_names),
+            technique_ids=sorted(technique_ids),
+            sub_technique_names=sorted(sub_technique_names),
+            sub_technique_ids=sorted(sub_technique_ids)
+        )
+@dataclass(frozen=True)
+class RiskScoreMapping(MarshmallowDataclassMixin):
+    field: str
+    operator: Optional[definitions.Operator]
+    value: Optional[str]
+@dataclass(frozen=True)
+class SeverityMapping(MarshmallowDataclassMixin):
+    field: str
+    operator: Optional[definitions.Operator]
+    value: Optional[str]
+    severity: Optional[str]
+@dataclass(frozen=True)
+class FlatThreatMapping(MarshmallowDataclassMixin):
+    tactic_names: List[str]
+    tactic_ids: List[str]
+    technique_names: List[str]
+    technique_ids: List[str]
+    sub_technique_names: List[str]
+    sub_technique_ids: List[str]
+@dataclass(frozen=True)
+class AlertSuppressionMapping(MarshmallowDataclassMixin, StackCompatMixin):
+    """Mapping to alert suppression."""
+    @dataclass
+    class AlertSuppressionDuration:
+        """Mapping to allert suppression duration."""
+        unit: definitions.TimeUnits
+        value: int
+    group_by: List[definitions.NonEmptyStr]
+    duration: Optional[AlertSuppressionDuration] = field(metadata=dict(metadata=dict(min_compat="8.7")))
+@dataclass(frozen=True)
+class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
+    @dataclass
+    class RequiredFields:
+        name: definitions.NonEmptyStr
+        type: definitions.NonEmptyStr
+        ecs: bool
+    @dataclass
+    class RelatedIntegrations:
+        package: definitions.NonEmptyStr
+        version: definitions.NonEmptyStr
+        integration: Optional[definitions.NonEmptyStr]
+    actions: Optional[list]
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.6")))
+    author: List[str]
+    building_block_type: Optional[definitions.BuildingBlockType]
+    description: str
+    enabled: Optional[bool]
+    exceptions_list: Optional[list]
+    license: Optional[str]
+    false_positives: Optional[List[str]]
+    filters: Optional[List[dict]]
+    # trailing `_` required since `from` is a reserved word in python
+    from_: Optional[str] = field(metadata=dict(data_key="from"))
+    interval: Optional[definitions.Interval]
+    max_signals: Optional[definitions.MaxSignals]
+    meta: Optional[Dict[str, Any]]
+    name: definitions.RuleName
+    note: Optional[definitions.Markdown]
+    # can we remove this comment?
+    # explicitly NOT allowed!
+    # output_index: Optional[str]
+    references: Optional[List[str]]
+    related_integrations: Optional[List[RelatedIntegrations]] = field(metadata=dict(metadata=dict(min_compat="8.3")))
+    required_fields: Optional[List[RequiredFields]] = field(metadata=dict(metadata=dict(min_compat="8.3")))
+    risk_score: definitions.RiskScore
+    risk_score_mapping: Optional[List[RiskScoreMapping]]
+    rule_id: definitions.UUIDString
+    rule_name_override: Optional[str]
+    setup: Optional[str] = field(metadata=dict(metadata=dict(min_compat="8.3")))
+    severity_mapping: Optional[List[SeverityMapping]]
+    severity: definitions.Severity
+    tags: Optional[List[str]]
+    throttle: Optional[str]
+    timeline_id: Optional[definitions.TimelineTemplateId]
+    timeline_title: Optional[definitions.TimelineTemplateTitle]
+    timestamp_override: Optional[str]
+    to: Optional[str]
+    type: definitions.RuleType
+    threat: Optional[List[ThreatMapping]]
+    @classmethod
+    def save_schema(cls):
+        """Save the schema as a jsonschema."""
+        fields: Tuple[dataclasses.Field, ...] = dataclasses.fields(cls)
+        type_field = next(f for f in fields if f.name == "type")
+        rule_type = typing.get_args(type_field.type)[0] if cls != BaseRuleData else "base"
+        schema = cls.jsonschema()
+        version_dir = SCHEMA_DIR / "master"
+        version_dir.mkdir(exist_ok=True, parents=True)
+        # expand out the jsonschema definitions
+        with (version_dir / f"master.{rule_type}.json").open("w") as f:
+            json.dump(schema, f, indent=2, sort_keys=True)
+    def validate_query(self, meta: RuleMeta) -> None:
+        pass
+    @cached_property
+    def get_restricted_fields(self) -> Optional[Dict[str, tuple]]:
+        """Get stack version restricted fields."""
+        fields: List[dataclasses.Field, ...] = list(dataclasses.fields(self))
+        return get_restricted_fields(fields)
+    @cached_property
+    def data_validator(self) -> Optional['DataValidator']:
+        return DataValidator(is_elastic_rule=self.is_elastic_rule, **self.to_dict())
+    @cached_property
+    def notify(self) -> bool:
+        return os.environ.get('DR_NOTIFY_INTEGRATION_UPDATE_AVAILABLE') is not None
+    @cached_property
+    def parsed_note(self) -> Optional[MarkoDocument]:
+        dv = self.data_validator
+        if dv:
+            return dv.parsed_note
+    @property
+    def is_elastic_rule(self):
+        return 'elastic' in [a.lower() for a in self.author]
+    def get_build_fields(self) -> {}:
+        """Get a list of build-time fields along with the stack versions which they will build within."""
+        build_fields = {}
+        rule_fields = {f.name: f for f in dataclasses.fields(self)}
+        for fld in BUILD_FIELD_VERSIONS:
+            if fld in rule_fields:
+                build_fields[fld] = BUILD_FIELD_VERSIONS[fld]
+        return build_fields
+    @classmethod
+    def process_transforms(cls, transform: RuleTransform, obj: dict) -> dict:
+        """Process transforms from toml [transform] called in TOMLRuleContents.to_dict."""
+        # only create functions that CAREFULLY mutate the obj dict
+        def process_note_plugins():
+            """Format the note field with osquery and insight plugin strings."""
+            note = obj.get('note')
+            if not note:
+                return
+            rendered = transform.render_insight_osquery_to_string()
+            rendered_patterns = {}
+            for plugin, entries in rendered.items():
+                rendered_patterns.update(**{f'{plugin}_{i}': e for i, e in enumerate(entries)})
+            note_template = PatchedTemplate(note)
+            rendered_note = note_template.safe_substitute(**rendered_patterns)
+            obj['note'] = rendered_note
+        # call transform functions
+        if transform:
+            process_note_plugins()
+        return obj
+class DataValidator:
+    """Additional validation beyond base marshmallow schema validation."""
+    def __init__(self,
+                 name: definitions.RuleName,
+                 is_elastic_rule: bool,
+                 note: Optional[definitions.Markdown] = None,
+                 interval: Optional[definitions.Interval] = None,
+                 building_block_type: Optional[definitions.BuildingBlockType] = None,
+                 setup: Optional[str] = None,
+                 **extras):
+        # only define fields needing additional validation
+        self.name = name
+        self.is_elastic_rule = is_elastic_rule
+        self.note = note
+        # Need to use extras because from is a reserved word in python
+        self.from_ = extras.get('from')
+        self.interval = interval
+        self.building_block_type = building_block_type
+        self.setup = setup
+        self._setup_in_note = False
+    @cached_property
+    def parsed_note(self) -> Optional[MarkoDocument]:
+        if self.note:
+            return gfm.parse(self.note)
+    @property
+    def setup_in_note(self):
+        return self._setup_in_note
+    @setup_in_note.setter
+    def setup_in_note(self, value: bool):
+        self._setup_in_note = value
+    @cached_property
+    def skip_validate_note(self) -> bool:
+        return os.environ.get('DR_BYPASS_NOTE_VALIDATION_AND_PARSE') is not None
+    @cached_property
+    def skip_validate_bbr(self) -> bool:
+        return os.environ.get('DR_BYPASS_BBR_LOOKBACK_VALIDATION') is not None
+    def validate_bbr(self, bypass: bool = False):
+        """Validate building block type and rule type."""
+        if self.skip_validate_bbr or bypass:
+            return
+        def validate_lookback(str_time: str) -> bool:
+            """Validate that the time is at least now-119m and at least 60m respectively."""
+            try:
+                if "now-" in str_time:
+                    str_time = str_time[4:]
+                    time = convert_time_span(str_time)
+                    # if from time is less than 119m as milliseconds
+                    if time  bool:
+            """Validate that the time is at least now-119m and at least 60m respectively."""
+            try:
+                time = convert_time_span(str_time)
+                # if interval time is less than 60m as milliseconds
+                if time < 60 * 60 * 1000:
+                    return False
+            except Exception as e:
+                raise ValidationError(f"Invalid time format: {e}")
+            return True
+        bypass_instructions = "To bypass, use the environment variable `DR_BYPASS_BBR_LOOKBACK_VALIDATION`"
+        if self.building_block_type:
+            if not self.from_ or not self.interval:

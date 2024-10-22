@@ -1,0 +1,237 @@
+// Concurrency-safe.
+func Icon(name string) image.Image {
+mu.RLock()
+if icons != nil {
+icon := icons[name]
+mu.RUnlock()
+return icon
+}
+mu.RUnlock()
+// acquire an exclusive lock
+mu.Lock()
+if icons == nil { // NOTE: must recheck for nil
+loadIcons()
+}
+icon := icons[name]
+mu.Unlock()
+return icon
+}
+上面的代码有两个临界区。goroutine首先会获取一个写锁，查询map，然后释放锁。如果条
+目被找到了(一般情况下)，那么会直接返回。如果没有找到，那goroutine会获取一个写锁。不
+释放共享锁的话，也没有任何办法来将一个共享锁升级为一个互斥锁，所以我们必须重新检
+查icons变量是否为nil，以防止在执行这一段代码的时候，icons变量已经被其它gorouine初始
+化过了。
+上面的模板使我们的程序能够更好的并发，但是有一点太复杂且容易出错。幸运的是，sync
+包为我们提供了一个专门的方案来解决这种一次性初始化的问题：sync.Once。概念上来讲，
+一次性的初始化需要一个互斥量mutex和一个boolean变量来记录初始化是不是已经完成了；
+互斥量用来保护boolean变量和客户端数据结构。Do这个唯一的方法需要接收初始化函数作为
+其参数。让我们用sync.Once来简化前面的Icon函数吧：
+var loadIconsOnce sync.Once
+var icons map[string]image.Image
+// Concurrency-safe.
+func Icon(name string) image.Image {
+loadIconsOnce.Do(loadIcons)
+return icons[name]
+}
+每一次对Do(loadIcons)的调用都会锁定mutex，并会检查boolean变量。在第一次调用时，变
+量的值是false，Do会调用loadIcons并会将boolean设置为true。随后的调用什么都不会做，
+但是mutex同步会保证loadIcons对内存(这里其实就是指icons变量啦)产生的效果能够对所有
+sync.Once初始化 355
+gopl
+goroutine可见。用这种方式来使用sync.Once的话，我们能够避免在变量被构建完成之前和其
+它goroutine共享该变量。
+练习 9.2： 重写2.6.2节中的PopCount的例子，使用sync.Once，只在第一次需要用到的时候
+进行初始化。(虽然实际上，对PopCount这样很小且高度优化的函数进行同步可能代价没法接
+受)
+sync.Once初始化 356
+gopl
+9.6. 竞争条件检测
+即使我们小心到不能再小心，但在并发程序中犯错还是太容易了。幸运的是，Go的runtime和
+工具链为我们装备了一个复杂但好用的动态分析工具，竞争检查器(the race detector)。
+只要在go build，go run或者go test命令后面加上-race的flag，就会使编译器创建一个你的应
+用的“修改”版或者一个附带了能够记录所有运行期对共享变量访问工具的test，并且会记录下
+每一个读或者写共享变量的goroutine的身份信息。另外，修改版的程序会记录下所有的同步
+事件，比如go语句，channel操作，以及对 ， 等
+(*sync.Mutex).Lock (*sync.WaitGroup).Wait
+等的调用。(完整的同步事件集合是在The Go Memory Model文档中有说明，该文档是和语言
+文档放在一起的。译注：https://golang.org/ref/mem)
+竞争检查器会检查这些事件，会寻找在哪一个goroutine中出现了这样的case，例如其读或者
+写了一个共享变量，这个共享变量是被另一个goroutine在没有进行干预同步操作便直接写入
+的。这种情况也就表明了是对一个共享变量的并发访问，即数据竞争。这个工具会打印一份
+报告，内容包含变量身份，读取和写入的goroutine中活跃的函数的调用栈。这些信息在定位
+问题时通常很有用。9.7节中会有一个竞争检查器的实战样例。
+竞争检查器会报告所有的已经发生的数据竞争。然而，它只能检测到运行时的竞争条件；并
+不能证明之后不会发生数据竞争。所以为了使结果尽量正确，请保证你的测试并发地覆盖到
+了你到包。
+由于需要额外的记录，因此构建时加了竞争检测的程序跑起来会慢一些，且需要更大的内
+存，即使是这样，这些代价对于很多生产环境的工作来说还是可以接受的。对于一些偶发的
+竞争条件来说，让竞争检查器来干活可以节省无数日夜的debugging。(译注：多少服务端C和
+C艹程序员为此竞折腰)
+竞争条件检测 357
+gopl
+9.7. 示例: 并发的非阻塞缓存
+本节中我们会做一个无阻塞的缓存，这种工具可以帮助我们来解决现实世界中并发程序出现
+但没有现成的库可以解决的问题。这个问题叫作缓存(memoizing)函数(译注：Memoization的
+定义： memoization 一词是Donald Michie 根据拉丁语memorandum杜撰的一个词。相应的
+动词、过去分词、ing形式有memoiz、memoized、memoizing.)，也就是说，我们需要缓存函
+数的返回结果，这样在对函数进行调用的时候，我们就只需要一次计算，之后只要返回计算
+的结果就可以了。我们的解决方案会是并发安全且会避免对整个缓存加锁而导致所有操作都
+去争一个锁的设计。
+我们将使用下面的httpGetBody函数作为我们需要缓存的函数的一个样例。这个函数会去进行
+HTTP GET请求并且获取http响应body。对这个函数的调用本身开销是比较大的，所以我们尽
+量避免在不必要的时候反复调用。
+func httpGetBody(url string) (interface{}, error) {
+resp, err := http.Get(url)
+if err != nil {
+return nil, err
+}
+defer resp.Body.Close()
+return ioutil.ReadAll(resp.Body)
+}
+最后一行稍微隐藏了一些细节。ReadAll会返回两个结果，一个[]byte数组和一个错误，不过
+这两个对象可以被赋值给httpGetBody的返回声明里的interface{}和error类型，所以我们也就
+可以这样返回结果并且不需要额外的工作了。我们在httpGetBody中选用这种返回类型是为了
+使其可以与缓存匹配。
+下面是我们要设计的cache的第一个“草稿”：
+gopl.io/ch9/memo1
+示例: 并发的非阻塞缓存 358
+gopl
+// Package memo provides a concurrency-unsafe
+// memoization of a function of type Func.
+package memo
+// A Memo caches the results of calling a Func.
+type Memo struct {
+f Func
+cache map[string]result
+}
+// Func is the type of the function to memoize.
+type Func func(key string) (interface{}, error)
+type result struct {
+value interface{}
+err error
+}
+func New(f Func) *Memo {
+return &Memo{f: f, cache: make(map[string]result)}
+}
+// NOTE: not concurrency-safe!
+func (memo *Memo) Get(key string) (interface{}, error) {
+res, ok := memo.cache[key]
+if !ok {
+res.value, res.err = memo.f(key)
+memo.cache[key] = res
+}
+return res.value, res.err
+}
+Memo实例会记录需要缓存的函数f(类型为Func)，以及缓存内容(里面是一个string到result映
+射的map)。每一个result都是简单的函数返回的值对儿--一个值和一个错误值。继续下去我们
+会展示一些Memo的变种，不过所有的例子都会遵循这些上面的这些方面。
+下面是一个使用Memo的例子。对于流入的URL的每一个元素我们都会调用Get，并打印调用
+延时以及其返回的数据大小的log：
+m := memo.New(httpGetBody)
+for url := range incomingURLs() {
+start := time.Now()
+value, err := m.Get(url)
+if err != nil {
+log.Print(err)
+}
+fmt.Printf("%s, %s, %d bytes\n",
+url, time.Since(start), len(value.([]byte)))
+}
+示例: 并发的非阻塞缓存 359
+gopl
+我们可以使用测试包(第11章的主题)来系统地鉴定缓存的效果。从下面的测试输出，我们可以
+看到URL流包含了一些重复的情况，尽管我们第一次对每一个URL的 的调用都会
+(*Memo).Get
+花上几百毫秒，但第二次就只需要花1毫秒就可以返回完整的数据了。
+$ go test -v gopl.io/ch9/memo1
+=== RUN Test
+https://golang.org, 175.026418ms, 7537 bytes
+https://godoc.org, 172.686825ms, 6878 bytes
+https://play.golang.org, 115.762377ms, 5767 bytes
+http://gopl.io, 749.887242ms, 2856 bytes
+https://golang.org, 721ns, 7537 bytes
+https://godoc.org, 152ns, 6878 bytes
+https://play.golang.org, 205ns, 5767 bytes
+http://gopl.io, 326ns, 2856 bytes
+--- PASS: Test (1.21s)
+PASS
+ok gopl.io/ch9/memo1 1.257s
+这个测试是顺序地去做所有的调用的。
+由于这种彼此独立的HTTP请求可以很好地并发，我们可以把这个测试改成并发形式。可以使
+用sync.WaitGroup来等待所有的请求都完成之后再返回。
+m := memo.New(httpGetBody)
+var n sync.WaitGroup
+for url := range incomingURLs() {
+n.Add(1)
+go func(url string) {
+start := time.Now()
+value, err := m.Get(url)
+if err != nil {
+log.Print(err)
+}
+fmt.Printf("%s, %s, %d bytes\n",
+url, time.Since(start), len(value.([]byte)))
+n.Done()
+}(url)
+}
+n.Wait()
+这次测试跑起来更快了，然而不幸的是貌似这个测试不是每次都能够正常工作。我们注意到
+有一些意料之外的cache miss(缓存未命中)，或者命中了缓存但却返回了错误的值，或者甚至
+会直接崩溃。
+但更糟糕的是，有时候这个程序还是能正确的运行(译：也就是最让人崩溃的偶发bug)，所以
+我们甚至可能都不会意识到这个程序有bug。但是我们可以使用-race这个flag来运行程序，竞
+争检测器(§9.6)会打印像下面这样的报告：
+示例: 并发的非阻塞缓存 360
+gopl
+$ go test -run=TestConcurrent -race -v gopl.io/ch9/memo1
+=== RUN TestConcurrent
+...
+WARNING: DATA RACE
+Write by goroutine 36:
+runtime.mapassign1()
+~/go/src/runtime/hashmap.go:411 +0x0
+gopl.io/ch9/memo1.(*Memo).Get()
+~/gobook2/src/gopl.io/ch9/memo1/memo.go:32 +0x205
+...
+Previous write by goroutine 35:
+runtime.mapassign1()
+~/go/src/runtime/hashmap.go:411 +0x0
+gopl.io/ch9/memo1.(*Memo).Get()
+~/gobook2/src/gopl.io/ch9/memo1/memo.go:32 +0x205
+...
+Found 1 data race(s)
+FAIL gopl.io/ch9/memo1 2.393s
+memo.go的32行出现了两次，说明有两个goroutine在没有同步干预的情况下更新了cache
+map。这表明Get不是并发安全的，存在数据竞争。
+28 func (memo *Memo) Get(key string) (interface{}, error) {
+29 res, ok := memo.cache(key)
+30 if !ok {
+31 res.value, res.err = memo.f(key)
+32 memo.cache[key] = res
+33 }
+34 return res.value, res.err
+35 }
+最简单的使cache并发安全的方式是使用基于监控的同步。只要给Memo加上一个mutex，在
+Get的一开始获取互斥锁，return的时候释放锁，就可以让cache的操作发生在临界区内了：
+gopl.io/ch9/memo2
+示例: 并发的非阻塞缓存 361
+gopl
+type Memo struct {
+f Func
+mu sync.Mutex // guards cache
+cache map[string]result
+}
+// Get is concurrency-safe.
+func (memo *Memo) Get(key string) (value interface{}, err error) {
+memo.mu.Lock()
+res, ok := memo.cache[key]
+if !ok {
+res.value, res.err = memo.f(key)
+memo.cache[key] = res
+}
+memo.mu.Unlock()
+return res.value, res.err
+}
+测试依然并发进行，但这回竞争检查器“沉默”了。不幸的是对于Memo的这一点改变使我们完
+全丧失了并发的性能优点。每次对f的调用期间都会持有锁，Get将本来可以并行运行的I/O操
+作串行化了。我们本章的目的是完成一个无锁缓存，而不是现在这样的将所有请求串行化的

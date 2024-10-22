@@ -1,0 +1,159 @@
+digoal=# alter role postgres valid until '2015-01-01';
+ALTER ROLE
+digoal=# \du
+                             List of roles
+ Role name |                   Attributes                   | Member of 
+-----------+------------------------------------------------+-----------
+ postgres  | Superuser, Create role, Create DB, Replication+| {}
+           | Password valid until 2015-01-01 00:00:00+08    | 
+```
+那么2015-01-01后, 使用密码认证将不能登录, 但是如果配置为trust的话, 不需要密码验证还是能登录的.  
+重复使用策略目前无法简单的实现, 但是可以结合事件触发器来实现, 例如创建用户, 修改用户时, 将用户和密码+user的md5值记录到一个文件中, 下次修改密码时在事件触发器中检索一下是否重复使用了密码.   
+4\. 密码验证失败几次后锁定, 以及解锁时间等  
+目前PostgreSQL 密码认证方法不支持这个安全策略, 目前只能使用auth_delay来延长暴力破解的时间.  
+如果企业有这个需求，可以通过修改PG内核实现，或者使用LDAP AD域认证方法，那种认证软件都有类似的功能。  
+5\. 设置密码时防止密码被记录到数据库日志,history,或审计日志中.   
+这一点是最容易被忽略的, 可能导致密码泄露.  
+例如 :   
+```
+postgres@db-172-16-3-221-> psql
+psql (9.3.5)
+Type "help" for help.
+digoal=# alter role postgres encrypted password 'a_b_cpostgreHAHAHAHAHAH';
+ALTER ROLE
+```
+这条SQL, 包括密码都可能被记录到几个地方.  
+5\.1 history  
+```
+postgres@db-172-16-3-221-> cd
+postgres@db-172-16-3-221-> less .psql_history
+alter role postgres encrypted password 'a_b_cpostgreHAHAHAHAHAH';
+\q
+```
+5\.2. csvlog, (如果开启了DDL或更高级别审计, #log_statement = 'ddl'                 # none, ddl, mod, all).  
+```
+postgres@db-172-16-3-221-> cd $PGDATA/pg_log
+2014-10-09 09:30:53.277 CST,"postgres","digoal",36441,"[local]",5435e54c.8e59,3,"idle",2014-10-09 09:30:52 CST,2/76,0,LOG,00000,"statement: alter role postgres encrypted password 'a_b_cpostgreHAHAHAHAHAH';",,,,,,,,"exec_simple_query, postgres.c:890","psql"
+```
+5\.3 同时还可能被记录到审计工具中, 例如堡垒机. 或者记录到pg_stat_activity, pg_stat_statements插件中。  
+解决办法 :   
+1\. 使用pwd+user的md5值设置密码,但是实际上MD5是不安全的，可以参考我写的使用MD5认证的方法。(修改客户端认证协议)     
+2\. 或者创建用户时使用createuser命令行工具-W选项提示输入密码.     
+例如 :   
+```
+postgres@db-172-16-3-221-> createuser -D -E -I -l -P -R -s --no-replication -h 127.0.0.1 -p 5432 -U postgres -W newrole
+Enter password for new role: 
+Enter it again: 
+Password: 
+```
+我们看到日志中记录的密码已经是加密后的密码.  
+```
+2014-10-09 09:36:31.491 CST,"postgres","postgres",36499,"127.0.0.1:10919",5435e69f.8e93,3,"idle",2014-10-09 09:36:31 CST,2/100,0,LOG,00000,"statement: CREATE ROLE newrole ENCRYPTED PASSWORD 'md5e8541c3402dc262583fc1b0980b013df' SUPERUSER CREATEDB CREATEROLE NOINHERIT LOGIN NOREPLICATION;
+```
+对应的代码 :   
+```
+src/bin/scripts/createuser.c
+                if (encrypted != TRI_NO)
+                {
+                        char       *encrypted_password;
+                        encrypted_password = PQencryptPassword(newpassword,
+                                                                                                   newuser);
+                        if (!encrypted_password)
+                        {
+                                fprintf(stderr, _("Password encryption failed.\n"));
+                                exit(1);
+                        }
+                        appendStringLiteralConn(&sql, encrypted_password, conn);
+                        PQfreemem(encrypted_password);
+                }
+src/interfaces/libpq/fe-auth.c
+/*
+ * PQencryptPassword -- exported routine to encrypt a password
+ *
+ * This is intended to be used by client applications that wish to send
+ * commands like ALTER USER joe PASSWORD 'pwd'.  The password need not
+ * be sent in cleartext if it is encrypted on the client side.  This is
+ * good because it ensures the cleartext password won't end up in logs,
+ * pg_stat displays, etc.  We export the function so that clients won't
+ * be dependent on low-level details like whether the enceyption is MD5
+ * or something else.
+ *
+ * Arguments are the cleartext password, and the SQL name of the user it
+ * is for.
+ *
+ * Return value is a malloc'd string, or NULL if out-of-memory.  The client
+ * may assume the string doesn't contain any special characters that would
+ * require escaping.
+ */
+char *
+PQencryptPassword(const char *passwd, const char *user)
+{
+        char       *crypt_pwd;
+        crypt_pwd = malloc(MD5_PASSWD_LEN + 1);
+        if (!crypt_pwd)
+                return NULL;
+        if (!pg_md5_encrypt(passwd, user, strlen(user), crypt_pwd))
+        {
+                free(crypt_pwd);
+                return NULL;
+        }
+        return crypt_pwd;
+}
+src/backend/libpq/md5.c
+/*
+ * Computes MD5 checksum of "passwd" (a null-terminated string) followed
+ * by "salt" (which need not be null-terminated).
+ *
+ * Output format is "md5" followed by a 32-hex-digit MD5 checksum.
+ * Hence, the output buffer "buf" must be at least 36 bytes long.
+ *
+ * Returns TRUE if okay, FALSE on error (out of memory).
+ */
+bool
+pg_md5_encrypt(const char *passwd, const char *salt, size_t salt_len,
+                           char *buf)
+{
+        size_t          passwd_len = strlen(passwd);
+        /* +1 here is just to avoid risk of unportable malloc(0) */
+        char       *crypt_buf = malloc(passwd_len + salt_len + 1);
+        bool            ret;
+        if (!crypt_buf)
+                return false;
+        /*
+         * Place salt at the end because it may be known by users trying to crack
+         * the MD5 output.
+         */
+        memcpy(crypt_buf, passwd, passwd_len);
+        memcpy(crypt_buf + passwd_len, salt, salt_len);
+        strcpy(buf, "md5");
+        ret = pg_md5_hash(crypt_buf, passwd_len + salt_len, buf + 3);
+        free(crypt_buf);
+        return ret;
+}
+```
+3\. 修改用户密码建议使用pg_md5工具生成密码, 在psql中使用ALTER ROLE填入md5值.   
+与上面类似, pg_md5是pgpool提供的一个工具, 实际上就是调用上面的函数.  
+如果需要将认证模块剥离, 可以选择使用域认证或其他第三方认证方法, 这样的话, 密码策略就交由第三方管理了.    
+[PostgreSQL LDAP simple bind认证配置](../201406/20140606_02.md)     
+[PostgreSQL LDAP search bind认证配置](../201406/20140609_01.md)    
+[PostgreSQL Windows AD域认证配置](20140924_01.md)    
+## 其他
+1\. PostgreSQL在密码安全管理这块还需要加强.  
+例如应该有密码修改的命令行工具.  
+应该有密码重复使用的策略模块.  
+## 参考
+[PostgreSQL LDAP simple bind认证配置](../201406/20140606_02.md)     
+[PostgreSQL LDAP search bind认证配置](../201406/20140609_01.md)    
+[PostgreSQL Windows AD域认证配置](20140924_01.md)    
+http://www.postgresql.org/docs/9.4/static/passwordcheck.html  
+http://www.postgresql.org/docs/9.4/static/auth-delay.html  
+http://sourceforge.net/projects/cracklib/    
+#### [PostgreSQL 许愿链接](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216")
+您的愿望将传达给PG kernel hacker、数据库厂商等, 帮助提高数据库产品质量和功能, 说不定下一个PG版本就有您提出的功能点. 针对非常好的提议，奖励限量版PG文化衫、纪念品、贴纸、PG热门书籍等，奖品丰富，快来许愿。[开不开森](https://github.com/digoal/blog/issues/76 "269ac3d1c492e938c0191101c7238216").  
+#### [9.9元购买3个月阿里云RDS PostgreSQL实例](https://www.aliyun.com/database/postgresqlactivity "57258f76c37864c6e6d23383d05714ea")
+#### [PostgreSQL 解决方案集合](https://yq.aliyun.com/topic/118 "40cff096e9ed7122c512b35d8561d9c8")
+#### [德哥 / digoal's github - 公益是一辈子的事.](https://github.com/digoal/blog/blob/master/README.md "22709685feb7cab07d30f30387f0a9ae")
+![digoal's wechat](../pic/digoal_weixin.jpg "f7ad92eeba24523fd47a6e1a0e691b59")
+#### [PolarDB 学习图谱: 训练营、培训认证、在线互动实验、解决方案、生态合作、写心得拿奖品](https://www.aliyun.com/database/openpolardb/activity "8642f60e04ed0c814bf9cb9677976bd4")
+#### [购买PolarDB云服务折扣活动进行中, 55元起](https://www.aliyun.com/activity/new/polardb-yunparter?userCode=bsb3t4al "e0495c413bedacabb75ff1e880be465a")
+#### [About 德哥](https://github.com/digoal/blog/blob/master/me/readme.md "a37735981e7704886ffd590565582dd0")

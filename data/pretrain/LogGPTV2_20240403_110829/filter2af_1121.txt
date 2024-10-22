@@ -1,0 +1,193 @@
+### 简介
+#### 漏洞详情
+[CVE-2014-3153](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2014-3153)是一个相当经典的提权漏洞，影响范围相当广泛，这实际上是一个Linux内核的uaf漏洞。神奇小子Geohot也利用了这个漏洞，开发出TowelRoot（简单粗暴的安卓root工具）。膜拜发现此漏洞以及写出exp的大牛。
+#### 什么是Futex
+Futex（Fast Userspace muTexes），按英文翻译过来就是 **快速用户空间互斥体**
+，设计目的是加速glibc层的互斥访问速度，在不必要的情况下，Futex可以在用户空间就处理互斥访问（仍然需要进入内核，因为futex函数是系统调用，但开销相对内核互斥量非常小，就是简单的判断一下uaddr的值），而不进入内核互斥量，大大的减小了内核的开销。简单的说，futex就是通过在用户态的检查，（motivation）如果了解到没有竞争就不用陷入内核了，大大提高了low-contention时候的效率。 Linux从2.5.7开始支持Futex。
+### 漏洞成因
+#### 1\. relock
+relock存在于futex_lock_pi()
+下面让我们看下futex的流程
+在futex系统调用内部是通过do_futex()完成具体操作
+    linux/kernel/futex.c
+    long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+            u32 __user *uaddr2, u32 val2, u32 val3)
+    {
+        int cmd = op & FUTEX_CMD_MASK;
+        unsigned int flags = 0;
+        if (!(op & FUTEX_PRIVATE_FLAG))
+            flags |= FLAGS_SHARED;
+        if (op & FUTEX_CLOCK_REALTIME) {
+            flags |= FLAGS_CLOCKRT;
+            if (cmd != FUTEX_WAIT_BITSET && cmd != FUTEX_WAIT_REQUEUE_PI)
+                return -ENOSYS;
+        }
+        switch (cmd) {
+        case FUTEX_LOCK_PI:
+        case FUTEX_UNLOCK_PI:
+        case FUTEX_TRYLOCK_PI:
+        case FUTEX_WAIT_REQUEUE_PI:
+        case FUTEX_CMP_REQUEUE_PI:
+            if (!futex_cmpxchg_enabled)
+                return -ENOSYS;
+        }
+        switch (cmd) {
+        case FUTEX_WAIT:
+            val3 = FUTEX_BITSET_MATCH_ANY;
+        case FUTEX_WAIT_BITSET:
+            return futex_wait(uaddr, flags, val, timeout, val3);
+        case FUTEX_WAKE:
+            val3 = FUTEX_BITSET_MATCH_ANY;
+        case FUTEX_WAKE_BITSET:
+            return futex_wake(uaddr, flags, val, val3);
+        case FUTEX_REQUEUE:
+            return futex_requeue(uaddr, flags, uaddr2, val, val2, NULL, 0);
+        case FUTEX_CMP_REQUEUE:
+            return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 0);
+        case FUTEX_WAKE_OP:
+            return futex_wake_op(uaddr, flags, uaddr2, val, val2, val3);
+        case FUTEX_LOCK_PI:
+            return futex_lock_pi(uaddr, flags, val, timeout, 0);
+        case FUTEX_UNLOCK_PI:
+            return futex_unlock_pi(uaddr, flags);
+        case FUTEX_TRYLOCK_PI:
+            return futex_lock_pi(uaddr, flags, 0, timeout, 1);
+        case FUTEX_WAIT_REQUEUE_PI:
+            val3 = FUTEX_BITSET_MATCH_ANY;
+            return futex_wait_requeue_pi(uaddr, flags, val, timeout, val3,
+                             uaddr2);
+        case FUTEX_CMP_REQUEUE_PI:
+            return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+        }
+        return -ENOSYS;
+    }
+在do_futex(……)中，主要根据op代表的具体操作类型进行不同分支的操作。例如FUTEX_WAIT执行futex_wait(uaddr, flags,
+val, timeout, val3)，FUTEX_WAKE则执行futex_wake(uaddr, flags, val,
+val3)，这是最基本futex阻塞唤醒操作。
+我们来看一下futex_lock_pi这个函数
+    /*
+     * Userspace tried a 0 -> TID atomic transition of the futex value
+     * and failed. The kernel side here does the whole locking operation:
+     * if there are waiters then it will block, it does PI, etc. (Due to
+     * races the kernel might see a 0 value of the futex too.)
+     */
+    static int futex_lock_pi(u32 __user *uaddr, unsigned int flags, int detect,
+                 ktime_t *time, int trylock)
+    {
+        struct hrtimer_sleeper timeout, *to = NULL;
+        struct futex_hash_bucket *hb;
+        struct futex_q q = futex_q_init;
+        int res, ret;
+        ...
+        ...
+        ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current, 0);
+        if (unlikely(ret)) {
+            switch (ret) {
+            case 1:
+                /* We got the lock. */
+                ret = 0;
+                goto out_unlock_put_key;
+            case -EFAULT:
+                goto uaddr_faulted;
+            case -EAGAIN:
+                /*
+                 * Task is exiting and we just wait for the
+                 * exit to complete.
+                 */
+                queue_unlock(&q, hb);
+                put_futex_key(&q.key);
+                cond_resched();
+                goto retry;
+            default:
+                goto out_unlock_put_key;
+            }
+        }
+可以看出futex_lock_pi的核心函数是futex_lock_pi_atomic
+    /**
+     * futex_lock_pi_atomic() - Atomic work required to acquire a pi aware futex
+     * @uaddr:      the pi futex user address
+     * @hb:         the pi futex hash bucket
+     * @key:        the futex key associated with uaddr and hb
+     * @ps:         the pi_state pointer where we store the result of the
+     *          lookup
+     * @task:       the task to perform the atomic lock work for.  This will
+     *          be "current" except in the case of requeue pi.
+     * @set_waiters:    force setting the FUTEX_WAITERS bit (1) or not (0)
+     *
+     * Returns:
+     *  0 - ready to wait
+     *  1 - acquired the lock
+     * lock and futex_key refs shall be held by the caller.
+     */
+    static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
+                    union futex_key *key,
+                    struct futex_pi_state **ps,
+                    struct task_struct *task, int set_waiters)
+    {
+        ...
+        ...
+        /*
+         * To avoid races, we attempt to take the lock here again
+         * (by doing a 0 -> TID atomic cmpxchg), while holding all
+         * the locks. It will most likely not succeed.
+         */
+        newval = vpid;
+        if (set_waiters)
+            newval |= FUTEX_WAITERS;
+        if (unlikely(cmpxchg_futex_value_locked(&curval, uaddr, 0, newval)))
+            return -EFAULT;
+        ...
+        ...
+        /*
+         * Surprise - we got the lock. Just return to userspace:
+         */
+        if (unlikely(!curval))
+            return 1;
+        ...
+        ...
+    }
+从注释我们可以看出unlikely(cmpxchg_futex_value_locked(&curval, uaddr, 0,
+newval))用于比较uaddr是否为0，若为0则将线程id赋给uaddr
+然后下面unlikely(!curval)如果cmpxchg操作成功即代表可以获取锁
+但这时候会产生一个问题，uaddr是位于用户空间的一个整形变量，我们可以手动设为0，这样uaddr被锁定也可以再次获取锁。因为我们没有调用futex_unlock_pi释放锁就进行了再次上锁，所以其中有一些收尾工作没有做，比如唤醒阻塞在锁上的线程，修改
+pi_state等。这个问题称为 ** _relock_** ，也可以叫多重上锁。
+#### 2\. requeue
+根据exp可知，这个漏洞利用主要依靠于系统调用接口FUTEX_WAIT_REQUEUE_PI、FUTEX_CMP_REQUEUE_PI
+根据do_futex的源码可知，FUTEX_WAIT_REQUEUE_PI调用了函数futex_wait_requeue_pi，FUTEX_CMP_REQUEUE_PI调用了函数futex_requeue
+futex_wait_requeue_pi的主要作用是在uaddr上等待唤醒，通过调用futex_wait_queue_me函数等待自身被唤醒。唤醒过程将所有阻塞在
+uaddr1上的线程全部移动到uaddr2上去，以防止“惊群”的情况发生。
+futex_requeue的主要作用是唤醒uaddr1最高优先级的线程，然后将阻塞在uaddr1上的等待线程转移到uaddr2上
+从源码可以看出，futex_requeue唤醒futex_wait_requeue_pi线程通过两个函数：futex_proxy_trylock_atomic和rt_mutx_start_proxy_lock
+如果futex_proxy_trylock_atomic函数获取uaddr2锁成功，它会返回用户空间，唤醒uaddr1上被阻塞的最高优先级进程，若获取uaddr2锁失败，继续执行后面代码。函数不进入内核互斥量，从而减小内核互斥量的开销。
+如果rt_mutx_start_proxy_lock函数获取uaddr2锁成功，它会调用requeue_pi_wake_futex函数唤醒等待的线程，在该函数中将互斥锁的rt_waiter清空。如果失败，则将线程阻塞到uaddr2的内核互斥量上，将rt_waiter加入rt_mutex的waiter
+list。
+我用伪代码描述以下调用
+    futex_wait_requeue_pi(uaddr1, uaddr2) // 在uaddr1上等待
+    futex_requeue(uaddr1, uaddr2) // 返回1，表示成功
+    futex_requeue(uaddr2, uaddr2) //返回0xffffffea，表示失败，crash
+前两步是正常操作，首先调用futex_wait_requeue_pi在uaddr1上等待，等待futex_requeue的唤醒，然后futex_requeue尝试获取uaddr2上的锁，然后唤醒uaddr1上等待的线程
+但最后一步执行了futex_requeue(uaddr2,
+uaddr2)，显然是不合逻辑的，如果第二次唤醒动作执行的是futex_requeue(uaddr1,
+uaddr2)，那么futex_requeue会返回0，表示未唤醒成功，不会产生crash，但是Futex没有检查这样的调用，也就是说没有检查uaddr1
+== uaddr2的情况，从而造成了我们可以二次进入futex_requeue中进行唤醒操作。
+### 漏洞原理
+  1. **_futex_lock_pi( &B)_**
+线程1调用futex_lock_pi锁住B，此时没有其他竞争，所以成功锁住B，B中内容被设置为tid
+  1. **_futex_wait_requeue_pi( &A, &B)_**
+创建线程2，进入系统调用futex_wait_requeue_pi后，会在栈上初始化一个futex_q结构体和rt_mutex_waiter。然后调用futex_wait_queue_me在A上进行等待，此时futex_q会被加入到A对应的PI
+chain中
+  1. **_futex_requeue_pi( &A, &B)_**
+线程2进入内核等待后，线程1进入内核调用futex_requeue唤醒线程2，首先会走到futex_proxy_trylock_atomic，由于B被锁住，所以获取锁失败，接下来走到rt_mutex_start_proxy_lock函数，同样获取锁失败，线程2阻塞到B的rt_mutex上，同时将futex_wait_requeue_pi中的rt_waiter加入到rt_waiter的waiter
+list上，调用链为rt_mutx_start_proxy_lock -> task_blocks_on_rt_mutex -> plist_add
+  1. **_B = 0_**
+利用relock漏洞，在用户态解锁B
+  1. **_futex_requeue_pi( &B, &B)_**
+利用requeue漏洞，再次调用futex_requeue(B, B)，这会导致
+futex_proxy_trylock_atomic函数被再次调用，进而调用futex_lock_pi_atomic。futex_lock_pi_atomic判断B值为0，从而获得锁，然后调用requeue_pi_wake_futex唤醒线程2
+q->rt_waiter会被置为NULL，因为已经获取了锁
+  1. **_futex_wait_requeue_pi( &A, &B)_**
+futex_wait_requeue_pi会认为没有进入内核互斥量等待，也就是说rt_waiter没有被加入到rt_mutex的waiter
+list上，因此futex_wait_requeue_pi将执行不清理rt_waiter的分支代码，从而造成了线程2被唤醒，但是它的rt_waiter没有从rt_mutex上摘除，而这个rt_waiter还正好在栈上，等futex_waite_requeue_pi线程结束后，会回收等待链表，就会引用到未被清理的re_waiter，从而导致uaf
+漏洞原理调用图：
+### reference
+《漏洞战争》CVE-2014-3153Android内核Futex提取漏洞

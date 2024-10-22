@@ -1,0 +1,206 @@
+         * If TF is set, we will single-step all the way to here -- do_debug
+         * will ignore all the traps.  (Yes, this is slow, but so is
+         * single-stepping in general.  This allows us to avoid having
+         * a more complicated code to handle the case where a user program
+         * forces us to single-step through the SYSENTER entry code.)
+         *
+         * NB.: .Lsysenter_fix_flags is a label with the code under it moved
+         * out-of-line as an optimization: NT is unlikely to be set in the
+         * majority of the cases and instead of polluting the I$ unnecessarily,
+         * we're keeping that code behind a branch which will predict as
+         * not-taken and therefore its instructions won't be fetched.
+         */
+        testl    $X86_EFLAGS_NT|X86_EFLAGS_AC|X86_EFLAGS_TF, EFLAGS(%rsp)
+        jnz    .Lsysenter_fix_flags
+    .Lsysenter_flags_fixed:
+        /*
+         * User mode is traced as though IRQs are on, and SYSENTER
+         * turned them off.
+         */
+        TRACE_IRQS_OFF
+        movq    %rsp, %rdi
+        call    do_fast_syscall_32
+        /* XEN PV guests always use IRET path */
+        ALTERNATIVE "testl %eax, %eax; jz .Lsyscall_32_done", \
+                "jmp .Lsyscall_32_done", X86_FEATURE_XENPV
+        jmp    sysret32_from_system_call
+    .Lsysenter_fix_flags:
+        pushq    $X86_EFLAGS_FIXED
+        popfq
+        jmp    .Lsysenter_flags_fixed
+    GLOBAL(__end_entry_SYSENTER_compat)
+    ENDPROC(entry_SYSENTER_compat)
+关于SWAPGS可阅读[参阅链接](http://web.archive.org/web/20160729112540/http://www.x86-64.org/pipermail/discuss/2000-October/001009.html)：
+`do_fast_syscall_32`函数会调用`do_syscall_32_irqs_on`：
+    /* Returns 0 to return using IRET or 1 to return using SYSEXIT/SYSRETL. */
+    __visible long do_fast_syscall_32(struct pt_regs *regs)
+    {
+    ......
+        /* Now this is just like a normal syscall. */
+        do_syscall_32_irqs_on(regs);
+    ......
+    }
+该函数其余代码部分见后文描述。
+###  b. 动态调试
+使用如下代码作为示例(不建议这样去执行系统调用，下面的代码仅仅是作为展示)：
+    int
+    main(int argc, char *argv[])
+    {
+      unsigned long syscall_nr = 1;
+      long exit_status = 44;
+      asm ("movl %0, %%eax\n"
+           "movl %1, %%ebx\n"
+           "sysenter"
+        : /* output parameters, we aren't outputting anything, no none */
+          /* (none) */
+        : /* input parameters mapped to %0 and %1, repsectively */
+          "m" (syscall_nr), "m" (exit_status)
+        : /* registers that we are "clobbering", unneeded since we are calling exit */
+          "eax", "ebx");
+    }
+于`entry_SYSENTER_compat`成功断下：
+将`regs`传递给`do_fast_syscall_32`：
+可以看到其`orig_ax`成员偏移与之前相比发生了变化， 这是因为`regs`对应结构定义为：
+    struct pt_regs {
+    /*
+     * C ABI says these regs are callee-preserved. They aren't saved on kernel entry
+     * unless syscall needs a complete, fully filled "struct pt_regs".
+     */
+        unsigned long r15;
+        unsigned long r14;
+        unsigned long r13;
+        unsigned long r12;
+        unsigned long bp;
+        unsigned long bx;
+    /* These regs are callee-clobbered. Always saved on kernel entry. */
+        unsigned long r11;
+        unsigned long r10;
+        unsigned long r9;
+        unsigned long r8;
+        unsigned long ax;
+        unsigned long cx;
+        unsigned long dx;
+        unsigned long si;
+        unsigned long di;
+    /*
+     * On syscall entry, this is syscall#. On CPU exception, this is error code.
+     * On hw interrupt, it's IRQ number:
+     */
+        unsigned long orig_ax;
+    /* Return frame for iretq */
+        unsigned long ip;
+        unsigned long cs;
+        unsigned long flags;
+        unsigned long sp;
+        unsigned long ss;
+    /* top of stack page */
+    }
+通过`sysret`指令返回调用程序：
+Intel SDM中对此命令描述如下：
+###  c. __kernel_vsyscall
+严格意义上来说，上一小节中给出示例不符合系统调用规范，笔者在实际测试时发现手动执行SYSENTER会出现错误。本小节示例如下：
+    #include 
+    #include 
+    #include 
+    #include 
+    int main(int argc, char *argv[]){
+        char buffer[80] = "/tmp/test";
+        int fd = open(buffer, O_RDONLY);
+        int size = read(fd, buffer, sizeof(buffer));
+        close(fd);
+    }
+采用静态编译方式，目标平台32位。跟踪`open`函数调用如下：
+对应源码位于arch/x86/entry/vdso/vdso32/system_call.S文件中：
+    .text
+        .globl __kernel_vsyscall
+        .type __kernel_vsyscall,@function
+        ALIGN
+    __kernel_vsyscall:
+        CFI_STARTPROC
+        pushl    %ecx
+        CFI_ADJUST_CFA_OFFSET    4
+        CFI_REL_OFFSET        ecx, 0
+        pushl    %edx
+        CFI_ADJUST_CFA_OFFSET    4
+        CFI_REL_OFFSET        edx, 0
+        pushl    %ebp
+        CFI_ADJUST_CFA_OFFSET    4
+        CFI_REL_OFFSET        ebp, 0
+        #define SYSENTER_SEQUENCE    "movl %esp, %ebp; sysenter"
+        #define SYSCALL_SEQUENCE    "movl %ecx, %ebp; syscall"
+    #ifdef CONFIG_X86_64
+        /* If SYSENTER (Intel) or SYSCALL32 (AMD) is available, use it. */
+        ALTERNATIVE_2 "", SYSENTER_SEQUENCE, X86_FEATURE_SYSENTER32, \
+                          SYSCALL_SEQUENCE,  X86_FEATURE_SYSCALL32
+    #else
+        ALTERNATIVE "", SYSENTER_SEQUENCE, X86_FEATURE_SEP
+    #endif
+        /* Enter using int $0x80 */
+        int    $0x80
+    GLOBAL(int80_landing_pad)
+        /*
+         * Restore EDX and ECX in case they were clobbered.  EBP is not
+         * clobbered (the kernel restores it), but it's cleaner and
+         * probably faster to pop it than to adjust ESP using addl.
+         */
+        popl    %ebp
+        CFI_RESTORE        ebp
+        CFI_ADJUST_CFA_OFFSET    -4
+        popl    %edx
+        CFI_RESTORE        edx
+        CFI_ADJUST_CFA_OFFSET    -4
+        popl    %ecx
+        CFI_RESTORE        ecx
+        CFI_ADJUST_CFA_OFFSET    -4
+        ret
+        CFI_ENDPROC
+        .size __kernel_vsyscall,.-__kernel_vsyscall
+        .previous
+关于系统调用指令，根据平台选择是SYSENTER或是SYSCALL，若均不支持则执行传统系统调用int $0x80。
+## 0x03 SYSCALL
+Intel SDM：
+同样是位于`syscall_init`函数中：
+    void syscall_init(void)
+    {
+        extern char _entry_trampoline[];
+        extern char entry_SYSCALL_64_trampoline[];
+        int cpu = smp_processor_id();
+        unsigned long SYSCALL64_entry_trampoline =
+            (unsigned long)get_cpu_entry_area(cpu)->entry_trampoline +
+            (entry_SYSCALL_64_trampoline - _entry_trampoline);
+        wrmsr(MSR_STAR, 0, (__USER32_CS tv_usec /= 1000;
+        }
+        if (unlikely(tz != NULL)) {
+            tz->tz_minuteswest = gtod->tz_minuteswest;
+            tz->tz_dsttime = gtod->tz_dsttime;
+        }
+        return 0;
+    }
+    int gettimeofday(struct timeval *, struct timezone *)
+        __attribute__((weak, alias("__vdso_gettimeofday")));
+用户调用`gettimeofday`时，实际执行的是`__vdso_gettimeofday`。示例代码如下：
+    #include 
+    #include 
+    #include 
+    int main(int argc, char **argv)
+    {
+        char buffer[40];
+        struct timeval time;
+        gettimeofday(&time, NULL);
+        strftime(buffer, 40, "Current date/time: %m-%d-%Y/%T", localtime(&time.tv_sec));
+        printf("%s\n",buffer);
+        return 0;
+    }
+编译之后跟踪`gettimeofday`函数调用：
+查看内存空间映射情况：
+可以看到执行指令确实映射在vdso区域内。
+## 0x05 参阅链接
+  1. [The Definitive Guide to Linux System Calls——Prerequisite information](https://blog.packagecloud.io/eng/2016/04/05/the-definitive-guide-to-linux-system-calls/#prerequisite-information)
+  2. [Linux Kernel 实践(二)：劫持系统调用](https://limxw.com/post/linux-kernel-practice-hijack-syscall/)
+  3. [代码解析Linux系统调用](https://ieevee.com/tech/2017/06/18/kernel-syscall.html)
+  4. [谈结构体struct 初始化多出的点号“.”，数组[]初始化多出的逗号“,](https://blog.csdn.net/comwise/article/details/9087279)
+  5. [x86 架构下 Linux 的系统调用与 vsyscall, vDSO](https://vvl.me/2019/06/linux-syscall-and-vsyscall-vdso-in-x86/)
+  6. [Setup: Ubuntu host, QEMU vm, x86-64 kernel](https://github.com/google/syzkaller/blob/master/docs/linux/setup_ubuntu-host_qemu-vm_x86-64-kernel.md)
+  7. [x86-64 Spec addition – SwapGS instruction](http://web.archive.org/web/20160729112540/http://www.x86-64.org/pipermail/discuss/2000-October/001009.html)
+  8. [Linux系统调用过程分析](https://zhuanlan.zhihu.com/p/79236207)
+  9. [Timers and time management in the Linux kernel. Part 7](https://garlicspace.com/2020/06/07/linux%E5%86%85%E6%A0%B8%E4%B8%AD%E7%9A%84%E5%AE%9A%E6%97%B6%E5%99%A8%E5%92%8C%E6%97%B6%E9%97%B4%E7%AE%A1%E7%90%86-part-7/)

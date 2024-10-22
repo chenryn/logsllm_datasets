@@ -1,0 +1,146 @@
+## PostgreSQL 类微博FEED系统 - 设计与性能指标   
+### 作者                                                           
+digoal                                                           
+### 日期                                                           
+2018-03-05                                                         
+### 标签                                                           
+PostgreSQL , feed , 微博 , 推送 , 分区 , 分片 , UDF , 挖掘 , 文本挖掘         
+----                                                           
+## 背景       
+类微博系统，最频繁用到的功能：  
+```  
+A,D,E用户关注B用户。  
+B用户推送消息。  
+A,D,E用户接收消息。  
+A,D,E用户消费消息。涉及消费排序算法。  
+```  
+之前写过一篇[《三体高可用PCC大赛 - facebook\微博 like场景 - 数据库设计与性能压测》](../201705/20170512_02.md)    
+LIKE相关场景，用PostgreSQL来设计，性能杠杠的。  
+本文则是与消息推送、消息消费相关的场景。  
+以内容2048字为例。   
+## 设计  
+为了满足高效率的推送与消费，设计时，需要考虑到分区。分区后，也便于将来做较为透明的分库。  
+例如可以按用户的UID进行哈希分区。  
+### 1 hash 分区表  
+创建消息推送表  
+```  
+create table tbl_feed(  
+  uid int8,   -- 用户ID  
+  from_uid int8,   -- 被关注用户ID  
+  ts timestamp,    -- 被关注用户发送该消息的时间  
+  content text,    -- 被关注用户发送该消息的内容  
+  status int       -- 消息被当前用户阅读的状态, 0 初始状态， 1 已消费  
+);    
+```  
+创建partial index，因为消费时，只关心没有被消费的记录。  
+```  
+create index idx_tbl_feed_1 on tbl_feed(uid,ts) where status=0;    
+```  
+创建1024个分区  
+```  
+do language plpgsql $$    
+declare    
+begin    
+  for i in 0..1023 loop    
+    execute format('create table tbl_feed_%s (like tbl_feed including all , constraint ck_tbl_feed_%s check(abs(mod(uid,1024))=%s)) inherits(tbl_feed)', i, i, i);    
+  end loop;    
+end;    
+$$;    
+```  
+### 2 写入 UDF    
+目前RDS PG 10的分区表写入效率和查询效率不是特别理想，为了达到较好的写入效率，建议可以先使用UDF，动态拼接SQL。  
+```  
+create or replace function ins_feed(int8, int8, timestamp, text, int) returns void as $$  
+declare  
+  i int := abs(mod($1,1024));  -- 动态拼接表名  
+begin  
+  execute format('insert into tbl_feed_%s(uid,from_uid,ts,content,status) values(%s,%s,%L,%L,%s)', i, $1,$2,$3,$4,$5);  
+end;  
+$$ language plpgsql strict;  
+```  
+### 写入性能  
+假设有20亿用户，随机输入1个用户，并推送一条2048个英文字的消息。  
+PG 10，单实例，写入 19.5 万行/s，瓶颈主要在写WAL日志的LOCK上。  
+```  
+\set uid random(1,2000000000)  
+select ins_feed(:uid,:uid+1,now()::timestamp,repeat(md5('a'),64),0);  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 56 -j 56 -T 120  
+```  
+```  
+transaction type: ./test.sql  
+scaling factor: 1  
+query mode: prepared  
+number of clients: 56  
+number of threads: 56  
+duration: 120 s  
+number of transactions actually processed: 23464891  
+latency average = 0.286 ms  
+latency stddev = 0.486 ms  
+tps = 195379.681306 (including connections establishing)  
+tps = 195404.169885 (excluding connections establishing)  
+statement latencies in milliseconds:  
+         0.001  \set uid random(1,2000000000)  
+         0.285  select ins_feed(:uid,:uid+1,now()::timestamp,repeat(md5('a'),64),0);  
+```  
+### 消费 UDF    
+目前RDS PG 10的分区表写入效率和查询效率不是特别理想，为了达到较好的写入效率，建议可以先使用UDF，动态拼接SQL。  
+```  
+create or replace function get_feed(int8, int, text) returns setof tbl_feed as $$  
+declare  
+  i int := abs(mod($1,1024));   -- 动态拼接表名  
+begin  
+return query execute format('with tmp as   
+(  
+update tbl_feed_%s set status=1 where ctid = any (array(  
+  select ctid from tbl_feed_%s where status=0 and uid=%s order by ts limit %s  -- 每次消费N条，按时间先或后消费都可以，都会走索引  
+))   
+returning *  
+)  
+select * from tmp order by %s',  -- 排序算法可以写成UDF，或参数传入, 本例使用ts排序    
+i, i, $1, $2, $3  
+);    
+end;  
+$$ language plpgsql strict;   
+```  
+消费例子  
+```  
+postgres=# select * from get_feed(642960384,10,'from_uid');  
+-[ RECORD 1 ]------------------------------------------------------------------------------------------------  
+uid      | 642960384  
+from_uid | 642960385  
+ts       | 2018-03-05 19:41:40.574568  
+content  | 0cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc17  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b  
+9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e  
+2697726610cc175b9c0f1b6a831c399e269772661  
+status   | 1  
+```  
+### 消费性能  
+为了观察到实际的消费，即每次消费都有至少20条被真实消费掉，这里先生成一批密集的数据再测。
+```
+\set uid random(1,4096)  
+select ins_feed(:uid,:uid+1,now()::timestamp,repeat(md5('a'),64),0);  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 56 -j 56 -T 120  
+```
+随机输入一个随机用户，每次消费20行。平均每秒消费 2.7 万次。  
+```  
+# \set uid random(1,2000000000)  
+测试时使用 \set uid random(1,4096) 
+select * from get_feed(:uid,20,'ts');  
+pgbench -M prepared -n -r -P 1 -f ./test.sql -c 56 -j 56 -T 45  
+```  

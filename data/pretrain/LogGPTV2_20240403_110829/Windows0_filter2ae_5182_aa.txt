@@ -1,0 +1,107 @@
+# Windows调试艺术——从0开始的异常处理（下）
+##### 译文声明
+本文是翻译文章
+译文仅供参考，具体内容表达以及含义原文为准。
+windows调试艺术主要是记录我自己学习的windows知识，并希望尽可能将这些东西在某些实际方面体现出来。
+要阅读本文章的小伙伴建议先看看《windows调试艺术》的前两篇文章来了解一下前置知识
+[Windows调试艺术——从0开始的异常处理（上）](https://www.anquanke.com/post/id/175293)
+[Windows调试艺术——利用LDR寻找dll基址](https://www.anquanke.com/post/id/173586)
+上一篇我们详细的了解了windows对于硬件和软件异常的不同处理过程以及相似的分发机制，但windows的异常管理远没有那么简单，还包括了SEH、VEH、安全措施等的重要知识，这次就来进行一下补充。要特别说明一下，作为windows最核心的部分之一，异常的大部分内容微软并没有公布，在加之笔者水平有限，所以在一些地方的了解还有很多欠缺，希望有能力的朋友能提出和我共同将windows异常这部分的内容总结完善。
+## SEH
+SEH（structure exception
+handle）即结构化异常处理，往大了说它是整个Windows异常处理体系的一种称呼，往小了说它是维护异常体系的一个具体结构。在之前的文中提到了FS寄存器的0偏移直接指向了TEB，TEB的第一个结构是TIB，而TIB的0也就是ExceptionList，也就是异常处理链表的头节点，其结构如下。
+    typedef struct _EXCEPTION_REGISTRATION_RECORD
+    {
+      struct _EXCEPTION_REGISTRATION_RECORD *Next;
+      PEXCEPTION_ROUTINE Handler;
+    }EXCEPTION_REGISTRATION_RECORD
+Next指向了下一个SEH节点，而Handler实际上就是我们具体的来处理该异常的函数了，我们也把它叫做异常处理回调函数。如果大家还记得数据结构的知识的话很显然这就是个简单的链表，而该链表只允许在头节点来进行删除和增添操作，且FS的0一直指向头节点，这就说明，越新的函数越接近头节点，系统会维护链表最后的next指向0xFFFFFFFF，回调函数的模版如下：
+    __cdecl _except_handler( struct _EXCEPTION_RECORD *ExceptionRecord,
+                            void * EstablisherFrame,
+                            struct _CONTEXT *ContextRecord,
+                            void * DispatcherContext);
+###  SEH安装
+通过之前的讲解我们可以知道SEH是基于线程的一种处理机制，而它又依赖于栈进行存储和查找，所以也被称作是基于栈帧的异常处理机制。在windows操作系统下的基础栈布局如下所示
+通过这样的布局我们也可以推断出来，SEH的装载甚至还在函数的序言之前，具体的装载代码如下：
+    push offset SEHandler
+    push fs:[0]
+    mov fs:[0],esp
+先向栈中压入了Handler和当前的节点，他们就又构成了一个EXCEPTION_REGISTRATION_RECORD结构，而esp指向栈顶，正好就是新的EXCEPTION_REGISTRATION_RECORD，将它付给fs:[0]也就是让SEH的头节点变成了刚刚加入的新节点。
+卸载过程其实就是恢复栈平衡，代码如下
+    mov esp,dword ptr fs:[0]
+    pop dword ptr fs:[0]
+要注意，SEH异常的安装实际上从main函数之前就开始了，当我们在启动一个进程时，实际的启动位置也就是kernel!32BaseProcessStartThunk，而在这个函数内就已经开始有try、catch结构了，线程的启动函数kernel!32BaseThreadStart也是如此
+    VOID BaseThreadStart(PTHREAD_START_ROUTINE pfnStartAddr, PVOID pvParam) {
+        __try{
+            ExitThread((pfnStartAddr)(pvParam));
+        }
+        __except (UnhandledExceptionFilter(GetExceptionInformation())){
+            ExitProcess(GetExceptionCode());
+        }
+    }
+实际上这里的try catch结构构成的异常回调函数就是常说的top
+level，即顶层异常处理，它们也是SEH链的最后一部分，并且可以看到，它们的except还存在一个叫做UnhandledFilter函数，和字面上的意思相似，这是用来实现异常过滤的函数，这是非常重要的一个函数，我们后面会细讲。
+###  RltDispatchExeption
+当我们的异常分发到了RtlDispatchException函数时，就会根据线程注册的SEH来处理该异常，之前的处理实际上都是简单的”打包”和”描述”的过程，到了这一步才开始真正的异常处理。为了个更好的理解这个过程，这里笔者给出了简化版的RltDispatchExeption伪代码，简单描绘一下该函数的执行过程，伪代码由笔者根据逆向和资料自行编写，有错误之处还望大家指出
+    if VEH异常处理例程 != Exception_continue_search
+        goto end_func
+    else
+        limit = 栈的limit
+        seh = 借助FS寄存器获取SEH的头节点
+        while(seh!=-1):
+            if SEH节点不在栈中 || SEH节点位置没有按ULONG对齐 || Handler在栈中
+                goto end_func
+            else
+                seh = 当前seh指向的下一个seh
+        seh = 借助FS寄存器获取SEH的头节点
+        while(seh!=-1):
+            if(检查safeseh)
+                goto end_func
+            else
+                return_value = 执行该seh的handler
+                switch(return_value):
+                    case 处理成功:
+                        flag=1
+                        goto end_func
+                    case 没法处理:
+                        seh = 当前seh指向的下一个seh
+                    case 处理时再次遭遇异常
+                        设置标记，做内嵌异常处理
+                        goto    end_func
+    end_func:
+        调用VEH的continue handler
+        return
+函数执行过程中实际上大部分的代码都是在对SEH机制进行检查，其主要包括了SEHOP和SafeSEH等，这里先暂且略过，在后面会放在一起讲。除去检查外，我们可以概括步骤如下：
+  * 调用VEH ExceptionHandler进行处理，成功则结束，否则进行SEH
+  * 遍历SEH节点，对每一个Handler进行RtlExceptionHandlerForException，根据返回值执行不同操作 
+    * ExceptionContinueExecution，表示异常已经被处理过了，接下来就可以回到之前的异常现场（借助之前讲过的Context）再执行试试了。但是这里就有两个重要的问题了，我们的回调函数真的成功处理了这个异常吗？我们的context被修改了怎么办？第一个问题的很简单 —— 不知道，系统是很”傻”的，只要你返回了这个值它就认为你成功了，而如果你压根就没处理还返回就会造成下次再执行还是错的，还是触发异常处理，进而陷入无限处理这个异常的循环状态。 第二个问题更简单了，被修改就完蛋了，不但异常没处理好，还搞出来个任意地址返回
+    * ExceptionContinueSearch，表示这个节点的handler处理不了这个异常，此时就会借助Next指针去寻找下一个节点接着去处理
+    * ExceptionNestedException，这个是最让人无奈的，意思是处理异常时又引发了一个新的异常，如果是内核态遇到了这个问题就直接game over蓝屏了，如果是用户态的话就成了”嵌套”异常，也就是会在此处再次进行异常处理
+    * ExceptionCollidedUnwind，这个和上面的类似，不过上面是异常处理时遇到了麻烦，而这个是在恢复现场的时候遇到了不测，这个”恢复现场”的过程也叫做展开，下面会具体说明。这个结果非常罕见，因为恢复现场的工作时系统来完成的，处理得非常严谨。
+  * 调用VEH ContinueHandler进行处理
+###  栈展开
+在SEH的处理体系中，如果所有的异常回调函数都无法处理某个异常时，系统会让发生异常的线程中所有的回调函数一个执行的机会，主要是为了实现清理、释放资源，保存异常的信息等功能，这也就是栈展开的基本概念，下面我们具体来看一下它。
+还记得上一篇文中提到的EXCEPTION_RECORD结构吗？它有个ExceptionFLags的标志位，我们之前没有仔细提，实际上它就会在这里发挥作用，0代表着可修复的异常，1表示不可修复的异常，2则表示展开操作，通常在用户态的异常不会涉及到1，一般是在异常嵌套或者是内核异常时会用到。当某个异常遍历完SEH链后依然没有能够执行的话，就会将该标志位置为2，并将ExceptionCode设置为ST0ATUS_UNWIND，来执行栈展开操作。
+RtlUnwind函数通常用来实现该功能，其函数原型如下：
+    RtlUnwind(EXCEPTION_REGISTRATION VirtualTargetFrame,INT * TargetPC,EXCEPTION_RECORD ExceptionRecord,INT ReturnValue)
+  * VirtualTargetFrame指向的是SEH链的EXECEPTION_REGISTRATION结构，表示要在哪个节点停止并进行展开操作
+  * TargetPC是调用RtlUnwind后的返回地址，如果是0则直接跳转至下一条指令
+  * Exception_record，当前异常的EXCEPTION_RECORD结构
+因为栈展开的详细过程较难理解且过于复杂，有兴趣的读者可以自行搜索相关资料学习
+###  UnhandledExceptionFilter函数
+未处理异常过滤函数，简称为UEF函数，这可以说是异常处理的最后一道防线了，他也是异常处理和windows error
+report交接的关键，首先来看看这个函数的大致流程
+  * 错误的预处理，主要是对三个方面的检查： 
+    * 是否存在着嵌套异常？上面说过了嵌套异常是一种非常难处理的情况，如果处理的不好就很难再恢复原始的状态了，于是这种情况下UEF函数会直接调用NtTerminateProcess结束当前的进程
+    * 是否是违例访问？还记得我们上一次windbg分析格蠹汇编的练习题吗？出现了0xc0000005的错误码，这就是EXCEPTION_ACCESS_VIOLATION，也就是所谓的违例访问。这种情况下UEF函数会尝试去通过更改页属性的方式去修复错误，当然如果你访问的是绝对不该访问的页，那UEF就无法解决了。
+    * DebugPort有没有？DebugPort在异常分发的过程中起到了标志着调试器是否开启的任务，一旦UEF检测到了DebugPort那它就不会处理该异常，而是返回一个ExceptionContinueSearch，而它作为最后的异常处理也没有处理该异常的话自然也就进入了第二次的异常分发，成功使调试器接手该异常
+  * 进行最终处理的处理 
+    * 根据程序的设置直接结束进程。windows提供了SetErrorMode的api用来设置某个标志位，一旦设置了，那那就不会出现任何的错误提示，程序直接结束。判断当前进程是否在job（以后会详细总结）中，如果在而且设置了未处理异常时直接结束，那就直接杀掉进程。
+    * 查看是否设置了JIT调试，如果是就开始进行调试。在上一章里我们实际设置并借助JIT进行了分析，实际上JIT的响应就是发生在UEF函数中的
+    * 弹出异常信息。此时程序会加载faultrep.all，调用ReportFault函数来汇报错误，如果设置了错误报告或者是非常严重的错误会弹出error窗口询问用户是否要发送错误报告，而其余情况下就会弹出我们熟知的application error
+当然我们也可以设置自己的UEF函数，我们可以通过SetUnhandledExceptionFilter函数来设置，UEF会在上面说的两步之间执行我们自定义的代码，还可以根据具体的返回值在后面执行不同的操作，而这也就是之前提到的try
+、catch构成的top level，顶层异常处理函数
+​ 图片来自《windows核心编程》
+## VEH
+VEH（Vectored Exception
+Handling）也就是向量化异常处理，是windows在xp之后新加入的一种异常处理机制，我们在RltDispatchException已经看到过它在异常处理时的调用过程了，下面就看看它的具体实现流程。

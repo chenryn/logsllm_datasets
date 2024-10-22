@@ -1,0 +1,155 @@
+**作者：f0rm2l1n@浙江大学AAA战队，team BlockSec  
+本文为作者投稿，Seebug Paper 期待你的分享，凡经采用即有礼品相送！ 投稿邮箱：PI:EMAIL**
+最近一段时间，我们团队针对Linux内核的蓝牙栈代码进行了漏洞挖掘。如安全维护者Greg所感慨的，Linux的蓝牙实现是buggy的
+> seems to be a busy time with people hammering on the bluetooth stack these
+> days...
+非常幸运，我们找到了一些品相不错的漏洞，其中有些可以稳定的造成任意代码执行以提升攻击者权限，在本文中，我将介绍其中特别的一位: 蓝色华容道
+(CVE-2021-3573)
+> 对于临界区的代码，虽然使用了锁从而看起来很安全，但是错误的锁搭配，就像派关羽去守华容道那样，最终只得不达所期
+## 概述
+CVE-2021-3573是一个在蓝牙控制器卸载过程中，由条件竞争 (race condition) 带来的释放后使用漏洞 (use-after-free)。具有 _CAP_NET_ADMIN_
+权限的本地攻击者可以在用户态伪造一个假的控制器，并主动地卸载该控制器以触发这个条件竞争。基于这个UAF，攻击者可以巧妙利用堆喷去覆盖恶意数据，以进一步劫持控制流，完成权限提升。
+## 漏洞细节
+既然是 race 造成的 UAF，那我们肯定要研究一条 USING 的线程以及一条 FREEING 的线程。不过在此之前，我们首先看一个系统调用实现，即蓝牙
+HCI 套接字的绑定过程，函数 `hci_sock_bind()`。
+> 注: 所有代码片段以内核 v5.12.0 作为参考
+    static int hci_sock_bind(struct socket *sock, struct sockaddr *addr,
+                 int addr_len)
+    {
+    ...
+        switch (haddr.hci_channel) {
+        case HCI_CHANNEL_RAW:
+            if (hci_pi(sk)->hdev) {
+                err = -EALREADY;
+                goto done;
+            }
+            if (haddr.hci_dev != HCI_DEV_NONE) {
+                hdev = hci_dev_get(haddr.hci_dev);
+                if (!hdev) {
+                    err = -ENODEV;
+                    goto done;
+                }
+                atomic_inc(&hdev->promisc);
+            }
+    ...
+            hci_pi(sk)->hdev = hdev;
+    ...
+    }
+简单来说，函数 `hci_sock_bind()` 将通过用户传递的参数 `haddr` 中关键的 `hci_dev`
+索引去寻找特定标号的控制器设备，并通过代码 `hci_pi(sk)->hdev = hdev;`
+在该设备（即对象`hdev`）与当前套接字之间建立联系。当这个 `bind` 系统调用完成之后，这个套接字就可以被称为一个绑定过的套接字了（bound
+socket）。
+可以看到，这里取得 `hdev` 是通过 `hci_dev_get` 函数，换言之，`hdev` 通过引用计数进行维护。
+### USING 线程
+一个完成绑定的套接字是允许调用 `hci_sock_bound_ioctl()` 函数中的命令的，见如下代码
+    /* Ioctls that require bound socket */
+    static int hci_sock_bound_ioctl(struct sock *sk, unsigned int cmd,
+                    unsigned long arg)
+    {
+        struct hci_dev *hdev = hci_pi(sk)->hdev;
+        if (!hdev)
+            return -EBADFD;
+    ...
+        switch (cmd) {
+    ...
+        case HCIGETCONNINFO:
+            return hci_get_conn_info(hdev, (void __user *)arg);
+        case HCIGETAUTHINFO:
+            return hci_get_auth_info(hdev, (void __user *)arg);
+        case HCIBLOCKADDR:
+            if (!capable(CAP_NET_ADMIN))
+                return -EPERM;
+            return hci_sock_blacklist_add(hdev, (void __user *)arg);
+        case HCIUNBLOCKADDR:
+            if (!capable(CAP_NET_ADMIN))
+                return -EPERM;
+            return hci_sock_blacklist_del(hdev, (void __user *)arg);
+        return -ENOIOCTLCMD;
+    }
+可以看到函数里提供了四个有效的额外命令，分别和访问当前连接的信息、当前连接的认证，以及设备的黑名单相关。这四个命令分别由四个额外的函数来响应 \-`hci_get_conn_info()` \- `hci_get_auth_info()` \- `hci_sock_blacklist_add()`
+\- `hci_sock_blacklist_del()`
+响应函数实际上都最终会去操作 `hdev` 对象中维护的链表，举个例子，我们可以看黑名单添加函数 `hci_sock_blacklist_add()`
+    static int hci_sock_blacklist_add(struct hci_dev *hdev, void __user *arg)
+    {
+        bdaddr_t bdaddr;
+        int err;
+        if (copy_from_user(&bdaddr, arg, sizeof(bdaddr)))
+            return -EFAULT;
+        hci_dev_lock(hdev);
+        err = hci_bdaddr_list_add(&hdev->blacklist, &bdaddr, BDADDR_BREDR);
+        hci_dev_unlock(hdev);
+        return err;
+    }
+代码逻辑很简单，其通过 `copy_from_usr` 去获取用户态提供的一个蓝牙地址，随后会遍历 `hdev->blacklist`
+来决定是否要将该地址插入链表。其他三个函数类似，他们都使用到了 `hdev` 上相关的数据成员。
+### FREEING 线程
+正常情况下，一个完成绑定的套接字应该通过如下的代码片段来解除其和下层设备 `hdev` 之间的联系。
+    static int hci_sock_release(struct socket *sock)
+    {
+        hdev = hci_pi(sk)->hdev;
+        if (hdev) {
+    ...
+            atomic_dec(&hdev->promisc);
+            hci_dev_put(hdev);
+        }
+    ...
+    }
+可以看到，这里的操作和 `bind` 中的操作是非常对称的，看起来也相当的安全。
+可是，这里并非唯一一个能解除联系的代码片段。试想现在电脑上运行的蓝牙控制器（就比如市面上买的USB的那种）突然被拔掉，这个时候这些绑定到该设备的套接字怎么办？理论上，下层的代码应该要通知套接字去主动放弃该联系。
+负责传达的代码就是 `hci_sock_dev_event()`，当控制器被移除时，内核会调用到 `hci_unregister_dev()`
+函数，该函数会以 `HCI_DEV_UNREG` 的形式去调用 `hci_sock_dev_event()`，见如下代码。
+    void hci_sock_dev_event(struct hci_dev *hdev, int event)
+    {
+    ...
+        if (event == HCI_DEV_UNREG) {
+            struct sock *sk;
+            /* Detach sockets from device */
+            read_lock(&hci_sk_list.lock);
+            sk_for_each(sk, &hci_sk_list.head) {
+                bh_lock_sock_nested(sk);
+                if (hci_pi(sk)->hdev == hdev) {
+                    hci_pi(sk)->hdev = NULL; // {1}
+                    sk->sk_err = EPIPE;
+                    sk->sk_state = BT_OPEN;
+                    sk->sk_state_change(sk);
+                    hci_dev_put(hdev); // {2}
+                }
+                bh_unlock_sock(sk);
+            }
+            read_unlock(&hci_sk_list.lock);
+        }
+    }
+可以见到，当事件是 `HCI_DEV_UNREG` 时，该函数会遍历全局的套接字链表 `hci_sk_list`
+并寻找绑定到了正要移除设备的那些套接字（hci_pi(sk)->hdev ==
+hdev）。随后，标记为`{1}`的代码行会更新套接字结构体并通过`{2}`代码放弃 `hdev` 的引用。
+`hdev` 对象的最后引用会在驱动代码调用 `hci_free_dev()` 时候减少到0，并由 `bt_host_release` 完成对其内存的回收。
+这条不那么常规的 FREEING 线程是很不安全的，事实上，它可以与 USING 线程形成如下的条件竞争。
+    hci_sock_bound_ioctl thread    |    hci_unregister_dev thread
+                                   |
+                                   |
+    if (!hdev)                     |
+        return -EBADFD;            |
+                                   |
+                                   |    hci_pi(sk)->hdev = NULL;
+                                   |    ...
+                                   |    hci_dev_put(hdev);
+                                   |    ...
+                                   |    hci_free_dev(hdev);
+    // UAF, for example            |
+    hci_dev_lock(hdev);            |
+                                   |
+                                   |
+读者可以访问当时OSS上的漏洞描述 (https://www.openwall.com/lists/oss-security/2021/06/08/2)
+去查看我准备的POC样例以及UAF KASan捕获时候的栈报告。
+## 漏洞利用
+可能已经有读者开始发牢骚了：条件竞争，哼，什么玩意儿。条件竞争漏洞可以说是漏洞里面品相最差的了，即使这一个能构成UAF，但不能稳定触发便是绝对软肋。
+好吧，很显然有牢骚的读者并没有去OSS上阅读漏洞描述，实际上，这个条件竞争可以被100%稳定的触发。
+如果读者有过CTF经验，那么再仔细读一下代码的话一定可以发现个钟奥妙
+    static int hci_sock_blacklist_add(struct hci_dev *hdev, void __user *arg)
+    {
+        bdaddr_t bdaddr;
+        int err;
+        if (copy_from_user(&bdaddr, arg, sizeof(bdaddr))) // {3}
+            return -EFAULT;
+可以看到`{3}`标记的代码是使用了`copy_from_user()`的，那么，只要依靠
+[userfaultfd](https://man7.org/linux/man-pages/man2/userfaultfd.2.html)

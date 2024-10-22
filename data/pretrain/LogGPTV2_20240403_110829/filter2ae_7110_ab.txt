@@ -1,0 +1,159 @@
+    [  118.491162]  hci_event_packet+0x1c29/0x2a90 [bluetooth]
+    [  118.491186]  ? hci_send_to_monitor+0xae/0x120 [bluetooth]
+    [  118.491190]  ? skb_release_all+0x26/0x30
+    [  118.491207]  hci_rx_work+0x19b/0x360 [bluetooth]
+    [  118.491211]  ? __schedule+0x2eb/0x740
+    [  118.491217]  process_one_work+0x1eb/0x3b0
+    [  118.491221]  worker_thread+0x4d/0x400
+    [  118.491225]  kthread+0x104/0x140
+    [  118.491229]  ? process_one_work+0x3b0/0x3b0
+    [  118.491232]  ? kthread_park+0x90/0x90
+    [  118.491236]  ret_from_fork+0x35/0x40
+这个报错意味着我们可以完全控制 `struct hci_dev`。一个有趣的可用来污染的指针是 `mgmt_pending->next`，因为它就是
+`struct mgmt_pending_cmd` 类型的，其包含了函数指针 `cmd_complete()`：
+    // pahole -E -C mgmt_pending_cmd --hex bluetooth.ko
+    struct mgmt_pending_cmd {
+        ...
+        int                        (*cmd_complete)(struct mgmt_pending_cmd *, u8);       /*  0x38   0x8 */
+        /* size: 64, cachelines: 1, members: 8 */
+        /* sum members: 62, holes: 1, sum holes: 2 */
+    };
+举个例子，这个处理例程可以通过中止 HCI 连接来触发。然而，为了能够成功重定向到 `mgmt_pending->next`
+指针，我们需要一个额外的信息泄漏漏洞，我们将在下一章节学习这个。
+### BadChoice: 基于栈的信息泄漏（CVE-2020-12352）
+_BadVibes_ 漏洞还不足以强大到可以转化成任意的 读/写
+原语，而且似乎没有办法用它来泄漏受害者的内存布局。原因是，唯一可以被污染破坏的成员指向了循环链表。顾名思义，这些数据结构是循环的，因此我们在没有办法确保它们最终指向它们开始的地方之前，我们无法改变它们。当受害者的内存布局是随机的时候，想要实现漏洞利用就很困难。虽然内核中有一些资源是在静态地址中分配的，但它们的内容很可能是不可控制的。因此，为了能够利用
+_BadVibes_ ，我们首先需要对内存布局有一个概念。更具体地说，我们需要泄漏一些受害者的内存地址，其指向的内容我们要能控制或者至少能够预测。
+通常来说，信息泄漏是通过越界访问来实现的，使用未初始化的变量或者，最近流行的，通过执行侧信道/时序攻击。后者可能比较难实现，因为传输的过程会有误差。相反，我们聚焦关注一开始的两个有漏洞的类实现，遍历所有的可将信息发送回攻击者的子程序，查看它们之中是否有越界数据或者未初始化的内存存在。
+我在分析 `a2mp_send()` 调用的时候在 A2MP 协议的 `A2MP_GETINFO_REQ` 指令中发现了第二个漏洞。这个漏洞在 Linux
+内核 3.6 的时候就已经存在了，并且如果 `CONFIG_BT_HS=y` 该漏洞是可利用的，而 `CONFIG_BT_HS` 默认是开启的。
+让我们来分析一下被 `A2MP_GETINFO_REQ` 指令调用的子程序 `a2mp_getinfo_req()`：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/a2mp.c
+    static int a2mp_getinfo_req(struct amp_mgr *mgr, struct sk_buff *skb,
+                    struct a2mp_cmd *hdr)
+    {
+        struct a2mp_info_req *req  = (void *) skb->data;
+        ...
+        hdev = hci_dev_get(req->id);
+        if (!hdev || hdev->dev_type != HCI_AMP) {
+            struct a2mp_info_rsp rsp;
+            rsp.id = req->id;
+            rsp.status = A2MP_STATUS_INVALID_CTRL_ID;
+            a2mp_send(mgr, A2MP_GETINFO_RSP, hdr->ident, sizeof(rsp),
+                  &rsp);
+            goto done;
+        }
+        ...
+    }
+该子程序通过使用 HCI 设备 id 来请求 AMP 控制器的信息。然而，如果设备 id 是无效的或者不是 `HCI_AMP`
+类型，错误路径会被提取，意味着受害者机器会发还给我们 status `A2MP_STATUS_INVALID_CTRL_ID`。遗憾的是，`struct
+a2mp_info_rsp` 由很多的成员组成而不仅仅是 id 和 status。并且我们可以看到，响应的结构并没有被完全初始化。因此，内核栈的 16
+字节可以被攻击者泄漏，其中也许包含了受害者机器的敏感信息。
+    // pahole -E -C a2mp_info_rsp --hex bluetooth.ko
+    struct a2mp_info_rsp {
+        /* typedef __u8 */ unsigned char              id;                                /*     0   0x1 */
+        /* typedef __u8 */ unsigned char              status;                            /*   0x1   0x1 */
+        /* typedef __le32 -> __u32 */ unsigned int               total_bw;               /*   0x2   0x4 */
+        /* typedef __le32 -> __u32 */ unsigned int               max_bw;                 /*   0x6   0x4 */
+        /* typedef __le32 -> __u32 */ unsigned int               min_latency;            /*   0xa   0x4 */
+        /* typedef __le16 -> __u16 */ short unsigned int         pal_cap;                /*   0xe   0x2 */
+        /* typedef __le16 -> __u16 */ short unsigned int         assoc_size;             /*  0x10   0x2 */
+        /* size: 18, cachelines: 1, members: 7 */
+        /* last cacheline: 18 bytes */
+    } __attribute__((__packed__));
+通过在发送 `A2MP_GETINFO_REQ` 之前发送有趣的指令来填充栈帧可以利用这个漏洞。这里有趣的指令指的是那些将指针放在重用
+`a2mp_getinfo_req()` 函数后的同一个栈帧中的指令。通过这种做法，未初始化的变量可能会包含先前推入栈的指针。
+注意，以 `CONFIG_INIT_STACK_ALL_PATTERN=y` 编译的内核不太容易受到这样的攻击。举个例子，在 ChromeOS 上，
+_BadChoice_ 只能返回 0xAA。然而，这个选项在流行的 Linux 发行版上似乎并没有默认启用。
+### BadKarma: 基于堆类型的混淆（CVE-2020-12351）
+我在尝试去触发 _BadChoice_ 确认其可利用时发现了第三个漏洞。受害者的机器意外崩溃了并输出以下调用栈跟踪：
+    [  445.440736] general protection fault: 0000 [#1] SMP PTI
+    [  445.440740] CPU: 4 PID: 483 Comm: kworker/u17:1 Not tainted 5.4.0-40-generic #44-Ubuntu
+    [  445.440741] Hardware name: Dell Inc. XPS 15 7590/0CF6RR, BIOS 1.7.0 05/11/2020
+    [  445.440764] Workqueue: hci0 hci_rx_work [bluetooth]
+    [  445.440771] RIP: 0010:sk_filter_trim_cap+0x6d/0x220
+    [  445.440773] Code: e8 18 e1 af ff 41 89 c5 85 c0 75 62 48 8b 83 10 01 00 00 48 85 c0 74 56 49 8b 4c 24 18 49 89 5c 24 18 4c 8b 78 18 48 89 4d b0  f6 47 02 08 0f 85 41 01 00 00 0f 1f 44 00 00 49 8b 47 30 49 8d
+    [  445.440776] RSP: 0018:ffffa86b403abca0 EFLAGS: 00010286
+    [  445.440778] RAX: ffffffffc071cc50 RBX: ffff8e95af6d7000 RCX: 0000000000000000
+    [  445.440780] RDX: 0000000000000000 RSI: ffff8e95ac533800 RDI: ffff8e95af6d7000
+    [  445.440781] RBP: ffffa86b403abd00 R08: ffff8e95b452f0e0 R09: ffff8e95b34072c0
+    [  445.440782] R10: ffff8e95acd57818 R11: ffff8e95b456ae38 R12: ffff8e95ac533800
+    [  445.440784] R13: 0000000000000000 R14: 0000000000000001 R15: 30478b4800000208
+    [  445.440786] FS:  0000000000000000(0000) GS:ffff8e95b4500000(0000) knlGS:0000000000000000
+    [  445.440788] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [  445.440789] CR2: 000055f371aa94a8 CR3: 000000022dc0a005 CR4: 00000000003606e0
+    [  445.440791] Call Trace:
+    [  445.440817]  ? __l2cap_chan_add+0x88/0x1c0 [bluetooth]
+    [  445.440838]  l2cap_data_rcv+0x351/0x510 [bluetooth]
+    [  445.440857]  l2cap_data_channel+0x29f/0x470 [bluetooth]
+    [  445.440875]  l2cap_recv_frame+0xe5/0x300 [bluetooth]
+    [  445.440878]  ? skb_release_all+0x26/0x30
+    [  445.440896]  l2cap_recv_acldata+0x2d2/0x2e0 [bluetooth]
+    [  445.440914]  hci_rx_work+0x186/0x360 [bluetooth]
+    [  445.440919]  process_one_work+0x1eb/0x3b0
+    [  445.440921]  worker_thread+0x4d/0x400
+    [  445.440924]  kthread+0x104/0x140
+    [  445.440927]  ? process_one_work+0x3b0/0x3b0
+    [  445.440929]  ? kthread_park+0x90/0x90
+    [  445.440932]  ret_from_fork+0x35/0x40
+查看一下 `l2cap_data_rcv()`，当 ERTM（增强型重传模式）或者流模式被使用时，我们可以看到 `sk_filter()` 被调用（类似于
+TCP）：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/l2cap_core.c
+    static int l2cap_data_rcv(struct l2cap_chan *chan, struct sk_buff *skb)
+    {
+        ...
+        if ((chan->mode == L2CAP_MODE_ERTM ||
+             chan->mode == L2CAP_MODE_STREAMING) && sk_filter(chan->data, skb))
+            goto drop;
+        ...
+    }
+这确实就是 A2MP 信道的情况（信道可以与网络端口做对照）：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/a2mp.c
+    static struct l2cap_chan *a2mp_chan_open(struct l2cap_conn *conn, bool locked)
+    {
+        struct l2cap_chan *chan;
+        int err;
+        chan = l2cap_chan_create();
+        if (!chan)
+            return NULL;
+        ...
+        chan->mode = L2CAP_MODE_ERTM;
+        ...
+        return chan;
+    }
+    ...
+    static struct amp_mgr *amp_mgr_create(struct l2cap_conn *conn, bool locked)
+    {
+        struct amp_mgr *mgr;
+        struct l2cap_chan *chan;
+        mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
+        if (!mgr)
+            return NULL;
+        ...
+        chan = a2mp_chan_open(conn, locked);
+        if (!chan) {
+            kfree(mgr);
+            return NULL;
+        }
+        mgr->a2mp_chan = chan;
+        chan->data = mgr;
+        ...
+        return mgr;
+    }
+查看 `amp_mgr_create()`，问题所在非常清晰。即，`chan->data` 的类型是 `struct amp_mgr`，鉴于
+`sk_filter()` 获取一个 `struct sock` 类型的参数，这意味着我们有了一个设计上的远程类型混淆漏洞。这个混淆漏洞在 Linux 内核
+4.8 引入，到目前为止仍然没有被更改。
+## 利用
+_BadChoice_ 漏洞可以用 _BadVibes_ 和 _BadKarma_ 漏洞来链接最终实现 RCE。在这篇博文中，我们将只会关注使用
+_BadKarma_ 的方法，有以下理由：
+  * 这并不仅限于蓝牙 5。
+  * 这不需要受害者去扫描。
+  * 这可能实现特定设备的针对性攻击
+_BadVibes_ 攻击，换句话说，只是一个广播，因此只有一台机器会被成功利用，其余监听到同一条消息的设备都将崩溃。
+### 绕过 BadKarma
+讽刺的是，为了利用 _BadKarma_ ，我们首先得摆脱 _BadKarma_ 。回顾刚才我们有一个设计上的类型混淆漏洞，只要 A2MP 信道被配置为
+ERTM/流模式，在 `sk_filter()` 中不触发 panic 的情况下，我们就不能通过 `l2cap_data_rcv()` 到达 A2MP
+的子程序。
+查看 `l2cap_data_channel()`，我们会发现采取不同的路由的唯一一个途径是重新配置信道模式为
+`L2CAP_MODE_BASIC`。这将“基本上”允许我们直接调用A2MP 接收处理程序：
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/l2cap_core.c

@@ -1,0 +1,165 @@
+  // 通过枚举值我们知道waitStatus>0是取消状态
+  if (ws > 0) {
+    do {
+      // 循环向前查找取消节点，把取消节点从队列中剔除
+      node.prev = pred = pred.prev;
+    } while (pred.waitStatus > 0);
+    pred.next = node;
+  } else {
+    // 设置前任节点等待状态为SIGNAL
+    compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+  }
+  return false;
+}
+```
+parkAndCheckInterrupt 主要用于挂起当前线程，阻塞调用栈，返回当前线程的中断状态。
+```java
+// java.util.concurrent.locks.AbstractQueuedSynchronizer
+private final boolean parkAndCheckInterrupt() {
+    LockSupport.park(this);
+    return Thread.interrupted();
+}
+```
+上述方法的流程图如下：
+![](https://p0.meituan.net/travelcube/c124b76dcbefb9bdc778458064703d1135485.png)
+从上图可以看出，跳出当前循环的条件是当“前置节点是头结点，且当前线程获取锁成功”。为了防止因死循环导致 CPU 资源被浪费，我们会判断前置节点的状态来决定是否要将当前线程挂起，具体挂起流程用流程图表示如下（shouldParkAfterFailedAcquire 流程）：
+![](https://p0.meituan.net/travelcube/9af16e2481ad85f38ca322a225ae737535740.png)
+从队列中释放节点的疑虑打消了，那么又有新问题了：
+- shouldParkAfterFailedAcquire 中取消节点是怎么生成的呢？什么时候会把一个节点的 waitStatus 设置为-1？
+- 是在什么时间释放节点通知到被挂起的线程呢？
+### 3.2 CANCELLED 状态节点生成
+acquireQueued 方法中的 Finally 代码：
+```java
+// java.util.concurrent.locks.AbstractQueuedSynchronizer
+final boolean acquireQueued(final Node node, int arg) {
+  boolean failed = true;
+  try {
+    ...
+    for (;;) {
+      final Node p = node.predecessor();
+      if (p == head && tryAcquire(arg)) {
+        ...
+        failed = false;
+        ...
+      }
+      ...
+  } finally {
+    if (failed)
+      cancelAcquire(node);
+    }
+}
+```
+通过 cancelAcquire 方法，将 Node 的状态标记为 CANCELLED。接下来，我们逐行来分析这个方法的原理：
+```java
+// java.util.concurrent.locks.AbstractQueuedSynchronizer
+private void cancelAcquire(Node node) {
+  // 将无效节点过滤
+  if (node == null)
+    return;
+  // 设置该节点不关联任何线程，也就是虚节点
+  node.thread = null;
+  Node pred = node.prev;
+  // 通过前驱节点，跳过取消状态的node
+  while (pred.waitStatus > 0)
+    node.prev = pred = pred.prev;
+  // 获取过滤后的前驱节点的后继节点
+  Node predNext = pred.next;
+  // 把当前node的状态设置为CANCELLED
+  node.waitStatus = Node.CANCELLED;
+  // 如果当前节点是尾节点，将从后往前的第一个非取消状态的节点设置为尾节点
+  // 更新失败的话，则进入else，如果更新成功，将tail的后继节点设置为null
+  if (node == tail && compareAndSetTail(node, pred)) {
+    compareAndSetNext(pred, predNext, null);
+  } else {
+    int ws;
+    // 如果当前节点不是head的后继节点，1:判断当前节点前驱节点的是否为SIGNAL，2:如果不是，则把前驱节点设置为SIGNAL看是否成功
+    // 如果1和2中有一个为true，再判断当前节点的线程是否为null
+    // 如果上述条件都满足，把当前节点的前驱节点的后继指针指向当前节点的后继节点
+    if (pred != head && ((ws = pred.waitStatus) == Node.SIGNAL || (ws  执行 cancelAcquire 的时候，当前节点的前置节点可能已经从队列中出去了（已经执行过 Try 代码块中的 shouldParkAfterFailedAcquire 方法了），如果此时修改 Prev 指针，有可能会导致 Prev 指向另一个已经移除队列的 Node，因此这块变化 Prev 指针不安全。 shouldParkAfterFailedAcquire 方法中，会执行下面的代码，其实就是在处理 Prev 指针。shouldParkAfterFailedAcquire 是获取锁失败的情况下才会执行，进入该方法后，说明共享资源已被获取，当前节点之前的节点都不会出现变化，因此这个时候变更 Prev 指针比较安全。
+>
+> ```java
+> do {
+>   node.prev = pred = pred.prev;
+> } while (pred.waitStatus > 0);
+> ```
+### 3.3 如何解锁
+我们已经剖析了加锁过程中的基本流程，接下来再对解锁的基本流程进行分析。由于 ReentrantLock 在解锁的时候，并不区分公平锁和非公平锁，所以我们直接看解锁的源码：
+```java
+// java.util.concurrent.locks.ReentrantLock
+public void unlock() {
+  sync.release(1);
+}
+```
+可以看到，本质释放锁的地方，是通过框架来完成的。
+```java
+// java.util.concurrent.locks.AbstractQueuedSynchronizer
+public final boolean release(int arg) {
+  if (tryRelease(arg)) {
+    Node h = head;
+    if (h != null && h.waitStatus != 0)
+      unparkSuccessor(h);
+    return true;
+  }
+  return false;
+}
+```
+在 ReentrantLock 里面的公平锁和非公平锁的父类 Sync 定义了可重入锁的释放锁机制。
+```java
+// java.util.concurrent.locks.ReentrantLock.Sync
+// 方法返回当前锁是不是没有被线程持有
+protected final boolean tryRelease(int releases) {
+  // 减少可重入次数
+  int c = getState() - releases;
+  // 当前线程不是持有锁的线程，抛出异常
+  if (Thread.currentThread() != getExclusiveOwnerThread())
+    throw new IllegalMonitorStateException();
+  boolean free = false;
+  // 如果持有线程全部释放，将当前独占锁所有线程设置为null，并更新state
+  if (c == 0) {
+    free = true;
+    setExclusiveOwnerThread(null);
+  }
+  setState(c);
+  return free;
+}
+```
+我们来解释下述源码：
+```java
+// java.util.concurrent.locks.AbstractQueuedSynchronizer
+public final boolean release(int arg) {
+  // 上边自定义的tryRelease如果返回true，说明该锁没有被任何线程持有
+  if (tryRelease(arg)) {
+    // 获取头结点
+    Node h = head;
+    // 头结点不为空并且头结点的waitStatus不是初始化节点情况，解除线程挂起状态
+    if (h != null && h.waitStatus != 0)
+      unparkSuccessor(h);
+    return true;
+  }
+  return false;
+}
+```
+这里的判断条件为什么是 h != null && h.waitStatus != 0？
+> h == null Head 还没初始化。初始情况下，head == null，第一个节点入队，Head 会被初始化一个虚拟节点。所以说，这里如果还没来得及入队，就会出现 head == null 的情况。
+>
+> h != null && waitStatus == 0 表明后继节点对应的线程仍在运行中，不需要唤醒。
+>
+> h != null && waitStatus  0) {
+    s = null;
+    // 就从尾部节点开始找，到队首，找到队列第一个waitStatus<0的节点。
+    for (Node t = tail; t != null && t != node; t = t.prev)
+      if (t.waitStatus <= 0)
+        s = t;
+  }
+  // 如果当前节点的下个节点不为空，而且状态<=0，就把当前节点unpark
+  if (s != null)
+    LockSupport.unpark(s.thread);
+}
+```
+为什么要从后往前找第一个非 Cancelled 的节点呢？原因如下。
+之前的 addWaiter 方法：
+```java
+// java.util.concurrent.locks.AbstractQueuedSynchronizer
+private Node addWaiter(Node mode) {
+  Node node = new Node(Thread.currentThread(), mode);
+  // Try the fast path of enq; backup to full enq on failure

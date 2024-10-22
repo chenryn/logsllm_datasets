@@ -1,0 +1,96 @@
+**Structures** 标签页，找到`Struct_24`即可：
+在后面的逆向分析过程中，我们可以根据实际需要重复这个过程，直到解开所有谜题。现在我们准备开始利用DiagHub服务，通过一个实际可用的例子给大家演示该服务的利用方法。
+## 三、利用方法
+根据前面的逆向分析结果，为了从`SYSTEM32`目录中加载DLL，我们需要做如下操作：
+1、使用`IStandardCollectorService::CreateSession`创建一个新的Diagnostics Session。
+2、在新会话上调用`ICollectionSession::AddAgent`方法，传入待加载的DLL名称（不需要包含任何路径信息）。
+`ICollectionSession::AddAgent`加载代码的简化版如下所示：
+    void EtwCollectionSession::AddAgent(LPWCSTR dll_path, 
+                                       REFGUID guid) {
+     WCHAR valid_path[MAX_PATH];
+     if ( !GetValidAgentPath(dll_path, valid_path)) {
+       return E_INVALID_AGENT_PATH;
+     HMODULE mod = LoadLibraryExW(valid_path, 
+           nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+     dll_get_class_obj = GetProcAddress(hModule, "DllGetClassObject");
+     return dll_get_class_obj(guid);
+    }
+从中可知，代码会检查agent
+path是否有效，然后返回一个完整路径（这正是之前存在EoP漏洞的地方，没有经过足够的校验）。代码使用`LoadLibraryEx`加载这个路径，然后获取DLL中的`DllGetClassObject`导出函数，然后再调用这个函数。因此为了得到代码执行机会，我们只需要实现这个方法，然后将文件放入`SYSTEM32`目录即可。`DllGetClassObject`会在loader
+lock之外被调用，所以基本上我们可以为所欲为。我们可以采用如下代码（移除了其中的错误处理代码）来加载名为`dummy.dll`的一个DLL文件：
+    IStandardCollectorService* service;
+    CoCreateInstance(CLSID_CollectorService, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&service));
+    SessionConfiguration config = {};
+    config.version = 1;
+    config.monitor_pid = ::GetCurrentProcessId();
+    CoCreateGuid(&config.guid);
+    config.path = ::SysAllocString(L"C:Dummy");
+    ICollectionSession* session;
+    service->CreateSession(&config, nullptr, &session);
+    GUID agent_guid;
+    CoCreateGuid(&agent_guid);
+    session->AddAgent(L"dummy.dll", agent_guid);
+现在我们只需要实现任意文件写入目标，将任意DLL放入`SYSTEM32`目录中，得到加载机会，提升权限。为了完成这个任务，我决定使用我在`Storage
+Service`的`SvcMoveFileInheritSecurity` RPC方法中找到的一个漏洞。这个函数之所以引起我的注意，原因是[Clément
+Rouault](https://twitter.com/hakril)和[Thomas
+Imbert](https://twitter.com/masthoon)在[PACSEC
+2017](https://pacsec.jp/psj17/PSJ2017_Rouault_Imbert_alpc_rpc_pacsec.pdf)上曾发现并演示过的一个漏洞（ALPC漏洞），漏洞利用过程中用到了这个函数。虽然这种方法的确是利用该漏洞的一条途径，但我发现其实这里潜伏着两个漏洞（至少包含普通用户权限提升漏洞）。未经修补前的`SvcMoveFileInheritSecurity`的代码如下所示：
+    void SvcMoveFileInheritSecurity(LPCWSTR lpExistingFileName, 
+                                   LPCWSTR lpNewFileName, 
+                                   DWORD dwFlags) {
+     PACL pAcl;
+     if (!RpcImpersonateClient()) {
+       // Move file while impersonating.
+       if (MoveFileEx(lpExistingFileName, lpNewFileName, dwFlags)) {
+         RpcRevertToSelf();
+         // Copy inherited DACL while not.
+         InitializeAcl(&pAcl, 8, ACL_REVISION);
+         DWORD status = SetNamedSecurityInfo(lpNewFileName, SE_FILE_OBJECT, 
+             UNPROTECTED_DACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+             nullptr, nullptr, &pAcl, nullptr);
+           if (status != ERROR_SUCCESS)
+             MoveFileEx(lpNewFileName, lpExistingFileName, dwFlags);
+       }
+       else {
+         // Copy file instead...
+         RpcRevertToSelf();
+       }
+     }
+    }
+这个方法的功能应该是移动文件到一个新的位置，然后将继承的所有ACE（Access Control
+Entry）应用于新目录中的DACL（Discretionary Access Control
+List）。这对移动处于同一卷上的文件来说是有必要的，这样老的文件名链接被取消，新的文件被链接到新的位置。然而，新文件仍然将保留从原位置那分配的安全属性。继承的ACE只有在目录中创建新文件时才会应用，或者就像这种情况一样，调用`SetNamedSecurityInfo`之类的函数来显式应用ACE。
+为了确保这种方法不会让以服务用户身份（这里为Local
+System）运行的用户移动任意文件，需要模拟一个RPC调用者（caller）。问题就在于此，当第一次调用`MoveFileEx`时，代码会终止模拟，恢复到自己的安全标识，然后调用`SetNamedSecurityInfo`。如果调用失败，代码则会再次调用`MoveFileEx`，尝试恢复原来的文件移动操作。这里是第一个漏洞，有可能原来文件名的所处的位置现在指向了别的地方（比如通过滥用符号链接来实现这种效果）。我们很容易就能让`SetNamedSecurityInfo`调用失败，只需要在文件的ACE中，为WRITE_DAC添加针对Local
+System的一个Deny ACL，这样将返回一个错误代码，导致恢复操作失败，因此我们就能拥有任意文件创建能力。这个问题已经之前已经给微软提交过（issue
+[1427](https://bugs.chromium.org/p/project-zero/issues/detail?id=1427)）。
+这并不是我们想利用的漏洞，因为这样没有什么挑战性。相反，我们可以利用这段代码中的第二个漏洞：当以Local
+System身份运行时，我们可以让服务在任何文件上调用`SetNamedSecurityInfo`。为了做到这一点，我们可以在第一次`MoveFileEx`时，滥用模拟设备映射，重定向本地驱动器盘符（如`C:`），将`lpNewFileName`指向任意位置，或者也可以通过滥用硬链接（hard
+link）来实现。这个问题之前也提交过（issue [1428](https://bugs.chromium.org/p/project-zero/issues/detail?id=1428)），我们可以通过硬链接来利用这个漏洞，如下所示：
+1、创建指向`SYSTEM32`目录中我们希望覆盖的某个文件的硬链接。由于创建硬链接时，我们不需要拥有目标文件的写入权限（至少沙箱外面时适用这种情况），因此我们可以完成这个步骤。
+2、创建一个新的目录，该目录具有某个组（如Everyone或者Authenticated
+Users）可以继承的ACE，以允许这些组用户修改新文件。其实我们根本不需要刻意去做这件事情，比如`C:`盘根目录下创建的任何目录都具有Authenticated
+Users能够继承的ACE。然后我们可以向RPC服务请求将硬链接文件移动到新的目录中。在模拟状态下，只要我们拥有原始位置的`FILE_DELETE_CHILD`访问权限，同时具有新位置的`FILE_ADD_FILE`权限，移动操作就能顺利完成，而这两个条件都是我们可控的条件。
+3、服务现在会在移动后的硬链接文件上调用`SetNamedSecurityInfo`。`SetNamedSecurityInfo`会从新目录中提取继承的ACE，然后将ACE应用到硬链接的文件上。ACE之所以会应用到硬链接的文件上，原因在于从`SetNamedSecurityInfo`的视角来看，虽然原始的目标文件位于`SYSTEM32`目录中，但硬链接的文件位于新的目录中。
+利用这一点，我们可以修改Local
+System具备`WRITE_DAC`访问权限的任意文件的安全属性。因此我们可以修改`SYSTEM32`目录中的某个文件，然后使用DiagHub服务来加载该文件。然而这个问题并不是特别严重。`SYSTEM32`目录下文件的所有者大部分属于`TrustedInstaller`组，因此我们无法修改（即便是Local
+System）。我们需要找到所有者不是TrustedInstaller且又能被我们修改的文件，同时也要保证这样不会导致系统安装被损坏。我们不用去管具体的文件扩展名，因为`AddAgent`只会检查文件是否存在，然后使用`LoadLibraryEx`来加载该文件。我们可以使用各种方法查找这类文件，比如通过SysInternals的[AccessChk](https://docs.microsoft.com/en-us/sysinternals/downloads/accesschk)工具，但为了百分百确认Storage
+Service的token能够修改目标文件，我决定使用我的[NtObjectManager](https://www.powershellgallery.com/packages/NtObjectManager)
+PowerShell模块（更确切一点是`Get-AccessibleFile`这个cmdlet，可以接受某个进程为参数来检查条件是否满足）。这个模块可以用来检查从沙箱中能够访问哪些文件，也能够用来检查特权服务能够访问哪些文件。安装该模块后，如果我们以管理员权限运行如下脚本，那么Storage
+Service具备`WRITE_DAC`访问权限的文件列表将存放在`$files`变量中。
+    Import-Module NtObjectManager
+    Start-Service -Name "StorSvc"
+    Set-NtTokenPrivilege SeDebugPrivilege | Out-Null
+    $files = Use-NtObject($p = Get-NtProcess -ServiceName "StorSvc") {
+       Get-AccessibleFile -Win32Path C:Windowssystem32 -Recurse `
+        -MaxDepth 1 -FormatWin32Path -AccessRights WriteDac -CheckMode FilesOnly
+    }
+查看这些文件后，我决定选择`license.rtf`这个文件，该文件包含Windows系统的简要许可声明。这个文件的优势在于它对操作系统而言不是特别关键，因此覆盖这个文件不大可能出现系统安装被破坏问题。
+因此利用过程分为以下几步：
+1、使用`Storage Service`漏洞修改`SYSTEM32`目录中`license.rtf`文件的安全属性。
+2、将某个DLL覆盖`license.rtf`，该文件实现了`DllGetClassObject`方法。
+3、使用DiagHub服务将经过我们修改的许可声明文件以DLL形式载入，这样我们就能以Local System身份获得代码执行机会，为所欲为。
+如果你想查看完整的利用过程，我也上传了一份完整代码，大家可以访问[此处](https://bugs.chromium.org/p/project-zero/issues/detail?id=1428#c9)下载分析。
+## 四、总结
+在本文中，我介绍了针对Windows 10的一种漏洞利用方法，我们也可以在某些沙箱环境（如Edge
+LPAC）中利用这种方法。找到这类方法后，漏洞利用过程可以更加简单，不容易出现错误。此外，本文也介绍了如何在类似的DCOM实现方法中去寻找可能存在的一些错误。

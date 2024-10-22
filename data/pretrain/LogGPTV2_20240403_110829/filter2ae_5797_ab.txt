@@ -1,0 +1,128 @@
+    {
+        return cap_settime(ts, tz);
+    }
+    int cap_settime(const struct timespec *ts, const struct timezone *tz)
+    {
+        if (!capable(CAP_SYS_TIME)) //检查CAP_SYS_TIME
+            return -EPERM;
+        return 0;
+    }
+所以我们如果想以这种方式来利用这个漏洞，就需要进程本身有CAP_SYS_TIME的权限，这也就限制了这种方法的适用范围。于是我们想要从0权限来利用这个漏洞，就得另辟蹊径。
+#### pipe的TOCTTOU
+在介绍0权限的利用方法思路之前，我觉得得先介绍下pipe的TOCTTOU机制，因为这个是接下来利用思路的一个基础。关于这部分的内容，也可以参考[shendi大牛的slide](https://github.com/retme7/My-Slides/blob/master/The-Art-of-Exploiting-Unconventional-Use-after-free-Bugs-in-Android-Kernel.pdf)
+TOCTTOU : time of check to time of use
+.写程序的时候通常都会在使用前，对要使用的数据进行一个检查。而这个检查的时间点，和使用的时间点之间，其实是有空隙的。如果能在这个时间空隙里，做到对已经check的数据的更改，那么就可能在use的时刻，使用到非法的数据。
+pipe的readv /
+writev就是这样一个典型。以readv为例，readv会在`do_readv_writev`的`rw_copy_check_uvector`函数里对用户态传进来的所有iovector进行合法性检查：
+    struct iovec {
+        void *iov_base;
+        size_t iov_len;
+    };
+    ssize_t rw_copy_check_uvector(int type, const struct iovec __user * uvector,
+                      unsigned long nr_segs, unsigned long fast_segs,
+                      struct iovec *fast_pointer,
+                      struct iovec **ret_pointer)
+    {
+        unsigned long seg;
+        ssize_t ret;
+        struct iovec *iov = fast_pointer;
+        ...
+        if (nr_segs > fast_segs) {
+            iov = kmalloc(nr_segs*sizeof(struct iovec), GFP_KERNEL);  //[1]
+            ...
+        }
+        if (copy_from_user(iov, uvector, nr_segs*sizeof(*uvector))) {
+            ...
+        }
+        ...
+        for (seg = 0; seg = 0
+                && unlikely(!access_ok(vrfy_dir(type), buf, len))) {  //[2]
+                ret = -EFAULT;
+                goto out;
+            }
+        ...
+        }
+    }
+可以看到这个检查函数做了两件事：
+[1]如果iovector的个数比较多（大于8），就会kmalloc一段内存，然后将用户态传来的iovector拷贝进去。当然如果比较小，就直接把用户态传来的iovector放到栈上。
+[2]对iovector进行合法性检查，确保所有的iovecor的iov_base都是用户态地址。
+这里也就是pipe的time of check。
+在检查通过之后，会去执行pipe_read函数，相信分析过CVE-2015-1805的朋友们都知道，pipe_read函数里对iovector的iov_base只会做是不是可写地址的检查，而不会做是不是用户态地址的检查，然后有数据就写入。pipe_read函数往iovector的iov_base里写入数据的时刻(__copy_to_user)，就是pipe的time
+of use。
+那么这个check 和
+use的间隙是多长呢？这取决于我们什么时候往pipe的buffer里写入数据。因为pipe_read默认是阻塞的，如果pipe的buffer里没有数据，pipe_read就会一直被阻塞，直到我们调用writev往pipe的buffer写数据。
+所以，pipe的time of check to time of use这个间隔，可以由我们自己控制。
+如果在这个时间间隔有办法对iovector进行更改，那么就可能往非法地址写入数据：
+那么，怎么才能在这个时间间隔，对iovector进行更改呢？
+这当然要通过漏洞来实现：
+1，堆溢出漏洞。前面分析知道，如果有8个以上的的iovctor，就会调用kmalloc来存储这些iovector。如果能有一个内核堆溢出漏洞，那么只要把堆布局好，就能让溢出的数据，该卸掉iovector的iov_base.
+2，UAF漏洞。要知道，我们kmalloc的iovector也是有占位功能的，如果使用iovector进行堆喷，将free过的victim进行占位。然后触发UAF，如果这个use的操作，能对占位的iovector进行更改，那么也就实现了目的。
+知道了pipe的TOCTTOU的基础，我们可以来重新思考下CVE-2017-10661。
+#### 思考下链表操作与UAF
+链表其实是个变化过程比较多的数据结构，对某节点的删除或者添加都会影响相邻的节点。那如果一个节点出现了问题，对它的相邻节点进行一系列操作会产生什么样的变化呢？在基于CVE-2017-10661将链表破坏之后，我在这里将给出两种情景。首先贴一张已经释放了victim
+ctx之后，cancel_list的状态图吧：
+victim ctx已经被free，但是head->next和ctx_A->prev仍然保留着这段内存的指针。那么：
+###### 情景一：添加一个新的节点ctx_B
+同样还是头插法，于是下面这几段代码会执行：
+    ctx_B->next = head->next;
+    ctx_B->prev = head;
+    head->next->prev = ctx_B; //这里等价于 victim_mem->data2 = ctx_B
+    head->next = ctx_B;
+可以看到，这个添加操作（list_add_rcu）会对已经free了的内存进行操作，会将 **victim_mem->data2**赋值为ctx_B。语言总是没有图片来的直观，添加操作执行后链表的状态如图：
+结合我们之前讨论的pipe
+TOCTTOU，如果victim_mem刚好是由我们的pipe的iovector所占位，那么这里对data2的更改，可能就会对某个iov_base进行更改：iov_base
+= ctx_B。那么这样就允许我们对ctx_B->list进行任意写入。
+###### 情景二：删除节点ctx_A
+删除操作会影响前后两个节点，我们假设ctx_A的next节点是ctx_C，那么就有：
+    ctx_A->prev->next = ctx_A->next;//等价于 victim_mem->data1 = ctx_C
+    ctx_A->next->prev = ctx_A->prev;//等价于 ctx_C->prev = victim_mem
+    ctx_A->prev = LIST_POISION2;
+与情景1类似，这个删除操作（list_del_rcu），也会已经free了的内存进行操作，将victim_mem->data1赋值为ctx_C：
+同样的，如果victim_mem刚好是由我们的pipe的iovector占位，对data1的更改，也可能改掉`iov_base:iov_base =
+ctx_C`。这样也就能对ctx_C->list进行任意写入。
+为什么要给出两种情景呢？因为我们需要考虑一个究竟是data1对应iov_base，还是data2对应iov_base。iovector的结构是这样：
+    struct iovec {
+    void *iov_base;
+    size_t iov_len;
+    };
+64位下，struct
+iovec是16字节大小，跟上面list结构的大小一样。于是data1和data2中必有一个是iov_base,一个是iov_len。而我们需要改的是iov_base。所以上述两种情景，根据具体情况就能找到一种适用的。
+问题又来了，比如说情景二，能够对ctx_C->list进行任意写入又能做什么呢？
+能够对双链表某节点的next,prev指针进行完全控制，是一件很恐怖的事情。因为在删除这个节点的时候，会导致一个很严重的问题。具体怎么回事我们看代码：
+    static inline void list_del_rcu(struct list_head *entry)
+    {
+        __list_del_entry(entry); 
+        //上一句可描述为：
+        //entry->next->prev = entry->prev;
+        //entry->prev->next = entry->next;
+        entry->prev = LIST_POISON2;
+    }
+假设我们将prev指针改为target_address，next指针改为target_value。那么上述代码就等价于：
+    *(uint64_t)(target_value + 8) = target_address;
+    *(uint64_t)(target_address) = target_value;
+于是这导致了一个任意地址写入任意内容的问题。当然，写入的内容没那么任意，它的值必须也要是一个可写的地址。
+#### 0权限下的利用
+有了上述的讨论之后，我们利用的思路逐渐明朗。
+我们的ctx是0xF8的大小，处于0x100的slab块里面，所以地址总是0地址对其。那么如果要做iovector进行占位，得到的地址也总是0地址对其，所以里面元素的iov_base也会是0地址对其。在我测试的机器（nexus6p）上，next指针偏移是0xE0，prev指针是0xE8。所以我们需要选择情景二：删除victim的next节点。那么我们的步骤应该是：‘
+在创造victim ctx之前，将ctx_C加入cancel_list，然后将ctx_A加入cancel_list
+赢得竞争，导致victim ctx被list_add_rcu两次
+对victim ctx执行list_del_rcu操作，并将victim_ctx释放，此时cacncel_list是这样：
+用iovector进行堆喷，使得其将victim mem占位：
+这时pipe_read被阻塞，执行删除ctx_A的操作，会导致iov_base的更改，改成指向我们的ctx_C:
+然后我们执行pipe_write，这时会导致ctx_C的next指针和prev指针被我们改写。next指针改写为target_value，prev指针改写为target_addr:
+最后我们对ctx_C执行删除节点的操作，就能实现任意地址写任意内容了，当然写的内容不能那么任意。
+在这之后，再进行提权是一件很容易的事情。这里简单描述两种做法：
+1，target_addr设置为&ptmx_cdev->ops,target_value设置为0x30000000。这样我们在用户态0x30000000布置好函数指针，
+后续操作就很容易了。修改task_prctl相关的也是一样的道理。
+2，增加/修改地址转换表中的内存描述符。这个虽然说原理比较复杂，介绍起来可能比本文之前说的所有的内容还要长，但是实现起来却是很方便。像nexus6p这样的机器，kernel的第一级地址转换表的地址固定为0xFFFFFFC00007d000，在中添加一条合适的内存描述符，就能实现在用户态读取/修改kernel的text段的内容，实现kernel
+patch。提权也就很轻松了，而且好处是不需要找各种各样的地址，自己读取kernel的内容，自己能计算出来，可以做成通用的root。不过这种方法在三星这种有RKP保护的机器上不适用，或者说得绕过才行。
+然后，这个漏洞，其实还是可以转化为任意地址写任意内容，这次的写的内容可以任意，但是做法就不一样了。需要把iov_len做得长一点，把对ctx_C的写入转化为一个堆溢出的漏洞。然后达成目标。
+江湖规矩放图：
+最后，对于文中出现的问题，还请各路大牛加以斧正，欢迎技术交流：PI:EMAIL
+参考文档 1, 
+2,
+3,
+4, 
+* * *
+_本文经安全客授权发布，转载请联系安全客平台。_
+* * *

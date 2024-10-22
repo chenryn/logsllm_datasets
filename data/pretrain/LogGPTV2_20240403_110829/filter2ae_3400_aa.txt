@@ -1,0 +1,74 @@
+本文是[Exploiting Recursion in the Linux
+Kernel](https://googleprojectzero.blogspot.com/2016/06/exploiting-recursion-in-linux-kernel_20.html)的翻译文章。
+# 前提条件
+在Linux上，用户级进程通常具有大约8 MB长的堆栈。如果一个程序溢出堆栈（例如使用无限递归）通常会被堆栈下方的防护页捕获。
+linux内核堆栈是非常不同的（例如在处理系统调用时）。它们相对较短：在32位x86上为4096 8192个字节，在x86-64上为16384个字节。
+（内核堆栈大小由THREAD_SIZE_ORDER和THREAD_SIZE指定。）它们使用内核的buddy分配器进行分配，这是内核对页面大小分配的正常分配器（以及两个幂的页数），并且不会创建防护页。这意味着如果内核堆栈溢出，它们会和正常的数据重叠。所以内核代码必须非常小心（在通常情况下），不要在堆栈上进行大的分配，并且必须防止过多的递归。
+Linux上的大多数文件系统都不使用底层设备（伪文件系统，如sysfs，procfs，tmpfs等），或使用块设备（通常是硬盘上的分区）作为后备设备。但是ecryptfs和overlayfs这两个文件系统例外：他们将堆叠文件系统作为后备设备，这些文件系统使用另一个文件系统中的文件夹（或者，在overlayfs中，多个其他文件夹，通常来自不同的文件系统）。（作为后备设备的文件系统称为下层文件系统，下层文件系统中的文件称为下层文件。）  
+堆叠文件系统的想法是它或多或少地转发对较低文件系统的访问，但对传递的数据进行一些修改。
+overlayfs将多个文件系统合并成一个通用视图，ecryptfs执行透明加密。
+堆叠文件系统的潜在危险是因为它们的虚拟文件系统处理程序经常调用底层文件系统的处理程序，与直接访问底层文件系统相比，堆叠文件系统增加了堆栈使用率。如果可以使用堆栈文件系统作为另一个堆栈文件系统等的支持设备，则在某些时候，内核堆栈会溢出，因为每一层文件系统堆栈都会增加内核堆栈深度。然而，通过在文件系统嵌套层的数量上设置限制（FILESYSTEM_MAX_STACK_DEPTH）就可以避免这种情况，即最多只能将两层嵌套文件系统放置在非堆栈文件系统之上。
+procfs伪文件系统包含系统上每个正在运行的进程的一个目录，每个目录包含描述进程的各种文件。
+我们感兴趣的是每个进程的`mem`，`environ`和`cmdline`文件，因为从它们读取会导致同步访问目标进程的虚拟内存。
+这些文件公开不同的虚拟地址范围：
+  * `mem`公开整个虚拟地址范围（并且需要PTRACE_MODE_ATTACH访问）
+  * `environ`将内存范围从mm-> env_start暴露给mm-> env_end（并且需要PTRACE_MODE_READ访问）
+  * `cmdline`将内存范围从mm-> arg_start暴露给mm-> arg_end，当mm-> arg_end之前的最后一个字节是空字节时，否则，它会变得更复杂。
+如果有可能去mmap()“mem”文件（这没有多大意义，不要太想它），你可以设置像这样的映射：  
+然后，假设`/proc/$pid/mem`映射必须出错，进程C中映射的读取页面错误会导致进程B中出现页面错误，这会导致进程B中出现另一个页面错误，
+这反过来又会导致页面从进程A的内存出现错误——也就是递归页面错误。
+然而，这并不会起作用。mem，environ和cmdline文件只有正常读取和写入的VFS处理程序，而不是mmap：
+    static const struct file_operations proc_pid_cmdline_ops = {
+    .read   = proc_pid_cmdline_read,
+    .llseek = generic_file_llseek,
+    };
+    [...]
+    static const struct file_operations proc_mem_operations = {
+    .llseek  = mem_lseek,
+    .read    = mem_read,
+    .write   = mem_write,
+    .open    = mem_open,
+    .release = mem_release,
+    };
+    [...]
+    static const struct file_operations proc_environ_operations = {
+    .open    = environ_open,
+    .read    = environ_read,
+    .llseek  = generic_file_llseek,
+    .release = mem_release,
+    };
+有关ecryptfs的一个有趣的细节是它支持mmap（）。由于用户看到的内存映射必须被解密，而来自底层文件系统的内存映射会被加密，所以ecryptfs不能仅仅将mmap（）操作转发到底层文件系统的mmap（）处理程序。
+相反，ecryptfs需要使用自己的页面缓存进行映射。
+当ecryptfs处理页面错误时，它必须以某种方式从底层文件系统读取加密页面。这可以通过读取较低文件系统的页面缓存（使用较低文件系统的mmap处理程序）来实现，但会浪费内存。
+相反，ecryptfs只是使用较低文件系统的VFS读处理程序（通过kernel_read（））。这是更高效和直接的，但也有副作用，有可能mmap（）解密通常不会映射的文件的视图（因为ecryptfs文件的mmap处理程序只要较低文件具有读取处理程序并包含有效的加密数据就可以工作）。
+# 漏洞
+在这一点上，我们可以拼凑出攻击步骤。  
+我们首先创建一个PID $A的进程A。然后，使用`/proc/$A`创建一个ecryptfs mount
+`/tmp/$A`作为较低的文件系统。（ecryptfs只能与一个密钥一起使用，以禁用文件名加密。）现在，如果`/proc/$A/`中的相应文件在文件开头处包含有效的ecryptfs标头，则可以映射`/tmp/$A/mem`，`/
+tmp/$A/environ`和`/tmp/$A/cmdline`。  
+除非我们已经拥有root权限，否则我们不能将任何东西映射到进程A中的地址0x0，这对应于`/proc/$A/mem`中的偏移量0，  
+所以从`/proc/$A/mem`开始读取将始终返回
+-EIO和`/proc/$A/mem`永远不会包含有效的ecryptfs标头。因此，在潜在的攻击中，只有environ和cmdline文件很有趣。
+在使用1CONFIG_CHECKPOINT_RESTORE编译的内核上（至少在Ubuntu的发行版内核中是这种情况），使用`prctl(PR_SET_MM,
+PR_SET_MM_MAP, &mm_map, sizeof(mm_map),
+0)`可以轻松地由非特权进程设置mm_struct的arg_start，arg_end，env_start和env_end属性。这允许在任意虚拟内存范围内指向`/proc/$A/environ`和`/proc/$A/cmdline`。（在没有检查点恢复支持的内核上，攻击的执行起来稍微麻烦一些，但仍然可以通过重新执行期望的参数区域和环境区域长度，然后替换部分堆栈内存映射。）
+如果将有效的加密ecryptfs文件加载到进程A的内存中，并将其环境区域配置为指向该区域，则可以在`/tmp/$A/environ`处访问环境区域中的数据的解密视图。这个文件然后可以映射到另一个进程的内存中，进程B.为了能够重复这个进程，一些数据必须用ecryptfs重复加密，创建一个ecryptfs
+matroska，它可以加载到进程A的内存中。  
+现在，可以设置映射彼此的解密环境区域的一系列进程：  
+如果在进程C和进程B的内存映射的相关范围内没有数据，进程C的内存中的页面错误（由用户空间中的页面错误引起，或者由内核中的用户空间访问引起，例如通过copy_from_user()）就会导致ecryptfs从`/proc/$B/environ`中读取，进而在进程B中导致页面错误，然后导致通过ecryptfs从`/proc/$A/environ`读取，使进程A中出现页面错误。像这样任意重复，从而导致堆栈溢出，内核崩溃。  
+堆栈看起来像这样：
+    [...]
+    [] handle_mm_fault+0xf8b/0x1820
+    [] __get_user_pages+0x135/0x620
+    [] get_user_pages+0x52/0x60
+    [] __access_remote_vm+0xe6/0x2d0
+    [] ? alloc_pages_current+0x8c/0x110
+    [] access_remote_vm+0x1f/0x30
+    [] environ_read+0x122/0x1a0
+    [] ? security_file_permission+0xa0/0xc0
+    [] __vfs_read+0x18/0x40
+    [] vfs_read+0x86/0x130
+    [] kernel_read+0x50/0x80
+    [] ecryptfs_read_lower+0x23/0x30
+    [] ecryptfs_decrypt_page+0x82/0x130
+    [] ecryptfs_readpage+0xcd/0x110

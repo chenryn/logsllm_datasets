@@ -1,0 +1,97 @@
+# Technical post-mortem of the August incident 
+
+At [Platform.sh](https://platform.sh), we had a downtime of 4
+hours on our EU region in August, 18th, 2016. This is the technical
+post-mortem of [this
+incident](http://status.platform.sh/incidents/rrbl80dmmcxt), published with the
+permission of my employer.
+
+# Introduction 
+
+Here is a reminder of the chronology:
+
+-   [19:00 UTC: a maintenance of the region started, only the git
+    servers and     the UI were affected.]
+-   [19:30 UTC: the sites went down.]
+-   [23:30 UTC: the sites came back up, as well as the git servers and
+    UI.]
+
+A little note: in local time, this was from 23:30PM to 3:30AM. The worst
+hours.
+
+To explain the technical issues that led to such a long downtime, a little background is necessary.
+
+The region is based on several components (I'm only listing the relevant ones):
+
+\- The gateways, which are the entrypoints to all the applications living in the region. - The orchestration software, providing among others the list of applications to the gateways. - [ZooKeeper](https://zookeeper.apache.org) servers (a quorum of 3), on
+which the orchestration software relies for its state.
+
+# Downtime 
+
+The maintenance window was only there to upgrade the orchestration software. Currently, an upgrade of the orchestration software requires a downtime of the git servers and the UI. (We're working on removing this dependency.) This explains the downtime between 19:00 UTC and 19:30 UTC of git and UI, while websites remained up.
+
+At this point, the gateways could not get the new list of applications being deployed, but the existing websites were fine, given that the list was kept in the gateways' memory. At 19:30 UTC, we restarted the gateways to upgrade them as well, not realizing that the orchestration software had not fully started.
+
+This means that we emptied the gateways' memory (since we restarted them), and the gateways couldn't fetch the list of applications, since the orchestration software wasn't available. Argh.
+
+From then on, the websites were down, although the environments holding the applications were still working fine. This explains why there was no issue regarding data integrity --- the websites were working fine, it's only the gateways that weren't.
+
+At this point, we realized that the orchestration software hadn't completely started. We started looking at the logs, and saw that the software was randomly dropping connections to ZooKeeper. After a lot of investigation, we found, thanks to strace, that the software was getting a lot of EPIPE errors. This is when we realized that our issue was in the [Kazoo](https://github.com/python-zk/kazoo) library we're using to
+manage ZooKeeper connections. WTF?
+
+# The bug 
+
+In the EU region, we currently have \~1 million nodes living in ZooKeeper. The orchestration software, as part of its startup, creates an ephemeral node below every node it's supposed to own called \`&owner\`, which is its way to acquire a global lock across servers. The Kazoo library had a bug that made it drop the connection when too many queries were sent at the same time.
+
+Internally, Kazoo uses a pipe
+([pipe(2)](http://man7.org/linux/man-pages/man2/pipe.2.html)) to synchronize state
+between its threads. You have the client, adding items to a queue, and writing a nul byte (\\0) to the internal pipe, and the connection object,
+[select()](http://man7.org/linux/man-pages/man2/select.2.html)ing on the internal pipe, and getting items from the queue to send them to the ZooKeeper socket. In the connection object, you have this kind of code:
+
+``` 
+self._read_pipe, self._write_pipe = create_pipe()# select() on the socket to zookeeper and the internal pipe
+s = self.handler.select([self._socket, self._read_pipe],
+                        [], [], timeout)[0]if s[0] == self._socket:
+    # Read the socket
+else:
+    os.read(self._read_pipe, 1)
+    send_request(self._queue.pop())
+```
+
+And in the client, you have this kind of code:
+
+``` 
+self._queue.append(object)write_pipe = self._connection._write_pipe
+try:
+    os.write(write_pipe, b'\0')
+except:
+    raise ConnectionClosedError("Connection has been closed")
+```
+
+The problem that we had was when the pipe buffer became full (64k). When this became the case, the os.write call was failing with an EPIPE, closing the connection to ZooKeeper. Given that each item in the pipe is 1 byte, it means there were 64k queries waiting to be sent.
+
+So we didn't see the issue before because we didn't have as many objects, thus the pipe wasn't used enough to fill up its buffer.
+
+To solve this issue, we added a semaphore lock in the client. Now, the client can write up to 1000 items to the pipe buffer before which it will wait until a slot becomes free to add another one. We're looking if we can increase the semaphore count to 64k without issue, or at least the current platform's pipe size. (It's configurable.) We're preparing a pull request for the Kazoo project. (By the way, we found other issues in the kazoo project, and have already contributed [a pull request](https://github.com/python-zk/kazoo/pull/407).)
+
+After we deployed this fix to our production servers, at 23:15 UTC, the random connection drops were gone. Now, we got *consistent* connection drops. Ugh.
+
+This time, quickly looking at ZooKeeper logs, we found that one node was
+over the max node size of ZooKeeper. We increased ZooKeeper max buffer
+size, restarted, and everything came back, at 23:30 UTC. Phew. Bed time,
+finally!
+
+# Wrapping up 
+
+To sum up, there were several issues which led to such a long downtime:
+
+1\. We restarted the gateways without waiting for the orchestration software to be fully started. 2. We had to debug and fix a scaling issue in kazoo, a popular open source library. 3. We had too big nodes in ZooKeeper.
+
+Solving the first issue is an automation problem. We have now implemented automated checks when upgrading the orchestration software to make sure it is fully started before we do anything else.
+
+The second issue is not something we could have predicted. We're going to send a pull request upstream for this bug to not occur to anyone else.
+
+The third issue was a monitoring problem. The nodes sizes weren't monitored, and this is now fixed. Whenever a node size goes up to 90% of ZooKeeper's max buffer size, an alert is sent to us, and we can decide on what to do. (If it's a runaway node, we can just delete it, and fix our software to not have runaway nodes. If it's a legitimate one, we'll have to increase the max buffer, and see if we can split up the node in our software. For example, we added compression to the ZooKeeper nodes a few weeks ago, greatly reducing the sizes of the nodes.)
+
+It has been said before, but it bears repeating: we're sorry for the long downtime. We try our best to avoid it as much as possible.
+

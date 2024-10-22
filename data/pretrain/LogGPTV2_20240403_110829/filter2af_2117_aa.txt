@@ -1,0 +1,277 @@
+### 0x01 前言
+#### 《java反序列化利用链自动挖掘工具gadgetinspector源码浅析》
+github：[改造过的gadgetinspector](https://github.com/threedr3am/gadgetinspector
+"改造过的gadgetinspector")  
+我的上一篇文章，详细地讲述了gadgetinspector挖掘java反序列化利用链的原理，在明白了gadgetinspector的原理细节后，我们其实会发现它还存在着一部分的缺点：
+  1. 对于运行时确定的实现，也就是多态性，没办法做到污点分析：
+gadgetinspector.PassthroughDiscovery.PassthroughDataflowMethodVisitor#visitMethodInsn
+    Set passthrough = passthroughDataflow.get(new MethodReference.Handle(new ClassReference.Handle(owner), name, desc));
+    if (passthrough != null) {
+        for (Integer passthroughDataflowArg : passthrough) {
+            //判断是否和同一方法体内的其它方法返回值关联，有关联则添加到栈底，等待执行return时保存
+            resultTaint.addAll(argTaint.get(passthroughDataflowArg));
+        }
+    }
+可以想到，如果调用的是一个接口interface中定义的方法，那么，在gadgetinspector对其扫描期间，并不在被扫描程序的Runtime，那么，就没办法取确定实际上的实现method。
+我看过有文章分析，可以通过查找该方法method的实现（接口的实现类中的方法）进行污染判断，不过，这种方式还是具有缺陷性，例如，这个接口存在着两个实现类，那么，从上述代码就可以看到，只能选择其中一个实现方法的污染结果进行判断。
+  1. 调用链搜索不完整，还是因为多态性的原因，做不到完整的调用链搜索：
+gadgetinspector.CallGraphDiscovery.ModelGeneratorMethodVisitor#visitMethodInsn
+    //记录参数流动关系
+    //argIndex：当前方法参数索引，srcArgIndex：对应上一级方法的参数索引
+    discoveredCalls.add(new GraphCall(
+            new MethodReference.Handle(new ClassReference.Handle(this.owner), this.name, this.desc),
+            new MethodReference.Handle(new ClassReference.Handle(owner), name, desc),
+            srcArgIndex,
+            srcArgPath,
+            argIndex));
+如果调用的是一个接口interface中定义的方法，那么，在gadgetinspector对其扫码期间，并不在被扫码程序的Runtime，那么，也就没办法取确定实际上的实现method。
+不过，对于这种缺陷，我们是不是可以考虑，通过列举所有的接口实现类出来，并把他们加入到调用链中？这个办法，有好处也有坏处，好处即是能全部Runtime时不管能不能执行到的实现都加进去了。而坏处也是因为这点，会造成路径爆炸，假如接口类有几十个实现类，如果把它们都加入到调用链中（不管Runtime到底是否能走到这个实现），造成的路径爆炸问题会非常严重。
+  1. 对于JNDI lookup的slink并没有加入
+  2. 还不能挖掘Fastjson利用链
+  3. 等等...
+而本篇文章，是围绕着第3、4点而讲，即讲述如何改造gadgetinspector，使它能够挖掘Fastjson的gadget chain
+### 0x02 如何新加序列化方式
+#### source
+对于看过gadgetinspector，并且看懂了的小伙伴来说，能够发现，对于一种新序列化方式的gadget
+chain挖掘，gadgetinspector做到了很好的适配。
+    public interface GIConfig {
+        String getName();
+        SerializableDecider getSerializableDecider(Map methodMap, InheritanceMap inheritanceMap);
+        ImplementationFinder getImplementationFinder(Map methodMap,
+                                                     Map> methodImplMap,
+                                                     InheritanceMap inheritanceMap);
+        SourceDiscovery getSourceDiscovery();
+    }
+    public class JacksonDeserializationConfig implements GIConfig {
+        @Override
+        public String getName() {
+            return "jackson";
+        }
+        @Override
+        public SerializableDecider getSerializableDecider(Map methodMap, InheritanceMap inheritanceMap) {
+            return new JacksonSerializableDecider(methodMap);
+        }
+        @Override
+        public ImplementationFinder getImplementationFinder(Map methodMap,
+                                                            Map> methodImplMap,
+                                                            InheritanceMap inheritanceMap) {
+            return new JacksonImplementationFinder(getSerializableDecider(methodMap, inheritanceMap));
+        }
+        @Override
+        public SourceDiscovery getSourceDiscovery() {
+            return new JacksonSourceDiscovery();
+        }
+    }
+从上述代码中，可以看到，想要增加新的反序列化类型的挖掘，需要的是实现GIConfig接口，并通过实现类构造三个组件：
+  1. SerializableDecider：序列化决策者，这个决策者的作用主要围绕着apply方法的实现，通过apply方法，判断目标类class是否具备这可序列化，那么相对而言就是是否可以被反序列化
+  2. ImplementationFinder：对于一个接口interface，该组件主要用于判断它的实现类，是否能被反序列化
+  3. SourceDiscovery：链的起始端搜索类，类似于jackson对于json的解析，在反序列化时，会有一定条件的触发setter、getter方法，那么，这些方法即是整个gadget chain的入口点，而该组件就是用于搜索所有具备这样特征的类
+我们可以看看jackson对于这三个组件的具体实现是怎么样的：
+  * SerializableDecider->JacksonSerializableDecider
+    public class JacksonSerializableDecider implements SerializableDecider {
+        ...
+        @Override
+        public Boolean apply(ClassReference.Handle handle) {
+            Boolean cached = cache.get(handle);
+            if (cached != null) {
+                return cached;
+            }
+            Set classMethods = methodsByClassMap.get(handle);
+            if (classMethods != null) {
+                for (MethodReference.Handle method : classMethods) {
+                    //该类，只要有无参构造方法，就通过决策
+                    if (method.getName().equals("") && method.getDesc().equals("()V")) {
+                        cache.put(handle, Boolean.TRUE);
+                        return Boolean.TRUE;
+                    }
+                }
+            }
+            cache.put(handle, Boolean.FALSE);
+            return Boolean.FALSE;
+        }
+    }
+很明显，jackson对于是否可被反序列化的判断就是是否存在无参构造方法。
+  * ImplementationFinder->JacksonImplementationFinder
+    public class JacksonImplementationFinder implements ImplementationFinder {
+        private final SerializableDecider serializableDecider;
+        public JacksonImplementationFinder(SerializableDecider serializableDecider) {
+            this.serializableDecider = serializableDecider;
+        }
+        @Override
+        public Set getImplementations(MethodReference.Handle target) {
+            Set allImpls = new HashSet<>();
+            // For jackson search, we don't get to specify the class; it uses reflection to instantiate the
+            // class itself. So just add the target method if the target class is serializable.
+            if (Boolean.TRUE.equals(serializableDecider.apply(target.getClassReference()))) {
+                allImpls.add(target);
+            }
+            return allImpls;
+        }
+    }
+而对于判断是否有效实现类，也是借用到了JacksonSerializableDecider，通过它判断，只要具有无参构造方法，那么就是有效的实现类。
+  * SourceDiscovery->JacksonSourceDiscovery
+    public class JacksonSourceDiscovery extends SourceDiscovery {
+        @Override
+        public void discover(Map classMap,
+                             Map methodMap,
+                             InheritanceMap inheritanceMap) {
+            final JacksonSerializableDecider serializableDecider = new JacksonSerializableDecider(methodMap);
+            for (MethodReference.Handle method : methodMap.keySet()) {
+                if (serializableDecider.apply(method.getClassReference())) {
+                    if (method.getName().equals("") && method.getDesc().equals("()V")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                    if (method.getName().startsWith("get") && method.getDesc().startsWith("()")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                    if (method.getName().startsWith("set") && method.getDesc().matches("\\(L[^;]*;\\)V")) {
+                        addDiscoveredSource(new Source(method, 0));
+                    }
+                }
+            }
+        }
+    }
+对于source搜索组件的逻辑，jackson的处理也非常简单，就是只要有无参构造方法或getter、setter，就能被标识为source起点类
+最后，在实现了这三个组件之后，还有最后的一步，需要把他们的构造放到上述所讲的JacksonDeserializationConfig，也就是GIConfig的实现类中，并最后，放到配置库中ConfigRepository：
+    public class ConfigRepository {
+        private static final List ALL_CONFIGS = Collections.unmodifiableList(Arrays.asList(
+                new JavaDeserializationConfig(),
+                new JacksonDeserializationConfig(),
+                new XstreamDeserializationConfig()));
+        public static GIConfig getConfig(String name) {
+            for (GIConfig config : ALL_CONFIGS) {
+                if (config.getName().equals(name)) {
+                    return config;
+                }
+            }
+            return null;
+        }
+    }
+#### slink
+除了三个组件确定节点有效性以外，最终数据流是否能触发到slink，亦是需要进行判断的。而gadgetinspector是这么做的：
+gadgetinspector.GadgetChainDiscovery#isSink
+    private boolean isSink(MethodReference.Handle method, int argIndex, InheritanceMap inheritanceMap) {
+        if (method.getClassReference().getName().equals("java/io/FileInputStream")
+                && method.getName().equals("")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/io/FileOutputStream")
+                && method.getName().equals("")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/nio/file/Files")
+            && (method.getName().equals("newInputStream")
+                || method.getName().equals("newOutputStream")
+                || method.getName().equals("newBufferedReader")
+                || method.getName().equals("newBufferedWriter"))) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/lang/Runtime")
+                && method.getName().equals("exec")) {
+            return true;
+        }
+        /*
+        if (method.getClassReference().getName().equals("java/lang/Class")
+                && method.getName().equals("forName")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/lang/Class")
+                && method.getName().equals("getMethod")) {
+            return true;
+        }
+        */
+        // If we can invoke an arbitrary method, that's probably interesting (though this doesn't assert that we
+        // can control its arguments). Conversely, if we can control the arguments to an invocation but not what
+        // method is being invoked, we don't mark that as interesting.
+        if (method.getClassReference().getName().equals("java/lang/reflect/Method")
+                && method.getName().equals("invoke") && argIndex == 0) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/net/URLClassLoader")
+                && method.getName().equals("newInstance")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/lang/System")
+                && method.getName().equals("exit")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/lang/Shutdown")
+                && method.getName().equals("exit")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/lang/Runtime")
+                && method.getName().equals("exit")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/nio/file/Files")
+                && method.getName().equals("newOutputStream")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/lang/ProcessBuilder")
+                && method.getName().equals("") && argIndex > 0) {
+            return true;
+        }
+        if (inheritanceMap.isSubclassOf(method.getClassReference(), new ClassReference.Handle("java/lang/ClassLoader"))
+                && method.getName().equals("")) {
+            return true;
+        }
+        if (method.getClassReference().getName().equals("java/net/URL") && method.getName().equals("openStream")) {
+            return true;
+        }
+        // Some groovy-specific sinks
+        if (method.getClassReference().getName().equals("org/codehaus/groovy/runtime/InvokerHelper")
+                && method.getName().equals("invokeMethod") && argIndex == 1) {
+            return true;
+        }
+        if (inheritanceMap.isSubclassOf(method.getClassReference(), new ClassReference.Handle("groovy/lang/MetaClass"))
+                && Arrays.asList("invokeMethod", "invokeConstructor", "invokeStaticMethod").contains(method.getName())) {
+            return true;
+        }
+        return false;
+    }
+代码有点多，但是不难看懂，其实就是对于一条执行链最末端的判断，基本都是判断是否属于某个类的某个方法，或者是否是某个类的子类、某个接口的实现类的某个方法。只要满足判断的特征，那么就证明这条链的可用性。
+### 0x03 Fastjson反序列化方式添加前的准备
+在添加Fastjson前，参考jackson三个组件，我们需要去了解Fastjson的一些特性：
+  1. 可被反序列化的类特征
+  2. 反序列化可被触发执行的方法特征
+#### 可被反序列化的类特征：
+通过阅读Fastjson的代码，在"@type"的处理部分
+com.alibaba.fastjson.parser.ParserConfig#checkAutoType(java.lang.String,
+java.lang.Class, int)方法调用后，会返回一个class类对象
+    clazz = config.checkAutoType(typeName, null, lexer.getFeatures());
+紧接着，会进行黑名单、白名单等判断，接着会创建JavaBeanInfo，进行autoType以及构造方法的判断
+创建JavaBeanInfo
+    JavaBeanInfo beanInfo = JavaBeanInfo.build(clazz
+            , type
+            , propertyNamingStrategy
+            ,false
+            , TypeUtils.compatibleWithJavaBean
+            , jacksonCompatible
+    );
+在build方法中，会对构造方法进行获取并判断
+    Constructor[] constructors = clazz.getDeclaredConstructors();
+    Constructor defaultConstructor = null;
+    if ((!kotlin) || constructors.length == 1) {
+        if (builderClass == null) {
+            defaultConstructor = getDefaultConstructor(clazz, constructors);
+        } else {
+            defaultConstructor = getDefaultConstructor(builderClass, builderClass.getDeclaredConstructors());
+        }
+    }
+    static Constructor getDefaultConstructor(Class clazz, final Constructor[] constructors) {
+    if (Modifier.isAbstract(clazz.getModifiers())) {
+        return null;
+    }
+    Constructor defaultConstructor = null;
+    for (Constructor constructor : constructors) {
+        if (constructor.getParameterTypes().length == 0) {
+            defaultConstructor = constructor;
+            break;
+        }
+    }
+    if (defaultConstructor == null) {
+        if (clazz.isMemberClass() && !Modifier.isStatic(clazz.getModifiers())) {
+            Class[] types;
+            for (Constructor constructor : constructors) {
+                if ((types = constructor.getParameterTypes()).length == 1
+                        && types[0].equals(clazz.getDeclaringClass())) {

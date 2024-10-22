@@ -1,0 +1,59 @@
+Table
+Entry)中有两个位，CPU可以将其作为地址转换的一部分写入：Accessed位指定CPU是否曾使用页表条目进行地址转换，换句话说，如果未设置Accessed位，则自上次软件写入PTE以来TLB尚未缓存页表条目的值。Dirty位指定CPU是否曾经用页表条目进行写内存访问，换句话说，如果未设置Dirty位，则自上次软件写入PTE以来没有创建可用于写入物理页面的TLB条目。
+## 漏洞解析
+### 漏洞原理
+在linux系统中进程的内存管理数据结构受到多个锁的保护：mm_struct结构体中的读/写信号量mmap_sem用来保护VMA(Virtual
+Memory
+Area)，页表锁用于保护对页表的访问。例如mmap/mremap/munmap以及用于页面错误处理的函数同时使用mmap_sem和页表锁。但是一些其它类型的页表访问(例如在系统中映射给定文件的所有位置上的操作，如缩小文件并释放超出文件新的末尾的页表的ftruncate函数)不会保留mmap_sem，只用页表锁。  
+mremap函数允许用户空间移动VMA及其关联的页表条目，它通过mremap_to->move_vma->move_page_tables->move_ptes移动页表。  
+move_ptes函数用于移动2个L1页表之间的条目(只有mmap_sem)的大致逻辑如下。  
+1.如果设置了need_rmap_locks标志(新的VMA已合并到相邻的VMA中)，则调用take_rmap_locks函数。  
+2.获取旧页表和新页表上的页表锁。  
+3.调用了flush_tlb_batched_pending函数，刷新由于并行回收竞争留下的旧的TLB条目。  
+4.对于当前页表的范围中的每个非空条目：  
+4.1.调用ptep_get_and_clear函数，原子性地读取页表条目的当前值并清除它。  
+4.2.如果读取的页表条目为Dirty，则将force_flush标志设置为true。  
+4.3.把读取的页表条目写入页表以获取新映射。  
+5.解锁新的页表。  
+6.如果设置了force_flush标志，则对在步骤4中访问的旧页表条目执行TLB刷新；如果未设置force_flush标志，则向调用者move_page_tables函数发出需要TLB刷新的信号。  
+7.解锁旧的页表。  
+8.如果设置了need_rmap_locks标志，则调用drop_rmap_locks函数。  
+稍后，在遍历多个页表之后，move_page_tables函数会在请求时对旧地址范围执行TLB刷新。  
+move_ptes函数需要确保在释放旧页表的引用时不再有过时的TLB条目。move_ptes函数中没有删除引用，但move_ptes函数将引用移动到新的页表条目中。当持有新页表上的页表锁时，同时运行的其它进程仍然无法删除新的页表条目并删除其引用，因此在步骤4.3之后一切仍然正常：页无法释放。但是在第5步之后，另一个进程理论上可以与mremap函数竞争并删除页。这远远早于move_page_tables函数对旧地址范围执行TLB刷新的时间。
+### 漏洞利用
+为了利用该漏洞，我们希望快速地从页面缓存中重新分配释放的可移动页。可以通过pcp的空闲列表来实现这一点，因为将本来就可移动的页重新分配为一个可移动的页比强制更改迁移类型更容易。使用这种策略，我们不能攻击普通内核内存分配或页表，但是可以攻击页缓存和匿名用户空间内存。EXP中是攻击的页缓存，这样可以在攻击的关键时间路径中避免其它用户空间进程的干扰。大致攻击步骤如下。  
+1.从页缓存中删除目标页。  
+首先需要挑选作为攻击目标的页。EXP利用/system/lib64/libandroid_runtime.so中包含com_android_internal_os_Zygote_nativeForkAndSpecialize函数的页。每当需要启动应用程序进程时，此函数在zygote进程的上下文中执行，换句话说，它不会经常在空闲设备上运行，这意味着我们可以删除它然后有时间触发漏洞。可以通过启动隔离服务来触发它的执行，因此能够在成功触发漏洞后立即执行它。zygote进程具有CAP_SYS_ADMIN功能(并且允许使用它)，并且因为它的作用是fork出app进程和system_server的进程，所以它可以访问system_server和每个app的上下文。注入到zygote中的shellcode会读取自己的SELinux上下文，然后使用调用sethostname函数得到的字符串覆盖主机名。shellcode在arm_shellcode.s中。  
+(系统调用表可以参考retme7大神的[2])  
+在EXP具体的删除操作是在eviction.c中实现的。在[3]中提到：A fundamental observation we made is that
+the replacement algorithm of the Linux page cache prioritizes eviction of
+nonexecutable pages over executable
+pages.在mm/vmscan.c的shrink_active_list函数和page_check_references函数中可以看到确实对有文件背景的页面有特殊处理，它们在内存中驻留的机会更大。  
+在eviction.c中通过fallocate函数利用可执行的具有文件背景的页面造成内存压力从而从页缓存中删除目标页。  
+通过mincore函数检查指定的页是否在页缓存中。  
+最好的情况是目标页一旦被删除，在下一次访问之前不会从磁盘重新加载。但情况并非总是如此：内核具有一些提前读取的逻辑，根据观察到的内存访问模式，这些逻辑可能从磁盘上读取页面错误周围的大量数据(最多VM_MAX_READAHEAD，即128KiB)。这是通过在filemap_fault函数中调用do_async_mmap_readahead函数/do_sync_mmap_readahead函数实现的。攻击进程可以在进行自己的访问时不使用它，但是对于来自其它进程的访问(这些进程可能正在执行来自目标文件中其它页面的代码)，也应该禁止这种行为。由于这个原因，EXP通过fallocate函数删除目标页之前通过MADV_RANDOM映射访问目标文件中的所有其它页，以降低访问它们触发提前读取逻辑的概率：当RAM中存在被访问的页时，不会发生同步提前读取；如果访问的页有一个小错误(即页存在于页缓存中但还不存在相应的页表条目)而没有标记为PG_readahead，异步提前读取也不会发生。  
+2.分配具有文件背景的页(例如通过memfd)，并将它们映射为映射1。  
+3.触发mremap/ftruncatrace竞争释放具有文件背景的页，而不删除映射1的对应TLB条目。  
+给运行mremap函数的进程设置SCHED_IDLE优先级，并且让它与具有正常优先级的由于read函数阻塞在管道上的进程运行在一个CPU核心上，然后在正确的时刻写入该管道的另一端，这样就可以抢占mremap函数了。  
+在`/proc//status`中包含进程使用的内存的情况，其中VmPTE字段显示进程页表占用的内存量。通过监视该字段可以检测由mremap函数执行的页表分配以确定在管道另一端调用write函数的正确时机。  
+在main函数中调用write函数写入管道的另一端。  
+4.从目标页开始读取，导致内核重新分配一个已释放的页作为目标页的页缓存。  
+5.在映射1(通过旧的TLB)中轮询页的内容，直到其中一个包含目标页。如果在此之前发生了页面错误，返回第一步。  
+下载对应版本的OTA包：  
+解压，使用payload_dumper提取出payload.bin中的system.img，解压system.img得到/system/lib64/libandroid_runtime.so。  
+起始地址是0x36000，所以0x36000+0x157000=0x18D000，刚好是0xeb08005f91007108。  
+6.此时，我们有一个旧的TLB将旧的映射1转换为目标页。因此，我们现在可以通过映射1来反复覆盖目标页。  
+漏洞利用的效果如下(我因为没有相关设备所以没有自己测试)。  
+### 补丁情况
+最重要的一处修改就是把对flush_tlb_range函数的调用放到了新的页表解锁之前。  
+## 参考资料
+1.[Memory Management with Huge
+Pages](https://d3s.mff.cuni.cz/legacy/teaching/advanced_operating_systems/slides/10_huge_pages.pdf
+"Memory Management with Huge Pages")  
+2.  
+3.[Another Flip in the Wall of Rowhammer
+Defenses](https://arxiv.org/pdf/1710.00551.pdf "Another Flip in the Wall of
+Rowhammer Defenses")  
+4.[Taking a page from the kernel's book: A TLB issue in
+mremap()](https://googleprojectzero.blogspot.com/2019/01/taking-page-from-kernels-book-tlb-issue.html "Taking a page from the kernel's book: A TLB issue
+in mremap\(\)")
