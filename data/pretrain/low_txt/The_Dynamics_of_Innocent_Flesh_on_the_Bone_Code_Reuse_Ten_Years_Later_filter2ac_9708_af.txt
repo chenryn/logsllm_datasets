@@ -1,0 +1,139 @@
+### Optimized Text
+
+#### 7.1 mprotect Hijacking Attack
+Our mprotect hijacking attack is effective when the callsite is diverted using a compatible function signature. To prevent such pointer corruption, stronger static (e.g., Src types) or dynamic (e.g., Live) target or write constraints are necessary. To validate the real-world applicability of Newton, we successfully implemented this attack in practice. Using gdb to simulate an attacker's arbitrary read and write memory primitive, we recorded a video demonstrating how our attack can mark libc memory pages as readable, writable, and executable. The annotated video is available on our project webpage [1].
+
+#### 7.2 CPI Case Study
+In this case study, we target CPI on nginx. CPI enforces a :Ptr write constraint, protecting code and data pointers. We used Newton’s results in Table 3 to identify callsites tainted by non-pointer values and selected callsite 32. This callsite is within the function `ngx_http_get_indexed_variable`, which selects its callee from an array of structures with function pointers, as follows:
+```c
+v[index].get_handler(r, &r->variables[index], v[index].data)
+```
+Newton’s output identified the taint source that needs to be corrupted to control the `get_handler` function pointer: the `data` field in an `ngx_http_log_op_s` structure. It is noteworthy how little effort it takes to find this dependency with Newton, given the complex data flow through multiple nginx-specific data structures and functions, which the low-effort attacker does not need to understand.
+
+Newton also revealed that all three arguments (Table 3) are tainted by non-pointer values. The last argument is controllable via the tainted index. The first two arguments are controllable by corrupting the allocator state earlier in the execution. For example, the taint of the first `ngx_http_request_t*` argument originates 11 functions earlier in `ngx_http_process_request_headers`. Newton simplifies this complexity for the user.
+
+Through simple manual inspection, we found that:
+1. The request data pointed to by the first argument can be controlled by sending an incomplete HTTP request (completed later to trigger the exploit).
+2. Controlling the target and arguments with an arbitrary memory write allows request handling to complete without crashes.
+3. Execution continues if the `get_handler` call is diverted to a different target, enabling chaining calls via repeated interactions with the server.
+
+In addition to providing information on how to perform an arbitrary memory write and divert control flow, Newton also lists 767 usable targets stored in memory, reflecting CPI’s Live target constraint. A complication arises because we only control the index into the `v` array of `ngx_http_variable_t` structures. Since each structure contains six word-sized fields, only 1/6 of memory can be used to select live code pointer targets. Fortunately, this alignment restriction can be bypassed using memory massaging techniques (on the heap, stack, etc.) [11]. Moreover, Newton found the address of `dlopen` live in memory, allowing us to load arbitrary shared objects on the victim system and expand the set of available live targets.
+
+For example, calling `dlopen` on “/bin/ed” or other shared objects that use the system library call forces the linker to bind the system code pointer in memory (GOT). This is easier after corrupting the linker configuration (LD_LIBRARY_PATH, LD_BIND_NOW). At that point, we again corrupt the index integer to redirect `get_handler` to the newly created live code pointer.
+
+[1] https://vusec.net/projects/newton
+
+#### Figure 4: Chaining malloc and mprotect in nginx
+This figure illustrates the memory layout and key variables of the nginx process before, during, and after our attack against CsCFI. We first overwrite the `send_chain` code pointer in `c` with the address of `malloc`. Since the callsite uses the address of `c` as the first argument, this results in a 0x565fe958 B = 1.3 GB allocation, adjacent to libc code. We then overwrite the same code pointer with the address of `mprotect` and construct a counterfeit `c` structure at a convenient location. Knowing that the value of `r->out` will be the `len` argument for `mprotect(void *addr, size_t len, int prot)`, we place `c` at `libc - r->out`, i.e., 0xf7eb6000 - 0x565f3320 = 0xa18c2000 (rounded to the page boundary). To make nginx use our counterfeit object, we must also update the data pointer in the relevant `ngx_event_t *rev` structure. By using partial HTTP requests, we divide a single control-flow diversion into multiple steps:
+1. Open a connection `c1` and send a partial request.
+2. Use the arbitrary memory read/write primitive to corrupt the connection state of `c1`, e.g., overwrite the `send_chain` code pointer.
+3. Open connections `c2 ... cn` to perform n HTTP requests in parallel to flush CsCFI history, i.e., recorded branches that set `send_chain` to `ngx_sendfile_chain` are pruned from memory.
+4. Finish the partial request of `c1`, triggering the control-flow diversion while CsCFI is unable to find in which context the overwritten code pointer was originally set.
+
+Subsequently, we send another request to chain an invocation of the (now live) system library call, allowing us to execute arbitrary commands on the victim system. To “massage” the GOT to obtain a correctly aligned system code pointer, we carefully choose the system-dependent shared object to load.
+
+We note that, other than CPI, the above attack bypasses all the defenses in the bottom-left quadrant marked by the data point in Figure 2, including CCFI, TASR, PtrRR, XoM, and TypeArmor. Thus, an important lesson learned is that we must combine CPI with other strong defenses to further limit the attack surface. CPI combined with a secure implementation of CsCFI, for instance, would prevent us from controlling callsite 32.
+
+When crafting the above attack in practice, we found that GNU libc enforces strict constraints on the flags provided to `dlopen`: unused bits should be zero, or else an error is returned [2]. This limits our attack, as it means that the index should be chosen such that the address of `r->variables[index]` is a valid flag for `dlopen` (e.g., RTLD_NOW), while `v[index].get_handler` still points to `dlopen`. Successful exploitation thus depends on the libc version. Musl libc, for example, does not enforce these constraints. However, running nginx with musl libc voids `dlopen` pointers in memory. Instead, we found code pointers to many functions of the `exec()` family, opening alternative ways for bypassing CPI.
+
+[2] https://sourceware.org/git/?p=glibc.git;h=3e539cb47e9fabfdda295926b4270b0f...
+
+#### 8 RELATED WORK
+As we have already discussed code-reuse defenses in detail in the paper, this section focuses on the literature on code-reuse attacks.
+
+**Return-into-libc (ret2libc)** [25] represents the first generation of code-reuse attacks. Traditionally targeting the 32-bit x86 ISA, ret2libc uses a memory corruption vulnerability to inject a return address on the stack pointing to an existing (libc) function, followed by function arguments. A subsequent `ret` instruction transfers control to the prepared function, effectively thwarting DEP [2]. By preparing multiple call frames, function calls can be chained. On the x86-64 architecture, most function arguments are passed in CPU registers, making ret2libc more challenging.
+
+**Return-Oriented Programming (ROP)** [57] generalizes ret2libc and is now the de-facto standard in real-world code-reuse attacks. ROP manipulates the stack but does not chain complete functions. Instead, ROP uses small code fragments ending in return instructions, called gadgets. ROP is an extremely potent attack technique, allowing attackers to implement arbitrary Turing-complete computations in most practical programs [60].
+
+The initial ROP attack signaled the start of an arms race around a third-generation of code-reuse attacks. Several defense techniques were developed, only to be shown susceptible to improved code-reuse attacks. **Jump-Oriented Programming (JOP)** [9] bypasses some execution monitoring defenses [24], and **Counterfeit Object-Oriented Programming (COOP)** [59] and related attacks [13, 14, 23, 27, 32, 33] bypass many existing Control-Flow Integrity (CFI) [1]-based defenses. Other attacks, such as JIT ROP [22, 63], SROP [10], and AOCR [58], bypass information hiding defenses, including leakage-resistant variants [58]. The "gadget-stitching" model extends even beyond code reuse, also adopted by state-of-the-art techniques to craft data-only attacks [37, 38]. Note that although these recent efforts on Data-Oriented Programming (DOP) show similar weaknesses in modern defenses, a key difference is that most of those defenses were never designed to mitigate data-only attacks. Attacks crafted with Newton, on the other hand, fall within the defenses’ threat models.
+
+Although the way Newton finds gadgets shows some similarity to how ACICS gadgets are found [27], the latter are more constrained: only attacks where the function pointer and arguments are directly corruptible on the heap or in global memory are considered. As shown in §7, Newton finds more sophisticated attacks, where these elements may be corrupted in complex, indirect ways.
+
+The focus on (manual or automatic) static analysis makes code reuse increasingly complex given increasingly sophisticated defenses. With Newton, we show that a switch to a simple and natural dynamic analysis approach significantly simplifies the discovery and stitching of gadgets, even in the face of state-of-the-art defenses. Moreover, we argue that ret2libc-style attacks on 64-bit architectures are not only practical but also much easier if an attacker piggybacks on the benign data flows of the application.
+
+#### 9 CONCLUSION
+The "geometry" of innocent flesh on the bone has characterized ten years of code-reuse research: an attacker statically analyzes binary code to find gadgets, chains them together, and "calls" into security-sensitive syscalls. This model is simple to understand but scales poorly as we assume increasingly sophisticated defenses.
+
+In this paper, we showed that by also considering the "dynamics" of innocent flesh on the bone, even a low-effort attacker can easily find useful defense-aware gadgets to craft practical attacks. We implemented Newton, a gadget-discovery framework based on simple static and dynamic (taint) analysis. Using Newton, we found gadgets compatible with state-of-the-art defenses in many real-world programs. We also presented an nginx case study, showing that a Newton-armed attacker can find useful gadgets and craft attacks that comply with the restrictions of strong defenses such as CPI and context-sensitive CFI.
+
+Our effort ultimately shows that, to sufficiently reduce the attack surface against a dynamic attack model, we must combine multiple state-of-the-art code-reuse defenses or, alternatively, deploy more heavyweight defenses at the cost of higher overhead.
+
+#### ACKNOWLEDGMENTS
+We thank the anonymous reviewers for their valuable comments and input to improve the paper. This work was supported by the Netherlands Organisation for Scientific Research through grants NWO 639.023.309 VICI “Dowsing” and NWO CSI-DHS 628.001.021, and by the European Commission through project H2020 ICT-32-2014 “SHARCS” under Grant Agreement No. 644571.
+
+#### REFERENCES
+[1] Martín Abadi, Mihai Budiu, Úlfar Erlingsson, and Jay Ligatti. 2005. Control-Flow Integrity. In CCS.
+[2] S. Andersen and V. Abella. Changes to Functionality in Microsoft Windows XP Service Pack 2, Part 3: Memory Protection Technologies, Data Execution Prevention. (2004). http://technet.microsoft.com/en-us/library/bb457155.aspx.
+[3] Michael Backes, Thorsten Holz, Benjamin Kollenda, Philipp Koppe, Stefan Nürnberger, and Jannik Pewny. 2014. You Can Run but You Can’t Read: Preventing Disclosure Exploits in Executable Code. In CCS.
+[4] Michael Backes and Stefan Nürnberger. 2014. Oxymoron: Making Fine-Grained Memory Randomization Practical by Allowing Code Sharing. In USENIX SEC.
+[5] Sandeep Bhatkar, Daniel C. DuVarney, and R. Sekar. 2003. Address Obfuscation: An Efficient Approach to Combat a Broad Range of Memory Error Exploits. In USENIX SEC.
+[6] Sandeep Bhatkar, Daniel C. DuVarney, and R. Sekar. 2005. Efficient Techniques for Comprehensive Protection from Memory Error Exploits. In USENIX SEC.
+[7] David Bigelow, Thomas Hobson, Robert Rudd, William Streilein, and Hamed Okhravi. 2015. Timely Rerandomization for Mitigating Memory Disclosures. In CCS.
+[8] Andrea Bittau, Adam Belay, Ali Mashtizadeh, David Mazières, and Dan Boneh. 2014. Hacking Blind. In S&P.
+[9] Tyler Bletsch, Xuxian Jiang, Vince W. Freeh, and Zhenkai Liang. 2011. Jump-Oriented Programming: A New Class of Code-Reuse Attack. In ASIACCS.
+[10] Erik Bosman and Herbert Bos. 2014. Framing Signals—A Return to Portable Shellcode. In S&P.
+[11] Erik Bosman, Kaveh Razavi, Herbert Bos, and Cristiano Giuffrida. 2016. Dedup Est Machina: Memory Deduplication as an Advanced Exploitation Vector. In S&P.
+[12] Kjell Braden, Stephen Crane, Lucas Davi, Michael Franz, Per Larsen, Christopher Liebchen, and Ahmad-Reza Sadeghi. 2016. Leakage-Resilient Layout Randomization for Mobile Devices. In NDSS.
+[13] Nicholas Carlini, Antonio Barresi, Mathias Payer, David Wagner, and Thomas R. Gross. 2015. Control-Flow Bending: On the Effectiveness of Control-Flow Integrity. In USENIX SEC.
+[14] Nicholas Carlini and David Wagner. 2014. ROP is Still Dangerous: Breaking Modern Defenses. In USENIX SEC.
+[15] Xi Chen, Herbert Bos, and Cristiano Giuffrida. 2017. CodeArmor: Virtualizing the Code Space to Counter Disclosure Attacks. In EuroS&P.
+[16] Yueqiang Cheng, Zongwei Zhou, Miao Yu, Xuhua Ding, and Robert H. Deng. 2014. ROPecker: A Generic and Practical Approach For Defending Against ROP Attacks. In NDSS.
+[17] Mauro Conti, Stephen Crane, Tommaso Frassetto, Andrei Homescu, Georg Kopp, Per Larsen, Christopher Liebchen, Mike Perry, and Ahmad-Reza Sadeghi. 2016. Selfrando: Securing the Tor Browser against De-anonymization Exploits. In PETS.
+[18] Stephen Crane, Andrei Homescu, and Per Larsen. 2016. Code Randomization: Haven’t We Solved This Problem Yet?. In SecDev.
+[19] Stephen Crane, Christopher Liebchen, Andrei Homescu, Lucas Davi, Per Larsen, Ahmad-Reza Sadeghi, Stephan Brunthaler, and Michael Franz. 2015. Readactor: Practical Code Randomization Resilient to Memory Disclosure. In S&P.
+[20] Stephen Crane, Stijn Volckaert, Felix Schuster, Christopher Liebchen, Per Larsen, Lucas Davi, Ahmad-Reza Sadeghi, Thorsten Holz, Bjorn De Sutter, and Michael Franz. 2015. It’s a TRaP: Table Randomization and Protection against Function-Reuse Attacks. In CCS.
+[21] Thurston H.Y. Dang, Petros Maniatis, and David Wagner. 2015. The Performance Cost of Shadow Stacks and Stack Canaries. In ASIACCS.
+[22] Lucas Davi, Christopher Liebchen, Ahmad-Reza Sadeghi, Kevin Z. Snow, and Fabian Monrose. 2015. Isomeron: Code Randomization Resilient to (Just-In-Time) Return-Oriented Programming. In NDSS.
+[23] Lucas Davi, Ahmad-Reza Sadeghi, Daniel Lehmann, and Fabian Monrose. 2014. Stitching the Gadgets: On the Ineffectiveness of Coarse-Grained Control-Flow Integrity Protection. In USENIX SEC.
+[24] Lucas Davi, Ahmad-Reza Sadeghi, and Marcel Winandy. 2009. Dynamic Integrity Measurement and Attestation: Towards Defense Against Return-oriented Programming Attacks. In ACM STC.
+[25] Solar Designer. Return-to-libc attack. BugTraq. (Aug. 1997).
+[26] Isaac Evans, Sam Fingeret, Julian Gonzalez, Ulziibayar Otgonbaatar, Tiffany Tang, Howard Shrobe, Stelios Sidiroglou-Douskos, Martin Rinard, and Hamed Okhravi. 2015. Missing the Point(er): On the Effectiveness of Code Pointer Integrity. In S&P.
+[27] Isaac Evans, Fan Long, Ulziibayar Otgonbaatar, Howard Shrobe, Martin C. Rinard, Hamed Okhravi, and Stelios Sidiroglou-Douskos. 2015. Control Jujutsu: On the Weaknesses of Fine-Grained Control Flow Integrity. In CCS.
+[28] Xinyang Ge, Weidong Cui, and Trent Jaeger. 2017. GRIFFIN: Guarding Control Flows Using Intel Processor Trace. In ASPLOS.
+[29] Jason Gionta, William Enck, and Per Larsen. 2016. Preventing Kernel Code-Reuse Attacks Through Disclosure Resistant Code Diversification. In CNS.
+[30] Jason Gionta, William Enck, and Peng Ning. 2015. HideM: Protecting the Contents of Userspace Memory in the Face of Disclosure Vulnerabilities. In CODASPY.
+[31] Cristiano Giuffrida, Anton Kuijsten, and Andrew S. Tanenbaum. 2012. Enhanced Operating System Security Through Efficient and Fine-grained Address Space Randomization. In USENIX SEC.
+[32] Enes Goktas, Elias Athanasopoulos, Herbert Bos, and Georgios Portokalidis. 2014. Out Of Control: Overcoming Control-Flow Integrity. In S&P.
+[33] Enes Goktas, Elias Athanasopoulos, Michalis Polychronakis, Herbert Bos, and Georgios Portokalidis. 2014. Size Does Matter: Why Using Gadget-Chain Length to Prevent Code-Reuse Attacks is Hard. In USENIX SEC.
+[34] Yufei Gu, Qingchuan Zhao, Yinqian Zhang, and Zhiqiang Lin. 2017. PT-CFI: Transparent Backward-Edge Control Flow Violation Detection Using Intel Processor Trace. In CODASPY.
+[35] Jason Hiser, Anh Nguyen-Tuong, Michele Co, Matthew Hall, and Jack W. Davidson. 2012. ILR: Where’D My Gadgets Go?. In S&P.
+[36] Andrei Homescu, Steven Neisius, Per Larsen, Stefan Brunthaler, and Michael Franz. 2013. Profile-guided Automated Software Diversity. In CGO.
+[37] Hong Hu, Zheng Leong Chua, Sendroiu Adrian, Prateek Saxena, and Zhenkai Liang. 2015. Automatic Generation of Data-Oriented Exploits. In USENIX SEC.
+[38] Hong Hu, Shweta Shinde, Sendroiu Adrian, Zheng Leong Chua, Prateek Saxena, and Zhenkai Liang. 2016. Data-Oriented Programming: On the Expressiveness of Non-Control Data Attacks. In S&P.
+[39] Vasileios P. Kemerlis, Georgios Portokalidis, Kangkook Jee, and Angelos D. Keromytis. 2012. libdft: Practical Dynamic Data Flow Tracking for Commodity Systems. In VEE.
+[40] Chongkyung Kil, Jinsuk Jun, Christopher Bookholt, Jun Xu, and Peng Ning. 2006. Address Space Layout Permutation (ASLP): Towards Fine-Grained Randomization of Commodity Software. In ACSAC.
+[41] Koen Koning, Herbert Bos, and Cristiano Giuffrida. 2016. Secure and Efficient Multi-Variant Execution Using Hardware-assisted Process Virtualization. In DSN.
+[42] Hyungjoon Koo and Michalis Polychronakis. 2016. Juggling the Gadgets: Binary-level Code Randomization Using Instruction Displacement. In ASIACCS.
+[43] Volodymyr Kuznetsov, László Szekeres, Mathias Payer, George Candea, R. Sekar, and Dawn Song. 2014. Code-Pointer Integrity. In OSDI.
+[44] Yutao Liu, Peitao Shi, Xinran Wang, Haibo Chen, Binyu Zang, and Haibing Guan. 2017. Transparent and Efficient CFI Enforcement with Intel Processor Trace. In HPCA.
+[45] Kangjie Lu, Stefan Nürnberger, Michael Backes, and Wenke Lee. 2016. How to Make ASLR Win the Clone Wars: Runtime Re-Randomization. In NDSS.
+[46] Kangjie Lu, Chengyu Song, Byoungyoung Lee, Simon P. Chung, Taesoo Kim, and Wenke Lee. 2015. ASLR-Guard: Stopping Address Space Leakage for Code Reuse Attacks. In USENIX SEC.
+[47] Ali Jose Mashtizadeh, Andrea Bittau, Dan Boneh, and David Mazières. 2015. CCFI: Cryptographically Enforced Control Flow Integrity. In CCS.
+[48] Santosh Nagarakatte, Jianzhou Zhao, Milo M.K. Martin, and Steve Zdancewic. 2009. SoftBound: Highly Compatible and Complete Spatial Memory Safety for C. In PLDI.
+[49] Santosh Nagarakatte, Jianzhou Zhao, Milo M.K. Martin, and Steve Zdancewic. 2010. CETS: Compiler Enforced Temporal Safety for C. In ISMM.
+[50] Ben Niu and Gang Tan. 2014. Modular Control-Flow Integrity. In PLDI.
+[51] Ben Niu and Gang Tan. 2015. Per-Input Control-Flow Integrity. In CCS.
+[52] Angelos Oikonomopoulos, Elias Athanasopoulos, Herbert Bos, and Cristiano Giuffrida. 2016. Poking Holes in Information Hiding. In USENIX SEC.
+[53] Vasilis Pappas, Michalis Polychronakis, and Angelos D. Keromytis. 2012. Smashing the Gadgets: Hindering Return-Oriented Programming Using In-place Code Randomization. In S&P.
+[54] Vasilis Pappas, Michalis Polychronakis, and Angelos D. Keromytis. 2013. Transparent ROP Exploit Mitigation Using Indirect Branch Tracing. In USENIX SEC.
+[55] PaX Team. Address Space Layout Randomization (ASLR). (2003). pax.grsecurity.net/docs/aslr.txt.
+[56] Marios Pomonis, Theofilos Petsios, Angelos D. Keromytis, Michalis Polychronakis, and Vasileios P. Kemerlis. 2017. kRˆX: Comprehensive Kernel Protection against Just-In-Time Code Reuse. In EuroSys.
+[57] Ryan Roemer, Erik Buchanan, Hovav Shacham, and Stefan Savage. Return-Oriented Programming: Systems, Languages, and Applications. TISSEC 15, 1 (2012).
+[58] Robert Rudd, Richard Skowyra, David Bigelow, Veer Dedhia, Thomas Hobson, Stephen Crane, Christopher Liebchen, Per Larsen, Lucas Davi, Michael Franz, Ahmad-Reza Sadeghi, and Hamed Okhravi. 2017. Address Oblivious Code Reuse: On the Effectiveness of Leakage Resilient Diversity. In NDSS.
+[59] Felix Schuster, Thomas Tendyck, Christopher Liebchen, Lucas Davi, Ahmad-Reza Sadeghi, and Thorsten Holz. 2015. Counterfeit Object-Oriented Programming: On the Difficulty of Preventing Code Reuse Attacks in C++ Applications. In S&P.
+[60] Edward J. Schwartz, Thanassis Avgerinos, and David Brumley. 2011. Q: Exploit Hardening Made Easy. In USENIX SEC.
+[61] Jeff Seibert, Hamed Okhravi, and Eric Söderström. 2014. Information Leaks Without Memory Disclosures: Remote Side Channel Attacks on Diversified Code. In CCS.
+[62] Hovav Shacham. 2007. The Geometry of Innocent Flesh on the Bone: Return-into-libc Without Function Calls (on the x86). In CCS.
+[63] Kevin Z. Snow, Fabian Monrose, Lucas Davi, Alexandra Dmitrienko, Christopher Liebchen, and Ahmad-Reza Sadeghi. 2013. Just-In-Time Code Reuse: On the Effectiveness of Fine-Grained Address Space Layout Randomization. In S&P.
+[64] Mingshen Sun, John C. S. Lui, and Yajin Zhou. 2016. Blender: Self-Randomizing Address Space Layout for Android Apps. In RAID.
+[65] Adrian Tang, Simha Sethumadhavan, and Salvatore Stolfo. 2015. Heisenbyte: Thwarting Memory Disclosure Attacks Using Destructive Code Reads. In CCS.
+[66] Caroline Tice, Tom Roeder, Peter Collingbourne, Stephen Checkoway, Úlfar Erlingsson, Luis Lozano, and Geoff Pike. 2014. Enforcing Forward-Edge Control-Flow Integrity in GCC & LLVM. In USENIX SEC.
+[67] Victor van der Veen, Dennis Andriesse, Enes Goktas, Ben Gras, Lionel Sambuc, Asia Slowinska, Herbert Bos, and Cristiano Giuffrida. 2015. Practical Context-sensitive CFI. In CCS.
+[68] Victor van der Veen, Enes Göktaş, Moritz Contag, Andre Pawloski, Xi Chen, Sanjay Rawat, Herbert Bos, Thorsten Holz, Elias Athanasopoulos, and Cristiano Giuffrida. 2016. A Tough Call: Mitigating Advanced Code-Reuse Attacks At The Binary Level. In S&P.
+[69] Stijn Volckaert, Bart Coppens, and Bjorn de Sutter. 2015. Cloning Your Gadgets: Complete ROP Attack Immunity with Multi-Variant Execution. In TDSC.
+[70] Zhe Wang, Chenggang Wu, Jianjun Li, Yuanming Lai, Xiangyu Zhang, Wei-Chung Hsu, and Yueqiang Cheng. 2017. ReRanz: A Light-Weight Virtual Machine to Mitigate Memory Disclosure Attacks. In VEE.
+[71] Richard Wartell, Vishwath Mohan, Kevin W. Hamlen, and Zhiqiang Lin. 2012. Binary Stirring: Self-Randomizing Instruction Addresses of Legacy x86 Binary Code. In CCS.
+[72] Jan Werner, George Baltas, Rob Dallara, Nathan Otterness, Kevin Z. Snow, Fabian Monrose, and Michalis Polychronakis. 2016. No-Execute-After-Read: Preventing Code Disclosure in Commodity Software. In ASIACCS.
+[73] David Williams-King, Graham Gobieski, Kent Williams-King, James P Blake, Xinhao Yuan, Patrick Colp, Michelle Zheng, Vasileios P. Kemerlis, Junfeng Yang, and William Aiello. 2016. Shuffler: Fast and Deployable Continuous Code Re-Randomization. In OSDI.
+[74] Chao Zhang, Tao Wei, Zhaofeng Chen, Lei Duan, Laszlo Szekeres, Stephen McCamant, Dawn Song, and Wei Zou. 2013. Practical Control Flow Integrity and Randomization for Binary Executables. In S&P.
+[75] Mingwei Zhang and R. Sekar. 2013. Control Flow Integrity for COTS Binaries.

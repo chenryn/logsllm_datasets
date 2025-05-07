@@ -1,0 +1,61 @@
+# 如何绕过EDR的内存保护机制
+
+##### 译文声明
+本文为翻译文章，原作者为fsx30，原文发表于medium.com。译文仅供参考，具体内容及含义以原文为准。
+
+## 一、前言
+在最近的一次内部渗透测试中，我遇到了一款端点检测与响应（EDR）产品。该产品能够保护`lsass`进程的内存空间，导致我无法使用Mimikatz工具导出明文凭据。此外，ProcDump工具也无法成功导出`lsass`的内存内容，如上图所示。
+
+## 二、误入歧途
+作为一名曾经的恶意软件开发者，我知道可以通过某些方法，利用驱动程序绕过这种检测和保护机制。我首先想到的是使用`ObRegisterCallback`函数，这是许多反病毒软件常用的函数。然而，根据MSDN文档，该函数仅适用于Windows Vista SP1、Windows Server 2008及其更高版本。而我面对的是Windows Server 2003系统，因此无法使用这个函数。
+
+经过数小时的努力，我在`csrss.exe`上尝试了一些非常规的方法，试图通过继承`lsass.exe`的句柄来获取`PROCESS_ALL_ACCESS`权限。具体方法是滥用`csrss.exe`生成一个子进程，并继承`lsass`现有的句柄。尽管最终成功获得了`lsass.exe`的`PROCESS_ALL_ACCESS`句柄，但EDR仍然阻止了我将shellcode注入`csrss`或通过`RtlCreateUserThread`创建线程。
+
+然而，我发现了一个奇怪的现象：尽管代码无法通过子进程方式执行并继承句柄，但我仍然能够直接使用以下代码获得`lsass.exe`的`PROCESS_ALL_ACCESS`句柄：
+```c
+HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, lsasspid);
+```
+这表明EDR并不禁止我们获取句柄，但在获取句柄后的操作会受到严格限制。
+
+## 三、回到正轨
+既然我们可以获得具有完整权限的`lsass.exe`句柄，下一步就是解决如何使用该句柄的问题。当我尝试使用`MiniDumpWriteDump()`函数时，操作失败了，并显示警告：“Violation: LsassRead”。
+
+进一步分析发现，`MiniDumpWriteDump()`函数需要调用一些WINAPI函数（如`ReadProcessMemory`），而这些函数正是被EDR监控的目标。为了理解这一点，我们需要了解Windows系统的内部工作原理。`ReadProcessMemory`只是一个封装函数，它会执行各种健全性检查，然后调用`NtReadVirtualMemory`，后者再通过`syscall`指令进入内核模式，最终调用`NtReadVirtualMemory`函数来完成实际操作。
+
+    — — — — — -Userland — — — —- — — — | — — — Kernel Land — — — —
+    RPM — > NtReadVirtualMemory --> SYSCALL->NtReadVirtualMemory
+    Kernel32 — — -ntdll — — — — — — — — — - — — — — — ntoskrnl
+
+大多数EDR产品会通过hook技术来监控和阻止这些函数的调用。由于KPP（Kernel Patch Protection）的存在，EDR不能直接在内核模式下进行hook，因此它们通常会在用户模式下的`ntdll`库中进行hook。
+
+## 四、Hook分析
+为了确定这些函数在应用程序内存中的具体位置，可以使用`printf`函数输出其地址：
+```c
+printf("RPM: %p\n", (void*)RPM);
+printf("NtReadVirtualMemory: %p\n", (void*)NtReadVirtualMemory);
+```
+
+通过逆向分析工具（如Cheat Engine），我们可以观察到`NtReadVirtualMemory`函数已经被修改。原本的函数开头应该是：
+```assembly
+0x4C, 0x8B, 0xD1, // mov r10, rcx; NtReadVirtualMemory
+0xB8, 0x3c, 0x00, 0x00, 0x00, // eax, 3ch — 即syscall的编号
+0x0F, 0x05, // syscall
+0xC3 // retn
+```
+
+但实际上，第一条指令被修改为一条跳转指令，指向`CyMemdef64.dll`模块中的代码。这意味着EDR在原始的`NtReadVirtualMemory`函数内设置了一条跳转指令，将代码执行流重定向到自己的模块中进行检查。如果检查未通过，则返回错误代码，阻止进入内核模式。
+
+## 五、绕过限制
+要绕过这个限制，可以采用以下两种方法：
+
+### 重新打补丁
+我们可以使用正确的指令覆盖`jmp`指令，恢复`NtReadVirtualMemory`函数的原始形态。这样就可以避免我们的调用被`CyMemDef64.dll`拦截，顺利进入内核模式。
+
+### Ntdll IAT Hook
+另一种方法是创建一个新的函数，功能与重新打补丁类似，但不覆盖被hook的函数，而是在其他地方重新创建该函数。然后遍历`ntdll`的导入地址表（IAT），将`NtReadVirtualMemory`对应的指针指向我们新创建的`fixed_NtReadVirtualMemory`函数。这种方法的优点在于，即使EDR检查hook机制是否正常，也会发现hook机制没有被修改，目标函数永远不会被调用。
+
+## 六、处理结果
+我选择了第一种方法，因为它简单且能快速解决问题。经过处理后，我的`AndrewSpecial.exe`程序再也不会被拦截，如下图所示：
+
+## 七、总结
+本文介绍的方法适用于特定的EDR产品，但也可以逆向分析其他EDR产品，开发通用的绕过方法。由于KPP的存在，这些产品不能hook所有目标函数。此外，这种方法同样适用于64位和32位系统（已在所有Windows版本上测试过）。源代码可从[此处](https://github.com/hoangprod/AndrewSpecial/tree/master)下载。

@@ -1,89 +1,98 @@
-    * 一些硬件设备可能公开一个MMIO接口，该接口本身足够强大，可以构建某种读/写原语;但是，我不知道有任何这样的组件。
-因此，我们将需要映射多个物理地址，并且很可能需要使用从一个映射读取的数据来查找另一个映射的物理地址。也就是说，我们的映射原语不能是一次性的。
-  * 4.在for循环尝试将vm_map_copy_insert()复制到vm_map_copy_zone后，调用vm_map_copy_insert。因为KERNEL_BUFFER对象最初是使用kalloc()分配的，所以如果vm_map_copy的初始类型是KERNEL_BUFFER，这将导致死机。
-###  PAN 捷径
-单字节技术的一个重要前提条件是在已知地址上创建一个fake
-vm_map_entry对象。因为我们已经在oob_timestamp上构建了这个POC，因此我决定使用在利用那个bug时学到的一个技巧。在实际情况中，除了单字节溢出之外，可能还需要另一个漏洞来泄漏内核地址。
-在为oob_timestamp开发POC时，我了解到AGXAccelerator内核扩展提供了一个非常好的原语:OAccelSharedUserClient2和IOAccelCommandQueue2同时允许在用户空间和内核之间共享大范围的分页内存。访问用户/内核共享内存在开发exploits时非常有用，因为您可以在那里放置伪造的内核数据结构，并在内核访问它们时对它们进行操作。当然，这个AGXAccelerator原语并不是获得内核/用户共享内存的唯一方法；例如physmap还将大部分DRAM映射到虚拟内存中，因此它也可以用于将用户空间内存内容映射到内核中。但是，AGXAccelerator原语在实践中要方便得多：首先，它在一个受约束的地址范围内提供了一个非常大的连续内存共享区域；其次，它更容易泄漏相邻对象的地址来定位它。
-在iPhone 7之前，iOS设备不支持PAN(Privileged Access
-Never),也就是说所有的用户空间都是与内核共享内存的，您可以重写内核中的指针指向用户空间中伪造的数据结构。
-但是，当前iOS设备启用了PAN，因此内核直接访问用户空间内存将会直接出错。这就是AGXAccelerator共享内存原语非常好用的原因:如果您可以构建一个较大的共享内存区域并知道其在内核中的地址，基本上等同于关闭了PAN。
-当然，这句话的一个关键部分是“在内核中学习它的地址”；这样做通常需要一个漏洞。相反，由于我们已经依赖于oob_timestamp，我们将对共享内存地址进行简单的硬编码，动态地查找地址留给读者作为练习。
-###  POC panicking
-有了内核读/写和用户/内核共享内存缓冲区后，我们就可以编写POC了。
-我们首先在内核中创建共享内存区域，我们在共享内存中初始化一个伪造的vm_map_entry列表。列表包含3个条目:一个”ready”，一个”mapping”和一个”done”，这些条目表示每个映射操作的当前状态。
-我们在Mach消息中包含一个伪造的vm_map_header的内存描述符发送到保留端口，外部内存作为vm_map_copy对象存储在内核中，该对象的类型为KERNEL_BUFFER(值为3)。
-我们模拟了一个单字节的堆溢出，该溢出会破坏 vm_map_copy 的 type 字段，并将其更改为ENTRY_LIST（值为1）。
-我们启动一个线程，它接收在保留端口上的Mach消息。这会在破坏的vm_map_copy上触发对vm_map_copyout_internal()的调用。
-由于vm_map_entry列表初始化的配置，vm_map_copyout线程将在“done”条目上无限循环，为我们操作它做好准备。
-此时，我们有一个内核线程正在准备映射所需的任何物理页面。
-要映射一个页面，我们首先将“ready”条目设置为链接到它本身，然后将“done”条目设置为链接到“ready”条目。这将导致vm_map_copyout线程转换为”ready”。
-在转换“ready”时，我们将“mapping”条目标记为与单个物理页面连接，并将其链接到“done”条目，我们将该条目链接到自身。我们还要填充伪造的vm_object和vm_page，以映射所需的物理页码。
-然后，我们可以通过将“ready”条目链接到“mapping”条目来执行映射。vm_map_copyout_internal()将映射到页面中，然后在“done”条目上转换，表示完成。
-这为我们提供了一个可重用的原语，该原语将任意物理地址映射到进程中。作为初步的Poc,我映射了不存在的物理地址0x414140000并试图从中读取，从而触发EL0de
-LLC总线错误：
-至此，我们已经证明了映射原语是正确的，但我们仍然不知道如何处理它。
-我首先想到的是，最简单的方法是在内存中查找kernelcache
-image。请注意，在目前的iphone上，即使使用直接的物理读/写原语，KTRR也会阻止我们修改内核image锁定的部分，因此我们不能仅仅修补内核的可执行代码。但是，kernelcache
-image的某些段在运行时仍然是可写的，包括含有sysctls的部分数据段。因为sysctls以前就被用于构建读/写原语，所以感觉这是一个稳定的方向。
-接下来的挑战是使用映射原语在物理内存中定位kernelcache，这样sysctl结构就可以映射到用户空间并进行修改。但首先，在我们弄清楚如何定位kernelcache之前，先来了解一下iPhone
-11 Pro的物理内存知识。
-iPhone 11 Pro在物理地址0x80000000有4GB的DRAM，因此物理DRAM地址的范围从0x800000000 到
-0x900000000。其中，0x801b80000 到0x8ec9b4000
-保留给应用处理器（AP），它是运行XNU内核和手机应用程序的主处理器。这个区域之外的内存为协处理器保留，例如：AOP(Always On
-Processor)、ANE(Apple Neural Engine)、SIO (possibly Apple SmartIO)、 AVE、ISP、
-IOP等。这些和其他区域的地址可以通过解析devicetree或在DRAM开始转储iboot-handoff区域来找到。
-在boot时，kernelcache被连续加载到物理内存中，也就是说找到一个kernelcache页面就足以定位整个image了。另外，虽然KASLR可能会在虚拟内存中大量地减少kernelcache，但物理内存中的加载地址是相当有限的：在我的测试中，内核header总是加载在0x805000000和0x807000000之间的地址，范围只有32MB。
-事实证明，此范围比内核缓存本身小，为 0x23d4000
-字节，即35.8MB。因此，我们可以确定在运行时地址0x807000000包含一个kernelcache页面。
-但是，在尝试映射kernelcache时，我很快陷入了panic：
-    panic(cpu 4 caller 0xfffffff0156f0c98): "pmap_enter_options_internal: page belongs to PPL, " "pmap=0xfffffff031a581d0, v=0x3bb844000, pn=2103160, prot=0x3, fault_type=0x3, flags=0x0, wired=1, options=0x1"
-该panic字符串似乎来自于pmap_enter_options_internal（）函数，它位于XNU(osfmk/arm/pmap.c)的源代码中，但是源代码中没有出现panic。因此，我逆向了kernelcache中的pmap_enter_options_internal()，以了解发生了什么。
-我了解到，问题在于我试图映射的page是Apple PPL（Protection Layer
-）中的一部分，该page是XNU内核的一部分，用于管理页面表，它被认为比内核的其他部分拥有更大的权限。PPL的目标是防止攻击者修改受保护的page。
-为了使受保护的pages不能被修改，PPL必须保护页表和页表元数据。因此，当我试图将一个受ppl保护的page映射到用户空间时，引发了panic。
-    if (pa_test_bits(pa, 0x4000 /* PP_ATTR_PPL? */)) {
-        panic("%s: page belongs to PPL, " ...);
-    }
-    if (pvh_get_flags(pai_to_pvh(pai)) & PVH_FLAG_LOCKDOWN) {
-        panic("%s: page locked down, " ...);
-    }
-PPL的存在使物理映射原语的使用更在复杂，因为尝试映射受PPL保护的页面将引起panic。而且kernelcache本身包含许多受ppl保护的page，将连续的35
-MB二进制文件拆分为较小的 PPL-free
-块，这些块不再桥接kernelcache的物理结构。因此，我们不再可以映射一个kernelcache页面的物理地址。
-而其他DRAM区域也是一个同样危险的雷区。PPL会抓取物理页面以供使用，并根据需要返回到内核，因此在运行时，PPL页面就像地雷一样分散在物理内存中。因此，在任何地方都没有确保不会被破坏的静态地址。
-在A13上的AP
-DRAM的每一页上显示保护标志的map。黄色为PPL+LOCKDOWN，红色为PPL，绿色为LOCKDOWN，蓝色为unguarded(可映射)。
-## 0x03 两种技术
-###  DRAM 保护之路
-然而，这并不完全正确。应用程序处理器的DRAM区域可能是一个雷区，但在它之外的任何区域都不是。这包括协处理器使用的DRAM，以及系统任何其他的寻址组件，比如通过memory-mapped I/O (MMIO)访问系统组件的硬件寄存器。
-有了这么强大的原语，我希望可以使用多种技术来构建读/写原语。我希望通过直接访问特殊的硬件寄存器和协同处理器，可以完成许多事情。不幸的是，这不是我非常熟悉的领域，因此在这里我将介绍一次绕过PPL的尝试（失败）。
+### 硬件设备与MMIO接口
+某些硬件设备可能公开一个内存映射I/O (MMIO)接口，该接口本身足够强大，可以构建某种读/写原语。然而，目前尚无已知的组件具备这种特性。因此，我们需要映射多个物理地址，并且很可能需要使用从一个映射读取的数据来查找另一个映射的物理地址。这意味着我们的映射原语不能是一次性的。
+
+在for循环中尝试将`vm_map_copy_insert()`复制到`vm_map_copy_zone`后，调用`vm_map_copy_insert`。由于`KERNEL_BUFFER`对象最初是通过`kalloc()`分配的，如果`vm_map_copy`的初始类型为`KERNEL_BUFFER`，这将导致系统崩溃。
+
+### PAN 捷径
+单字节技术的一个重要前提条件是在已知地址上创建一个伪造的`vm_map_entry`对象。因为在开发oob_timestamp POC时已经构建了这个前提条件，所以我决定采用当时学到的一种技巧。实际上，在处理单字节溢出之外，通常还需要另一个漏洞来泄漏内核地址。
+
+在为oob_timestamp开发POC的过程中，我了解到AGXAccelerator内核扩展提供了一个非常有用的原语：`OAccelSharedUserClient2`和`IOAccelCommandQueue2`允许用户空间和内核之间共享大范围的分页内存。访问用户/内核共享内存在开发exploits时非常有用，因为您可以在那里放置伪造的内核数据结构，并在内核访问它们时进行操作。当然，AGXAccelerator原语并不是获得内核/用户共享内存的唯一方法；例如，physmap也将大部分DRAM映射到虚拟内存中，从而可以将用户空间内存内容映射到内核中。然而，AGXAccelerator原语在实践中更为方便：首先，它在一个受约束的地址范围内提供了一个非常大的连续内存共享区域；其次，它更容易泄漏相邻对象的地址以定位共享内存。
+
+在iPhone 7之前，iOS设备不支持PAN（Privileged Access Never），即所有用户空间都与内核共享内存，您可以重写内核中的指针指向用户空间中的伪造数据结构。但当前的iOS设备启用了PAN，直接访问用户空间内存会导致错误。这就是为什么AGXAccelerator共享内存原语特别有用：如果您能构建一个较大的共享内存区域并知道其在内核中的地址，基本上等同于关闭了PAN。
+
+当然，关键在于“在内核中学习它的地址”；这通常需要一个漏洞。由于我们依赖于oob_timestamp，我们将对共享内存地址进行硬编码，动态查找地址留给读者作为练习。
+
+### POC panicking
+有了内核读/写和用户/内核共享内存缓冲区后，我们可以编写POC。首先在内核中创建共享内存区域，并在共享内存中初始化一个伪造的`vm_map_entry`列表。列表包含三个条目：“ready”、“mapping”和“done”，这些条目表示每个映射操作的当前状态。
+
+我们在Mach消息中包含一个伪造的`vm_map_header`的内存描述符发送到保留端口，外部内存作为`vm_map_copy`对象存储在内核中，其类型为`KERNEL_BUFFER`（值为3）。模拟单字节堆溢出，破坏`vm_map_copy`的`type`字段，并将其更改为`ENTRY_LIST`（值为1）。
+
+启动一个线程接收保留端口上的Mach消息，触发对`vm_map_copyout_internal()`的调用。由于`vm_map_entry`列表的配置，`vm_map_copyout`线程将在“done”条目上无限循环，为我们操作做好准备。
+
+此时，我们有一个内核线程正在准备映射所需的任何物理页面。要映射一个页面，首先将“ready”条目设置为链接到自身，然后将“done”条目设置为链接到“ready”条目，使`vm_map_copyout`线程转换为“ready”。
+
+在转换“ready”时，将“mapping”条目标记为与单个物理页面连接，并将其链接到“done”条目，再将“done”条目链接到自身。填充伪造的`vm_object`和`vm_page`以映射所需的物理页码。然后，通过将“ready”条目链接到“mapping”条目来执行映射。`vm_map_copyout_internal()`将映射到页面中，然后在“done”条目上转换，表示完成。
+
+这为我们提供了一个可重用的原语，将任意物理地址映射到进程中。作为初步的POC，我映射了不存在的物理地址0x414140000并试图从中读取，从而触发EL0de LLC总线错误。至此，我们已经证明了映射原语的正确性，但仍需进一步探索如何利用它。
+
+### Kernelcache 映射
+最简单的方法是在内存中查找kernelcache image。请注意，在当前iPhone上，即使使用直接的物理读/写原语，KTRR也会阻止我们修改内核image锁定的部分，因此我们不能仅修补内核的可执行代码。但是，kernelcache image的某些段在运行时仍然是可写的，包括含有sysctls的部分数据段。因为sysctls以前被用于构建读/写原语，所以这是一个稳定的方向。
+
+接下来的挑战是使用映射原语在物理内存中定位kernelcache，以便将sysctl结构映射到用户空间并进行修改。但在弄清楚如何定位kernelcache之前，先了解iPhone 11 Pro的物理内存知识。
+
+iPhone 11 Pro在物理地址0x80000000有4GB的DRAM，因此物理DRAM地址的范围从0x800000000 到 0x900000000。其中，0x801b80000 到 0x8ec9b4000 保留给应用处理器（AP），它是运行XNU内核和手机应用程序的主处理器。这个区域之外的内存为协处理器保留，例如AOP（Always On Processor）、ANE（Apple Neural Engine）、SIO（可能是Apple SmartIO）、AVE、ISP、IOP等。这些和其他区域的地址可以通过解析devicetree或在DRAM开始转储iboot-handoff区域来找到。
+
+在启动时，kernelcache被连续加载到物理内存中，找到一个kernelcache页面就足以定位整个image。尽管KASLR可能会在虚拟内存中大量减少kernelcache，但物理内存中的加载地址相对有限：在我的测试中，内核header总是加载在0x805000000和0x807000000之间的地址，范围只有32MB。事实上，此范围比内核缓存本身小，为0x23d4000字节，即35.8MB。因此，我们可以确定在运行时地址0x807000000包含一个kernelcache页面。
+
+但在尝试映射kernelcache时，我遇到了panic：
+```
+panic(cpu 4 caller 0xfffffff0156f0c98): "pmap_enter_options_internal: page belongs to PPL, " "pmap=0xfffffff031a581d0, v=0x3bb844000, pn=2103160, prot=0x3, fault_type=0x3, flags=0x0, wired=1, options=0x1"
+```
+
+该panic字符串来自`pmap_enter_options_internal()`函数，位于XNU(osfmk/arm/pmap.c)的源代码中，但源代码中没有出现panic。因此，我逆向了kernelcache中的`pmap_enter_options_internal()`，发现问题是尝试映射的page属于Apple PPL（Protection Layer），这是XNU内核的一部分，用于管理页面表，具有更大的权限。PPL的目标是防止攻击者修改受保护的page。
+
+为了使受保护的pages不能被修改，PPL必须保护页表和页表元数据。当我试图将一个受PPL保护的page映射到用户空间时，引发了panic：
+```c
+if (pa_test_bits(pa, 0x4000 /* PP_ATTR_PPL? */)) {
+    panic("%s: page belongs to PPL, " ...);
+}
+if (pvh_get_flags(pai_to_pvh(pai)) & PVH_FLAG_LOCKDOWN) {
+    panic("%s: page locked down, " ...);
+}
+```
+
+PPL的存在使物理映射原语的使用更加复杂，因为尝试映射受PPL保护的页面将引起panic。而且kernelcache本身包含许多受PPL保护的page，将连续的35 MB二进制文件拆分为较小的PPL-free块，这些块不再桥接kernelcache的物理结构。因此，我们不能再映射一个kernelcache页面的物理地址。
+
+其他DRAM区域也是一个危险的雷区。PPL会抓取物理页面以供使用，并根据需要返回到内核，因此在运行时，PPL页面像地雷一样分散在物理内存中。因此，在任何地方都没有确保不会被破坏的静态地址。
+
+### DRAM 保护之路
+虽然应用程序处理器的DRAM区域可能是一个雷区，但在它之外的任何区域都不是。这包括协处理器使用的DRAM，以及系统任何其他的寻址组件，比如通过memory-mapped I/O (MMIO)访问系统组件的硬件寄存器。
+
+我希望可以使用多种技术来构建读/写原语。通过直接访问特殊的硬件寄存器和协同处理器，可以完成许多事情。不幸的是，这不是我非常熟悉的领域，因此在这里我将介绍一次绕过PPL的尝试（失败）。
+
 我的想法是控制一些协处理器，同时使用协处理器和AP上的执行来攻击内核。首先，我们使用物理映射原语来修改DRAM中协处理器存储数据的部分，以便在该协处理器上执行代码。接下来，回到主处理器上，我们再次使用映射原语来映射和禁用协处理器的设备地址解析表或DART（基本上是IOMMU）。在协处理器上执行代码并禁用了相应的DART的情况下，我们可以从协处理器直接无保护地访问物理内存，从而使我们能够完全避开对PPL的保护（PPL只在AP上执行）。
-然而，每当我试图修改协处理器使用的DRAM的某些区域时，我就会遇到内核panic，特别是区域0x800000000 –
-0x801564000看起来是只读的:
-    panic(cpu 5 caller 0xfffffff0189fc598): "LLC Bus error from cpu1: FAR=0x16f507f10 LLC_ERR_STS/ADR/INF=0x11000ffc00000080/0x214000800000000/0x1 addr=0x800000000 cmd=0x14(acc_cifl2c_cmd_ncwr)"
-    panic(cpu 5 caller 0xfffffff020ca4598): "LLC Bus error from cpu1: FAR=0x15f03c000 LLC_ERR_STS/ADR/INF=0x11000ffc00000080/0x214030800104000/0x1 addr=0x800104000 cmd=0x14(acc_cifl2c_cmd_ncwr)"
-    panic(cpu 5 caller 0xfffffff02997c598): "LLC Bus error from cpu1: FAR=0x10a024000 LLC_ERR_STS/ADR/INF=0x11000ffc00000082/0x21400080154c000/0x1 addr=0x80154c000 cmd=0x14(acc_cifl2c_cmd_ncwr)"
-这是非常奇怪的:这些地址在KTRR锁定区域之外，所以没有任何内容能够阻止对DRAM这部分的写操作。因此，必须在此物理范围上强制执行其他一些未记录的锁定。
+
+然而，每当我试图修改协处理器使用的DRAM的某些区域时，都会遇到内核panic，特别是区域0x800000000 – 0x801564000看起来是只读的：
+```
+panic(cpu 5 caller 0xfffffff0189fc598): "LLC Bus error from cpu1: FAR=0x16f507f10 LLC_ERR_STS/ADR/INF=0x11000ffc00000080/0x214000800000000/0x1 addr=0x800000000 cmd=0x14(acc_cifl2c_cmd_ncwr)"
+panic(cpu 5 caller 0xfffffff020ca4598): "LLC Bus error from cpu1: FAR=0x15f03c000 LLC_ERR_STS/ADR/INF=0x11000ffc00000080/0x214030800104000/0x1 addr=0x800104000 cmd=0x14(acc_cifl2c_cmd_ncwr)"
+panic(cpu 5 caller 0xfffffff02997c598): "LLC Bus error from cpu1: FAR=0x10a024000 LLC_ERR_STS/ADR/INF=0x11000ffc00000082/0x21400080154c000/0x1 addr=0x80154c000 cmd=0x14(acc_cifl2c_cmd_ncwr)"
+```
+
+这是非常奇怪的：这些地址在KTRR锁定区域之外，没有任何内容阻止对DRAM这部分的写操作。因此，必须在此物理范围上强制执行其他一些未记录的锁定。
+
 另一方面，0x801564000-0x801b80000仍然是可写的，对这个区域的不同区域写入会产生奇怪的系统行为，这支持了协处理器使用的数据被破坏的理论。例如，在某些区域写入会导致相机和手电筒失去响应，而在其他区域写入会导致手机在开启静音滑块时出现panic。
-为了方便了解可能发生的情况，我通过检查devicetree并dump内存来确定这个范围内的区域。最后，我发现在0x800000000 –
-0x801b80000范围内的协处理器固件段布局如下:
-因此，被锁定的区域都是协处理器固件的所有 **TEXT 段,这表明，苹果已经增加了一个新的缓解措施，使协处理器** TEXT
-段在物理内存中只读，类似于AMCC(可能是苹果的内存控制器)上的KTRR，但不只是针对AP内核，而是针对协处理器固件。这可能是之前发布的xnu-6153.41.3源代码中引用的未记录的CTRR缓解措施，它似乎是A12及更高版本上KTRR的增强版；Ian
-Beer建议CTRR可以表示协处理器Text只读区域。
-然而，在这些协处理器上执行代码应该仍然是可行的：就像KTRR不能阻止AP上的利用一样，协处理器 Text
-锁定缓解也不能阻止对协处理器的攻击。因此，即使这种缓解会使事情变得更困难，但此时我们禁用DART并使用协处理器上的代码执行来写入受PPL保护的物理地址的方案，应该仍然可行。
-###  PPL的影响
-但是，PPL在应用程序处理器上强制执行的DART/IOMMU锁定确实是一个障碍。在boot时，XNU解析devicetree中的“pmap-io-ranges”属性来填充io_attr_table数组，该数组存储特定物理I/O地址的页面属性。然后，当尝试映射物理地址时，pmap_enter_options_internal()检查属性，看看是否应该不允许某些映射:
-    wimg_bits = pmap_cache_attributes(pn); // checks io_attr_table
-    if ( flags )
-        wimg_bits = wimg_bits & 0xFFFFFF00 | (u8)flags;
-    pte |= wimg_to_pte(wimg_bits);
-    if ( wimg_bits & 0x4000 )
-    {
-        xprr_perm = (pte >> 4) & 0xC | (pte >> 53) & 1 | (pte >> 53) & 2;
-        if ( xprr_perm == 0xB )
-            pte_perm_bits = 0x20000000000080LL;
-        else if ( xprr_perm == 3 )
-            pte_perm_bits = 0x20000000000000LL;
-        else
+
+为了方便了解可能发生的情况，我通过检查devicetree并dump内存来确定这个范围内的区域。最后，我发现0x800000000 – 0x801b80000范围内的协处理器固件段布局如下：
+
+被锁定的区域都是协处理器固件的所有**TEXT段**，这表明苹果增加了一个新的缓解措施，使协处理器**TEXT段**在物理内存中只读，类似于AMCC（可能是苹果的内存控制器）上的KTRR，但不只是针对AP内核，而是针对协处理器固件。这可能是之前发布的xnu-6153.41.3源代码中引用的未记录的CTRR缓解措施，似乎是A12及更高版本上KTRR的增强版；Ian Beer建议CTRR可以表示协处理器Text只读区域。
+
+然而，在这些协处理器上执行代码应该仍然是可行的：就像KTRR不能阻止AP上的利用一样，协处理器**TEXT锁定缓解**也不能阻止对协处理器的攻击。因此，即使这种缓解会使事情变得更困难，但此时我们禁用DART并使用协处理器上的代码执行来写入受PPL保护的物理地址的方案，应该仍然可行。
+
+### PPL的影响
+PPL在应用程序处理器上强制执行的DART/IOMMU锁定确实是一个障碍。在启动时，XNU解析devicetree中的“pmap-io-ranges”属性来填充`io_attr_table`数组，该数组存储特定物理I/O地址的页面属性。当尝试映射物理地址时，`pmap_enter_options_internal()`检查属性，看看是否应该不允许某些映射：
+```c
+wimg_bits = pmap_cache_attributes(pn); // checks io_attr_table
+if (flags)
+    wimg_bits = wimg_bits & 0xFFFFFF00 | (u8)flags;
+pte |= wimg_to_pte(wimg_bits);
+if (wimg_bits & 0x4000) {
+    xprr_perm = (pte >> 4) & 0xC | (pte >> 53) & 1 | (pte >> 53) & 2;
+    if (xprr_perm == 0xB)
+        pte_perm_bits = 0x20000000000080LL;
+    else if (xprr_perm == 3)
+        pte_perm_bits = 0x20000000000000LL;
+    else
+```
+
+这段代码显示了PPL如何影响物理地址映射，使得某些区域无法被映射。

@@ -1,0 +1,51 @@
+从上一节的最后一个图中可以看出，越界写覆盖了两个未分配的内存字节。在 V8 引擎中，New Space 内的对象是顺序分配的，且在代码片段 3 的第二步和第三步之间没有分配新的对象。因此，`RawOneByteString` 后面总是存在未分配的内存空间，修改这些未分配的数据毫无意义。关键问题在于如何使 `RawOneByteString` 对象后的内容变成有意义的数据，从而实现从越界写到任意地址写。
+
+### 方法一：通过触发垃圾回收（GC）来改变内存布局
+
+一种思路是在分配 `RawOneByteString` 时触发一次 GC，使得新分配的对象被重新拷贝，从而使它之后的内存变为已分配的其他对象。然而，经过深入分析发现这种方法不可行。因为在 New Space 中，一个新分配的对象第一次 GC 拷贝仅在 from space 和 to space 之间移动，仍处于 New Space 内部，拷贝后的 `RawOneByteString` 之后的内存仍然是未分配的。
+
+### 方法二：越界写跨越 New Space 边界
+
+另一种方法是越界写越过 New Space 边界，改写非 New Space 内存的数据。这需要紧跟在 New Space 之后的内存区间是映射并可写的。New Space 的内存范围不连续，每个基本块大小为 1MB，最大可达 16MB，因此可以选择写过任意一个基本块的边界。我们需要通过地址空间布局将要覆盖的内容映射到 New Space 基本块之后。将 Large Space 的基本块映射到 New Space 基本块之后是一个较好的选择，这样可以覆盖 Large Space 中的堆对象。
+
+#### 障碍及解决方法
+
+然而，Chrome 在分配堆的基本块时使用随机值作为第一个参数，导致 New Space 和 Large Space 分配的基本块位置随机，Large Space 基本块恰好位于 New Space 之后的概率很小。为此，我们采用了两种技巧：
+
+1. **使用 Web Worker**：Web Worker 是独立的 JS 实例，每个 Web Worker 的 New Space 地址空间不同。如果当前 Web Worker 的 New Space 无法满足条件，我们可以结束该实例并启动一个新的 Web Worker，期望其内存布局更符合要求。
+2. **暴力风水**：与堆喷射不同，暴力风水的方法是先获取 16 个 New Space 基本块的地址，然后尝试分配一个 Large Space 基本块。通过分配超长字符串来分配 Large Space 基本块，并判断其是否位于某个 New Space 基本块之后。如果不是，则释放该 Large Space 基本块并重新分配，直到满足条件。记住满足条件的 Large Space 基本块之上的 New Space 基本块地址，在此 New Space 基本块中触发越界写，覆盖紧随其后的 Large Space 基本块。
+
+### 实现任意地址读写
+
+当在 V8 中分配一个特别大的 JS 对象（大于 `kMaxRegularHeapObjectSize == 507136`）时，该对象会分配在 Large Space 中。在 Large Space 基本块中，分配的 v8 对象距离基本块首地址的偏移量为 `0x8100`，前 `0x8100` 个字节是基本块的头部。为了实现任意地址读写，只需将 Large Space 中的超长字符串对象修改成 `JSArrayBuffer` 对象。在改写前需要保存基本块的头部，在改写后恢复，以确保只修改对象而不破坏基本块的元数据。
+
+### 精确覆盖 Large Space 基本块中的超长字符串
+
+根据 `unescape` 的解码规则，构造一个越界串，其起始地址为 `border-0x40000`，结束地址为 `border-0x2018`。其中，`border-0x40000` 到 `border-0x20000` 范围是已分配并已初始化的内存，存储了编码后的 `JSArrayBuffer` 对象和辅助填充数据 "a"，`border-0x20000` 到 `border-0x2018` 是未分配内存，存储堆喷后的残留数据 "a"。整个越界串的内容都是以 `%xxy` 的形式存在，y 不是字符 %，整个越界串的长度为 `(0x40000-0x2018)`。执行完 `unescape` 后，内存布局如下：
+
+- 解码 `border-0x40000` 到 `border-0x20000` 的内容，长度减半，解码后写的地址范围为 `border-0x20000+0xc` 到 `border-0x10000+0xc`，解码后的 `JSArrayBuffer` 位于 `border-0x17f18`。
+- 解码 `border-0x20000` 到 `border-0x10000` 的内容，长度不变，解码后写的地址范围为 `border-0x10000+0xc` 到 `border+0xc`，解码后的 `JSArrayBuffer` 位于 `border-0x7f0c`。
+- 解码 `border-0x10000` 到 `border-0x2018` 的内容，长度不变，解码后写的地址范围为 `border+0xc` 到 `border+0xdfe8`，解码后的 `JSArrayBuffer` 位于 `border+0x8100`，覆盖了 Large Space 中的超长字符串对象。
+
+### 任意地址读写到任意代码执行
+
+有了任意地址读写的能力，将其转换为任意代码执行非常简单。Chrome 中 JIT 代码所在的页具有 rwx 属性，只需找到这样的页并覆盖 JIT 代码即可执行 ShellCode。找到 JIT 代码也很容易，通过 `JSFunction` 对象的 `kCodeEntryOffset` 可以获取 JIT 代码的地址。
+
+### 总结
+
+本文从一个微小的逻辑漏洞出发，详细介绍了如何克服重重障碍，利用这个漏洞实现稳定的任意代码执行。文中所述的将越界读漏洞转换为越界写漏洞的思路，也可以应用于其他信息泄露漏洞。对于具体的利用细节，本文还有很多未提及之处，感兴趣的读者可以参考相关资料。
+
+### 引用
+[1] [2]
+[3]  
+[4]
+[5]
+[6]
+[7]
+[8]
+[9]  
+[10]
+
+---
+
+希望优化后的文本更加清晰、连贯和专业。如果有任何进一步的修改需求，请告诉我！

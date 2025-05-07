@@ -1,331 +1,177 @@
-Virtunoid: Breaking out of KVM
-Nelson Elhage
+### Virtunoid: Breaking out of KVM
+**Nelson Elhage**  
 July 25, 2011
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
+
+---
+
+### Outline
+1. **KVM: Architecture Overview**
+   - Components
+   - Control Flow
+   - Attack Surface
+2. **CVE-2011-1751: The Bug**
+3. **virtunoid.c: The Exploit**
+   - %rip Control
+   - Getting to Shellcode
+   - Bypassing ASLR
+4. **Conclusions and Further Research**
+5. **Demo**
+
+---
+
+### KVM: Architecture Overview
+
+#### KVM: The Components
+- **kvm.ko**: The core KVM kernel module.
+  - Provides ioctls for communicating with the kernel module.
+  - Primarily responsible for emulating the virtual CPU and MMU.
+  - Emulates a few devices in-kernel for efficiency.
+  - Contains an emulator for a subset of x86 used in handling certain traps.
+- **kvm-intel.ko / kvm-amd.ko**: 
+  - Provides support for Intel's VMX and AMD's SVM virtualization extensions.
+  - Relatively small compared to the rest of KVM (one .c file each).
+- **qemu-kvm**:
+  - Provides the most direct user interface to KVM.
+  - Based on the classic qemu x86 emulator.
+  - Implements the bulk of the virtual devices a VM uses.
+  - An order of magnitude more code than the kernel module.
+
+#### Control Flow
+- [Detailed control flow diagram or description]
+
+#### Attack Surface
+- **kvm.ko**:
+  - A tempting target – successful exploitation gets ring0 on the host without further escalation.
+  - Much less code than qemu-kvm, and much of that is dedicated to interfacing with qemu-kvm, not the guest directly.
+  - The x86 emulator is an interesting target.
+  - Several bugs have been discovered allowing privilege escalation within the guest.
+  - Not the target of this talk, but potential for future work.
+- **qemu-kvm**:
+  - A veritable goldmine of targets.
+  - Hundreds of thousands of lines of device emulation code.
+  - Emulated devices communicate directly with the guest via MMIO or IO ports, providing a large attack surface.
+  - Much of the code comes straight from qemu and is ancient.
+  - Often sandboxed using SELinux or similar, requiring a second privilege escalation within the host.
+  - Many bugs have been found here.
+
+---
+
+### CVE-2011-1751: The Bug
+
+- **RHSA-2011:0534-1**:
+  - "It was found that the PIIX4 Power Management emulation layer in qemu-kvm did not properly check for hot plug eligibility during device removals. A privileged guest user could use this flaw to crash the guest or, possibly, execute arbitrary code on the host. (CVE-2011-1751)"
+
+- **Patch**:
+  ```diff
+  diff --git a/hw/acpi_piix4.c b/hw/acpi_piix4.c
+  index 96f5222..6c908ff 100644
+  --- a/hw/acpi_piix4.c
+  +++ b/hw/acpi_piix4.c
+  @@ -471,11 +471,13 @@
+     static void pcie_jwrite(void *opaque, uint32_t addr, uint32_t val) {
+         BusState *bus = opaque;
+         DeviceState *qdev, *next;
+         PCIDevice *dev;
+  +        PCIDeviceInfo *info;
+         int slot = ffs(val) - 1;
+         QLIST_FOREACH_SAFE(qdev, &bus->children, sibling, next) {
+             dev = DO_UPCAST(PCIDevice, qdev, qdev);
+  -        if (PCI_SLOT(dev->devfn) == slot) {
+  +        info = container_of(qdev->info, PCIDeviceInfo, qdev);
+  +        if (PCI_SLOT(dev->devfn) == slot && !info->no_hotplug) {
+                 qdev_free(qdev);
+             }
+         }
+  ```
+
+- **PIIX4**:
+  - A Southbridge chip used in many circa-2000 Intel chipsets.
+  - The default southbridge emulated by qemu-kvm.
+  - Includes ACPI support, a PCI-ISA bridge, an embedded MC146818 RTC, and more.
+
+- **Device Hotplug**:
+  - The PIIX4 supports PCI hotplug, implemented by writing values to IO port 0xae08.
+  - qemu-kvm emulates this by calling `qdev_free(qdev);`, which should ensure the device is properly disconnected.
+  - Certain devices do not properly support being hotplugged, but KVM previously did not check this before freeing them.
+
+- **The PCI-ISA Bridge**:
+  - It should not be possible to unplug the ISA bridge.
+  - The emulated MC146818 RTC hangs off the ISA bridge.
+  - KVM’s emulated RTC is not designed to be unplugged; it leaves behind dangling `QEMUTimer` objects when unplugged.
+
+- **The Real-Time Clock (RTC)**:
+  - Structure definition:
+    ```c
+    typedef struct RTCState {
+        uint8_t cmos_data[128];
+        // ...
+        int64_t next_second_time;
+        // ...
+        QEMUTimer *second_timer;
+        QEMUTimer *second_timer2;
+    } RTCState;
+    ```
+  - Initialization function:
+    ```c
+    static int rtc_init_fn(ISADevice *dev) {
+        RTCState *s = DO_UPCAST(RTCState, dev, dev);
+        // ...
+        s->second_timer = qemu_new_timer_ns(rtc_clock, rtc_update_second, s);
+        s->second_timer2 = qemu_new_timer_ns(rtc_clock, rtc_update_second2, s);
+        s->next_second_time = qemu_get_clock_ns(rtc_clock) + (get_ticks_per_sec() * 99) / 100;
+        qemu_mod_timer(s->second_timer2, s->next_second_time);
+        // ...
+    }
+    ```
+
+- **QEMUTimer**:
+  - Structure definition:
+    ```c
+    struct QEMUTimer {
+        QEMUClock *clock;
+        int64_t expire_time; // in nanoseconds
+        QEMUTimerCB *cb;
+        void *opaque;
+        struct QEMUTimer *next;
+    };
+    ```
+
+- **Use-after-free**:
+  - Unplugging the virtual RTC frees the `RTCState`.
+  - It does not free or unregister either of the timers, leaving dangling pointers from the `QEMUTimers`.
+
+---
+
+### virtunoid.c: The Exploit
+
+- **%rip Control**:
+  - **High-level TODO**:
+    - Inject a controlled `QEMUTimer` into qemu-kvm at a known address.
+    - Eject the emulated ISA bridge.
+    - Force an allocation into the freed `RTCState`, with `second_timer` pointing at our dummy timer.
+  - **Injecting Data**:
+    - The guest’s RAM is backed by a simple `mmap()`ed region inside the host.
+    - [Further details on how to inject and control data]
+
+- **Getting to Shellcode**:
+  - [Details on how to achieve shellcode execution]
+
+- **Bypassing ASLR**:
+  - [Techniques and methods to bypass Address Space Layout Randomization (ASLR)]
+
+---
+
+### Conclusions and Further Research
+- [Summary of findings]
+- [Future research directions]
+
+---
+
+### Demo
+- [Live demonstration of the exploit]
+
+---
+
+**Nelson Elhage**  
+Virtunoid: Breaking out of KVM  
 July 25, 2011
-1 / 42
-Outline
-1
-KVM: Architecture overview
-Attack Surface
-2
-CVE-2011-1751: The bug
-3
-virtunoid.c: The exploit
-%rip control
-Getting to shellcode
-Bypassing ASLR
-4
-Conclusions and further research
-5
-Demo
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-2 / 42
-KVM: Architecture overview
-KVM: The components
-kvm.ko
-kvm-intel.ko / kvm-amd.ko
-qemu-kvm
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-3 / 42
-KVM: Architecture overview
-kvm.ko
-The core KVM kernel module
-Provides ioctls for communicating with the kernel module.
-Primarily responsible for emulating the virtual CPU and MMU
-Emulates a few devices in-kernel for eﬃciency.
-Contains an emulator for a subset of x86 used in handling certain
-traps (!)
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-4 / 42
-KVM: Architecture overview
-kvm-intel.ko / kvm-amd.ko
-Provides support for Intel’s VMX and AMD’s SVM virtualization
-extensions.
-Relatively small compared to the rest of KVM (one .c ﬁle each)
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-5 / 42
-KVM: Architecture overview
-qemu-kvm
-Provides the most direct user interface to KVM.
-Based on the classic qemu x86 emulator.
-Implements the bulk of the virtual devices a VM uses.
-Implements a wide variety of possible devices and buses.
-An order of magnitude more code than the kernel module.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-6 / 42
-KVM: Architecture overview
-Control ﬂow
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-7 / 42
-KVM: Architecture overview
-Attack Surface
-kvm.ko
-A tempting target – successful exploitation gets ring0 on the host
-without further escalation.
-Much less code than qemu-kvm, and much of that is dedicated to
-interfacing with qemu-kvm, not the guest directly.
-The x86 emulator is an interesting target.
-A number of bugs have been discovered allowing privesc within the
-guest.
-A lot of tricky code that is not often exercised.
-Not the target of this talk, but I have some ideas for future work.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-8 / 42
-KVM: Architecture overview
-Attack Surface
-qemu-kvm
-A veritable goldmine of targets.
-Hundreds of thousands of lines of device emulation code.
-Emulated devices communicate directly with the guest via MMIO or
-IO ports, lots of attack surface.
-Much of the code comes straight from qemu and is ancient.
-qemu-kvm is often sandboxed using SELinux or similar, meaning that
-successful exploitation will often require a second privesc within the
-host.
-(Fortunately, Linux never has any of those)
-Lots of bugs have been found here.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-9 / 42
-CVE-2011-1751: The bug
-RHSA-2011:0534-1
-“It was found that the PIIX4 Power Management emulation layer in
-qemu-kvm did not properly check for hot plug eligibility during device
-removals. A privileged guest user could use this ﬂaw to crash the guest or,
-possibly, execute arbitrary code on the host. (CVE-2011-1751)”
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-10 / 42
-CVE-2011-1751: The bug
-d i f f −−g i t
-a/hw/ a c p i p i i x 4 . c b/hw/ a c p i p i i x 4 . c
-index
-96 f5222 . . 6 c 9 0 8 f f
-100644
-−−− a/hw/ a c p i p i i x 4 . c
-+++ b/hw/ a c p i p i i x 4 . c
-@@ −471,11 +471 ,13 @@
-s t a t i c
-void
-p c i e j w r i t e ( void
-*opaque ,
-u i n t 3 2 t
-addr ,
-u i n t 3 2 t
-v a l )
-BusState *bus = opaque ;
-DeviceState
-*qdev ,
-* next ;
-PCIDevice *dev ;
-+
-PCIDeviceInfo
-* i n f o ;
-i n t
-s l o t = f f s ( v a l ) − 1;
-QLIST FOREACH SAFE( qdev , &bus−>c h i l d r e n ,
-s i b l i n g ,
-next ) {
-dev = DO UPCAST( PCIDevice ,
-qdev ,
-qdev ) ;
-−
-i f
-( PCI SLOT ( dev−>devfn ) == s l o t ) {
-+
-i n f o = c o n t a i n e r o f ( qdev−>info ,
-PCIDeviceInfo ,
-qdev ) ;
-+
-i f
-( PCI SLOT ( dev−>devfn ) == s l o t && ! info−>no hotplug ) {
-q d e v f r e e ( qdev ) ;
-}
-}
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-11 / 42
-CVE-2011-1751: The bug
-PIIX4
-The PIIX4 was a Southbridge chip used in many circa-2000 Intel
-chipsets.
-The default southbridge emulated by qemu-kvm
-Includes ACPI support, a PCI-ISA bridge, an embedded MC146818
-RTC, and much more.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-12 / 42
-CVE-2011-1751: The bug
-Device Hotplug
-The PIIX4 supports PCI hotplug, implemented by writing values to IO
-port 0xae08.
-qemu-kvm emulates this by calling qdev_free(qdev);, which is
-supposed to make sure the device is properly disconnected.
-Certain devices don’t properly support being hotplugged, but KVM
-previously didn’t check this before freeing them.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-13 / 42
-CVE-2011-1751: The bug
-The PCI-ISA bridge
-In particular, it should not be possible to unplug the ISA bridge.
-Among other things, the emulated MC146818 RTC hangs oﬀ the ISA
-bridge.
-KVM’s emulated RTC is not designed to be unplugged; In particular,
-it leaves around dangling QEMUTimer objects when unplugged.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-14 / 42
-CVE-2011-1751: The bug
-The real-time clock
-typedef
-s t r u c t
-RTCState {
-u i n t 8 t
-cmos data [ 1 2 8 ] ;
-. . .
-/* second
-update */
-i n t 6 4 t
-next second time ;
-. . .
-QEMUTimer * second timer ;
-QEMUTimer * second timer2 ;
-} RTCState ;
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-15 / 42
-CVE-2011-1751: The bug
-The real-time clock
-s t a t i c
-i n t
-r t c
-i n i t f n ( ISADevice *dev )
-{
-RTCState *s = DO UPCAST( RTCState ,
-dev ,
-dev ) ;
-. . .
-s−>s e c o n d t i m e r = qemu new timer ns ( r t c c l o c k ,
-r t c u p d a t e s ec o n d ,
-s ) ;
-s−>second ti mer2 = qemu new timer ns ( r t c c l o c k ,
-rtc update second2 ,
-s ) ;
-s−>n e x t s e c o n d t i m e =
-q em u get cl ock ns ( r t c c l o c k ) + ( g e t t i c k s p e r s e c ()
-* 99) /
-100;
-qemu mod timer ( s−>second timer2 ,
-s−>n e x t s e c o n d t i m e ) ;
-. . .
-}
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-16 / 42
-CVE-2011-1751: The bug
-QEMUTimer
-s t r u c t QEMUTimer {
-QEMUClock * clock ;
-i n t 6 4 t
-e x p i r e t i m e ;
-/*
-in
-nanoseconds */
-QEMUTimerCB *cb ;
-void *opaque ;
-s t r u c t QEMUTimer * next ;
-};
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-17 / 42
-CVE-2011-1751: The bug
-RTC timers
-...
-(s−>second_timer)
-rtc_update_second
-(s−>second_timer2)
-rtc_update_second2
-1.1s
-1s
-Update in progress
-Update in progress
-2s
-2.1s
-Time
-rtc_update_second
-(s−>second_timer)
-rtc_update_second2
-(s−>second_timer2)
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-18 / 42
-CVE-2011-1751: The bug
-Use-after-free
-Unplugging the virtual RTC free()s the RTCState
-It doesn’t free() or unregister either of the timers.
-So we’re left with dangling pointers from the QEMUTimers
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-19 / 42
-virtunoid.c: The exploit
-1
-KVM: Architecture overview
-Attack Surface
-2
-CVE-2011-1751: The bug
-3
-virtunoid.c: The exploit
-%rip control
-Getting to shellcode
-Bypassing ASLR
-4
-Conclusions and further research
-5
-Demo
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-20 / 42
-virtunoid.c: The exploit
-%rip control
-High-level TODO
-Inject a controlled QEMUTimer into qemu-kvm at a known address
-Eject the emulated ISA bridge
-Force an allocation into the freed RTCState, with second_timer
-pointing at our dummy timer.
-Nelson Elhage ()
-Virtunoid: Breaking out of KVM
-July 25, 2011
-21 / 42
-virtunoid.c: The exploit
-%rip control
-Injecting data
-The guest’s RAM is backed by a simple mmap()ed region inside the

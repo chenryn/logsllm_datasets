@@ -1,125 +1,152 @@
-      " call close\n"
-      "\n"
-      " pushl $" STRINGIFY((FORKSRV_FD + 1)) "\n"
-      " call close\n"
-      "\n"
-      " addl $8, %esp\n"
-      "\n"
-      " popl %edx\n"
-      " popl %ecx\n"
-      " popl %eax\n"
-      " jmp __afl_store\n"
-父进程则仍然作为fork
-server运行，其会将子进程的pid通过状态管道发送给fuzzer，并等待子进程执行完毕；一旦子进程执行完毕，则再通过状态管道，将其结束状态发送给fuzzer；之后再次进入等待状态`__afl_fork_wait_loop`：
-      " /* In parent process: write PID to pipe, then wait for child. */\n"
-      "\n"
-      " movl %eax, __afl_fork_pid\n"
-      "\n"
-      " pushl $4 /* length */\n"
-      " pushl $__afl_fork_pid /* data */\n"
-      " pushl $" STRINGIFY((FORKSRV_FD + 1)) " /* file desc */\n"
-      " call write\n"
-      " addl $12, %esp\n"
-      "\n"
-      " pushl $0 /* no flags */\n"
-      " pushl $__afl_temp /* status */\n"
-      " pushl __afl_fork_pid /* PID */\n"
-      " call waitpid\n"
-      " addl $12, %esp\n"
-      "\n"
-      " cmpl $0, %eax\n"
-      " jle __afl_die\n"
-      "\n"
-      " /* Relay wait status to pipe, then loop back. */\n"
-      "\n"
-      " pushl $4 /* length */\n"
-      " pushl $__afl_temp /* data */\n"
-      " pushl $" STRINGIFY((FORKSRV_FD + 1)) " /* file desc */\n"
-      " call write\n"
-      " addl $12, %esp\n"
-      "\n"
-      " jmp __afl_fork_wait_loop\n"
-以上就是fork server的主要逻辑，现在我们再回到fuzzer侧。在fork
-server启动完成后，一旦需要执行某个测试用例，则fuzzer会调用`run_target()`方法。在此方法中，便是通过命令管道，通知fork
-server准备fork；并通过状态管道，获取子进程pid：
-        s32 res;
-        /* In non-dumb mode, we have the fork server up and running, so simply
-    tell it to have at it, and then read back PID. */
-        if ((res = write(fsrv_ctl_fd, &prev_timed_out, 4)) != 4) {
-    ...
-        if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
-    ...
-随后，fuzzer再次读取状态管道，获取子进程退出状态，并由此来判断子进程结束的原因，例如正常退出、超时、崩溃等，并进行相应的记录。
-        if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
-    ...
-      /* Report outcome to caller. */
-      if (WIFSIGNALED(status) && !stop_soon) {
-        kill_signal = WTERMSIG(status);
-        if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
-        return FAULT_CRASH;
-      }
-#### 共享内存
-作为fuzzer，AFL并不是像无头苍蝇那样对输入文件无脑地随机变化（其实也支持这种方式，即dumb模式），其最大特点就是会对target进行插桩，以辅助mutated
-input的生成。具体地，插桩后的target，会记录执行过程中的分支信息；随后，fuzzer便可以根据这些信息，判断这次执行的整体流程和代码覆盖情况。
-AFL使用共享内存，来完成以上信息在fuzzer和target之间的传递。具体地，fuzzer在启动时，会执行`setup_shm()`方法进行配置。其首先调用`shemget()`分配一块共享内存，大小`MAP_SIZE`为64K:
+### Fork Server 主要逻辑优化
+
+在fork server中，当子进程创建完成后，将执行以下操作：
+
+```assembly
+call close
+pushl $FORKSRV_FD + 1
+call close
+addl $8, %esp
+popl %edx
+popl %ecx
+popl %eax
+jmp __afl_store
+```
+
+父进程则继续作为fork server运行。它会通过状态管道将子进程的PID发送给fuzzer，并等待子进程完成。一旦子进程结束，父进程会将其退出状态通过状态管道再次发送给fuzzer，然后进入等待循环`__afl_fork_wait_loop`。
+
+```assembly
+/* 在父进程中: 将PID写入管道，然后等待子进程 */
+movl %eax, __afl_fork_pid
+pushl $4 /* 长度 */
+pushl $__afl_fork_pid /* 数据 */
+pushl $FORKSRV_FD + 1 /* 文件描述符 */
+call write
+addl $12, %esp
+
+pushl $0 /* 无标志 */
+pushl $__afl_temp /* 状态 */
+pushl __afl_fork_pid /* PID */
+call waitpid
+addl $12, %esp
+
+cmpl $0, %eax
+jle __afl_die
+
+/* 通过管道传递等待状态，然后循环回退 */
+pushl $4 /* 长度 */
+pushl $__afl_temp /* 数据 */
+pushl $FORKSRV_FD + 1 /* 文件描述符 */
+call write
+addl $12, %esp
+
+jmp __afl_fork_wait_loop
+```
+
+### Fuzzer 与 Fork Server 交互
+
+在fork server启动后，每当需要执行一个测试用例时，fuzzer调用`run_target()`方法。在此方法中，fuzzer通过命令管道通知fork server准备创建新进程，并通过状态管道获取子进程的PID。
+
+```c
+s32 res;
+if ((res = write(fsrv_ctl_fd, &prev_timed_out, 4)) != 4) {
+    // 处理错误
+}
+if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
+    // 处理错误
+}
+```
+
+随后，fuzzer再次读取状态管道以获取子进程的退出状态，并根据该状态判断子进程是正常退出、超时还是崩溃等，从而进行相应的记录。
+
+```c
+if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
+    // 处理错误
+}
+
+/* 向调用者报告结果 */
+if (WIFSIGNALED(status) && !stop_soon) {
+    kill_signal = WTERMSIG(status);
+    if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
+    return FAULT_CRASH;
+}
+```
+
+### 共享内存机制
+
+AFL使用共享内存来在fuzzer和target之间传递分支信息。具体步骤如下：
+
+1. **分配共享内存**：fuzzer在启动时调用`setup_shm()`方法，首先通过`shmget()`分配一块大小为64KB的共享内存。
+    ```c
     shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
-分配成功后，该共享内存的标志符会被设置到环境变量中，从而之后fork()得到的子进程可以通过该环境变量，得到这块共享内存的标志符：
+    ```
+
+2. **设置环境变量**：分配成功后，将共享内存的标识符设置到环境变量中，以便后续通过fork()得到的子进程可以访问这块共享内存。
+    ```c
     shm_str = alloc_printf("%d", shm_id);
     if (!dumb_mode) setenv(SHM_ENV_VAR, shm_str, 1);
-并且，fuzzer本身，会使用变量`trace_bits`来保存共享内存的地址：
+    ```
+
+3. **映射共享内存**：fuzzer使用`shmat()`将共享内存映射到自己的地址空间，并保存其地址。
+    ```c
     trace_bits = shmat(shm_id, NULL, 0);
-在每次target执行之前，fuzzer首先将该共享内容清零：
-    memset(trace_bits, 0, MAP_SIZE); 
-接下来，我们再来看看target是如何获取并使用这块共享内存的。相关代码同样也在上面提到的方法`__afl_maybe_log()`中。首先，会检查是否已经将共享内存映射完成：
-      " /* Check if SHM region is already mapped. */\n"
-      "\n"
-      " movl __afl_area_ptr, %edx\n"
-      " testl %edx, %edx\n"
-      " je __afl_setup\n"
-`__afl_area_ptr`中保存的就是共享内存映射到target的内存空间中的地址，如果其不是NULL，便保存在ebx中继续执行；否则进一步跳转到`__afl_setup`。
-`__afl_setup`处会做一些错误检查，然后获取环境变量`AFL_SHM_ENV`的内容并将其转为整型。查看其定义便可知，这里获取到的，便是之前fuzzer保存的共享内存的标志符。
-      "__afl_setup:\n"
-      "\n"
-      " /* Do not retry setup if we had previous failures. */\n"
-      "\n"
-      " cmpb $0, __afl_setup_failure\n"
-      " jne __afl_return\n"
-      "\n"
-      " /* Map SHM, jumping to __afl_setup_abort if something goes wrong.\n"
-      " We do not save FPU/MMX/SSE registers here, but hopefully, nobody\n"
-      " will notice this early in the game. */\n"
-      "\n"
-      " pushl %eax\n"
-      " pushl %ecx\n"
-      "\n"
-      " pushl $.AFL_SHM_ENV\n"
-      " call getenv\n"
-      " addl $4, %esp\n"
-      "\n"
-      " testl %eax, %eax\n"
-      " je __afl_setup_abort\n"
-      "\n"
-      " pushl %eax\n"
-      " call atoi\n"
-      " addl $4, %esp\n"
-最后，通过调用`shmat()`，target将这块共享内存也映射到了自己的内存空间中，并将其地址保存在`__afl_area_ptr`及`edx`中。由此，便完成了fuzzer与target之间共享内存的设置。
-      " pushl $0 /* shmat flags */\n"
-      " pushl $0 /* requested addr */\n"
-      " pushl %eax /* SHM ID */\n"
-      " call shmat\n"
-      " addl $12, %esp\n"
-      "\n"
-      " cmpl $-1, %eax\n"
-      " je __afl_setup_abort\n"
-      "\n"
-      " /* Store the address of the SHM region. */\n"
-      "\n"
-      " movl %eax, __afl_area_ptr\n"
-      " movl %eax, %edx\n"
-      "\n"
-      " popl %ecx\n"
-      " popl %eax\n"
-注记：如果使用了fork server模式，那么上述获取共享内存的操作，是在fork
-server中进行；随后fork出来的子进程，只需直接使用这个共享内存即可。
-#### 分支信息的记录
-现在，用于通信的共享内存已准备完毕，接下来我们看看具体通信的是什么。
+    ```
+
+4. **初始化共享内存**：每次target执行前，fuzzer将共享内存内容清零。
+    ```c
+    memset(trace_bits, 0, MAP_SIZE);
+    ```
+
+### Target 获取并使用共享内存
+
+在target端，代码会检查是否已经映射了共享内存。如果没有映射，则跳转到`__afl_setup`进行映射。
+
+```assembly
+/* 检查SHM区域是否已经映射 */
+movl __afl_area_ptr, %edx
+testl %edx, %edx
+je __afl_setup
+```
+
+在`__afl_setup`中，首先进行错误检查，然后从环境变量`AFL_SHM_ENV`中获取共享内存标识符，并将其转换为整数。最后，通过`shmat()`将共享内存映射到target的地址空间，并保存其地址。
+
+```assembly
+__afl_setup:
+cmpb $0, __afl_setup_failure
+jne __afl_return
+
+/* 映射SHM */
+pushl %eax
+pushl %ecx
+pushl $.AFL_SHM_ENV
+call getenv
+addl $4, %esp
+testl %eax, %eax
+je __afl_setup_abort
+
+pushl %eax
+call atoi
+addl $4, %esp
+
+pushl $0 /* shmat flags */
+pushl $0 /* 请求的地址 */
+pushl %eax /* SHM ID */
+call shmat
+addl $12, %esp
+
+cmpl $-1, %eax
+je __afl_setup_abort
+
+/* 存储SHM区域的地址 */
+movl %eax, __afl_area_ptr
+movl %eax, %edx
+
+popl %ecx
+popl %eax
+```
+
+如果使用了fork server模式，上述获取共享内存的操作将在fork server中进行。随后，通过fork创建的子进程可以直接使用这块共享内存。
+
+### 分支信息记录
+
+现在，用于通信的共享内存已准备完毕，接下来我们看看具体通信的内容。

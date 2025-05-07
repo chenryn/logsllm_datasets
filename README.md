@@ -8,7 +8,8 @@ continuous pretraining and finetuning datasets for logsllm
 
 数据集清洗过程中，涉及较多的 PDF 识别，由于本人见识较浅，当时未发现比较好的开源工具，比如 [OpenDataLab](https://github.com/opendatalab/PDF-Extract-Kit/blob/main/README_zh-CN.md) 啥的，都是用智谱清言生成一些简单的 python 程序(见 `utils/` 目录)运行。比如 PDF 识别，未考虑章节关系，简单的对每页内容强加了`### 页码`的三级标题。
 
-注：数据集已经由千帆平台的异常清洗、过滤、去重和去隐私。仿真数据除非特殊说明，均来自千帆平台的 ernie-speed 免费模型。
+注1：数据集已经由千帆平台的异常清洗、过滤、去重和去隐私。仿真数据除非特殊说明，均来自千帆平台的 ernie-speed 免费模型。
+注2：参照 [DCLM 论文](https://github.com/mlfoundations/dclm/tree/main/baselines#fasttext-filtering)，采用 fasttext 模型进行文本质量过滤，对评分过低的五万多个文本，由 qwen-max 进行质量优化。依然有一万三千个评分过低，挪出存放在 low_txt/ 目录。
 
 ## 数据来源说明
 
@@ -30,7 +31,7 @@ continuous pretraining and finetuning datasets for logsllm
 
 微调数据集的来源主要包括：
 
-* 部分运维领域的公开微调数据集(如云智慧的 owl、蚂蚁金服的 codefuse、stackoverflow 热门问题)
+* 部分运维领域的公开微调数据集(如云智慧的 owl、蚂蚁金服的 codefuse、stackoverflow 热门问题、nl2logql和 kubectl 问答等)
 * 部分日志领域的 AIOps 论文样例数据(按固定模板转换，如 LogQA 等)
 * 部分开源的 Splunk、微软 Kusto 查询语句数据集(来自不同 Github 仓库，人工改写成日志易 SPL 语法)
 * 日志易内部 SPL 趋势图数据(按固定模板转换图表标题和语句，然后由 starcoder 进行角色扮演，丰富提问)
