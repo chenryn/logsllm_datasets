@@ -25,6 +25,7 @@ continuous pretraining and finetuning datasets for logsllm
 * 部分网络公开可见的国内技术大会分享(基本是PDF 横版格式，识别转换)
 * 日志易产品手册(asciidoc 格式)
 * 部分网络公开可见的网站故障报告(HTML 格式，转换为 markdown)
+* [VOID](https://www.thevoid.community/) 社区收集的 2021-2024 年公开故障报告和《Understanding Software Failures Through Incident Report Analysis》论文中清洗转换的对应[根因类型分析数据](https://zenodo.org/records/15712312)
 * [河南中医院大学的网络与信息系统智能运维课程体系](https://internet.hactcm.edu.cn/)公开课件(PDF 识别转换)
 * 少量 AIOps 论文(由 PDF 识别转换)
 * 仿真数据(日志易 SPL 问答的 CoT 过程)
