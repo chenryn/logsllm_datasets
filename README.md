@@ -22,6 +22,7 @@ continuous pretraining and finetuning datasets for logsllm
 * 极客时间开源数据集(技术内容部分，由 PDF 识别转换，有大量的内插图片和格式标签，清洗不太干净)
 * 部分开源日志样例(loghub、knowlog 等，为了减少 token 消耗，仅使用标注部分)
 * 部分网络公开可见的网络安全设备产品手册(基本是PDF格式，少量 CSV 编码说明)
+ * [LogReasoner 开源数据集](https://github.com/LeaperOvO/LogReasoner)(JSON 格式,由产品故障排查手册经 GPT4O 生成,清洗成 txt)
 * 部分网络公开可见的国内技术大会分享(基本是PDF 横版格式，识别转换)
 * 日志易产品手册(asciidoc 格式)
 * 部分网络公开可见的网站故障报告(HTML 格式，转换为 markdown)
